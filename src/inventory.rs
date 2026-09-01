@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::HashSet,
     fs,
     io::{self, Read},
     path::Path,
@@ -8,14 +8,14 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    narinfo::{PublishedNarInfoError, TrustedPublicKeys},
+    narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo},
     storage::{NarObjectId, StoreHash, nix32_sha256},
 };
 
-pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
+pub use crate::narinfo::MAX_NARINFO_BYTES;
 
 pub fn narinfo_is_valid(trusted: &TrustedPublicKeys, store: &StoreHash, bytes: Vec<u8>) -> bool {
-    bytes.len() as u64 <= MAX_NARINFO_BYTES && trusted.inspect(store, bytes).is_ok()
+    trusted.inspect(store, bytes).is_ok()
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -106,11 +106,10 @@ pub struct Inventory {
 impl Inventory {
     pub fn scan(root: &Path, trusted: &TrustedPublicKeys, verify_hashes: bool) -> io::Result<Self> {
         let mut entries = Vec::new();
-        let mut referenced = BTreeSet::new();
-        let mut narinfos = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
-        narinfos.sort_by_key(fs::DirEntry::file_name);
+        let mut referenced = HashSet::new();
 
-        for entry in narinfos {
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
@@ -122,12 +121,11 @@ impl Inventory {
                 entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
                 continue;
             };
-            let metadata = entry.metadata()?;
-            if !metadata.is_file() || metadata.len() > MAX_NARINFO_BYTES {
+            if !entry.metadata()?.is_file() {
                 entries.push(InventoryEntry::new(InventoryClass::MalformedNarInfo, route));
                 continue;
             }
-            let validated = match trusted.inspect(&store, fs::read(entry.path())?) {
+            let validated = match trusted.inspect(&store, read_narinfo(&entry.path())?) {
                 Ok(validated) => validated,
                 Err(PublishedNarInfoError::Malformed) => {
                     entries.push(InventoryEntry::new(InventoryClass::MalformedNarInfo, route));
@@ -182,9 +180,8 @@ impl Inventory {
 
         let nar_dir = root.join("nar");
         if nar_dir.is_dir() {
-            let mut nars = fs::read_dir(nar_dir)?.collect::<Result<Vec<_>, _>>()?;
-            nars.sort_by_key(fs::DirEntry::file_name);
-            for entry in nars {
+            for entry in fs::read_dir(nar_dir)? {
+                let entry = entry?;
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else {
                     continue;

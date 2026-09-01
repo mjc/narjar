@@ -1,4 +1,4 @@
-use std::{fmt, io, path::Path};
+use std::path::Path;
 
 use data_encoding::BASE64;
 use sha2::{Digest, Sha256};
@@ -19,7 +19,7 @@ pub enum Permission {
 struct TokenHashes(TokenFile);
 
 impl TokenHashes {
-    fn load(path: &Path) -> Result<Option<Self>, AuthError> {
+    fn load(path: &Path) -> Result<Option<Self>, TokenFileError> {
         Ok(TokenFile::load(path)?.map(Self))
     }
 
@@ -39,7 +39,7 @@ enum ReadPolicy {
 }
 
 impl ReadPolicy {
-    fn load(path: &Path) -> Result<Self, AuthError> {
+    fn load(path: &Path) -> Result<Self, TokenFileError> {
         Ok(match TokenHashes::load(path)? {
             Some(tokens) => Self::Private(tokens),
             None => Self::Public,
@@ -65,7 +65,7 @@ pub struct Authorizer {
 }
 
 impl Authorizer {
-    pub fn load(root: &Path) -> Result<Self, AuthError> {
+    pub fn load(root: &Path) -> Result<Self, TokenFileError> {
         let auth = root.join("auth");
         Ok(Self {
             read: ReadPolicy::load(&auth.join("read.tokens"))?,
@@ -113,52 +113,6 @@ fn authorization_token_hash(request: &Request) -> Option<[u8; TOKEN_BYTES]> {
         return None;
     }
     Some(Sha256::digest(token).into())
-}
-
-#[derive(Debug)]
-pub enum AuthError {
-    InsecurePermissions,
-    InvalidTokenFile,
-    Io(io::Error),
-}
-
-impl From<TokenFileError> for AuthError {
-    fn from(error: TokenFileError) -> Self {
-        match error {
-            TokenFileError::InsecurePermissions => Self::InsecurePermissions,
-            TokenFileError::Invalid | TokenFileError::TemporaryFileExhausted => {
-                Self::InvalidTokenFile
-            }
-            TokenFileError::Io(error) => Self::Io(error),
-        }
-    }
-}
-
-impl From<io::Error> for AuthError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl fmt::Display for AuthError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InsecurePermissions => {
-                formatter.write_str("token hash file permissions must be 0600")
-            }
-            Self::InvalidTokenFile => formatter.write_str("invalid token hash file"),
-            Self::Io(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for AuthError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InsecurePermissions | Self::InvalidTokenFile => None,
-            Self::Io(error) => Some(error),
-        }
-    }
 }
 
 #[cfg(test)]

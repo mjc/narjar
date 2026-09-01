@@ -13,16 +13,18 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use crate::storage::{NarObjectId, StoreHash};
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
-const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
+pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
-#[derive(Debug)]
-struct TrustedPublicKey {
-    name: String,
-    key: VerifyingKey,
+pub(crate) fn read_narinfo(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_NARINFO_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[derive(Debug, Default)]
-pub struct TrustedPublicKeys(Vec<TrustedPublicKey>);
+pub struct TrustedPublicKeys(BTreeMap<String, VerifyingKey>);
 
 impl TrustedPublicKeys {
     pub fn load(path: &Path) -> Result<Self, TrustError> {
@@ -44,14 +46,13 @@ impl TrustedPublicKeys {
             return Err(TrustError::InvalidTrustFile);
         }
 
-        let mut names = BTreeSet::new();
-        let mut keys = Vec::new();
+        let mut keys = BTreeMap::new();
         for entry in contents.split_ascii_whitespace() {
             let (name, encoded) = entry
                 .split_once(':')
                 .filter(|(name, encoded)| valid_name(name) && !encoded.is_empty())
                 .ok_or(TrustError::InvalidTrustFile)?;
-            if !names.insert(name.to_owned()) {
+            if keys.contains_key(name) {
                 return Err(TrustError::InvalidTrustFile);
             }
 
@@ -64,10 +65,7 @@ impl TrustedPublicKeys {
             if key.is_weak() {
                 return Err(TrustError::InvalidTrustFile);
             }
-            keys.push(TrustedPublicKey {
-                name: name.to_owned(),
-                key,
-            });
+            keys.insert(name.to_owned(), key);
         }
         Ok(Self(keys))
     }
@@ -106,11 +104,8 @@ impl TrustedPublicKeys {
                 return Err(TrustError::UntrustedPublishedNarInfo);
             }
 
-            let mut bytes = Vec::new();
-            (&mut File::open(entry.path())?)
-                .take(MAX_NARINFO_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_NARINFO_BYTES || self.validate(&route, bytes).is_err() {
+            let bytes = read_narinfo(&entry.path())?;
+            if self.validate(&route, bytes).is_err() {
                 return Err(TrustError::UntrustedPublishedNarInfo);
             }
         }
@@ -119,13 +114,9 @@ impl TrustedPublicKeys {
 
     fn verifies(&self, fingerprint: &[u8], signatures: &[NamedSignature]) -> bool {
         signatures.iter().any(|signature| {
-            self.0.iter().any(|trusted| {
-                trusted.name == signature.name
-                    && trusted
-                        .key
-                        .verify_strict(fingerprint, &signature.signature)
-                        .is_ok()
-            })
+            self.0
+                .get(signature.name.as_str())
+                .is_some_and(|key| key.verify_strict(fingerprint, &signature.signature).is_ok())
         })
     }
 }
@@ -171,6 +162,9 @@ struct ParsedNarInfo {
 
 impl ParsedNarInfo {
     fn parse(route: &StoreHash, bytes: Vec<u8>) -> Result<Self, NarInfoError> {
+        if bytes.len() as u64 > MAX_NARINFO_BYTES {
+            return Err(NarInfoError);
+        }
         let text = std::str::from_utf8(&bytes).map_err(|_| NarInfoError)?;
         if !text.ends_with('\n') || text.contains('\r') {
             return Err(NarInfoError);
@@ -386,5 +380,35 @@ impl std::error::Error for TrustError {
             Self::UntrustedPublishedNarInfo => None,
             Self::Io(error) => Some(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STORE_HASH: &str = "00000000000000000000000000000000";
+    const NAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+
+    #[test]
+    fn parser_rejects_oversized_narinfo() {
+        let route = StoreHash::parse(STORE_HASH).expect("valid store hash");
+        let store_name = "a".repeat(MAX_NARINFO_BYTES as usize);
+        let signature = BASE64.encode(&[0; 64]);
+        let bytes = format!(
+            "StorePath: /nix/store/{STORE_HASH}-{store_name}\n\
+             URL: nar/{NAR_HASH}.nar\n\
+             Compression: none\n\
+             FileHash: sha256:{NAR_HASH}\n\
+             FileSize: 1\n\
+             NarHash: sha256:{NAR_HASH}\n\
+             NarSize: 1\n\
+             References: \n\
+             Sig: test:{signature}\n"
+        )
+        .into_bytes();
+
+        assert!(bytes.len() as u64 > MAX_NARINFO_BYTES);
+        assert!(ParsedNarInfo::parse(&route, bytes).is_err());
     }
 }
