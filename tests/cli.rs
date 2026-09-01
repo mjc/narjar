@@ -238,6 +238,42 @@ struct RunningServer {
     address: String,
 }
 
+struct HttpExchange {
+    request: Vec<u8>,
+    response: Vec<u8>,
+}
+
+impl HttpExchange {
+    fn sanitized_transcript(&self) -> String {
+        let header_end = self
+            .request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request must contain a header terminator");
+        let request_head = String::from_utf8_lossy(&self.request[..header_end]);
+        let mut lines = request_head.lines();
+        let mut transcript = String::new();
+        transcript.push_str(lines.next().expect("request must contain a request line"));
+        transcript.push('\n');
+        for line in lines {
+            let name = line.split_once(':').map_or(line, |(name, _)| name);
+            if name.eq_ignore_ascii_case("authorization") {
+                transcript.push_str("> Authorization: <redacted>\n");
+            } else {
+                transcript.push_str(&format!("> {line}\n"));
+            }
+        }
+        let body_len = self.request.len() - header_end - 4;
+        if body_len != 0 {
+            transcript.push_str(&format!("> [body: {body_len} bytes]\n"));
+        }
+        transcript.push_str("< ");
+        transcript.push_str(&String::from_utf8_lossy(&self.response).replace("\r\n", "\n< "));
+        transcript.push('\n');
+        transcript
+    }
+}
+
 impl RunningServer {
     fn start(test: &str) -> Self {
         Self::start_with_args(test, &[])
@@ -337,10 +373,7 @@ impl RunningServer {
     }
 
     fn request_with_headers(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> Vec<u8> {
-        let mut stream = self.open_request(method, path, headers);
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read response");
-        response
+        self.exchange(method, path, headers, None).response
     }
 
     fn request_with_body(
@@ -350,11 +383,7 @@ impl RunningServer {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Vec<u8> {
-        let mut headers = headers.to_vec();
-        if method == "PUT" {
-            headers.push(("Authorization", TEST_AUTHORIZATION));
-        }
-        self.raw_request_with_body(method, path, &headers, body)
+        self.exchange(method, path, headers, Some(body)).response
     }
 
     fn raw_request_with_body(
@@ -364,38 +393,81 @@ impl RunningServer {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Vec<u8> {
-        let content_length = body.len().to_string();
-        let mut headers = headers.to_vec();
-        headers.push(("Content-Length", content_length.as_str()));
-        let mut stream = self.open_raw_request(method, path, &headers);
-        stream.write_all(body).expect("write request body");
+        self.raw_exchange(method, path, headers, Some(body))
+            .response
+    }
 
+    fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> HttpExchange {
+        let headers = Self::authenticated_headers(method, headers);
+        self.raw_exchange(method, path, &headers, body)
+    }
+
+    fn raw_exchange(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> HttpExchange {
+        let content_length = body.map(|body| body.len().to_string());
+        let mut headers = headers.to_vec();
+        if let Some(content_length) = content_length.as_deref() {
+            headers.push(("Content-Length", content_length));
+        }
+        let mut request = self.raw_request_head(method, path, &headers);
+        if let Some(body) = body {
+            request.extend_from_slice(body);
+        }
+
+        let mut stream = TcpStream::connect(&self.address).expect("connect to narjar");
+        stream.write_all(&request).expect("write request");
         let mut response = Vec::new();
         stream.read_to_end(&mut response).expect("read response");
-        response
+        HttpExchange { request, response }
     }
 
     fn open_request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> TcpStream {
+        let headers = Self::authenticated_headers(method, headers);
+        self.open_raw_request(method, path, &headers)
+    }
+
+    fn authenticated_headers<'a>(
+        method: &str,
+        headers: &[(&'a str, &'a str)],
+    ) -> Vec<(&'a str, &'a str)> {
         let mut headers = headers.to_vec();
         if method == "PUT" {
             headers.push(("Authorization", TEST_AUTHORIZATION));
         }
-        self.open_raw_request(method, path, &headers)
+        headers
     }
 
     fn open_raw_request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> TcpStream {
+        let request = self.raw_request_head(method, path, headers);
         let mut stream = TcpStream::connect(&self.address).expect("connect to narjar");
+        stream.write_all(&request).expect("write request");
+        stream
+    }
+
+    fn raw_request_head(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> Vec<u8> {
+        let mut request = Vec::new();
         write!(
-            stream,
+            request,
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
             self.address
         )
-        .expect("write request");
+        .expect("write request line");
         for &(name, value) in headers {
-            write!(stream, "{name}: {value}\r\n").expect("write request header");
+            write!(request, "{name}: {value}\r\n").expect("write request header");
         }
-        write!(stream, "\r\n").expect("finish request");
-        stream
+        write!(request, "\r\n").expect("finish request");
+        request
     }
 
     fn stop(self) -> (ExitStatus, ExitStatus) {
@@ -645,29 +717,12 @@ fn run_conformance_trace(server: &RunningServer, fixture: &str) -> String {
             ),
         };
 
-        transcript.push_str(&format!("{method} {path}\n"));
-        transcript.push_str(&format!(
-            "> Host: {}\n> Connection: close\n",
-            server.address
-        ));
-        if *method == "PUT" {
-            transcript.push_str("> Authorization: <redacted>\n");
-        }
-        if let Some(body) = body {
-            transcript.push_str(&format!("> Content-Length: {}\n", body.len()));
-        }
-
-        let response = match body {
-            Some(body) => server.request_with_body(method, path, &[], body),
-            None => server.request(method, path),
-        };
-        transcript.push_str("< ");
-        transcript.push_str(&String::from_utf8_lossy(&response).replace("\r\n", "\n< "));
-        transcript.push('\n');
+        let exchange = server.exchange(method, path, &[], body);
+        transcript.push_str(&exchange.sanitized_transcript());
 
         let expected = format!("HTTP/1.1 {expected_status} ");
         assert!(
-            response.starts_with(expected.as_bytes()),
+            exchange.response.starts_with(expected.as_bytes()),
             "conformance fixture line {} expected status {expected_status}\n{transcript}",
             line_number + 1
         );
