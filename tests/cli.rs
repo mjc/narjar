@@ -5,7 +5,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{Shutdown, TcpStream},
     os::unix::fs::symlink,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     thread,
     time::{Duration, SystemTime},
@@ -311,7 +311,7 @@ impl RunningServer {
         }
     }
 
-    fn spawn(data_dir: &PathBuf, extra_args: &[&str]) -> Child {
+    fn spawn(data_dir: &Path, extra_args: &[&str]) -> Child {
         let mut process = command();
         process
             .args([

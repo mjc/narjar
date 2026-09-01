@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    fs::File,
+    fs::{self, File},
     io::{self, Read},
     os::unix::fs::MetadataExt,
     path::Path,
@@ -13,6 +13,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use crate::storage::{NarObjectId, StoreHash};
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 struct TrustedPublicKey {
@@ -69,6 +70,34 @@ impl TrustedPublicKeys {
             });
         }
         Ok(Self(keys))
+    }
+    pub fn validate_published(&self, root: &Path) -> Result<(), TrustError> {
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(route) = name.to_str().and_then(|name| name.strip_suffix(".narinfo")) else {
+                continue;
+            };
+            let Ok(route) = StoreHash::parse(route) else {
+                continue;
+            };
+            if !entry.file_type()?.is_file() {
+                return Err(TrustError::UntrustedPublishedNarInfo);
+            }
+
+            let mut bytes = Vec::new();
+            (&mut File::open(entry.path())?)
+                .take(MAX_NARINFO_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_NARINFO_BYTES
+                || ParsedNarInfo::parse(&route, bytes)
+                    .and_then(|narinfo| narinfo.verify(self))
+                    .is_err()
+            {
+                return Err(TrustError::UntrustedPublishedNarInfo);
+            }
+        }
+        Ok(())
     }
 
     fn verifies(&self, fingerprint: &[u8], signatures: &[NamedSignature]) -> bool {
@@ -312,6 +341,7 @@ impl std::error::Error for NarInfoError {}
 #[derive(Debug)]
 pub enum TrustError {
     InvalidTrustFile,
+    UntrustedPublishedNarInfo,
     Io(io::Error),
 }
 
@@ -325,6 +355,9 @@ impl fmt::Display for TrustError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidTrustFile => formatter.write_str("invalid trusted public key file"),
+            Self::UntrustedPublishedNarInfo => {
+                formatter.write_str("published narinfo is not trusted")
+            }
             Self::Io(error) => error.fmt(formatter),
         }
     }
@@ -334,6 +367,7 @@ impl std::error::Error for TrustError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidTrustFile => None,
+            Self::UntrustedPublishedNarInfo => None,
             Self::Io(error) => Some(error),
         }
     }

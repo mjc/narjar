@@ -131,10 +131,12 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         Arc::new(Authorizer::load(&config.data_dir).map_err(|error| {
             Error::runtime(format!("cannot load authorization policy: {error}"))
         })?);
-    let trusted_keys = Arc::new(
-        TrustedPublicKeys::load(&config.data_dir.join("trusted-public-keys"))
-            .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?,
-    );
+    let trusted_keys = TrustedPublicKeys::load(&config.data_dir.join("trusted-public-keys"))
+        .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
+    trusted_keys
+        .validate_published(&config.data_dir)
+        .map_err(|error| Error::runtime(format!("cannot activate trusted public keys: {error}")))?;
+    let trusted_keys = Arc::new(trusted_keys);
 
     let server = Server::http(config.listen)
         .map_err(|error| Error::runtime(format!("cannot listen on {}: {error}", config.listen)))?;
