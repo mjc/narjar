@@ -737,7 +737,7 @@ fn read_routes_distinguish_bad_methods_names_and_unsupported_surfaces() {
         headers.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
         "{headers:?}"
     );
-    assert!(headers.contains("Allow: GET, HEAD\r\n"), "{headers:?}");
+    assert!(headers.contains("Allow: GET, HEAD, PUT\r\n"), "{headers:?}");
     assert!(body.is_empty());
 
     for response in invalid_routes {

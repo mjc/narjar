@@ -161,12 +161,18 @@ impl Layout {
     fn realisations_dir(&self) -> PathBuf {
         self.root.join("realisations")
     }
+
+    fn cache_info_path(&self) -> PathBuf {
+        self.root.join("nix-cache-info")
+    }
+
     fn lock_path(&self) -> PathBuf {
         self.root.join("lock")
     }
 }
 
 enum PublishTarget<'a> {
+    CacheInfo,
     Nar(&'a NarObjectId),
     NarInfo(&'a StoreHash),
 }
@@ -174,6 +180,7 @@ enum PublishTarget<'a> {
 impl PublishTarget<'_> {
     fn destination(&self, layout: &Layout) -> PathBuf {
         match self {
+            Self::CacheInfo => layout.cache_info_path(),
             Self::Nar(id) => layout.nar_path(id),
             Self::NarInfo(store) => layout.narinfo_path(store),
         }
@@ -181,6 +188,7 @@ impl PublishTarget<'_> {
 
     fn temp_prefix(&self) -> &'static str {
         match self {
+            Self::CacheInfo => "cache-info",
             Self::Nar(_) => "nar",
             Self::NarInfo(_) => "narinfo",
         }
@@ -269,6 +277,10 @@ impl Storage {
     #[cfg(test)]
     fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    pub fn publish_cache_info(&self, source: impl Read) -> Result<PublishOutcome, StorageError> {
+        self.publish(PublishTarget::CacheInfo, source)
     }
 
     pub fn publish_nar(

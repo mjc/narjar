@@ -260,6 +260,48 @@ fn has_header(request: &tiny_http::Request, name: &'static str) -> bool {
         .any(|header| header.field.equiv(name))
 }
 
+fn respond_cache_info_put(mut request: tiny_http::Request, storage: &Storage) {
+    if has_header(&request, "Transfer-Encoding") {
+        let _ = request.respond(Response::empty(StatusCode(400)));
+        return;
+    }
+    if has_header(&request, "Content-Encoding") {
+        let _ = request.respond(Response::empty(StatusCode(415)));
+        return;
+    }
+    let Some(length) = request.body_length() else {
+        let _ = request.respond(Response::empty(StatusCode(411)));
+        return;
+    };
+    if length != NIX_CACHE_INFO.len() {
+        let _ = request.respond(Response::empty(StatusCode(409)));
+        return;
+    }
+
+    let mut bytes = Vec::with_capacity(length);
+    let read = request
+        .as_reader()
+        .take(length as u64 + 1)
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() != length {
+        let _ = request.respond(Response::empty(StatusCode(422)));
+        return;
+    }
+    if bytes != NIX_CACHE_INFO {
+        let _ = request.respond(Response::empty(StatusCode(409)));
+        return;
+    }
+
+    let status = match storage.publish_cache_info(bytes.as_slice()) {
+        Ok(PublishOutcome::Created) => 201,
+        Ok(PublishOutcome::Identical) => 200,
+        Err(StorageError::Conflict) => 409,
+        Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
+        Err(_) => 500,
+    };
+    let _ = request.respond(Response::empty(StatusCode(status)));
+}
+
 fn respond_nar_put(
     mut request: tiny_http::Request,
     storage: &Storage,
@@ -387,17 +429,12 @@ pub fn respond(
         return match route {
             ReadRoute::Nar(id) => respond_nar_put(request, storage, &id, policy),
             ReadRoute::NarInfo(store) => respond_narinfo_put(request, storage, &store, trusted),
-            ReadRoute::CacheInfo => method_not_allowed(request, "GET, HEAD"),
+            ReadRoute::CacheInfo => respond_cache_info_put(request, storage),
         };
     }
 
     if !matches!(request.method(), Method::Get | Method::Head) {
-        let allow = if matches!(&route, ReadRoute::Nar(_) | ReadRoute::NarInfo(_)) {
-            "GET, HEAD, PUT"
-        } else {
-            "GET, HEAD"
-        };
-        method_not_allowed(request, allow);
+        method_not_allowed(request, "GET, HEAD, PUT");
         return;
     }
 
