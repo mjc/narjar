@@ -1,5 +1,4 @@
 .direnv/
-target/
+/target/
 result
 result-*
-/target
