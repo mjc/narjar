@@ -102,9 +102,28 @@ fn injected_fault(boundary: PublishBoundary, fault: PublishBoundary) -> Result<(
 }
 
 #[derive(Debug)]
+struct ProcessLock {
+    _file: File,
+}
+
+impl ProcessLock {
+    fn acquire(path: &Path) -> Result<Self, StorageError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        lock_exclusive(&file)?;
+        Ok(Self { _file: file })
+    }
+}
+
+#[derive(Debug)]
 pub struct Storage {
     layout: Layout,
-    _lock: File,
+    _lock: ProcessLock,
 }
 
 impl Storage {
@@ -115,14 +134,7 @@ impl Storage {
         fs::create_dir_all(layout.temp_dir())?;
         fs::create_dir_all(layout.realisations_dir())?;
 
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(layout.lock_path())?;
-        lock_exclusive(&lock)?;
+        let lock = ProcessLock::acquire(&layout.lock_path())?;
         sync_dir(&layout.root)?;
 
         Ok(Self {
