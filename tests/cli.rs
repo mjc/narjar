@@ -531,3 +531,54 @@ fn nar_get_and_head_support_one_byte_range() {
         assert!(body.is_empty());
     }
 }
+
+#[test]
+fn read_routes_distinguish_bad_methods_names_and_unsupported_surfaces() {
+    let server = RunningServer::start("read-negatives");
+
+    let wrong_method = server.request("POST", "/nix-cache-info");
+    let invalid_routes = [
+        format!("/{}.narinfo", &STORE_HASH[..STORE_HASH.len() - 1]),
+        format!("/nar/{}.nar", &NAR_ID[..NAR_ID.len() - 1]),
+        format!("/nar/{NAR_ID}.nar/extra"),
+        "//nix-cache-info".to_owned(),
+    ]
+    .map(|path| server.request("GET", &path));
+    let unsupported_routes = [
+        format!("/{STORE_HASH}.ls"),
+        format!("/log/{STORE_HASH}"),
+        "/realisations/example.doi".to_owned(),
+        "/query-paths".to_owned(),
+    ]
+    .map(|path| server.request("GET", &path));
+    let (signal, status) = server.stop();
+
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+
+    let (headers, body) = response_parts(&wrong_method);
+    assert!(
+        headers.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+        "{headers:?}"
+    );
+    assert!(headers.contains("Allow: GET, HEAD\r\n"), "{headers:?}");
+    assert!(body.is_empty());
+
+    for response in invalid_routes {
+        let (headers, body) = response_parts(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{headers:?}"
+        );
+        assert!(body.is_empty());
+    }
+
+    for response in unsupported_routes {
+        let (headers, body) = response_parts(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{headers:?}"
+        );
+        assert!(body.is_empty());
+    }
+}
