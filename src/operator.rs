@@ -137,19 +137,21 @@ fn report(
 
     for finding in findings
         .iter()
-        .filter(|finding| !only_orphans || finding.class == "orphan_nar")
+        .filter(|finding| !only_orphans || finding.class == FindingClass::OrphanNar)
     {
         if json {
             println!(
                 "{{\"class\":\"{}\",\"identifier\":\"{}\",\"action\":\"{}\"}}",
                 finding.class,
                 json_escape(&finding.identifier),
-                finding.action
+                finding.class.action()
             );
         } else {
             println!(
                 "{}\t{}\t{}",
-                finding.class, finding.identifier, finding.action
+                finding.class,
+                finding.identifier,
+                finding.class.action()
             );
         }
     }
@@ -180,20 +182,12 @@ fn scan(root: &Path, verify_hashes: bool) -> Result<Vec<Finding>, Error> {
             continue;
         };
         let Ok(store) = StoreHash::parse(route) else {
-            findings.push(Finding::new(
-                "invalid_filename",
-                name,
-                "quarantine manually",
-            ));
+            findings.push(Finding::new(FindingClass::InvalidFilename, name));
             continue;
         };
         let metadata = entry.metadata().map_err(runtime)?;
         if !metadata.is_file() || metadata.len() > MAX_NARINFO_BYTES {
-            findings.push(Finding::new(
-                "malformed_narinfo",
-                route,
-                "quarantine narinfo",
-            ));
+            findings.push(Finding::new(FindingClass::MalformedNarInfo, route));
             continue;
         }
         let validated = match fs::read(entry.path()).map_err(runtime).and_then(|bytes| {
@@ -203,22 +197,14 @@ fn scan(root: &Path, verify_hashes: bool) -> Result<Vec<Finding>, Error> {
         }) {
             Ok(validated) => validated,
             Err(_) => {
-                findings.push(Finding::new(
-                    "malformed_narinfo",
-                    route,
-                    "quarantine narinfo",
-                ));
+                findings.push(Finding::new(FindingClass::MalformedNarInfo, route));
                 continue;
             }
         };
         let nar = validated.nar();
         referenced.insert(nar.as_str().to_owned());
         let Some(mut file) = storage.open_nar(nar).map_err(runtime)? else {
-            findings.push(Finding::new(
-                "missing_nar",
-                route,
-                "reupload NAR or quarantine narinfo",
-            ));
+            findings.push(Finding::new(FindingClass::MissingNar, route));
             continue;
         };
         let size_matches = file.metadata().map_err(runtime)?.len() == validated.nar_size();
@@ -237,13 +223,9 @@ fn scan(root: &Path, verify_hashes: bool) -> Result<Vec<Finding>, Error> {
             true
         };
         if size_matches && hash_matches {
-            findings.push(Finding::new("valid_pair", route, "none"));
+            findings.push(Finding::new(FindingClass::ValidPair, route));
         } else {
-            findings.push(Finding::new(
-                "hash_or_size_mismatch",
-                route,
-                "quarantine and reupload",
-            ));
+            findings.push(Finding::new(FindingClass::HashOrSizeMismatch, route));
         }
     }
 
@@ -259,24 +241,18 @@ fn scan(root: &Path, verify_hashes: bool) -> Result<Vec<Finding>, Error> {
         };
         let Some(id) = name.strip_suffix(".nar") else {
             findings.push(Finding::new(
-                "invalid_filename",
+                FindingClass::InvalidFilename,
                 format!("nar/{name}"),
-                "quarantine manually",
             ));
             continue;
         };
         if NarObjectId::parse(id).is_err() {
             findings.push(Finding::new(
-                "invalid_filename",
+                FindingClass::InvalidFilename,
                 format!("nar/{name}"),
-                "quarantine manually",
             ));
         } else if !referenced.contains(id) {
-            findings.push(Finding::new(
-                "orphan_nar",
-                id,
-                "retain or delete after policy review",
-            ));
+            findings.push(Finding::new(FindingClass::OrphanNar, id));
         }
     }
 
@@ -435,26 +411,68 @@ fn json_escape(value: &str) -> String {
 }
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct Finding {
-    class: &'static str,
-    identifier: String,
-    action: &'static str,
+enum FindingClass {
+    ValidPair,
+    OrphanNar,
+    MissingNar,
+    MalformedNarInfo,
+    HashOrSizeMismatch,
+    InvalidFilename,
 }
 
-impl Finding {
-    fn new(class: &'static str, identifier: impl Into<String>, action: &'static str) -> Self {
-        Self {
-            class,
-            identifier: identifier.into(),
-            action,
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Finding {
+    class: FindingClass,
+    identifier: String,
+}
+
+impl FindingClass {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ValidPair => "valid_pair",
+            Self::OrphanNar => "orphan_nar",
+            Self::MissingNar => "missing_nar",
+            Self::MalformedNarInfo => "malformed_narinfo",
+            Self::HashOrSizeMismatch => "hash_or_size_mismatch",
+            Self::InvalidFilename => "invalid_filename",
         }
     }
 
-    fn invalid_published_pair(&self) -> bool {
+    const fn action(&self) -> &'static str {
+        match self {
+            Self::ValidPair => "none",
+            Self::OrphanNar => "review before deleting",
+            Self::MissingNar => "reupload NAR or quarantine narinfo",
+            Self::MalformedNarInfo => "quarantine narinfo",
+            Self::HashOrSizeMismatch => "quarantine and reupload",
+            Self::InvalidFilename => "quarantine manually",
+        }
+    }
+
+    const fn invalid_published_pair(&self) -> bool {
         matches!(
-            self.class,
-            "missing_nar" | "malformed_narinfo" | "hash_or_size_mismatch" | "untrusted_signature"
+            self,
+            Self::MissingNar | Self::MalformedNarInfo | Self::HashOrSizeMismatch
         )
+    }
+}
+
+impl std::fmt::Display for FindingClass {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Finding {
+    fn new(class: FindingClass, identifier: impl Into<String>) -> Self {
+        Self {
+            class,
+            identifier: identifier.into(),
+        }
+    }
+
+    const fn invalid_published_pair(&self) -> bool {
+        self.class.invalid_published_pair()
     }
 }
 
