@@ -161,16 +161,20 @@
         };
 
       systems = lib.genAttrs supportedSystems mkSystem;
+      staticPkgs = systems.${staticSystem}.pkgs;
+      skopeoForBuild = staticPkgs.writeShellScriptBin "skopeo" ''
+        exec ${lib.getExe staticPkgs.skopeo} --tmpdir "$NIX_BUILD_TOP" "$@"
+      '';
       static = mkCraneBuild {
-        pkgs = systems.${staticSystem}.pkgs;
-        toolchain = mkToolchain systems.${staticSystem}.pkgs [ staticTarget ];
+        pkgs = staticPkgs;
+        toolchain = mkToolchain staticPkgs [ staticTarget ];
         cargoExtraArgs = "--locked --target ${staticTarget}";
         extraArgs = {
           CARGO_BUILD_TARGET = staticTarget;
-          nativeBuildInputs = [ systems.${staticSystem}.pkgs.pkgsStatic.stdenv.cc ];
+          nativeBuildInputs = [ staticPkgs.pkgsStatic.stdenv.cc ];
         };
       };
-      containerImage = systems.${staticSystem}.pkgs.dockerTools.buildLayeredImage {
+      containerImage = staticPkgs.dockerTools.buildLayeredImage {
         name = "narjar";
         tag = "latest";
         contents = [ static.narjar ];
@@ -197,12 +201,12 @@
         };
       };
       ociImage =
-        systems.${staticSystem}.pkgs.runCommand "narjar-oci.tar"
+        staticPkgs.runCommand "narjar-oci.tar"
           {
-            nativeBuildInputs = [ systems.${staticSystem}.pkgs.skopeo ];
+            nativeBuildInputs = [ skopeoForBuild ];
           }
           ''
-            skopeo --tmpdir "$NIX_BUILD_TOP" --insecure-policy copy \
+            skopeo --insecure-policy copy \
               docker-archive:${containerImage} \
               oci-archive:$out:narjar
           '';
@@ -363,12 +367,12 @@
               {
                 nativeBuildInputs = [
                   env.pkgs.jq
-                  env.pkgs.skopeo
+                  skopeoForBuild
                 ];
               }
               ''
-                skopeo --tmpdir "$NIX_BUILD_TOP" --insecure-policy inspect oci-archive:${ociImage} > image.json
-                skopeo --tmpdir "$NIX_BUILD_TOP" --insecure-policy inspect --config oci-archive:${ociImage} > config.json
+                skopeo --insecure-policy inspect oci-archive:${ociImage} > image.json
+                skopeo --insecure-policy inspect --config oci-archive:${ociImage} > config.json
                 jq -e '.Architecture == "amd64" and .Os == "linux"' image.json
                 jq -e '.config.User == "${containerUser}"' config.json
                 touch $out
