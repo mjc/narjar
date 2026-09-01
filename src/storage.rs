@@ -11,28 +11,39 @@ const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 const TEMP_ATTEMPTS: u64 = 128;
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidObjectId;
+
+impl fmt::Display for InvalidObjectId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid Nix base-32 object identifier")
+    }
+}
+
+impl std::error::Error for InvalidObjectId {}
+
 #[derive(Debug, Eq, PartialEq)]
-struct NarObjectId(String);
+pub struct NarObjectId(String);
 
 impl NarObjectId {
-    fn parse(value: &str) -> Result<Self, ()> {
+    pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
         parse_nix32(value, 52).map(Self)
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct StoreHash(String);
+pub struct StoreHash(String);
 
 impl StoreHash {
-    fn parse(value: &str) -> Result<Self, ()> {
+    pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
         parse_nix32(value, 32).map(Self)
     }
 }
 
-fn parse_nix32(value: &str, expected_len: usize) -> Result<String, ()> {
+fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObjectId> {
     (value.len() == expected_len && value.bytes().all(|byte| NIX32.contains(&byte)))
         .then(|| value.to_owned())
-        .ok_or(())
+        .ok_or(InvalidObjectId)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -67,12 +78,12 @@ impl Layout {
 }
 
 #[derive(Debug)]
-struct Storage {
+pub struct Storage {
     layout: Layout,
 }
 
 impl Storage {
-    fn initialize(root: impl AsRef<Path>) -> Result<Self, PublishError> {
+    pub fn initialize(root: impl AsRef<Path>) -> Result<Self, StorageError> {
         let layout = Layout::new(root.as_ref().to_owned());
         fs::create_dir_all(&layout.root)?;
         fs::create_dir_all(layout.nar_dir())?;
@@ -83,29 +94,30 @@ impl Storage {
         Ok(Self { layout })
     }
 
+    #[cfg(test)]
     fn layout(&self) -> &Layout {
         &self.layout
     }
 
-    fn publish_nar(
+    pub fn publish_nar(
         &self,
         id: &NarObjectId,
         source: impl Read,
-    ) -> Result<PublishOutcome, PublishError> {
+    ) -> Result<PublishOutcome, StorageError> {
         self.publish("nar", self.layout.nar_path(id), source)
     }
 
-    fn publish_narinfo(
+    pub fn publish_narinfo(
         &self,
         store: &StoreHash,
         nar: &NarObjectId,
         source: impl Read,
-    ) -> Result<PublishOutcome, PublishError> {
+    ) -> Result<PublishOutcome, StorageError> {
         match fs::metadata(self.layout.nar_path(nar)) {
             Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => return Err(PublishError::MissingNar),
+            Ok(_) => return Err(StorageError::MissingNar),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(PublishError::MissingNar);
+                return Err(StorageError::MissingNar);
             }
             Err(error) => return Err(error.into()),
         }
@@ -113,11 +125,11 @@ impl Storage {
         self.publish("narinfo", self.layout.narinfo_path(store), source)
     }
 
-    fn open_pair(
+    pub fn open_pair(
         &self,
         store: &StoreHash,
         nar: &NarObjectId,
-    ) -> Result<Option<PublishedPair>, PublishError> {
+    ) -> Result<Option<PublishedPair>, StorageError> {
         let Some(narinfo) = open_optional(self.layout.narinfo_path(store))? else {
             return Ok(None);
         };
@@ -133,7 +145,7 @@ impl Storage {
         prefix: &str,
         destination: PathBuf,
         mut source: impl Read,
-    ) -> Result<PublishOutcome, PublishError> {
+    ) -> Result<PublishOutcome, StorageError> {
         let (temp_path, mut temp) = self.create_temp(prefix)?;
         let result = (|| {
             io::copy(&mut source, &mut temp)?;
@@ -151,7 +163,7 @@ impl Storage {
                     if files_equal(&temp_path, &destination)? {
                         Ok(PublishOutcome::Identical)
                     } else {
-                        Err(PublishError::Conflict)
+                        Err(StorageError::Conflict)
                     }
                 }
                 Err(error) => Err(error.into()),
@@ -161,7 +173,7 @@ impl Storage {
         drop(temp);
         let cleanup = fs::remove_file(&temp_path)
             .and_then(|()| sync_dir(&self.layout.temp_dir()))
-            .map_err(PublishError::from);
+            .map_err(StorageError::from);
 
         match result {
             Ok(outcome) => {
@@ -175,7 +187,7 @@ impl Storage {
         }
     }
 
-    fn create_temp(&self, prefix: &str) -> Result<(PathBuf, File), PublishError> {
+    fn create_temp(&self, prefix: &str) -> Result<(PathBuf, File), StorageError> {
         for _ in 0..TEMP_ATTEMPTS {
             let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let path = self
@@ -203,31 +215,31 @@ impl Storage {
 }
 
 #[derive(Debug)]
-struct PublishedPair {
-    nar: File,
-    narinfo: File,
+pub struct PublishedPair {
+    pub nar: File,
+    pub narinfo: File,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublishOutcome {
+pub enum PublishOutcome {
     Created,
     Identical,
 }
 
 #[derive(Debug)]
-enum PublishError {
+pub enum StorageError {
     Conflict,
     MissingNar,
     Io(io::Error),
 }
 
-impl From<io::Error> for PublishError {
+impl From<io::Error> for StorageError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
 }
 
-impl fmt::Display for PublishError {
+impl fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Conflict => formatter.write_str("immutable destination has different contents"),
@@ -237,7 +249,7 @@ impl fmt::Display for PublishError {
     }
 }
 
-impl std::error::Error for PublishError {
+impl std::error::Error for StorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
@@ -246,7 +258,7 @@ impl std::error::Error for PublishError {
     }
 }
 
-fn open_optional(path: PathBuf) -> Result<Option<File>, PublishError> {
+fn open_optional(path: PathBuf) -> Result<Option<File>, StorageError> {
     match File::open(path) {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -292,7 +304,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{Layout, NarObjectId, PublishError, PublishOutcome, Storage, StoreHash};
+    use super::{Layout, NarObjectId, PublishOutcome, Storage, StorageError, StoreHash};
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
     const STORE_HASH: &str = "00000000000000000000000000000000";
@@ -376,7 +388,7 @@ mod tests {
         );
         assert!(matches!(
             storage.publish_nar(&nar, Cursor::new(b"different")),
-            Err(PublishError::Conflict)
+            Err(StorageError::Conflict)
         ));
         assert!(
             storage
@@ -400,7 +412,7 @@ mod tests {
         );
         assert!(matches!(
             storage.publish_narinfo(&store, &nar, Cursor::new(b"different")),
-            Err(PublishError::Conflict)
+            Err(StorageError::Conflict)
         ));
 
         let mut pair = storage

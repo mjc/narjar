@@ -15,6 +15,8 @@ use signal_hook::{
 };
 use tiny_http::{Response, Server, StatusCode};
 
+use narjar::storage::Storage;
+
 use crate::{config::ServeConfig, error::Error};
 
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
@@ -27,6 +29,13 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             config.data_dir.display()
         )));
     }
+
+    let _storage = Storage::initialize(&config.data_dir).map_err(|error| {
+        Error::runtime(format!(
+            "cannot initialize data directory {}: {error}",
+            config.data_dir.display()
+        ))
+    })?;
 
     let server =
         Arc::new(Server::http(config.listen).map_err(|error| {

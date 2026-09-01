@@ -67,7 +67,7 @@ fn serve_accepts_data_dir_from_environment() {
             data_dir.to_str().expect("temporary path should be UTF-8"),
         )],
     );
-    fs::remove_dir(data_dir).expect("test data directory should be removed");
+    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
 
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
@@ -86,7 +86,7 @@ fn serve_rejects_zero_workers() {
         "--workers",
         "0",
     ]);
-    fs::remove_dir(data_dir).expect("test data directory should be removed");
+    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
 
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
@@ -98,7 +98,7 @@ fn serve_rejects_zero_workers() {
 #[test]
 fn serve_rejects_zero_workers_from_environment() {
     let missing = data_dir("environment-zero-workers");
-    fs::remove_dir(&missing).expect("test data directory should be removed");
+    fs::remove_dir_all(&missing).expect("test data directory should be removed");
     let output = run_with_env(
         &[
             "serve",
@@ -118,7 +118,7 @@ fn serve_rejects_zero_workers_from_environment() {
 #[test]
 fn serve_flag_overrides_environment() {
     let missing = data_dir("flag-precedence");
-    fs::remove_dir(&missing).expect("test data directory should be removed");
+    fs::remove_dir_all(&missing).expect("test data directory should be removed");
     let output = run_with_env(
         &[
             "serve",
@@ -143,7 +143,7 @@ fn serve_flag_overrides_environment() {
 #[test]
 fn serve_rejects_duplicate_options() {
     let missing = data_dir("duplicate-workers");
-    fs::remove_dir(&missing).expect("test data directory should be removed");
+    fs::remove_dir_all(&missing).expect("test data directory should be removed");
     let output = run(&[
         "serve",
         "--data-dir",
@@ -164,7 +164,7 @@ fn serve_rejects_duplicate_options() {
 #[test]
 fn serve_rejects_zero_request_limit() {
     let missing = data_dir("zero-request-limit");
-    fs::remove_dir(&missing).expect("test data directory should be removed");
+    fs::remove_dir_all(&missing).expect("test data directory should be removed");
     let output = run(&[
         "serve",
         "--data-dir",
@@ -183,7 +183,7 @@ fn serve_rejects_zero_request_limit() {
 #[test]
 fn serve_rejects_zero_nar_limit() {
     let missing = data_dir("zero-nar-limit");
-    fs::remove_dir(&missing).expect("test data directory should be removed");
+    fs::remove_dir_all(&missing).expect("test data directory should be removed");
     let output = run(&[
         "serve",
         "--data-dir",
@@ -240,7 +240,13 @@ fn serve_reports_listener_and_stops_on_sigterm() {
         child.kill().expect("hung child should be killed");
         let _ = child.wait();
     }
-    fs::remove_dir(data_dir).expect("test data directory should be removed");
+    for directory in ["nar", ".tmp", "realisations"] {
+        assert!(
+            data_dir.join(directory).is_dir(),
+            "daemon did not initialize {directory}"
+        );
+    }
+    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
 
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(

@@ -1,8 +1,6 @@
 mod config;
 mod error;
 mod server;
-#[cfg(test)]
-mod storage;
 
 use std::{env, process::ExitCode};
 
