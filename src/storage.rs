@@ -87,6 +87,27 @@ impl Layout {
     }
 }
 
+enum PublishTarget<'a> {
+    Nar(&'a NarObjectId),
+    NarInfo(&'a StoreHash),
+}
+
+impl PublishTarget<'_> {
+    fn destination(&self, layout: &Layout) -> PathBuf {
+        match self {
+            Self::Nar(id) => layout.nar_path(id),
+            Self::NarInfo(store) => layout.narinfo_path(store),
+        }
+    }
+
+    fn temp_prefix(&self) -> &'static str {
+        match self {
+            Self::Nar(_) => "nar",
+            Self::NarInfo(_) => "narinfo",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublishBoundary {
     BeforeTempCreate,
@@ -159,7 +180,7 @@ impl Storage {
         id: &NarObjectId,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish("nar", self.layout.nar_path(id), source)
+        self.publish(PublishTarget::Nar(id), source)
     }
 
     #[cfg(test)]
@@ -169,7 +190,7 @@ impl Storage {
         source: impl Read,
         fault: PublishBoundary,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish_with("nar", self.layout.nar_path(id), source, |boundary| {
+        self.publish_with(PublishTarget::Nar(id), source, |boundary| {
             injected_fault(boundary, fault)
         })
     }
@@ -181,7 +202,7 @@ impl Storage {
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
         self.ensure_nar(nar)?;
-        self.publish("narinfo", self.layout.narinfo_path(store), source)
+        self.publish(PublishTarget::NarInfo(store), source)
     }
 
     #[cfg(test)]
@@ -193,12 +214,9 @@ impl Storage {
         fault: PublishBoundary,
     ) -> Result<PublishOutcome, StorageError> {
         self.ensure_nar(nar)?;
-        self.publish_with(
-            "narinfo",
-            self.layout.narinfo_path(store),
-            source,
-            |boundary| injected_fault(boundary, fault),
-        )
+        self.publish_with(PublishTarget::NarInfo(store), source, |boundary| {
+            injected_fault(boundary, fault)
+        })
     }
 
     fn ensure_nar(&self, nar: &NarObjectId) -> Result<(), StorageError> {
@@ -250,22 +268,21 @@ impl Storage {
 
     fn publish(
         &self,
-        prefix: &str,
-        destination: PathBuf,
+        target: PublishTarget<'_>,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish_with(prefix, destination, source, |_| Ok(()))
+        self.publish_with(target, source, |_| Ok(()))
     }
 
     fn publish_with(
         &self,
-        prefix: &str,
-        destination: PathBuf,
+        target: PublishTarget<'_>,
         mut source: impl Read,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
+        let destination = target.destination(&self.layout);
         checkpoint(PublishBoundary::BeforeTempCreate)?;
-        let (temp_path, mut temp) = self.create_temp(prefix)?;
+        let (temp_path, mut temp) = self.create_temp(&target)?;
         let result = (|| {
             checkpoint(PublishBoundary::AfterTempCreate)?;
             io::copy(&mut source, &mut temp)?;
@@ -318,7 +335,8 @@ impl Storage {
         }
     }
 
-    fn create_temp(&self, prefix: &str) -> Result<(PathBuf, File), StorageError> {
+    fn create_temp(&self, target: &PublishTarget<'_>) -> Result<(PathBuf, File), StorageError> {
+        let prefix = target.temp_prefix();
         for _ in 0..TEMP_ATTEMPTS {
             let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let path = self
