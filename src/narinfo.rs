@@ -177,13 +177,16 @@ impl ParsedNarInfo {
             return Err(NarInfoError);
         }
 
-        for optional in ["Deriver", "CA"] {
-            if fields
-                .get(optional)
-                .is_some_and(|value| value.is_empty() || !value.is_ascii())
-            {
-                return Err(NarInfoError);
-            }
+        if fields.get("Deriver").is_some_and(|deriver| {
+            *deriver != "unknown-deriver" && parse_store_basename(deriver).is_err()
+        }) {
+            return Err(NarInfoError);
+        }
+        if fields
+            .get("CA")
+            .is_some_and(|value| value.is_empty() || !value.is_ascii())
+        {
+            return Err(NarInfoError);
         }
 
         let references = parse_references(required("References")?)?;
