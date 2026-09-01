@@ -21,19 +21,21 @@ Nix, direnv, and nix-direnv.
 
 ## Supported outputs
 
-| System | Development | Native package | Static package | Runtime checks |
-| --- | --- | --- | --- | --- |
-| `aarch64-darwin` | yes | yes | no | no |
-| `x86_64-linux` | yes | yes | `x86_64-unknown-linux-musl` | yes |
+| System | Development | Native package | Static package | OCI archive | NixOS module checks |
+| --- | --- | --- | --- | --- | --- |
+| `aarch64-darwin` | yes | yes | no | no | no |
+| `x86_64-linux` | yes | yes | `x86_64-unknown-linux-musl` | yes | yes |
 
 Unsupported `x86_64-darwin` and `aarch64-linux` systems intentionally expose
-no outputs. A Darwin cross-build is build evidence only; Linux runtime and
-ELF checks run on native Linux CI.
+no outputs. A Darwin cross-build is build evidence only; Linux ELF, OCI, and
+NixOS VM checks run on native Linux CI.
 
 Useful commands are `nix build .#narjar`, `nix build
-.#packages.x86_64-linux.narjar-static`, `nix run`, and `nix run
-.#provenance`. Provenance reports the lock identity, Nix and Rust versions,
-host/target triples, package path, and closure metadata.
+.#packages.x86_64-linux.narjar-static`, `nix build
+.#packages.x86_64-linux.narjar-oci`, `nix run`, and `nix run
+.#provenance`. The flake also exports `nixosModules.default`. Provenance
+reports the lock identity, Nix and Rust versions, host/target triples, package
+path, and closure metadata.
 
 ## Checks
 

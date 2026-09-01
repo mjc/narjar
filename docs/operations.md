@@ -314,45 +314,114 @@ There is no control socket.
 
 ## Deployment
 
-systemd service properties:
+The flake exports one implementation in three deployment forms:
 
-~~~ini
-User=narjar
-Group=narjar
-StateDirectory=narjar
-ExecStart=/nix/store/.../bin/narjar serve --data-dir /var/lib/narjar
-Restart=on-failure
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/narjar
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-LockPersonality=true
-MemoryDenyWriteExecute=true
-CapabilityBoundingSet=
-SystemCallArchitectures=native
-TimeoutStopSec=30
+- `packages.x86_64-linux.narjar-static` is the musl binary. The
+  `static-elf` check rejects an ELF interpreter or dynamic `NEEDED` entry.
+- `nixosModules.default` runs the normal package as a hardened systemd
+  service.
+- `packages.x86_64-linux.narjar-oci` is an OCI archive containing that same
+  static binary, an unprivileged numeric user, and the `/var/lib/narjar`
+  layout.
+
+A minimal NixOS configuration is:
+
+~~~nix
+{
+  imports = [ inputs.narjar.nixosModules.default ];
+
+  services.narjar = {
+    enable = true;
+    listen = "127.0.0.1:5000";
+    workers = 8;
+    maxInFlight = 64;
+    maxNarBytes = 16 * 1024 * 1024 * 1024;
+    minFreeBytes = 1024 * 1024 * 1024;
+
+    auth.trustedPublicKeys = "/run/keys/narjar-trusted-public-keys";
+    auth.readTokens = "/run/keys/narjar-read-tokens";
+    auth.writeTokens = "/run/keys/narjar-write-tokens";
+  };
+}
 ~~~
 
-Socket activation is an explicit v0.1 non-goal; tiny_http owns the listener.
-The NixOS module configures the service, state directory, firewall opt-in,
-reverse-proxy example, and secret/public-key credential file paths. It never
-places tokens in the Nix store.
+The auth values are host paths consumed by systemd `LoadCredential`, not
+credential contents. Do not use `builtins.readFile` or Nix string literals for
+secrets. systemd supplies a dynamic unprivileged user, a mode-0700
+`StateDirectory`, and the only writable path. The unit drops capabilities and
+enables `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, kernel and
+namespace protections, and an AF_INET/AF_INET6-only address-family allowlist.
+The NixOS VM check performs state initialization and HTTP requests under those
+restrictions, and verifies the credential and state modes.
 
-The OCI image contains the static binary and an unprivileged numeric user only.
-DATA is a volume. TLS and configuration injection remain orchestrator concerns;
-the image makes no Docker-specific runtime assumption.
+`GET /healthz` is the liveness endpoint. `GET /readyz` is the readiness
+endpoint and requires a read token when private-read mode is enabled. Socket
+activation is an explicit v0.1 non-goal because tiny_http owns the listener.
+
+For public service, terminate TLS and enforce stream timeouts at a reverse
+proxy. This nginx location is also exercised by the NixOS VM check:
+
+~~~nix
+services.nginx = {
+  enable = true;
+  virtualHosts."cache.example.org".locations."/" = {
+    proxyPass = "http://127.0.0.1:5000";
+    extraConfig = ''
+      proxy_request_buffering off;
+      proxy_buffering off;
+      client_max_body_size 16g;
+      client_header_timeout 10s;
+      client_body_timeout 300s;
+      proxy_read_timeout 300s;
+      proxy_send_timeout 300s;
+    '';
+  };
+};
+~~~
+
+Build and load the OCI archive with any OCI-capable runtime:
+
+~~~sh
+image="$(nix build --print-out-paths .#narjar-oci)"
+podman load --input "$image"
+install -d -m 0700 -o 65532 -g 65532 /var/lib/narjar-container
+podman run --rm --read-only \
+  --user 65532:65532 \
+  --publish 127.0.0.1:5000:5000 \
+  --volume /var/lib/narjar-container:/var/lib/narjar \
+  narjar:latest
+~~~
+
+The archive sets only the standard image entrypoint, command, user, port,
+working directory, and volume metadata. TLS, credentials, and bind mounts remain
+orchestrator concerns; Narjar does not inspect a Docker-specific environment.
 
 ## Backup and restore
 
-Because files are immutable, a live backup copies DATA excluding .tmp, then
-runs verify against the snapshot. For a strictly point-in-time coherent backup,
-stop serve or snapshot the filesystem after flushing.
+Because published files are immutable, a live backup can exclude `.tmp` and
+then verify the copy. Stop the service or snapshot the filesystem after
+flushing when a strict point-in-time boundary is required:
 
-Restore into an empty mode-0700 DATA directory, restore token hashes and trusted
-public keys through the secret manager, run verify, then start serve. Missing
-NAR findings require reupload or narinfo quarantine before readiness.
+~~~sh
+backup="/srv/backup/narjar-$(date +%F)"
+install -d -m 0700 "$backup"
+rsync -a --exclude='/.tmp/' /var/lib/narjar/ "$backup/"
+nix run . -- verify --data-dir "$backup"
+~~~
 
-A backup containing signing public keys and token hashes is security-sensitive
-but contains no producer private key or plaintext token.
+Restore into a new mode-0700 directory, restore token hashes and trusted public
+keys through the secret manager, verify, and only then point the service at the
+restored directory:
+
+~~~sh
+restore=/var/lib/narjar-restore
+install -d -m 0700 "$restore"
+rsync -a --exclude='/.tmp/' "$backup/" "$restore/"
+nix run . -- verify --data-dir "$restore"
+~~~
+
+The `restored_cache_verifies_before_serving` integration test exercises this
+copy, verification, and serving sequence. Missing-NAR findings require reupload
+or narinfo quarantine before readiness. A backup contains no producer private
+key or plaintext token, but token hashes and trust policy remain
+security-sensitive.
