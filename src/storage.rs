@@ -298,13 +298,15 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 mod tests {
     use std::{
         env, fs,
-        io::{Cursor, Read},
+        io::{self, Cursor, Read},
         path::{Path, PathBuf},
         process,
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{Layout, NarObjectId, PublishOutcome, Storage, StorageError, StoreHash};
+    use super::{
+        Layout, NarObjectId, PublishBoundary, PublishOutcome, Storage, StorageError, StoreHash,
+    };
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
     const STORE_HASH: &str = "00000000000000000000000000000000";
@@ -434,6 +436,121 @@ mod tests {
                 .is_none(),
             "completed attempts must not leave temporary files"
         );
+    }
+
+    #[test]
+    fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
+        for boundary in [
+            PublishBoundary::BeforeTempCreate,
+            PublishBoundary::AfterTempCreate,
+            PublishBoundary::AfterStream,
+            PublishBoundary::AfterTempSync,
+            PublishBoundary::BeforeFinalLink,
+            PublishBoundary::BeforeParentSync,
+        ] {
+            let directory = TestDir::new();
+            let storage = Storage::initialize(directory.path()).expect("initialize storage");
+            let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+
+            assert!(
+                storage
+                    .publish_nar_fault(&nar, Cursor::new(b"nar bytes"), boundary)
+                    .is_err(),
+                "{boundary:?} unexpectedly succeeded"
+            );
+            assert!(
+                !storage.layout().nar_path(&nar).exists(),
+                "{boundary:?} left a final NAR"
+            );
+            assert!(
+                fs::read_dir(storage.layout().temp_dir())
+                    .expect("read temp directory")
+                    .next()
+                    .is_none(),
+                "{boundary:?} left a temporary file"
+            );
+        }
+    }
+
+    #[test]
+    fn response_loss_after_parent_sync_is_visible_and_idempotent() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+        let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
+
+        assert!(
+            storage
+                .publish_nar_fault(
+                    &nar,
+                    Cursor::new(b"nar bytes"),
+                    PublishBoundary::AfterParentSync,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .publish_nar(&nar, Cursor::new(b"nar bytes"))
+                .expect("retry durable NAR"),
+            PublishOutcome::Identical
+        );
+
+        assert!(
+            storage
+                .publish_narinfo_fault(
+                    &store,
+                    &nar,
+                    Cursor::new(b"narinfo bytes"),
+                    PublishBoundary::AfterParentSync,
+                )
+                .is_err()
+        );
+        assert!(
+            storage
+                .open_pair(&store, &nar)
+                .expect("open durable pair")
+                .is_some(),
+            "a parent-synced pair must remain visible after response loss"
+        );
+        assert_eq!(
+            storage
+                .publish_narinfo(&store, &nar, Cursor::new(b"narinfo bytes"))
+                .expect("retry durable narinfo"),
+            PublishOutcome::Identical
+        );
+    }
+
+    #[test]
+    fn stream_io_failure_leaves_no_final_or_temp() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+
+        assert!(storage.publish_nar(&nar, BrokenReader::default()).is_err());
+        assert!(!storage.layout().nar_path(&nar).exists());
+        assert!(
+            fs::read_dir(storage.layout().temp_dir())
+                .expect("read temp directory")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[derive(Default)]
+    struct BrokenReader {
+        returned_prefix: bool,
+    }
+
+    impl Read for BrokenReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.returned_prefix {
+                return Err(io::Error::other("injected stream failure"));
+            }
+
+            self.returned_prefix = true;
+            buffer[..3].copy_from_slice(b"nar");
+            Ok(3)
+        }
     }
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
