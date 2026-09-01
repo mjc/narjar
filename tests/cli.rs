@@ -241,14 +241,23 @@ impl RunningServer {
     }
 
     fn start_with_args(test: &str, extra_args: &[&str]) -> Self {
-        Self::start_with_auth(test, extra_args, None)
+        Self::start_with_auth(test, extra_args, None, None)
     }
 
     fn start_with_read_tokens(test: &str, read_tokens: &str) -> Self {
-        Self::start_with_auth(test, &[], Some(read_tokens))
+        Self::start_with_auth(test, &[], Some(read_tokens), None)
     }
 
-    fn start_with_auth(test: &str, extra_args: &[&str], read_tokens: Option<&str>) -> Self {
+    fn start_with_trusted_keys(test: &str, trusted_keys: &str) -> Self {
+        Self::start_with_auth(test, &[], None, Some(trusted_keys))
+    }
+
+    fn start_with_auth(
+        test: &str,
+        extra_args: &[&str],
+        read_tokens: Option<&str>,
+        trusted_keys: Option<&str>,
+    ) -> Self {
         let data_dir = data_dir(test);
         let auth_dir = data_dir.join("auth");
         fs::create_dir(&auth_dir).expect("test auth directory should be created");
@@ -268,31 +277,21 @@ impl RunningServer {
             )
             .expect("test read tokens should be private");
         }
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let trusted_key = format!(
-            "narjar-test:{}\n",
-            BASE64.encode(signing_key.verifying_key().as_bytes())
-        );
+        let trusted_key = trusted_keys.map(str::to_owned).unwrap_or_else(|| {
+            let signing_key = SigningKey::from_bytes(&[7; 32]);
+            format!(
+                "narjar-test:{}\n",
+                BASE64.encode(signing_key.verifying_key().as_bytes())
+            )
+        });
         fs::write(data_dir.join("trusted-public-keys"), trusted_key)
             .expect("test trusted key should be written");
-        let mut process = command();
-        process
-            .args([
-                "serve",
-                "--data-dir",
-                data_dir.to_str().expect("temporary path should be UTF-8"),
-                "--listen",
-                "127.0.0.1:0",
-                "--workers",
-                "1",
-            ])
-            .args(extra_args);
-        let mut child = process
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("narjar should start");
 
+        Self::start_in(data_dir, extra_args)
+    }
+
+    fn start_in(data_dir: PathBuf, extra_args: &[&str]) -> Self {
+        let mut child = Self::spawn(&data_dir, extra_args);
         let mut startup_line = String::new();
         BufReader::new(child.stdout.take().expect("stdout should be piped"))
             .read_line(&mut startup_line)
@@ -310,6 +309,24 @@ impl RunningServer {
             startup_line,
             address,
         }
+    }
+
+    fn spawn(data_dir: &PathBuf, extra_args: &[&str]) -> Child {
+        let mut process = command();
+        process
+            .args([
+                "serve",
+                "--data-dir",
+                data_dir.to_str().expect("temporary path should be UTF-8"),
+                "--listen",
+                "127.0.0.1:0",
+                "--workers",
+                "1",
+            ])
+            .args(extra_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        process.spawn().expect("narjar should start")
     }
 
     fn request(&self, method: &str, path: &str) -> Vec<u8> {
@@ -378,7 +395,15 @@ impl RunningServer {
         stream
     }
 
-    fn stop(mut self) -> (ExitStatus, ExitStatus) {
+    fn stop(self) -> (ExitStatus, ExitStatus) {
+        self.stop_with_cleanup(true)
+    }
+
+    fn stop_preserving(self) -> (ExitStatus, ExitStatus) {
+        self.stop_with_cleanup(false)
+    }
+
+    fn stop_with_cleanup(mut self, cleanup: bool) -> (ExitStatus, ExitStatus) {
         let signal = Command::new("kill")
             .args(["-TERM", &self.child.id().to_string()])
             .status()
@@ -400,7 +425,9 @@ impl RunningServer {
             self.child.kill().expect("hung child should be killed");
             let _ = self.child.wait();
         }
-        fs::remove_dir_all(&self.data_dir).expect("test data directory should be removed");
+        if cleanup {
+            fs::remove_dir_all(&self.data_dir).expect("test data directory should be removed");
+        }
 
         (signal, status.expect("narjar should stop after SIGTERM"))
     }
@@ -1035,6 +1062,82 @@ fn narinfo_put_rejects_a_signed_malformed_content_address() {
     );
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
+}
+#[test]
+fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
+    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    let old = SigningKey::from_bytes(&[7; 32]);
+    let new = SigningKey::from_bytes(&[8; 32]);
+    let overlap = format!(
+        "narjar-test:{}\nnarjar-next:{}\n",
+        BASE64.encode(old.verifying_key().as_bytes()),
+        BASE64.encode(new.verifying_key().as_bytes())
+    );
+    let server = RunningServer::start_with_trusted_keys("trusted-key-rotation", &overlap);
+    let path = format!("/{STORE_HASH}.narinfo");
+    let nar_created =
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], b"narjar");
+    let narinfo = signed_narinfo(NARJAR_HASH, 6);
+    let metadata_created = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
+    let data_dir = server.data_dir.clone();
+    let (signal, status) = server.stop_preserving();
+
+    assert!(
+        response_parts(&nar_created)
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n")
+    );
+    assert!(
+        response_parts(&metadata_created)
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n")
+    );
+    assert!(signal.success());
+    assert!(status.success());
+
+    let restarted = RunningServer::start_in(data_dir.clone(), &[]);
+    assert!(
+        response_parts(&restarted.request("GET", &path))
+            .0
+            .starts_with("HTTP/1.1 200 OK\r\n")
+    );
+    let (signal, status) = restarted.stop_preserving();
+    assert!(signal.success());
+    assert!(status.success());
+
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-next:{}\n",
+            BASE64.encode(new.verifying_key().as_bytes())
+        ),
+    )
+    .expect("new-only trust file should be written");
+    let mut child = RunningServer::spawn(&data_dir, &[]);
+    let mut startup_line = String::new();
+    BufReader::new(child.stdout.take().expect("stdout should be piped"))
+        .read_line(&mut startup_line)
+        .expect("startup result should be readable");
+    if !startup_line.is_empty() {
+        child.kill().expect("unexpected server should be stopped");
+    }
+    let status = child.wait().expect("startup status should be readable");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr should be piped")
+        .read_to_string(&mut stderr)
+        .expect("startup error should be readable");
+
+    fs::remove_dir_all(&data_dir).expect("rotation test data should be removed");
+
+    assert!(startup_line.is_empty(), "{startup_line:?}");
+    assert!(!status.success());
+    assert!(
+        stderr.contains("published narinfo is not trusted"),
+        "{stderr:?}"
+    );
 }
 
 #[test]
