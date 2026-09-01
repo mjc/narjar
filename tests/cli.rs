@@ -874,6 +874,47 @@ fn nar_put_streams_hash_checks_and_retries_immutably() {
 }
 
 #[test]
+fn narinfo_put_rejects_unsigned_metadata_without_publication() {
+    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    let server = RunningServer::start("narinfo-put-unsigned");
+    let nar_path = format!("/nar/{NARJAR_HASH}.nar");
+    let nar_created = server.request_with_body("PUT", &nar_path, &[], b"narjar");
+    let narinfo = format!(
+        "StorePath: /nix/store/{STORE_HASH}-narjar\n\
+         URL: nar/{NARJAR_HASH}.nar\n\
+         Compression: none\n\
+         FileHash: sha256:{NARJAR_HASH}\n\
+         FileSize: 6\n\
+         NarHash: sha256:{NARJAR_HASH}\n\
+         NarSize: 6\n\
+         References: \n"
+    );
+    let rejected = server.request_with_body(
+        "PUT",
+        &format!("/{STORE_HASH}.narinfo"),
+        &[],
+        narinfo.as_bytes(),
+    );
+    let published = server.data_dir.join(format!("{STORE_HASH}.narinfo"));
+    let (signal, status) = server.stop();
+
+    assert!(
+        response_parts(&nar_created)
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n")
+    );
+    let (headers, body) = response_parts(&rejected);
+    assert!(
+        headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{headers:?}"
+    );
+    assert!(body.is_empty());
+    assert!(!published.exists());
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
 fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
     const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     let path = format!("/nar/{NARJAR_HASH}.nar");
