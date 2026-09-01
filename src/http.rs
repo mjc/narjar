@@ -260,35 +260,72 @@ fn has_header(request: &tiny_http::Request, name: &'static str) -> bool {
         .any(|header| header.field.equiv(name))
 }
 
-fn respond_cache_info_put(mut request: tiny_http::Request, storage: &Storage) {
-    if has_header(&request, "Transfer-Encoding") {
-        let _ = request.respond(Response::empty(StatusCode(400)));
-        return;
-    }
-    if has_header(&request, "Content-Encoding") {
-        let _ = request.respond(Response::empty(StatusCode(415)));
-        return;
-    }
-    let Some(length) = request.body_length() else {
-        let _ = request.respond(Response::empty(StatusCode(411)));
-        return;
-    };
-    if length != NIX_CACHE_INFO.len() {
-        let _ = request.respond(Response::empty(StatusCode(409)));
-        return;
+struct UploadRequest {
+    request: tiny_http::Request,
+    length: usize,
+}
+
+impl UploadRequest {
+    fn accept(request: tiny_http::Request) -> Option<Self> {
+        let length = if has_header(&request, "Transfer-Encoding") {
+            Err(400)
+        } else if has_header(&request, "Content-Encoding") {
+            Err(415)
+        } else {
+            request.body_length().ok_or(411)
+        };
+        match length {
+            Ok(length) => Some(Self { request, length }),
+            Err(status) => {
+                let _ = request.respond(Response::empty(StatusCode(status)));
+                None
+            }
+        }
     }
 
-    let mut bytes = Vec::with_capacity(length);
-    let read = request
-        .as_reader()
-        .take(length as u64 + 1)
-        .read_to_end(&mut bytes);
-    if read.is_err() || bytes.len() != length {
-        let _ = request.respond(Response::empty(StatusCode(422)));
+    const fn length(&self) -> usize {
+        self.length
+    }
+
+    fn reader(&mut self) -> &mut dyn Read {
+        self.request.as_reader()
+    }
+
+    fn read_body(&mut self, max_bytes: usize) -> Result<Vec<u8>, u16> {
+        if self.length > max_bytes {
+            return Err(413);
+        }
+        let length = self.length;
+        let mut bytes = Vec::with_capacity(length);
+        let read = self
+            .reader()
+            .take(length as u64 + 1)
+            .read_to_end(&mut bytes);
+        if read.is_err() || bytes.len() != length {
+            return Err(422);
+        }
+        Ok(bytes)
+    }
+
+    fn respond(self, status: u16) {
+        let _ = self.request.respond(Response::empty(StatusCode(status)));
+    }
+}
+
+fn respond_cache_info_put(request: tiny_http::Request, storage: &Storage) {
+    let Some(mut upload) = UploadRequest::accept(request) else {
+        return;
+    };
+    if upload.length() != NIX_CACHE_INFO.len() {
+        upload.respond(409);
         return;
     }
+    let bytes = match upload.read_body(NIX_CACHE_INFO.len()) {
+        Ok(bytes) => bytes,
+        Err(status) => return upload.respond(status),
+    };
     if bytes != NIX_CACHE_INFO {
-        let _ = request.respond(Response::empty(StatusCode(409)));
+        upload.respond(409);
         return;
     }
 
@@ -299,29 +336,20 @@ fn respond_cache_info_put(mut request: tiny_http::Request, storage: &Storage) {
         Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
         Err(_) => 500,
     };
-    let _ = request.respond(Response::empty(StatusCode(status)));
+    upload.respond(status);
 }
 
 fn respond_nar_put(
-    mut request: tiny_http::Request,
+    request: tiny_http::Request,
     storage: &Storage,
     id: &NarObjectId,
     policy: NarUploadPolicy,
 ) {
-    if has_header(&request, "Transfer-Encoding") {
-        let _ = request.respond(Response::empty(StatusCode(400)));
-        return;
-    }
-    if has_header(&request, "Content-Encoding") {
-        let _ = request.respond(Response::empty(StatusCode(415)));
-        return;
-    }
-
-    let Some(length) = request.body_length() else {
-        let _ = request.respond(Response::empty(StatusCode(411)));
+    let Some(mut upload) = UploadRequest::accept(request) else {
         return;
     };
-    let status = match storage.publish_nar(id, request.as_reader(), length as u64, policy) {
+    let length = upload.length();
+    let status = match storage.publish_nar(id, upload.reader(), length as u64, policy) {
         Ok(PublishOutcome::Created) => 201,
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,
@@ -331,46 +359,26 @@ fn respond_nar_put(
         Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
         Err(_) => 500,
     };
-    let _ = request.respond(Response::empty(StatusCode(status)));
+    upload.respond(status);
 }
+
 fn respond_narinfo_put(
-    mut request: tiny_http::Request,
+    request: tiny_http::Request,
     storage: &Storage,
     store: &StoreHash,
     trusted: &TrustedPublicKeys,
 ) {
-    if has_header(&request, "Transfer-Encoding") {
-        let _ = request.respond(Response::empty(StatusCode(400)));
-        return;
-    }
-    if has_header(&request, "Content-Encoding") {
-        let _ = request.respond(Response::empty(StatusCode(415)));
-        return;
-    }
-
-    let Some(length) = request.body_length() else {
-        let _ = request.respond(Response::empty(StatusCode(411)));
+    let Some(mut upload) = UploadRequest::accept(request) else {
         return;
     };
-    if length > MAX_NARINFO_BYTES {
-        let _ = request.respond(Response::empty(StatusCode(413)));
-        return;
-    }
-
-    let mut bytes = Vec::with_capacity(length);
-    let read = request
-        .as_reader()
-        .take(length as u64 + 1)
-        .read_to_end(&mut bytes);
-    if read.is_err() || bytes.len() != length {
-        let _ = request.respond(Response::empty(StatusCode(422)));
-        return;
-    }
-
+    let bytes = match upload.read_body(MAX_NARINFO_BYTES) {
+        Ok(bytes) => bytes,
+        Err(status) => return upload.respond(status),
+    };
     let validated = match trusted.validate(store, bytes) {
         Ok(validated) => validated,
         Err(_) => {
-            let _ = request.respond(Response::empty(StatusCode(422)));
+            upload.respond(422);
             return;
         }
     };
@@ -382,7 +390,7 @@ fn respond_narinfo_put(
         Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
         Err(_) => 500,
     };
-    let _ = request.respond(Response::empty(StatusCode(status)));
+    upload.respond(status);
 }
 
 fn unauthorized(request: tiny_http::Request) {
