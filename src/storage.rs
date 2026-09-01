@@ -478,13 +478,17 @@ mod tests {
         num::NonZeroUsize,
         path::{Path, PathBuf},
         process,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
         time::{Duration, SystemTime},
     };
 
     use super::{
-        Layout, NarObjectId, PublishBoundary, PublishOutcome, ReconcileClass, Storage,
-        StorageError, StoreHash,
+        Layout, NarObjectId, PublishBoundary, PublishOutcome, PublishTarget, ReconcileClass,
+        Storage, StorageError, StoreHash,
     };
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -615,6 +619,64 @@ mod tests {
                 .is_none(),
             "completed attempts must not leave temporary files"
         );
+    }
+
+    #[test]
+    fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
+        let directory = TestDir::new();
+        let storage = Arc::new(Storage::initialize(directory.path()).expect("initialize storage"));
+        let (linked_tx, linked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let winner = {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || {
+                let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+                storage.publish_with(
+                    PublishTarget::Nar(&nar),
+                    Cursor::new(b"nar bytes"),
+                    |boundary| {
+                        if boundary == PublishBoundary::BeforeParentSync {
+                            linked_tx.send(()).expect("signal linked destination");
+                            release_rx.recv().expect("release failing publisher");
+                            return Err(io::Error::other("injected parent sync failure").into());
+                        }
+                        Ok(())
+                    },
+                )
+            })
+        };
+
+        linked_rx.recv().expect("wait for linked destination");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let contender = {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || {
+                let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+                started_tx.send(()).expect("signal contender start");
+                let outcome = storage.publish_nar(&nar, Cursor::new(b"nar bytes"));
+                outcome_tx.send(outcome).expect("send contender outcome");
+            })
+        };
+
+        started_rx.recv().expect("wait for contender");
+        let early_outcome = outcome_rx.recv_timeout(Duration::from_millis(500)).ok();
+        release_tx.send(()).expect("release failing publisher");
+
+        assert!(winner.join().expect("join failing publisher").is_err());
+        let outcome = match early_outcome {
+            Some(outcome) => outcome,
+            None => outcome_rx.recv().expect("wait for contender outcome"),
+        };
+        contender.join().expect("join contender");
+        assert_eq!(
+            outcome.expect("concurrent identical publication"),
+            PublishOutcome::Created
+        );
+
+        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+        assert!(storage.layout().nar_path(&nar).exists());
     }
 
     #[test]
