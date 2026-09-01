@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::TcpStream,
+    net::{Shutdown, TcpStream},
     os::unix::fs::symlink,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Output, Stdio},
@@ -213,8 +213,13 @@ struct RunningServer {
 
 impl RunningServer {
     fn start(test: &str) -> Self {
+        Self::start_with_args(test, &[])
+    }
+
+    fn start_with_args(test: &str, extra_args: &[&str]) -> Self {
         let data_dir = data_dir(test);
-        let mut child = command()
+        let mut process = command();
+        process
             .args([
                 "serve",
                 "--data-dir",
@@ -224,6 +229,8 @@ impl RunningServer {
                 "--workers",
                 "1",
             ])
+            .args(extra_args);
+        let mut child = process
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -813,4 +820,57 @@ fn nar_put_streams_hash_checks_and_retries_immutably() {
     assert!(!mismatched_path.exists());
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
+    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    let path = format!("/nar/{NARJAR_HASH}.nar");
+
+    let server = RunningServer::start("nar-put-invalid");
+    let encoded =
+        server.request_with_body("PUT", &path, &[("Content-Encoding", "gzip")], b"narjar");
+    let compressed = server.request_with_body("PUT", &format!("{path}.xz"), &[], b"narjar");
+
+    let mut truncated_stream = server.open_request("PUT", &path, &[("Content-Length", "7")]);
+    truncated_stream
+        .write_all(b"narjar")
+        .expect("write truncated request body");
+    truncated_stream
+        .shutdown(Shutdown::Write)
+        .expect("finish truncated request");
+    let mut truncated = Vec::new();
+    truncated_stream
+        .read_to_end(&mut truncated)
+        .expect("read truncated response");
+
+    let final_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
+    let temp_is_empty = fs::read_dir(server.data_dir.join(".tmp"))
+        .expect("read temp directory")
+        .next()
+        .is_none();
+    let (signal, status) = server.stop();
+
+    let limited = RunningServer::start_with_args("nar-put-oversized", &["--max-nar-bytes", "5"]);
+    let oversized = limited.request_with_body("PUT", &path, &[], b"narjar");
+    let oversized_path = limited.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
+    let (limited_signal, limited_status) = limited.stop();
+
+    for (response, expected_status) in [
+        (&encoded, "HTTP/1.1 415 Unsupported Media Type\r\n"),
+        (&compressed, "HTTP/1.1 415 Unsupported Media Type\r\n"),
+        (&truncated, "HTTP/1.1 422 Unprocessable Entity\r\n"),
+        (&oversized, "HTTP/1.1 413 Payload Too Large\r\n"),
+    ] {
+        let (headers, body) = response_parts(response);
+        assert!(headers.starts_with(expected_status), "{headers:?}");
+        assert!(body.is_empty());
+    }
+    assert!(!final_path.exists());
+    assert!(temp_is_empty);
+    assert!(!oversized_path.exists());
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+    assert!(limited_signal.success(), "SIGTERM should be sent");
+    assert!(limited_status.success(), "narjar should shut down cleanly");
 }
