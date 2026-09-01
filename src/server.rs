@@ -13,11 +13,32 @@ use signal_hook::{
     consts::{SIGINT, SIGTERM},
     flag,
 };
-use tiny_http::{Response, Server, StatusCode};
+use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use narjar::storage::Storage;
 
 use crate::{config::ServeConfig, error::Error};
+const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
+
+fn respond(request: tiny_http::Request) {
+    let response = if matches!(request.method(), Method::Get | Method::Head)
+        && request.url() == "/nix-cache-info"
+    {
+        Response::from_data(NIX_CACHE_INFO)
+            .with_header(
+                Header::from_bytes("Content-Type", "text/x-nix-cache-info")
+                    .expect("static content type is valid"),
+            )
+            .with_header(
+                Header::from_bytes("Cache-Control", "public, max-age=3600")
+                    .expect("static cache policy is valid"),
+            )
+    } else {
+        Response::from_data(Vec::new()).with_status_code(StatusCode(404))
+    };
+
+    let _ = request.respond(response);
+}
 
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     if !fs::metadata(&config.data_dir)
@@ -65,7 +86,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             thread::spawn(move || {
                 while !stopping.load(Ordering::Acquire) {
                     if let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(50)) {
-                        let _ = request.respond(Response::empty(StatusCode(404)));
+                        respond(request);
                     }
                 }
             })
