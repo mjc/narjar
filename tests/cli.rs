@@ -4,12 +4,14 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{Shutdown, TcpStream},
+    ops::Deref,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     thread,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
+use tempfile::TempDir;
 
 const CONFIG_ENV: &[&str] = &[
     "NARJAR_DATA_DIR",
@@ -72,13 +74,47 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
         .expect("narjar should run")
 }
 
-fn data_dir(test: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("clock should be after the Unix epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("narjar-{test}-{}-{nonce}", std::process::id()));
-    fs::create_dir(&path).expect("test data directory should be created");
+struct TestDir(TempDir);
+
+impl TestDir {
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    fn close(self) -> std::io::Result<()> {
+        self.0.close()
+    }
+}
+
+impl AsRef<Path> for TestDir {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
+impl Deref for TestDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.path()
+    }
+}
+
+fn data_dir(test: &str) -> TestDir {
+    TestDir(
+        tempfile::Builder::new()
+            .prefix(&format!("narjar-{test}-"))
+            .tempdir()
+            .expect("test data directory should be created"),
+    )
+}
+
+fn missing_data_dir(test: &str) -> PathBuf {
+    let directory = data_dir(test);
+    let path = directory.path().to_owned();
+    directory
+        .close()
+        .expect("test data directory should be removed");
     path
 }
 
@@ -103,7 +139,6 @@ fn serve_accepts_data_dir_from_environment() {
             data_dir.to_str().expect("temporary path should be UTF-8"),
         )],
     );
-    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
 
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
@@ -122,7 +157,6 @@ fn serve_rejects_zero_workers() {
         "--workers",
         "0",
     ]);
-    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
 
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
@@ -133,8 +167,7 @@ fn serve_rejects_zero_workers() {
 
 #[test]
 fn serve_rejects_zero_workers_from_environment() {
-    let missing = data_dir("environment-zero-workers");
-    fs::remove_dir_all(&missing).expect("test data directory should be removed");
+    let missing = missing_data_dir("environment-zero-workers");
     let output = run_with_env(
         &[
             "serve",
@@ -153,8 +186,7 @@ fn serve_rejects_zero_workers_from_environment() {
 
 #[test]
 fn serve_flag_overrides_environment() {
-    let missing = data_dir("flag-precedence");
-    fs::remove_dir_all(&missing).expect("test data directory should be removed");
+    let missing = missing_data_dir("flag-precedence");
     let output = run_with_env(
         &[
             "serve",
@@ -178,8 +210,7 @@ fn serve_flag_overrides_environment() {
 
 #[test]
 fn serve_rejects_duplicate_options() {
-    let missing = data_dir("duplicate-workers");
-    fs::remove_dir_all(&missing).expect("test data directory should be removed");
+    let missing = missing_data_dir("duplicate-workers");
     let output = run(&[
         "serve",
         "--data-dir",
@@ -199,8 +230,7 @@ fn serve_rejects_duplicate_options() {
 
 #[test]
 fn serve_rejects_zero_request_limit() {
-    let missing = data_dir("zero-request-limit");
-    fs::remove_dir_all(&missing).expect("test data directory should be removed");
+    let missing = missing_data_dir("zero-request-limit");
     let output = run(&[
         "serve",
         "--data-dir",
@@ -218,8 +248,7 @@ fn serve_rejects_zero_request_limit() {
 
 #[test]
 fn serve_rejects_zero_nar_limit() {
-    let missing = data_dir("zero-nar-limit");
-    fs::remove_dir_all(&missing).expect("test data directory should be removed");
+    let missing = missing_data_dir("zero-nar-limit");
     let output = run(&[
         "serve",
         "--data-dir",
@@ -236,8 +265,9 @@ fn serve_rejects_zero_nar_limit() {
 }
 
 struct RunningServer {
-    child: Child,
+    child: Option<Child>,
     data_dir: PathBuf,
+    temp_dir: Option<TestDir>,
     startup_line: String,
     address: String,
 }
@@ -302,7 +332,7 @@ impl RunningServer {
         trusted_keys: Option<&str>,
     ) -> Self {
         let data_dir = data_dir(test);
-        let auth_dir = data_dir.join("auth");
+        let auth_dir = data_dir.path().join("auth");
         fs::create_dir(&auth_dir).expect("test auth directory should be created");
         let write_tokens = auth_dir.join("write.tokens");
         fs::write(&write_tokens, TEST_WRITE_TOKEN).expect("test write token should be written");
@@ -327,13 +357,14 @@ impl RunningServer {
                 BASE64.encode(signing_key.verifying_key().as_bytes())
             )
         });
-        fs::write(data_dir.join("trusted-public-keys"), trusted_key)
+        fs::write(data_dir.path().join("trusted-public-keys"), trusted_key)
             .expect("test trusted key should be written");
 
         Self::start_in(data_dir, extra_args)
     }
 
-    fn start_in(data_dir: PathBuf, extra_args: &[&str]) -> Self {
+    fn start_in(temp_dir: TestDir, extra_args: &[&str]) -> Self {
+        let data_dir = temp_dir.path().to_owned();
         let mut child = Self::spawn(&data_dir, extra_args);
         let mut startup_line = String::new();
         BufReader::new(child.stdout.take().expect("stdout should be piped"))
@@ -347,8 +378,9 @@ impl RunningServer {
             .to_owned();
 
         Self {
-            child,
+            child: Some(child),
             data_dir,
+            temp_dir: Some(temp_dir),
             startup_line,
             address,
         }
@@ -474,41 +506,57 @@ impl RunningServer {
         request
     }
 
-    fn stop(self) -> (ExitStatus, ExitStatus) {
-        self.stop_with_cleanup(true)
+    fn stop(mut self) -> (ExitStatus, ExitStatus) {
+        self.stop_process()
     }
 
-    fn stop_preserving(self) -> (ExitStatus, ExitStatus) {
-        self.stop_with_cleanup(false)
+    fn stop_preserving(mut self) -> (TestDir, ExitStatus, ExitStatus) {
+        let (signal, status) = self.stop_process();
+        let temp_dir = self
+            .temp_dir
+            .take()
+            .expect("running server should own its data directory");
+        (temp_dir, signal, status)
     }
 
-    fn stop_with_cleanup(mut self, cleanup: bool) -> (ExitStatus, ExitStatus) {
+    fn stop_process(&mut self) -> (ExitStatus, ExitStatus) {
+        let child = self
+            .child
+            .as_mut()
+            .expect("running server should own its child");
         let signal = Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
+            .args(["-TERM", &child.id().to_string()])
             .status()
             .expect("kill should run");
 
         let mut status = None;
         for _ in 0..100 {
-            status = self
-                .child
-                .try_wait()
-                .expect("child status should be readable");
+            status = child.try_wait().expect("child status should be readable");
             if status.is_some() {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
 
-        if status.is_none() {
-            self.child.kill().expect("hung child should be killed");
-            let _ = self.child.wait();
-        }
-        if cleanup {
-            fs::remove_dir_all(&self.data_dir).expect("test data directory should be removed");
-        }
+        let status = status.unwrap_or_else(|| {
+            child.kill().expect("hung child should be killed");
+            child.wait().expect("killed child should be reaped")
+        });
+        self.child.take();
 
-        (signal, status.expect("narjar should stop after SIGTERM"))
+        (signal, status)
+    }
+}
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -1205,8 +1253,7 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
         server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
     let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
     let metadata_created = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
-    let data_dir = server.data_dir.clone();
-    let (signal, status) = server.stop_preserving();
+    let (data_dir, signal, status) = server.stop_preserving();
 
     assert!(
         response_parts(&nar_created)
@@ -1221,13 +1268,13 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
     assert!(signal.success());
     assert!(status.success());
 
-    let restarted = RunningServer::start_in(data_dir.clone(), &[]);
+    let restarted = RunningServer::start_in(data_dir, &[]);
     assert!(
         response_parts(&restarted.request("GET", &path))
             .0
             .starts_with("HTTP/1.1 200 OK\r\n")
     );
-    let (signal, status) = restarted.stop_preserving();
+    let (data_dir, signal, status) = restarted.stop_preserving();
     assert!(signal.success());
     assert!(status.success());
 
@@ -1255,8 +1302,6 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
         .expect("stderr should be piped")
         .read_to_string(&mut stderr)
         .expect("startup error should be readable");
-
-    fs::remove_dir_all(&data_dir).expect("rotation test data should be removed");
 
     assert!(startup_line.is_empty(), "{startup_line:?}");
     assert!(!status.success());
@@ -1452,7 +1497,8 @@ fn configured_empty_read_token_set_stays_private() {
 #[test]
 fn token_create_and_revoke_rotate_hashed_write_credentials() {
     let data_dir = data_dir("token-lifecycle");
-    let root = data_dir.to_str().expect("temporary path should be UTF-8");
+    let root_path = data_dir.path().to_owned();
+    let root = root_path.to_str().expect("temporary path should be UTF-8");
     let old = run(&[
         "token",
         "create",
@@ -1516,7 +1562,7 @@ fn token_create_and_revoke_rotate_hashed_write_credentials() {
         )
     };
 
-    let server = RunningServer::start_in(data_dir.clone(), &[]);
+    let server = RunningServer::start_in(data_dir, &[]);
     for token in [&old_token, &new_token] {
         let response = reaches_router(&server, token);
         assert!(
@@ -1524,7 +1570,7 @@ fn token_create_and_revoke_rotate_hashed_write_credentials() {
             "{response:?}"
         );
     }
-    let (signal, status) = server.stop_preserving();
+    let (data_dir, signal, status) = server.stop_preserving();
     assert!(signal.success());
     assert!(status.success());
 
@@ -1614,7 +1660,7 @@ fn nix_2_31_5_trace_drives_redacted_socket_conformance() {
     assert!(status.success());
 }
 
-fn init_data_dir(test: &str) -> PathBuf {
+fn init_data_dir(test: &str) -> TestDir {
     let data_dir = data_dir(test);
     let output = run(&[
         "init",
@@ -1698,8 +1744,6 @@ fn init_and_key_generate_create_secure_operator_material() {
             & 0o777,
         0o600
     );
-
-    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
 }
 
 #[test]
@@ -1771,8 +1815,6 @@ fn reconcile_and_verify_classify_operator_findings() {
     assert_eq!(verify.status.code(), Some(1));
     let report = String::from_utf8(verify.stdout).expect("report should be UTF-8");
     assert!(report.contains("\"class\":\"hash_or_size_mismatch\""));
-
-    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
 }
 
 #[test]
@@ -1796,8 +1838,8 @@ fn delete_is_offline_and_leaves_shared_nar_objects() {
             .starts_with("HTTP/1.1 201")
     );
 
-    let data_dir = server.data_dir.clone();
-    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let data_path = server.data_dir.clone();
+    let path = data_path.to_str().expect("temporary path should be UTF-8");
     let locked = run(&[
         "delete",
         "--data-dir",
@@ -1809,7 +1851,7 @@ fn delete_is_offline_and_leaves_shared_nar_objects() {
     assert_eq!(locked.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&locked.stderr).contains("locked"));
 
-    let (signal, status) = server.stop_preserving();
+    let (data_dir, signal, status) = server.stop_preserving();
     assert!(signal.success());
     assert!(status.success());
     let deleted = run(&[
@@ -1825,10 +1867,18 @@ fn delete_is_offline_and_leaves_shared_nar_objects() {
         "delete failed: {}",
         String::from_utf8_lossy(&deleted.stderr)
     );
-    assert!(!data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
-    assert!(data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
-
-    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
+    assert!(
+        !data_dir
+            .path()
+            .join(format!("{STORE_HASH}.narinfo"))
+            .exists()
+    );
+    assert!(
+        data_dir
+            .path()
+            .join(format!("nar/{NARJAR_HASH}.nar"))
+            .exists()
+    );
 }
 
 #[test]
@@ -1961,7 +2011,4 @@ fn restored_cache_verifies_before_serving() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    fs::remove_dir_all(source).expect("source data directory should be removed");
-    fs::remove_dir_all(restored).expect("restored data directory should be removed");
 }
