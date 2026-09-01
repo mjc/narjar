@@ -38,13 +38,15 @@ host/target triples, package path, and closure metadata.
 ## Checks
 
 The format check runs rustfmt in check mode. The source-filter check proves
-Cargo files, Rust sources, tests, flake files, direnv configuration, and
-README survive filtering while `target` and `.direnv` do not. The lock check
-requires both committed lockfiles. Crane's cargo-artifacts layer is built
-once and reused by compile/lint, tests, docs, and package checks. The runtime
-smoke check executes the packaged binary and the runtime-closure check rejects
-compiler, Cargo, analyzer, Nix, and test-tool leakage. Native Linux additionally inspects
-the musl ELF for an interpreter and dynamic `NEEDED` entries.
+the repository boundary retains every authoritative Nix, direnv, Cargo, and
+Rust input while excluding disposable build state. Cargo builds use Crane's
+Cargo-only source, so documentation and infrastructure edits do not rebuild
+the package. The cargo-artifacts layer is built once and reused by Clippy,
+tests, docs, and packaging; the compile check is the package derivation itself.
+The runtime smoke check executes that package, and the runtime-closure check
+rejects compiler, Cargo, analyzer, Nix, and test-tool leakage. Native Linux
+additionally inspects the musl ELF for an interpreter and dynamic `NEEDED`
+entries.
 
 ## Updates and recovery
 

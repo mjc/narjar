@@ -17,22 +17,58 @@
     };
   };
 
-  outputs = { self, nixpkgs, crane, rust-overlay }:
+  outputs = { nixpkgs, crane, rust-overlay, ... }:
     let
       lib = nixpkgs.lib;
+      rustVersion = "1.85.1";
       supportedSystems = [ "aarch64-darwin" "x86_64-linux" ];
       staticTarget = "x86_64-unknown-linux-musl";
       staticSystem = "x86_64-linux";
-      lockIdentity = if self ? narHash then self.narHash else "working-tree";
+      lockIdentity = builtins.hashFile "sha256" ./flake.lock;
+      rustTargetFor = {
+        aarch64-darwin = "aarch64-apple-darwin";
+        x86_64-linux = "x86_64-unknown-linux-gnu";
+      };
+      repositorySrc = lib.cleanSourceWith {
+        src = ./.;
+        filter = lib.cleanSourceFilter;
+      };
 
-      sourceFilter = path: type:
-        lib.cleanSourceFilter path type
-        || builtins.elem (baseNameOf (toString path)) [
-          "flake.nix"
-          "flake.lock"
-          ".envrc"
-          "README.md"
-        ];
+      mkToolchain = pkgs: targets:
+        pkgs.rust-bin.stable.${rustVersion}.default.override (
+          {
+            extensions = [ "rust-src" "rust-analyzer-preview" ];
+          }
+          // lib.optionalAttrs (targets != []) { inherit targets; }
+        );
+
+      mkCraneBuild =
+        {
+          pkgs,
+          toolchain,
+          cargoExtraArgs ? "--locked",
+          extraArgs ? {},
+        }:
+        let
+          craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
+          src = craneLib.cleanCargoSource ./.;
+          cargoVendorDir = craneLib.vendorCargoDeps { inherit src; };
+          commonArgs = {
+            inherit src cargoVendorDir cargoExtraArgs;
+            pname = "narjar";
+            version = "0.1.0";
+            strictDeps = true;
+          } // extraArgs;
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          narjar = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            doCheck = false;
+            meta.mainProgram = "narjar";
+          });
+        in
+        {
+          inherit craneLib src cargoVendorDir commonArgs cargoArtifacts narjar;
+        };
 
       mkSystem = system:
         let
@@ -40,70 +76,32 @@
             inherit system;
             overlays = [ (import rust-overlay) ];
           };
-          toolchain = pkgs.rust-bin.stable."1.85.1".default.override {
-            extensions = [ "rust-src" "rust-analyzer-preview" ];
-          };
-          craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
-          src = lib.cleanSourceWith {
-            src = ./.;
-            filter = sourceFilter;
-          };
-          cargoVendorDir = craneLib.vendorCargoDeps { inherit src; };
-          commonArgs = {
-            inherit src cargoVendorDir;
-            pname = "narjar";
-            version = "0.1.0";
-            strictDeps = true;
-            cargoExtraArgs = "--locked";
-          };
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-          narjar = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-            doCheck = false;
-            meta.mainProgram = "narjar";
-          });
+          toolchain = mkToolchain pkgs [];
+          build = mkCraneBuild { inherit pkgs toolchain; };
           provenance = pkgs.writeShellScriptBin "narjar-provenance" ''
             echo "flake_lock_identity=${lockIdentity}"
             echo "nix_version=$(${pkgs.nix}/bin/nix --version)"
             echo "rust_version=$(${toolchain}/bin/rustc --version)"
             echo "host_system=${system}"
-            echo "target_triple=${system}"
-            echo "package=${narjar}"
-            echo "closure=$(${pkgs.nix}/bin/nix path-info -S ${narjar})"
+            echo "target_triple=${rustTargetFor.${system}}"
+            echo "package=${build.narjar}"
+            echo "closure=$(${pkgs.nix}/bin/nix path-info -S ${build.narjar})"
           '';
         in
-        {
-          inherit pkgs toolchain craneLib src cargoVendorDir commonArgs cargoArtifacts narjar provenance;
+        build // {
+          inherit pkgs toolchain provenance;
         };
 
       systems = lib.genAttrs supportedSystems mkSystem;
-
-      mkStatic = env:
-        let
-          toolchain = env.pkgs.rust-bin.stable."1.85.1".default.override {
-            extensions = [ "rust-src" "rust-analyzer-preview" ];
-            targets = [ staticTarget ];
-          };
-          craneLib = (crane.mkLib env.pkgs).overrideToolchain toolchain;
-          cargoVendorDir = craneLib.vendorCargoDeps { src = env.src; };
-          commonArgs = env.commonArgs // {
-            inherit cargoVendorDir;
-            cargoExtraArgs = "--locked --target ${staticTarget}";
-            CARGO_BUILD_TARGET = staticTarget;
-            nativeBuildInputs = [ env.pkgs.pkgsStatic.stdenv.cc ];
-          };
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-          narjar = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-            doCheck = false;
-            meta.mainProgram = "narjar";
-          });
-        in
-        {
-          inherit cargoArtifacts narjar;
+      static = mkCraneBuild {
+        pkgs = systems.${staticSystem}.pkgs;
+        toolchain = mkToolchain systems.${staticSystem}.pkgs [ staticTarget ];
+        cargoExtraArgs = "--locked --target ${staticTarget}";
+        extraArgs = {
+          CARGO_BUILD_TARGET = staticTarget;
+          nativeBuildInputs = [ systems.${staticSystem}.pkgs.pkgsStatic.stdenv.cc ];
         };
-
-      static = mkStatic systems.${staticSystem};
+      };
     in
     {
       packages = lib.mapAttrs (_system: env: {
@@ -136,10 +134,12 @@
         default = {
           type = "app";
           program = lib.getExe' env.narjar "narjar";
+          meta.description = "Run narjar";
         };
         provenance = {
           type = "app";
           program = lib.getExe env.provenance;
+          meta.description = "Report the locked Narjar build identity";
         };
       }) systems;
 
@@ -153,21 +153,20 @@
             touch $out
           '';
           source-filter = env.pkgs.runCommand "narjar-source-filter" {} ''
-            test -f ${env.src}/Cargo.toml
-            test -f ${env.src}/Cargo.lock
-            test -f ${env.src}/src/main.rs
-            test -f ${env.src}/tests/flake_contract.rs
-            test -f ${env.src}/flake.nix
-            test -f ${env.src}/flake.lock
-            test -f ${env.src}/.envrc
-            test -f ${env.src}/README.md
-            test ! -e ${env.src}/target
-            test ! -e ${env.src}/.direnv
+            test -f ${repositorySrc}/Cargo.toml
+            test -f ${repositorySrc}/Cargo.lock
+            test -f ${repositorySrc}/src/main.rs
+            test -f ${repositorySrc}/flake.nix
+            test -f ${repositorySrc}/flake.lock
+            test -f ${repositorySrc}/.envrc
+            test -f ${repositorySrc}/README.md
+            test ! -e ${repositorySrc}/target
+            test ! -e ${repositorySrc}/.direnv
             touch $out
           '';
           lock-consistency = env.pkgs.runCommand "narjar-lock-consistency" {} ''
             test -s ${env.src}/Cargo.lock
-            test -s ${env.src}/flake.lock
+            test -s ${repositorySrc}/flake.lock
             touch $out
           '';
           runtime-smoke = env.pkgs.runCommand "narjar-runtime-smoke" {} ''
@@ -183,10 +182,7 @@
         {
           inherit format source-filter lock-consistency runtime-smoke runtime-closure;
           cargo-artifacts = env.cargoArtifacts;
-          compile = env.craneLib.cargoClippy (env.commonArgs // {
-            inherit (env) cargoArtifacts;
-            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-          });
+          compile = env.narjar;
           clippy = env.craneLib.cargoClippy (env.commonArgs // {
             inherit (env) cargoArtifacts;
             cargoClippyExtraArgs = "--all-targets -- --deny warnings";
