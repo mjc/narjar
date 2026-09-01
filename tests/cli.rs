@@ -620,6 +620,61 @@ fn response_parts(response: &[u8]) -> (String, Vec<u8>) {
     (headers, body)
 }
 
+fn run_conformance_trace(server: &RunningServer, fixture: &str) -> String {
+    const CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
+    const NAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+
+    let narinfo = signed_narinfo(NAR_HASH, 6);
+    let mut transcript = String::new();
+    for (line_number, line) in fixture.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let [method, path, expected_status, body_fixture] = fields.as_slice() else {
+            panic!("invalid conformance fixture line {}", line_number + 1);
+        };
+        let body: Option<&[u8]> = match *body_fixture {
+            "-" => None,
+            "cache-info" => Some(CACHE_INFO),
+            "nar" => Some(b"narjar"),
+            "narinfo" => Some(narinfo.as_bytes()),
+            fixture => panic!(
+                "unknown body fixture {fixture:?} on line {}",
+                line_number + 1
+            ),
+        };
+
+        transcript.push_str(&format!("{method} {path}\n"));
+        transcript.push_str(&format!(
+            "> Host: {}\n> Connection: close\n",
+            server.address
+        ));
+        if *method == "PUT" {
+            transcript.push_str("> Authorization: <redacted>\n");
+        }
+        if let Some(body) = body {
+            transcript.push_str(&format!("> Content-Length: {}\n", body.len()));
+        }
+
+        let response = match body {
+            Some(body) => server.request_with_body(method, path, &[], body),
+            None => server.request(method, path),
+        };
+        transcript.push_str("< ");
+        transcript.push_str(&String::from_utf8_lossy(&response).replace("\r\n", "\n< "));
+        transcript.push('\n');
+
+        let expected = format!("HTTP/1.1 {expected_status} ");
+        assert!(
+            response.starts_with(expected.as_bytes()),
+            "conformance fixture line {} expected status {expected_status}\n{transcript}",
+            line_number + 1
+        );
+    }
+    transcript
+}
+
 #[test]
 fn nar_get_and_head_support_one_byte_range() {
     let server = RunningServer::start("nar-ranges");
@@ -1482,10 +1537,8 @@ fn nix_2_31_5_trace_drives_redacted_socket_conformance() {
         run_conformance_trace(&server, include_str!("fixtures/nix-2.31.5-http-v0.1.tsv"));
     let (signal, status) = server.stop();
 
-    assert!(
-        transcript.contains("GET /nix-cache-info\n< HTTP/1.1 200 OK"),
-        "{transcript}"
-    );
+    assert!(transcript.contains("GET /nix-cache-info"), "{transcript}");
+    assert!(transcript.contains("< HTTP/1.1 200 OK"), "{transcript}");
     assert!(
         transcript.contains("Authorization: <redacted>"),
         "{transcript}"
