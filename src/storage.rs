@@ -764,6 +764,29 @@ mod tests {
         assert!(directory.path().join("realisations").is_dir());
         assert_eq!(storage.layout(), &Layout::new(directory.path().to_owned()));
     }
+    #[test]
+    fn recovery_marker_distinguishes_clean_and_interrupted_publication() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+
+        assert!(
+            !storage
+                .recovery_required()
+                .expect("inspect clean recovery marker")
+        );
+        assert!(
+            storage
+                .publish_nar_fault(&nar, Cursor::new(b"nar bytes"), PublishBoundary::AfterTempCreate)
+                .is_err()
+        );
+        assert!(
+            storage
+                .recovery_required()
+                .expect("inspect interrupted recovery marker")
+        );
+    }
+
 
     #[test]
     fn publication_is_immutable_idempotent_and_pair_gated() {
