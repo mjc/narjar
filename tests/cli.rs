@@ -913,3 +913,45 @@ fn nar_put_preserves_the_configured_free_space_reserve() {
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
+
+#[test]
+fn saturated_request_limit_rejects_excess_work() {
+    let server = RunningServer::start_with_args(
+        "request-saturation",
+        &["--max-in-flight", "1"],
+    );
+    let nar_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
+    fs::write(&nar_path, vec![0x5a; 8 * 1024 * 1024]).expect("write large NAR fixture");
+    let path = format!("/nar/{NAR_ID}.nar");
+    let mut blocked = server.open_request("GET", &path, &[]);
+    blocked
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set slow response timeout");
+    let mut started_response = Vec::new();
+    let mut chunk = [0; 8192];
+    while !started_response
+        .windows(4)
+        .any(|window| window == b"\r\n\r\n")
+    {
+        let read = blocked.read(&mut chunk).expect("read slow response headers");
+        assert_ne!(read, 0, "slow response ended before headers");
+        started_response.extend_from_slice(&chunk[..read]);
+    }
+
+    let mut rejected = server.open_request("GET", "/nix-cache-info", &[]);
+    rejected
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set response timeout");
+    let mut response = Vec::new();
+    let _ = rejected.read_to_end(&mut response);
+
+    assert!(
+        response.starts_with(b"HTTP/1.1 429 Too Many Requests\r\n"),
+        "{response:?}"
+    );
+
+    drop(blocked);
+    let (signal, status) = server.stop();
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
