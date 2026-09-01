@@ -16,18 +16,66 @@ pub enum Permission {
 #[derive(Debug)]
 struct TokenHash([u8; TOKEN_BYTES]);
 
+#[derive(Debug, Default)]
+struct TokenHashes(Vec<TokenHash>);
+
+impl TokenHashes {
+    fn load(path: &Path) -> Result<Self, AuthError> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut labels = HashSet::new();
+        let mut tokens = Vec::new();
+        for line in contents.lines().filter(|line| !line.is_empty()) {
+            let mut fields = line.split_ascii_whitespace();
+            let (Some(label), Some(encoded), None) = (fields.next(), fields.next(), fields.next())
+            else {
+                return Err(AuthError::InvalidTokenFile);
+            };
+            if !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                || label.is_empty()
+                || !labels.insert(label)
+            {
+                return Err(AuthError::InvalidTokenFile);
+            }
+            let digest: [u8; TOKEN_BYTES] = HEXLOWER
+                .decode(encoded.as_bytes())
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or(AuthError::InvalidTokenFile)?;
+            tokens.push(TokenHash(digest));
+        }
+        Ok(Self(tokens))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn matches(&self, actual: &[u8; TOKEN_BYTES]) -> Choice {
+        self.0.iter().fold(Choice::from(0), |accepted, candidate| {
+            accepted | candidate.0.ct_eq(actual)
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Authorizer {
-    read: Vec<TokenHash>,
-    write: Vec<TokenHash>,
+    read: TokenHashes,
+    write: TokenHashes,
 }
 
 impl Authorizer {
     pub fn load(root: &Path) -> Result<Self, AuthError> {
         let auth = root.join("auth");
         Ok(Self {
-            read: load_tokens(&auth.join("read.tokens"))?,
-            write: load_tokens(&auth.join("write.tokens"))?,
+            read: TokenHashes::load(&auth.join("read.tokens"))?,
+            write: TokenHashes::load(&auth.join("write.tokens"))?,
         })
     }
 
@@ -39,22 +87,12 @@ impl Authorizer {
             return false;
         };
 
-        match permission {
-            Permission::Read => token_matches(self.read.iter().chain(&self.write), &actual),
-            Permission::Write => token_matches(self.write.iter(), &actual),
-        }
+        let accepted = match permission {
+            Permission::Read => self.read.matches(&actual) | self.write.matches(&actual),
+            Permission::Write => self.write.matches(&actual),
+        };
+        bool::from(accepted)
     }
-}
-
-fn token_matches<'a>(
-    candidates: impl Iterator<Item = &'a TokenHash>,
-    actual: &[u8; TOKEN_BYTES],
-) -> bool {
-    let mut accepted = Choice::from(0);
-    for candidate in candidates {
-        accepted |= candidate.0.ct_eq(actual);
-    }
-    bool::from(accepted)
 }
 
 fn authorization_token_hash(request: &Request) -> Option<[u8; TOKEN_BYTES]> {
@@ -81,38 +119,6 @@ fn authorization_token_hash(request: &Request) -> Option<[u8; TOKEN_BYTES]> {
         return None;
     }
     Some(Sha256::digest(token).into())
-}
-
-fn load_tokens(path: &Path) -> Result<Vec<TokenHash>, AuthError> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-
-    let mut labels = HashSet::new();
-    let mut tokens = Vec::new();
-    for line in contents.lines().filter(|line| !line.is_empty()) {
-        let mut fields = line.split_ascii_whitespace();
-        let (Some(label), Some(encoded), None) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(AuthError::InvalidTokenFile);
-        };
-        if !label
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-            || !labels.insert(label)
-        {
-            return Err(AuthError::InvalidTokenFile);
-        }
-        let digest: [u8; TOKEN_BYTES] = HEXLOWER
-            .decode(encoded.as_bytes())
-            .ok()
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or(AuthError::InvalidTokenFile)?;
-        tokens.push(TokenHash(digest));
-    }
-    Ok(tokens)
 }
 
 #[derive(Debug)]
