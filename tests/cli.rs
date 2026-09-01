@@ -1431,3 +1431,46 @@ fn token_create_and_revoke_rotate_hashed_write_credentials() {
     assert!(signal.success());
     assert!(status.success());
 }
+
+#[test]
+fn nix_cache_info_put_is_durable_idempotent_and_immutable() {
+    const CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
+
+    let server = RunningServer::start("nix-cache-info-put");
+    let created = server.request_with_body("PUT", "/nix-cache-info", &[], CACHE_INFO);
+    let identical = server.request_with_body("PUT", "/nix-cache-info", &[], CACHE_INFO);
+    let conflict = server.request_with_body(
+        "PUT",
+        "/nix-cache-info",
+        &[],
+        b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 31\n",
+    );
+    let stored = fs::read(server.data_dir.join("nix-cache-info"))
+        .expect("cache info should be durably stored");
+    let (signal, status) = server.stop();
+
+    assert!(
+        response_parts(&created)
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(
+        response_parts(&identical)
+            .0
+            .starts_with("HTTP/1.1 200 OK\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&identical)
+    );
+    assert!(
+        response_parts(&conflict)
+            .0
+            .starts_with("HTTP/1.1 409 Conflict\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&conflict)
+    );
+    assert_eq!(stored, CACHE_INFO);
+    assert!(signal.success());
+    assert!(status.success());
+}
