@@ -247,17 +247,30 @@ fn stats(args: impl Iterator<Item = String>) -> Result<(), Error> {
 
 fn netrc_authorization(path: &Path, authority: &str) -> Result<String, Error> {
     let text = fs::read_to_string(path).map_err(runtime)?;
-    let host = authority
-        .trim_start_matches('[')
-        .split([':', ']'])
-        .next()
-        .unwrap_or(authority);
+    netrc_authorization_from_str(&text, authority)
+}
+
+fn netrc_authorization_from_str(text: &str, authority: &str) -> Result<String, Error> {
+    let host = match authority
+        .strip_prefix('[')
+        .and_then(|authority| authority.split_once(']'))
+    {
+        Some((host, _)) => host,
+        None => authority
+            .split_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
     let words: Vec<_> = text.split_whitespace().collect();
     let machine = words
         .windows(2)
         .position(|pair| pair == ["machine", host])
         .ok_or_else(|| Error::runtime("netrc has no matching machine"))?;
-    let fields = &words[machine + 2..];
+    let remaining = &words[machine + 2..];
+    let entry_end = remaining
+        .iter()
+        .position(|word| *word == "machine")
+        .unwrap_or(remaining.len());
+    let fields = &remaining[..entry_end];
     let login = fields
         .windows(2)
         .find(|pair| pair[0] == "login")
@@ -361,5 +374,35 @@ impl Options {
 
     fn switch(&self, name: &str) -> bool {
         self.switches.contains(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn netrc_entry_does_not_borrow_password_from_next_machine() {
+        let error = netrc_authorization_from_str(
+            "machine cache.example login cache-user
+machine other.example password other-secret
+",
+            "cache.example:5000",
+        )
+        .expect_err("the matching machine has no password");
+
+        assert_eq!(error.to_string(), "netrc entry has no password");
+    }
+
+    #[test]
+    fn netrc_matches_a_bracketed_ipv6_authority() {
+        let authorization = netrc_authorization_from_str(
+            "machine ::1 login cache-user password cache-secret
+",
+            "[::1]:5000",
+        )
+        .expect("IPv6 machine should match");
+
+        assert_eq!(authorization, BASE64.encode(b"cache-user:cache-secret"));
     }
 }
