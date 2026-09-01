@@ -1325,3 +1325,109 @@ fn configured_empty_read_token_set_stays_private() {
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
+
+#[test]
+fn token_create_and_revoke_rotate_hashed_write_credentials() {
+    let data_dir = data_dir("token-lifecycle");
+    let root = data_dir.to_str().expect("temporary path should be UTF-8");
+    let old = run(&[
+        "token",
+        "create",
+        "--data-dir",
+        root,
+        "--scope",
+        "write",
+        "--name",
+        "old",
+    ]);
+    assert!(old.status.success(), "{:?}", old.stderr);
+    assert!(old.stderr.is_empty());
+    let old_token = String::from_utf8(old.stdout)
+        .expect("token should be UTF-8")
+        .trim()
+        .to_owned();
+    assert_eq!(old_token.len(), 64);
+    assert!(old_token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    let token_path = data_dir.join("auth/write.tokens");
+    let stored = fs::read_to_string(&token_path).expect("hashed token file should be readable");
+    assert!(stored.starts_with("old "));
+    assert!(!stored.contains(&old_token));
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(
+            &fs::metadata(&token_path).expect("hashed token metadata should be readable")
+        ) & 0o777,
+        0o600
+    );
+
+    let new = run(&[
+        "token",
+        "create",
+        "--data-dir",
+        root,
+        "--scope",
+        "write",
+        "--name",
+        "new",
+    ]);
+    assert!(new.status.success(), "{:?}", new.stderr);
+    let new_token = String::from_utf8(new.stdout)
+        .expect("token should be UTF-8")
+        .trim()
+        .to_owned();
+    assert_ne!(old_token, new_token);
+
+    let authorization = |token: &str| {
+        format!(
+            "Basic {}",
+            BASE64.encode(format!("narjar:{token}").as_bytes())
+        )
+    };
+    let reaches_router = |server: &RunningServer, token: &str| {
+        let authorization = authorization(token);
+        server.raw_request_with_body(
+            "PUT",
+            "/not-a-route",
+            &[("Authorization", &authorization)],
+            &[],
+        )
+    };
+
+    let server = RunningServer::start_in(data_dir.clone(), &[]);
+    for token in [&old_token, &new_token] {
+        let response = reaches_router(&server, token);
+        assert!(
+            !response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"),
+            "{response:?}"
+        );
+    }
+    let (signal, status) = server.stop_preserving();
+    assert!(signal.success());
+    assert!(status.success());
+
+    let revoked = run(&[
+        "token",
+        "revoke",
+        "--data-dir",
+        root,
+        "--scope",
+        "write",
+        "--name",
+        "old",
+    ]);
+    assert!(revoked.status.success(), "{:?}", revoked.stderr);
+    assert!(revoked.stdout.is_empty());
+    let stored = fs::read_to_string(&token_path).expect("rotated token file should be readable");
+    assert!(!stored.contains("old "));
+    assert!(stored.contains("new "));
+
+    let server = RunningServer::start_in(data_dir, &[]);
+    let rejected = reaches_router(&server, &old_token);
+    let accepted = reaches_router(&server, &new_token);
+    let (signal, status) = server.stop();
+
+    assert!(rejected.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+    assert!(!accepted.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+    assert!(signal.success());
+    assert!(status.success());
+}
