@@ -7,17 +7,20 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        Mutex,
+        Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::SystemTime,
 };
 
+use data_encoding::{BitOrder, Encoding, Specification};
+use sha2::{Digest, Sha256};
+
 mod reconcile;
 
 pub use reconcile::{ReconcileClass, ReconcileEntry, ReconcileReport};
 
-const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const TEMP_ATTEMPTS: u64 = 128;
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 
@@ -51,9 +54,79 @@ impl StoreHash {
 }
 
 fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObjectId> {
-    (value.len() == expected_len && value.bytes().all(|byte| NIX32.contains(&byte)))
+    (value.len() == expected_len && value.bytes().all(|byte| NIX32.as_bytes().contains(&byte)))
         .then(|| value.to_owned())
         .ok_or(InvalidObjectId)
+}
+
+fn nix32_sha256(digest: &[u8]) -> String {
+    static ENCODING: OnceLock<Encoding> = OnceLock::new();
+    let encoding = ENCODING.get_or_init(|| {
+        let mut specification = Specification::new();
+        specification.symbols.push_str(NIX32);
+        specification.bit_order = BitOrder::LeastSignificantFirst;
+        specification
+            .encoding()
+            .expect("Nix base32 specification is valid")
+    });
+    encoding.encode(digest).chars().rev().collect()
+}
+
+struct CheckedNarReader<'a, R> {
+    inner: R,
+    expected_id: &'a str,
+    expected_length: u64,
+    bytes_read: u64,
+    hasher: Sha256,
+    done: bool,
+}
+
+impl<'a, R> CheckedNarReader<'a, R> {
+    fn new(inner: R, expected_id: &'a str, expected_length: u64) -> Self {
+        Self {
+            inner,
+            expected_id,
+            expected_length,
+            bytes_read: 0,
+            hasher: Sha256::new(),
+            done: false,
+        }
+    }
+}
+
+impl<R: Read> Read for CheckedNarReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.done {
+            return Ok(0);
+        }
+
+        let read = self.inner.read(buffer)?;
+        if read == 0 {
+            let digest = self.hasher.clone().finalize();
+            if self.bytes_read != self.expected_length || nix32_sha256(&digest) != self.expected_id
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "NAR hash or size mismatch",
+                ));
+            }
+            self.done = true;
+            return Ok(0);
+        }
+
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?;
+        if self.bytes_read > self.expected_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NAR exceeds declared length",
+            ));
+        }
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -186,6 +259,18 @@ impl Storage {
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
         self.publish(PublishTarget::Nar(id), source)
+    }
+
+    pub fn publish_checked_nar(
+        &self,
+        id: &NarObjectId,
+        source: impl Read,
+        expected_length: u64,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.publish(
+            PublishTarget::Nar(id),
+            CheckedNarReader::new(source, &id.0, expected_length),
+        )
     }
 
     #[cfg(test)]

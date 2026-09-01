@@ -1,8 +1,8 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 
 use tiny_http::{Header, Method, Response, StatusCode};
 
-use crate::storage::{NarObjectId, Storage, StoreHash};
+use crate::storage::{NarObjectId, PublishOutcome, Storage, StorageError, StoreHash};
 
 const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
 const MAX_NARINFO_BYTES: usize = 1024 * 1024;
@@ -238,7 +238,55 @@ impl ReadRoute {
     }
 }
 
-pub fn respond(request: tiny_http::Request, storage: &Storage) {
+fn method_not_allowed(request: tiny_http::Request, allow: &str) {
+    let response = Response::empty(StatusCode(405)).with_header(header("Allow", allow));
+    let _ = request.respond(response);
+}
+
+fn has_header(request: &tiny_http::Request, name: &'static str) -> bool {
+    request
+        .headers()
+        .iter()
+        .any(|header| header.field.equiv(name))
+}
+
+fn respond_nar_put(
+    mut request: tiny_http::Request,
+    storage: &Storage,
+    id: &NarObjectId,
+    max_nar_bytes: u64,
+) {
+    if has_header(&request, "Transfer-Encoding") {
+        let _ = request.respond(Response::empty(StatusCode(400)));
+        return;
+    }
+    if has_header(&request, "Content-Encoding") {
+        let _ = request.respond(Response::empty(StatusCode(415)));
+        return;
+    }
+
+    let Some(length) = request.body_length() else {
+        let _ = request.respond(Response::empty(StatusCode(411)));
+        return;
+    };
+    let length = length as u64;
+    if length > max_nar_bytes {
+        let _ = request.respond(Response::empty(StatusCode(413)));
+        return;
+    }
+
+    let status = match storage.publish_checked_nar(id, request.as_reader(), length) {
+        Ok(PublishOutcome::Created) => 201,
+        Ok(PublishOutcome::Identical) => 200,
+        Err(StorageError::Conflict) => 409,
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => 422,
+        Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
+        Err(_) => 500,
+    };
+    let _ = request.respond(Response::empty(StatusCode(status)));
+}
+
+pub fn respond(request: tiny_http::Request, storage: &Storage, max_nar_bytes: u64) {
     let route = match ReadRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
@@ -248,9 +296,22 @@ pub fn respond(request: tiny_http::Request, storage: &Storage) {
         RouteMatch::Missing => return not_found(request),
     };
 
+    if matches!(request.method(), Method::Put) {
+        return match route {
+            ReadRoute::Nar(id) => respond_nar_put(request, storage, &id, max_nar_bytes),
+            ReadRoute::CacheInfo | ReadRoute::NarInfo(_) => {
+                method_not_allowed(request, "GET, HEAD")
+            }
+        };
+    }
+
     if !matches!(request.method(), Method::Get | Method::Head) {
-        let response = Response::empty(StatusCode(405)).with_header(header("Allow", "GET, HEAD"));
-        let _ = request.respond(response);
+        let allow = if matches!(&route, ReadRoute::Nar(_)) {
+            "GET, HEAD, PUT"
+        } else {
+            "GET, HEAD"
+        };
+        method_not_allowed(request, allow);
         return;
     }
 

@@ -58,6 +58,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .flush()
         .map_err(|error| Error::runtime(format!("cannot report listener: {error}")))?;
 
+    let max_nar_bytes = config.max_nar_bytes.get();
     let handles: Vec<_> = (0..config.workers.get())
         .map(|_| {
             let server = Arc::clone(&server);
@@ -66,7 +67,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             thread::spawn(move || {
                 while !stopping.load(Ordering::Acquire) {
                     if let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(50)) {
-                        respond(request, &storage);
+                        respond(request, &storage, max_nar_bytes);
                     }
                 }
             })
