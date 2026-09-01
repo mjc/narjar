@@ -77,6 +77,26 @@ impl Layout {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishBoundary {
+    BeforeTempCreate,
+    AfterTempCreate,
+    AfterStream,
+    AfterTempSync,
+    BeforeFinalLink,
+    BeforeParentSync,
+    AfterParentSync,
+}
+
+#[cfg(test)]
+fn injected_fault(boundary: PublishBoundary, fault: PublishBoundary) -> Result<(), StorageError> {
+    if boundary == fault {
+        Err(io::Error::other(format!("injected fault at {boundary:?}")).into())
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct Storage {
     layout: Layout,
@@ -107,22 +127,52 @@ impl Storage {
         self.publish("nar", self.layout.nar_path(id), source)
     }
 
+    #[cfg(test)]
+    fn publish_nar_fault(
+        &self,
+        id: &NarObjectId,
+        source: impl Read,
+        fault: PublishBoundary,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.publish_with("nar", self.layout.nar_path(id), source, |boundary| {
+            injected_fault(boundary, fault)
+        })
+    }
+
     pub fn publish_narinfo(
         &self,
         store: &StoreHash,
         nar: &NarObjectId,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
-        match fs::metadata(self.layout.nar_path(nar)) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => return Err(StorageError::MissingNar),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(StorageError::MissingNar);
-            }
-            Err(error) => return Err(error.into()),
-        }
-
+        self.ensure_nar(nar)?;
         self.publish("narinfo", self.layout.narinfo_path(store), source)
+    }
+
+    #[cfg(test)]
+    fn publish_narinfo_fault(
+        &self,
+        store: &StoreHash,
+        nar: &NarObjectId,
+        source: impl Read,
+        fault: PublishBoundary,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.ensure_nar(nar)?;
+        self.publish_with(
+            "narinfo",
+            self.layout.narinfo_path(store),
+            source,
+            |boundary| injected_fault(boundary, fault),
+        )
+    }
+
+    fn ensure_nar(&self, nar: &NarObjectId) -> Result<(), StorageError> {
+        match fs::metadata(self.layout.nar_path(nar)) {
+            Ok(metadata) if metadata.is_file() => Ok(()),
+            Ok(_) => Err(StorageError::MissingNar),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StorageError::MissingNar),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn open_pair(
@@ -144,19 +194,42 @@ impl Storage {
         &self,
         prefix: &str,
         destination: PathBuf,
-        mut source: impl Read,
+        source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
+        self.publish_with(prefix, destination, source, |_| Ok(()))
+    }
+
+    fn publish_with(
+        &self,
+        prefix: &str,
+        destination: PathBuf,
+        mut source: impl Read,
+        mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+    ) -> Result<PublishOutcome, StorageError> {
+        checkpoint(PublishBoundary::BeforeTempCreate)?;
         let (temp_path, mut temp) = self.create_temp(prefix)?;
         let result = (|| {
+            checkpoint(PublishBoundary::AfterTempCreate)?;
             io::copy(&mut source, &mut temp)?;
+            checkpoint(PublishBoundary::AfterStream)?;
             temp.sync_all()?;
+            checkpoint(PublishBoundary::AfterTempSync)?;
+            checkpoint(PublishBoundary::BeforeFinalLink)?;
 
             match fs::hard_link(&temp_path, &destination) {
                 Ok(()) => {
                     let parent = destination
                         .parent()
                         .expect("validated storage destination has a parent");
-                    sync_dir(parent)?;
+                    if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
+                        rollback_link(&destination, parent)?;
+                        return Err(error);
+                    }
+                    if let Err(error) = sync_dir(parent) {
+                        rollback_link(&destination, parent)?;
+                        return Err(error.into());
+                    }
+                    checkpoint(PublishBoundary::AfterParentSync)?;
                     Ok(PublishOutcome::Created)
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -264,6 +337,11 @@ fn open_optional(path: PathBuf) -> Result<Option<File>, StorageError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+fn rollback_link(destination: &Path, parent: &Path) -> Result<(), StorageError> {
+    fs::remove_file(destination)?;
+    sync_dir(parent)?;
+    Ok(())
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
