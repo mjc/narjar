@@ -27,3 +27,26 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), Error> {
         None => Err(Error::usage("a command is required")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn command_schema_rejects_invalid_input() {
+        for args in [
+            ["serve", "--unknown"].as_slice(),
+            ["serve", "--data-dir", "/cache", "--workers", "1", "--workers", "2"].as_slice(),
+            ["serve", "--data-dir"].as_slice(),
+            ["token", "revoke", "--data-dir", "/cache", "--scope", "write"].as_slice(),
+            ["token", "create", "--data-dir", "/cache", "--scope", "invalid"].as_slice(),
+            ["key", "generate", "--name", "bad/name", "--secret-key-file", "secret", "--public-key-file", "public"].as_slice(),
+            ["serve", "--data-dir", "/cache", "--workers", "0"].as_slice(),
+            ["serve", "--data-dir", "/cache", "--listen", "not-an-address"].as_slice(),
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("narjar").chain(args.iter().copied())).is_err());
+        }
+    }
+}
