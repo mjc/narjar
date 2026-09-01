@@ -275,7 +275,7 @@ fn respond_nar_put(
         return;
     }
 
-    let status = match storage.publish_checked_nar(id, request.as_reader(), length) {
+    let status = match storage.publish_nar(id, request.as_reader(), length) {
         Ok(PublishOutcome::Created) => 201,
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,

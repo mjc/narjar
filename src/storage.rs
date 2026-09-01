@@ -257,20 +257,21 @@ impl Storage {
         &self,
         id: &NarObjectId,
         source: impl Read,
-    ) -> Result<PublishOutcome, StorageError> {
-        self.publish(PublishTarget::Nar(id), source)
-    }
-
-    pub fn publish_checked_nar(
-        &self,
-        id: &NarObjectId,
-        source: impl Read,
         expected_length: u64,
     ) -> Result<PublishOutcome, StorageError> {
         self.publish(
             PublishTarget::Nar(id),
             CheckedNarReader::new(source, &id.0, expected_length),
         )
+    }
+
+    #[cfg(test)]
+    fn publish_nar_unchecked(
+        &self,
+        id: &NarObjectId,
+        source: impl Read,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.publish(PublishTarget::Nar(id), source)
     }
 
     #[cfg(test)]
@@ -663,18 +664,18 @@ mod tests {
 
         assert_eq!(
             storage
-                .publish_nar(&nar, Cursor::new(b"nar bytes"))
+                .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
                 .expect("publish NAR"),
             PublishOutcome::Created
         );
         assert_eq!(
             storage
-                .publish_nar(&nar, Cursor::new(b"nar bytes"))
+                .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
                 .expect("retry identical NAR"),
             PublishOutcome::Identical
         );
         assert!(matches!(
-            storage.publish_nar(&nar, Cursor::new(b"different")),
+            storage.publish_nar_unchecked(&nar, Cursor::new(b"different")),
             Err(StorageError::Conflict)
         ));
         assert!(
@@ -757,7 +758,7 @@ mod tests {
             std::thread::spawn(move || {
                 let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
                 started_tx.send(()).expect("signal contender start");
-                let outcome = storage.publish_nar(&nar, Cursor::new(b"nar bytes"));
+                let outcome = storage.publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"));
                 outcome_tx.send(outcome).expect("send contender outcome");
             })
         };
@@ -833,7 +834,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .publish_nar(&nar, Cursor::new(b"nar bytes"))
+                .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
                 .expect("retry durable NAR"),
             PublishOutcome::Identical
         );
@@ -871,7 +872,7 @@ mod tests {
             let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
 
             let error = storage
-                .publish_nar(&nar, BrokenReader::new(raw_error))
+                .publish_nar_unchecked(&nar, BrokenReader::new(raw_error))
                 .expect_err("stream failure must reject publication");
             let StorageError::Io(error) = error else {
                 panic!("stream failure returned a non-I/O error");
@@ -1021,7 +1022,7 @@ mod tests {
         let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
         let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
         storage
-            .publish_nar(&nar, Cursor::new(b"nar bytes"))
+            .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
             .expect("publish NAR");
         storage
             .publish_narinfo(&store, &nar, Cursor::new(b"narinfo bytes"))
