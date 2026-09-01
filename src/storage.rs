@@ -233,15 +233,23 @@ impl Storage {
         }
     }
 
+    pub fn open_nar(&self, nar: &NarObjectId) -> Result<Option<File>, StorageError> {
+        open_optional(self.layout.nar_path(nar))
+    }
+
+    pub fn open_narinfo(&self, store: &StoreHash) -> Result<Option<File>, StorageError> {
+        open_optional(self.layout.narinfo_path(store))
+    }
+
     pub fn open_pair(
         &self,
         store: &StoreHash,
         nar: &NarObjectId,
     ) -> Result<Option<PublishedPair>, StorageError> {
-        let Some(narinfo) = open_optional(self.layout.narinfo_path(store))? else {
+        let Some(narinfo) = self.open_narinfo(store)? else {
             return Ok(None);
         };
-        let Some(nar) = open_optional(self.layout.nar_path(nar))? else {
+        let Some(nar) = self.open_nar(nar)? else {
             return Ok(None);
         };
 
