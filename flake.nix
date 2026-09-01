@@ -31,7 +31,9 @@
       };
       repositorySrc = lib.cleanSourceWith {
         src = ./.;
-        filter = lib.cleanSourceFilter;
+        filter = path: type:
+          lib.cleanSourceFilter path type
+          && !(lib.hasPrefix (toString ./. + "/benchmarks/results") (toString path));
       };
 
       mkToolchain = pkgs: targets:
@@ -201,6 +203,7 @@
             test -f ${repositorySrc}/README.md
             test ! -e ${repositorySrc}/target
             test ! -e ${repositorySrc}/.direnv
+            test ! -e ${repositorySrc}/benchmarks/results
             touch $out
           '';
           lock-consistency = env.pkgs.runCommand "narjar-lock-consistency" {} ''
