@@ -1,6 +1,7 @@
 use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpStream,
     path::PathBuf,
     process::{Command, Output, Stdio},
     thread,
@@ -263,4 +264,73 @@ fn serve_reports_listener_and_stops_on_sigterm() {
         ),
         "startup line omits effective limits: {first_line:?}"
     );
+}
+
+#[test]
+fn nix_cache_info_get_and_head_match_contract() {
+    let data_dir = data_dir("nix-cache-info");
+    let mut child = command()
+        .args([
+            "serve",
+            "--data-dir",
+            data_dir.to_str().expect("temporary path should be UTF-8"),
+            "--listen",
+            "127.0.0.1:0",
+            "--workers",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("narjar should start");
+
+    let mut first_line = String::new();
+    BufReader::new(child.stdout.take().expect("stdout should be piped"))
+        .read_line(&mut first_line)
+        .expect("startup line should be readable");
+    let address = first_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|url| url.strip_prefix("http://"))
+        .expect("startup line should contain listener address");
+
+    let request = |method: &str| {
+        let mut stream = TcpStream::connect(address).expect("connect to narjar");
+        write!(
+            stream,
+            "{method} /nix-cache-info HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    };
+    let get = request("GET");
+    let head = request("HEAD");
+
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("kill should run");
+    let status = child.wait().expect("narjar should stop");
+    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
+
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+
+    let body = "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
+    for response in [&get, &head] {
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response:?}");
+        assert!(
+            response.contains("Content-Type: text/x-nix-cache-info\r\n"),
+            "{response:?}"
+        );
+        assert!(response.contains("Content-Length: 51\r\n"), "{response:?}");
+        assert!(
+            response.contains("Cache-Control: public, max-age=3600\r\n"),
+            "{response:?}"
+        );
+    }
+    assert!(get.ends_with(&format!("\r\n\r\n{body}")), "{get:?}");
+    assert!(head.ends_with("\r\n\r\n"), "{head:?}");
 }
