@@ -3,7 +3,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     path::PathBuf,
-    process::{Command, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     thread,
     time::{Duration, SystemTime},
 };
@@ -200,120 +200,129 @@ fn serve_rejects_zero_nar_limit() {
     );
 }
 
+struct RunningServer {
+    child: Child,
+    data_dir: PathBuf,
+    startup_line: String,
+    address: String,
+}
+
+impl RunningServer {
+    fn start(test: &str) -> Self {
+        let data_dir = data_dir(test);
+        let mut child = command()
+            .args([
+                "serve",
+                "--data-dir",
+                data_dir.to_str().expect("temporary path should be UTF-8"),
+                "--listen",
+                "127.0.0.1:0",
+                "--workers",
+                "1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("narjar should start");
+
+        let mut startup_line = String::new();
+        BufReader::new(child.stdout.take().expect("stdout should be piped"))
+            .read_line(&mut startup_line)
+            .expect("startup line should be readable");
+        let address = startup_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|url| url.strip_prefix("http://"))
+            .expect("startup line should contain listener address")
+            .to_owned();
+
+        Self {
+            child,
+            data_dir,
+            startup_line,
+            address,
+        }
+    }
+
+    fn request(&self, method: &str, path: &str) -> Vec<u8> {
+        let mut stream = TcpStream::connect(&self.address).expect("connect to narjar");
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            self.address
+        )
+        .expect("write request");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response");
+        response
+    }
+
+    fn stop(mut self) -> (ExitStatus, ExitStatus) {
+        let signal = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .expect("kill should run");
+
+        let mut status = None;
+        for _ in 0..100 {
+            status = self
+                .child
+                .try_wait()
+                .expect("child status should be readable");
+            if status.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        if status.is_none() {
+            self.child.kill().expect("hung child should be killed");
+            let _ = self.child.wait();
+        }
+        fs::remove_dir_all(&self.data_dir).expect("test data directory should be removed");
+
+        (signal, status.expect("narjar should stop after SIGTERM"))
+    }
+}
+
 #[test]
 fn serve_reports_listener_and_stops_on_sigterm() {
-    let data_dir = data_dir("lifecycle");
-    let mut child = command()
-        .args([
-            "serve",
-            "--data-dir",
-            data_dir.to_str().expect("temporary path should be UTF-8"),
-            "--listen",
-            "127.0.0.1:0",
-            "--workers",
-            "1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("narjar should start");
+    let server = RunningServer::start("lifecycle");
 
-    let mut first_line = String::new();
-    BufReader::new(child.stdout.take().expect("stdout should be piped"))
-        .read_line(&mut first_line)
-        .expect("startup line should be readable");
-
-    let signal = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill should run");
-
-    let mut status = None;
-    for _ in 0..100 {
-        status = child.try_wait().expect("child status should be readable");
-        if status.is_some() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    if status.is_none() {
-        child.kill().expect("hung child should be killed");
-        let _ = child.wait();
-    }
     for directory in ["nar", ".tmp", "realisations"] {
         assert!(
-            data_dir.join(directory).is_dir(),
+            server.data_dir.join(directory).is_dir(),
             "daemon did not initialize {directory}"
         );
     }
-    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
-
-    assert!(signal.success(), "SIGTERM should be sent");
     assert!(
-        status.expect("narjar should stop after SIGTERM").success(),
-        "narjar should shut down cleanly"
+        server
+            .startup_line
+            .starts_with("listening http://127.0.0.1:"),
+        "unexpected startup line: {:?}",
+        server.startup_line
     );
     assert!(
-        first_line.starts_with("listening http://127.0.0.1:"),
-        "unexpected startup line: {first_line:?}"
-    );
-    assert!(
-        first_line.ends_with(
+        server.startup_line.ends_with(
             " workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824\n"
         ),
-        "startup line omits effective limits: {first_line:?}"
+        "startup line omits effective limits: {:?}",
+        server.startup_line
     );
+
+    let (signal, status) = server.stop();
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
 }
 
 #[test]
 fn nix_cache_info_get_and_head_match_contract() {
-    let data_dir = data_dir("nix-cache-info");
-    let mut child = command()
-        .args([
-            "serve",
-            "--data-dir",
-            data_dir.to_str().expect("temporary path should be UTF-8"),
-            "--listen",
-            "127.0.0.1:0",
-            "--workers",
-            "1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("narjar should start");
-
-    let mut first_line = String::new();
-    BufReader::new(child.stdout.take().expect("stdout should be piped"))
-        .read_line(&mut first_line)
-        .expect("startup line should be readable");
-    let address = first_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|url| url.strip_prefix("http://"))
-        .expect("startup line should contain listener address");
-
-    let request = |method: &str| {
-        let mut stream = TcpStream::connect(address).expect("connect to narjar");
-        write!(
-            stream,
-            "{method} /nix-cache-info HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
-        )
-        .expect("write request");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).expect("read response");
-        response
-    };
-    let get = request("GET");
-    let head = request("HEAD");
-
-    let signal = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill should run");
-    let status = child.wait().expect("narjar should stop");
-    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
+    let server = RunningServer::start("nix-cache-info");
+    let get = String::from_utf8(server.request("GET", "/nix-cache-info"))
+        .expect("GET response should be UTF-8");
+    let head = String::from_utf8(server.request("HEAD", "/nix-cache-info"))
+        .expect("HEAD response should be UTF-8");
+    let (signal, status) = server.stop();
 
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
