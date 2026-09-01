@@ -141,8 +141,7 @@ pub(crate) struct Reconcile {
 pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
     report(
         options.data_dir,
-        false,
-        false,
+        ReportMode::Reconcile,
         options.verify_hashes,
         options.json,
     )
@@ -157,7 +156,7 @@ pub(crate) struct Verify {
 }
 
 pub(crate) fn verify(options: Verify) -> Result<(), Error> {
-    report(options.data_dir, true, false, false, options.json)
+    report(options.data_dir, ReportMode::Verify, false, options.json)
 }
 
 #[derive(Args)]
@@ -173,27 +172,38 @@ pub(crate) struct ListOrphans {
 pub(crate) fn list_orphans(options: ListOrphans) -> Result<(), Error> {
     report(
         options.data_dir,
-        false,
-        true,
+        ReportMode::Orphans,
         options.verify_hashes,
         options.json,
     )
 }
 
-fn report(
-    root: PathBuf,
-    verify: bool,
-    only_orphans: bool,
-    verify_hashes: bool,
-    json: bool,
-) -> Result<(), Error> {
+#[derive(Clone, Copy)]
+enum ReportMode {
+    Reconcile,
+    Verify,
+    Orphans,
+}
+
+impl ReportMode {
+    const fn scans_content(self) -> bool {
+        matches!(self, Self::Verify)
+    }
+
+    const fn only_orphans(self) -> bool {
+        matches!(self, Self::Orphans)
+    }
+}
+
+fn report(root: PathBuf, mode: ReportMode, verify_hashes: bool, json: bool) -> Result<(), Error> {
     let trusted = TrustedPublicKeys::load(&root.join("trusted-public-keys")).map_err(runtime)?;
-    let inventory = Inventory::scan(&root, &trusted, verify || verify_hashes).map_err(runtime)?;
+    let inventory =
+        Inventory::scan(&root, &trusted, mode.scans_content() || verify_hashes).map_err(runtime)?;
 
     for finding in inventory
         .entries()
         .iter()
-        .filter(|finding| !only_orphans || finding.class() == InventoryClass::OrphanNar)
+        .filter(|finding| !mode.only_orphans() || finding.class() == InventoryClass::OrphanNar)
     {
         if json {
             println!(
@@ -212,7 +222,7 @@ fn report(
         }
     }
 
-    if verify
+    if mode.scans_content()
         && inventory
             .entries()
             .iter()
