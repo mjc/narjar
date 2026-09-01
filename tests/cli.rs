@@ -916,10 +916,7 @@ fn nar_put_preserves_the_configured_free_space_reserve() {
 
 #[test]
 fn saturated_request_limit_rejects_excess_work() {
-    let server = RunningServer::start_with_args(
-        "request-saturation",
-        &["--max-in-flight", "1"],
-    );
+    let server = RunningServer::start_with_args("request-saturation", &["--max-in-flight", "1"]);
     let nar_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
     fs::write(&nar_path, vec![0x5a; 8 * 1024 * 1024]).expect("write large NAR fixture");
     let path = format!("/nar/{NAR_ID}.nar");
@@ -933,7 +930,9 @@ fn saturated_request_limit_rejects_excess_work() {
         .windows(4)
         .any(|window| window == b"\r\n\r\n")
     {
-        let read = blocked.read(&mut chunk).expect("read slow response headers");
+        let read = blocked
+            .read(&mut chunk)
+            .expect("read slow response headers");
         assert_ne!(read, 0, "slow response ended before headers");
         started_response.extend_from_slice(&chunk[..read]);
     }
