@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -252,37 +254,139 @@ class Candidate:
                 return int(line.split()[1])
         raise RuntimeError(f"RSS missing for {self.name}")
 
-    def publish(self, paths: Sequence[str]) -> None:
-        if self.url is None:
-            raise RuntimeError(f"{self.name} is not running")
-        for offset in range(0, len(paths), 128):
-            batch = paths[offset : offset + 128]
-            if self.name == "narjar":
-                subprocess.run(
-                    [
-                        "nix",
-                        "store",
-                        "sign",
-                        "--key-file",
-                        str(self.root / "secret-key"),
-                        *batch,
-                    ],
-                    check=True,
-                )
+    def _sign(self, paths: Sequence[str]) -> None:
+        if self.name == "narjar":
             subprocess.run(
                 [
                     "nix",
-                    "copy",
-                    "--refresh",
-                    "--option",
-                    "netrc-file",
-                    str(self.netrc),
-                    "--to",
-                    f"{self.url}?compression=none",
-                    *batch,
+                    "store",
+                    "sign",
+                    "--key-file",
+                    str(self.root / "secret-key"),
+                    *paths,
                 ],
                 check=True,
             )
+
+    def _copy_args(self, paths: Sequence[str]) -> list[str]:
+        if self.url is None:
+            raise RuntimeError(f"{self.name} is not running")
+        return [
+            "nix",
+            "copy",
+            "--refresh",
+            "--option",
+            "netrc-file",
+            str(self.netrc),
+            "--to",
+            f"{self.url}?compression=none",
+            *paths,
+        ]
+
+    def publish(self, paths: Sequence[str]) -> None:
+        for offset in range(0, len(paths), 128):
+            batch = paths[offset : offset + 128]
+            self._sign(batch)
+            subprocess.run(self._copy_args(batch), check=True)
+
+    def process_cpu_seconds(self) -> float:
+        if self.process is None:
+            raise RuntimeError(f"{self.name} is not running")
+        fields = Path(f"/proc/{self.process.pid}/stat").read_text().rsplit(")", 1)[1].split()
+        ticks = int(fields[11]) + int(fields[12])
+        return ticks / os.sysconf("SC_CLK_TCK")
+
+    def disk_bytes(self) -> int:
+        return sum(
+            entry.stat().st_size
+            for entry in self.data_dir.rglob("*")
+            if entry.is_file()
+        )
+
+    def publish_timed(self, path: str) -> dict[str, float]:
+        self._sign([path])
+        before_cpu = self.process_cpu_seconds()
+        before_disk = self.disk_bytes()
+        peak_rss = [self.rss_kib()]
+        finished = threading.Event()
+
+        def sample_rss() -> None:
+            while not finished.wait(0.005):
+                peak_rss.append(self.rss_kib())
+
+        sampler = threading.Thread(target=sample_rss)
+        sampler.start()
+        started = time.perf_counter_ns()
+        try:
+            subprocess.run(
+                self._copy_args([path]),
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        finally:
+            elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+            finished.set()
+            sampler.join()
+
+        return {
+            "wall_ms": elapsed_ms,
+            "server_cpu_ms": (self.process_cpu_seconds() - before_cpu) * 1_000,
+            "peak_rss_kib": max(peak_rss),
+            "stored_bytes": self.disk_bytes() - before_disk,
+        }
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, float, bytes]:
+        if self.url is None:
+            raise RuntimeError(f"{self.name} is not running")
+        request = urllib.request.Request(
+            f"{self.url}/{path.lstrip('/')}",
+            method=method,
+            headers=headers or {},
+        )
+        started = time.perf_counter_ns()
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = response.read()
+                status = response.status
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            status = error.code
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+        return status, elapsed_ms, body
+
+    def nar_info(self, store_path: str) -> tuple[str, int]:
+        store_hash = Path(store_path).name.split("-", 1)[0]
+        status, _, body = self.request("GET", f"{store_hash}.narinfo")
+        if status != 200:
+            raise RuntimeError(f"{self.name} returned {status} for {store_hash}.narinfo")
+        fields = dict(
+            line.split(": ", 1)
+            for line in body.decode().splitlines()
+            if ": " in line
+        )
+        return fields["URL"], int(fields["NarSize"])
+
+    def evict_cache(self) -> None:
+        for entry in self.data_dir.rglob("*"):
+            if not entry.is_file():
+                continue
+            try:
+                with entry.open("rb") as stream:
+                    os.posix_fadvise(
+                        stream.fileno(),
+                        0,
+                        0,
+                        os.POSIX_FADV_DONTNEED,
+                    )
+            except OSError:
+                pass
+
 
 class Recorder:
     def __init__(self, output: Path) -> None:
@@ -463,6 +567,231 @@ def benchmark_startup(
             candidate.stop()
 
 
+def make_payloads(run: Run, count: int, size: int) -> list[str]:
+    directory = run.work / "payloads"
+    directory.mkdir(exist_ok=True)
+    paths = []
+    for index in range(count):
+        source = directory / f"upload-{size}-{index}.bin"
+        generator = random.Random(SEED + size + index)
+        remaining = size
+        with source.open("wb") as stream:
+            while remaining:
+                chunk_size = min(1024 * 1024, remaining)
+                stream.write(generator.randbytes(chunk_size))
+                remaining -= chunk_size
+        paths.append(command("nix", "store", "add-file", str(source)))
+    return paths
+
+
+def benchmark_io(
+    run: Run,
+    candidates: list[Candidate],
+    recorder: Recorder,
+    rng: random.Random,
+) -> None:
+    payload_bytes = 1 * 1024 * 1024 if run.quick else 16 * 1024 * 1024
+    paths = make_payloads(run, run.repetitions + 1, payload_bytes)
+
+    for candidate in candidates:
+        candidate.start()
+    try:
+        for candidate in candidates:
+            candidate.publish([paths[0]])
+
+        schedule = [
+            (candidate, path)
+            for candidate in candidates
+            for path in paths[1:]
+        ]
+        rng.shuffle(schedule)
+        repetitions = {candidate.name: 0 for candidate in candidates}
+        for order_index, (candidate, path) in enumerate(schedule):
+            repetition = repetitions[candidate.name]
+            repetitions[candidate.name] += 1
+            result = candidate.publish_timed(path)
+            recorder.add(
+                "upload_wall",
+                candidate.name,
+                repetition,
+                result["wall_ms"],
+                "ms",
+                order=order_index,
+                payload_bytes=payload_bytes,
+            )
+            recorder.add(
+                "upload_throughput",
+                candidate.name,
+                repetition,
+                payload_bytes / result["wall_ms"] * 1_000 / (1024 * 1024),
+                "MiB/s",
+                order=order_index,
+                payload_bytes=payload_bytes,
+            )
+            recorder.add(
+                "upload_server_cpu",
+                candidate.name,
+                repetition,
+                result["server_cpu_ms"],
+                "ms",
+                order=order_index,
+                payload_bytes=payload_bytes,
+            )
+            recorder.add(
+                "upload_peak_rss",
+                candidate.name,
+                repetition,
+                result["peak_rss_kib"],
+                "KiB",
+                order=order_index,
+                payload_bytes=payload_bytes,
+            )
+            recorder.add(
+                "upload_stored_bytes",
+                candidate.name,
+                repetition,
+                result["stored_bytes"],
+                "bytes",
+                order=order_index,
+                payload_bytes=payload_bytes,
+            )
+
+        nar_info = {
+            candidate.name: candidate.nar_info(paths[0])
+            for candidate in candidates
+        }
+        operations = [
+            ("get_warm", "GET", {}, 200, False),
+            ("get_cold", "GET", {}, 200, True),
+            ("head_warm", "HEAD", {}, 200, False),
+            ("range_warm", "GET", {"Range": "bytes=0-65535"}, 206, False),
+            (
+                "missing_404",
+                "GET",
+                {},
+                404,
+                False,
+            ),
+        ]
+        for case, method, headers, expected, cold in operations:
+            for candidate in candidates:
+                path = (
+                    "00000000000000000000000000000000.narinfo"
+                    if case == "missing_404"
+                    else nar_info[candidate.name][0]
+                )
+                if cold:
+                    candidate.evict_cache()
+                candidate.request(method, path, headers)
+
+            request_schedule = [
+                candidate
+                for candidate in candidates
+                for _ in range(run.repetitions)
+            ]
+            rng.shuffle(request_schedule)
+            repetitions = {candidate.name: 0 for candidate in candidates}
+            for order_index, candidate in enumerate(request_schedule):
+                repetition = repetitions[candidate.name]
+                repetitions[candidate.name] += 1
+                path = (
+                    "00000000000000000000000000000000.narinfo"
+                    if case == "missing_404"
+                    else nar_info[candidate.name][0]
+                )
+                if cold:
+                    candidate.evict_cache()
+                status, elapsed_ms, body = candidate.request(method, path, headers)
+                valid_statuses = {expected}
+                if case == "range_warm" and candidate.name == "bincache":
+                    valid_statuses.add(200)
+                if status not in valid_statuses:
+                    raise RuntimeError(
+                        f"{candidate.name} {case} returned {status}, "
+                        f"expected one of {sorted(valid_statuses)}"
+                    )
+                recorder.add(
+                    f"{case}_status",
+                    candidate.name,
+                    repetition,
+                    status,
+                    "HTTP",
+                    order=order_index,
+                    response_bytes=len(body),
+                )
+                recorder.add(
+                    f"{case}_latency",
+                    candidate.name,
+                    repetition,
+                    elapsed_ms,
+                    "ms",
+                    order=order_index,
+                    response_bytes=len(body),
+                )
+                if case in {"get_warm", "get_cold"}:
+                    logical_bytes = nar_info[candidate.name][1]
+                    recorder.add(
+                        f"{case}_throughput",
+                        candidate.name,
+                        repetition,
+                        logical_bytes / elapsed_ms * 1_000 / (1024 * 1024),
+                        "MiB/s",
+                        order=order_index,
+                        response_bytes=len(body),
+                    )
+
+        widths = [1, 2] if run.quick else [1, 8, 32]
+        for width in widths:
+            for candidate in candidates:
+                path = nar_info[candidate.name][0]
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=width
+                ) as executor:
+                    list(
+                        executor.map(
+                            lambda _: candidate.request("GET", path),
+                            range(width),
+                        )
+                    )
+
+            request_schedule = [
+                candidate
+                for candidate in candidates
+                for _ in range(run.repetitions)
+            ]
+            rng.shuffle(request_schedule)
+            repetitions = {candidate.name: 0 for candidate in candidates}
+            for order_index, candidate in enumerate(request_schedule):
+                repetition = repetitions[candidate.name]
+                repetitions[candidate.name] += 1
+                path = nar_info[candidate.name][0]
+                started = time.perf_counter_ns()
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=width
+                ) as executor:
+                    responses = list(
+                        executor.map(
+                            lambda _: candidate.request("GET", path),
+                            range(width),
+                        )
+                    )
+                elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+                if any(status != 200 for status, _, _ in responses):
+                    raise RuntimeError(f"{candidate.name} concurrent GET failed")
+                logical_bytes = nar_info[candidate.name][1] * width
+                recorder.add(
+                    f"concurrent_get_{width}",
+                    candidate.name,
+                    repetition,
+                    logical_bytes / elapsed_ms * 1_000 / (1024 * 1024),
+                    "MiB/s",
+                    order=order_index,
+                )
+    finally:
+        for candidate in candidates:
+            candidate.stop()
+
+
 def measure_closures(run: Run, recorder: Recorder) -> None:
     binaries = {"narjar": run.narjar, "bincache": run.bincache}
     if not run.quick:
@@ -540,6 +869,7 @@ def main() -> int:
 
         recorder = Recorder(run.output)
         benchmark_startup(run, candidates, recorder, random.Random(SEED))
+        benchmark_io(run, candidates, recorder, random.Random(SEED + 1))
         measure_closures(run, recorder)
         write_report(run, recorder)
         print(run.output)
