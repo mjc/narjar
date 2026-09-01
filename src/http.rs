@@ -1,9 +1,10 @@
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 use tiny_http::{Header, Method, Response, StatusCode};
 
 use crate::{
     auth::{Authorizer, Permission},
+    narinfo::{TrustedPublicKeys, ValidatedNarInfo},
     storage::{NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError, StoreHash},
 };
 
@@ -291,6 +292,70 @@ fn respond_nar_put(
     };
     let _ = request.respond(Response::empty(StatusCode(status)));
 }
+fn respond_narinfo_put(
+    mut request: tiny_http::Request,
+    storage: &Storage,
+    store: &StoreHash,
+    trusted: &TrustedPublicKeys,
+) {
+    if has_header(&request, "Transfer-Encoding") {
+        let _ = request.respond(Response::empty(StatusCode(400)));
+        return;
+    }
+    if has_header(&request, "Content-Encoding") {
+        let _ = request.respond(Response::empty(StatusCode(415)));
+        return;
+    }
+
+    let Some(length) = request.body_length() else {
+        let _ = request.respond(Response::empty(StatusCode(411)));
+        return;
+    };
+    if length > MAX_NARINFO_BYTES {
+        let _ = request.respond(Response::empty(StatusCode(413)));
+        return;
+    }
+
+    let mut bytes = Vec::with_capacity(length);
+    let read = request
+        .as_reader()
+        .take(length as u64 + 1)
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() != length {
+        let _ = request.respond(Response::empty(StatusCode(422)));
+        return;
+    }
+
+    let validated = match ValidatedNarInfo::parse(store, &bytes, trusted) {
+        Ok(validated) => validated,
+        Err(_) => {
+            let _ = request.respond(Response::empty(StatusCode(422)));
+            return;
+        }
+    };
+    let nar = match storage.open_nar(validated.nar()) {
+        Ok(Some(nar)) => nar,
+        Ok(None) => {
+            let _ = request.respond(Response::empty(StatusCode(422)));
+            return;
+        }
+        Err(_) => return internal_error(request),
+    };
+    if !matches!(nar.metadata(), Ok(metadata) if metadata.len() == validated.nar_size()) {
+        let _ = request.respond(Response::empty(StatusCode(422)));
+        return;
+    }
+
+    let status = match storage.publish_narinfo(store, validated.nar(), Cursor::new(bytes)) {
+        Ok(PublishOutcome::Created) => 201,
+        Ok(PublishOutcome::Identical) => 200,
+        Err(StorageError::Conflict) => 409,
+        Err(StorageError::MissingNar) => 422,
+        Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
+        Err(_) => 500,
+    };
+    let _ = request.respond(Response::empty(StatusCode(status)));
+}
 
 fn unauthorized(request: tiny_http::Request) {
     let challenge = header("WWW-Authenticate", "Basic realm=\"narjar\"");
@@ -301,6 +366,7 @@ pub fn respond(
     request: tiny_http::Request,
     storage: &Storage,
     authorizer: &Authorizer,
+    trusted: &TrustedPublicKeys,
     policy: NarUploadPolicy,
 ) {
     let permission = if matches!(request.method(), Method::Put) {
@@ -334,9 +400,7 @@ pub fn respond(
     if matches!(request.method(), Method::Put) {
         return match route {
             ReadRoute::Nar(id) => respond_nar_put(request, storage, &id, policy),
-            ReadRoute::NarInfo(_) => {
-                let _ = request.respond(Response::empty(StatusCode(422)));
-            }
+            ReadRoute::NarInfo(store) => respond_narinfo_put(request, storage, &store, trusted),
             ReadRoute::CacheInfo => method_not_allowed(request, "GET, HEAD"),
         };
     }

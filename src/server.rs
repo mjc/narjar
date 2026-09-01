@@ -19,6 +19,7 @@ use tiny_http::{Request, Response, Server, StatusCode};
 use narjar::{
     auth::Authorizer,
     http::respond,
+    narinfo::TrustedPublicKeys,
     storage::{NarUploadPolicy, Storage},
 };
 
@@ -130,6 +131,10 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         Arc::new(Authorizer::load(&config.data_dir).map_err(|error| {
             Error::runtime(format!("cannot load authorization policy: {error}"))
         })?);
+    let trusted_keys = Arc::new(
+        TrustedPublicKeys::load(&config.data_dir.join("trusted-public-keys"))
+            .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?,
+    );
 
     let server = Server::http(config.listen)
         .map_err(|error| Error::runtime(format!("cannot listen on {}: {error}", config.listen)))?;
@@ -157,10 +162,11 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             let queue = Arc::clone(&queue);
             let storage = Arc::clone(&storage);
             let authorizer = Arc::clone(&authorizer);
+            let trusted_keys = Arc::clone(&trusted_keys);
             thread::spawn(move || {
                 while let Some(request) = queue.pop() {
                     let _admission = Admission(queue.as_ref());
-                    respond(request, &storage, &authorizer, upload_policy);
+                    respond(request, &storage, &authorizer, &trusted_keys, upload_policy);
                 }
             })
         })
