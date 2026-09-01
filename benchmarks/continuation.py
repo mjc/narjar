@@ -10,6 +10,7 @@ import platform
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +43,36 @@ def resolve_bincache(explicit: Path | None) -> Path:
     return Path(output.splitlines()[-1]) / "bin" / "bincache"
 
 
+@dataclass(frozen=True)
+class Run:
+    output: Path
+    repetitions: int
+    narjar: Path
+    bincache: Path
+
+    @classmethod
+    def prepare(cls, args: argparse.Namespace) -> "Run":
+        if platform.system() != "Linux":
+            raise SystemExit("the continuation benchmark requires Linux /proc")
+        if args.repetitions < 15:
+            raise SystemExit("--repetitions must be at least 15")
+        if args.output.exists():
+            raise SystemExit(f"output already exists: {args.output}")
+
+        narjar = os.environ.get("NARJAR_BIN")
+        if narjar is None:
+            raise SystemExit("NARJAR_BIN must point to the release binary")
+
+        run = cls(
+            output=args.output,
+            repetitions=args.repetitions,
+            narjar=Path(narjar).resolve(),
+            bincache=resolve_bincache(args.bincache_bin),
+        )
+        run.output.mkdir(parents=True)
+        return run
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Prepare a pinned, matched Narjar/bincache benchmark run."
@@ -67,20 +98,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
-    if platform.system() != "Linux":
-        raise SystemExit("the continuation benchmark requires Linux /proc")
-    if args.repetitions < 15:
-        raise SystemExit("--repetitions must be at least 15")
-    if args.output.exists():
-        raise SystemExit(f"output already exists: {args.output}")
-
-    narjar = os.environ.get("NARJAR_BIN")
-    if narjar is None:
-        raise SystemExit("NARJAR_BIN must point to the release binary")
-
-    bincache = resolve_bincache(args.bincache_bin)
-    args.output.mkdir(parents=True)
+    run = Run.prepare(parse_args())
 
     metadata = {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -88,18 +106,18 @@ def main() -> int:
         "platform": platform.platform(),
         "uname": " ".join(platform.uname()),
         "cpu_count": os.cpu_count(),
-        "filesystem": command("findmnt", "-T", str(args.output), "-no", "SOURCE,FSTYPE,OPTIONS"),
+        "filesystem": command("findmnt", "-T", str(run.output), "-no", "SOURCE,FSTYPE,OPTIONS"),
         "nix": command("nix", "--version"),
         "rustc": optional_command("rustc", "--version"),
-        "narjar_binary": str(Path(narjar).resolve()),
-        "bincache_binary": str(bincache.resolve()),
+        "narjar_binary": str(run.narjar),
+        "bincache_binary": str(run.bincache),
         "bincache_commit": BINCACHE_COMMIT,
-        "repetitions": args.repetitions,
+        "repetitions": run.repetitions,
     }
-    (args.output / "environment.json").write_text(
+    (run.output / "environment.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n"
     )
-    (args.output / "commands.txt").write_text(
+    (run.output / "commands.txt").write_text(
         " ".join(
             (
                 "nix",
@@ -112,7 +130,7 @@ def main() -> int:
         )
         + "\n"
     )
-    print(args.output)
+    print(run.output)
     return 0
 
 
