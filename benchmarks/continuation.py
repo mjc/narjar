@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""Prepare a reproducible Narjar/bincache continuation benchmark."""
+"""Run the matched Narjar/bincache continuation benchmark."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
+import random
 import shutil
+import socket
+import statistics
 import subprocess
 import sys
-from dataclasses import dataclass
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Sequence
 
 BINCACHE_COMMIT = "556a9c8f97a3c994a9de85f567a2ef16ce6513ab"
 BINCACHE_FLAKE = f"github:wyattgill9/bincache/{BINCACHE_COMMIT}"
+SEED = 29030
 
 
 def command(*args: str) -> str:
@@ -43,10 +53,25 @@ def resolve_bincache(explicit: Path | None) -> Path:
     return Path(output.splitlines()[-1]) / "bin" / "bincache"
 
 
+def reserve_port() -> int:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def read_optional(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
 @dataclass(frozen=True)
 class Run:
     output: Path
+    work: Path
     repetitions: int
+    quick: bool
     narjar: Path
     bincache: Path
 
@@ -54,7 +79,7 @@ class Run:
     def prepare(cls, args: argparse.Namespace) -> "Run":
         if platform.system() != "Linux":
             raise SystemExit("the continuation benchmark requires Linux /proc")
-        if args.repetitions < 15:
+        if not args.quick and args.repetitions < 15:
             raise SystemExit("--repetitions must be at least 15")
         if args.output.exists():
             raise SystemExit(f"output already exists: {args.output}")
@@ -63,19 +88,255 @@ class Run:
         if narjar is None:
             raise SystemExit("NARJAR_BIN must point to the release binary")
 
-        run = cls(
+        args.output.mkdir(parents=True)
+        work = Path(tempfile.mkdtemp(prefix=".continuation-", dir=args.output.parent))
+        return cls(
             output=args.output,
-            repetitions=args.repetitions,
+            work=work,
+            repetitions=1 if args.quick else args.repetitions,
+            quick=args.quick,
             narjar=Path(narjar).resolve(),
             bincache=resolve_bincache(args.bincache_bin),
         )
-        run.output.mkdir(parents=True)
-        return run
+
+
+@dataclass
+class Candidate:
+    name: str
+    binary: Path
+    root: Path
+    log_dir: Path
+    process: subprocess.Popen[str] | None = field(default=None, init=False)
+    url: str | None = field(default=None, init=False)
+    public_key: str = field(default="", init=False)
+    netrc: Path = field(init=False)
+    _log: Any = field(default=None, init=False, repr=False)
+
+    @property
+    def data_dir(self) -> Path:
+        return self.root / "data"
+
+    def prepare(self) -> None:
+        self.data_dir.mkdir(parents=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        secret = self.root / "secret-key"
+        token_file = self.root / "push-token"
+
+        if self.name == "narjar":
+            public = self.root / "public-key"
+            subprocess.run(
+                [
+                    "nix-store",
+                    "--generate-binary-cache-key",
+                    "narjar-benchmark",
+                    str(secret),
+                    str(public),
+                ],
+                check=True,
+            )
+            self.public_key = public.read_text().strip()
+            shutil.copyfile(public, self.data_dir / "trusted-public-keys")
+            token = command(
+                str(self.binary),
+                "token",
+                "create",
+                "--data-dir",
+                str(self.data_dir),
+                "--scope",
+                "write",
+                "--name",
+                "benchmark",
+            )
+        else:
+            generated = subprocess.run(
+                [str(self.binary), "keygen", "--name", "bincache-benchmark"],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            secret.write_text(generated.stdout)
+            prefix = "trusted-public-keys entry: "
+            public_line = generated.stderr.strip()
+            if not public_line.startswith(prefix):
+                raise RuntimeError(f"unexpected bincache keygen output: {public_line}")
+            self.public_key = public_line.removeprefix(prefix)
+            token = command(str(self.binary), "token")
+
+        token_file.write_text(token + "\n")
+        self.netrc = self.root / "netrc"
+        self.netrc.write_text(
+            f"machine 127.0.0.1\nlogin benchmark\npassword {token}\n"
+        )
+        self.netrc.chmod(0o600)
+
+    def server_command(self, port: int) -> list[str]:
+        if self.name == "narjar":
+            return [
+                str(self.binary),
+                "serve",
+                "--data-dir",
+                str(self.data_dir),
+                "--listen",
+                f"127.0.0.1:{port}",
+                "--workers",
+                "1",
+            ]
+        return [
+            str(self.binary),
+            "serve",
+            "--data-dir",
+            str(self.data_dir),
+            "--secret-key-file",
+            str(self.root / "secret-key"),
+            "--push-token-file",
+            str(self.root / "push-token"),
+            "--listen",
+            f"127.0.0.1:{port}",
+            "--shards",
+            "1",
+        ]
+
+    def start(self) -> float:
+        if self.process is not None:
+            raise RuntimeError(f"{self.name} is already running")
+
+        port = reserve_port()
+        self.url = f"http://127.0.0.1:{port}"
+        self._log = (self.log_dir / f"{self.name}.log").open("a")
+        started = time.perf_counter_ns()
+        self.process = subprocess.Popen(
+            self.server_command(port),
+            stdout=self._log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                log = (self.log_dir / f"{self.name}.log").read_text()
+                self.stop()
+                raise RuntimeError(f"{self.name} exited during startup:\n{log}")
+            try:
+                with urllib.request.urlopen(
+                    f"{self.url}/nix-cache-info", timeout=0.2
+                ) as response:
+                    response.read()
+                return (time.perf_counter_ns() - started) / 1_000_000
+            except (OSError, urllib.error.URLError):
+                time.sleep(0.002)
+
+        self.stop()
+        raise RuntimeError(f"{self.name} did not become ready")
+
+    def stop(self) -> None:
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+            self.process = None
+        self.url = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+    def rss_kib(self) -> int:
+        if self.process is None:
+            raise RuntimeError(f"{self.name} is not running")
+        status = Path(f"/proc/{self.process.pid}/smaps_rollup").read_text()
+        for line in status.splitlines():
+            if line.startswith("Rss:"):
+                return int(line.split()[1])
+        raise RuntimeError(f"RSS missing for {self.name}")
+
+    def publish(self, paths: Sequence[str]) -> None:
+        if self.url is None:
+            raise RuntimeError(f"{self.name} is not running")
+        for offset in range(0, len(paths), 128):
+            batch = paths[offset : offset + 128]
+            if self.name == "narjar":
+                subprocess.run(
+                    [
+                        "nix",
+                        "store",
+                        "sign",
+                        "--key-file",
+                        str(self.root / "secret-key"),
+                        *batch,
+                    ],
+                    check=True,
+                )
+            subprocess.run(
+                [
+                    "nix",
+                    "copy",
+                    "--refresh",
+                    "--option",
+                    "netrc-file",
+                    str(self.netrc),
+                    "--to",
+                    f"{self.url}?compression=none",
+                    *batch,
+                ],
+                check=True,
+            )
+
+class Recorder:
+    def __init__(self, output: Path) -> None:
+        self.path = output / "samples.jsonl"
+        self.rows: list[dict[str, Any]] = []
+
+    def add(
+        self,
+        case: str,
+        candidate: str,
+        repetition: int,
+        value: float,
+        unit: str,
+        **context: Any,
+    ) -> None:
+        row = {
+            "case": case,
+            "candidate": candidate,
+            "repetition": repetition,
+            "value": value,
+            "unit": unit,
+            **context,
+        }
+        self.rows.append(row)
+        with self.path.open("a") as stream:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def summary(self) -> list[dict[str, Any]]:
+        groups: dict[tuple[str, str, str], list[float]] = {}
+        for row in self.rows:
+            key = (row["case"], row["candidate"], row["unit"])
+            groups.setdefault(key, []).append(row["value"])
+
+        result = []
+        for (case, candidate, unit), values in sorted(groups.items()):
+            ordered = sorted(values)
+            result.append(
+                {
+                    "case": case,
+                    "candidate": candidate,
+                    "unit": unit,
+                    "n": len(values),
+                    "median": statistics.median(values),
+                    "p95": ordered[math.ceil(0.95 * len(ordered)) - 1],
+                    "min": ordered[0],
+                    "max": ordered[-1],
+                }
+            )
+        return result
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare a pinned, matched Narjar/bincache benchmark run."
+        description="Run a pinned, matched Narjar/bincache benchmark."
     )
     parser.add_argument(
         "--output",
@@ -94,44 +355,199 @@ def parse_args() -> argparse.Namespace:
         default=15,
         help="measured repetitions per case after warm-up (default: 15)",
     )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="run one repetition over a ten-path corpus; not decision evidence",
+    )
     return parser.parse_args()
 
 
-def main() -> int:
-    run = Run.prepare(parse_args())
+def environment(run: Run) -> dict[str, Any]:
+    cpu_model = None
+    for line in Path("/proc/cpuinfo").read_text().splitlines():
+        if line.startswith("model name"):
+            cpu_model = line.partition(":")[2].strip()
+            break
 
-    metadata = {
+    return {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "host": platform.node(),
         "platform": platform.platform(),
         "uname": " ".join(platform.uname()),
         "cpu_count": os.cpu_count(),
-        "filesystem": command("findmnt", "-T", str(run.output), "-no", "SOURCE,FSTYPE,OPTIONS"),
+        "cpu_model": cpu_model,
+        "cpu_governor": read_optional(
+            Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        ),
+        "filesystem": command(
+            "findmnt", "-T", str(run.output), "-no", "SOURCE,FSTYPE,OPTIONS"
+        ),
         "nix": command("nix", "--version"),
         "rustc": optional_command("rustc", "--version"),
         "narjar_binary": str(run.narjar),
+        "narjar_commit": optional_command("git", "rev-parse", "HEAD"),
         "bincache_binary": str(run.bincache),
         "bincache_commit": BINCACHE_COMMIT,
         "repetitions": run.repetitions,
+        "random_seed": SEED,
+        "quick": run.quick,
     }
-    (run.output / "environment.json").write_text(
-        json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+
+
+def corpus(count: int) -> list[str]:
+    expression = (
+        "builtins.genList "
+        '(i: builtins.toFile ("narjar-continuation-" + builtins.toString i) '
+        "(builtins.toString i)) "
+        f"{count}"
     )
-    (run.output / "commands.txt").write_text(
-        " ".join(
-            (
-                "nix",
-                "build",
-                "--no-write-lock-file",
-                "--no-link",
-                "--print-out-paths",
-                BINCACHE_FLAKE,
+    return json.loads(command("nix", "eval", "--json", "--expr", expression))
+
+
+def benchmark_startup(
+    run: Run,
+    candidates: list[Candidate],
+    recorder: Recorder,
+    rng: random.Random,
+) -> None:
+    targets = [0, 10] if run.quick else [0, 100, 1_000, 10_000]
+    paths = corpus(targets[-1])
+    published = 0
+
+    for target in targets:
+        additions = paths[published:target]
+        order = candidates.copy()
+        rng.shuffle(order)
+        for candidate in order:
+            if additions:
+                candidate.start()
+                candidate.publish(additions)
+                candidate.stop()
+        published = target
+
+        for candidate in candidates:
+            candidate.start()
+            candidate.stop()
+
+        schedule = [
+            candidate
+            for candidate in candidates
+            for _ in range(run.repetitions)
+        ]
+        rng.shuffle(schedule)
+        repetitions = {candidate.name: 0 for candidate in candidates}
+        for order_index, candidate in enumerate(schedule):
+            repetition = repetitions[candidate.name]
+            repetitions[candidate.name] += 1
+            startup_ms = candidate.start()
+            time.sleep(0.2)
+            recorder.add(
+                f"startup_{target}_paths",
+                candidate.name,
+                repetition,
+                startup_ms,
+                "ms",
+                cache_paths=target,
+                order=order_index,
             )
-        )
-        + "\n"
+            recorder.add(
+                f"settled_idle_rss_{target}_paths",
+                candidate.name,
+                repetition,
+                candidate.rss_kib(),
+                "KiB",
+                cache_paths=target,
+                order=order_index,
+            )
+            candidate.stop()
+
+
+def measure_closures(run: Run, recorder: Recorder) -> None:
+    binaries = {"narjar": run.narjar, "bincache": run.bincache}
+    if not run.quick:
+        static_output = command(
+            "nix",
+            "build",
+            "--no-link",
+            "--print-out-paths",
+            ".#narjar-static",
+        ).splitlines()[-1]
+        binaries["narjar-static"] = Path(static_output) / "bin" / "narjar"
+
+    for name, binary in binaries.items():
+        output = binary.parent.parent
+        closure_bytes = int(command("nix", "path-info", "-S", str(output)).split()[-1])
+        recorder.add("binary_size", name, 0, binary.stat().st_size, "bytes")
+        recorder.add("runtime_closure_size", name, 0, closure_bytes, "bytes")
+
+
+def write_report(run: Run, recorder: Recorder) -> None:
+    summary = recorder.summary()
+    (run.output / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )
-    print(run.output)
-    return 0
+
+    lines = [
+        "# Continuation benchmark",
+        "",
+        f"- bincache ref: `{BINCACHE_COMMIT}`",
+        f"- repetitions: {run.repetitions}",
+        f"- random seed: {SEED}",
+        f"- quick smoke run: {'yes; not decision evidence' if run.quick else 'no'}",
+        "",
+        "| Case | Candidate | n | Median | p95 | Min | Max | Unit |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in summary:
+        lines.append(
+            "| {case} | {candidate} | {n} | {median:.3f} | {p95:.3f} | "
+            "{min:.3f} | {max:.3f} | {unit} |".format(**row)
+        )
+    (run.output / "report.md").write_text("\n".join(lines) + "\n")
+
+
+def main() -> int:
+    run = Run.prepare(parse_args())
+    candidates = [
+        Candidate("narjar", run.narjar, run.work / "narjar", run.output / "logs"),
+        Candidate(
+            "bincache",
+            run.bincache,
+            run.work / "bincache",
+            run.output / "logs",
+        ),
+    ]
+    try:
+        (run.output / "environment.json").write_text(
+            json.dumps(environment(run), indent=2, sort_keys=True) + "\n"
+        )
+        (run.output / "commands.txt").write_text(
+            " ".join(
+                (
+                    "nix",
+                    "build",
+                    "--no-write-lock-file",
+                    "--no-link",
+                    "--print-out-paths",
+                    BINCACHE_FLAKE,
+                )
+            )
+            + "\n"
+        )
+        for candidate in candidates:
+            candidate.prepare()
+
+        recorder = Recorder(run.output)
+        benchmark_startup(run, candidates, recorder, random.Random(SEED))
+        measure_closures(run, recorder)
+        write_report(run, recorder)
+        print(run.output)
+        return 0
+    finally:
+        for candidate in candidates:
+            candidate.stop()
+        shutil.rmtree(run.work, ignore_errors=True)
 
 
 if __name__ == "__main__":
