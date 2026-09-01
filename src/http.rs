@@ -262,6 +262,7 @@ fn respond_nar_put(
     storage: &Storage,
     id: &NarObjectId,
     max_nar_bytes: u64,
+    min_free_bytes: u64,
 ) {
     if has_header(&request, "Transfer-Encoding") {
         let _ = request.respond(Response::empty(StatusCode(400)));
@@ -281,6 +282,17 @@ fn respond_nar_put(
         let _ = request.respond(Response::empty(StatusCode(413)));
         return;
     }
+    match storage.has_capacity_for(length, min_free_bytes) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = request.respond(Response::empty(StatusCode(507)));
+            return;
+        }
+        Err(_) => {
+            let _ = request.respond(Response::empty(StatusCode(500)));
+            return;
+        }
+    }
 
     let status = match storage.publish_nar(id, request.as_reader(), length) {
         Ok(PublishOutcome::Created) => 201,
@@ -293,7 +305,12 @@ fn respond_nar_put(
     let _ = request.respond(Response::empty(StatusCode(status)));
 }
 
-pub fn respond(request: tiny_http::Request, storage: &Storage, max_nar_bytes: u64) {
+pub fn respond(
+    request: tiny_http::Request,
+    storage: &Storage,
+    max_nar_bytes: u64,
+    min_free_bytes: u64,
+) {
     let route = match ReadRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
         RouteMatch::UnsupportedEncoding => {
@@ -314,7 +331,9 @@ pub fn respond(request: tiny_http::Request, storage: &Storage, max_nar_bytes: u6
 
     if matches!(request.method(), Method::Put) {
         return match route {
-            ReadRoute::Nar(id) => respond_nar_put(request, storage, &id, max_nar_bytes),
+            ReadRoute::Nar(id) => {
+                respond_nar_put(request, storage, &id, max_nar_bytes, min_free_bytes)
+            }
             ReadRoute::CacheInfo | ReadRoute::NarInfo(_) => {
                 method_not_allowed(request, "GET, HEAD")
             }

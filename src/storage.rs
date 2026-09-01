@@ -2,6 +2,7 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read},
+    mem::MaybeUninit,
     num::NonZeroUsize,
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
@@ -246,6 +247,15 @@ impl Storage {
             publication_lock: Mutex::new(()),
             _lock: lock,
         })
+    }
+
+    pub(crate) fn has_capacity_for(
+        &self,
+        object_bytes: u64,
+        min_free_bytes: u64,
+    ) -> Result<bool, StorageError> {
+        let required = object_bytes.saturating_add(min_free_bytes);
+        Ok(available_bytes(&self.layout.root)? >= required)
     }
 
     #[cfg(test)]
@@ -510,6 +520,22 @@ impl std::error::Error for StorageError {
             Self::Conflict | Self::MissingNar | Self::Locked => None,
         }
     }
+}
+
+fn available_bytes(path: &Path) -> io::Result<u64> {
+    let directory = File::open(path)?;
+    let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
+
+    // SAFETY: directory owns a valid descriptor for the duration of the call,
+    // and statistics points to writable storage for one statvfs value.
+    if unsafe { libc::fstatvfs(directory.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: fstatvfs returned success, so it initialized statistics.
+    let statistics = unsafe { statistics.assume_init() };
+    let available = (statistics.f_bavail as u128).saturating_mul(statistics.f_frsize as u128);
+    Ok(available.min(u128::from(u64::MAX)) as u64)
 }
 
 fn open_optional(path: PathBuf) -> Result<Option<File>, StorageError> {
