@@ -21,6 +21,9 @@ const CONFIG_ENV: &[&str] = &[
 ];
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
+const NAR_BYTES: &[u8] = b"narjar";
+const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+const CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
 const STORE_HASH: &str = "00000000000000000000000000000000";
 const TEST_AUTHORIZATION: &str = "Basic bmFyamFyOnRlc3Qtd3JpdGUtdG9rZW4=";
 const TEST_WRITE_TOKEN: &str =
@@ -621,10 +624,7 @@ fn response_parts(response: &[u8]) -> (String, Vec<u8>) {
 }
 
 fn run_conformance_trace(server: &RunningServer, fixture: &str) -> String {
-    const CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
-    const NAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
-
-    let narinfo = signed_narinfo(NAR_HASH, 6);
+    let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
     let mut transcript = String::new();
     for (line_number, line) in fixture.lines().enumerate() {
         if line.is_empty() || line.starts_with('#') {
@@ -637,7 +637,7 @@ fn run_conformance_trace(server: &RunningServer, fixture: &str) -> String {
         let body: Option<&[u8]> = match *body_fixture {
             "-" => None,
             "cache-info" => Some(CACHE_INFO),
-            "nar" => Some(b"narjar"),
+            "nar" => Some(NAR_BYTES),
             "narinfo" => Some(narinfo.as_bytes()),
             fixture => panic!(
                 "unknown body fixture {fixture:?} on line {}",
@@ -955,13 +955,11 @@ fn read_misses_do_not_hide_corrupt_or_unreadable_finals() {
 
 #[test]
 fn nar_put_streams_hash_checks_and_retries_immutably() {
-    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
-
     let server = RunningServer::start("nar-put");
     let path = format!("/nar/{NARJAR_HASH}.nar");
-    let created = server.request_with_body("PUT", &path, &[], b"narjar");
-    let identical = server.request_with_body("PUT", &path, &[], b"narjar");
-    let mismatch = server.request_with_body("PUT", &format!("/nar/{NAR_ID}.nar"), &[], b"narjar");
+    let created = server.request_with_body("PUT", &path, &[], NAR_BYTES);
+    let identical = server.request_with_body("PUT", &path, &[], NAR_BYTES);
+    let mismatch = server.request_with_body("PUT", &format!("/nar/{NAR_ID}.nar"), &[], NAR_BYTES);
     let missing_length = server.request("PUT", &path);
     let published = fs::read(server.data_dir.join(format!("nar/{NARJAR_HASH}.nar")));
     let mismatched_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
@@ -977,7 +975,7 @@ fn nar_put_streams_hash_checks_and_retries_immutably() {
         assert!(headers.starts_with(expected_status), "{headers:?}");
         assert!(body.is_empty());
     }
-    assert_eq!(published.expect("published NAR"), b"narjar");
+    assert_eq!(published.expect("published NAR"), NAR_BYTES);
     assert!(!mismatched_path.exists());
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
@@ -985,10 +983,9 @@ fn nar_put_streams_hash_checks_and_retries_immutably() {
 
 #[test]
 fn narinfo_put_rejects_unsigned_metadata_without_publication() {
-    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     let server = RunningServer::start("narinfo-put-unsigned");
     let nar_path = format!("/nar/{NARJAR_HASH}.nar");
-    let nar_created = server.request_with_body("PUT", &nar_path, &[], b"narjar");
+    let nar_created = server.request_with_body("PUT", &nar_path, &[], NAR_BYTES);
     let narinfo = format!(
         "StorePath: /nix/store/{STORE_HASH}-narjar\n\
          URL: nar/{NARJAR_HASH}.nar\n\
@@ -1026,11 +1023,10 @@ fn narinfo_put_rejects_unsigned_metadata_without_publication() {
 
 #[test]
 fn narinfo_put_accepts_a_trusted_nix_signature() {
-    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     let server = RunningServer::start("narinfo-put-trusted");
     let nar_created =
-        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], b"narjar");
-    let narinfo = signed_narinfo(NARJAR_HASH, 6);
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
+    let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
     let path = format!("/{STORE_HASH}.narinfo");
     let created = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
     let identical = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
@@ -1058,12 +1054,14 @@ fn narinfo_put_accepts_a_trusted_nix_signature() {
 }
 #[test]
 fn narinfo_put_rejects_a_signed_malformed_deriver() {
-    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     let server = RunningServer::start("narinfo-put-bad-deriver");
     let nar_created =
-        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], b"narjar");
-    let narinfo =
-        signed_narinfo(NARJAR_HASH, 6).replacen("Sig:", "Deriver: not-a-store-path\nSig:", 1);
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
+    let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64).replacen(
+        "Sig:",
+        "Deriver: not-a-store-path\nSig:",
+        1,
+    );
     let path = format!("/{STORE_HASH}.narinfo");
     let rejected = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
     let missing = server.request("GET", &path);
@@ -1089,12 +1087,14 @@ fn narinfo_put_rejects_a_signed_malformed_deriver() {
 }
 #[test]
 fn narinfo_put_rejects_a_signed_malformed_content_address() {
-    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     let server = RunningServer::start("narinfo-put-bad-ca");
     let nar_created =
-        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], b"narjar");
-    let narinfo =
-        signed_narinfo(NARJAR_HASH, 6).replacen("Sig:", "CA: fixed:sha256:not-a-hash\nSig:", 1);
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
+    let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64).replacen(
+        "Sig:",
+        "CA: fixed:sha256:not-a-hash\nSig:",
+        1,
+    );
     let path = format!("/{STORE_HASH}.narinfo");
     let rejected = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
     let missing = server.request("GET", &path);
@@ -1120,7 +1120,6 @@ fn narinfo_put_rejects_a_signed_malformed_content_address() {
 }
 #[test]
 fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
-    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     let old = SigningKey::from_bytes(&[7; 32]);
     let new = SigningKey::from_bytes(&[8; 32]);
     let overlap = format!(
@@ -1131,8 +1130,8 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
     let server = RunningServer::start_with_trusted_keys("trusted-key-rotation", &overlap);
     let path = format!("/{STORE_HASH}.narinfo");
     let nar_created =
-        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], b"narjar");
-    let narinfo = signed_narinfo(NARJAR_HASH, 6);
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
+    let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
     let metadata_created = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
     let data_dir = server.data_dir.clone();
     let (signal, status) = server.stop_preserving();
@@ -1197,17 +1196,16 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
 
 #[test]
 fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
-    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     let path = format!("/nar/{NARJAR_HASH}.nar");
 
     let server = RunningServer::start("nar-put-invalid");
     let encoded =
-        server.request_with_body("PUT", &path, &[("Content-Encoding", "gzip")], b"narjar");
-    let compressed = server.request_with_body("PUT", &format!("{path}.xz"), &[], b"narjar");
+        server.request_with_body("PUT", &path, &[("Content-Encoding", "gzip")], NAR_BYTES);
+    let compressed = server.request_with_body("PUT", &format!("{path}.xz"), &[], NAR_BYTES);
 
     let mut truncated_stream = server.open_request("PUT", &path, &[("Content-Length", "7")]);
     truncated_stream
-        .write_all(b"narjar")
+        .write_all(NAR_BYTES)
         .expect("write truncated request body");
     truncated_stream
         .shutdown(Shutdown::Write)
@@ -1225,7 +1223,7 @@ fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
     let (signal, status) = server.stop();
 
     let limited = RunningServer::start_with_args("nar-put-oversized", &["--max-nar-bytes", "5"]);
-    let oversized = limited.request_with_body("PUT", &path, &[], b"narjar");
+    let oversized = limited.request_with_body("PUT", &path, &[], NAR_BYTES);
     let oversized_path = limited.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
     let (limited_signal, limited_status) = limited.stop();
 
@@ -1266,13 +1264,12 @@ fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
 
 #[test]
 fn nar_put_preserves_the_configured_free_space_reserve() {
-    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     let server = RunningServer::start_with_args(
         "nar-put-reserve",
         &["--min-free-bytes", "18446744073709551615"],
     );
     let response =
-        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], b"narjar");
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
     let final_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
     let (signal, status) = server.stop();
     let (headers, body) = response_parts(&response);
@@ -1330,12 +1327,11 @@ fn saturated_request_limit_rejects_excess_work() {
 
 #[test]
 fn writes_require_valid_basic_auth_before_route_or_storage() {
-    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     let server = RunningServer::start("write-auth");
     let path = format!("/nar/{NARJAR_HASH}.nar");
-    let missing = server.raw_request_with_body("PUT", &path, &[], b"narjar");
+    let missing = server.raw_request_with_body("PUT", &path, &[], NAR_BYTES);
     let malformed =
-        server.raw_request_with_body("PUT", &path, &[("Authorization", "Basic !!!")], b"narjar");
+        server.raw_request_with_body("PUT", &path, &[("Authorization", "Basic !!!")], NAR_BYTES);
     let public_read = server.request("GET", "/nix-cache-info");
     let final_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
     let (signal, status) = server.stop();
@@ -1489,8 +1485,6 @@ fn token_create_and_revoke_rotate_hashed_write_credentials() {
 
 #[test]
 fn nix_cache_info_put_is_durable_idempotent_and_immutable() {
-    const CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
-
     let server = RunningServer::start("nix-cache-info-put");
     let created = server.request_with_body("PUT", "/nix-cache-info", &[], CACHE_INFO);
     let identical = server.request_with_body("PUT", "/nix-cache-info", &[], CACHE_INFO);
