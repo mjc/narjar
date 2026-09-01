@@ -1,3 +1,54 @@
+use std::path::PathBuf;
+
+const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+#[derive(Debug, Eq, PartialEq)]
+struct NarObjectId(String);
+
+impl NarObjectId {
+    fn parse(value: &str) -> Result<Self, ()> {
+        parse_nix32(value, 52).map(Self)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct StoreHash(String);
+
+impl StoreHash {
+    fn parse(value: &str) -> Result<Self, ()> {
+        parse_nix32(value, 32).map(Self)
+    }
+}
+
+fn parse_nix32(value: &str, expected_len: usize) -> Result<String, ()> {
+    (value.len() == expected_len && value.bytes().all(|byte| NIX32.contains(&byte)))
+        .then(|| value.to_owned())
+        .ok_or(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Layout {
+    root: PathBuf,
+}
+
+impl Layout {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    fn nar_path(&self, id: &NarObjectId) -> PathBuf {
+        self.root.join("nar").join(format!("{}.nar", id.0))
+    }
+
+    fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
+        self.root.join(format!("{}.narinfo", hash.0))
+    }
+
+    fn temp_dir(&self) -> PathBuf {
+        self.root.join(".tmp")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
