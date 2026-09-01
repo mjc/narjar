@@ -15,6 +15,7 @@ The initial allowed set is deliberately small:
 | getrandom | Cryptographic token and temporary-name entropy | Rust 1.85 std has no stable OS RNG API | Full rand distribution framework |
 | subtle | Constant-time fixed-size token-hash comparison | Optimizers can defeat a handwritten compare | Password-KDF stack for already-random 256-bit tokens |
 | signal-hook | Portable SIGINT/SIGTERM flag registration | Rust std exposes no stable signal handler API | Async runtime or control-socket framework |
+| libc | Nonblocking advisory lock on `DATA/lock` | Rust 1.85 has no stable file-lock API | Stale PID files or a larger portability crate |
 
 Candidate metadata captured with `cargo info` on 2026-08-31. These are review
 candidates, not loose semver ranges: implementation pins the selected exact
@@ -29,6 +30,7 @@ versions in Cargo.lock and upgrades only after the same dependency gates.
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | 1.85 | no optional features; direct OS entropy; no `rand` distribution stack |
 | subtle | 2.6.1 | BSD-3-Clause | undeclared; prove on 1.85 | default features off; fixed-size comparison only; pure Rust |
 | signal-hook | 0.4.4 | MIT OR Apache-2.0 | 1.66 | default features off; flag registration only; no iterator/channel or C helper |
+| libc | 0.2.189 | MIT OR Apache-2.0 | 1.65 | default features off; one documented `flock` call; already present through signal-hook |
 
 The project MSRV is Rust 1.85, matching the pinned shell. An undeclared upstream
 MSRV is accepted only after an explicit 1.85 build. Every candidate is

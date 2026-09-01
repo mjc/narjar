@@ -2,6 +2,7 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read},
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
@@ -75,6 +76,9 @@ impl Layout {
     fn realisations_dir(&self) -> PathBuf {
         self.root.join("realisations")
     }
+    fn lock_path(&self) -> PathBuf {
+        self.root.join("lock")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +104,7 @@ fn injected_fault(boundary: PublishBoundary, fault: PublishBoundary) -> Result<(
 #[derive(Debug)]
 pub struct Storage {
     layout: Layout,
+    _lock: File,
 }
 
 impl Storage {
@@ -109,9 +114,21 @@ impl Storage {
         fs::create_dir_all(layout.nar_dir())?;
         fs::create_dir_all(layout.temp_dir())?;
         fs::create_dir_all(layout.realisations_dir())?;
+
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(layout.lock_path())?;
+        lock_exclusive(&lock)?;
         sync_dir(&layout.root)?;
 
-        Ok(Self { layout })
+        Ok(Self {
+            layout,
+            _lock: lock,
+        })
     }
 
     #[cfg(test)]
@@ -302,6 +319,7 @@ pub enum PublishOutcome {
 #[derive(Debug)]
 pub enum StorageError {
     Conflict,
+    Locked,
     MissingNar,
     Io(io::Error),
 }
@@ -317,6 +335,7 @@ impl fmt::Display for StorageError {
         match self {
             Self::Conflict => formatter.write_str("immutable destination has different contents"),
             Self::MissingNar => formatter.write_str("referenced NAR is not published"),
+            Self::Locked => formatter.write_str("data directory is locked by another process"),
             Self::Io(error) => error.fmt(formatter),
         }
     }
@@ -326,7 +345,7 @@ impl std::error::Error for StorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Conflict | Self::MissingNar => None,
+            Self::Conflict | Self::MissingNar | Self::Locked => None,
         }
     }
 }
@@ -342,6 +361,26 @@ fn rollback_link(destination: &Path, parent: &Path) -> Result<(), StorageError> 
     fs::remove_file(destination)?;
     sync_dir(parent)?;
     Ok(())
+}
+
+fn lock_exclusive(file: &File) -> Result<(), StorageError> {
+    // SAFETY: file owns this live descriptor for the entire call. flock neither
+    // dereferences Rust memory nor retains the descriptor after returning.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    let code = error.raw_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock
+        || code == Some(libc::EAGAIN)
+        || code == Some(libc::EWOULDBLOCK)
+    {
+        Err(StorageError::Locked)
+    } else {
+        Err(error.into())
+    }
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
