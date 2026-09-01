@@ -17,11 +17,21 @@
     };
   };
 
-  outputs = { nixpkgs, crane, rust-overlay, ... }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      crane,
+      rust-overlay,
+      ...
+    }:
     let
       lib = nixpkgs.lib;
       rustVersion = "1.85.1";
-      supportedSystems = [ "aarch64-darwin" "x86_64-linux" ];
+      supportedSystems = [
+        "aarch64-darwin"
+        "x86_64-linux"
+      ];
       staticTarget = "x86_64-unknown-linux-musl";
       staticSystem = "x86_64-linux";
       lockIdentity = builtins.hashFile "sha256" ./flake.lock;
@@ -31,17 +41,22 @@
       };
       repositorySrc = lib.cleanSourceWith {
         src = ./.;
-        filter = path: type:
+        filter =
+          path: type:
           lib.cleanSourceFilter path type
           && !(lib.hasPrefix (toString ./. + "/benchmarks/results") (toString path));
       };
 
-      mkToolchain = pkgs: targets:
+      mkToolchain =
+        pkgs: targets:
         pkgs.rust-bin.stable.${rustVersion}.default.override (
           {
-            extensions = [ "rust-src" "rust-analyzer-preview" ];
+            extensions = [
+              "rust-src"
+              "rust-analyzer-preview"
+            ];
           }
-          // lib.optionalAttrs (targets != []) { inherit targets; }
+          // lib.optionalAttrs (targets != [ ]) { inherit targets; }
         );
 
       mkCraneBuild =
@@ -49,36 +64,54 @@
           pkgs,
           toolchain,
           cargoExtraArgs ? "--locked",
-          extraArgs ? {},
+          extraArgs ? { },
         }:
         let
           craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
-          src = craneLib.cleanCargoSource ./.;
+          src = lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              craneLib.filterCargoSources path type
+              || toString path == toString ./tests/fixtures/nix-2.31.5-http-v0.1.tsv;
+          };
           cargoVendorDir = craneLib.vendorCargoDeps { inherit src; };
           commonArgs = {
             inherit src cargoVendorDir cargoExtraArgs;
             pname = "narjar";
             version = "0.1.0";
             strictDeps = true;
-          } // extraArgs;
+          }
+          // extraArgs;
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-          narjar = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-            doCheck = false;
-            meta.mainProgram = "narjar";
-          });
+          narjar = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              doCheck = false;
+              meta.mainProgram = "narjar";
+            }
+          );
         in
         {
-          inherit craneLib src cargoVendorDir commonArgs cargoArtifacts narjar;
+          inherit
+            craneLib
+            src
+            cargoVendorDir
+            commonArgs
+            cargoArtifacts
+            narjar
+            ;
         };
 
-      mkSystem = system:
+      mkSystem =
+        system:
         let
           pkgs = import nixpkgs {
             inherit system;
             overlays = [ (import rust-overlay) ];
           };
-          toolchain = mkToolchain pkgs [];
+          toolchain = mkToolchain pkgs [ ];
           build = mkCraneBuild { inherit pkgs toolchain; };
           provenance = pkgs.writeShellScriptBin "narjar-provenance" ''
             echo "flake_lock_identity=${lockIdentity}"
@@ -115,8 +148,15 @@
             '';
           };
         in
-        build // {
-          inherit pkgs toolchain provenance nixE2E continuationBenchmark;
+        build
+        // {
+          inherit
+            pkgs
+            toolchain
+            provenance
+            nixE2E
+            continuationBenchmark
+            ;
         };
 
       systems = lib.genAttrs supportedSystems mkSystem;
@@ -129,25 +169,64 @@
           nativeBuildInputs = [ systems.${staticSystem}.pkgs.pkgsStatic.stdenv.cc ];
         };
       };
-    in
-    {
-      packages = lib.mapAttrs (_system: env: {
-        narjar = env.narjar;
-        default = env.narjar;
-        cargo-artifacts = env.cargoArtifacts;
-        nix-e2e = env.nixE2E;
-        continuation-benchmark = env.continuationBenchmark;
-      }) systems // {
-        ${staticSystem} = {
-          narjar = systems.${staticSystem}.narjar;
-          default = systems.${staticSystem}.narjar;
-          cargo-artifacts = systems.${staticSystem}.cargoArtifacts;
-          narjar-static = static.narjar;
-          static-cargo-artifacts = static.cargoArtifacts;
-          nix-e2e = systems.${staticSystem}.nixE2E;
-          continuation-benchmark = systems.${staticSystem}.continuationBenchmark;
+      containerImage = systems.${staticSystem}.pkgs.dockerTools.buildLayeredImage {
+        name = "narjar";
+        tag = "latest";
+        contents = [ static.narjar ];
+        extraCommands = ''
+          mkdir -p var/lib/narjar
+          chmod 0700 var/lib/narjar
+          chown 65532:65532 var/lib/narjar
+        '';
+        config = {
+          Entrypoint = [ "${static.narjar}/bin/narjar" ];
+          Cmd = [
+            "serve"
+            "--data-dir"
+            "/var/lib/narjar"
+            "--listen"
+            "0.0.0.0:5000"
+          ];
+          User = "65532:65532";
+          WorkingDir = "/var/lib/narjar";
+          ExposedPorts."5000/tcp" = { };
+          Volumes."/var/lib/narjar" = { };
         };
       };
+      ociImage =
+        systems.${staticSystem}.pkgs.runCommand "narjar-oci.tar"
+          {
+            nativeBuildInputs = [ systems.${staticSystem}.pkgs.skopeo ];
+          }
+          ''
+            skopeo --insecure-policy copy \
+              docker-archive:${containerImage} \
+              oci-archive:$out:narjar
+          '';
+    in
+    {
+      nixosModules.default = import ./nix/module.nix { inherit self; };
+
+      packages =
+        lib.mapAttrs (_system: env: {
+          narjar = env.narjar;
+          default = env.narjar;
+          cargo-artifacts = env.cargoArtifacts;
+          nix-e2e = env.nixE2E;
+          continuation-benchmark = env.continuationBenchmark;
+        }) systems
+        // {
+          ${staticSystem} = {
+            narjar = systems.${staticSystem}.narjar;
+            default = systems.${staticSystem}.narjar;
+            cargo-artifacts = systems.${staticSystem}.cargoArtifacts;
+            narjar-static = static.narjar;
+            narjar-oci = ociImage;
+            static-cargo-artifacts = static.cargoArtifacts;
+            nix-e2e = systems.${staticSystem}.nixE2E;
+            continuation-benchmark = systems.${staticSystem}.continuationBenchmark;
+          };
+        };
 
       devShells = lib.mapAttrs (_system: env: {
         default = env.pkgs.mkShell {
@@ -184,16 +263,20 @@
         };
       }) systems;
 
-      checks = lib.mapAttrs (system: env:
+      checks = lib.mapAttrs (
+        system: env:
         let
-          format = env.pkgs.runCommand "narjar-format" {
-            nativeBuildInputs = [ env.toolchain ];
-          } ''
-            cd ${env.src}
-            cargo fmt --all -- --check
-            touch $out
-          '';
-          source-filter = env.pkgs.runCommand "narjar-source-filter" {} ''
+          format =
+            env.pkgs.runCommand "narjar-format"
+              {
+                nativeBuildInputs = [ env.toolchain ];
+              }
+              ''
+                cd ${env.src}
+                cargo fmt --all -- --check
+                touch $out
+              '';
+          source-filter = env.pkgs.runCommand "narjar-source-filter" { } ''
             test -f ${repositorySrc}/Cargo.toml
             test -f ${repositorySrc}/Cargo.lock
             test -f ${repositorySrc}/src/main.rs
@@ -201,17 +284,18 @@
             test -f ${repositorySrc}/flake.lock
             test -f ${repositorySrc}/.envrc
             test -f ${repositorySrc}/README.md
+            test -f ${env.src}/tests/fixtures/nix-2.31.5-http-v0.1.tsv
             test ! -e ${repositorySrc}/target
             test ! -e ${repositorySrc}/.direnv
             test ! -e ${repositorySrc}/benchmarks/results
             touch $out
           '';
-          lock-consistency = env.pkgs.runCommand "narjar-lock-consistency" {} ''
+          lock-consistency = env.pkgs.runCommand "narjar-lock-consistency" { } ''
             test -s ${env.src}/Cargo.lock
             test -s ${repositorySrc}/flake.lock
             touch $out
           '';
-          runtime-smoke = env.pkgs.runCommand "narjar-runtime-smoke" {} ''
+          runtime-smoke = env.pkgs.runCommand "narjar-runtime-smoke" { } ''
             mkdir data
             ${env.narjar}/bin/narjar serve \
               --data-dir "$PWD/data" \
@@ -229,7 +313,7 @@
             wait "$pid"
             trap - EXIT
           '';
-          runtime-closure = env.pkgs.runCommand "narjar-runtime-closure" {} ''
+          runtime-closure = env.pkgs.runCommand "narjar-runtime-closure" { } ''
             if ${env.pkgs.nix}/bin/nix-store -qR ${env.narjar} | grep -Eq '(rustc|cargo-|rust-analyzer|clippy|nix-[0-9])'; then
               exit 1
             fi
@@ -237,32 +321,67 @@
           '';
         in
         {
-          inherit format source-filter lock-consistency runtime-smoke runtime-closure;
+          inherit
+            format
+            source-filter
+            lock-consistency
+            runtime-smoke
+            runtime-closure
+            ;
           cargo-artifacts = env.cargoArtifacts;
           compile = env.narjar;
-          clippy = env.craneLib.cargoClippy (env.commonArgs // {
-            inherit (env) cargoArtifacts;
-            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-          });
-          tests = env.craneLib.cargoTest (env.commonArgs // {
-            inherit (env) cargoArtifacts;
-          });
-          docs = env.craneLib.cargoDoc (env.commonArgs // {
-            inherit (env) cargoArtifacts;
-          });
+          clippy = env.craneLib.cargoClippy (
+            env.commonArgs
+            // {
+              inherit (env) cargoArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+            }
+          );
+          tests = env.craneLib.cargoTest (
+            env.commonArgs
+            // {
+              inherit (env) cargoArtifacts;
+            }
+          );
+          docs = env.craneLib.cargoDoc (
+            env.commonArgs
+            // {
+              inherit (env) cargoArtifacts;
+            }
+          );
           package = env.narjar;
         }
         // lib.optionalAttrs (system == staticSystem) {
           static-cargo-artifacts = static.cargoArtifacts;
           static-package = static.narjar;
-          static-elf = env.pkgs.runCommand "narjar-static-elf" {
-            nativeBuildInputs = [ env.pkgs.binutils env.pkgs.file ];
-          } ''
-            file ${static.narjar}/bin/narjar > $out
-            ! readelf -l ${static.narjar}/bin/narjar | grep -q INTERP
-            ! readelf -d ${static.narjar}/bin/narjar | grep -q NEEDED
-          '';
-        }) systems;
+          nixos-module = env.pkgs.testers.runNixOSTest (import ./nix/module-test.nix { inherit self; });
+          oci-archive =
+            env.pkgs.runCommand "narjar-oci-archive"
+              {
+                nativeBuildInputs = [
+                  env.pkgs.jq
+                  env.pkgs.skopeo
+                ];
+              }
+              ''
+                skopeo --insecure-policy inspect oci-archive:${ociImage} > image.json
+                jq -e '.Architecture == "amd64" and .Os == "linux"' image.json
+                touch $out
+              '';
+          static-elf =
+            env.pkgs.runCommand "narjar-static-elf"
+              {
+                nativeBuildInputs = [
+                  env.pkgs.binutils
+                  env.pkgs.file
+                ];
+              }
+              ''
+                file ${static.narjar}/bin/narjar > $out
+                ! readelf -l ${static.narjar}/bin/narjar | grep -q INTERP
+                ! readelf -d ${static.narjar}/bin/narjar | grep -q NEEDED
+              '';
+        }
+      ) systems;
     };
 }
-
