@@ -4,27 +4,60 @@ mod operator;
 mod server;
 mod token;
 
-use std::{env, process::ExitCode};
+use std::process::ExitCode;
 
-use config::ServeConfig;
+use clap::{Parser, Subcommand};
+use config::{ServeArgs, ServeConfig};
 use error::Error;
 
+#[derive(Parser)]
+#[command(name = "narjar")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Serve(ServeArgs),
+    Init(operator::Init),
+    Key(operator::Key),
+    Reconcile(operator::Reconcile),
+    Verify(operator::Verify),
+    ListOrphans(operator::ListOrphans),
+    Delete(operator::Delete),
+    Stats(operator::Stats),
+    Token(token::Token),
+}
+
 fn main() -> ExitCode {
-    match run(env::args().skip(1)) {
-        Ok(()) => ExitCode::SUCCESS,
+    match Cli::try_parse() {
+        Ok(cli) => match run(cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("narjar: {error}");
+                ExitCode::from(error.exit_code())
+            }
+        },
         Err(error) => {
-            eprintln!("narjar: {error}");
-            ExitCode::from(error.exit_code())
+            let code = error.exit_code();
+            let _ = error.print();
+            ExitCode::from(code as u8)
         }
     }
 }
 
-fn run(mut args: impl Iterator<Item = String>) -> Result<(), Error> {
-    match args.next().as_deref() {
-        Some("serve") => server::serve(ServeConfig::parse(args)?),
-        Some("token") => token::run(args),
-        Some(command) => operator::run(command, args),
-        None => Err(Error::usage("a command is required")),
+fn run(cli: Cli) -> Result<(), Error> {
+    match cli.command {
+        Command::Serve(args) => server::serve(ServeConfig::from(args)),
+        Command::Init(args) => operator::init(args),
+        Command::Key(args) => operator::key(args),
+        Command::Reconcile(args) => operator::reconcile(args),
+        Command::Verify(args) => operator::verify(args),
+        Command::ListOrphans(args) => operator::list_orphans(args),
+        Command::Delete(args) => operator::delete(args),
+        Command::Stats(args) => operator::stats(args),
+        Command::Token(args) => token::run(args),
     }
 }
 
@@ -38,15 +71,59 @@ mod tests {
     fn command_schema_rejects_invalid_input() {
         for args in [
             ["serve", "--unknown"].as_slice(),
-            ["serve", "--data-dir", "/cache", "--workers", "1", "--workers", "2"].as_slice(),
+            [
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--workers",
+                "1",
+                "--workers",
+                "2",
+            ]
+            .as_slice(),
             ["serve", "--data-dir"].as_slice(),
-            ["token", "revoke", "--data-dir", "/cache", "--scope", "write"].as_slice(),
-            ["token", "create", "--data-dir", "/cache", "--scope", "invalid"].as_slice(),
-            ["key", "generate", "--name", "bad/name", "--secret-key-file", "secret", "--public-key-file", "public"].as_slice(),
+            [
+                "token",
+                "revoke",
+                "--data-dir",
+                "/cache",
+                "--scope",
+                "write",
+            ]
+            .as_slice(),
+            [
+                "token",
+                "create",
+                "--data-dir",
+                "/cache",
+                "--scope",
+                "invalid",
+            ]
+            .as_slice(),
+            [
+                "key",
+                "generate",
+                "--name",
+                "bad/name",
+                "--secret-key-file",
+                "secret",
+                "--public-key-file",
+                "public",
+            ]
+            .as_slice(),
             ["serve", "--data-dir", "/cache", "--workers", "0"].as_slice(),
-            ["serve", "--data-dir", "/cache", "--listen", "not-an-address"].as_slice(),
+            [
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--listen",
+                "not-an-address",
+            ]
+            .as_slice(),
         ] {
-            assert!(Cli::try_parse_from(std::iter::once("narjar").chain(args.iter().copied())).is_err());
+            assert!(
+                Cli::try_parse_from(std::iter::once("narjar").chain(args.iter().copied())).is_err()
+            );
         }
     }
 }

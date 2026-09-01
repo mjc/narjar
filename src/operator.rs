@@ -1,5 +1,4 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::TcpStream,
@@ -7,37 +6,33 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use clap::{Args, Subcommand};
 use data_encoding::BASE64;
 use ed25519_dalek::SigningKey;
-use narjar::inventory::{Inventory, InventoryClass, MAX_NARINFO_BYTES, narinfo_is_valid};
-
-use crate::error::Error;
 use narjar::{
+    inventory::{Inventory, InventoryClass, MAX_NARINFO_BYTES, narinfo_is_valid},
     narinfo::TrustedPublicKeys,
     storage::{Storage, StoreHash},
 };
 
-pub(crate) fn run(command: &str, args: impl Iterator<Item = String>) -> Result<(), Error> {
-    match command {
-        "init" => init(args),
-        "key" => key(args),
-        "reconcile" => report(args, false, false),
-        "verify" => report(args, true, false),
-        "list-orphans" => report(args, false, true),
-        "delete" => delete(args),
-        "stats" => stats(args),
-        _ => Err(Error::usage(format!("unknown command: {command}"))),
-    }
+use crate::error::Error;
+
+#[derive(Args)]
+pub(crate) struct Init {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long, default_value_t = 30)]
+    priority: u32,
+    #[arg(long)]
+    private_read: bool,
 }
 
-fn init(args: impl Iterator<Item = String>) -> Result<(), Error> {
-    let options = Options::parse(args, &["--data-dir", "--priority"], &["--private-read"])?;
-    let root = PathBuf::from(options.required("--data-dir")?);
-    let priority: u32 = options
-        .value("--priority")
-        .unwrap_or("30")
-        .parse()
-        .map_err(|_| Error::usage("--priority must be an unsigned integer"))?;
+pub(crate) fn init(options: Init) -> Result<(), Error> {
+    let Init {
+        data_dir: root,
+        priority,
+        private_read,
+    } = options;
 
     if root.exists() {
         let mut entries = fs::read_dir(&root).map_err(runtime)?;
@@ -66,31 +61,46 @@ fn init(args: impl Iterator<Item = String>) -> Result<(), Error> {
     )?;
     create_file(&root.join("trusted-public-keys"), b"", 0o600)?;
     create_file(&root.join("auth/write.tokens"), b"", 0o600)?;
-    if options.switch("--private-read") {
+    if private_read {
         create_file(&root.join("auth/read.tokens"), b"", 0o600)?;
     }
     drop(storage);
     Ok(())
 }
 
-fn key(mut args: impl Iterator<Item = String>) -> Result<(), Error> {
-    match args.next().as_deref() {
-        Some("generate") => generate_key(args),
-        Some(command) => Err(Error::usage(format!("unknown key command: {command}"))),
-        None => Err(Error::usage("key command is required")),
+#[derive(Args)]
+pub(crate) struct Key {
+    #[command(subcommand)]
+    command: KeyCommand,
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    Generate(GenerateKey),
+}
+
+pub(crate) fn key(key: Key) -> Result<(), Error> {
+    match key.command {
+        KeyCommand::Generate(options) => generate_key(options),
     }
 }
 
-fn generate_key(args: impl Iterator<Item = String>) -> Result<(), Error> {
-    let options = Options::parse(
-        args,
-        &["--name", "--secret-key-file", "--public-key-file"],
-        &[],
-    )?;
-    let name = options.required("--name")?;
-    validate_name(name)?;
-    let secret_path = PathBuf::from(options.required("--secret-key-file")?);
-    let public_path = PathBuf::from(options.required("--public-key-file")?);
+#[derive(Args)]
+struct GenerateKey {
+    #[arg(long, value_parser = valid_key_name)]
+    name: String,
+    #[arg(long)]
+    secret_key_file: PathBuf,
+    #[arg(long)]
+    public_key_file: PathBuf,
+}
+
+fn generate_key(options: GenerateKey) -> Result<(), Error> {
+    let GenerateKey {
+        name,
+        secret_key_file: secret_path,
+        public_key_file: public_path,
+    } = options;
 
     let mut seed = [0; 32];
     File::open("/dev/urandom")
@@ -118,22 +128,67 @@ fn generate_key(args: impl Iterator<Item = String>) -> Result<(), Error> {
     Ok(())
 }
 
+#[derive(Args)]
+pub(crate) struct Reconcile {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    verify_hashes: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
+    report(
+        options.data_dir,
+        false,
+        false,
+        options.verify_hashes,
+        options.json,
+    )
+}
+
+#[derive(Args)]
+pub(crate) struct Verify {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+pub(crate) fn verify(options: Verify) -> Result<(), Error> {
+    report(options.data_dir, true, false, false, options.json)
+}
+
+#[derive(Args)]
+pub(crate) struct ListOrphans {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    verify_hashes: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+pub(crate) fn list_orphans(options: ListOrphans) -> Result<(), Error> {
+    report(
+        options.data_dir,
+        false,
+        true,
+        options.verify_hashes,
+        options.json,
+    )
+}
+
 fn report(
-    args: impl Iterator<Item = String>,
+    root: PathBuf,
     verify: bool,
     only_orphans: bool,
+    verify_hashes: bool,
+    json: bool,
 ) -> Result<(), Error> {
-    let switches = if verify {
-        &["--json"][..]
-    } else {
-        &["--verify-hashes", "--json"][..]
-    };
-    let options = Options::parse(args, &["--data-dir"], switches)?;
-    let root = PathBuf::from(options.required("--data-dir")?);
     let trusted = TrustedPublicKeys::load(&root.join("trusted-public-keys")).map_err(runtime)?;
-    let inventory = Inventory::scan(&root, &trusted, verify || options.switch("--verify-hashes"))
-        .map_err(runtime)?;
-    let json = options.switch("--json");
+    let inventory = Inventory::scan(&root, &trusted, verify || verify_hashes).map_err(runtime)?;
 
     for finding in inventory
         .entries()
@@ -168,11 +223,23 @@ fn report(
     Ok(())
 }
 
-fn delete(args: impl Iterator<Item = String>) -> Result<(), Error> {
-    let options = Options::parse(args, &["--data-dir", "--store-hash"], &["--json"])?;
-    let root = PathBuf::from(options.required("--data-dir")?);
-    let route = options.required("--store-hash")?;
-    let store = StoreHash::parse(route).map_err(|_| Error::usage("--store-hash is invalid"))?;
+#[derive(Args)]
+pub(crate) struct Delete {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    store_hash: String,
+    #[arg(long)]
+    json: bool,
+}
+
+pub(crate) fn delete(options: Delete) -> Result<(), Error> {
+    let Delete {
+        data_dir: root,
+        store_hash: route,
+        json,
+    } = options;
+    let store = StoreHash::parse(&route).map_err(|_| Error::usage("--store-hash is invalid"))?;
     let storage = Storage::initialize(&root).map_err(runtime)?;
     let trusted = TrustedPublicKeys::load(&root.join("trusted-public-keys")).map_err(runtime)?;
     let file = storage
@@ -188,10 +255,10 @@ fn delete(args: impl Iterator<Item = String>) -> Result<(), Error> {
     }
     storage.delete_narinfo(&store).map_err(runtime)?;
 
-    if options.switch("--json") {
+    if json {
         println!(
             "{{\"class\":\"deleted\",\"identifier\":\"{}\",\"action\":\"narinfo removed; NAR retained\"}}",
-            json_escape(route)
+            json_escape(&route)
         );
     } else {
         println!("deleted\t{route}");
@@ -199,17 +266,27 @@ fn delete(args: impl Iterator<Item = String>) -> Result<(), Error> {
     Ok(())
 }
 
-fn stats(args: impl Iterator<Item = String>) -> Result<(), Error> {
-    let options = Options::parse(args, &["--url", "--netrc-file"], &["--json"])?;
-    let url = options.required("--url")?;
-    let authority = url
+#[derive(Args)]
+pub(crate) struct Stats {
+    #[arg(long)]
+    url: String,
+    #[arg(long)]
+    netrc_file: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+pub(crate) fn stats(options: Stats) -> Result<(), Error> {
+    let authority = options
+        .url
         .strip_prefix("http://")
         .and_then(|url| url.split('/').next())
         .filter(|authority| !authority.is_empty())
         .ok_or_else(|| Error::usage("--url must be an http:// URL"))?;
     let authorization = options
-        .value("--netrc-file")
-        .map(|path| netrc_authorization(Path::new(path), authority))
+        .netrc_file
+        .as_deref()
+        .map(|path| netrc_authorization(path, authority))
         .transpose()?;
 
     let mut stream = TcpStream::connect(authority).map_err(runtime)?;
@@ -237,7 +314,7 @@ fn stats(args: impl Iterator<Item = String>) -> Result<(), Error> {
     }
     let body = String::from_utf8(response[split + 4..].to_vec())
         .map_err(|_| Error::runtime("stats endpoint returned non-UTF-8 metrics"))?;
-    if options.switch("--json") {
+    if options.json {
         println!("{{\"metrics\":\"{}\"}}", json_escape(&body));
     } else {
         print!("{body}");
@@ -295,17 +372,14 @@ fn create_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Error> {
     file.sync_all().map_err(runtime)
 }
 
-fn validate_name(name: &str) -> Result<(), Error> {
-    if !name.is_empty()
-        && name.len() <= 64
-        && name
+fn valid_key_name(value: &str) -> Result<String, String> {
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        Ok(())
-    } else {
-        Err(Error::usage("--name is invalid"))
-    }
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    .then(|| value.to_owned())
+    .ok_or_else(|| "must be 1-64 ASCII letters, digits, '.', '_' or '-'".to_owned())
 }
 
 fn runtime(error: impl std::fmt::Display) -> Error {
@@ -329,52 +403,6 @@ fn json_escape(value: &str) -> String {
         }
     }
     escaped
-}
-
-#[derive(Default)]
-struct Options {
-    values: BTreeMap<String, String>,
-    switches: BTreeSet<String>,
-}
-
-impl Options {
-    fn parse(
-        mut args: impl Iterator<Item = String>,
-        valued: &[&str],
-        switches: &[&str],
-    ) -> Result<Self, Error> {
-        let mut options = Self::default();
-        while let Some(option) = args.next() {
-            if valued.contains(&option.as_str()) {
-                let value = args
-                    .next()
-                    .ok_or_else(|| Error::usage(format!("{option} requires a value")))?;
-                if options.values.insert(option.clone(), value).is_some() {
-                    return Err(Error::usage(format!("{option} may only be specified once")));
-                }
-            } else if switches.contains(&option.as_str()) {
-                if !options.switches.insert(option.clone()) {
-                    return Err(Error::usage(format!("{option} may only be specified once")));
-                }
-            } else {
-                return Err(Error::usage(format!("unexpected argument: {option}")));
-            }
-        }
-        Ok(options)
-    }
-
-    fn required(&self, name: &str) -> Result<&str, Error> {
-        self.value(name)
-            .ok_or_else(|| Error::usage(format!("{name} is required")))
-    }
-
-    fn value(&self, name: &str) -> Option<&str> {
-        self.values.get(name).map(String::as_str)
-    }
-
-    fn switch(&self, name: &str) -> bool {
-        self.switches.contains(name)
-    }
 }
 
 #[cfg(test)]

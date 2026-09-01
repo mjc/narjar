@@ -1,28 +1,42 @@
 use std::{fs::File, io::Read, path::PathBuf};
 
-use crate::error::Error;
+use clap::{Args, Subcommand, ValueEnum};
 use data_encoding::HEXLOWER;
 use narjar::token_file::{TOKEN_BYTES, TokenFile, valid_label};
 use sha2::{Digest, Sha256};
 
-pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Error> {
-    match args.next().as_deref() {
-        Some("create") => create(parse_options(args, false)?),
-        Some("revoke") => revoke(parse_options(args, true)?),
-        Some(command) => Err(Error::usage(format!("unknown token command: {command}"))),
-        None => Err(Error::usage("a token command is required")),
+use crate::error::Error;
+
+#[derive(Args)]
+pub(crate) struct Token {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Create(Create),
+    Revoke(Revoke),
+}
+
+pub(crate) fn run(token: Token) -> Result<(), Error> {
+    match token.command {
+        Command::Create(options) => create(options),
+        Command::Revoke(options) => revoke(options),
     }
 }
 
-fn create(options: Options) -> Result<(), Error> {
-    let name = options.name.as_deref().unwrap_or("token");
-    if !valid_label(name) {
-        return Err(Error::usage(
-            "token labels may contain only ASCII letters, digits, '.', '_', and '-'",
-        ));
-    }
+#[derive(Args)]
+struct Create {
+    #[command(flatten)]
+    target: Target,
+    #[arg(long, value_parser = valid_token_label)]
+    name: Option<String>,
+}
 
-    let path = options.path();
+fn create(options: Create) -> Result<(), Error> {
+    let name = options.name.as_deref().unwrap_or("token");
+    let path = options.target.path();
     let mut tokens = TokenFile::load(&path).map_err(runtime)?.unwrap_or_default();
 
     let mut random = [0; TOKEN_BYTES];
@@ -40,34 +54,47 @@ fn create(options: Options) -> Result<(), Error> {
     Ok(())
 }
 
-fn revoke(options: Options) -> Result<(), Error> {
-    let name = options
-        .name
-        .as_deref()
-        .expect("the parser requires a revoke name");
-    let path = options.path();
+#[derive(Args)]
+struct Revoke {
+    #[command(flatten)]
+    target: Target,
+    #[arg(long)]
+    name: String,
+}
+
+fn revoke(options: Revoke) -> Result<(), Error> {
+    let path = options.target.path();
     let mut tokens = TokenFile::load(&path).map_err(runtime)?.unwrap_or_default();
-    if !tokens.remove(name) {
-        return Err(Error::runtime(format!("unknown token label: {name}")));
+    if !tokens.remove(&options.name) {
+        return Err(Error::runtime(format!(
+            "unknown token label: {}",
+            options.name
+        )));
     }
     tokens.store(&path).map_err(runtime)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Args)]
+struct Target {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long, value_enum)]
+    scope: Scope,
+}
+
+impl Target {
+    fn path(&self) -> PathBuf {
+        self.data_dir.join("auth").join(self.scope.filename())
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum Scope {
     Read,
     Write,
 }
 
 impl Scope {
-    fn parse(value: &str) -> Result<Self, Error> {
-        match value {
-            "read" => Ok(Self::Read),
-            "write" => Ok(Self::Write),
-            _ => Err(Error::usage("--scope must be read or write")),
-        }
-    }
-
     const fn filename(self) -> &'static str {
         match self {
             Self::Read => "read.tokens",
@@ -76,50 +103,10 @@ impl Scope {
     }
 }
 
-struct Options {
-    data_dir: PathBuf,
-    scope: Scope,
-    name: Option<String>,
-}
-
-impl Options {
-    fn path(&self) -> PathBuf {
-        self.data_dir.join("auth").join(self.scope.filename())
-    }
-}
-
-fn parse_options(
-    mut args: impl Iterator<Item = String>,
-    name_required: bool,
-) -> Result<Options, Error> {
-    let mut data_dir = None;
-    let mut scope = None;
-    let mut name = None;
-
-    while let Some(option) = args.next() {
-        let value = args
-            .next()
-            .ok_or_else(|| Error::usage(format!("{option} requires a value")))?;
-        match option.as_str() {
-            "--data-dir" if data_dir.is_none() => data_dir = Some(PathBuf::from(value)),
-            "--scope" if scope.is_none() => scope = Some(Scope::parse(&value)?),
-            "--name" if name.is_none() => name = Some(value),
-            _ if matches!(option.as_str(), "--data-dir" | "--scope" | "--name") => {
-                return Err(Error::usage(format!("duplicate option: {option}")));
-            }
-            _ => return Err(Error::usage(format!("unknown option: {option}"))),
-        }
-    }
-
-    if name_required && name.is_none() {
-        return Err(Error::usage("--name is required"));
-    }
-
-    Ok(Options {
-        data_dir: data_dir.ok_or_else(|| Error::usage("--data-dir is required"))?,
-        scope: scope.ok_or_else(|| Error::usage("--scope is required"))?,
-        name,
-    })
+fn valid_token_label(value: &str) -> Result<String, String> {
+    valid_label(value)
+        .then(|| value.to_owned())
+        .ok_or_else(|| "must contain only ASCII letters, digits, '.', '_', and '-'".to_owned())
 }
 
 fn runtime(error: impl std::fmt::Display) -> Error {

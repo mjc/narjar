@@ -125,7 +125,7 @@ fn serve_requires_data_dir() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "narjar: --data-dir is required\n"
+        "error: one or more required arguments were not provided\n"
     );
 }
 
@@ -143,7 +143,7 @@ fn serve_accepts_data_dir_from_environment() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "narjar: --listen must be an IP socket address\n"
+        "error: invalid value for one of the arguments\n"
     );
 }
 
@@ -161,7 +161,7 @@ fn serve_rejects_zero_workers() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "narjar: --workers must be greater than zero\n"
+        "error: invalid value for one of the arguments\n"
     );
 }
 
@@ -180,7 +180,7 @@ fn serve_rejects_zero_workers_from_environment() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "narjar: NARJAR_WORKERS must be greater than zero\n"
+        "error: invalid value for one of the arguments\n"
     );
 }
 
@@ -224,7 +224,7 @@ fn serve_rejects_duplicate_options() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "narjar: --workers may only be specified once\n"
+        "error: an argument cannot be used with one or more of the other specified arguments\n"
     );
 }
 
@@ -242,7 +242,7 @@ fn serve_rejects_zero_request_limit() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "narjar: --max-in-flight must be greater than zero\n"
+        "error: invalid value for one of the arguments\n"
     );
 }
 
@@ -260,7 +260,7 @@ fn serve_rejects_zero_nar_limit() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "narjar: --max-nar-bytes must be greater than zero\n"
+        "error: invalid value for one of the arguments\n"
     );
 }
 
