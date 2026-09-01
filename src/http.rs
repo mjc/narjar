@@ -5,12 +5,11 @@ use tiny_http::{Header, Method, Response, StatusCode};
 use crate::{
     auth::{Authorizer, Permission},
     metrics::Metrics,
-    narinfo::TrustedPublicKeys,
+    narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError, StoreHash},
 };
 
 const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
-const MAX_NARINFO_BYTES: usize = 1024 * 1024;
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 fn header(name: &str, value: &str) -> Header {
@@ -23,6 +22,14 @@ fn not_found(request: tiny_http::Request) {
 
 fn internal_error(request: tiny_http::Request) {
     let _ = request.respond(Response::empty(StatusCode(500)));
+}
+
+fn nar_response<R: Read>(status: StatusCode, reader: R, content_length: usize) -> Response<R> {
+    Response::new(status, Vec::new(), reader, Some(content_length), None)
+        .with_chunked_threshold(usize::MAX)
+        .with_header(header("Content-Type", "application/x-nix-nar"))
+        .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
+        .with_header(header("Accept-Ranges", "bytes"))
 }
 
 fn respond_narinfo(
@@ -38,10 +45,10 @@ fn respond_narinfo(
     };
     let mut bytes = Vec::new();
     if narinfo
-        .take((MAX_NARINFO_BYTES + 1) as u64)
+        .take(MAX_NARINFO_BYTES + 1)
         .read_to_end(&mut bytes)
         .is_err()
-        || bytes.len() > MAX_NARINFO_BYTES
+        || bytes.len() as u64 > MAX_NARINFO_BYTES
     {
         return internal_error(request);
     }
@@ -143,17 +150,7 @@ fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId
             let Ok(content_length) = usize::try_from(length) else {
                 return internal_error(request);
             };
-            let response = Response::new(
-                StatusCode(200),
-                Vec::new(),
-                file,
-                Some(content_length),
-                None,
-            )
-            .with_chunked_threshold(usize::MAX)
-            .with_header(header("Content-Type", "application/x-nix-nar"))
-            .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
-            .with_header(header("Accept-Ranges", "bytes"));
+            let response = nar_response(StatusCode(200), file, content_length);
             let _ = request.respond(response);
         }
         RequestedRange::Partial { start, end } => {
@@ -164,21 +161,12 @@ fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId
             let Ok(content_length) = usize::try_from(response_length) else {
                 return internal_error(request);
             };
-            let response = Response::new(
-                StatusCode(206),
-                Vec::new(),
-                file.take(response_length),
-                Some(content_length),
-                None,
-            )
-            .with_chunked_threshold(usize::MAX)
-            .with_header(header("Content-Type", "application/x-nix-nar"))
-            .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
-            .with_header(header("Accept-Ranges", "bytes"))
-            .with_header(header(
-                "Content-Range",
-                &format!("bytes {start}-{end}/{length}"),
-            ));
+            let response =
+                nar_response(StatusCode(206), file.take(response_length), content_length)
+                    .with_header(header(
+                        "Content-Range",
+                        &format!("bytes {start}-{end}/{length}"),
+                    ));
             let _ = request.respond(response);
         }
         RequestedRange::Unsatisfiable => {
@@ -372,7 +360,7 @@ fn respond_narinfo_put(
     let Some(mut upload) = UploadRequest::accept(request) else {
         return;
     };
-    let bytes = match upload.read_body(MAX_NARINFO_BYTES) {
+    let bytes = match upload.read_body(MAX_NARINFO_BYTES as usize) {
         Ok(bytes) => bytes,
         Err(status) => return upload.respond(status),
     };
