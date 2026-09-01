@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 use tiny_http::{Header, Method, Response, StatusCode};
 
@@ -53,15 +53,118 @@ fn respond_narinfo(request: tiny_http::Request, storage: &Storage, store: &Store
     let _ = request.respond(response);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestedRange {
+    Full,
+    Partial { start: u64, end: u64 },
+    Unsatisfiable,
+    Invalid,
+}
+
+fn requested_range(request: &tiny_http::Request, length: u64) -> RequestedRange {
+    let mut headers = request
+        .headers()
+        .iter()
+        .filter(|header| header.field.equiv("Range"));
+    let Some(header) = headers.next() else {
+        return RequestedRange::Full;
+    };
+    if headers.next().is_some() {
+        return RequestedRange::Invalid;
+    }
+
+    let Some(specification) = header.value.as_str().strip_prefix("bytes=") else {
+        return RequestedRange::Invalid;
+    };
+    if specification.contains(',') {
+        return RequestedRange::Invalid;
+    }
+    let Some((start, end)) = specification.split_once('-') else {
+        return RequestedRange::Invalid;
+    };
+    if start.is_empty() {
+        let Ok(suffix_length) = end.parse::<u64>() else {
+            return RequestedRange::Invalid;
+        };
+        if suffix_length == 0 || length == 0 {
+            return RequestedRange::Unsatisfiable;
+        }
+        let start = length.saturating_sub(suffix_length);
+        return RequestedRange::Partial {
+            start,
+            end: length - 1,
+        };
+    }
+
+    let Ok(start) = start.parse::<u64>() else {
+        return RequestedRange::Invalid;
+    };
+    if start >= length {
+        return RequestedRange::Unsatisfiable;
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        let Ok(end) = end.parse::<u64>() else {
+            return RequestedRange::Invalid;
+        };
+        if start > end {
+            return RequestedRange::Unsatisfiable;
+        }
+        end.min(length - 1)
+    };
+    RequestedRange::Partial { start, end }
+}
+
 fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId) {
-    let Ok(Some(file)) = storage.open_nar(nar) else {
+    let Ok(Some(mut file)) = storage.open_nar(nar) else {
         return not_found(request);
     };
-    let response = Response::from_file(file)
-        .with_header(header("Content-Type", "application/x-nix-nar"))
-        .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
-        .with_header(header("Accept-Ranges", "bytes"));
-    let _ = request.respond(response);
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return not_found(request);
+    };
+
+    match requested_range(&request, length) {
+        RequestedRange::Full => {
+            let response = Response::from_file(file)
+                .with_header(header("Content-Type", "application/x-nix-nar"))
+                .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
+                .with_header(header("Accept-Ranges", "bytes"));
+            let _ = request.respond(response);
+        }
+        RequestedRange::Partial { start, end } => {
+            if file.seek(SeekFrom::Start(start)).is_err() {
+                return not_found(request);
+            }
+            let response_length = end - start + 1;
+            let Ok(content_length) = usize::try_from(response_length) else {
+                return not_found(request);
+            };
+            let response = Response::new(
+                StatusCode(206),
+                Vec::new(),
+                file.take(response_length),
+                Some(content_length),
+                None,
+            )
+            .with_header(header("Content-Type", "application/x-nix-nar"))
+            .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
+            .with_header(header("Accept-Ranges", "bytes"))
+            .with_header(header(
+                "Content-Range",
+                &format!("bytes {start}-{end}/{length}"),
+            ));
+            let _ = request.respond(response);
+        }
+        RequestedRange::Unsatisfiable => {
+            let response = Response::empty(StatusCode(416))
+                .with_header(header("Content-Range", &format!("bytes */{length}")));
+            let _ = request.respond(response);
+        }
+        RequestedRange::Invalid => {
+            let _ = request.respond(Response::empty(StatusCode(400)));
+        }
+    }
 }
 
 #[derive(Debug)]
