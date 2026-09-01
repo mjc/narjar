@@ -364,13 +364,13 @@ proxy. This nginx location is also exercised by the NixOS VM check:
 ~~~nix
 services.nginx = {
   enable = true;
+  virtualHosts."cache.example.org".extraConfig = "client_header_timeout 10s;";
   virtualHosts."cache.example.org".locations."/" = {
     proxyPass = "http://127.0.0.1:5000";
     extraConfig = ''
       proxy_request_buffering off;
       proxy_buffering off;
       client_max_body_size 16g;
-      client_header_timeout 10s;
       client_body_timeout 300s;
       proxy_read_timeout 300s;
       proxy_send_timeout 300s;

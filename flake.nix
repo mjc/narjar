@@ -34,6 +34,7 @@
       ];
       staticTarget = "x86_64-unknown-linux-musl";
       staticSystem = "x86_64-linux";
+      containerUser = "65532:65532";
       lockIdentity = builtins.hashFile "sha256" ./flake.lock;
       rustTargetFor = {
         aarch64-darwin = "aarch64-apple-darwin";
@@ -176,7 +177,9 @@
         extraCommands = ''
           mkdir -p var/lib/narjar
           chmod 0700 var/lib/narjar
-          chown 65532:65532 var/lib/narjar
+        '';
+        fakeRootCommands = ''
+          chown ${containerUser} var/lib/narjar
         '';
         config = {
           Entrypoint = [ "${static.narjar}/bin/narjar" ];
@@ -187,7 +190,7 @@
             "--listen"
             "0.0.0.0:5000"
           ];
-          User = "65532:65532";
+          User = containerUser;
           WorkingDir = "/var/lib/narjar";
           ExposedPorts."5000/tcp" = { };
           Volumes."/var/lib/narjar" = { };
@@ -199,7 +202,7 @@
             nativeBuildInputs = [ systems.${staticSystem}.pkgs.skopeo ];
           }
           ''
-            skopeo --insecure-policy copy \
+            skopeo --tmpdir "$NIX_BUILD_TOP" --insecure-policy copy \
               docker-archive:${containerImage} \
               oci-archive:$out:narjar
           '';
@@ -364,8 +367,10 @@
                 ];
               }
               ''
-                skopeo --insecure-policy inspect oci-archive:${ociImage} > image.json
+                skopeo --tmpdir "$NIX_BUILD_TOP" --insecure-policy inspect oci-archive:${ociImage} > image.json
+                skopeo --tmpdir "$NIX_BUILD_TOP" --insecure-policy inspect --config oci-archive:${ociImage} > config.json
                 jq -e '.Architecture == "amd64" and .Os == "linux"' image.json
+                jq -e '.config.User == "${containerUser}"' config.json
                 touch $out
               '';
           static-elf =
