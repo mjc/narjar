@@ -4,7 +4,7 @@ use tiny_http::{Header, Method, Response, StatusCode};
 
 use crate::{
     auth::{Authorizer, Permission},
-    narinfo::{TrustedPublicKeys, ValidatedNarInfo},
+    narinfo::{ParsedNarInfo, TrustedPublicKeys},
     storage::{NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError, StoreHash},
 };
 
@@ -24,17 +24,6 @@ fn internal_error(request: tiny_http::Request) {
     let _ = request.respond(Response::empty(StatusCode(500)));
 }
 
-fn referenced_nar(bytes: &[u8]) -> Option<NarObjectId> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let mut urls = text.lines().filter_map(|line| line.strip_prefix("URL: "));
-    let url = urls.next()?;
-    if urls.next().is_some() {
-        return None;
-    }
-    let id = url.strip_prefix("nar/")?.strip_suffix(".nar")?;
-    NarObjectId::parse(id).ok()
-}
-
 fn respond_narinfo(request: tiny_http::Request, storage: &Storage, store: &StoreHash) {
     let narinfo = match storage.open_narinfo(store) {
         Ok(Some(narinfo)) => narinfo,
@@ -50,13 +39,18 @@ fn respond_narinfo(request: tiny_http::Request, storage: &Storage, store: &Store
     {
         return internal_error(request);
     }
-    let Some(nar) = referenced_nar(&bytes) else {
-        return internal_error(request);
-    };
-    match storage.open_nar(&nar) {
-        Ok(Some(_)) => {}
-        Ok(None) => return not_found(request),
+    let parsed = match ParsedNarInfo::parse(store, &bytes) {
+        Ok(parsed) => parsed,
         Err(_) => return internal_error(request),
+    };
+    match storage.open_nar(parsed.nar()) {
+        Ok(Some(nar))
+            if matches!(
+                nar.metadata(),
+                Ok(metadata) if metadata.len() == parsed.nar_size()
+            ) => {}
+        Ok(Some(_)) | Err(_) => return internal_error(request),
+        Ok(None) => return not_found(request),
     }
 
     let response = Response::from_data(bytes)
@@ -326,13 +320,14 @@ fn respond_narinfo_put(
         return;
     }
 
-    let validated = match ValidatedNarInfo::parse(store, &bytes, trusted) {
-        Ok(validated) => validated,
-        Err(_) => {
-            let _ = request.respond(Response::empty(StatusCode(422)));
-            return;
-        }
-    };
+    let validated =
+        match ParsedNarInfo::parse(store, &bytes).and_then(|parsed| parsed.verify(trusted)) {
+            Ok(validated) => validated,
+            Err(_) => {
+                let _ = request.respond(Response::empty(StatusCode(422)));
+                return;
+            }
+        };
     let nar = match storage.open_nar(validated.nar()) {
         Ok(Some(nar)) => nar,
         Ok(None) => {

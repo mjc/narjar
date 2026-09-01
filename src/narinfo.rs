@@ -115,17 +115,15 @@ impl NamedSignature {
 }
 
 #[derive(Debug)]
-pub struct ValidatedNarInfo {
+pub struct ParsedNarInfo {
     nar: NarObjectId,
     nar_size: u64,
+    fingerprint: String,
+    signatures: Vec<NamedSignature>,
 }
 
-impl ValidatedNarInfo {
-    pub fn parse(
-        route: &StoreHash,
-        bytes: &[u8],
-        trusted: &TrustedPublicKeys,
-    ) -> Result<Self, NarInfoError> {
+impl ParsedNarInfo {
+    pub fn parse(route: &StoreHash, bytes: &[u8]) -> Result<Self, NarInfoError> {
         let text = std::str::from_utf8(bytes).map_err(|_| NarInfoError)?;
         if !text.ends_with('\n') || text.contains('\r') {
             return Err(NarInfoError);
@@ -196,11 +194,23 @@ impl ValidatedNarInfo {
             .into_iter()
             .map(NamedSignature::parse)
             .collect::<Result<Vec<_>, _>>()?;
-        if signatures.is_empty() || !trusted.verifies(fingerprint.as_bytes(), &signatures) {
+        if signatures.is_empty() {
             return Err(NarInfoError);
         }
 
-        Ok(Self { nar, nar_size })
+        Ok(Self {
+            nar,
+            nar_size,
+            fingerprint,
+            signatures,
+        })
+    }
+
+    pub fn verify(self, trusted: &TrustedPublicKeys) -> Result<ValidatedNarInfo, NarInfoError> {
+        if !trusted.verifies(self.fingerprint.as_bytes(), &self.signatures) {
+            return Err(NarInfoError);
+        }
+        Ok(ValidatedNarInfo(self))
     }
 
     pub fn nar(&self) -> &NarObjectId {
@@ -209,6 +219,19 @@ impl ValidatedNarInfo {
 
     pub const fn nar_size(&self) -> u64 {
         self.nar_size
+    }
+}
+
+#[derive(Debug)]
+pub struct ValidatedNarInfo(ParsedNarInfo);
+
+impl ValidatedNarInfo {
+    pub fn nar(&self) -> &NarObjectId {
+        self.0.nar()
+    }
+
+    pub const fn nar_size(&self) -> u64 {
+        self.0.nar_size()
     }
 }
 

@@ -468,7 +468,8 @@ fn nix_cache_info_get_and_head_match_contract() {
 #[test]
 fn published_narinfo_and_nar_get_head_are_pair_gated() {
     let server = RunningServer::start("published-pair");
-    let narinfo = format!("URL: nar/{NAR_ID}.nar\n");
+    let nar_bytes = b"known NAR bytes";
+    let narinfo = signed_narinfo(NAR_ID, nar_bytes.len() as u64);
     fs::write(
         server.data_dir.join(format!("{STORE_HASH}.narinfo")),
         &narinfo,
@@ -482,7 +483,6 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
         "{missing:?}"
     );
 
-    let nar_bytes = b"known NAR bytes";
     fs::write(server.data_dir.join(format!("nar/{NAR_ID}.nar")), nar_bytes)
         .expect("write NAR fixture");
 
