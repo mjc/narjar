@@ -1,6 +1,7 @@
 mod config;
 mod error;
 mod server;
+mod token;
 
 use std::{env, process::ExitCode};
 
@@ -20,6 +21,7 @@ fn main() -> ExitCode {
 fn run(mut args: impl Iterator<Item = String>) -> Result<(), Error> {
     match args.next().as_deref() {
         Some("serve") => server::serve(ServeConfig::parse(args)?),
+        Some("token") => token::run(args),
         Some(command) => Err(Error::usage(format!("unknown command: {command}"))),
         None => Err(Error::usage("a command is required")),
     }
