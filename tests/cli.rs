@@ -30,7 +30,11 @@ const TEST_WRITE_TOKEN: &str =
     "test 4c6fe1d79dd5595d75e9b7c82dbdc4481996f7aea7143e7153c8eb5e9f94ea45\n";
 
 fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
-    let store_path = format!("/nix/store/{STORE_HASH}-narjar");
+    signed_narinfo_for(STORE_HASH, nar_hash, nar_size)
+}
+
+fn signed_narinfo_for(store_hash: &str, nar_hash: &str, nar_size: u64) -> String {
+    let store_path = format!("/nix/store/{store_hash}-narjar");
     let fingerprint = format!("1;{store_path};sha256:{nar_hash};{nar_size};");
     let signature = SigningKey::from_bytes(&[7; 32]).sign(fingerprint.as_bytes());
 
@@ -1608,4 +1612,350 @@ fn nix_2_31_5_trace_drives_redacted_socket_conformance() {
     assert!(!transcript.contains(TEST_AUTHORIZATION), "{transcript}");
     assert!(signal.success());
     assert!(status.success());
+}
+
+fn init_data_dir(test: &str) -> PathBuf {
+    let data_dir = data_dir(test);
+    let output = run(&[
+        "init",
+        "--data-dir",
+        data_dir.to_str().expect("temporary path should be UTF-8"),
+    ]);
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    data_dir
+}
+
+#[test]
+fn init_and_key_generate_create_secure_operator_material() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let data_dir = init_data_dir("operator-init");
+    for directory in ["nar", ".tmp", "realisations", "auth"] {
+        assert!(data_dir.join(directory).is_dir(), "{directory}");
+    }
+    for file in [
+        "nix-cache-info",
+        "trusted-public-keys",
+        "auth/read.tokens",
+        "auth/write.tokens",
+    ] {
+        assert!(data_dir.join(file).is_file(), "{file}");
+    }
+    assert_eq!(
+        fs::metadata(&data_dir)
+            .expect("data directory metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    let secret = data_dir.join("cache-secret-key");
+    let public = data_dir.join("cache-public-key");
+    let output = run(&[
+        "key",
+        "generate",
+        "--name",
+        "narjar-test",
+        "--secret-key-file",
+        secret.to_str().expect("secret path should be UTF-8"),
+        "--public-key-file",
+        public.to_str().expect("public path should be UTF-8"),
+    ]);
+    assert!(
+        output.status.success(),
+        "key generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let secret_line = fs::read_to_string(&secret).expect("secret key should be readable");
+    let public_line = fs::read_to_string(&public).expect("public key should be readable");
+    let (_, secret_bytes) = secret_line
+        .trim()
+        .split_once(':')
+        .expect("secret key should be named");
+    let (_, public_bytes) = public_line
+        .trim()
+        .split_once(':')
+        .expect("public key should be named");
+    assert_eq!(
+        BASE64
+            .decode(secret_bytes.as_bytes())
+            .expect("secret key should be base64")
+            .len(),
+        64
+    );
+    assert_eq!(
+        BASE64
+            .decode(public_bytes.as_bytes())
+            .expect("public key should be base64")
+            .len(),
+        32
+    );
+    assert_eq!(
+        fs::metadata(secret)
+            .expect("secret key metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
+}
+
+#[test]
+fn reconcile_and_verify_classify_operator_findings() {
+    let data_dir = init_data_dir("operator-verify");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+
+    let missing_store = "11111111111111111111111111111111";
+    let malformed_store = "22222222222222222222222222222222";
+    let mismatch_store = "33333333333333333333333333333333";
+    let missing_nar = "1111111111111111111111111111111111111111111111111111";
+
+    fs::write(data_dir.join(format!("nar/{NAR_ID}.nar")), b"orphan")
+        .expect("orphan should be written");
+    fs::write(
+        data_dir.join(format!("{missing_store}.narinfo")),
+        signed_narinfo_for(missing_store, missing_nar, 6),
+    )
+    .expect("missing-NAR metadata should be written");
+    fs::write(
+        data_dir.join(format!("{malformed_store}.narinfo")),
+        b"not a narinfo\n",
+    )
+    .expect("malformed metadata should be written");
+    fs::write(
+        data_dir.join(format!("{mismatch_store}.narinfo")),
+        signed_narinfo_for(mismatch_store, NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("mismatched metadata should be written");
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), b"narjax")
+        .expect("same-size corrupt NAR should be written");
+
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let reconcile = run(&["reconcile", "--data-dir", path, "--verify-hashes", "--json"]);
+    assert!(
+        reconcile.status.success(),
+        "reconcile failed: {}",
+        String::from_utf8_lossy(&reconcile.stderr)
+    );
+    let report = String::from_utf8(reconcile.stdout).expect("report should be UTF-8");
+    for class in [
+        "orphan_nar",
+        "missing_nar",
+        "malformed_narinfo",
+        "hash_or_size_mismatch",
+    ] {
+        assert!(
+            report.contains(&format!("\"class\":\"{class}\"")),
+            "{report}"
+        );
+    }
+
+    let verify = run(&["verify", "--data-dir", path, "--json"]);
+    assert_eq!(verify.status.code(), Some(1));
+    let report = String::from_utf8(verify.stdout).expect("report should be UTF-8");
+    assert!(report.contains("\"class\":\"hash_or_size_mismatch\""));
+
+    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
+}
+
+#[test]
+fn delete_is_offline_and_leaves_shared_nar_objects() {
+    let server = RunningServer::start("operator-delete");
+    let nar_path = format!("/nar/{NARJAR_HASH}.nar");
+    let narinfo_path = format!("/{STORE_HASH}.narinfo");
+    let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
+    let headers = [("Authorization", TEST_AUTHORIZATION)];
+    let nar_created = server.request_with_body("PUT", &nar_path, &headers, NAR_BYTES);
+    let narinfo_created =
+        server.request_with_body("PUT", &narinfo_path, &headers, narinfo.as_bytes());
+    assert!(response_parts(&nar_created).0.starts_with("HTTP/1.1 201"));
+    assert!(
+        response_parts(&narinfo_created)
+            .0
+            .starts_with("HTTP/1.1 201")
+    );
+
+    let data_dir = server.data_dir.clone();
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let locked = run(&[
+        "delete",
+        "--data-dir",
+        path,
+        "--store-hash",
+        STORE_HASH,
+        "--json",
+    ]);
+    assert_eq!(locked.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&locked.stderr).contains("locked"));
+
+    let (signal, status) = server.stop_preserving();
+    assert!(signal.success());
+    assert!(status.success());
+    let deleted = run(&[
+        "delete",
+        "--data-dir",
+        path,
+        "--store-hash",
+        STORE_HASH,
+        "--json",
+    ]);
+    assert!(
+        deleted.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(!data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+    assert!(data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
+
+    fs::remove_dir_all(data_dir).expect("test data directory should be removed");
+}
+
+#[test]
+fn health_readiness_metrics_and_stats_follow_the_operator_contract() {
+    let server = RunningServer::start("operator-observability");
+
+    let (health_headers, health_body) = response_parts(&server.request("GET", "/healthz"));
+    assert!(
+        health_headers.starts_with("HTTP/1.1 200"),
+        "{health_headers}"
+    );
+    assert_eq!(health_body, b"ok\n");
+
+    let (ready_headers, ready_body) = response_parts(&server.request("GET", "/readyz"));
+    assert!(ready_headers.starts_with("HTTP/1.1 200"), "{ready_headers}");
+    assert_eq!(ready_body, b"ready\n");
+
+    let _ = server.request("GET", "/missing");
+    let (metric_headers, metric_body) = response_parts(&server.request("GET", "/metrics"));
+    assert!(
+        metric_headers.starts_with("HTTP/1.1 200"),
+        "{metric_headers}"
+    );
+    let metrics = String::from_utf8(metric_body).expect("metrics should be UTF-8");
+    for series in [
+        "narjar_http_requests_total",
+        "narjar_http_bytes_in_total",
+        "narjar_http_bytes_out_total",
+        "narjar_auth_failures_total",
+        "narjar_validation_failures_total",
+        "narjar_uploads_in_flight",
+        "narjar_requests_in_flight",
+        "narjar_temp_objects",
+        "narjar_disk_full_total",
+        "narjar_publications_total",
+        "narjar_publication_duration_seconds",
+        "narjar_ready",
+    ] {
+        assert!(metrics.contains(series), "missing {series}: {metrics}");
+    }
+
+    let url = format!("http://{}", server.address);
+    let stats = run(&["stats", "--url", &url]);
+    assert!(
+        stats.status.success(),
+        "stats failed: {}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    assert!(String::from_utf8_lossy(&stats.stdout).contains("narjar_ready 1"));
+
+    let (signal, status) = server.stop();
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
+fn health_is_public_but_private_read_protects_readiness_and_metrics() {
+    let server =
+        RunningServer::start_with_read_tokens("private-operator-observability", TEST_WRITE_TOKEN);
+
+    let health = response_parts(&server.request("GET", "/healthz")).0;
+    let ready = response_parts(&server.request("GET", "/readyz")).0;
+    let metrics = response_parts(&server.request("GET", "/metrics")).0;
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    assert!(ready.starts_with("HTTP/1.1 401"), "{ready}");
+    assert!(metrics.starts_with("HTTP/1.1 401"), "{metrics}");
+
+    let (signal, status) = server.stop();
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
+fn readiness_fails_without_affecting_liveness_when_space_is_reserved() {
+    let server = RunningServer::start_with_args(
+        "operator-not-ready",
+        &["--min-free-bytes", "18446744073709551615"],
+    );
+
+    let health = response_parts(&server.request("GET", "/healthz")).0;
+    let (ready, reason) = response_parts(&server.request("GET", "/readyz"));
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    assert!(ready.starts_with("HTTP/1.1 503"), "{ready}");
+    assert_eq!(reason, b"insufficient_space\n");
+
+    let (signal, status) = server.stop();
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
+fn restored_cache_verifies_before_serving() {
+    let source = init_data_dir("backup-source");
+    fs::write(
+        source.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(source.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("NAR should be written");
+    fs::write(
+        source.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("narinfo should be written");
+
+    let restored = init_data_dir("backup-restored");
+    for relative in [
+        "nix-cache-info",
+        "trusted-public-keys",
+        "auth/read.tokens",
+        "auth/write.tokens",
+        "nar/0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl.nar",
+        "00000000000000000000000000000000.narinfo",
+    ] {
+        fs::copy(source.join(relative), restored.join(relative))
+            .expect("backup file should be restored");
+    }
+    let output = run(&[
+        "verify",
+        "--data-dir",
+        restored.to_str().expect("restored path should be UTF-8"),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "restored cache failed verification: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(source).expect("source data directory should be removed");
+    fs::remove_dir_all(restored).expect("restored data directory should be removed");
 }
