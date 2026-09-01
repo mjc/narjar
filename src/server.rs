@@ -29,7 +29,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
 
     let server =
-        Arc::new(Server::http(&config.listen).map_err(|error| {
+        Arc::new(Server::http(config.listen).map_err(|error| {
             Error::runtime(format!("cannot listen on {}: {error}", config.listen))
         })?);
     let stopping = Arc::new(AtomicBool::new(false));
@@ -37,7 +37,14 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .and_then(|_| flag::register(SIGTERM, Arc::clone(&stopping)))
         .map_err(|error| Error::runtime(format!("cannot install signal handler: {error}")))?;
 
-    println!("listening http://{}", server.server_addr());
+    println!(
+        "listening http://{} workers={} max_in_flight={} max_nar_bytes={} min_free_bytes={}",
+        server.server_addr(),
+        config.workers,
+        config.max_in_flight,
+        config.max_nar_bytes,
+        config.min_free_bytes
+    );
     io::stdout()
         .flush()
         .map_err(|error| Error::runtime(format!("cannot report listener: {error}")))?;

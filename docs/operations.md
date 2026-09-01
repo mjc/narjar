@@ -18,8 +18,8 @@ narjar serve
   [--listen 127.0.0.1:5000]
   [--workers 8]
   [--max-in-flight 64]
-  [--max-nar-bytes BYTES]
-  [--min-free-bytes BYTES]
+  [--max-nar-bytes 17179869184]
+  [--min-free-bytes 1073741824]
 
 narjar token create
   --data-dir PATH
@@ -92,6 +92,12 @@ NARJAR_MAX_IN_FLIGHT
 NARJAR_MAX_NAR_BYTES
 NARJAR_MIN_FREE_BYTES
 ~~~
+
+The compiled defaults bind to loopback, use 8 workers, admit at most 64
+in-flight requests, cap one NAR at 16 GiB, and preserve a 1 GiB free-space
+reserve. `--data-dir` has no default. A flag or environment value may override
+each numeric policy; zero is valid only for the free-space reserve. Listen
+addresses must be numeric IP socket addresses so startup never depends on DNS.
 
 A TOML configuration file is an explicit v0.1 non-goal. It would add a parser
 and duplicate the systemd/container environment boundary. If future option
