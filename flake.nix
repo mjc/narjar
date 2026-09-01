@@ -87,9 +87,21 @@
             echo "package=${build.narjar}"
             echo "closure=$(${pkgs.nix}/bin/nix path-info -S ${build.narjar})"
           '';
+          nixE2E = pkgs.writeShellApplication {
+            name = "narjar-nix-e2e";
+            runtimeInputs = [
+              build.narjar
+              pkgs.coreutils
+              pkgs.curl
+              pkgs.findutils
+              pkgs.gnugrep
+              pkgs.nix
+            ];
+            text = builtins.readFile ./tests/nix-e2e.sh;
+          };
         in
         build // {
-          inherit pkgs toolchain provenance;
+          inherit pkgs toolchain provenance nixE2E;
         };
 
       systems = lib.genAttrs supportedSystems mkSystem;
@@ -108,6 +120,7 @@
         narjar = env.narjar;
         default = env.narjar;
         cargo-artifacts = env.cargoArtifacts;
+        nix-e2e = env.nixE2E;
       }) systems // {
         ${staticSystem} = {
           narjar = systems.${staticSystem}.narjar;
@@ -115,6 +128,7 @@
           cargo-artifacts = systems.${staticSystem}.cargoArtifacts;
           narjar-static = static.narjar;
           static-cargo-artifacts = static.cargoArtifacts;
+          nix-e2e = systems.${staticSystem}.nixE2E;
         };
       };
 
@@ -141,26 +155,11 @@
           program = lib.getExe env.provenance;
           meta.description = "Report the locked Narjar build identity";
         };
-        nix-e2e =
-          let
-            program = env.pkgs.writeShellApplication {
-              name = "narjar-nix-e2e";
-              runtimeInputs = [
-                env.narjar
-                env.pkgs.coreutils
-                env.pkgs.curl
-                env.pkgs.findutils
-                env.pkgs.gnugrep
-                env.pkgs.nix
-              ];
-              text = builtins.readFile ./tests/nix-e2e.sh;
-            };
-          in
-          {
-            type = "app";
-            program = lib.getExe program;
-            meta.description = "Run the real-Nix end-to-end verification";
-          };
+        nix-e2e = {
+          type = "app";
+          program = lib.getExe env.nixE2E;
+          meta.description = "Run the real-Nix end-to-end verification";
+        };
       }) systems;
 
       checks = lib.mapAttrs (system: env:
