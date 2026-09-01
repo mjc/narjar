@@ -126,10 +126,20 @@ fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId
 
     match requested_range(&request, length) {
         RequestedRange::Full => {
-            let response = Response::from_file(file)
-                .with_header(header("Content-Type", "application/x-nix-nar"))
-                .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
-                .with_header(header("Accept-Ranges", "bytes"));
+            let Ok(content_length) = usize::try_from(length) else {
+                return not_found(request);
+            };
+            let response = Response::new(
+                StatusCode(200),
+                Vec::new(),
+                file,
+                Some(content_length),
+                None,
+            )
+            .with_chunked_threshold(usize::MAX)
+            .with_header(header("Content-Type", "application/x-nix-nar"))
+            .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
+            .with_header(header("Accept-Ranges", "bytes"));
             let _ = request.respond(response);
         }
         RequestedRange::Partial { start, end } => {
@@ -147,6 +157,7 @@ fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId
                 Some(content_length),
                 None,
             )
+            .with_chunked_threshold(usize::MAX)
             .with_header(header("Content-Type", "application/x-nix-nar"))
             .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
             .with_header(header("Accept-Ranges", "bytes"))
