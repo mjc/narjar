@@ -856,17 +856,33 @@ fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
     let oversized_path = limited.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
     let (limited_signal, limited_status) = limited.stop();
 
-    for (response, expected_status) in [
-        (&encoded, "HTTP/1.1 415 Unsupported Media Type\r\n"),
-        (&compressed, "HTTP/1.1 415 Unsupported Media Type\r\n"),
-        (&truncated, "HTTP/1.1 422 Unprocessable Entity\r\n"),
-        (&oversized, "HTTP/1.1 413 Payload Too Large\r\n"),
+    for (case, response, expected_status) in [
+        (
+            "encoded",
+            &encoded,
+            "HTTP/1.1 415 Unsupported Media Type\r\n",
+        ),
+        (
+            "compressed",
+            &compressed,
+            "HTTP/1.1 415 Unsupported Media Type\r\n",
+        ),
+        (
+            "oversized",
+            &oversized,
+            "HTTP/1.1 413 Payload Too Large\r\n",
+        ),
     ] {
+        assert!(!response.is_empty(), "{case} response is empty");
         let (headers, body) = response_parts(response);
-        assert!(headers.starts_with(expected_status), "{headers:?}");
-        assert!(body.is_empty());
+        assert!(headers.starts_with(expected_status), "{case}: {headers:?}");
+        assert!(body.is_empty(), "{case}");
     }
     assert!(!final_path.exists());
+    assert!(
+        truncated.is_empty(),
+        "truncated request closes without a response"
+    );
     assert!(temp_is_empty);
     assert!(!oversized_path.exists());
     assert!(signal.success(), "SIGTERM should be sent");

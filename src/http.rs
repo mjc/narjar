@@ -198,6 +198,7 @@ enum ReadRoute {
 #[derive(Debug)]
 enum RouteMatch {
     Found(ReadRoute),
+    UnsupportedEncoding,
     Invalid,
     Missing,
 }
@@ -212,6 +213,12 @@ impl ReadRoute {
         }
 
         if let Some(path) = url.strip_prefix("/nar/") {
+            if [".nar.xz", ".nar.zst"].into_iter().any(|suffix| {
+                path.strip_suffix(suffix)
+                    .is_some_and(|id| NarObjectId::parse(id).is_ok())
+            }) {
+                return RouteMatch::UnsupportedEncoding;
+            }
             return match path
                 .strip_suffix(".nar")
                 .and_then(|id| NarObjectId::parse(id).ok())
@@ -289,6 +296,15 @@ fn respond_nar_put(
 pub fn respond(request: tiny_http::Request, storage: &Storage, max_nar_bytes: u64) {
     let route = match ReadRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
+        RouteMatch::UnsupportedEncoding => {
+            let status = if matches!(request.method(), Method::Put) {
+                415
+            } else {
+                400
+            };
+            let _ = request.respond(Response::empty(StatusCode(status)));
+            return;
+        }
         RouteMatch::Invalid => {
             let _ = request.respond(Response::empty(StatusCode(400)));
             return;
