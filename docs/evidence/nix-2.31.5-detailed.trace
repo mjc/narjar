@@ -1,0 +1,29 @@
+1788228289.622	GET	/xz/nix-cache-info	404	160	153					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228289.623	PUT	/xz/nix-cache-info	201	238	0	21			text/x-nix-cache-info	curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228289.623	GET	/xz/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	404	186	153					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228289.624	HEAD	/xz/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	404	187	0					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228289.624	HEAD	/xz/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	404	187	0					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228289.625	HEAD	/xz/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	404	187	0					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228289.689	HEAD	/xz/nar/1f3ra85ai21gk1njzjsdzcygdz5bfs3yrx2ma4w2wh5py7xrnnmw.nar.xz	404	210	0					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228289.690	PUT	/xz/nar/1f3ra85ai21gk1njzjsdzcygdz5bfs3yrx2ma4w2wh5py7xrnnmw.nar.xz	201	133634	0	133364			application/x-nix-nar	curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228289.690	PUT	/xz/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	201	638	0	397			text/x-nix-narinfo	curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228541.127	GET	/auth/nix-cache-info	404	213	153					curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228541.127	PUT	/auth/nix-cache-info	401	219	179	21			text/x-nix-cache-info	curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228610.045	GET	/ca/nix-cache-info	404	160	153					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228610.046	PUT	/ca/nix-cache-info	201	238	0	21			text/x-nix-cache-info	curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228610.046	GET	/ca/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	186	153					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228610.047	HEAD	/ca/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	187	0					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228610.047	HEAD	/ca/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	187	0					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228610.047	HEAD	/ca/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	187	0					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228610.048	HEAD	/ca/nar/1bxcykid814n3lrljpln5riwmf1f1bdb3msp5jw807ysdlampicc.nar	404	207	0					curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228610.048	PUT	/ca/nar/1bxcykid814n3lrljpln5riwmf1f1bdb3msp5jw807ysdlampicc.nar	201	3265	0	3000			application/x-nix-nar	curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228610.048	PUT	/ca/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	201	641	0	400			text/x-nix-narinfo	curl/8.20.0 Nix/2.31.5					*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228718.412	GET	/auth/nix-cache-info	404	213	153					curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228718.413	PUT	/auth/nix-cache-info	201	291	0	21			text/x-nix-cache-info	curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228718.414	GET	/auth/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	404	239	153					curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228718.415	HEAD	/auth/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	404	240	0					curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228718.416	HEAD	/auth/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	404	240	0					curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228718.416	HEAD	/auth/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	404	240	0					curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228718.419	HEAD	/auth/nar/1bxy7jis1anr9gjbqslmyw00wjnjx4lgcirv3c6vfp65x2f0y9ij.nar	404	260	0					curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228718.420	PUT	/auth/nar/1bxy7jis1anr9gjbqslmyw00wjnjx4lgcirv3c6vfp65x2f0y9ij.nar	201	412304	0	411984			application/x-nix-nar	curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz
+1788228718.421	PUT	/auth/2rb20j0cvcvp0s8rsj993wv5xf86cq2m.narinfo	201	690	0	396			text/x-nix-narinfo	curl/8.20.0 Nix/2.31.5	narjar				*/*	zstd, br, gzip, deflate, bzip2, xz

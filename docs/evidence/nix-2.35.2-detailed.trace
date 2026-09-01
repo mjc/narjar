@@ -1,0 +1,36 @@
+1788228916.247	GET	/redirect/nix-cache-info	307	155	171					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.247	GET	/redirect-target/nix-cache-info	404	162	153					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.248	PUT	/redirect/nix-cache-info	307	170	171	21			text/x-nix-cache-info	curl/8.21.0 Nix/2.35.2					*/*	
+1788228916.248	PUT	/redirect-target/nix-cache-info	201	198	0	21			text/x-nix-cache-info	curl/8.21.0 Nix/2.35.2					*/*	
+1788228916.249	GET	/redirect/0xxpy7vfi7i41mx2nf0iji9pjrkkvkri.narinfo	307	181	171					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.249	GET	/redirect-target/0xxpy7vfi7i41mx2nf0iji9pjrkkvkri.narinfo	404	188	153					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.250	HEAD	/redirect/0xxpy7vfi7i41mx2nf0iji9pjrkkvkri.narinfo	307	182	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.250	HEAD	/redirect-target/0xxpy7vfi7i41mx2nf0iji9pjrkkvkri.narinfo	404	189	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.251	HEAD	/redirect/nar/0xzr68rqmrfzpc2wxg14mj8vxqxgzw0fxqn5biflpsvnc607b7yc.nar	307	202	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.251	HEAD	/redirect-target/nar/0xzr68rqmrfzpc2wxg14mj8vxqxgzw0fxqn5biflpsvnc607b7yc.nar	404	209	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.251	PUT	/redirect/nar/0xzr68rqmrfzpc2wxg14mj8vxqxgzw0fxqn5biflpsvnc607b7yc.nar	307	217	171	192			application/x-nix-nar	curl/8.21.0 Nix/2.35.2					*/*	
+1788228916.251	PUT	/redirect-target/nar/0xzr68rqmrfzpc2wxg14mj8vxqxgzw0fxqn5biflpsvnc607b7yc.nar	201	416	0	192			application/x-nix-nar	curl/8.21.0 Nix/2.35.2					*/*	
+1788228916.252	HEAD	/redirect/0xxpy7vfi7i41mx2nf0iji9pjrkkvkri.narinfo	307	182	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.252	HEAD	/redirect-target/0xxpy7vfi7i41mx2nf0iji9pjrkkvkri.narinfo	404	189	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228916.252	PUT	/redirect/0xxpy7vfi7i41mx2nf0iji9pjrkkvkri.narinfo	307	194	171	399			text/x-nix-narinfo	curl/8.21.0 Nix/2.35.2					*/*	
+1788228916.252	PUT	/redirect-target/0xxpy7vfi7i41mx2nf0iji9pjrkkvkri.narinfo	201	600	0	399			text/x-nix-narinfo	curl/8.21.0 Nix/2.35.2					*/*	
+1788228950.261	GET	/negative/nix-cache-info	404	155	153					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228950.262	PUT	/negative/nix-cache-info	201	191	0	21			text/x-nix-cache-info	curl/8.21.0 Nix/2.35.2					*/*	
+1788228950.262	HEAD	/negative/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	182	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228957.982	GET	/negative/nix-cache-info	200	155	21					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228957.983	GET	/negative/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	181	153					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228957.983	HEAD	/negative/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	182	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228957.985	HEAD	/negative/nar/1bxcykid814n3lrljpln5riwmf1f1bdb3msp5jw807ysdlampicc.nar	404	202	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228957.985	PUT	/negative/nar/1bxcykid814n3lrljpln5riwmf1f1bdb3msp5jw807ysdlampicc.nar	201	3218	0	3000			application/x-nix-nar	curl/8.21.0 Nix/2.35.2					*/*	
+1788228957.985	HEAD	/negative/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	182	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228957.986	PUT	/negative/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	201	594	0	400			text/x-nix-narinfo	curl/8.21.0 Nix/2.35.2					*/*	
+1788228970.607	GET	/negative-external/nix-cache-info	404	164	153					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228970.607	PUT	/negative-external/nix-cache-info	201	200	0	21			text/x-nix-cache-info	curl/8.21.0 Nix/2.35.2					*/*	
+1788228970.607	HEAD	/negative-external/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	191	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228984.204	GET	/negative-external/nix-cache-info	200	164	21					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228984.207	HEAD	/negative-external/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	191	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788228987.336	GET	/negative-external/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	404	190	153					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788229011.778	GET	/negative-external/nix-cache-info	200	164	21					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788229011.779	HEAD	/negative-external/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	200	191	0					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788229011.779	GET	/negative-external/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	200	190	400					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
+1788229011.779	GET	/negative-external/nhhlm22g5zbl2ap83jvgr3vfrq1sxrcg.narinfo	200	190	400					curl/8.21.0 Nix/2.35.2					*/*	deflate, gzip, br, zstd
