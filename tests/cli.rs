@@ -1,3 +1,5 @@
+use data_encoding::BASE64;
+use ed25519_dalek::{Signer, SigningKey};
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -23,6 +25,25 @@ const STORE_HASH: &str = "00000000000000000000000000000000";
 const TEST_AUTHORIZATION: &str = "Basic bmFyamFyOnRlc3Qtd3JpdGUtdG9rZW4=";
 const TEST_WRITE_TOKEN: &str =
     "test 4c6fe1d79dd5595d75e9b7c82dbdc4481996f7aea7143e7153c8eb5e9f94ea45\n";
+
+fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
+    let store_path = format!("/nix/store/{STORE_HASH}-narjar");
+    let fingerprint = format!("1;{store_path};sha256:{nar_hash};{nar_size};");
+    let signature = SigningKey::from_bytes(&[7; 32]).sign(fingerprint.as_bytes());
+
+    format!(
+        "StorePath: {store_path}\n\
+         URL: nar/{nar_hash}.nar\n\
+         Compression: none\n\
+         FileHash: sha256:{nar_hash}\n\
+         FileSize: {nar_size}\n\
+         NarHash: sha256:{nar_hash}\n\
+         NarSize: {nar_size}\n\
+         References: \n\
+         Sig: narjar-test:{}\n",
+        BASE64.encode(&signature.to_bytes())
+    )
+}
 
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_narjar"));
@@ -247,6 +268,13 @@ impl RunningServer {
             )
             .expect("test read tokens should be private");
         }
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let trusted_key = format!(
+            "narjar-test:{}\n",
+            BASE64.encode(signing_key.verifying_key().as_bytes())
+        );
+        fs::write(data_dir.join("trusted-public-keys"), trusted_key)
+            .expect("test trusted key should be written");
         let mut process = command();
         process
             .args([
@@ -910,6 +938,39 @@ fn narinfo_put_rejects_unsigned_metadata_without_publication() {
     );
     assert!(body.is_empty());
     assert!(!published.exists());
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn narinfo_put_accepts_a_trusted_nix_signature() {
+    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    let server = RunningServer::start("narinfo-put-trusted");
+    let nar_created =
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], b"narjar");
+    let narinfo = signed_narinfo(NARJAR_HASH, 6);
+    let path = format!("/{STORE_HASH}.narinfo");
+    let created = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
+    let identical = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
+    let visible = server.request("GET", &path);
+    let (signal, status) = server.stop();
+
+    assert!(
+        response_parts(&nar_created)
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n")
+    );
+    for (response, expected) in [
+        (&created, "HTTP/1.1 201 Created\r\n"),
+        (&identical, "HTTP/1.1 200 OK\r\n"),
+    ] {
+        let (headers, body) = response_parts(response);
+        assert!(headers.starts_with(expected), "{headers:?}");
+        assert!(body.is_empty());
+    }
+    let (headers, body) = response_parts(&visible);
+    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+    assert_eq!(body, narinfo.as_bytes());
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
