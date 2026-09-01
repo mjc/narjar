@@ -1,14 +1,15 @@
 use std::{
-    collections::VecDeque,
     fs,
     io::{self, Write},
     sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
 };
+
+use crossbeam_channel::{Sender, TrySendError, bounded};
 
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -27,88 +28,62 @@ use narjar::{
 use crate::{config::ServeConfig, error::Error};
 use narjar::metrics::Metrics;
 
-struct WorkQueue {
+struct Admissions {
     limit: usize,
-    state: Mutex<QueueState>,
-    ready: Condvar,
+    in_flight: AtomicUsize,
 }
 
-#[derive(Default)]
-struct QueueState {
-    requests: VecDeque<Request>,
-    in_flight: usize,
-    closed: bool,
-}
-
-impl WorkQueue {
+impl Admissions {
     fn new(limit: usize) -> Self {
         Self {
             limit,
-            state: Mutex::new(QueueState::default()),
-            ready: Condvar::new(),
+            in_flight: AtomicUsize::new(0),
         }
     }
 
-    fn try_push(&self, request: Request) -> Option<Request> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.in_flight >= self.limit {
-            return Some(request);
-        }
-        debug_assert!(!state.closed);
-        state.in_flight += 1;
-        state.requests.push_back(request);
-        drop(state);
-        self.ready.notify_one();
-        None
-    }
-
-    fn pop(&self) -> Option<Request> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        loop {
-            if let Some(request) = state.requests.pop_front() {
-                return Some(request);
-            }
-            if state.closed {
-                return None;
-            }
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-    }
-
-    fn complete(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(state.in_flight > 0);
-        state.in_flight -= 1;
-    }
-
-    fn close(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.closed = true;
-        drop(state);
-        self.ready.notify_all();
+    fn try_acquire(self: &Arc<Self>) -> Option<Admission> {
+        self.in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |in_flight| {
+                (in_flight < self.limit).then_some(in_flight + 1)
+            })
+            .ok()?;
+        Some(Admission(Arc::clone(self)))
     }
 }
 
-struct Admission<'a>(&'a WorkQueue);
+struct Admission(Arc<Admissions>);
 
-impl Drop for Admission<'_> {
+impl Drop for Admission {
     fn drop(&mut self) {
-        self.0.complete();
+        let in_flight = self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(in_flight > 0);
+    }
+}
+
+struct AcceptedRequest {
+    request: Request,
+    _admission: Admission,
+}
+
+fn try_dispatch(
+    sender: &Sender<AcceptedRequest>,
+    admissions: &Arc<Admissions>,
+    request: Request,
+) -> Option<Request> {
+    let admission = match admissions.try_acquire() {
+        Some(admission) => admission,
+        None => return Some(request),
+    };
+    let accepted = AcceptedRequest {
+        request,
+        _admission: admission,
+    };
+
+    match sender.try_send(accepted) {
+        Ok(()) => None,
+        Err(TrySendError::Full(accepted) | TrySendError::Disconnected(accepted)) => {
+            Some(accepted.request)
+        }
     }
 }
 
@@ -166,17 +141,22 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
 
     let min_free_bytes = config.min_free_bytes;
     let upload_policy = NarUploadPolicy::new(config.max_nar_bytes.get(), config.min_free_bytes);
-    let queue = Arc::new(WorkQueue::new(config.max_in_flight.get()));
+    let max_in_flight = config.max_in_flight.get();
+    let admissions = Arc::new(Admissions::new(max_in_flight));
+    let (sender, receiver) = bounded::<AcceptedRequest>(max_in_flight);
     let handles: Vec<_> = (0..config.workers.get())
         .map(|_| {
-            let queue = Arc::clone(&queue);
+            let receiver = receiver.clone();
             let storage = Arc::clone(&storage);
             let authorizer = Arc::clone(&authorizer);
             let trusted_keys = Arc::clone(&trusted_keys);
             let metrics = Arc::clone(&metrics);
             thread::spawn(move || {
-                while let Some(request) = queue.pop() {
-                    let _admission = Admission(queue.as_ref());
+                while let Ok(accepted) = receiver.recv() {
+                    let AcceptedRequest {
+                        request,
+                        _admission,
+                    } = accepted;
                     respond(
                         request,
                         &storage,
@@ -190,15 +170,16 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             })
         })
         .collect();
+    drop(receiver);
 
     while !stopping.load(Ordering::Acquire) {
         if let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(50)) {
-            if let Some(request) = queue.try_push(request) {
+            if let Some(request) = try_dispatch(&sender, &admissions, request) {
                 let _ = request.respond(Response::empty(StatusCode(429)));
             }
         }
     }
-    queue.close();
+    drop(sender);
 
     for handle in handles {
         handle
@@ -207,4 +188,43 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::Arc,
+    };
+
+    use super::Admissions;
+
+    #[test]
+    fn admission_limit_counts_live_guards() {
+        let admissions = Arc::new(Admissions::new(2));
+        let first = admissions.try_acquire().expect("first admission");
+        let second = admissions.try_acquire().expect("second admission");
+
+        assert!(admissions.try_acquire().is_none());
+
+        drop(first);
+        assert!(admissions.try_acquire().is_some());
+        drop(second);
+    }
+
+    #[test]
+    fn admission_is_released_during_unwind() {
+        let admissions = Arc::new(Admissions::new(1));
+
+        let result = catch_unwind(AssertUnwindSafe({
+            let admissions = Arc::clone(&admissions);
+            move || {
+                let _admission = admissions.try_acquire().expect("admission");
+                panic!("handler panicked");
+            }
+        }));
+
+        assert!(result.is_err());
+        assert!(admissions.try_acquire().is_some());
+    }
 }

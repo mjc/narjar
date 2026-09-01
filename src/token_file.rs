@@ -1,9 +1,9 @@
 use std::{
     collections::HashSet,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::Path,
 };
 
@@ -87,44 +87,22 @@ impl TokenFile {
         fs::create_dir_all(directory)?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
 
-        let mut temporary = None;
-        for attempt in 0..128 {
-            let candidate = directory.join(format!(
-                ".{}.{}.{}.tmp",
-                path.file_name()
-                    .expect("token paths always have a file name")
-                    .to_string_lossy(),
-                std::process::id(),
-                attempt
-            ));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&candidate)
-            {
-                Ok(file) => {
-                    temporary = Some((candidate, file));
-                    break;
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+        for record in &self.0 {
+            writeln!(
+                temporary,
+                "{} {}",
+                record.label,
+                HEXLOWER.encode(&record.digest)
+            )?;
         }
-        let (temporary_path, mut file) = temporary.ok_or(Error::TemporaryFileExhausted)?;
-
-        let result = (|| -> io::Result<()> {
-            for record in &self.0 {
-                writeln!(file, "{} {}", record.label, HEXLOWER.encode(&record.digest))?;
-            }
-            file.sync_all()?;
-            fs::rename(&temporary_path, path)?;
-            File::open(directory)?.sync_all()
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary_path);
-        }
-        result.map_err(Into::into)
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        File::open(directory)?.sync_all()?;
+        Ok(())
     }
 }
 
@@ -139,7 +117,6 @@ pub fn valid_label(label: &str) -> bool {
 pub enum Error {
     InsecurePermissions,
     Invalid,
-    TemporaryFileExhausted,
     Io(io::Error),
 }
 
@@ -156,9 +133,6 @@ impl fmt::Display for Error {
                 formatter.write_str("token hash file permissions must be 0600")
             }
             Self::Invalid => formatter.write_str("invalid token hash file"),
-            Self::TemporaryFileExhausted => {
-                formatter.write_str("cannot create temporary token hash file")
-            }
             Self::Io(error) => error.fmt(formatter),
         }
     }
@@ -168,7 +142,39 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InsecurePermissions | Self::Invalid | Self::TemporaryFileExhausted => None,
+            Self::InsecurePermissions | Self::Invalid => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt, process};
+
+    use super::TokenFile;
+
+    #[test]
+    fn store_uses_unpredictable_private_temporary_file() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let path = directory.path().join("tokens");
+        fs::write(&path, b"stale").expect("create existing token file");
+        for attempt in 0..128 {
+            let candidate =
+                directory
+                    .path()
+                    .join(format!(".tokens.{}.{}.tmp", process::id(), attempt));
+            fs::write(candidate, []).expect("preclaim temporary name");
+        }
+
+        TokenFile::default()
+            .store(&path)
+            .expect("store should not depend on predictable temporary names");
+
+        assert_eq!(fs::read(&path).expect("read token file"), b"");
+        let mode = fs::metadata(path)
+            .expect("read token file metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
