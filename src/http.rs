@@ -334,14 +334,15 @@ pub fn respond(
     if matches!(request.method(), Method::Put) {
         return match route {
             ReadRoute::Nar(id) => respond_nar_put(request, storage, &id, policy),
-            ReadRoute::CacheInfo | ReadRoute::NarInfo(_) => {
-                method_not_allowed(request, "GET, HEAD")
+            ReadRoute::NarInfo(_) => {
+                let _ = request.respond(Response::empty(StatusCode(422)));
             }
+            ReadRoute::CacheInfo => method_not_allowed(request, "GET, HEAD"),
         };
     }
 
     if !matches!(request.method(), Method::Get | Method::Head) {
-        let allow = if matches!(&route, ReadRoute::Nar(_)) {
+        let allow = if matches!(&route, ReadRoute::Nar(_) | ReadRoute::NarInfo(_)) {
             "GET, HEAD, PUT"
         } else {
             "GET, HEAD"
