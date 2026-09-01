@@ -17,6 +17,9 @@ const CONFIG_ENV: &[&str] = &[
     "NARJAR_MIN_FREE_BYTES",
 ];
 
+const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
+const STORE_HASH: &str = "00000000000000000000000000000000";
+
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_narjar"));
     for variable in CONFIG_ENV {
@@ -342,4 +345,91 @@ fn nix_cache_info_get_and_head_match_contract() {
     }
     assert!(get.ends_with(&format!("\r\n\r\n{body}")), "{get:?}");
     assert!(head.ends_with("\r\n\r\n"), "{head:?}");
+}
+
+#[test]
+fn published_narinfo_and_nar_get_head_are_pair_gated() {
+    let server = RunningServer::start("published-pair");
+    let narinfo = format!("URL: nar/{NAR_ID}.nar\n");
+    fs::write(
+        server.data_dir.join(format!("{STORE_HASH}.narinfo")),
+        &narinfo,
+    )
+    .expect("write narinfo fixture");
+
+    let missing = String::from_utf8(server.request("GET", &format!("/{STORE_HASH}.narinfo")))
+        .expect("missing response should be UTF-8");
+    assert!(
+        missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "{missing:?}"
+    );
+
+    let nar_bytes = b"known NAR bytes";
+    fs::write(server.data_dir.join(format!("nar/{NAR_ID}.nar")), nar_bytes)
+        .expect("write NAR fixture");
+
+    let narinfo_get = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
+    let narinfo_head = server.request("HEAD", &format!("/{STORE_HASH}.narinfo"));
+    let nar_get = server.request("GET", &format!("/nar/{NAR_ID}.nar"));
+    let nar_head = server.request("HEAD", &format!("/nar/{NAR_ID}.nar"));
+    let (signal, status) = server.stop();
+
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+
+    let split = |response: &[u8]| {
+        response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+            .expect("response must contain a header terminator")
+    };
+
+    let narinfo_get_body = split(&narinfo_get);
+    let narinfo_head_body = split(&narinfo_head);
+    let nar_get_body = split(&nar_get);
+    let nar_head_body = split(&nar_head);
+    let narinfo_get_headers =
+        String::from_utf8_lossy(&narinfo_get[..narinfo_get_body]).into_owned();
+    let narinfo_head_headers =
+        String::from_utf8_lossy(&narinfo_head[..narinfo_head_body]).into_owned();
+    let nar_get_headers = String::from_utf8_lossy(&nar_get[..nar_get_body]).into_owned();
+    let nar_head_headers = String::from_utf8_lossy(&nar_head[..nar_head_body]).into_owned();
+
+    for headers in [&narinfo_get_headers, &narinfo_head_headers] {
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+        assert!(
+            headers.contains("Content-Type: text/x-nix-narinfo\r\n"),
+            "{headers:?}"
+        );
+        assert!(
+            headers.contains(&format!("Content-Length: {}\r\n", narinfo.len())),
+            "{headers:?}"
+        );
+        assert!(
+            headers.contains("Cache-Control: public, max-age=31536000, immutable\r\n"),
+            "{headers:?}"
+        );
+    }
+    for headers in [&nar_get_headers, &nar_head_headers] {
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+        assert!(
+            headers.contains("Content-Type: application/x-nix-nar\r\n"),
+            "{headers:?}"
+        );
+        assert!(
+            headers.contains(&format!("Content-Length: {}\r\n", nar_bytes.len())),
+            "{headers:?}"
+        );
+        assert!(headers.contains("Accept-Ranges: bytes\r\n"), "{headers:?}");
+        assert!(
+            headers.contains("Cache-Control: public, max-age=31536000, immutable\r\n"),
+            "{headers:?}"
+        );
+    }
+
+    assert_eq!(&narinfo_get[narinfo_get_body..], narinfo.as_bytes());
+    assert!(narinfo_head[narinfo_head_body..].is_empty());
+    assert_eq!(&nar_get[nar_get_body..], nar_bytes);
+    assert!(nar_head[nar_head_body..].is_empty());
 }
