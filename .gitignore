@@ -1,1 +1,5 @@
+.direnv/
+target/
+result
+result-*
 /target
