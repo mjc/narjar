@@ -10,7 +10,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    crane.url = "github:ipetkov/crane/v0.20.0";
+    crane.url = "github:ipetkov/crane/v0.20.1";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -170,7 +170,22 @@
             touch $out
           '';
           runtime-smoke = env.pkgs.runCommand "narjar-runtime-smoke" {} ''
-            ${env.narjar}/bin/narjar > $out
+            mkdir data
+            ${env.narjar}/bin/narjar serve \
+              --data-dir "$PWD/data" \
+              --listen 127.0.0.1:0 \
+              --workers 1 > "$out" &
+            pid=$!
+            trap 'kill "$pid" 2>/dev/null || true' EXIT
+            for attempt in $(seq 1 100); do
+              grep -q '^listening http://127.0.0.1:' "$out" && break
+              kill -0 "$pid"
+              sleep 0.05
+            done
+            grep -q '^listening http://127.0.0.1:' "$out"
+            kill -TERM "$pid"
+            wait "$pid"
+            trap - EXIT
           '';
           runtime-closure = env.pkgs.runCommand "narjar-runtime-closure" {} ''
             if ${env.pkgs.nix}/bin/nix-store -qR ${env.narjar} | grep -Eq '(rustc|cargo-|rust-analyzer|clippy|nix-[0-9])'; then

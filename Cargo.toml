@@ -2,5 +2,8 @@
 name = "narjar"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
+signal-hook = { version = "=0.4.4", default-features = false }
+tiny_http = { version = "=0.12.0", default-features = false }
