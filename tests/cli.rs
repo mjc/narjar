@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
+    os::unix::fs::symlink,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Output, Stdio},
     thread,
@@ -712,6 +713,46 @@ fn nar_reads_survive_unlink_and_aborted_slow_clients_without_exposing_temps() {
         after_abort_headers.starts_with("HTTP/1.1 200 OK\r\n"),
         "{after_abort_headers:?}"
     );
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn read_misses_do_not_hide_corrupt_or_unreadable_finals() {
+    let server = RunningServer::start("read-errors");
+    let narinfo_path = server.data_dir.join(format!("{STORE_HASH}.narinfo"));
+    fs::write(&narinfo_path, [0xff]).expect("write corrupt narinfo");
+
+    let corrupt_narinfo = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
+    let (corrupt_headers, corrupt_body) = response_parts(&corrupt_narinfo);
+    assert!(
+        corrupt_headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{corrupt_headers:?}"
+    );
+    assert!(corrupt_body.is_empty());
+    fs::remove_file(narinfo_path).expect("remove corrupt narinfo");
+
+    let nar_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
+    symlink(nar_path.file_name().expect("NAR file name"), &nar_path)
+        .expect("create unreadable final");
+    let unreadable_nar = server.request("GET", &format!("/nar/{NAR_ID}.nar"));
+    let (unreadable_headers, unreadable_body) = response_parts(&unreadable_nar);
+    assert!(
+        unreadable_headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{unreadable_headers:?}"
+    );
+    assert!(unreadable_body.is_empty());
+    fs::remove_file(&nar_path).expect("remove unreadable final");
+
+    let missing_nar = server.request("GET", &format!("/nar/{NAR_ID}.nar"));
+    let (missing_headers, missing_body) = response_parts(&missing_nar);
+    let (signal, status) = server.stop();
+
+    assert!(
+        missing_headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "{missing_headers:?}"
+    );
+    assert!(missing_body.is_empty());
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
