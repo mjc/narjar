@@ -20,6 +20,9 @@ const CONFIG_ENV: &[&str] = &[
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const STORE_HASH: &str = "00000000000000000000000000000000";
+const TEST_AUTHORIZATION: &str = "Basic bmFyamFyOnRlc3Qtd3JpdGUtdG9rZW4=";
+const TEST_WRITE_TOKEN: &str =
+    "test 4c6fe1d79dd5595d75e9b7c82dbdc4481996f7aea7143e7153c8eb5e9f94ea45\n";
 
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_narjar"));
@@ -218,6 +221,10 @@ impl RunningServer {
 
     fn start_with_args(test: &str, extra_args: &[&str]) -> Self {
         let data_dir = data_dir(test);
+        let auth_dir = data_dir.join("auth");
+        fs::create_dir(&auth_dir).expect("test auth directory should be created");
+        fs::write(auth_dir.join("write.tokens"), TEST_WRITE_TOKEN)
+            .expect("test write token should be written");
         let mut process = command();
         process
             .args([
@@ -273,7 +280,11 @@ impl RunningServer {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Vec<u8> {
-        self.raw_request_with_body(method, path, headers, body)
+        let mut headers = headers.to_vec();
+        if method == "PUT" {
+            headers.push(("Authorization", TEST_AUTHORIZATION));
+        }
+        self.raw_request_with_body(method, path, &headers, body)
     }
 
     fn raw_request_with_body(
@@ -286,7 +297,7 @@ impl RunningServer {
         let content_length = body.len().to_string();
         let mut headers = headers.to_vec();
         headers.push(("Content-Length", content_length.as_str()));
-        let mut stream = self.open_request(method, path, &headers);
+        let mut stream = self.open_raw_request(method, path, &headers);
         stream.write_all(body).expect("write request body");
 
         let mut response = Vec::new();
@@ -295,6 +306,14 @@ impl RunningServer {
     }
 
     fn open_request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> TcpStream {
+        let mut headers = headers.to_vec();
+        if method == "PUT" {
+            headers.push(("Authorization", TEST_AUTHORIZATION));
+        }
+        self.open_raw_request(method, path, &headers)
+    }
+
+    fn open_raw_request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> TcpStream {
         let mut stream = TcpStream::connect(&self.address).expect("connect to narjar");
         write!(
             stream,
@@ -971,12 +990,8 @@ fn writes_require_valid_basic_auth_before_route_or_storage() {
     let server = RunningServer::start("write-auth");
     let path = format!("/nar/{NARJAR_HASH}.nar");
     let missing = server.raw_request_with_body("PUT", &path, &[], b"narjar");
-    let malformed = server.raw_request_with_body(
-        "PUT",
-        &path,
-        &[("Authorization", "Basic !!!")],
-        b"narjar",
-    );
+    let malformed =
+        server.raw_request_with_body("PUT", &path, &[("Authorization", "Basic !!!")], b"narjar");
     let public_read = server.request("GET", "/nix-cache-info");
     let final_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
     let (signal, status) = server.stop();

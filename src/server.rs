@@ -17,6 +17,7 @@ use signal_hook::{
 use tiny_http::{Request, Response, Server, StatusCode};
 
 use narjar::{
+    auth::Authorizer,
     http::respond,
     storage::{NarUploadPolicy, Storage},
 };
@@ -125,6 +126,10 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             config.data_dir.display()
         ))
     })?);
+    let authorizer =
+        Arc::new(Authorizer::load(&config.data_dir).map_err(|error| {
+            Error::runtime(format!("cannot load authorization policy: {error}"))
+        })?);
 
     let server = Server::http(config.listen)
         .map_err(|error| Error::runtime(format!("cannot listen on {}: {error}", config.listen)))?;
@@ -151,10 +156,11 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .map(|_| {
             let queue = Arc::clone(&queue);
             let storage = Arc::clone(&storage);
+            let authorizer = Arc::clone(&authorizer);
             thread::spawn(move || {
                 while let Some(request) = queue.pop() {
                     let _admission = Admission(queue.as_ref());
-                    respond(request, &storage, upload_policy);
+                    respond(request, &storage, &authorizer, upload_policy);
                 }
             })
         })

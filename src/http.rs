@@ -2,8 +2,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use tiny_http::{Header, Method, Response, StatusCode};
 
-use crate::storage::{
-    NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError, StoreHash,
+use crate::{
+    auth::{Authorizer, Permission},
+    storage::{NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError, StoreHash},
 };
 
 const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
@@ -291,7 +292,27 @@ fn respond_nar_put(
     let _ = request.respond(Response::empty(StatusCode(status)));
 }
 
-pub fn respond(request: tiny_http::Request, storage: &Storage, policy: NarUploadPolicy) {
+fn unauthorized(request: tiny_http::Request) {
+    let challenge = header("WWW-Authenticate", "Basic realm=\"narjar\"");
+    let _ = request.respond(Response::empty(StatusCode(401)).with_header(challenge));
+}
+
+pub fn respond(
+    request: tiny_http::Request,
+    storage: &Storage,
+    authorizer: &Authorizer,
+    policy: NarUploadPolicy,
+) {
+    let permission = if matches!(request.method(), Method::Put) {
+        Permission::Write
+    } else {
+        Permission::Read
+    };
+    if !authorizer.allows(&request, permission) {
+        unauthorized(request);
+        return;
+    }
+
     let route = match ReadRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
         RouteMatch::UnsupportedEncoding => {
