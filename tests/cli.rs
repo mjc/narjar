@@ -273,6 +273,16 @@ impl RunningServer {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Vec<u8> {
+        self.raw_request_with_body(method, path, headers, body)
+    }
+
+    fn raw_request_with_body(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<u8> {
         let content_length = body.len().to_string();
         let mut headers = headers.to_vec();
         headers.push(("Content-Length", content_length.as_str()));
@@ -951,6 +961,43 @@ fn saturated_request_limit_rejects_excess_work() {
 
     drop(blocked);
     let (signal, status) = server.stop();
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn writes_require_valid_basic_auth_before_route_or_storage() {
+    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    let server = RunningServer::start("write-auth");
+    let path = format!("/nar/{NARJAR_HASH}.nar");
+    let missing = server.raw_request_with_body("PUT", &path, &[], b"narjar");
+    let malformed = server.raw_request_with_body(
+        "PUT",
+        &path,
+        &[("Authorization", "Basic !!!")],
+        b"narjar",
+    );
+    let public_read = server.request("GET", "/nix-cache-info");
+    let final_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
+    let (signal, status) = server.stop();
+
+    for response in [missing, malformed] {
+        let (headers, body) = response_parts(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+            "{headers:?}"
+        );
+        assert!(
+            headers.contains("WWW-Authenticate: Basic realm=\"narjar\"\r\n"),
+            "{headers:?}"
+        );
+        assert!(body.is_empty());
+    }
+    assert!(
+        public_read.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "{public_read:?}"
+    );
+    assert!(!final_path.exists());
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
