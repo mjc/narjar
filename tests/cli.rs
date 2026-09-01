@@ -703,8 +703,21 @@ fn run_conformance_trace(server: &RunningServer, fixture: &str) -> String {
             continue;
         }
         let fields = line.split('\t').collect::<Vec<_>>();
-        let [method, path, expected_status, body_fixture] = fields.as_slice() else {
+        let [
+            method,
+            path,
+            expected_status,
+            body_fixture,
+            header_fixture @ ..,
+        ] = fields.as_slice()
+        else {
             panic!("invalid conformance fixture line {}", line_number + 1);
+        };
+        let headers: &[(&str, &str)] = match header_fixture {
+            [] => &[],
+            ["if-none-match"] => &[("If-None-Match", "\"narjar-ignored\"")],
+            ["if-modified-since"] => &[("If-Modified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")],
+            _ => panic!("invalid request header fixture on line {}", line_number + 1),
         };
         let body: Option<&[u8]> = match *body_fixture {
             "-" => None,
@@ -717,7 +730,7 @@ fn run_conformance_trace(server: &RunningServer, fixture: &str) -> String {
             ),
         };
 
-        let exchange = server.exchange(method, path, &[], body);
+        let exchange = server.exchange(method, path, headers, body);
         transcript.push_str(&exchange.sanitized_transcript());
 
         let expected = format!("HTTP/1.1 {expected_status} ");
