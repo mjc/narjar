@@ -174,41 +174,73 @@ enum ReadRoute {
     NarInfo(StoreHash),
 }
 
+#[derive(Debug)]
+enum RouteMatch {
+    Found(ReadRoute),
+    Invalid,
+    Missing,
+}
+
 impl ReadRoute {
-    fn parse(url: &str) -> Option<Self> {
+    fn classify(url: &str) -> RouteMatch {
         if url == "/nix-cache-info" {
-            return Some(Self::CacheInfo);
+            return RouteMatch::Found(Self::CacheInfo);
+        }
+        if url.starts_with("//") || url.contains(['\\', '?', '#']) {
+            return RouteMatch::Invalid;
         }
 
-        if let Some(id) = url
-            .strip_prefix("/nar/")
-            .and_then(|path| path.strip_suffix(".nar"))
-            .and_then(|id| NarObjectId::parse(id).ok())
-        {
-            return Some(Self::Nar(id));
+        if let Some(path) = url.strip_prefix("/nar/") {
+            return match path
+                .strip_suffix(".nar")
+                .and_then(|id| NarObjectId::parse(id).ok())
+            {
+                Some(id) => RouteMatch::Found(Self::Nar(id)),
+                None => RouteMatch::Invalid,
+            };
+        }
+        if url == "/nar" || url.starts_with("/nix-cache-info/") {
+            return RouteMatch::Invalid;
         }
 
-        url.strip_prefix('/')
+        if let Some(hash) = url
+            .strip_prefix('/')
             .and_then(|path| path.strip_suffix(".narinfo"))
-            .and_then(|hash| StoreHash::parse(hash).ok())
-            .map(Self::NarInfo)
+        {
+            return match StoreHash::parse(hash) {
+                Ok(store) => RouteMatch::Found(Self::NarInfo(store)),
+                Err(_) => RouteMatch::Invalid,
+            };
+        }
+
+        RouteMatch::Missing
     }
 }
 
 pub fn respond(request: tiny_http::Request, storage: &Storage) {
+    let route = match ReadRoute::classify(request.url()) {
+        RouteMatch::Found(route) => route,
+        RouteMatch::Invalid => {
+            let _ = request.respond(Response::empty(StatusCode(400)));
+            return;
+        }
+        RouteMatch::Missing => return not_found(request),
+    };
+
     if !matches!(request.method(), Method::Get | Method::Head) {
-        return not_found(request);
+        let response = Response::empty(StatusCode(405)).with_header(header("Allow", "GET, HEAD"));
+        let _ = request.respond(response);
+        return;
     }
 
-    match ReadRoute::parse(request.url()) {
-        Some(ReadRoute::CacheInfo) => {
+    match route {
+        ReadRoute::CacheInfo => {
             let response = Response::from_data(NIX_CACHE_INFO)
                 .with_header(header("Content-Type", "text/x-nix-cache-info"))
                 .with_header(header("Cache-Control", "public, max-age=3600"));
             let _ = request.respond(response);
         }
-        Some(ReadRoute::Nar(id)) => respond_nar(request, storage, &id),
-        Some(ReadRoute::NarInfo(store)) => respond_narinfo(request, storage, &store),
-        None => not_found(request),
+        ReadRoute::Nar(id) => respond_nar(request, storage, &id),
+        ReadRoute::NarInfo(store) => respond_narinfo(request, storage, &store),
     }
 }
