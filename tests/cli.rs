@@ -1717,6 +1717,7 @@ fn reconcile_and_verify_classify_operator_findings() {
     let missing_store = "11111111111111111111111111111111";
     let malformed_store = "22222222222222222222222222222222";
     let mismatch_store = "33333333333333333333333333333333";
+    let untrusted_store = "44444444444444444444444444444444";
     let missing_nar = "1111111111111111111111111111111111111111111111111111";
 
     fs::write(data_dir.join(format!("nar/{NAR_ID}.nar")), b"orphan")
@@ -1731,6 +1732,12 @@ fn reconcile_and_verify_classify_operator_findings() {
         b"not a narinfo\n",
     )
     .expect("malformed metadata should be written");
+    fs::write(
+        data_dir.join(format!("{untrusted_store}.narinfo")),
+        signed_narinfo_for(untrusted_store, missing_nar, 6)
+            .replace("Sig: narjar-test:", "Sig: unknown:"),
+    )
+    .expect("untrusted metadata should be written");
     fs::write(
         data_dir.join(format!("{mismatch_store}.narinfo")),
         signed_narinfo_for(mismatch_store, NARJAR_HASH, NAR_BYTES.len() as u64),
@@ -1751,6 +1758,7 @@ fn reconcile_and_verify_classify_operator_findings() {
         "orphan_nar",
         "missing_nar",
         "malformed_narinfo",
+        "untrusted_signature",
         "hash_or_size_mismatch",
     ] {
         assert!(

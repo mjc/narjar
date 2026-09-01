@@ -71,13 +71,25 @@ impl TrustedPublicKeys {
         }
         Ok(Self(keys))
     }
-    #[doc(hidden)]
-    pub fn validate(
+    pub(crate) fn inspect(
+        &self,
+        route: &StoreHash,
+        bytes: Vec<u8>,
+    ) -> Result<ValidatedNarInfo, PublishedNarInfoError> {
+        let narinfo =
+            ParsedNarInfo::parse(route, bytes).map_err(|_| PublishedNarInfoError::Malformed)?;
+        if !self.verifies(narinfo.fingerprint.as_bytes(), &narinfo.signatures) {
+            return Err(PublishedNarInfoError::UntrustedSignature);
+        }
+        Ok(ValidatedNarInfo(narinfo))
+    }
+
+    pub(crate) fn validate(
         &self,
         route: &StoreHash,
         bytes: Vec<u8>,
     ) -> Result<ValidatedNarInfo, NarInfoError> {
-        ParsedNarInfo::parse(route, bytes).and_then(|narinfo| narinfo.verify(self))
+        self.inspect(route, bytes).map_err(|_| NarInfoError)
     }
 
     pub fn validate_published(&self, root: &Path) -> Result<(), TrustError> {
@@ -241,26 +253,17 @@ impl ParsedNarInfo {
             bytes,
         })
     }
-
-    fn verify(self, trusted: &TrustedPublicKeys) -> Result<ValidatedNarInfo, NarInfoError> {
-        if !trusted.verifies(self.fingerprint.as_bytes(), &self.signatures) {
-            return Err(NarInfoError);
-        }
-        Ok(ValidatedNarInfo(self))
-    }
 }
 
 #[derive(Debug)]
 pub struct ValidatedNarInfo(ParsedNarInfo);
 
 impl ValidatedNarInfo {
-    #[doc(hidden)]
-    pub fn nar(&self) -> &NarObjectId {
+    pub(crate) fn nar(&self) -> &NarObjectId {
         &self.0.nar
     }
 
-    #[doc(hidden)]
-    pub const fn nar_size(&self) -> u64 {
+    pub(crate) const fn nar_size(&self) -> u64 {
         self.0.nar_size
     }
 
@@ -336,6 +339,12 @@ fn parse_store_basename(value: &str) -> Result<(StoreHash, &str), NarInfoError> 
 
 #[derive(Clone, Copy, Debug)]
 pub struct NarInfoError;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublishedNarInfoError {
+    Malformed,
+    UntrustedSignature,
+}
 
 impl fmt::Display for NarInfoError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

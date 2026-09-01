@@ -46,8 +46,7 @@ impl NarObjectId {
         parse_nix32(value, 52).map(Self)
     }
 
-    #[doc(hidden)]
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -59,11 +58,6 @@ impl StoreHash {
     pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
         parse_nix32(value, 32).map(Self)
     }
-
-    #[doc(hidden)]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObjectId> {
@@ -72,8 +66,7 @@ fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObject
         .ok_or(InvalidObjectId)
 }
 
-#[doc(hidden)]
-pub fn nix32_sha256(digest: &[u8]) -> String {
+pub(crate) fn nix32_sha256(digest: &[u8]) -> String {
     static ENCODING: OnceLock<Encoding> = OnceLock::new();
     let encoding = ENCODING.get_or_init(|| {
         let mut specification = Specification::new();

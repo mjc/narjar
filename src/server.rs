@@ -19,6 +19,7 @@ use tiny_http::{Request, Response, Server, StatusCode};
 use narjar::{
     auth::Authorizer,
     http::respond,
+    inventory::Inventory,
     narinfo::TrustedPublicKeys,
     storage::{NarUploadPolicy, Storage},
 };
@@ -134,9 +135,11 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         })?);
     let trusted_keys = TrustedPublicKeys::load(&config.data_dir.join("trusted-public-keys"))
         .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
-    trusted_keys
-        .validate_published(&config.data_dir)
-        .map_err(|error| Error::runtime(format!("cannot activate trusted public keys: {error}")))?;
+    let inventory = Inventory::scan(&config.data_dir, &trusted_keys, false)
+        .map_err(|error| Error::runtime(format!("cannot inventory cache: {error}")))?;
+    if !inventory.can_serve() {
+        return Err(Error::runtime("cannot activate trusted public keys: published narinfo is not trusted"));
+    }
     let trusted_keys = Arc::new(trusted_keys);
     let metrics = Arc::new(Metrics::default());
 
