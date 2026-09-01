@@ -1,4 +1,10 @@
-use std::{collections::HashSet, fmt, fs, io, path::Path};
+use std::{
+    collections::HashSet,
+    fmt, fs,
+    io::{self, Read},
+    os::unix::fs::PermissionsExt,
+    path::Path,
+};
 
 use data_encoding::{BASE64, HEXLOWER};
 use sha2::{Digest, Sha256};
@@ -21,11 +27,17 @@ struct TokenHashes(Vec<TokenHash>);
 
 impl TokenHashes {
     fn load(path: &Path) -> Result<Self, AuthError> {
-        let contents = match fs::read_to_string(path) {
-            Ok(contents) => contents,
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(error.into()),
         };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(AuthError::InsecurePermissions);
+        }
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
 
         let mut labels = HashSet::new();
         let mut tokens = Vec::new();
@@ -123,6 +135,7 @@ fn authorization_token_hash(request: &Request) -> Option<[u8; TOKEN_BYTES]> {
 
 #[derive(Debug)]
 pub enum AuthError {
+    InsecurePermissions,
     InvalidTokenFile,
     Io(io::Error),
 }
@@ -136,6 +149,9 @@ impl From<io::Error> for AuthError {
 impl fmt::Display for AuthError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InsecurePermissions => {
+                formatter.write_str("token hash file permissions must be 0600")
+            }
             Self::InvalidTokenFile => formatter.write_str("invalid token hash file"),
             Self::Io(error) => error.fmt(formatter),
         }
@@ -145,7 +161,7 @@ impl fmt::Display for AuthError {
 impl std::error::Error for AuthError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidTokenFile => None,
+            Self::InsecurePermissions | Self::InvalidTokenFile => None,
             Self::Io(error) => Some(error),
         }
     }

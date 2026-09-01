@@ -223,8 +223,13 @@ impl RunningServer {
         let data_dir = data_dir(test);
         let auth_dir = data_dir.join("auth");
         fs::create_dir(&auth_dir).expect("test auth directory should be created");
-        fs::write(auth_dir.join("write.tokens"), TEST_WRITE_TOKEN)
-            .expect("test write token should be written");
+        let write_tokens = auth_dir.join("write.tokens");
+        fs::write(&write_tokens, TEST_WRITE_TOKEN).expect("test write token should be written");
+        fs::set_permissions(
+            &write_tokens,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("test write token should be private");
         let mut process = command();
         process
             .args([
