@@ -141,6 +141,26 @@
           program = lib.getExe env.provenance;
           meta.description = "Report the locked Narjar build identity";
         };
+        nix-e2e =
+          let
+            program = env.pkgs.writeShellApplication {
+              name = "narjar-nix-e2e";
+              runtimeInputs = [
+                env.narjar
+                env.pkgs.coreutils
+                env.pkgs.curl
+                env.pkgs.findutils
+                env.pkgs.gnugrep
+                env.pkgs.nix
+              ];
+              text = builtins.readFile ./tests/nix-e2e.sh;
+            };
+          in
+          {
+            type = "app";
+            program = lib.getExe program;
+            meta.description = "Run the real-Nix end-to-end verification";
+          };
       }) systems;
 
       checks = lib.mapAttrs (system: env:
