@@ -71,6 +71,14 @@ impl TrustedPublicKeys {
         }
         Ok(Self(keys))
     }
+    pub(crate) fn validate(
+        &self,
+        route: &StoreHash,
+        bytes: Vec<u8>,
+    ) -> Result<ValidatedNarInfo, NarInfoError> {
+        ParsedNarInfo::parse(route, bytes).and_then(|narinfo| narinfo.verify(self))
+    }
+
     pub fn validate_published(&self, root: &Path) -> Result<(), TrustError> {
         for entry in fs::read_dir(root)? {
             let entry = entry?;
@@ -89,11 +97,7 @@ impl TrustedPublicKeys {
             (&mut File::open(entry.path())?)
                 .take(MAX_NARINFO_BYTES + 1)
                 .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_NARINFO_BYTES
-                || ParsedNarInfo::parse(&route, bytes)
-                    .and_then(|narinfo| narinfo.verify(self))
-                    .is_err()
-            {
+            if bytes.len() as u64 > MAX_NARINFO_BYTES || self.validate(&route, bytes).is_err() {
                 return Err(TrustError::UntrustedPublishedNarInfo);
             }
         }
@@ -144,7 +148,7 @@ impl NamedSignature {
 }
 
 #[derive(Debug)]
-pub struct ParsedNarInfo {
+struct ParsedNarInfo {
     nar: NarObjectId,
     nar_size: u64,
     fingerprint: String,
@@ -153,7 +157,7 @@ pub struct ParsedNarInfo {
 }
 
 impl ParsedNarInfo {
-    pub fn parse(route: &StoreHash, bytes: Vec<u8>) -> Result<Self, NarInfoError> {
+    fn parse(route: &StoreHash, bytes: Vec<u8>) -> Result<Self, NarInfoError> {
         let text = std::str::from_utf8(&bytes).map_err(|_| NarInfoError)?;
         if !text.ends_with('\n') || text.contains('\r') {
             return Err(NarInfoError);
@@ -237,23 +241,11 @@ impl ParsedNarInfo {
         })
     }
 
-    pub fn verify(self, trusted: &TrustedPublicKeys) -> Result<ValidatedNarInfo, NarInfoError> {
+    fn verify(self, trusted: &TrustedPublicKeys) -> Result<ValidatedNarInfo, NarInfoError> {
         if !trusted.verifies(self.fingerprint.as_bytes(), &self.signatures) {
             return Err(NarInfoError);
         }
         Ok(ValidatedNarInfo(self))
-    }
-
-    pub fn nar(&self) -> &NarObjectId {
-        &self.nar
-    }
-
-    pub const fn nar_size(&self) -> u64 {
-        self.nar_size
-    }
-
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
     }
 }
 
@@ -261,6 +253,18 @@ impl ParsedNarInfo {
 pub struct ValidatedNarInfo(ParsedNarInfo);
 
 impl ValidatedNarInfo {
+    pub(crate) fn nar(&self) -> &NarObjectId {
+        &self.0.nar
+    }
+
+    pub(crate) const fn nar_size(&self) -> u64 {
+        self.0.nar_size
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.0.bytes
+    }
+
     pub(crate) fn into_parts(self) -> (NarObjectId, u64, Vec<u8>) {
         let parsed = self.0;
         (parsed.nar, parsed.nar_size, parsed.bytes)
