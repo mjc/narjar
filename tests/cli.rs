@@ -890,3 +890,26 @@ fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
     assert!(limited_signal.success(), "SIGTERM should be sent");
     assert!(limited_status.success(), "narjar should shut down cleanly");
 }
+
+#[test]
+fn nar_put_preserves_the_configured_free_space_reserve() {
+    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    let server = RunningServer::start_with_args(
+        "nar-put-reserve",
+        &["--min-free-bytes", "18446744073709551615"],
+    );
+    let response =
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], b"narjar");
+    let final_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
+    let (signal, status) = server.stop();
+    let (headers, body) = response_parts(&response);
+
+    assert!(
+        headers.starts_with("HTTP/1.1 507 Insufficient Storage\r\n"),
+        "{headers:?}"
+    );
+    assert!(body.is_empty());
+    assert!(!final_path.exists());
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
