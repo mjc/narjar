@@ -24,6 +24,7 @@ use narjar::{
 };
 
 use crate::{config::ServeConfig, error::Error};
+use narjar::metrics::Metrics;
 
 struct WorkQueue {
     limit: usize,
@@ -137,6 +138,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .validate_published(&config.data_dir)
         .map_err(|error| Error::runtime(format!("cannot activate trusted public keys: {error}")))?;
     let trusted_keys = Arc::new(trusted_keys);
+    let metrics = Arc::new(Metrics::default());
 
     let server = Server::http(config.listen)
         .map_err(|error| Error::runtime(format!("cannot listen on {}: {error}", config.listen)))?;
@@ -157,6 +159,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .flush()
         .map_err(|error| Error::runtime(format!("cannot report listener: {error}")))?;
 
+    let min_free_bytes = config.min_free_bytes;
     let upload_policy = NarUploadPolicy::new(config.max_nar_bytes.get(), config.min_free_bytes);
     let queue = Arc::new(WorkQueue::new(config.max_in_flight.get()));
     let handles: Vec<_> = (0..config.workers.get())
@@ -165,10 +168,19 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             let storage = Arc::clone(&storage);
             let authorizer = Arc::clone(&authorizer);
             let trusted_keys = Arc::clone(&trusted_keys);
+            let metrics = Arc::clone(&metrics);
             thread::spawn(move || {
                 while let Some(request) = queue.pop() {
                     let _admission = Admission(queue.as_ref());
-                    respond(request, &storage, &authorizer, &trusted_keys, upload_policy);
+                    respond(
+                        request,
+                        &storage,
+                        &authorizer,
+                        &trusted_keys,
+                        upload_policy,
+                        &metrics,
+                        min_free_bytes,
+                    );
                 }
             })
         })

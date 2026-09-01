@@ -45,6 +45,11 @@ impl NarObjectId {
     pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
         parse_nix32(value, 52).map(Self)
     }
+
+    #[doc(hidden)]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -54,6 +59,11 @@ impl StoreHash {
     pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
         parse_nix32(value, 32).map(Self)
     }
+
+    #[doc(hidden)]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObjectId> {
@@ -62,7 +72,8 @@ fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObject
         .ok_or(InvalidObjectId)
 }
 
-fn nix32_sha256(digest: &[u8]) -> String {
+#[doc(hidden)]
+pub fn nix32_sha256(digest: &[u8]) -> String {
     static ENCODING: OnceLock<Encoding> = OnceLock::new();
     let encoding = ENCODING.get_or_init(|| {
         let mut specification = Specification::new();
@@ -402,6 +413,10 @@ impl Storage {
         };
 
         Ok(Some(PublishedPair { nar, narinfo }))
+    }
+
+    pub fn is_ready(&self, min_free_bytes: u64) -> Result<bool, StorageError> {
+        Ok(available_bytes(&self.layout.root)? >= min_free_bytes)
     }
 
     pub fn reconcile(

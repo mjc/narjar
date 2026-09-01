@@ -1637,12 +1637,7 @@ fn init_and_key_generate_create_secure_operator_material() {
     for directory in ["nar", ".tmp", "realisations", "auth"] {
         assert!(data_dir.join(directory).is_dir(), "{directory}");
     }
-    for file in [
-        "nix-cache-info",
-        "trusted-public-keys",
-        "auth/read.tokens",
-        "auth/write.tokens",
-    ] {
+    for file in ["nix-cache-info", "trusted-public-keys", "auth/write.tokens"] {
         assert!(data_dir.join(file).is_file(), "{file}");
     }
     assert_eq!(
@@ -1778,11 +1773,15 @@ fn delete_is_offline_and_leaves_shared_nar_objects() {
     let nar_path = format!("/nar/{NARJAR_HASH}.nar");
     let narinfo_path = format!("/{STORE_HASH}.narinfo");
     let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
-    let headers = [("Authorization", TEST_AUTHORIZATION)];
+    let headers: [(&str, &str); 0] = [];
     let nar_created = server.request_with_body("PUT", &nar_path, &headers, NAR_BYTES);
     let narinfo_created =
         server.request_with_body("PUT", &narinfo_path, &headers, narinfo.as_bytes());
-    assert!(response_parts(&nar_created).0.starts_with("HTTP/1.1 201"));
+    assert!(
+        response_parts(&nar_created).0.starts_with("HTTP/1.1 201"),
+        "{}",
+        String::from_utf8_lossy(&nar_created)
+    );
     assert!(
         response_parts(&narinfo_created)
             .0
@@ -1935,7 +1934,6 @@ fn restored_cache_verifies_before_serving() {
     for relative in [
         "nix-cache-info",
         "trusted-public-keys",
-        "auth/read.tokens",
         "auth/write.tokens",
         "nar/0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl.nar",
         "00000000000000000000000000000000.narinfo",

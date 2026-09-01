@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod operator;
 mod server;
 mod token;
 
@@ -22,7 +23,7 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), Error> {
     match args.next().as_deref() {
         Some("serve") => server::serve(ServeConfig::parse(args)?),
         Some("token") => token::run(args),
-        Some(command) => Err(Error::usage(format!("unknown command: {command}"))),
+        Some(command) => operator::run(command, args),
         None => Err(Error::usage("a command is required")),
     }
 }

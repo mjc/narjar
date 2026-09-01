@@ -71,7 +71,8 @@ impl TrustedPublicKeys {
         }
         Ok(Self(keys))
     }
-    pub(crate) fn validate(
+    #[doc(hidden)]
+    pub fn validate(
         &self,
         route: &StoreHash,
         bytes: Vec<u8>,
@@ -253,11 +254,13 @@ impl ParsedNarInfo {
 pub struct ValidatedNarInfo(ParsedNarInfo);
 
 impl ValidatedNarInfo {
-    pub(crate) fn nar(&self) -> &NarObjectId {
+    #[doc(hidden)]
+    pub fn nar(&self) -> &NarObjectId {
         &self.0.nar
     }
 
-    pub(crate) const fn nar_size(&self) -> u64 {
+    #[doc(hidden)]
+    pub const fn nar_size(&self) -> u64 {
         self.0.nar_size
     }
 

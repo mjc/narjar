@@ -4,6 +4,7 @@ use tiny_http::{Header, Method, Response, StatusCode};
 
 use crate::{
     auth::{Authorizer, Permission},
+    metrics::Metrics,
     narinfo::TrustedPublicKeys,
     storage::{NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError, StoreHash},
 };
@@ -404,13 +405,64 @@ pub fn respond(
     authorizer: &Authorizer,
     trusted: &TrustedPublicKeys,
     policy: NarUploadPolicy,
+    metrics: &Metrics,
+    min_free_bytes: u64,
 ) {
+    let _request = metrics.request();
+    if request.url() == "/healthz" {
+        if !matches!(request.method(), Method::Get | Method::Head) {
+            method_not_allowed(request, "GET, HEAD");
+            return;
+        }
+        let _ = request.respond(
+            Response::from_string("ok\n")
+                .with_status_code(StatusCode(200))
+                .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+        );
+        return;
+    }
+    if matches!(request.url(), "/readyz" | "/metrics") {
+        if !matches!(request.method(), Method::Get | Method::Head) {
+            method_not_allowed(request, "GET, HEAD");
+            return;
+        }
+        if !authorizer.allows(&request, Permission::Read) {
+            metrics.auth_failure();
+            unauthorized(request);
+            return;
+        }
+        let ready = storage.is_ready(min_free_bytes).unwrap_or(false);
+        if request.url() == "/readyz" {
+            let (status, body) = if ready {
+                (200, "ready\n")
+            } else {
+                (503, "insufficient_space\n")
+            };
+            let _ = request.respond(
+                Response::from_string(body)
+                    .with_status_code(StatusCode(status))
+                    .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+            );
+        } else {
+            let _ = request.respond(
+                Response::from_string(metrics.render(ready))
+                    .with_status_code(StatusCode(200))
+                    .with_header(header(
+                        "Content-Type",
+                        "text/plain; version=0.0.4; charset=utf-8",
+                    )),
+            );
+        }
+        return;
+    }
+
     let permission = if matches!(request.method(), Method::Put) {
         Permission::Write
     } else {
         Permission::Read
     };
     if !authorizer.allows(&request, permission) {
+        metrics.auth_failure();
         unauthorized(request);
         return;
     }
