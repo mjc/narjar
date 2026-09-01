@@ -631,6 +631,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn process_lock_is_exclusive_and_released_on_drop() {
+        let directory = TestDir::new();
+        let first = Storage::initialize(directory.path()).expect("acquire first process lock");
+
+        assert!(directory.path().join("lock").is_file());
+        assert!(matches!(
+            Storage::initialize(directory.path()),
+            Err(StorageError::Locked)
+        ));
+
+        drop(first);
+        Storage::initialize(directory.path()).expect("reacquire released process lock");
+    }
+
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
