@@ -12,6 +12,7 @@ import math
 import os
 import platform
 import random
+import shlex
 import shutil
 import socket
 import statistics
@@ -175,13 +176,18 @@ class Candidate:
         )
         self.netrc.chmod(0o600)
 
-    def server_command(self, port: int) -> list[str]:
+    def server_command(
+        self,
+        port: int,
+        data_dir: Path | None = None,
+    ) -> list[str]:
+        data_dir = data_dir or self.data_dir
         if self.name == "narjar":
             return [
                 str(self.binary),
                 "serve",
                 "--data-dir",
-                str(self.data_dir),
+                str(data_dir),
                 "--listen",
                 f"127.0.0.1:{port}",
                 "--workers",
@@ -191,7 +197,7 @@ class Candidate:
             str(self.binary),
             "serve",
             "--data-dir",
-            str(self.data_dir),
+            str(data_dir),
             "--secret-key-file",
             str(self.root / "secret-key"),
             "--push-token-file",
@@ -202,16 +208,39 @@ class Candidate:
             "1",
         ]
 
-    def start(self) -> float:
+    def start(self, data_limit_mib: int | None = None) -> float:
         if self.process is not None:
             raise RuntimeError(f"{self.name} is already running")
 
         port = reserve_port()
         self.url = f"http://127.0.0.1:{port}"
         self._log = (self.log_dir / f"{self.name}.log").open("a")
+        server_command = self.server_command(port)
+        if data_limit_mib is not None:
+            limited_data = self.root / "limited-data"
+            limited_data.mkdir(exist_ok=True)
+            server_command = [
+                "unshare",
+                "-Urm",
+                "--map-root-user",
+                "sh",
+                "-c",
+                (
+                    'set -eu\n'
+                    'mount -t tmpfs -o "size=${1}M" tmpfs "$2"\n'
+                    'cp -a "$3/." "$2/"\n'
+                    'shift 3\n'
+                    'exec "$@"'
+                ),
+                "benchmark-enospc",
+                str(data_limit_mib),
+                str(limited_data),
+                str(self.data_dir),
+                *self.server_command(port, limited_data),
+            ]
         started = time.perf_counter_ns()
         self.process = subprocess.Popen(
-            self.server_command(port),
+            server_command,
             stdout=self._log,
             stderr=subprocess.STDOUT,
             text=True,
@@ -292,6 +321,46 @@ class Candidate:
             batch = paths[offset : offset + 128]
             self._sign(batch)
             subprocess.run(self._copy_args(batch), check=True)
+
+    def publish_result(self, path: str) -> subprocess.CompletedProcess[str]:
+        self._sign([path])
+        return subprocess.run(
+            self._copy_args([path]),
+            text=True,
+            capture_output=True,
+        )
+
+    def substitute(
+        self,
+        path: str,
+        store_root: Path,
+        public_key: str,
+    ) -> subprocess.CompletedProcess[str]:
+        if self.url is None:
+            raise RuntimeError(f"{self.name} is not running")
+        return subprocess.run(
+            [
+                "nix",
+                "--store",
+                f"local?root={store_root}",
+                "copy",
+                "--refresh",
+                "--from",
+                self.url,
+                "--option",
+                "netrc-file",
+                str(self.netrc),
+                "--option",
+                "require-sigs",
+                "true",
+                "--option",
+                "trusted-public-keys",
+                public_key,
+                path,
+            ],
+            text=True,
+            capture_output=True,
+        )
 
     def process_cpu_seconds(self) -> float:
         if self.process is None:
@@ -546,6 +615,7 @@ def environment(run: Run) -> dict[str, Any]:
             "findmnt", "-T", str(run.output), "-no", "SOURCE,FSTYPE,OPTIONS"
         ),
         "nix": command("nix", "--version"),
+        "unshare": optional_command("unshare", "--version"),
         "rustc": optional_command("rustc", "--version"),
         "narjar_binary": str(run.narjar),
         "narjar_commit": optional_command("git", "rev-parse", "HEAD"),
@@ -1065,6 +1135,161 @@ def benchmark_recovery(
     )
 
 
+def benchmark_enospc(
+    run: Run,
+    candidates: list[Candidate],
+    recorder: Recorder,
+) -> None:
+    if shutil.which("unshare") is None:
+        raise RuntimeError("unshare is required for the bounded ENOSPC case")
+
+    payload_bytes = 16 * 1024 * 1024 if run.quick else 64 * 1024 * 1024
+    payload = make_payloads(run, 1, payload_bytes, "enospc")[0]
+    store_hash = Path(payload).name.split("-", 1)[0]
+    evidence = []
+    for base in candidates:
+        candidate = Candidate(
+            base.name,
+            base.binary,
+            run.work / "enospc" / base.name,
+            run.output / "logs",
+        )
+        candidate.prepare()
+        try:
+            candidate.start(data_limit_mib=8)
+            result = candidate.publish_result(payload)
+            time.sleep(0.1)
+            alive = candidate.process is not None and candidate.process.poll() is None
+            status = candidate.request("HEAD", f"{store_hash}.narinfo")[0] if alive else 0
+            candidate.stop()
+            candidate.start()
+            restart_status = candidate.request("HEAD", f"{store_hash}.narinfo")[0]
+        finally:
+            candidate.stop()
+
+        if result.returncode == 0:
+            raise RuntimeError(f"{candidate.name} unexpectedly accepted ENOSPC upload")
+        if not alive or status != 404 or restart_status != 404:
+            raise RuntimeError(
+                f"{candidate.name} ENOSPC recovery failed: "
+                f"alive={alive}, status={status}, restart={restart_status}"
+            )
+        recorder.add("enospc_client_failed", candidate.name, 0, 1, "bool")
+        recorder.add("enospc_service_alive", candidate.name, 0, 1, "bool")
+        recorder.add(
+            "enospc_visibility_after_failure",
+            candidate.name,
+            0,
+            status,
+            "HTTP status",
+        )
+        recorder.add(
+            "enospc_visibility_after_restart",
+            candidate.name,
+            0,
+            restart_status,
+            "HTTP status",
+        )
+        evidence.append(
+            {
+                "candidate": candidate.name,
+                "client_returncode": result.returncode,
+                "client_stderr_tail": result.stderr[-4000:],
+                "data_limit_mib": 8,
+                "payload_bytes": payload_bytes,
+                "server_alive": alive,
+                "status_after_failure": status,
+                "status_after_restart": restart_status,
+            }
+        )
+
+    (run.output / "enospc.json").write_text(
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def benchmark_trust(
+    run: Run,
+    candidates: list[Candidate],
+    recorder: Recorder,
+) -> None:
+    wrong_secret = run.work / "wrong-secret-key"
+    wrong_public = run.work / "wrong-public-key"
+    subprocess.run(
+        [
+            "nix-store",
+            "--generate-binary-cache-key",
+            "wrong-benchmark-key",
+            str(wrong_secret),
+            str(wrong_public),
+        ],
+        check=True,
+    )
+    wrong_key = wrong_public.read_text().strip()
+    evidence = []
+    for candidate in candidates:
+        flake_uri = f"path:{Path.cwd()}"
+        script = (
+            f'printf "matched substitution proof for {candidate.name}\\n" > "$out"'
+        )
+        expression = (
+            "let pkgs = import (builtins.getFlake "
+            + json.dumps(flake_uri)
+            + ").inputs.nixpkgs { system = builtins.currentSystem; }; "
+            + "in pkgs.runCommand "
+            + json.dumps(f"narjar-trust-{candidate.name}")
+            + " {} "
+            + json.dumps(script)
+        )
+        path = command(
+            "nix",
+            "build",
+            "--no-link",
+            "--print-out-paths",
+            "--impure",
+            "--expr",
+            expression,
+        )
+        candidate.start()
+        try:
+            candidate.publish([path])
+            wrong = candidate.substitute(
+                path,
+                run.work / f"wrong-store-{candidate.name}",
+                wrong_key,
+            )
+            correct = candidate.substitute(
+                path,
+                run.work / f"correct-store-{candidate.name}",
+                candidate.public_key,
+            )
+        finally:
+            candidate.stop()
+
+        if wrong.returncode == 0:
+            raise RuntimeError(f"{candidate.name} accepted an unrelated cache key")
+        if correct.returncode != 0:
+            raise RuntimeError(
+                f"{candidate.name} substitution failed: {correct.stderr[-4000:]}"
+            )
+        recorder.add("wrong_key_rejected", candidate.name, 0, 1, "bool")
+        recorder.add("correct_key_substituted", candidate.name, 0, 1, "bool")
+        evidence.append(
+            {
+                "candidate": candidate.name,
+                "correct_key_returncode": correct.returncode,
+                "correct_key_stderr_tail": correct.stderr[-4000:],
+                "path": path,
+                "wrong_key_returncode": wrong.returncode,
+                "wrong_key_stderr_tail": wrong.stderr[-4000:],
+            }
+        )
+
+    (run.output / "substitution.json").write_text(
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+    )
+
+
 def measure_closures(run: Run, recorder: Recorder) -> None:
     binaries = {"narjar": run.narjar, "bincache": run.bincache}
     if not run.quick:
@@ -1124,17 +1349,33 @@ def main() -> int:
         (run.output / "environment.json").write_text(
             json.dumps(environment(run), indent=2, sort_keys=True) + "\n"
         )
+        benchmark_command = [
+            "nix",
+            "run",
+            ".#continuation-benchmark",
+            "--",
+            "--output",
+            str(run.output),
+            "--bincache-bin",
+            str(run.bincache),
+            "--repetitions",
+            str(run.repetitions),
+        ]
+        if run.quick:
+            benchmark_command.append("--quick")
         (run.output / "commands.txt").write_text(
-            " ".join(
-                (
+            shlex.join(
+                [
                     "nix",
                     "build",
                     "--no-write-lock-file",
                     "--no-link",
                     "--print-out-paths",
                     BINCACHE_FLAKE,
-                )
+                ]
             )
+            + "\n"
+            + shlex.join(benchmark_command)
             + "\n"
         )
         for candidate in candidates:
@@ -1145,6 +1386,8 @@ def main() -> int:
         benchmark_io(run, candidates, recorder, random.Random(SEED + 1))
         benchmark_streaming(run, candidates, recorder, random.Random(SEED + 2))
         benchmark_recovery(run, candidates, recorder, random.Random(SEED + 3))
+        benchmark_enospc(run, candidates, recorder)
+        benchmark_trust(run, candidates, recorder)
         measure_closures(run, recorder)
         write_report(run, recorder)
         print(run.output)
