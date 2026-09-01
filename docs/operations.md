@@ -110,6 +110,7 @@ Example fresh start:
 install -d -m 0700 /var/lib/narjar
 narjar init --data-dir /var/lib/narjar
 narjar token create --data-dir /var/lib/narjar --scope write --name ci > /run/credentials/narjar-ci-token
+narjar key generate --name narjar-producer --secret-key-file /run/credentials/narjar-producer.sec --public-key-file /var/lib/narjar/narjar-producer.pub
 install -m 0600 producer-public-keys /var/lib/narjar/trusted-public-keys
 narjar serve --data-dir /var/lib/narjar --listen 127.0.0.1:5000
 ~~~
@@ -124,6 +125,8 @@ The service runs as a dedicated unprivileged user.
 | DATA/nar and DATA/.tmp | 0700 | no direct web-server access |
 | NAR/narinfo/cache-info | 0600 | served only through process |
 | auth token files | 0600 | hashes, still security-sensitive |
+| generated signing secret | 0600 | create outside DATA and provision as a runtime credential |
+| generated signing public key | 0644 | distribute to producers and trust stores as required |
 | trusted-public-keys | 0644 or stricter | public material |
 | lock | 0600 | single serving process |
 
