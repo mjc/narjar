@@ -252,6 +252,13 @@ impl RunningServer {
     }
 
     fn request_with_headers(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> Vec<u8> {
+        let mut stream = self.open_request(method, path, headers);
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response");
+        response
+    }
+
+    fn open_request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> TcpStream {
         let mut stream = TcpStream::connect(&self.address).expect("connect to narjar");
         write!(
             stream,
@@ -263,10 +270,7 @@ impl RunningServer {
             write!(stream, "{name}: {value}\r\n").expect("write request header");
         }
         write!(stream, "\r\n").expect("finish request");
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read response");
-        response
+        stream
     }
 
     fn stop(mut self) -> (ExitStatus, ExitStatus) {
@@ -442,16 +446,46 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
     assert_eq!(&nar_get[nar_get_body..], nar_bytes);
     assert!(nar_head[nar_head_body..].is_empty());
 }
-fn response_parts(response: &[u8]) -> (String, &[u8]) {
+fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::new();
+    loop {
+        if body.is_empty() {
+            break;
+        }
+        let line_end = body
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("chunk must start with a size");
+        let size = std::str::from_utf8(&body[..line_end])
+            .ok()
+            .and_then(|size| size.split(';').next())
+            .and_then(|size| usize::from_str_radix(size, 16).ok())
+            .expect("chunk size must be hexadecimal");
+        body = &body[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        assert!(body.len() >= size + 2, "chunk body must be complete");
+        decoded.extend_from_slice(&body[..size]);
+        assert_eq!(&body[size..size + 2], b"\r\n");
+        body = &body[size + 2..];
+    }
+    decoded
+}
+
+fn response_parts(response: &[u8]) -> (String, Vec<u8>) {
     let body = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map(|position| position + 4)
         .expect("response must contain a header terminator");
-    (
-        String::from_utf8_lossy(&response[..body]).into_owned(),
-        &response[body..],
-    )
+    let headers = String::from_utf8_lossy(&response[..body]).into_owned();
+    let body = if headers.contains("Transfer-Encoding: chunked\r\n") {
+        decode_chunked(&response[body..])
+    } else {
+        response[body..].to_vec()
+    };
+    (headers, body)
 }
 
 #[test]
@@ -581,4 +615,103 @@ fn read_routes_distinguish_bad_methods_names_and_unsupported_surfaces() {
         );
         assert!(body.is_empty());
     }
+}
+
+#[test]
+fn nar_reads_survive_unlink_and_aborted_slow_clients_without_exposing_temps() {
+    let server = RunningServer::start("nar-read-races");
+    let nar_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
+    let nar_bytes = vec![0x5a; 8 * 1024 * 1024];
+    fs::write(&nar_path, &nar_bytes).expect("write large NAR fixture");
+    let path = format!("/nar/{NAR_ID}.nar");
+
+    let range = format!("bytes=0-{}", nar_bytes.len() - 1);
+    let mut deleting_stream = server.open_request("GET", &path, &[("Range", &range)]);
+    deleting_stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut deleting_response = Vec::new();
+    let mut chunk = [0; 8192];
+    while !deleting_response
+        .windows(4)
+        .any(|window| window == b"\r\n\r\n")
+    {
+        let read = deleting_stream
+            .read(&mut chunk)
+            .expect("read response headers");
+        assert_ne!(read, 0, "response ended before headers");
+        deleting_response.extend_from_slice(&chunk[..read]);
+    }
+
+    fs::remove_file(&nar_path).expect("unlink open NAR");
+    deleting_stream
+        .read_to_end(&mut deleting_response)
+        .expect("finish unlinked NAR response");
+    let (headers, body) = response_parts(&deleting_response);
+    assert!(
+        headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+        "{headers:?}"
+    );
+    assert_eq!(body.len(), nar_bytes.len());
+    assert!(body.iter().all(|&byte| byte == 0x5a));
+
+    let missing = server.request("GET", &path);
+    let (missing_headers, missing_body) = response_parts(&missing);
+    assert!(
+        missing_headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "{missing_headers:?}"
+    );
+    assert!(missing_body.is_empty());
+
+    fs::write(
+        server.data_dir.join(".tmp/read-race-unvalidated"),
+        b"temporary bytes",
+    )
+    .expect("write temporary fixture");
+    for temp_path in [
+        "/.tmp/read-race-unvalidated",
+        &format!("/nar/{NAR_ID}.nar.tmp"),
+    ] {
+        let response = server.request("GET", temp_path);
+        let (headers, _) = response_parts(&response);
+        assert!(!headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+    }
+
+    let sparse = fs::File::create(&nar_path).expect("create sparse NAR");
+    let sparse_length = 64_u64 * 1024 * 1024;
+    sparse.set_len(sparse_length).expect("size sparse NAR");
+    drop(sparse);
+
+    let head = server.request("HEAD", &path);
+    let (head_headers, head_body) = response_parts(&head);
+    assert!(
+        head_headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{head_headers:?}"
+    );
+    assert!(
+        head_headers.contains(&format!("Content-Length: {sparse_length}\r\n")),
+        "{head_headers:?}"
+    );
+    assert!(head_body.is_empty());
+
+    let mut aborted = server.open_request("GET", &path, &[]);
+    aborted
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let read = aborted
+        .read(&mut chunk)
+        .expect("read initial response bytes");
+    assert_ne!(read, 0, "response should start before abort");
+    drop(aborted);
+
+    let after_abort = server.request("GET", "/nix-cache-info");
+    let (after_abort_headers, _) = response_parts(&after_abort);
+    let (signal, status) = server.stop();
+
+    assert!(
+        after_abort_headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{after_abort_headers:?}"
+    );
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
 }
