@@ -150,3 +150,40 @@ impl std::error::Error for AuthError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    const WRITE_TOKEN: &str =
+        "test 4c6fe1d79dd5595d75e9b7c82dbdc4481996f7aea7143e7153c8eb5e9f94ea45\n";
+
+    fn test_root(test: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("narjar-auth-{test}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn rejects_group_or_world_readable_token_files() {
+        let root = test_root("permissions");
+        let auth = root.join("auth");
+        fs::create_dir_all(&auth).expect("create test auth directory");
+        let path = auth.join("write.tokens");
+        fs::write(&path, WRITE_TOKEN).expect("write test token file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("set insecure test permissions");
+
+        let result = Authorizer::load(&root);
+        fs::remove_dir_all(root).expect("remove test data directory");
+
+        assert!(result.is_err(), "insecure token file should be rejected");
+    }
+}
