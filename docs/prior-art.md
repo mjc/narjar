@@ -131,9 +131,10 @@ Narjar differential would be:
 - No io_uring-specific runtime path, sharding, redb, rkyv, metrics dependency,
   key rotation, or online deletion in v0.1.
 
-Before implementation, benchmark and fault-model that differential against
-bincache. If the simpler profile cannot beat its idle RSS/startup/operability
-targets materially, adopt bincache.
+The gate may authorize only a thin vertical slice needed to obtain matched
+measurements. Before implementation continues past that slice, benchmark and
+fault-model the differential against bincache. If the simpler profile cannot
+beat its idle RSS/startup/operability targets materially, adopt bincache.
 
 ## niks3
 
@@ -159,4 +160,5 @@ one of these outcomes:
 3. Build Narjar as the demonstrably smaller no-DB/no-key/no-recompression
    profile, with a written differential and matched measurements.
 
-The architecture gate must pick one before a Rust server red test is added.
+The architecture gate must pick one before a Rust server red test is added. A
+conditional greenfield decision authorizes only the measured vertical slice.

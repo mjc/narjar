@@ -66,7 +66,7 @@ text/x-nix-narinfo.
 The upstream Nix 2.31.5 implementation computes and optionally compresses the
 NAR locally, derives nar/<file-hash>.nar[.<codec>], uploads the NAR, signs the
 metadata, and writes narinfo last:
-[binary-cache-store.cc lines 1599-1818](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/binary-cache-store.cc#L1599-L1818).
+[binary-cache-store.cc lines 130-271](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/binary-cache-store.cc#L130-L271).
 That source order agrees with the wire capture.
 
 ## Compression, addressing, duplicate writes, and reads
@@ -86,10 +86,14 @@ Range/resume support is therefore not required for a normal read, but
 interrupted-transfer behavior remains a separate acceptance test.
 
 Nix treats narinfo existence as path validity:
-[binary-cache-store.cc lines 1992-2003](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/binary-cache-store.cc#L1992-L2003).
-Realisation metadata, when used, is stored separately at
-realisations/<drv-output-id>.doi:
-[binary-cache-store.cc lines 2184-2228](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/binary-cache-store.cc#L2184-L2228).
+[binary-cache-store.cc lines 361-366](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/binary-cache-store.cc#L361-L366).
+Realisation metadata, when used, is a separate JSON object at
+`realisations/<drv-output-id>.doi`; current source maps both query and
+registration to that namespace:
+[binary-cache-store.cc lines 470-497](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/binary-cache-store.cc#L470-L497).
+No realisation request occurred for the tested source-path/content-addressed
+fixtures. v0.1 reserves the route and returns 404/405; support remains an
+explicit non-goal until a real CA-derivation trace requires it.
 
 ## Authentication and redirects
 
@@ -112,9 +116,23 @@ Servers must therefore make publication atomic at narinfo and operators must
 understand that a prior 404 may remain client-visible until refresh or cache
 expiry.
 
-Nix documents a seven-day cache for nix-cache-info; this experiment only
-characterizes negative narinfo behavior and does not infer its TTL:
-[nix-cache-info format](https://nix.dev/manual/nix/2.35/protocols/binary-cache/nix-cache-info.html).
+The default negative narinfo TTL is 3600 seconds and applies to the local disk
+cache; zero forces refresh. The in-process path-info cache uses the same
+positive/negative TTL selection:
+[Nix 2.35 setting](https://nix.dev/manual/nix/2.35/command-ref/conf-file.html#conf-narinfo-cache-negative-ttl),
+[store-api.cc lines 295-300](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/store-api.cc#L295-L300).
+
+## Retries and interrupted transfers
+
+Nix retries 408, 429, most 5xx responses, and transient curl failures with
+backoff; 401/403/407, most other 4xx, and selected permanent 5xx/curl failures
+are terminal. A partial download resumes only when the server advertised byte
+ranges and no content encoding is active. Upload data is replayable, but the
+protocol defines no server-side partial-PUT resume. Narjar must therefore keep
+an interrupted PUT invisible, discard or reconcile its temporary, and accept a
+later full-body retry idempotently:
+[resume setup](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/filetransfer.cc#L383-L384),
+[retry classification](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/filetransfer.cc#L437-L532).
 
 ## Contract consequences for Narjar
 
@@ -131,11 +149,16 @@ characterizes negative narinfo behavior and does not infer its TTL:
 - TLS is expected at a reverse proxy for v0.1; Narjar itself has no evidence
   basis for owning TLS.
 
-## Remaining NARJ-2 gaps
+## Explicit evidence boundaries
 
-- Deliberately interrupted download/upload, retry, and resume captures.
-- A real derivation-output realisation capture, not only the source path.
-- TLS/CA and proxy-buffering behavior at the chosen deployment boundary.
-- Retry classification for connection reset, 408, 429, and 5xx.
-- Exact negative narinfo cache TTL and process-versus-disk-cache behavior.
-- A Linux capture to accompany the Darwin client captures.
+- HTTP behavior is proven on real Darwin sockets for Nix 2.31.5 and 2.35.2;
+  Linux remains a release-matrix confirmation, not a different protocol claim.
+- TLS verification and CA selection are libcurl/Nix client responsibilities;
+  Narjar terminates plain HTTP behind a trusted proxy. The production proxy
+  buffering/timeout test remains an implementation acceptance check:
+  [filetransfer.cc lines 363-377](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/filetransfer.cc#L363-L377).
+- No live realisation request was produced by the captured corpus. The exact
+  namespace is source-backed and explicitly unsupported in v0.1.
+- A killed live PUT was not retained as a protocol fixture. Current Nix retry
+  classification is source-backed; Narjar's required behavior is full-body,
+  idempotent retry with no partial visibility.
