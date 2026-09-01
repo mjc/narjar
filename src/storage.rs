@@ -6,7 +6,10 @@ use std::{
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -150,6 +153,7 @@ impl ProcessLock {
 #[derive(Debug)]
 pub struct Storage {
     layout: Layout,
+    publication_lock: Mutex<()>,
     _lock: ProcessLock,
 }
 
@@ -166,6 +170,7 @@ impl Storage {
 
         Ok(Self {
             layout,
+            publication_lock: Mutex::new(()),
             _lock: lock,
         })
     }
@@ -280,6 +285,10 @@ impl Storage {
         mut source: impl Read,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
+        let _publication = self
+            .publication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let destination = target.destination(&self.layout);
         checkpoint(PublishBoundary::BeforeTempCreate)?;
         let (temp_path, mut temp) = self.create_temp(&target)?;
