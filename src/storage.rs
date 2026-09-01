@@ -771,30 +771,47 @@ mod tests {
     }
 
     #[test]
-    fn stream_io_failure_leaves_no_final_or_temp() {
-        let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
-        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+    fn stream_resource_failures_leave_no_false_publication_state() {
+        for raw_error in [libc::EIO, libc::ENOSPC] {
+            let directory = TestDir::new();
+            let storage = Storage::initialize(directory.path()).expect("initialize storage");
+            let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
 
-        assert!(storage.publish_nar(&nar, BrokenReader::default()).is_err());
-        assert!(!storage.layout().nar_path(&nar).exists());
-        assert!(
-            fs::read_dir(storage.layout().temp_dir())
-                .expect("read temp directory")
-                .next()
-                .is_none()
-        );
+            let error = storage
+                .publish_nar(&nar, BrokenReader::new(raw_error))
+                .expect_err("stream failure must reject publication");
+            let StorageError::Io(error) = error else {
+                panic!("stream failure returned a non-I/O error");
+            };
+            assert_eq!(error.raw_os_error(), Some(raw_error));
+            assert!(!storage.layout().nar_path(&nar).exists());
+            assert!(
+                fs::read_dir(storage.layout().temp_dir())
+                    .expect("read temp directory")
+                    .next()
+                    .is_none()
+            );
+        }
     }
 
-    #[derive(Default)]
     struct BrokenReader {
+        raw_error: i32,
         returned_prefix: bool,
+    }
+
+    impl BrokenReader {
+        fn new(raw_error: i32) -> Self {
+            Self {
+                raw_error,
+                returned_prefix: false,
+            }
+        }
     }
 
     impl Read for BrokenReader {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             if self.returned_prefix {
-                return Err(io::Error::other("injected stream failure"));
+                return Err(io::Error::from_raw_os_error(self.raw_error));
             }
 
             self.returned_prefix = true;
