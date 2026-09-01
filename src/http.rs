@@ -2,7 +2,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use tiny_http::{Header, Method, Response, StatusCode};
 
-use crate::storage::{NarObjectId, PublishOutcome, Storage, StorageError, StoreHash};
+use crate::storage::{
+    NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError, StoreHash,
+};
 
 const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
 const MAX_NARINFO_BYTES: usize = 1024 * 1024;
@@ -261,8 +263,7 @@ fn respond_nar_put(
     mut request: tiny_http::Request,
     storage: &Storage,
     id: &NarObjectId,
-    max_nar_bytes: u64,
-    min_free_bytes: u64,
+    policy: NarUploadPolicy,
 ) {
     if has_header(&request, "Transfer-Encoding") {
         let _ = request.respond(Response::empty(StatusCode(400)));
@@ -277,27 +278,12 @@ fn respond_nar_put(
         let _ = request.respond(Response::empty(StatusCode(411)));
         return;
     };
-    let length = length as u64;
-    if length > max_nar_bytes {
-        let _ = request.respond(Response::empty(StatusCode(413)));
-        return;
-    }
-    match storage.has_capacity_for(length, min_free_bytes) {
-        Ok(true) => {}
-        Ok(false) => {
-            let _ = request.respond(Response::empty(StatusCode(507)));
-            return;
-        }
-        Err(_) => {
-            let _ = request.respond(Response::empty(StatusCode(500)));
-            return;
-        }
-    }
-
-    let status = match storage.publish_nar(id, request.as_reader(), length) {
+    let status = match storage.publish_nar(id, request.as_reader(), length as u64, policy) {
         Ok(PublishOutcome::Created) => 201,
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,
+        Err(StorageError::UploadTooLarge) => 413,
+        Err(StorageError::InsufficientSpace) => 507,
         Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => 422,
         Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
         Err(_) => 500,
@@ -305,12 +291,7 @@ fn respond_nar_put(
     let _ = request.respond(Response::empty(StatusCode(status)));
 }
 
-pub fn respond(
-    request: tiny_http::Request,
-    storage: &Storage,
-    max_nar_bytes: u64,
-    min_free_bytes: u64,
-) {
+pub fn respond(request: tiny_http::Request, storage: &Storage, policy: NarUploadPolicy) {
     let route = match ReadRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
         RouteMatch::UnsupportedEncoding => {
@@ -331,9 +312,7 @@ pub fn respond(
 
     if matches!(request.method(), Method::Put) {
         return match route {
-            ReadRoute::Nar(id) => {
-                respond_nar_put(request, storage, &id, max_nar_bytes, min_free_bytes)
-            }
+            ReadRoute::Nar(id) => respond_nar_put(request, storage, &id, policy),
             ReadRoute::CacheInfo | ReadRoute::NarInfo(_) => {
                 method_not_allowed(request, "GET, HEAD")
             }

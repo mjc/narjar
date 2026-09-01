@@ -224,6 +224,21 @@ impl ProcessLock {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NarUploadPolicy {
+    max_bytes: u64,
+    min_free_bytes: u64,
+}
+
+impl NarUploadPolicy {
+    pub const fn new(max_bytes: u64, min_free_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            min_free_bytes,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Storage {
     layout: Layout,
@@ -249,15 +264,6 @@ impl Storage {
         })
     }
 
-    pub(crate) fn has_capacity_for(
-        &self,
-        object_bytes: u64,
-        min_free_bytes: u64,
-    ) -> Result<bool, StorageError> {
-        let required = object_bytes.saturating_add(min_free_bytes);
-        Ok(available_bytes(&self.layout.root)? >= required)
-    }
-
     #[cfg(test)]
     fn layout(&self) -> &Layout {
         &self.layout
@@ -268,10 +274,23 @@ impl Storage {
         id: &NarObjectId,
         source: impl Read,
         expected_length: u64,
+        policy: NarUploadPolicy,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish(
+        if expected_length > policy.max_bytes {
+            return Err(StorageError::UploadTooLarge);
+        }
+
+        let required_bytes = expected_length.saturating_add(policy.min_free_bytes);
+        self.publish_with_admission(
             PublishTarget::Nar(id),
             CheckedNarReader::new(source, &id.0, expected_length),
+            || {
+                if available_bytes(&self.layout.root)? < required_bytes {
+                    return Err(StorageError::InsufficientSpace);
+                }
+                Ok(())
+            },
+            |_| Ok(()),
         )
     }
 
@@ -386,13 +405,24 @@ impl Storage {
     fn publish_with(
         &self,
         target: PublishTarget<'_>,
+        source: impl Read,
+        checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.publish_with_admission(target, source, || Ok(()), checkpoint)
+    }
+
+    fn publish_with_admission(
+        &self,
+        target: PublishTarget<'_>,
         mut source: impl Read,
+        admit: impl FnOnce() -> Result<(), StorageError>,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
         let _publication = self
             .publication_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        admit()?;
         let destination = target.destination(&self.layout);
         checkpoint(PublishBoundary::BeforeTempCreate)?;
         let (temp_path, mut temp) = self.create_temp(&target)?;
@@ -491,8 +521,10 @@ pub enum PublishOutcome {
 #[derive(Debug)]
 pub enum StorageError {
     Conflict,
+    InsufficientSpace,
     Locked,
     MissingNar,
+    UploadTooLarge,
     Io(io::Error),
 }
 
@@ -506,8 +538,12 @@ impl fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Conflict => formatter.write_str("immutable destination has different contents"),
-            Self::MissingNar => formatter.write_str("referenced NAR is not published"),
+            Self::InsufficientSpace => {
+                formatter.write_str("configured free space reserve would be violated")
+            }
             Self::Locked => formatter.write_str("data directory is locked by another process"),
+            Self::MissingNar => formatter.write_str("referenced NAR is not published"),
+            Self::UploadTooLarge => formatter.write_str("NAR upload exceeds configured size limit"),
             Self::Io(error) => error.fmt(formatter),
         }
     }
@@ -517,7 +553,11 @@ impl std::error::Error for StorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Conflict | Self::MissingNar | Self::Locked => None,
+            Self::Conflict
+            | Self::InsufficientSpace
+            | Self::Locked
+            | Self::MissingNar
+            | Self::UploadTooLarge => None,
         }
     }
 }

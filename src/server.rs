@@ -15,7 +15,10 @@ use signal_hook::{
 };
 use tiny_http::Server;
 
-use narjar::{http::respond, storage::Storage};
+use narjar::{
+    http::respond,
+    storage::{NarUploadPolicy, Storage},
+};
 
 use crate::{config::ServeConfig, error::Error};
 
@@ -58,8 +61,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .flush()
         .map_err(|error| Error::runtime(format!("cannot report listener: {error}")))?;
 
-    let max_nar_bytes = config.max_nar_bytes.get();
-    let min_free_bytes = config.min_free_bytes;
+    let upload_policy = NarUploadPolicy::new(config.max_nar_bytes.get(), config.min_free_bytes);
     let handles: Vec<_> = (0..config.workers.get())
         .map(|_| {
             let server = Arc::clone(&server);
@@ -68,7 +70,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             thread::spawn(move || {
                 while !stopping.load(Ordering::Acquire) {
                     if let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(50)) {
-                        respond(request, &storage, max_nar_bytes, min_free_bytes);
+                        respond(request, &storage, upload_policy);
                     }
                 }
             })
