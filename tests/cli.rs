@@ -1474,3 +1474,23 @@ fn nix_cache_info_put_is_durable_idempotent_and_immutable() {
     assert!(signal.success());
     assert!(status.success());
 }
+
+#[test]
+fn nix_2_31_5_trace_drives_redacted_socket_conformance() {
+    let server = RunningServer::start("nix-trace-conformance");
+    let transcript =
+        run_conformance_trace(&server, include_str!("fixtures/nix-2.31.5-http-v0.1.tsv"));
+    let (signal, status) = server.stop();
+
+    assert!(
+        transcript.contains("GET /nix-cache-info\n< HTTP/1.1 200 OK"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("Authorization: <redacted>"),
+        "{transcript}"
+    );
+    assert!(!transcript.contains(TEST_AUTHORIZATION), "{transcript}");
+    assert!(signal.success());
+    assert!(status.success());
+}
