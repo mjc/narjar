@@ -1,6 +1,15 @@
-use std::path::PathBuf;
+use std::{
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{self, Read},
+    path::{Path, PathBuf},
+    process,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+const TEMP_ATTEMPTS: u64 = 128;
+const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Eq, PartialEq)]
 struct NarObjectId(String);
@@ -36,8 +45,12 @@ impl Layout {
         Self { root }
     }
 
+    fn nar_dir(&self) -> PathBuf {
+        self.root.join("nar")
+    }
+
     fn nar_path(&self, id: &NarObjectId) -> PathBuf {
-        self.root.join("nar").join(format!("{}.nar", id.0))
+        self.nar_dir().join(format!("{}.nar", id.0))
     }
 
     fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
@@ -47,7 +60,227 @@ impl Layout {
     fn temp_dir(&self) -> PathBuf {
         self.root.join(".tmp")
     }
+
+    fn realisations_dir(&self) -> PathBuf {
+        self.root.join("realisations")
+    }
 }
+
+#[derive(Debug)]
+struct Storage {
+    layout: Layout,
+}
+
+impl Storage {
+    fn initialize(root: impl AsRef<Path>) -> Result<Self, PublishError> {
+        let layout = Layout::new(root.as_ref().to_owned());
+        fs::create_dir_all(&layout.root)?;
+        fs::create_dir_all(layout.nar_dir())?;
+        fs::create_dir_all(layout.temp_dir())?;
+        fs::create_dir_all(layout.realisations_dir())?;
+        sync_dir(&layout.root)?;
+
+        Ok(Self { layout })
+    }
+
+    fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    fn publish_nar(
+        &self,
+        id: &NarObjectId,
+        source: impl Read,
+    ) -> Result<PublishOutcome, PublishError> {
+        self.publish("nar", self.layout.nar_path(id), source)
+    }
+
+    fn publish_narinfo(
+        &self,
+        store: &StoreHash,
+        nar: &NarObjectId,
+        source: impl Read,
+    ) -> Result<PublishOutcome, PublishError> {
+        match fs::metadata(self.layout.nar_path(nar)) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(PublishError::MissingNar),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(PublishError::MissingNar);
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        self.publish("narinfo", self.layout.narinfo_path(store), source)
+    }
+
+    fn open_pair(
+        &self,
+        store: &StoreHash,
+        nar: &NarObjectId,
+    ) -> Result<Option<PublishedPair>, PublishError> {
+        let Some(narinfo) = open_optional(self.layout.narinfo_path(store))? else {
+            return Ok(None);
+        };
+        let Some(nar) = open_optional(self.layout.nar_path(nar))? else {
+            return Ok(None);
+        };
+
+        Ok(Some(PublishedPair { nar, narinfo }))
+    }
+
+    fn publish(
+        &self,
+        prefix: &str,
+        destination: PathBuf,
+        mut source: impl Read,
+    ) -> Result<PublishOutcome, PublishError> {
+        let (temp_path, mut temp) = self.create_temp(prefix)?;
+        let result = (|| {
+            io::copy(&mut source, &mut temp)?;
+            temp.sync_all()?;
+
+            match fs::hard_link(&temp_path, &destination) {
+                Ok(()) => {
+                    let parent = destination
+                        .parent()
+                        .expect("validated storage destination has a parent");
+                    sync_dir(parent)?;
+                    Ok(PublishOutcome::Created)
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if files_equal(&temp_path, &destination)? {
+                        Ok(PublishOutcome::Identical)
+                    } else {
+                        Err(PublishError::Conflict)
+                    }
+                }
+                Err(error) => Err(error.into()),
+            }
+        })();
+
+        drop(temp);
+        let cleanup = fs::remove_file(&temp_path)
+            .and_then(|()| sync_dir(&self.layout.temp_dir()))
+            .map_err(PublishError::from);
+
+        match result {
+            Ok(outcome) => {
+                cleanup?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = cleanup;
+                Err(error)
+            }
+        }
+    }
+
+    fn create_temp(&self, prefix: &str) -> Result<(PathBuf, File), PublishError> {
+        for _ in 0..TEMP_ATTEMPTS {
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let path = self
+                .layout
+                .temp_dir()
+                .join(format!("{prefix}-{}-{sequence:016x}.part", process::id()));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "cannot allocate unique temporary file",
+        )
+        .into())
+    }
+}
+
+#[derive(Debug)]
+struct PublishedPair {
+    nar: File,
+    narinfo: File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishOutcome {
+    Created,
+    Identical,
+}
+
+#[derive(Debug)]
+enum PublishError {
+    Conflict,
+    MissingNar,
+    Io(io::Error),
+}
+
+impl From<io::Error> for PublishError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl fmt::Display for PublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict => formatter.write_str("immutable destination has different contents"),
+            Self::MissingNar => formatter.write_str("referenced NAR is not published"),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for PublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Conflict | Self::MissingNar => None,
+        }
+    }
+}
+
+fn open_optional(path: PathBuf) -> Result<Option<File>, PublishError> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
+    if fs::metadata(left)?.len() != fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+
+    let mut left = File::open(left)?;
+    let mut right = File::open(right)?;
+    let mut left_buffer = [0; COMPARE_BUFFER_BYTES];
+    let mut right_buffer = [0; COMPARE_BUFFER_BYTES];
+
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {
