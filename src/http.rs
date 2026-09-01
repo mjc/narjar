@@ -1,4 +1,4 @@
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 
 use tiny_http::{Header, Method, Response, StatusCode};
 
@@ -39,7 +39,7 @@ fn respond_narinfo(request: tiny_http::Request, storage: &Storage, store: &Store
     {
         return internal_error(request);
     }
-    let parsed = match ParsedNarInfo::parse(store, &bytes) {
+    let parsed = match ParsedNarInfo::parse(store, bytes) {
         Ok(parsed) => parsed,
         Err(_) => return internal_error(request),
     };
@@ -53,7 +53,7 @@ fn respond_narinfo(request: tiny_http::Request, storage: &Storage, store: &Store
         Ok(None) => return not_found(request),
     }
 
-    let response = Response::from_data(bytes)
+    let response = Response::from_data(parsed.into_bytes())
         .with_header(header("Content-Type", "text/x-nix-narinfo"))
         .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL));
     let _ = request.respond(response);
@@ -321,31 +321,18 @@ fn respond_narinfo_put(
     }
 
     let validated =
-        match ParsedNarInfo::parse(store, &bytes).and_then(|parsed| parsed.verify(trusted)) {
+        match ParsedNarInfo::parse(store, bytes).and_then(|parsed| parsed.verify(trusted)) {
             Ok(validated) => validated,
             Err(_) => {
                 let _ = request.respond(Response::empty(StatusCode(422)));
                 return;
             }
         };
-    let nar = match storage.open_nar(validated.nar()) {
-        Ok(Some(nar)) => nar,
-        Ok(None) => {
-            let _ = request.respond(Response::empty(StatusCode(422)));
-            return;
-        }
-        Err(_) => return internal_error(request),
-    };
-    if !matches!(nar.metadata(), Ok(metadata) if metadata.len() == validated.nar_size()) {
-        let _ = request.respond(Response::empty(StatusCode(422)));
-        return;
-    }
-
-    let status = match storage.publish_narinfo(store, validated.nar(), Cursor::new(bytes)) {
+    let status = match storage.publish_narinfo(store, validated) {
         Ok(PublishOutcome::Created) => 201,
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,
-        Err(StorageError::MissingNar) => 422,
+        Err(StorageError::MissingNar | StorageError::NarMismatch) => 422,
         Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
         Err(_) => 500,
     };

@@ -1,7 +1,7 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read},
+    io::{self, Cursor, Read},
     mem::MaybeUninit,
     num::NonZeroUsize,
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
@@ -16,6 +16,8 @@ use std::{
 
 use data_encoding::{BitOrder, Encoding, Specification};
 use sha2::{Digest, Sha256};
+
+use crate::narinfo::ValidatedNarInfo;
 
 mod reconcile;
 
@@ -318,6 +320,24 @@ impl Storage {
     pub fn publish_narinfo(
         &self,
         store: &StoreHash,
+        narinfo: ValidatedNarInfo,
+    ) -> Result<PublishOutcome, StorageError> {
+        let (nar, nar_size, bytes) = narinfo.into_parts();
+        match fs::metadata(self.layout.nar_path(&nar)) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == nar_size => {}
+            Ok(_) => return Err(StorageError::NarMismatch),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StorageError::MissingNar);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        self.publish(PublishTarget::NarInfo(store), Cursor::new(bytes))
+    }
+
+    #[cfg(test)]
+    fn publish_narinfo_unchecked(
+        &self,
+        store: &StoreHash,
         nar: &NarObjectId,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
@@ -339,6 +359,7 @@ impl Storage {
         })
     }
 
+    #[cfg(test)]
     fn ensure_nar(&self, nar: &NarObjectId) -> Result<(), StorageError> {
         match fs::metadata(self.layout.nar_path(nar)) {
             Ok(metadata) if metadata.is_file() => Ok(()),
@@ -524,6 +545,7 @@ pub enum StorageError {
     InsufficientSpace,
     Locked,
     MissingNar,
+    NarMismatch,
     UploadTooLarge,
     Io(io::Error),
 }
@@ -543,6 +565,7 @@ impl fmt::Display for StorageError {
             }
             Self::Locked => formatter.write_str("data directory is locked by another process"),
             Self::MissingNar => formatter.write_str("referenced NAR is not published"),
+            Self::NarMismatch => formatter.write_str("referenced NAR size does not match narinfo"),
             Self::UploadTooLarge => formatter.write_str("NAR upload exceeds configured size limit"),
             Self::Io(error) => error.fmt(formatter),
         }
@@ -557,6 +580,7 @@ impl std::error::Error for StorageError {
             | Self::InsufficientSpace
             | Self::Locked
             | Self::MissingNar
+            | Self::NarMismatch
             | Self::UploadTooLarge => None,
         }
     }
@@ -754,18 +778,18 @@ mod tests {
 
         assert_eq!(
             storage
-                .publish_narinfo(&store, &nar, Cursor::new(b"narinfo bytes"))
+                .publish_narinfo_unchecked(&store, &nar, Cursor::new(b"narinfo bytes"))
                 .expect("publish narinfo"),
             PublishOutcome::Created
         );
         assert_eq!(
             storage
-                .publish_narinfo(&store, &nar, Cursor::new(b"narinfo bytes"))
+                .publish_narinfo_unchecked(&store, &nar, Cursor::new(b"narinfo bytes"))
                 .expect("retry identical narinfo"),
             PublishOutcome::Identical
         );
         assert!(matches!(
-            storage.publish_narinfo(&store, &nar, Cursor::new(b"different")),
+            storage.publish_narinfo_unchecked(&store, &nar, Cursor::new(b"different")),
             Err(StorageError::Conflict)
         ));
 
@@ -924,7 +948,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .publish_narinfo(&store, &nar, Cursor::new(b"narinfo bytes"))
+                .publish_narinfo_unchecked(&store, &nar, Cursor::new(b"narinfo bytes"))
                 .expect("retry durable narinfo"),
             PublishOutcome::Identical
         );
@@ -1091,7 +1115,7 @@ mod tests {
             .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
             .expect("publish NAR");
         storage
-            .publish_narinfo(&store, &nar, Cursor::new(b"narinfo bytes"))
+            .publish_narinfo_unchecked(&store, &nar, Cursor::new(b"narinfo bytes"))
             .expect("publish narinfo");
 
         assert!(storage.delete_narinfo(&store).expect("delete narinfo"));

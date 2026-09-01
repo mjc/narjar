@@ -120,11 +120,12 @@ pub struct ParsedNarInfo {
     nar_size: u64,
     fingerprint: String,
     signatures: Vec<NamedSignature>,
+    bytes: Vec<u8>,
 }
 
 impl ParsedNarInfo {
-    pub fn parse(route: &StoreHash, bytes: &[u8]) -> Result<Self, NarInfoError> {
-        let text = std::str::from_utf8(bytes).map_err(|_| NarInfoError)?;
+    pub fn parse(route: &StoreHash, bytes: Vec<u8>) -> Result<Self, NarInfoError> {
+        let text = std::str::from_utf8(&bytes).map_err(|_| NarInfoError)?;
         if !text.ends_with('\n') || text.contains('\r') {
             return Err(NarInfoError);
         }
@@ -203,6 +204,7 @@ impl ParsedNarInfo {
             nar_size,
             fingerprint,
             signatures,
+            bytes,
         })
     }
 
@@ -220,18 +222,19 @@ impl ParsedNarInfo {
     pub const fn nar_size(&self) -> u64 {
         self.nar_size
     }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 #[derive(Debug)]
 pub struct ValidatedNarInfo(ParsedNarInfo);
 
 impl ValidatedNarInfo {
-    pub fn nar(&self) -> &NarObjectId {
-        self.0.nar()
-    }
-
-    pub const fn nar_size(&self) -> u64 {
-        self.0.nar_size()
+    pub(crate) fn into_parts(self) -> (NarObjectId, u64, Vec<u8>) {
+        let parsed = self.0;
+        (parsed.nar, parsed.nar_size, parsed.bytes)
     }
 }
 
