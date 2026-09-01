@@ -182,11 +182,8 @@ impl ParsedNarInfo {
         }) {
             return Err(NarInfoError);
         }
-        if fields
-            .get("CA")
-            .is_some_and(|value| value.is_empty() || !value.is_ascii())
-        {
-            return Err(NarInfoError);
+        if let Some(ca) = fields.get("CA") {
+            parse_content_address(ca)?;
         }
 
         let references = parse_references(required("References")?)?;
@@ -257,6 +254,35 @@ fn parse_references(value: &str) -> Result<BTreeSet<String>, NarInfoError> {
         }
     }
     Ok(references)
+}
+
+fn parse_content_address(value: &str) -> Result<(), NarInfoError> {
+    let rest = if let Some(rest) = value.strip_prefix("text:") {
+        rest
+    } else if let Some(rest) = value.strip_prefix("fixed:") {
+        rest.strip_prefix("r:")
+            .or_else(|| rest.strip_prefix("git:"))
+            .unwrap_or(rest)
+    } else {
+        return Err(NarInfoError);
+    };
+    let (algorithm, hash) = rest.split_once(':').ok_or(NarInfoError)?;
+    let hash_bytes = match algorithm {
+        "md5" => 16,
+        "sha1" => 20,
+        "blake3" | "sha256" => 32,
+        "sha512" => 64,
+        _ => return Err(NarInfoError),
+    };
+    let valid = (hash.len() == hash_bytes * 2 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || (hash.len() == (hash_bytes * 8).div_ceil(5)
+            && hash
+                .bytes()
+                .all(|byte| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&byte)))
+        || BASE64
+            .decode(hash.as_bytes())
+            .is_ok_and(|decoded| decoded.len() == hash_bytes);
+    valid.then_some(()).ok_or(NarInfoError)
 }
 
 fn parse_store_basename(value: &str) -> Result<(StoreHash, &str), NarInfoError> {
