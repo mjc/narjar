@@ -26,10 +26,10 @@ struct TokenHash([u8; TOKEN_BYTES]);
 struct TokenHashes(Vec<TokenHash>);
 
 impl TokenHashes {
-    fn load(path: &Path) -> Result<Self, AuthError> {
+    fn load(path: &Path) -> Result<Option<Self>, AuthError> {
         let mut file = match fs::File::open(path) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let metadata = file.metadata()?;
@@ -62,11 +62,7 @@ impl TokenHashes {
                 .ok_or(AuthError::InvalidTokenFile)?;
             tokens.push(TokenHash(digest));
         }
-        Ok(Self(tokens))
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        Ok(Some(Self(tokens)))
     }
 
     fn matches(&self, actual: &[u8; TOKEN_BYTES]) -> Choice {
@@ -77,8 +73,34 @@ impl TokenHashes {
 }
 
 #[derive(Debug)]
+enum ReadPolicy {
+    Public,
+    Private(TokenHashes),
+}
+
+impl ReadPolicy {
+    fn load(path: &Path) -> Result<Self, AuthError> {
+        Ok(match TokenHashes::load(path)? {
+            Some(tokens) => Self::Private(tokens),
+            None => Self::Public,
+        })
+    }
+
+    fn is_public(&self) -> bool {
+        matches!(self, Self::Public)
+    }
+
+    fn matches(&self, actual: &[u8; TOKEN_BYTES]) -> Choice {
+        match self {
+            Self::Public => Choice::from(0),
+            Self::Private(tokens) => tokens.matches(actual),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Authorizer {
-    read: TokenHashes,
+    read: ReadPolicy,
     write: TokenHashes,
 }
 
@@ -86,13 +108,13 @@ impl Authorizer {
     pub fn load(root: &Path) -> Result<Self, AuthError> {
         let auth = root.join("auth");
         Ok(Self {
-            read: TokenHashes::load(&auth.join("read.tokens"))?,
-            write: TokenHashes::load(&auth.join("write.tokens"))?,
+            read: ReadPolicy::load(&auth.join("read.tokens"))?,
+            write: TokenHashes::load(&auth.join("write.tokens"))?.unwrap_or_default(),
         })
     }
 
     pub fn allows(&self, request: &Request, permission: Permission) -> bool {
-        if matches!(permission, Permission::Read) && self.read.is_empty() {
+        if matches!(permission, Permission::Read) && self.read.is_public() {
             return true;
         }
         let Some(actual) = authorization_token_hash(request) else {
