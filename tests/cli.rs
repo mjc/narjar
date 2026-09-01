@@ -505,6 +505,14 @@ fn nar_get_and_head_support_one_byte_range() {
     let unsatisfiable = request("GET", "bytes=20-");
     let multiple = request("GET", "bytes=0-1,4-5");
     let malformed = request("GET", "bytes=wat");
+    let empty = request("GET", "bytes=-");
+    let overflow = request("GET", "bytes=18446744073709551616-");
+    let reversed = request("GET", "bytes=8-2");
+    let duplicate = server.request_with_headers(
+        "GET",
+        &path,
+        &[("Range", "bytes=0-1"), ("Range", "bytes=4-5")],
+    );
     let (signal, status) = server.stop();
 
     assert!(signal.success(), "SIGTERM should be sent");
@@ -546,18 +554,20 @@ fn nar_get_and_head_support_one_byte_range() {
     );
     assert!(head_body.is_empty());
 
-    let (unsatisfiable_headers, unsatisfiable_body) = response_parts(&unsatisfiable);
-    assert!(
-        unsatisfiable_headers.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
-        "{unsatisfiable_headers:?}"
-    );
-    assert!(
-        unsatisfiable_headers.contains("Content-Range: bytes */10\r\n"),
-        "{unsatisfiable_headers:?}"
-    );
-    assert!(unsatisfiable_body.is_empty());
+    for response in [&unsatisfiable, &reversed] {
+        let (headers, body) = response_parts(response);
+        assert!(
+            headers.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
+            "{headers:?}"
+        );
+        assert!(
+            headers.contains("Content-Range: bytes */10\r\n"),
+            "{headers:?}"
+        );
+        assert!(body.is_empty());
+    }
 
-    for response in [&multiple, &malformed] {
+    for response in [&multiple, &malformed, &empty, &overflow, &duplicate] {
         let (headers, body) = response_parts(response);
         assert!(
             headers.starts_with("HTTP/1.1 400 Bad Request\r\n"),
