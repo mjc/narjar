@@ -428,13 +428,16 @@ mod tests {
     use std::{
         env, fs,
         io::{self, Cursor, Read},
+        num::NonZeroUsize,
         path::{Path, PathBuf},
         process,
         sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, SystemTime},
     };
 
     use super::{
-        Layout, NarObjectId, PublishBoundary, PublishOutcome, Storage, StorageError, StoreHash,
+        Layout, NarObjectId, PublishBoundary, PublishOutcome, ReconcileClass, Storage,
+        StorageError, StoreHash,
     };
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -695,6 +698,116 @@ mod tests {
 
         drop(first);
         Storage::initialize(directory.path()).expect("reacquire released process lock");
+    }
+
+    #[test]
+    fn reconciliation_is_deterministic_bounded_and_reports_manual_changes() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        fs::write(directory.path().join("manual"), b"manual").expect("write manual file");
+        fs::write(directory.path().join("nar/not-valid.nar"), b"bad").expect("write malformed NAR");
+        fs::write(directory.path().join(".tmp/nar-manual.part"), b"temp")
+            .expect("write temporary file");
+
+        let stale_before = SystemTime::now() + Duration::from_secs(1);
+        let full = storage
+            .reconcile(NonZeroUsize::new(16).expect("nonzero limit"), stale_before)
+            .expect("reconcile storage");
+        let paths: Vec<_> = full
+            .entries()
+            .iter()
+            .map(|entry| entry.relative_path().to_owned())
+            .collect();
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(full.entries().iter().any(|entry| {
+            entry.relative_path() == Path::new("manual")
+                && entry.class() == ReconcileClass::UnknownFile
+        }));
+        assert!(full.entries().iter().any(|entry| {
+            entry.relative_path() == Path::new("nar/not-valid.nar")
+                && entry.class() == ReconcileClass::InvalidFilename
+        }));
+        assert!(full.entries().iter().any(|entry| {
+            entry.relative_path() == Path::new(".tmp/nar-manual.part")
+                && entry.class() == ReconcileClass::TempStale
+        }));
+
+        let bounded = storage
+            .reconcile(NonZeroUsize::new(1).expect("nonzero limit"), stale_before)
+            .expect("bounded reconcile");
+        assert_eq!(bounded.entries().len(), 1);
+        assert!(bounded.truncated());
+        assert_eq!(bounded.entries()[0].relative_path(), paths[0]);
+    }
+
+    #[test]
+    fn cleanup_removes_only_reported_stale_temps() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let stale_path = directory.path().join(".tmp/nar-stale.part");
+        fs::write(&stale_path, b"temp").expect("write stale temp");
+
+        let stale_report = storage
+            .reconcile(
+                NonZeroUsize::new(16).expect("nonzero limit"),
+                SystemTime::now() + Duration::from_secs(1),
+            )
+            .expect("classify stale temp");
+        let stale = stale_report
+            .entries()
+            .iter()
+            .find(|entry| entry.relative_path() == Path::new(".tmp/nar-stale.part"))
+            .expect("stale temp entry");
+        assert_eq!(stale.class(), ReconcileClass::TempStale);
+        assert!(
+            storage
+                .cleanup_stale_temp(stale)
+                .expect("cleanup stale temp")
+        );
+        assert!(!stale_path.exists());
+
+        let young_path = directory.path().join(".tmp/nar-young.part");
+        fs::write(&young_path, b"temp").expect("write young temp");
+        let young_report = storage
+            .reconcile(
+                NonZeroUsize::new(16).expect("nonzero limit"),
+                SystemTime::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("past time"),
+            )
+            .expect("classify young temp");
+        let young = young_report
+            .entries()
+            .iter()
+            .find(|entry| entry.relative_path() == Path::new(".tmp/nar-young.part"))
+            .expect("young temp entry");
+        assert_eq!(young.class(), ReconcileClass::TempYoung);
+        assert!(!storage.cleanup_stale_temp(young).expect("keep young temp"));
+        assert!(young_path.exists());
+    }
+
+    #[test]
+    fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+        let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
+        storage
+            .publish_nar(&nar, Cursor::new(b"nar bytes"))
+            .expect("publish NAR");
+        storage
+            .publish_narinfo(&store, &nar, Cursor::new(b"narinfo bytes"))
+            .expect("publish narinfo");
+
+        assert!(storage.delete_narinfo(&store).expect("delete narinfo"));
+        assert!(
+            storage
+                .open_pair(&store, &nar)
+                .expect("open deleted pair")
+                .is_none()
+        );
+        assert!(storage.layout().nar_path(&nar).is_file());
+        assert!(!storage.delete_narinfo(&store).expect("repeat delete"));
     }
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
