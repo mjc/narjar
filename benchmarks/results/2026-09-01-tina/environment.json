@@ -1,0 +1,20 @@
+{
+  "bincache_binary": "/nix/store/60gcvw7g02x1idqmgnjhmg3zh9b8mpg5-bincache-0.0.0/bin/bincache",
+  "bincache_commit": "556a9c8f97a3c994a9de85f567a2ef16ce6513ab",
+  "cpu_count": 32,
+  "cpu_governor": "performance",
+  "cpu_model": "AMD Ryzen 9 5950X 16-Core Processor",
+  "filesystem": "zroot/home zfs rw,relatime,xattr,noacl,casesensitive",
+  "host": "tina",
+  "narjar_binary": "/nix/store/m46wh09zx3fkjwglf9jy35g42d1kl06k-narjar-0.1.0/bin/narjar",
+  "narjar_commit": "905ca46d3433a6e23ee06aaccf4c1c2810b00ede",
+  "nix": "nix (Nix) 2.31.5",
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.40",
+  "quick": false,
+  "random_seed": 29030,
+  "recorded_at": "2026-09-01T08:14:06.455143+00:00",
+  "repetitions": 15,
+  "rustc": "rustc 1.85.1 (4eb161250 2025-03-15)",
+  "uname": "Linux tina 6.18.44 #1-NixOS SMP PREEMPT_DYNAMIC Sun Aug  9 18:25:30 UTC 2026 x86_64 ",
+  "unshare": "unshare from util-linux 2.42.2"
+}

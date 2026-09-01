@@ -1,0 +1,22 @@
+[
+  {
+    "candidate": "narjar",
+    "client_returncode": 1,
+    "client_stderr_tail": "copying 1 paths...\ncopying path '/nix/store/sn2spw08n406n3x60vii7vgh9lapdm8v-enospc-67108864-0.bin' to 'http://127.0.0.1:48899'...\nwarning: error: unable to upload 'http://127.0.0.1:48899/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 507; retrying in 265 ms\nwarning: error: unable to upload 'http://127.0.0.1:48899/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 507; retrying in 686 ms\nwarning: error: unable to upload 'http://127.0.0.1:48899/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 507; retrying in 1262 ms\nwarning: error: unable to upload 'http://127.0.0.1:48899/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 507; retrying in 2455 ms\nerror: while uploading to HTTP binary cache at 'http://127.0.0.1:48899': error: unable to upload 'http://127.0.0.1:48899/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 507\n",
+    "data_limit_mib": 8,
+    "payload_bytes": 67108864,
+    "server_alive": true,
+    "status_after_failure": 404,
+    "status_after_restart": 404
+  },
+  {
+    "candidate": "bincache",
+    "client_returncode": 1,
+    "client_stderr_tail": "copying 1 paths...\ncopying path '/nix/store/sn2spw08n406n3x60vii7vgh9lapdm8v-enospc-67108864-0.bin' to 'http://127.0.0.1:49299'...\nwarning: error: unable to upload 'http://127.0.0.1:49299/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 100 (curl error: Failure when receiving data from the peer); retrying in 267 ms\nwarning: error: unable to upload 'http://127.0.0.1:49299/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 100 (curl error: Failure when receiving data from the peer); retrying in 617 ms\nwarning: error: unable to upload 'http://127.0.0.1:49299/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 100 (curl error: Failure when receiving data from the peer); retrying in 1289 ms\nwarning: error: unable to upload 'http://127.0.0.1:49299/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 100 (curl error: Failed to open/read local data from file/application); retrying in 2688 ms\nerror: while uploading to HTTP binary cache at 'http://127.0.0.1:49299': error: unable to upload 'http://127.0.0.1:49299/nar/0i5wnrvxaw78nj1mqgg2bdfhqk8q9lns9jpfyjssknvjald9j2k6.nar': HTTP error 100 (curl error: Failed to open/read local data from file/application)\n",
+    "data_limit_mib": 8,
+    "payload_bytes": 67108864,
+    "server_alive": true,
+    "status_after_failure": 404,
+    "status_after_restart": 404
+  }
+]

@@ -1,0 +1,3 @@
+nix build --no-write-lock-file --no-link --print-out-paths github:wyattgill9/bincache/556a9c8f97a3c994a9de85f567a2ef16ce6513ab
+nix run '.#continuation-benchmark' -- --output benchmarks/results/2026-09-01-tina --bincache-bin /nix/store/60gcvw7g02x1idqmgnjhmg3zh9b8mpg5-bincache-0.0.0/bin/bincache --repetitions 15
+nix eval --json --expr 'builtins.genList (i: builtins.toFile ("narjar-continuation-" + builtins.toString i) (builtins.toString i)) 10000' > benchmarks/results/2026-09-01-tina/corpus.json
