@@ -259,6 +259,24 @@ impl RunningServer {
         response
     }
 
+    fn request_with_body(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        let content_length = body.len().to_string();
+        let mut headers = headers.to_vec();
+        headers.push(("Content-Length", content_length.as_str()));
+        let mut stream = self.open_request(method, path, &headers);
+        stream.write_all(body).expect("write request body");
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response");
+        response
+    }
+
     fn open_request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> TcpStream {
         let mut stream = TcpStream::connect(&self.address).expect("connect to narjar");
         write!(
@@ -763,6 +781,36 @@ fn read_misses_do_not_hide_corrupt_or_unreadable_finals() {
         "{missing_headers:?}"
     );
     assert!(missing_body.is_empty());
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn nar_put_streams_hash_checks_and_retries_immutably() {
+    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+
+    let server = RunningServer::start("nar-put");
+    let path = format!("/nar/{NARJAR_HASH}.nar");
+    let created = server.request_with_body("PUT", &path, &[], b"narjar");
+    let identical = server.request_with_body("PUT", &path, &[], b"narjar");
+    let mismatch = server.request_with_body("PUT", &format!("/nar/{NAR_ID}.nar"), &[], b"narjar");
+    let missing_length = server.request("PUT", &path);
+    let published = fs::read(server.data_dir.join(format!("nar/{NARJAR_HASH}.nar")));
+    let mismatched_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
+    let (signal, status) = server.stop();
+
+    for (response, expected_status) in [
+        (&created, "HTTP/1.1 201 Created\r\n"),
+        (&identical, "HTTP/1.1 200 OK\r\n"),
+        (&mismatch, "HTTP/1.1 422 Unprocessable Entity\r\n"),
+        (&missing_length, "HTTP/1.1 411 Length Required\r\n"),
+    ] {
+        let (headers, body) = response_parts(response);
+        assert!(headers.starts_with(expected_status), "{headers:?}");
+        assert!(body.is_empty());
+    }
+    assert_eq!(published.expect("published NAR"), b"narjar");
+    assert!(!mismatched_path.exists());
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
