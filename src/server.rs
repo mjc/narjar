@@ -138,7 +138,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let inventory = Inventory::scan(&config.data_dir, &trusted_keys, false)
         .map_err(|error| Error::runtime(format!("cannot inventory cache: {error}")))?;
     if !inventory.can_serve() {
-        return Err(Error::runtime("cannot activate trusted public keys: published narinfo is not trusted"));
+        return Err(Error::runtime(
+            "cannot activate trusted public keys: published narinfo is not trusted",
+        ));
     }
     let trusted_keys = Arc::new(trusted_keys);
     let metrics = Arc::new(Metrics::default());
