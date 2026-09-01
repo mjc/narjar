@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
+import http.client
 import json
 import math
 import os
@@ -111,6 +113,7 @@ class Candidate:
     process: subprocess.Popen[str] | None = field(default=None, init=False)
     url: str | None = field(default=None, init=False)
     public_key: str = field(default="", init=False)
+    token: str = field(default="", init=False)
     netrc: Path = field(init=False)
     _log: Any = field(default=None, init=False, repr=False)
 
@@ -164,6 +167,7 @@ class Candidate:
             self.public_key = public_line.removeprefix(prefix)
             token = command(str(self.binary), "token")
 
+        self.token = token
         token_file.write_text(token + "\n")
         self.netrc = self.root / "netrc"
         self.netrc.write_text(
@@ -388,6 +392,60 @@ class Candidate:
                 pass
 
 
+    def publish_concurrent(self, path: str) -> dict[str, float]:
+        self._sign([path])
+        before_cpu = self.process_cpu_seconds()
+        before_disk = self.disk_bytes()
+        peak_rss = [self.rss_kib()]
+        started = time.perf_counter_ns()
+        processes = [
+            subprocess.Popen(
+                self._copy_args([path]),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            for _ in range(2)
+        ]
+        while any(process.poll() is None for process in processes):
+            peak_rss.append(self.rss_kib())
+            time.sleep(0.005)
+        return_codes = [process.wait() for process in processes]
+        if any(return_code != 0 for return_code in return_codes):
+            raise RuntimeError(
+                f"{self.name} concurrent upload failed: {return_codes}"
+            )
+        return {
+            "wall_ms": (time.perf_counter_ns() - started) / 1_000_000,
+            "server_cpu_ms": (self.process_cpu_seconds() - before_cpu) * 1_000,
+            "peak_rss_kib": max(peak_rss),
+            "stored_bytes": self.disk_bytes() - before_disk,
+        }
+
+    def interrupt_upload(self, nar_file: Path, object_path: str) -> tuple[int, bool]:
+        if self.url is None or self.process is None:
+            raise RuntimeError(f"{self.name} is not running")
+        port = int(self.url.rsplit(":", 1)[1])
+        authorization = base64.b64encode(
+            f"benchmark:{self.token}".encode()
+        ).decode()
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        size = nar_file.stat().st_size
+        connection.putrequest("PUT", f"/{object_path}")
+        connection.putheader("Authorization", f"Basic {authorization}")
+        connection.putheader("Content-Length", str(size))
+        connection.endheaders()
+        try:
+            with nar_file.open("rb") as stream:
+                connection.send(stream.read(size // 2))
+        except OSError:
+            pass
+        finally:
+            connection.close()
+        time.sleep(0.1)
+        status, _, _ = self.request("HEAD", object_path)
+        return status, self.process.poll() is None
+
+
 class Recorder:
     def __init__(self, output: Path) -> None:
         self.path = output / "samples.jsonl"
@@ -567,13 +625,19 @@ def benchmark_startup(
             candidate.stop()
 
 
-def make_payloads(run: Run, count: int, size: int) -> list[str]:
+def make_payloads(
+    run: Run,
+    count: int,
+    size: int,
+    label: str = "upload",
+) -> list[str]:
     directory = run.work / "payloads"
     directory.mkdir(exist_ok=True)
     paths = []
+    label_seed = sum(label.encode())
     for index in range(count):
-        source = directory / f"upload-{size}-{index}.bin"
-        generator = random.Random(SEED + size + index)
+        source = directory / f"{label}-{size}-{index}.bin"
+        generator = random.Random(SEED + label_seed + size + index)
         remaining = size
         with source.open("wb") as stream:
             while remaining:
@@ -582,6 +646,7 @@ def make_payloads(run: Run, count: int, size: int) -> list[str]:
                 remaining -= chunk_size
         paths.append(command("nix", "store", "add-file", str(source)))
     return paths
+
 
 
 def benchmark_io(
@@ -792,6 +857,214 @@ def benchmark_io(
             candidate.stop()
 
 
+def benchmark_streaming(
+    run: Run,
+    candidates: list[Candidate],
+    recorder: Recorder,
+    rng: random.Random,
+) -> None:
+    sizes = [4 * 1024 * 1024] if run.quick else [100 * 1024 * 1024, 1024 * 1024 * 1024]
+    for size in sizes:
+        path = make_payloads(run, 1, size, "streaming")[0]
+        order = candidates.copy()
+        rng.shuffle(order)
+        for candidate in candidates:
+            candidate.start()
+        try:
+            for order_index, candidate in enumerate(order):
+                result = candidate.publish_timed(path)
+                for case, key, unit in (
+                    ("streaming_upload_wall", "wall_ms", "ms"),
+                    ("streaming_upload_server_cpu", "server_cpu_ms", "ms"),
+                    ("streaming_upload_peak_rss", "peak_rss_kib", "KiB"),
+                    ("streaming_upload_stored_bytes", "stored_bytes", "bytes"),
+                ):
+                    recorder.add(
+                        f"{case}_{size}_bytes",
+                        candidate.name,
+                        0,
+                        result[key],
+                        unit,
+                        order=order_index,
+                        payload_bytes=size,
+                    )
+        finally:
+            for candidate in candidates:
+                candidate.stop()
+
+
+def benchmark_recovery(
+    run: Run,
+    candidates: list[Candidate],
+    recorder: Recorder,
+    rng: random.Random,
+) -> None:
+    payload_bytes = 1 * 1024 * 1024 if run.quick else 4 * 1024 * 1024
+    paths = make_payloads(
+        run,
+        run.repetitions + 2,
+        payload_bytes,
+        "recovery",
+    )
+    for candidate in candidates:
+        candidate.start()
+    try:
+        for candidate in candidates:
+            candidate.publish([paths[0]])
+            candidate.publish_concurrent(paths[1])
+
+        duplicate_schedule = [
+            candidate
+            for candidate in candidates
+            for _ in range(run.repetitions)
+        ]
+        rng.shuffle(duplicate_schedule)
+        repetitions = {candidate.name: 0 for candidate in candidates}
+        for order_index, candidate in enumerate(duplicate_schedule):
+            repetition = repetitions[candidate.name]
+            repetitions[candidate.name] += 1
+            result = candidate.publish_timed(paths[0])
+            recorder.add(
+                "duplicate_upload_wall",
+                candidate.name,
+                repetition,
+                result["wall_ms"],
+                "ms",
+                order=order_index,
+            )
+            recorder.add(
+                "duplicate_upload_stored_bytes",
+                candidate.name,
+                repetition,
+                result["stored_bytes"],
+                "bytes",
+                order=order_index,
+            )
+
+        concurrent_schedule = [
+            (candidate, path)
+            for candidate in candidates
+            for path in paths[2:]
+        ]
+        rng.shuffle(concurrent_schedule)
+        repetitions = {candidate.name: 0 for candidate in candidates}
+        for order_index, (candidate, path) in enumerate(concurrent_schedule):
+            repetition = repetitions[candidate.name]
+            repetitions[candidate.name] += 1
+            result = candidate.publish_concurrent(path)
+            recorder.add(
+                "concurrent_upload_wall",
+                candidate.name,
+                repetition,
+                result["wall_ms"],
+                "ms",
+                order=order_index,
+            )
+            recorder.add(
+                "concurrent_upload_server_cpu",
+                candidate.name,
+                repetition,
+                result["server_cpu_ms"],
+                "ms",
+                order=order_index,
+            )
+            recorder.add(
+                "concurrent_upload_peak_rss",
+                candidate.name,
+                repetition,
+                result["peak_rss_kib"],
+                "KiB",
+                order=order_index,
+            )
+    finally:
+        for candidate in candidates:
+            candidate.stop()
+
+    interrupted_path = make_payloads(
+        run,
+        1,
+        payload_bytes,
+        "interrupted",
+    )[0]
+    nar_file = run.work / "interrupted.nar"
+    with nar_file.open("wb") as stream:
+        subprocess.run(
+            ["nix", "nar", "pack", interrupted_path],
+            check=True,
+            stdout=stream,
+        )
+    object_id = command(
+        "nix",
+        "hash",
+        "file",
+        "--type",
+        "sha256",
+        "--base32",
+        str(nar_file),
+    ).split(":")[-1]
+    object_path = f"{object_id}.nar"
+
+    operations = []
+    for candidate in candidates:
+        candidate.start()
+        status, alive = candidate.interrupt_upload(nar_file, object_path)
+        recorder.add("interrupted_upload_status", candidate.name, 0, status, "HTTP")
+        recorder.add(
+            "interrupted_upload_server_alive",
+            candidate.name,
+            0,
+            int(alive),
+            "bool",
+        )
+        candidate.stop()
+
+        recovery_ms = candidate.start()
+        restarted_status, _, _ = candidate.request("HEAD", object_path)
+        recorder.add(
+            "interrupted_upload_restart_status",
+            candidate.name,
+            0,
+            restarted_status,
+            "HTTP",
+        )
+        recorder.add(
+            "interrupted_upload_recovery_wall",
+            candidate.name,
+            0,
+            recovery_ms,
+            "ms",
+        )
+        candidate.stop()
+
+        if status != 404 or restarted_status != 404 or not alive:
+            raise RuntimeError(f"{candidate.name} exposed an interrupted upload")
+
+        if candidate.name == "bincache":
+            started = time.perf_counter_ns()
+            subprocess.run(
+                [
+                    str(candidate.binary),
+                    "reconcile",
+                    "--data-dir",
+                    str(candidate.data_dir),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            reconcile_ms = (time.perf_counter_ns() - started) / 1_000_000
+            steps = ["stop serve", "run bincache reconcile", "start serve"]
+        else:
+            reconcile_ms = recovery_ms
+            steps = ["restart serve; reconciliation is automatic"]
+        recorder.add("reconcile_wall", candidate.name, 0, reconcile_ms, "ms")
+        recorder.add("reconcile_steps", candidate.name, 0, len(steps), "steps")
+        operations.append({"candidate": candidate.name, "steps": steps})
+
+    (run.output / "recovery-operations.json").write_text(
+        json.dumps(operations, indent=2, sort_keys=True) + "\n"
+    )
+
+
 def measure_closures(run: Run, recorder: Recorder) -> None:
     binaries = {"narjar": run.narjar, "bincache": run.bincache}
     if not run.quick:
@@ -870,6 +1143,8 @@ def main() -> int:
         recorder = Recorder(run.output)
         benchmark_startup(run, candidates, recorder, random.Random(SEED))
         benchmark_io(run, candidates, recorder, random.Random(SEED + 1))
+        benchmark_streaming(run, candidates, recorder, random.Random(SEED + 2))
+        benchmark_recovery(run, candidates, recorder, random.Random(SEED + 3))
         measure_closures(run, recorder)
         write_report(run, recorder)
         print(run.output)
