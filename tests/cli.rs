@@ -1005,6 +1005,37 @@ fn narinfo_put_rejects_a_signed_malformed_deriver() {
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
+#[test]
+fn narinfo_put_rejects_a_signed_malformed_content_address() {
+    const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    let server = RunningServer::start("narinfo-put-bad-ca");
+    let nar_created =
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], b"narjar");
+    let narinfo =
+        signed_narinfo(NARJAR_HASH, 6).replacen("Sig:", "CA: fixed:sha256:not-a-hash\nSig:", 1);
+    let path = format!("/{STORE_HASH}.narinfo");
+    let rejected = server.request_with_body("PUT", &path, &[], narinfo.as_bytes());
+    let missing = server.request("GET", &path);
+    let (signal, status) = server.stop();
+
+    assert!(
+        response_parts(&nar_created)
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n")
+    );
+    assert!(
+        response_parts(&rejected)
+            .0
+            .starts_with("HTTP/1.1 422 Unprocessable Entity\r\n")
+    );
+    assert!(
+        response_parts(&missing)
+            .0
+            .starts_with("HTTP/1.1 404 Not Found\r\n")
+    );
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
 
 #[test]
 fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
