@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
@@ -23,8 +23,8 @@ use narjar::{
 
 use crate::{config::ServeConfig, error::Error};
 
-#[derive(Default)]
 struct WorkQueue {
+    limit: usize,
     state: Mutex<QueueState>,
     ready: Condvar,
 }
@@ -32,19 +32,33 @@ struct WorkQueue {
 #[derive(Default)]
 struct QueueState {
     requests: VecDeque<Request>,
+    in_flight: usize,
     closed: bool,
 }
 
 impl WorkQueue {
-    fn push(&self, request: Request) {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn try_push(&self, request: Request) -> Option<Request> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.in_flight >= self.limit {
+            return Some(request);
+        }
         debug_assert!(!state.closed);
+        state.in_flight += 1;
         state.requests.push_back(request);
         drop(state);
         self.ready.notify_one();
+        None
     }
 
     fn pop(&self) -> Option<Request> {
@@ -66,6 +80,15 @@ impl WorkQueue {
         }
     }
 
+    fn complete(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(state.in_flight > 0);
+        state.in_flight -= 1;
+    }
+
     fn close(&self) {
         let mut state = self
             .state
@@ -77,19 +100,11 @@ impl WorkQueue {
     }
 }
 
-fn try_admit(in_flight: &AtomicUsize, limit: usize) -> bool {
-    in_flight
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            (count < limit).then_some(count + 1)
-        })
-        .is_ok()
-}
-
-struct Admission<'a>(&'a AtomicUsize);
+struct Admission<'a>(&'a WorkQueue);
 
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0.complete();
     }
 }
 
@@ -131,17 +146,14 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .map_err(|error| Error::runtime(format!("cannot report listener: {error}")))?;
 
     let upload_policy = NarUploadPolicy::new(config.max_nar_bytes.get(), config.min_free_bytes);
-    let max_in_flight = config.max_in_flight.get();
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    let queue = Arc::new(WorkQueue::default());
+    let queue = Arc::new(WorkQueue::new(config.max_in_flight.get()));
     let handles: Vec<_> = (0..config.workers.get())
         .map(|_| {
-            let in_flight = Arc::clone(&in_flight);
             let queue = Arc::clone(&queue);
             let storage = Arc::clone(&storage);
             thread::spawn(move || {
                 while let Some(request) = queue.pop() {
-                    let _admission = Admission(&in_flight);
+                    let _admission = Admission(queue.as_ref());
                     respond(request, &storage, upload_policy);
                 }
             })
@@ -150,9 +162,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
 
     while !stopping.load(Ordering::Acquire) {
         if let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(50)) {
-            if try_admit(&in_flight, max_in_flight) {
-                queue.push(request);
-            } else {
+            if let Some(request) = queue.try_push(request) {
                 let _ = request.respond(Response::empty(StatusCode(429)));
             }
         }
