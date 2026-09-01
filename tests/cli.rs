@@ -220,6 +220,14 @@ impl RunningServer {
     }
 
     fn start_with_args(test: &str, extra_args: &[&str]) -> Self {
+        Self::start_with_auth(test, extra_args, None)
+    }
+
+    fn start_with_read_tokens(test: &str, read_tokens: &str) -> Self {
+        Self::start_with_auth(test, &[], Some(read_tokens))
+    }
+
+    fn start_with_auth(test: &str, extra_args: &[&str], read_tokens: Option<&str>) -> Self {
         let data_dir = data_dir(test);
         let auth_dir = data_dir.join("auth");
         fs::create_dir(&auth_dir).expect("test auth directory should be created");
@@ -230,6 +238,15 @@ impl RunningServer {
             <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         )
         .expect("test write token should be private");
+        if let Some(contents) = read_tokens {
+            let read_tokens = auth_dir.join("read.tokens");
+            fs::write(&read_tokens, contents).expect("test read tokens should be written");
+            fs::set_permissions(
+                &read_tokens,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+            )
+            .expect("test read tokens should be private");
+        }
         let mut process = command();
         process
             .args([
@@ -1018,6 +1035,26 @@ fn writes_require_valid_basic_auth_before_route_or_storage() {
         "{public_read:?}"
     );
     assert!(!final_path.exists());
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn configured_empty_read_token_set_stays_private() {
+    let server = RunningServer::start_with_read_tokens("empty-private-read", "");
+    let response = server.request("GET", "/nix-cache-info");
+    let (signal, status) = server.stop();
+    let (headers, body) = response_parts(&response);
+
+    assert!(
+        headers.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{headers:?}"
+    );
+    assert!(
+        headers.contains("WWW-Authenticate: Basic realm=\"narjar\"\r\n"),
+        "{headers:?}"
+    );
+    assert!(body.is_empty());
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
