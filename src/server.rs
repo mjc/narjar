@@ -78,38 +78,50 @@ fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId
     let _ = request.respond(response);
 }
 
+#[derive(Debug)]
+enum ReadRoute {
+    CacheInfo,
+    Nar(NarObjectId),
+    NarInfo(StoreHash),
+}
+
+impl ReadRoute {
+    fn parse(url: &str) -> Option<Self> {
+        if url == "/nix-cache-info" {
+            return Some(Self::CacheInfo);
+        }
+
+        if let Some(id) = url
+            .strip_prefix("/nar/")
+            .and_then(|path| path.strip_suffix(".nar"))
+            .and_then(|id| NarObjectId::parse(id).ok())
+        {
+            return Some(Self::Nar(id));
+        }
+
+        url.strip_prefix('/')
+            .and_then(|path| path.strip_suffix(".narinfo"))
+            .and_then(|hash| StoreHash::parse(hash).ok())
+            .map(Self::NarInfo)
+    }
+}
+
 fn respond(request: tiny_http::Request, storage: &Storage) {
     if !matches!(request.method(), Method::Get | Method::Head) {
         return not_found(request);
     }
 
-    if request.url() == "/nix-cache-info" {
-        let response = Response::from_data(NIX_CACHE_INFO)
-            .with_header(header("Content-Type", "text/x-nix-cache-info"))
-            .with_header(header("Cache-Control", "public, max-age=3600"));
-        let _ = request.respond(response);
-        return;
+    match ReadRoute::parse(request.url()) {
+        Some(ReadRoute::CacheInfo) => {
+            let response = Response::from_data(NIX_CACHE_INFO)
+                .with_header(header("Content-Type", "text/x-nix-cache-info"))
+                .with_header(header("Cache-Control", "public, max-age=3600"));
+            let _ = request.respond(response);
+        }
+        Some(ReadRoute::Nar(id)) => respond_nar(request, storage, &id),
+        Some(ReadRoute::NarInfo(store)) => respond_narinfo(request, storage, &store),
+        None => not_found(request),
     }
-
-    if let Some(id) = request
-        .url()
-        .strip_prefix("/nar/")
-        .and_then(|path| path.strip_suffix(".nar"))
-        .and_then(|id| NarObjectId::parse(id).ok())
-    {
-        return respond_nar(request, storage, &id);
-    }
-
-    if let Some(store) = request
-        .url()
-        .strip_prefix('/')
-        .and_then(|path| path.strip_suffix(".narinfo"))
-        .and_then(|hash| StoreHash::parse(hash).ok())
-    {
-        return respond_narinfo(request, storage, &store);
-    }
-
-    not_found(request);
 }
 
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
