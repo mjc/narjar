@@ -16,6 +16,10 @@ fn not_found(request: tiny_http::Request) {
     let _ = request.respond(Response::empty(StatusCode(404)));
 }
 
+fn internal_error(request: tiny_http::Request) {
+    let _ = request.respond(Response::empty(StatusCode(500)));
+}
+
 fn referenced_nar(bytes: &[u8]) -> Option<NarObjectId> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut urls = text.lines().filter_map(|line| line.strip_prefix("URL: "));
@@ -28,8 +32,10 @@ fn referenced_nar(bytes: &[u8]) -> Option<NarObjectId> {
 }
 
 fn respond_narinfo(request: tiny_http::Request, storage: &Storage, store: &StoreHash) {
-    let Ok(Some(narinfo)) = storage.open_narinfo(store) else {
-        return not_found(request);
+    let narinfo = match storage.open_narinfo(store) {
+        Ok(Some(narinfo)) => narinfo,
+        Ok(None) => return not_found(request),
+        Err(_) => return internal_error(request),
     };
     let mut bytes = Vec::new();
     if narinfo
@@ -38,14 +44,16 @@ fn respond_narinfo(request: tiny_http::Request, storage: &Storage, store: &Store
         .is_err()
         || bytes.len() > MAX_NARINFO_BYTES
     {
-        return not_found(request);
+        return internal_error(request);
     }
     let Some(nar) = referenced_nar(&bytes) else {
-        return not_found(request);
+        return internal_error(request);
     };
-    let Ok(Some(_nar)) = storage.open_nar(&nar) else {
-        return not_found(request);
-    };
+    match storage.open_nar(&nar) {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found(request),
+        Err(_) => return internal_error(request),
+    }
 
     let response = Response::from_data(bytes)
         .with_header(header("Content-Type", "text/x-nix-narinfo"))
@@ -117,17 +125,19 @@ fn requested_range(request: &tiny_http::Request, length: u64) -> RequestedRange 
 }
 
 fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId) {
-    let Ok(Some(mut file)) = storage.open_nar(nar) else {
-        return not_found(request);
+    let mut file = match storage.open_nar(nar) {
+        Ok(Some(file)) => file,
+        Ok(None) => return not_found(request),
+        Err(_) => return internal_error(request),
     };
     let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
-        return not_found(request);
+        return internal_error(request);
     };
 
     match requested_range(&request, length) {
         RequestedRange::Full => {
             let Ok(content_length) = usize::try_from(length) else {
-                return not_found(request);
+                return internal_error(request);
             };
             let response = Response::new(
                 StatusCode(200),
@@ -144,11 +154,11 @@ fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId
         }
         RequestedRange::Partial { start, end } => {
             if file.seek(SeekFrom::Start(start)).is_err() {
-                return not_found(request);
+                return internal_error(request);
             }
             let response_length = end - start + 1;
             let Ok(content_length) = usize::try_from(response_length) else {
-                return not_found(request);
+                return internal_error(request);
             };
             let response = Response::new(
                 StatusCode(206),
