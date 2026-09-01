@@ -1,15 +1,11 @@
-use std::{
-    collections::HashSet,
-    fmt, fs,
-    io::{self, Read},
-    os::unix::fs::PermissionsExt,
-    path::Path,
-};
+use std::{fmt, io, path::Path};
 
-use data_encoding::{BASE64, HEXLOWER};
+use data_encoding::BASE64;
 use sha2::{Digest, Sha256};
 use subtle::{Choice, ConstantTimeEq};
 use tiny_http::Request;
+
+use crate::token_file::{Error as TokenFileError, TokenFile};
 
 const TOKEN_BYTES: usize = 32;
 
@@ -19,56 +15,20 @@ pub enum Permission {
     Write,
 }
 
-#[derive(Debug)]
-struct TokenHash([u8; TOKEN_BYTES]);
-
 #[derive(Debug, Default)]
-struct TokenHashes(Vec<TokenHash>);
+struct TokenHashes(TokenFile);
 
 impl TokenHashes {
     fn load(path: &Path) -> Result<Option<Self>, AuthError> {
-        let mut file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
-            return Err(AuthError::InsecurePermissions);
-        }
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-
-        let mut labels = HashSet::new();
-        let mut tokens = Vec::new();
-        for line in contents.lines().filter(|line| !line.is_empty()) {
-            let mut fields = line.split_ascii_whitespace();
-            let (Some(label), Some(encoded), None) = (fields.next(), fields.next(), fields.next())
-            else {
-                return Err(AuthError::InvalidTokenFile);
-            };
-            if !label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-                || label.is_empty()
-                || !labels.insert(label)
-            {
-                return Err(AuthError::InvalidTokenFile);
-            }
-            let digest: [u8; TOKEN_BYTES] = HEXLOWER
-                .decode(encoded.as_bytes())
-                .ok()
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or(AuthError::InvalidTokenFile)?;
-            tokens.push(TokenHash(digest));
-        }
-        Ok(Some(Self(tokens)))
+        Ok(TokenFile::load(path)?.map(Self))
     }
 
     fn matches(&self, actual: &[u8; TOKEN_BYTES]) -> Choice {
-        self.0.iter().fold(Choice::from(0), |accepted, candidate| {
-            accepted | candidate.0.ct_eq(actual)
-        })
+        self.0
+            .hashes()
+            .fold(Choice::from(0), |accepted, candidate| {
+                accepted | candidate.ct_eq(actual)
+            })
     }
 }
 
@@ -162,6 +122,18 @@ pub enum AuthError {
     Io(io::Error),
 }
 
+impl From<TokenFileError> for AuthError {
+    fn from(error: TokenFileError) -> Self {
+        match error {
+            TokenFileError::InsecurePermissions => Self::InsecurePermissions,
+            TokenFileError::Invalid | TokenFileError::TemporaryFileExhausted => {
+                Self::InvalidTokenFile
+            }
+            TokenFileError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 impl From<io::Error> for AuthError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
@@ -192,6 +164,7 @@ impl std::error::Error for AuthError {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         os::unix::fs::PermissionsExt,
         time::{SystemTime, UNIX_EPOCH},
     };
