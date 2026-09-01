@@ -99,9 +99,22 @@
             ];
             text = builtins.readFile ./tests/nix-e2e.sh;
           };
+          continuationBenchmark = pkgs.writeShellApplication {
+            name = "narjar-continuation-benchmark";
+            runtimeInputs = [
+              build.narjar
+              pkgs.coreutils
+              pkgs.nix
+              pkgs.python3
+            ];
+            text = ''
+              export NARJAR_BIN=${lib.getExe build.narjar}
+              exec python3 ${./benchmarks/continuation.py} "$@"
+            '';
+          };
         in
         build // {
-          inherit pkgs toolchain provenance nixE2E;
+          inherit pkgs toolchain provenance nixE2E continuationBenchmark;
         };
 
       systems = lib.genAttrs supportedSystems mkSystem;
@@ -121,6 +134,7 @@
         default = env.narjar;
         cargo-artifacts = env.cargoArtifacts;
         nix-e2e = env.nixE2E;
+        continuation-benchmark = env.continuationBenchmark;
       }) systems // {
         ${staticSystem} = {
           narjar = systems.${staticSystem}.narjar;
@@ -129,6 +143,7 @@
           narjar-static = static.narjar;
           static-cargo-artifacts = static.cargoArtifacts;
           nix-e2e = systems.${staticSystem}.nixE2E;
+          continuation-benchmark = systems.${staticSystem}.continuationBenchmark;
         };
       };
 
@@ -159,6 +174,11 @@
           type = "app";
           program = lib.getExe env.nixE2E;
           meta.description = "Run the real-Nix end-to-end verification";
+        };
+        continuation-benchmark = {
+          type = "app";
+          program = lib.getExe env.continuationBenchmark;
+          meta.description = "Run the matched bincache continuation benchmark";
         };
       }) systems;
 
