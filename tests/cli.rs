@@ -248,13 +248,22 @@ impl RunningServer {
     }
 
     fn request(&self, method: &str, path: &str) -> Vec<u8> {
+        self.request_with_headers(method, path, &[])
+    }
+
+    fn request_with_headers(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> Vec<u8> {
         let mut stream = TcpStream::connect(&self.address).expect("connect to narjar");
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
             self.address
         )
         .expect("write request");
+        for &(name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").expect("write request header");
+        }
+        write!(stream, "\r\n").expect("finish request");
+
         let mut response = Vec::new();
         stream.read_to_end(&mut response).expect("read response");
         response
@@ -432,4 +441,93 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
     assert!(narinfo_head[narinfo_head_body..].is_empty());
     assert_eq!(&nar_get[nar_get_body..], nar_bytes);
     assert!(nar_head[nar_head_body..].is_empty());
+}
+fn response_parts(response: &[u8]) -> (String, &[u8]) {
+    let body = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .expect("response must contain a header terminator");
+    (
+        String::from_utf8_lossy(&response[..body]).into_owned(),
+        &response[body..],
+    )
+}
+
+#[test]
+fn nar_get_and_head_support_one_byte_range() {
+    let server = RunningServer::start("nar-ranges");
+    let nar_bytes = b"0123456789";
+    fs::write(server.data_dir.join(format!("nar/{NAR_ID}.nar")), nar_bytes)
+        .expect("write NAR fixture");
+    let path = format!("/nar/{NAR_ID}.nar");
+    let request = |method, range| server.request_with_headers(method, &path, &[("Range", range)]);
+
+    let closed = request("GET", "bytes=2-5");
+    let open = request("GET", "bytes=5-");
+    let suffix = request("GET", "bytes=-4");
+    let head = request("HEAD", "bytes=2-5");
+    let unsatisfiable = request("GET", "bytes=20-");
+    let multiple = request("GET", "bytes=0-1,4-5");
+    let malformed = request("GET", "bytes=wat");
+    let (signal, status) = server.stop();
+
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+
+    for (response, content_range, body) in [
+        (&closed, "bytes 2-5/10", &b"2345"[..]),
+        (&open, "bytes 5-9/10", &b"56789"[..]),
+        (&suffix, "bytes 6-9/10", &b"6789"[..]),
+    ] {
+        let (headers, actual_body) = response_parts(response);
+        assert!(
+            headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+            "{headers:?}"
+        );
+        assert!(
+            headers.contains(&format!("Content-Range: {content_range}\r\n")),
+            "{headers:?}"
+        );
+        assert!(
+            headers.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "{headers:?}"
+        );
+        assert_eq!(actual_body, body);
+    }
+
+    let (head_headers, head_body) = response_parts(&head);
+    assert!(
+        head_headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+        "{head_headers:?}"
+    );
+    assert!(
+        head_headers.contains("Content-Range: bytes 2-5/10\r\n"),
+        "{head_headers:?}"
+    );
+    assert!(
+        head_headers.contains("Content-Length: 4\r\n"),
+        "{head_headers:?}"
+    );
+    assert!(head_body.is_empty());
+
+    let (unsatisfiable_headers, unsatisfiable_body) = response_parts(&unsatisfiable);
+    assert!(
+        unsatisfiable_headers.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
+        "{unsatisfiable_headers:?}"
+    );
+    assert!(
+        unsatisfiable_headers.contains("Content-Range: bytes */10\r\n"),
+        "{unsatisfiable_headers:?}"
+    );
+    assert!(unsatisfiable_body.is_empty());
+
+    for response in [&multiple, &malformed] {
+        let (headers, body) = response_parts(response);
+        assert!(
+            headers.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{headers:?}"
+        );
+        assert!(body.is_empty());
+    }
 }
