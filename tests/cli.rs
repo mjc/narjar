@@ -222,6 +222,31 @@ fn serve_flag_overrides_environment() {
 }
 
 #[test]
+fn serve_rejects_a_symlinked_data_directory() {
+    let directory = data_dir("symlinked-data-directory");
+    let target = directory.path().join("target");
+    let link = directory.path().join("data");
+    fs::create_dir(&target).expect("create data directory target");
+    symlink(&target, &link).expect("create data directory symlink");
+
+    let output = run(&[
+        "serve",
+        "--data-dir",
+        link.to_str().expect("temporary path should be UTF-8"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
+        format!(
+            "narjar: data directory is not a directory: {}\n",
+            link.display()
+        )
+    );
+    assert!(!target.join("nar").exists());
+}
+
+#[test]
 fn serve_rejects_duplicate_options() {
     let missing = missing_data_dir("duplicate-workers");
     let output = run(&[

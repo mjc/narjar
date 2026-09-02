@@ -88,7 +88,7 @@ fn try_dispatch(
 }
 
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
-    if !fs::metadata(&config.data_dir)
+    if !fs::symlink_metadata(&config.data_dir)
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
     {
