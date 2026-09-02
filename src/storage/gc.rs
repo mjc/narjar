@@ -124,8 +124,9 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         options.min_age,
         now,
     );
-    let after_bytes = logical_after_bytes(&entries, &selected, &orphans, &selected_orphans);
-    let evicted_bytes = before_bytes.saturating_sub(after_bytes);
+    let projected_after_bytes =
+        logical_after_bytes(&entries, &selected, &orphans, &selected_orphans);
+    let mut after_bytes = projected_after_bytes;
     let dry_run = !options.apply;
     let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
         (0, 0, 0)
@@ -137,12 +138,16 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         })();
         match result {
             Ok(deleted) => {
+                let remaining_entries = scan(&storage, &trusted)?;
+                let remaining_orphans = scan_orphans(&storage, &remaining_entries)?;
+                after_bytes = total_bytes(&remaining_entries) + orphan_bytes(&remaining_orphans);
                 storage.recovery.finish(&trusted_keys_path)?;
                 deleted
             }
             Err(error) => return Err(error),
         }
     };
+    let evicted_bytes = before_bytes.saturating_sub(after_bytes);
 
     Ok(GcReport {
         accounting_basis: "logical",

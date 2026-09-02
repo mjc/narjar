@@ -2182,7 +2182,9 @@ fn gc_dry_run_preserves_and_apply_removes_old_pair() {
     );
     assert!(!data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
     assert!(!data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
-    assert!(String::from_utf8_lossy(&apply.stdout).contains("\"deleted_narinfos\":1"));
+    let apply_stdout = String::from_utf8_lossy(&apply.stdout);
+    assert!(apply_stdout.contains("\"deleted_narinfos\":1"));
+    assert!(apply_stdout.contains("\"after_bytes\":0"));
 }
 
 #[test]
