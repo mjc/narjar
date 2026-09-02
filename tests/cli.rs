@@ -1151,6 +1151,40 @@ fn nar_reads_external_symlinks_as_internal_errors() {
 }
 
 #[test]
+fn nar_reads_replaced_nar_directories_as_internal_errors() {
+    let server = RunningServer::start("read-replaced-nar-directory");
+    let nar_dir = server.data_dir.join("nar");
+    let real_nar_dir = server.data_dir.join("nar-real");
+    let external_dir = server
+        .data_dir
+        .parent()
+        .expect("data directory should have a parent")
+        .join("external-nar-dir");
+    let external_nar = external_dir.join(format!("{NAR_ID}.nar"));
+    fs::rename(&nar_dir, &real_nar_dir).expect("move real NAR directory");
+    fs::create_dir(&external_dir).expect("create external directory");
+    fs::write(&external_nar, NAR_BYTES).expect("write external NAR");
+    symlink(&external_dir, &nar_dir).expect("create NAR directory symlink");
+
+    let response = server.request("GET", &format!("/nar/{NAR_ID}.nar"));
+    let (headers, body) = response_parts(&response);
+    let (signal, status) = server.stop();
+
+    assert!(
+        headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{headers:?}"
+    );
+    assert!(body.is_empty());
+    assert_eq!(
+        fs::read(&external_nar).expect("read external NAR"),
+        NAR_BYTES
+    );
+    fs::remove_dir_all(&external_dir).expect("remove external directory");
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
 fn nar_put_streams_hash_checks_and_retries_immutably() {
     let server = RunningServer::start("nar-put");
     let path = format!("/nar/{NARJAR_HASH}.nar");

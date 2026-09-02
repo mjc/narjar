@@ -1,11 +1,13 @@
 use std::{
+    ffi::{CString, OsStr},
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Cursor, Read},
     mem::MaybeUninit,
     num::NonZeroUsize,
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
         unix::fs::{OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
@@ -63,6 +65,10 @@ pub struct StoreHash(String);
 impl StoreHash {
     pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
         parse_nix32(value, 32).map(Self)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -377,7 +383,9 @@ impl Storage {
         narinfo: ValidatedNarInfo,
     ) -> Result<PublishOutcome, StorageError> {
         let (nar, nar_size, bytes) = narinfo.into_parts();
-        match open_regular(&self.layout.nar_path(&nar)) {
+        let nar_directory = self.nar_directory()?;
+        let nar_name = format!("{}.nar", nar.as_str());
+        match open_regular_at(&nar_directory, OsStr::new(&nar_name)) {
             Ok(file) if file.metadata()?.len() == nar_size => {}
             Ok(_) => return Err(StorageError::NarMismatch),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -415,7 +423,9 @@ impl Storage {
 
     #[cfg(test)]
     fn ensure_nar(&self, nar: &NarObjectId) -> Result<(), StorageError> {
-        match open_regular(&self.layout.nar_path(nar)) {
+        let nar_directory = self.nar_directory()?;
+        let nar_name = format!("{}.nar", nar.as_str());
+        match open_regular_at(&nar_directory, OsStr::new(&nar_name)) {
             Ok(_) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StorageError::MissingNar),
             Err(error) => Err(error.into()),
@@ -423,11 +433,15 @@ impl Storage {
     }
 
     pub fn open_nar(&self, nar: &NarObjectId) -> Result<Option<File>, StorageError> {
-        open_optional(&self.layout.nar_path(nar))
+        let directory = self.nar_directory()?;
+        let name = format!("{}.nar", nar.as_str());
+        open_optional_at(&directory, OsStr::new(&name))
     }
 
     pub fn open_narinfo(&self, store: &StoreHash) -> Result<Option<File>, StorageError> {
-        open_optional(&self.layout.narinfo_path(store))
+        let directory = self.root_directory()?;
+        let name = format!("{}.narinfo", store.as_str());
+        open_optional_at(&directory, OsStr::new(&name))
     }
 
     pub fn open_pair(
@@ -589,6 +603,15 @@ impl Storage {
         )
         .into())
     }
+
+    fn root_directory(&self) -> Result<File, StorageError> {
+        Ok(open_directory(&self.layout.root)?)
+    }
+
+    fn nar_directory(&self) -> Result<File, StorageError> {
+        let root = self.root_directory()?;
+        Ok(open_directory_at(&root, OsStr::new("nar"))?)
+    }
 }
 
 #[derive(Debug)]
@@ -682,14 +705,6 @@ fn ensure_directory(path: &Path, name: &str) -> io::Result<()> {
     }
 }
 
-fn open_optional(path: &Path) -> Result<Option<File>, StorageError> {
-    match open_regular(path) {
-        Ok(file) => Ok(Some(file)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
 fn open_directory(path: &Path) -> io::Result<File> {
     let directory = OpenOptions::new()
         .read(true)
@@ -699,6 +714,22 @@ fn open_directory(path: &Path) -> io::Result<File> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{} is not a directory", path.display()),
+        ));
+    }
+    Ok(directory)
+}
+
+fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    let directory = open_at(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a directory", name.to_string_lossy()),
         ));
     }
     Ok(directory)
@@ -716,6 +747,54 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File> {
+    let file = open_at(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", name.to_string_lossy()),
+        ));
+    }
+    Ok(file)
+}
+
+fn open_optional_at(directory: &File, name: &OsStr) -> Result<Option<File>, StorageError> {
+    match open_regular_at(directory, name) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn open_at(parent: &File, name: &OsStr, flags: i32, mode: u32) -> io::Result<File> {
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage entry name contains a NUL byte",
+        )
+    })?;
+    // SAFETY: parent owns a live directory descriptor, name is NUL-terminated,
+    // and the returned descriptor is transferred to File exactly once.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn rollback_link(destination: &Path, parent: &Path) -> Result<(), StorageError> {
