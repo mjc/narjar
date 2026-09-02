@@ -3,12 +3,14 @@ use std::{
     ffi::OsStr,
     fs, io,
     num::NonZeroUsize,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
-use super::{Layout, StorageError, parse_nix32, sync_dir};
+use super::{
+    Storage, StorageError, entry_identity_at, entry_is_directory_at, entry_is_regular_at,
+    open_regular_at, parse_nix32, read_dir_names, unlink_at,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ReconcileClass {
@@ -61,85 +63,79 @@ struct FileIdentity {
     inode: u64,
 }
 
-impl From<&fs::Metadata> for FileIdentity {
-    fn from(metadata: &fs::Metadata) -> Self {
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
-}
-
 pub(super) fn scan(
-    layout: &Layout,
+    storage: &Storage,
     limit: NonZeroUsize,
     stale_before: SystemTime,
 ) -> Result<ReconcileReport, StorageError> {
     let mut found = BoundedEntries::new(limit);
+    let root = storage.root_directory()?;
 
-    for entry in fs::read_dir(&layout.root)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let file_type = entry.file_type()?;
-        if let Some(class) = classify_root_entry(&name, &file_type) {
-            found.record(PathBuf::from(name), class, &path)?;
+    for name in read_dir_names(&root)? {
+        if let Some(class) = classify_root_entry(&root, &name)? {
+            found.record(
+                PathBuf::from(&name),
+                class,
+                entry_identity_at(&root, &name)?,
+            );
         }
     }
 
-    for entry in fs::read_dir(layout.nar_dir())? {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = PathBuf::from("nar").join(entry.file_name());
-        let file_type = entry.file_type()?;
-        let class = if !file_type.is_file() {
+    let nar_directory = storage.nar_directory()?;
+    for name in read_dir_names(&nar_directory)? {
+        let relative = PathBuf::from("nar").join(&name);
+        let class = if !entry_is_regular_at(&nar_directory, &name)? {
             ReconcileClass::UnexpectedType
-        } else if valid_nar_filename(&entry.file_name()) {
+        } else if valid_nar_filename(&name) {
             ReconcileClass::NarObject
         } else {
             ReconcileClass::InvalidFilename
         };
-        found.record(relative, class, &path)?;
+        found.record(relative, class, entry_identity_at(&nar_directory, &name)?);
     }
 
-    for entry in fs::read_dir(layout.temp_dir())? {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = PathBuf::from(".tmp").join(entry.file_name());
-        let file_type = entry.file_type()?;
-        let metadata = fs::symlink_metadata(&path)?;
-        let class = if !file_type.is_file() {
+    let temp_directory = storage.temp_directory()?;
+    for name in read_dir_names(&temp_directory)? {
+        let relative = PathBuf::from(".tmp").join(&name);
+        let identity = entry_identity_at(&temp_directory, &name)?;
+        let class = if !entry_is_regular_at(&temp_directory, &name)? {
             ReconcileClass::UnexpectedType
-        } else if !valid_temp_filename(&entry.file_name()) {
+        } else if !valid_temp_filename(&name) {
             ReconcileClass::InvalidFilename
-        } else if metadata.modified()? <= stale_before {
+        } else if open_regular_at(&temp_directory, &name)?
+            .metadata()?
+            .modified()?
+            <= stale_before
+        {
             ReconcileClass::TempStale
         } else {
             ReconcileClass::TempYoung
         };
-        found.record_with_metadata(relative, class, metadata);
+        found.record(relative, class, identity);
     }
 
-    for entry in fs::read_dir(layout.realisations_dir())? {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = PathBuf::from("realisations").join(entry.file_name());
-        let file_type = entry.file_type()?;
-        let class = if !file_type.is_file() {
+    let realisations_directory = storage.realisations_directory()?;
+    for name in read_dir_names(&realisations_directory)? {
+        let relative = PathBuf::from("realisations").join(&name);
+        let class = if !entry_is_regular_at(&realisations_directory, &name)? {
             ReconcileClass::UnexpectedType
-        } else if valid_realisation_filename(&entry.file_name()) {
+        } else if valid_realisation_filename(&name) {
             ReconcileClass::Realisation
         } else {
             ReconcileClass::InvalidFilename
         };
-        found.record(relative, class, &path)?;
+        found.record(
+            relative,
+            class,
+            entry_identity_at(&realisations_directory, &name)?,
+        );
     }
 
     Ok(found.finish())
 }
 
 pub(super) fn cleanup_stale_temp(
-    layout: &Layout,
+    storage: &Storage,
     entry: &ReconcileEntry,
 ) -> Result<bool, StorageError> {
     if entry.class != ReconcileClass::TempStale
@@ -148,18 +144,22 @@ pub(super) fn cleanup_stale_temp(
         return Ok(false);
     }
 
-    let path = layout.root.join(&entry.relative_path);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
+    let directory = storage.temp_directory()?;
+    let name = entry
+        .relative_path
+        .file_name()
+        .expect("validated temporary entry has a filename");
+    let identity = match entry_identity_at(&directory, name) {
+        Ok((device, inode)) => FileIdentity { device, inode },
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    if FileIdentity::from(&metadata) != entry.identity {
+    if identity != entry.identity {
         return Ok(false);
     }
 
-    fs::remove_file(path)?;
-    sync_dir(&layout.temp_dir())?;
+    unlink_at(&directory, name)?;
+    directory.sync_all()?;
     Ok(true)
 }
 
@@ -183,24 +183,13 @@ impl BoundedEntries {
         &mut self,
         relative_path: PathBuf,
         class: ReconcileClass,
-        path: &Path,
-    ) -> Result<(), StorageError> {
-        let metadata = fs::symlink_metadata(path)?;
-        self.record_with_metadata(relative_path, class, metadata);
-        Ok(())
-    }
-
-    fn record_with_metadata(
-        &mut self,
-        relative_path: PathBuf,
-        class: ReconcileClass,
-        metadata: fs::Metadata,
+        (device, inode): (u64, u64),
     ) {
         self.seen += 1;
         self.entries.push(ReconcileEntry {
             relative_path,
             class,
-            identity: FileIdentity::from(&metadata),
+            identity: FileIdentity { device, inode },
         });
         if self.entries.len() > self.limit {
             self.entries.pop();
@@ -217,10 +206,15 @@ impl BoundedEntries {
     }
 }
 
-fn classify_root_entry(name: &OsStr, file_type: &fs::FileType) -> Option<ReconcileClass> {
-    match name.to_str() {
+fn classify_root_entry(
+    directory: &fs::File,
+    name: &OsStr,
+) -> Result<Option<ReconcileClass>, StorageError> {
+    let is_directory = entry_is_directory_at(directory, name)?;
+    let is_regular = entry_is_regular_at(directory, name)?;
+    Ok(match name.to_str() {
         Some("nar" | ".tmp" | "realisations" | "auth") => {
-            (!file_type.is_dir()).then_some(ReconcileClass::UnexpectedType)
+            (!is_directory).then_some(ReconcileClass::UnexpectedType)
         }
         Some(
             "lock"
@@ -228,15 +222,15 @@ fn classify_root_entry(name: &OsStr, file_type: &fs::FileType) -> Option<Reconci
             | "trusted-public-keys"
             | ".narjar-clean"
             | ".narjar-recovery",
-        ) => (!file_type.is_file()).then_some(ReconcileClass::UnexpectedType),
-        Some(name) if valid_store_hash_filename(name) => Some(if file_type.is_file() {
+        ) => (!is_regular).then_some(ReconcileClass::UnexpectedType),
+        Some(name) if valid_store_hash_filename(name) => Some(if is_regular {
             ReconcileClass::NarInfo
         } else {
             ReconcileClass::UnexpectedType
         }),
         Some(_) => Some(ReconcileClass::UnknownFile),
         None => Some(ReconcileClass::InvalidFilename),
-    }
+    })
 }
 
 fn valid_store_hash_filename(name: &str) -> bool {

@@ -158,6 +158,7 @@ impl Layout {
         Self { root }
     }
 
+    #[cfg(test)]
     fn nar_dir(&self) -> PathBuf {
         self.root.join("nar")
     }
@@ -173,10 +174,6 @@ impl Layout {
 
     fn temp_dir(&self) -> PathBuf {
         self.root.join(".tmp")
-    }
-
-    fn realisations_dir(&self) -> PathBuf {
-        self.root.join("realisations")
     }
 }
 
@@ -475,11 +472,11 @@ impl Storage {
         limit: NonZeroUsize,
         stale_before: SystemTime,
     ) -> Result<ReconcileReport, StorageError> {
-        reconcile::scan(&self.layout, limit, stale_before)
+        reconcile::scan(self, limit, stale_before)
     }
 
     pub fn cleanup_stale_temp(&self, entry: &ReconcileEntry) -> Result<bool, StorageError> {
-        reconcile::cleanup_stale_temp(&self.layout, entry)
+        reconcile::cleanup_stale_temp(self, entry)
     }
 
     pub fn delete_narinfo(&self, store: &StoreHash) -> Result<bool, StorageError> {
@@ -631,6 +628,11 @@ impl Storage {
         Ok(open_directory_at(&root, OsStr::new(".tmp"))?)
     }
 
+    fn realisations_directory(&self) -> Result<File, StorageError> {
+        let root = self.root_directory()?;
+        Ok(open_directory_at(&root, OsStr::new("realisations"))?)
+    }
+
     fn destination_directory(&self, target: &PublishTarget<'_>) -> Result<File, StorageError> {
         match target {
             PublishTarget::Nar(_) => self.nar_directory(),
@@ -766,7 +768,7 @@ fn validate_directory(directory: &File, name: &str) -> io::Result<File> {
     directory.try_clone()
 }
 
-fn open_directory(path: &Path) -> io::Result<File> {
+pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -780,7 +782,7 @@ fn open_directory(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
-fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
+pub(crate) fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
     let directory = open_at(
         parent,
         name,
@@ -810,7 +812,7 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File> {
+pub(crate) fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File> {
     let file = open_at(
         directory,
         name,
@@ -827,6 +829,23 @@ fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File> {
 }
 
 pub(crate) fn entry_is_regular_at(directory: &File, name: &OsStr) -> io::Result<bool> {
+    Ok(entry_mode_at(directory, name)? & libc::S_IFMT == libc::S_IFREG)
+}
+
+pub(crate) fn entry_is_directory_at(directory: &File, name: &OsStr) -> io::Result<bool> {
+    Ok(entry_mode_at(directory, name)? & libc::S_IFMT == libc::S_IFDIR)
+}
+
+pub(crate) fn entry_identity_at(directory: &File, name: &OsStr) -> io::Result<(u64, u64)> {
+    let metadata = entry_stat_at(directory, name)?;
+    Ok((metadata.st_dev as u64, metadata.st_ino as u64))
+}
+
+fn entry_mode_at(directory: &File, name: &OsStr) -> io::Result<libc::mode_t> {
+    Ok(entry_stat_at(directory, name)?.st_mode as libc::mode_t)
+}
+
+fn entry_stat_at(directory: &File, name: &OsStr) -> io::Result<libc::stat> {
     let name = CString::new(name.as_bytes()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -849,7 +868,7 @@ pub(crate) fn entry_is_regular_at(directory: &File, name: &OsStr) -> io::Result<
     }
     // SAFETY: fstatat returned success, so it initialized metadata.
     let metadata = unsafe { metadata.assume_init() };
-    Ok((metadata.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG)
+    Ok(metadata)
 }
 
 fn open_optional_at(directory: &File, name: &OsStr) -> Result<Option<File>, StorageError> {
@@ -1248,6 +1267,32 @@ mod tests {
         assert_eq!(
             fs::read(&external_nar).expect("read external NAR"),
             b"must not be compared"
+        );
+    }
+
+    #[test]
+    fn reconciliation_rejects_a_symlinked_nar_directory() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let nar_dir = storage.layout.nar_dir();
+        let real_nar_dir = directory.path().join("nar-real");
+        let external = directory.path().join("external");
+        fs::rename(&nar_dir, &real_nar_dir).expect("move real NAR directory");
+        fs::create_dir(&external).expect("create external directory");
+        fs::write(
+            external.join("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl.nar"),
+            b"external",
+        )
+        .expect("write external NAR");
+        symlink(&external, &nar_dir).expect("create NAR directory symlink");
+
+        assert!(
+            storage
+                .reconcile(
+                    NonZeroUsize::new(32).expect("non-zero limit"),
+                    SystemTime::now()
+                )
+                .is_err()
         );
     }
 

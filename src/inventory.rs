@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    fs,
     io::{self, Read},
     path::Path,
 };
@@ -8,8 +7,11 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo},
-    storage::{NarObjectId, StoreHash, nix32_sha256, open_regular},
+    narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
+    storage::{
+        NarObjectId, StoreHash, entry_is_regular_at, nix32_sha256, open_directory,
+        open_directory_at, open_regular_at, read_dir_names,
+    },
 };
 
 pub use crate::narinfo::MAX_NARINFO_BYTES;
@@ -107,10 +109,10 @@ impl Inventory {
     pub fn scan(root: &Path, trusted: &TrustedPublicKeys, verify_hashes: bool) -> io::Result<Self> {
         let mut entries = Vec::new();
         let mut referenced = HashSet::new();
+        let root_directory = open_directory(root)?;
+        let nar_directory = open_directory_at(&root_directory, std::ffi::OsStr::new("nar"))?;
 
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            let name = entry.file_name();
+        for name in read_dir_names(&root_directory)? {
             let Some(name) = name.to_str() else {
                 continue;
             };
@@ -121,11 +123,15 @@ impl Inventory {
                 entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
                 continue;
             };
-            if !entry.metadata()?.is_file() {
+            let name = std::ffi::OsStr::new(name);
+            if !entry_is_regular_at(&root_directory, name)? {
                 entries.push(InventoryEntry::new(InventoryClass::MalformedNarInfo, route));
                 continue;
             }
-            let validated = match trusted.inspect(&store, read_narinfo(&entry.path())?) {
+            let validated = match trusted.inspect(
+                &store,
+                read_narinfo_file(open_regular_at(&root_directory, name)?)?,
+            ) {
                 Ok(validated) => validated,
                 Err(PublishedNarInfoError::Malformed) => {
                     entries.push(InventoryEntry::new(InventoryClass::MalformedNarInfo, route));
@@ -141,14 +147,16 @@ impl Inventory {
             };
             let nar = validated.nar();
             referenced.insert(nar.as_str().to_owned());
-            let path = root.join("nar").join(format!("{}.nar", nar.as_str()));
-            let Some(mut file) = open_regular(&path).map(Some).or_else(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    Ok(None)
-                } else {
-                    Err(error)
-                }
-            })?
+            let nar_name = format!("{}.nar", nar.as_str());
+            let Some(mut file) = open_regular_at(&nar_directory, std::ffi::OsStr::new(&nar_name))
+                .map(Some)
+                .or_else(|error| {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    }
+                })?
             else {
                 entries.push(InventoryEntry::new(InventoryClass::MissingNar, route));
                 continue;
@@ -178,23 +186,20 @@ impl Inventory {
             ));
         }
 
-        let nar_dir = root.join("nar");
-        if nar_dir.is_dir() {
-            for entry in fs::read_dir(nar_dir)? {
-                let entry = entry?;
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                let Some(identifier) = name.strip_suffix(".nar") else {
-                    entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
-                    continue;
-                };
-                if NarObjectId::parse(identifier).is_err() {
-                    entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
-                } else if !referenced.contains(identifier) {
-                    entries.push(InventoryEntry::new(InventoryClass::OrphanNar, identifier));
-                }
+        for name in read_dir_names(&nar_directory)? {
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(identifier) = name.strip_suffix(".nar") else {
+                entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
+                continue;
+            };
+            if NarObjectId::parse(identifier).is_err()
+                || !entry_is_regular_at(&nar_directory, std::ffi::OsStr::new(name))?
+            {
+                entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
+            } else if !referenced.contains(identifier) {
+                entries.push(InventoryEntry::new(InventoryClass::OrphanNar, identifier));
             }
         }
 
