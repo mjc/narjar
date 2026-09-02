@@ -363,8 +363,8 @@ impl Storage {
         narinfo: ValidatedNarInfo,
     ) -> Result<PublishOutcome, StorageError> {
         let (nar, nar_size, bytes) = narinfo.into_parts();
-        match fs::metadata(self.layout.nar_path(&nar)) {
-            Ok(metadata) if metadata.is_file() && metadata.len() == nar_size => {}
+        match open_regular(&self.layout.nar_path(&nar)) {
+            Ok(file) if file.metadata()?.len() == nar_size => {}
             Ok(_) => return Err(StorageError::NarMismatch),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(StorageError::MissingNar);
@@ -401,9 +401,8 @@ impl Storage {
 
     #[cfg(test)]
     fn ensure_nar(&self, nar: &NarObjectId) -> Result<(), StorageError> {
-        match fs::metadata(self.layout.nar_path(nar)) {
-            Ok(metadata) if metadata.is_file() => Ok(()),
-            Ok(_) => Err(StorageError::MissingNar),
+        match open_regular(&self.layout.nar_path(nar)) {
+            Ok(_) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StorageError::MissingNar),
             Err(error) => Err(error.into()),
         }
@@ -649,12 +648,27 @@ fn available_bytes(path: &Path) -> io::Result<u64> {
 }
 
 fn open_optional(path: PathBuf) -> Result<Option<File>, StorageError> {
-    match File::open(path) {
+    match open_regular(&path) {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
+
+fn open_regular(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 fn rollback_link(destination: &Path, parent: &Path) -> Result<(), StorageError> {
     fs::remove_file(destination)?;
     sync_dir(parent)?;
@@ -686,12 +700,12 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 }
 
 fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
-    if fs::metadata(left)?.len() != fs::metadata(right)?.len() {
+    let mut left = open_regular(left)?;
+    let mut right = open_regular(right)?;
+    if left.metadata()?.len() != right.metadata()?.len() {
         return Ok(false);
     }
 
-    let mut left = File::open(left)?;
-    let mut right = File::open(right)?;
     let mut left_buffer = [0; COMPARE_BUFFER_BYTES];
     let mut right_buffer = [0; COMPARE_BUFFER_BYTES];
 

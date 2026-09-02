@@ -1096,6 +1096,36 @@ fn read_misses_do_not_hide_corrupt_or_unreadable_finals() {
 }
 
 #[test]
+fn nar_reads_external_symlinks_as_internal_errors() {
+    let server = RunningServer::start("read-external-symlink");
+    let nar_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
+    let external_path = server
+        .data_dir
+        .parent()
+        .expect("data directory should have a parent")
+        .join("external.nar");
+    let external_bytes = b"must stay outside the cache";
+    fs::write(&external_path, external_bytes).expect("write external target");
+    symlink(&external_path, &nar_path).expect("create external NAR symlink");
+
+    let response = server.request("GET", &format!("/nar/{NAR_ID}.nar"));
+    let (headers, body) = response_parts(&response);
+    let (signal, status) = server.stop();
+
+    assert!(
+        headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{headers:?}"
+    );
+    assert!(body.is_empty());
+    assert_eq!(
+        fs::read(&external_path).expect("read external target"),
+        external_bytes
+    );
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
 fn nar_put_streams_hash_checks_and_retries_immutably() {
     let server = RunningServer::start("nar-put");
     let path = format!("/nar/{NARJAR_HASH}.nar");
