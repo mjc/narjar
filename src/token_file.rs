@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
@@ -88,8 +88,22 @@ impl TokenFile {
         let directory = path
             .parent()
             .expect("token paths always have an auth directory");
-        fs::create_dir_all(directory)?;
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        let directory_file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(directory)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(directory)?;
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    .open(directory)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        directory_file.set_permissions(fs::Permissions::from_mode(0o700))?;
 
         let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
         temporary
@@ -105,7 +119,7 @@ impl TokenFile {
         }
         temporary.as_file().sync_all()?;
         temporary.persist(path).map_err(|error| error.error)?;
-        File::open(directory)?.sync_all()?;
+        directory_file.sync_all()?;
         Ok(())
     }
 }
@@ -200,5 +214,17 @@ mod tests {
 
         assert!(TokenFile::load(&path).is_err());
         assert!(target.exists());
+    }
+
+    #[test]
+    fn store_rejects_a_symlinked_token_directory() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let target = directory.path().join("auth-real");
+        let auth = directory.path().join("auth");
+        fs::create_dir(&target).expect("create token target directory");
+        symlink(&target, &auth).expect("create token directory symlink");
+
+        assert!(TokenFile::default().store(&auth.join("tokens")).is_err());
+        assert!(!target.join("tokens").exists());
     }
 }
