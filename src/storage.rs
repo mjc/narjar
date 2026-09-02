@@ -234,8 +234,19 @@ impl ProcessLock {
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
             .mode(0o600)
-            .open(path)?;
+            .open(path)
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("lock {}: {error}", path.display()))
+            })?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("lock is not a regular file: {}", path.display()),
+            )
+            .into());
+        }
         lock_exclusive(&file)?;
         Ok(Self { _file: file })
     }
@@ -267,11 +278,11 @@ pub struct Storage {
 impl Storage {
     pub fn initialize(root: impl AsRef<Path>) -> Result<Self, StorageError> {
         let layout = Layout::new(root.as_ref().to_owned());
+        ensure_directory(&layout.root, "data directory")?;
         let root_is_empty = RecoveryState::root_is_empty(&layout.root)?;
-        fs::create_dir_all(&layout.root)?;
-        fs::create_dir_all(layout.nar_dir())?;
-        fs::create_dir_all(layout.temp_dir())?;
-        fs::create_dir_all(layout.realisations_dir())?;
+        ensure_directory(&layout.nar_dir(), "nar directory")?;
+        ensure_directory(&layout.temp_dir(), "temporary directory")?;
+        ensure_directory(&layout.realisations_dir(), "realisations directory")?;
 
         let lock = ProcessLock::acquire(&layout.lock_path())?;
         sync_dir(&layout.root)?;
@@ -647,6 +658,18 @@ fn available_bytes(path: &Path) -> io::Result<u64> {
     Ok(available.min(u128::from(u64::MAX)) as u64)
 }
 
+fn ensure_directory(path: &Path, name: &str) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} is not a directory: {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(path),
+        Err(error) => Err(error),
+    }
+}
+
 fn open_optional(path: &Path) -> Result<Option<File>, StorageError> {
     match open_regular(path) {
         Ok(file) => Ok(Some(file)),
@@ -729,6 +752,7 @@ mod tests {
         env, fs,
         io::{self, Cursor, Read},
         num::NonZeroUsize,
+        os::unix::fs::symlink,
         path::{Path, PathBuf},
         process,
         sync::{
@@ -804,6 +828,38 @@ mod tests {
         assert!(directory.path().join("realisations").is_dir());
         assert_eq!(storage.layout(), &Layout::new(directory.path().to_owned()));
     }
+
+    #[test]
+    fn initialization_rejects_a_symlinked_data_directory() {
+        let directory = TestDir::new();
+        let target = directory.path().join("target");
+        let link = directory.path().join("data");
+        fs::create_dir(&target).expect("create symlink target");
+        symlink(&target, &link).expect("create data directory symlink");
+
+        let error = Storage::initialize(&link).expect_err("symlinked data must be rejected");
+        assert!(error.to_string().contains("data directory"));
+        assert!(!target.join("nar").exists());
+        assert!(!target.join(".tmp").exists());
+        assert!(!target.join("realisations").exists());
+    }
+
+    #[test]
+    fn initialization_rejects_a_symlinked_lock() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        drop(storage);
+
+        let target = directory.path().join("lock-target");
+        let lock = directory.path().join("lock");
+        fs::write(&target, b"external lock").expect("create lock target");
+        fs::remove_file(&lock).expect("remove original lock");
+        symlink(&target, &lock).expect("create lock symlink");
+
+        let error = Storage::initialize(directory.path()).expect_err("symlinked lock must fail");
+        assert!(error.to_string().contains("lock"));
+    }
+
     #[test]
     fn recovery_marker_distinguishes_clean_and_interrupted_publication() {
         let directory = TestDir::new();
