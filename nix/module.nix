@@ -41,7 +41,11 @@ let
     fi
     ${installCredentials}
   '';
-  privilegedPreStart = pkgs.writeShellScript "narjar-pre-start" preStartScript;
+  privilegedPreStartScript = ''
+    ${preStartScript}
+    ${pkgs.coreutils}/bin/chown -R narjar:narjar ${lib.escapeShellArg cfg.dataDir}
+  '';
+  privilegedPreStart = pkgs.writeShellScript "narjar-pre-start" privilegedPreStartScript;
   serveArgs = lib.escapeShellArgs [
     "serve"
     "--data-dir"
