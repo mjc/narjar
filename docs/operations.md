@@ -376,6 +376,41 @@ A minimal NixOS configuration is:
 }
 ~~~
 
+Scheduled retention is disabled unless explicitly enabled. On NixOS, the optional
+timer runs a one-shot offline pass with the same data-directory lock as the
+server:
+
+~~~nix
+services.narjar.gc = {
+  enable = true;
+  schedule = "*-*-* 03:00:00";
+  maxBytes = 8 * 1024 * 1024 * 1024;
+  targetBytes = 6 * 1024 * 1024 * 1024;
+  minAgeSeconds = 7 * 24 * 60 * 60;
+  protectedRoots = "/var/lib/narjar/protected-roots";
+};
+~~~
+
+Enabling this creates `narjar-gc.timer` and `narjar-gc.service`. The service
+stops `narjar.service`, runs `gc --apply`, and starts the cache again from
+`ExecStopPost`, including after a failed collection. A persistent timer may
+run once after downtime; it is still disabled by default, and at least one
+size or age policy must be configured. The maintenance interval is expected
+downtime, so schedule it alongside storage snapshots and backups.
+
+For OCI or other non-systemd deployments, use the equivalent explicit
+stop/collect/start sequence:
+
+~~~sh
+docker stop narjar
+narjar gc --data-dir /var/lib/narjar --target-bytes 6442450944 --min-age-seconds 604800 --apply
+docker start narjar
+~~~
+
+Do not run GC while another process has the data-directory lease. If a pass is
+interrupted, leave the recovery marker in place and start Narjar; startup
+revalidates the inventory before serving.
+
 The auth values are host paths consumed by systemd `LoadCredential`, not
 credential contents. Do not use `builtins.readFile` or Nix string literals for
 secrets. systemd supplies a dynamic unprivileged user, a mode-0700

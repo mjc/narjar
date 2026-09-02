@@ -1,12 +1,9 @@
-{ self }:
-{
+{self}: {
   config,
   lib,
   pkgs,
   ...
-}:
-
-let
+}: let
   cfg = config.services.narjar;
   executable = lib.getExe' cfg.package "narjar";
   stateDirectory = lib.removePrefix "/var/lib/" cfg.dataDir;
@@ -30,11 +27,13 @@ let
       mode = "0644";
     }
   ];
-  installCredentials = lib.concatMapStringsSep "\n" (credential: ''
-    ${pkgs.coreutils}/bin/install -m ${credential.mode} \
-      "$NARJAR_CREDENTIALS_DIRECTORY/${credential.name}" \
-      ${lib.escapeShellArg "${cfg.dataDir}/${credential.target}"}
-  '') credentials;
+  installCredentials =
+    lib.concatMapStringsSep "\n" (credential: ''
+      ${pkgs.coreutils}/bin/install -m ${credential.mode} \
+        "$NARJAR_CREDENTIALS_DIRECTORY/${credential.name}" \
+        ${lib.escapeShellArg "${cfg.dataDir}/${credential.target}"}
+    '')
+    credentials;
   preStartScript = ''
     if [ ! -e ${lib.escapeShellArg "${cfg.dataDir}/nix-cache-info"} ]; then
       ${executable} init --data-dir ${lib.escapeShellArg cfg.dataDir}
@@ -64,8 +63,35 @@ let
     "--min-free-bytes"
     (toString cfg.minFreeBytes)
   ];
-in
-{
+  gcArgs = lib.escapeShellArgs (
+    [
+      "gc"
+      "--data-dir"
+      cfg.dataDir
+      "--apply"
+    ]
+    ++ lib.optionals (cfg.gc.maxBytes != null) [
+      "--max-bytes"
+      (toString cfg.gc.maxBytes)
+    ]
+    ++ lib.optionals (cfg.gc.targetBytes != null) [
+      "--target-bytes"
+      (toString cfg.gc.targetBytes)
+    ]
+    ++ lib.optionals (cfg.gc.maxAgeSeconds != null) [
+      "--max-age-seconds"
+      (toString cfg.gc.maxAgeSeconds)
+    ]
+    ++ lib.optionals (cfg.gc.minAgeSeconds != 0) [
+      "--min-age-seconds"
+      (toString cfg.gc.minAgeSeconds)
+    ]
+    ++ lib.optionals (cfg.gc.protectedRoots != null) [
+      "--protected-roots"
+      cfg.gc.protectedRoots
+    ]
+  );
+in {
   options.services.narjar = {
     enable = lib.mkEnableOption "the Narjar binary cache";
 
@@ -114,6 +140,46 @@ in
       default = 1024 * 1024 * 1024;
     };
 
+    gc = {
+      enable = lib.mkEnableOption "scheduled Narjar garbage collection";
+
+      schedule = lib.mkOption {
+        type = lib.types.str;
+        default = "weekly";
+        description = "systemd OnCalendar expression for offline garbage collection.";
+      };
+
+      maxBytes = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.unsigned;
+        default = null;
+        description = "Maximum cache bytes before collection is needed.";
+      };
+
+      targetBytes = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.unsigned;
+        default = null;
+        description = "Target cache bytes for collection.";
+      };
+
+      maxAgeSeconds = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.unsigned;
+        default = null;
+        description = "Maximum publication age in seconds.";
+      };
+
+      minAgeSeconds = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 0;
+        description = "Minimum publication age in seconds.";
+      };
+
+      protectedRoots = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "File containing protected store paths or hashes.";
+      };
+    };
+
     auth = {
       readTokens = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
@@ -144,6 +210,14 @@ in
           && !(lib.hasInfix ".." stateDirectory);
         message = "services.narjar.dataDir must be a directory below /var/lib";
       }
+      {
+        assertion =
+          !cfg.gc.enable
+          || cfg.gc.maxBytes != null
+          || cfg.gc.targetBytes != null
+          || cfg.gc.maxAgeSeconds != null;
+        message = "services.narjar.gc requires maxBytes, targetBytes, or maxAgeSeconds";
+      }
     ];
 
     users.groups.narjar = lib.mkIf (!cfg.dynamicUser) {};
@@ -155,8 +229,8 @@ in
 
     systemd.services.narjar = {
       description = "Narjar binary cache";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      wantedBy = ["multi-user.target"];
+      after = ["network.target"];
 
       preStart = lib.mkIf cfg.dynamicUser preStartScript;
 
@@ -190,7 +264,7 @@ in
         ProtectKernelTunables = true;
         ProtectProc = "invisible";
         ProtectSystem = "strict";
-        ReadWritePaths = [ cfg.dataDir ];
+        ReadWritePaths = [cfg.dataDir];
         RemoveIPC = true;
         RestrictAddressFamilies = [
           "AF_INET"
@@ -204,6 +278,32 @@ in
           "~@privileged"
           "~@resources"
         ];
+      };
+    };
+    systemd.services.narjar-gc = lib.mkIf cfg.gc.enable {
+      description = "Narjar offline garbage collection";
+      after = ["network.target"];
+      unitConfig.RequiresMountsFor = [cfg.dataDir];
+
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStartPre = "${pkgs.systemd}/bin/systemctl stop narjar.service";
+        ExecStart = "${executable} ${gcArgs}";
+        ExecStopPost = "${pkgs.systemd}/bin/systemctl start narjar.service";
+        TimeoutStartSec = "infinity";
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ReadWritePaths = [cfg.dataDir];
+        UMask = "0077";
+      };
+    };
+
+    systemd.timers.narjar-gc = lib.mkIf cfg.gc.enable {
+      wantedBy = ["timers.target"];
+      timerConfig = {
+        OnCalendar = cfg.gc.schedule;
+        Persistent = true;
+        Unit = "narjar-gc.service";
       };
     };
   };
