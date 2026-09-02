@@ -298,9 +298,7 @@ fn parse_references(value: &str) -> Result<BTreeSet<String>, NarInfoError> {
             return Err(NarInfoError);
         }
         parse_store_basename(reference)?;
-        if !references.insert(format!("/nix/store/{reference}")) {
-            return Err(NarInfoError);
-        }
+        references.insert(format!("/nix/store/{reference}"));
     }
     Ok(references)
 }
@@ -426,5 +424,12 @@ mod tests {
 
         assert!(bytes.len() as u64 > MAX_NARINFO_BYTES);
         assert!(ParsedNarInfo::parse(&route, bytes).is_err());
+    }
+
+    #[test]
+    fn parser_deduplicates_references() {
+        let references = parse_references(&format!("{STORE_HASH}-package {STORE_HASH}-package"))
+            .expect("duplicate references should be accepted");
+        assert_eq!(references.len(), 1);
     }
 }
