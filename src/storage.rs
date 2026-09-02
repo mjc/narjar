@@ -650,7 +650,7 @@ impl std::error::Error for StorageError {
 }
 
 fn available_bytes(path: &Path) -> io::Result<u64> {
-    let directory = File::open(path)?;
+    let directory = open_directory(path)?;
     let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
 
     // SAFETY: directory owns a valid descriptor for the duration of the call,
@@ -683,6 +683,20 @@ fn open_optional(path: &Path) -> Result<Option<File>, StorageError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn open_directory(path: &Path) -> io::Result<File> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    Ok(directory)
 }
 
 pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
@@ -726,7 +740,7 @@ fn lock_exclusive(file: &File) -> Result<(), StorageError> {
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    open_directory(path)?.sync_all()
 }
 
 fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
@@ -772,7 +786,7 @@ mod tests {
 
     use super::{
         Layout, NarObjectId, PublishBoundary, PublishOutcome, PublishTarget, ReconcileClass,
-        Storage, StorageError, StoreHash,
+        Storage, StorageError, StoreHash, sync_dir,
     };
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -886,6 +900,17 @@ mod tests {
 
         drop(file);
         fs::remove_file(path).expect("remove temporary publication file");
+    }
+
+    #[test]
+    fn directory_sync_rejects_a_symlinked_directory() {
+        let directory = TestDir::new();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        fs::create_dir(&target).expect("create sync target");
+        symlink(&target, &link).expect("create sync directory symlink");
+
+        assert!(sync_dir(&link).is_err());
     }
 
     #[test]
