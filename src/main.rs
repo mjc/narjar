@@ -126,4 +126,25 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn gc_command_accepts_policy() {
+        let cli = Cli::try_parse_from([
+            "narjar",
+            "gc",
+            "--data-dir",
+            "/cache",
+            "--max-bytes",
+            "1000",
+            "--target-bytes",
+            "500",
+            "--min-age-seconds",
+            "60",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("gc policy should parse");
+
+        assert!(matches!(cli.command, super::Command::Gc(_)));
+    }
 }
