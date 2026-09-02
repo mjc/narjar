@@ -39,6 +39,9 @@ let
     if [ ! -e ${lib.escapeShellArg "${cfg.dataDir}/nix-cache-info"} ]; then
       ${executable} init --data-dir ${lib.escapeShellArg cfg.dataDir}
     fi
+    ${lib.optionalString (cfg.auth.readTokens == null) ''
+      ${pkgs.coreutils}/bin/rm -f ${lib.escapeShellArg "${cfg.dataDir}/auth/read.tokens"}
+    ''}
     ${installCredentials}
   '';
   privilegedPreStartScript = ''

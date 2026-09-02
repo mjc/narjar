@@ -47,8 +47,12 @@
     machine.succeed("test \"$(systemctl show narjar.service -p DynamicUser --value)\" = yes")
     machine.succeed("test \"$(systemctl show narjar.service -p NoNewPrivileges --value)\" = yes")
     machine.succeed("test \"$(systemctl show narjar.service -p ProtectSystem --value)\" = strict")
+    machine.succeed("install -m 0600 /dev/null /var/lib/narjar/auth/read.tokens")
     machine.succeed("systemctl restart narjar.service")
     machine.wait_for_open_port(5000)
+    machine.succeed("test ! -e /var/lib/narjar/auth/read.tokens")
+    machine.succeed("curl --fail http://127.0.0.1:5000/nix-cache-info")
+    machine.succeed("curl --fail http://127.0.0.1/readyz")
     machine.succeed("curl --fail http://127.0.0.1/healthz")
   '';
 }
