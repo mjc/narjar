@@ -153,7 +153,7 @@ The service runs as a dedicated unprivileged user.
 | Path | Mode | Notes |
 | --- | ---: | --- |
 | DATA | 0700 | service user owns it |
-| DATA/nar and DATA/.tmp | 0700 | no direct web-server access |
+| DATA/nar, DATA/nar/.tmp, DATA/realisations, DATA/realisations/.tmp, and DATA/.tmp | 0700 | no direct web-server access |
 | NAR/narinfo/cache-info | 0600 | served only through process |
 | auth token files | 0600 | hashes, still security-sensitive |
 | generated signing secret | 0600 | create outside DATA and provision as a runtime credential |
@@ -464,8 +464,8 @@ orchestrator concerns; Narjar does not inspect a Docker-specific environment.
 
 ## Backup and restore
 
-Because published files are immutable, a live backup can exclude `.tmp` and
-then verify the copy. Stop the service or snapshot the filesystem after
+Because published files are immutable, a live backup can exclude every `.tmp`
+directory and then verify the copy. Stop the service or snapshot the filesystem after
 flushing when a strict point-in-time boundary is required:
 
 ~~~sh

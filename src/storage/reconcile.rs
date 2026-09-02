@@ -83,6 +83,9 @@ pub(super) fn scan(
 
     let nar_directory = storage.nar_directory()?;
     for name in read_dir_names(&nar_directory)? {
+        if name == OsStr::new(".tmp") {
+            continue;
+        }
         let relative = PathBuf::from("nar").join(&name);
         let class = if !entry_is_regular_at(&nar_directory, &name)? {
             ReconcileClass::UnexpectedType
@@ -94,28 +97,18 @@ pub(super) fn scan(
         found.record(relative, class, entry_identity_at(&nar_directory, &name)?);
     }
 
-    let temp_directory = storage.temp_directory()?;
-    for name in read_dir_names(&temp_directory)? {
-        let relative = PathBuf::from(".tmp").join(&name);
-        let identity = entry_identity_at(&temp_directory, &name)?;
-        let class = if !entry_is_regular_at(&temp_directory, &name)? {
-            ReconcileClass::UnexpectedType
-        } else if !valid_temp_filename(&name) {
-            ReconcileClass::InvalidFilename
-        } else if open_regular_at(&temp_directory, &name)?
-            .metadata()?
-            .modified()?
-            <= stale_before
-        {
-            ReconcileClass::TempStale
-        } else {
-            ReconcileClass::TempYoung
-        };
-        found.record(relative, class, identity);
-    }
+    scan_temps(
+        &mut found,
+        &storage.temp_directory()?,
+        Path::new(".tmp"),
+        stale_before,
+    )?;
 
     let realisations_directory = storage.realisations_directory()?;
     for name in read_dir_names(&realisations_directory)? {
+        if name == OsStr::new(".tmp") {
+            continue;
+        }
         let relative = PathBuf::from("realisations").join(&name);
         let class = if !entry_is_regular_at(&realisations_directory, &name)? {
             ReconcileClass::UnexpectedType
@@ -130,21 +123,56 @@ pub(super) fn scan(
             entry_identity_at(&realisations_directory, &name)?,
         );
     }
+    scan_temps(
+        &mut found,
+        &storage.realisations_temp_directory()?,
+        Path::new("realisations/.tmp"),
+        stale_before,
+    )?;
 
     Ok(found.finish())
+}
+
+fn scan_temps(
+    found: &mut BoundedEntries,
+    directory: &fs::File,
+    prefix: &Path,
+    stale_before: SystemTime,
+) -> Result<(), StorageError> {
+    for name in read_dir_names(directory)? {
+        let relative = prefix.join(&name);
+        let identity = entry_identity_at(directory, &name)?;
+        let class = if !entry_is_regular_at(directory, &name)? {
+            ReconcileClass::UnexpectedType
+        } else if !valid_temp_filename(&name) {
+            ReconcileClass::InvalidFilename
+        } else if open_regular_at(directory, &name)?.metadata()?.modified()? <= stale_before {
+            ReconcileClass::TempStale
+        } else {
+            ReconcileClass::TempYoung
+        };
+        found.record(relative, class, identity);
+    }
+    Ok(())
 }
 
 pub(super) fn cleanup_stale_temp(
     storage: &Storage,
     entry: &ReconcileEntry,
 ) -> Result<bool, StorageError> {
-    if entry.class != ReconcileClass::TempStale
-        || entry.relative_path.parent() != Some(Path::new(".tmp"))
-    {
+    if entry.class != ReconcileClass::TempStale {
         return Ok(false);
     }
 
-    let directory = storage.temp_directory()?;
+    let (directory, parent) = match entry.relative_path.parent() {
+        Some(path) if path == Path::new(".tmp") => (storage.temp_directory()?, path),
+        Some(path) if path == Path::new("nar/.tmp") => (storage.nar_temp_directory()?, path),
+        Some(path) if path == Path::new("realisations/.tmp") => {
+            (storage.realisations_temp_directory()?, path)
+        }
+        _ => return Ok(false),
+    };
+    debug_assert_eq!(entry.relative_path.parent(), Some(parent));
     let name = entry
         .relative_path
         .file_name()

@@ -10,7 +10,7 @@ use std::{
         unix::ffi::OsStrExt,
         unix::fs::{OpenOptionsExt, PermissionsExt},
     },
-    path::{Path, PathBuf},
+    path::Path,
     process,
     sync::{
         Mutex, OnceLock,
@@ -18,6 +18,9 @@ use std::{
     },
     time::SystemTime,
 };
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 use data_encoding::{BitOrder, Encoding, Specification};
 use sha2::{Digest, Sha256};
@@ -148,11 +151,13 @@ impl<R: Read> Read for CheckedNarReader<'_, R> {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 struct Layout {
     root: PathBuf,
 }
 
+#[cfg(test)]
 impl Layout {
     fn new(root: PathBuf) -> Self {
         Self { root }
@@ -169,10 +174,16 @@ impl Layout {
     }
 
     #[cfg(test)]
+    fn nar_temp_dir(&self) -> PathBuf {
+        self.nar_dir().join(".tmp")
+    }
+
+    #[cfg(test)]
     fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
         self.root.join(format!("{}.narinfo", hash.0))
     }
 
+    #[cfg(test)]
     fn temp_dir(&self) -> PathBuf {
         self.root.join(".tmp")
     }
@@ -276,6 +287,7 @@ impl NarUploadPolicy {
 
 #[derive(Debug)]
 pub struct Storage {
+    #[cfg(test)]
     layout: Layout,
     root: File,
     recovery: RecoveryState,
@@ -285,16 +297,29 @@ pub struct Storage {
 
 impl Storage {
     pub fn initialize(root: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let layout = Layout::new(root.as_ref().to_owned());
-        ensure_directory(&layout.root, "data directory")?;
-        let root_directory = open_directory(&layout.root)?;
+        let root_path = root.as_ref().to_owned();
+        #[cfg(test)]
+        let layout = Layout::new(root_path.clone());
+        ensure_directory(&root_path, "data directory")?;
+        let root_directory = open_directory(&root_path)?;
         let root_is_empty = read_dir_names(&root_directory)?.is_empty();
-        ensure_directory_at(&root_directory, OsStr::new("nar"), "nar directory")?;
-        ensure_directory_at(&root_directory, OsStr::new(".tmp"), "temporary directory")?;
+        let nar_directory =
+            ensure_directory_at(&root_directory, OsStr::new("nar"), "nar directory")?;
         ensure_directory_at(
+            &nar_directory,
+            OsStr::new(".tmp"),
+            "NAR temporary directory",
+        )?;
+        ensure_directory_at(&root_directory, OsStr::new(".tmp"), "temporary directory")?;
+        let realisations_directory = ensure_directory_at(
             &root_directory,
             OsStr::new("realisations"),
             "realisations directory",
+        )?;
+        ensure_directory_at(
+            &realisations_directory,
+            OsStr::new(".tmp"),
+            "realisation temporary directory",
         )?;
 
         let lock = ProcessLock::acquire(&root_directory)?;
@@ -302,6 +327,7 @@ impl Storage {
 
         let recovery = RecoveryState::new(&root_directory)?;
         let storage = Self {
+            #[cfg(test)]
             layout,
             root: root_directory,
             recovery,
@@ -591,8 +617,10 @@ impl Storage {
     }
 
     fn create_temp(&self, target: &PublishTarget<'_>) -> Result<TemporaryFile, StorageError> {
-        ensure_directory(&self.layout.temp_dir(), "temporary directory")?;
-        let directory = self.temp_directory()?;
+        let directory = match target {
+            PublishTarget::Nar(_) => self.nar_temp_directory()?,
+            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.temp_directory()?,
+        };
         let prefix = target.temp_prefix();
         for _ in 0..TEMP_ATTEMPTS {
             let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -637,9 +665,19 @@ impl Storage {
         Ok(open_directory_at(&root, OsStr::new(".tmp"))?)
     }
 
+    fn nar_temp_directory(&self) -> Result<File, StorageError> {
+        let nar = self.nar_directory()?;
+        Ok(open_directory_at(&nar, OsStr::new(".tmp"))?)
+    }
+
     fn realisations_directory(&self) -> Result<File, StorageError> {
         let root = self.root_directory()?;
         Ok(open_directory_at(&root, OsStr::new("realisations"))?)
+    }
+
+    fn realisations_temp_directory(&self) -> Result<File, StorageError> {
+        let realisations = self.realisations_directory()?;
+        Ok(open_directory_at(&realisations, OsStr::new(".tmp"))?)
     }
 
     fn destination_directory(&self, target: &PublishTarget<'_>) -> Result<File, StorageError> {
@@ -1146,8 +1184,10 @@ mod tests {
         let storage = Storage::initialize(directory.path()).expect("initialize storage");
 
         assert!(directory.path().join("nar").is_dir());
+        assert!(directory.path().join("nar/.tmp").is_dir());
         assert!(directory.path().join(".tmp").is_dir());
         assert!(directory.path().join("realisations").is_dir());
+        assert!(directory.path().join("realisations/.tmp").is_dir());
         assert_eq!(storage.layout(), &Layout::new(directory.path().to_owned()));
     }
 
@@ -1218,6 +1258,30 @@ mod tests {
     }
 
     #[test]
+    fn nar_publication_uses_a_destination_local_temporary_directory() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+
+        let temporary = storage
+            .create_temp(&PublishTarget::Nar(&nar))
+            .expect("create NAR temporary publication file");
+        assert_eq!(
+            fs::read_dir(storage.layout().temp_dir())
+                .expect("read metadata temporary directory")
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(storage.layout().nar_temp_dir())
+                .expect("read NAR temporary directory")
+                .count(),
+            1
+        );
+        remove_temp(&temporary).expect("remove NAR temporary publication file");
+    }
+
+    #[test]
     fn directory_sync_rejects_a_symlinked_directory() {
         let directory = TestDir::new();
         let target = directory.path().join("target");
@@ -1232,8 +1296,8 @@ mod tests {
     fn publication_rejects_a_symlinked_temporary_directory() {
         let directory = TestDir::new();
         let storage = Storage::initialize(directory.path()).expect("initialize storage");
-        let temporary = storage.layout.temp_dir();
-        let real_temporary = directory.path().join("tmp-real");
+        let temporary = storage.layout.nar_temp_dir();
+        let real_temporary = directory.path().join("nar-tmp-real");
         let target = directory.path().join("external");
         fs::rename(&temporary, &real_temporary).expect("move real temporary directory");
         fs::create_dir(&target).expect("create external directory");

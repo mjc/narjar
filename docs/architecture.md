@@ -101,14 +101,16 @@ Exact v0.1 layout:
 DATA/
   nix-cache-info
   nar/
+    .tmp/
+      nar-<random>.part
     <52-char-nix32-sha256>.nar
   <32-char-store-hash>.narinfo
   realisations/
+    .tmp/
+      realisation-<random>.part
     <validated-drv-output-id>.doi       optional protocol compatibility
   .tmp/
-    nar-<random>.part
     narinfo-<random>.part
-    realisation-<random>.part
   auth/
     read.tokens                         mode 0600, hashed records
     write.tokens                        mode 0600, hashed records
@@ -137,7 +139,7 @@ races.
 PUT /nar/<file-hash>.nar
   -> authorize writer
   -> validate route and Content-Length <= configured maximum
-  -> create DATA/.tmp/nar-<random>.part with create-new
+  -> create DATA/nar/.tmp/nar-<random>.part with create-new
   -> stream body once:
        count bytes
        SHA-256 raw NAR bytes
@@ -158,7 +160,7 @@ PUT /<store-hash>.narinfo
   -> validate FileHash/FileSize and NarHash/NarSize
   -> require referenced NAR file metadata and size
   -> verify at least one signature from trusted-public-keys
-  -> write canonical original bytes to same-filesystem temporary
+  -> write canonical original bytes to DATA/.tmp with create-new
   -> sync temporary file
   -> rename-no-replace to DATA/<store-hash>.narinfo
   -> sync DATA
@@ -173,14 +175,16 @@ A second parser would add attack surface without adding authenticity.
 
 Narjar does not recompress. This makes the upload and stored object identical,
 removes decompression bombs and codec dependencies, and preserves O(1) memory.
+NAR staging is under `DATA/nar/.tmp`, so a split NAR destination can publish
+with a same-filesystem rename; metadata remains staged under `DATA/.tmp`.
 The bandwidth tradeoff is explicit and must be measured.
 
 ## Publication and crash semantics
 
 The narinfo rename is the visibility point. A crash can leave:
 
-- A .tmp file: never reader-visible; reconcile may delete it after an age
-  threshold.
+- A file under any `.tmp` directory: never reader-visible; reconcile may delete
+  it after an age threshold.
 - A durable NAR without narinfo: unreachable orphan; safe to retain.
 - A narinfo temporary: never reader-visible.
 - A published narinfo: its referenced NAR was validated and durable first.

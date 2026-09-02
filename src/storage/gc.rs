@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    fs, io,
+    fs::{self, File},
+    io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -102,7 +103,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     let eligible_bytes_total = eligible_bytes(&entries, &orphans, now, options.min_age);
     let shared = shared_count(&entries);
     let shared_bytes_total = shared_bytes(&entries);
-    let (temporary, temporary_bytes) = temporary_inventory(&storage.layout.temp_dir())?;
+    let (temporary, temporary_bytes) = temporary_inventory(&storage)?;
     let selected = select(
         &entries,
         before_bytes,
@@ -303,13 +304,28 @@ fn shared_count(entries: &[Entry]) -> usize {
         .count()
 }
 
-fn temporary_inventory(path: &Path) -> Result<(usize, u64), StorageError> {
-    let directory = super::open_directory(path)?;
+fn temporary_inventory(storage: &Storage) -> Result<(usize, u64), StorageError> {
+    let directories = [
+        storage.temp_directory()?,
+        storage.nar_temp_directory()?,
+        storage.realisations_temp_directory()?,
+    ];
     let mut count = 0;
     let mut bytes = 0;
-    for name in read_dir_names(&directory)? {
-        if super::entry_is_regular_at(&directory, &name)? {
-            let metadata = super::open_regular_at(&directory, &name)?.metadata()?;
+    for directory in directories {
+        let (directory_count, directory_bytes) = temporary_inventory_directory(&directory)?;
+        count += directory_count;
+        bytes += directory_bytes;
+    }
+    Ok((count, bytes))
+}
+
+fn temporary_inventory_directory(directory: &File) -> Result<(usize, u64), StorageError> {
+    let mut count = 0;
+    let mut bytes = 0;
+    for name in read_dir_names(directory)? {
+        if super::entry_is_regular_at(directory, &name)? {
+            let metadata = super::open_regular_at(directory, &name)?.metadata()?;
             bytes += metadata.len();
             count += 1;
         }
@@ -633,6 +649,7 @@ fn invalid(message: impl Into<String>) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::open_directory;
     use std::{
         fs,
         os::unix::fs::symlink,
@@ -735,7 +752,10 @@ mod tests {
         symlink(&target, temporary.join("escaped")).expect("temporary symlink should be created");
 
         assert_eq!(
-            temporary_inventory(&temporary).expect("scan temporary directory"),
+            temporary_inventory_directory(
+                &open_directory(&temporary).expect("open temporary directory"),
+            )
+            .expect("scan temporary directory"),
             (0, 0)
         );
     }
@@ -749,7 +769,7 @@ mod tests {
         fs::write(target.join("escaped"), vec![0; 17]).expect("external file should be written");
         symlink(&target, &temporary).expect("temporary directory symlink should be created");
 
-        assert!(temporary_inventory(&temporary).is_err());
+        assert!(open_directory(&temporary).is_err());
     }
 
     #[test]
