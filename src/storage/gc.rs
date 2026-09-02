@@ -201,6 +201,13 @@ fn total_bytes(entries: &[Entry]) -> u64 {
     total += nars.values().copied().sum::<u64>();
     total
 }
+fn reference_counts(entries: &[Entry]) -> BTreeMap<String, u64> {
+    let mut references = BTreeMap::new();
+    for entry in entries {
+        *references.entry(entry.nar.0.clone()).or_insert(0_u64) += 1;
+    }
+    references
+}
 
 fn select(
     entries: &[Entry],
@@ -211,10 +218,7 @@ fn select(
     min_age: Duration,
     now: SystemTime,
 ) -> Vec<usize> {
-    let mut references = BTreeMap::new();
-    for entry in entries {
-        *references.entry(entry.nar.0.clone()).or_insert(0_u64) += 1;
-    }
+    let mut references = reference_counts(entries);
 
     let size_pressure = target_bytes
         .is_some_and(|target| max_bytes.map_or(current_bytes > target, |max| current_bytes > max));
@@ -252,18 +256,10 @@ fn select(
 }
 
 fn projected_bytes(entries: &[Entry], selected: &[usize]) -> u64 {
-    let mut selected = selected.to_vec();
-    selected.sort_unstable();
-    let selected = selected
-        .into_iter()
-        .map(|index| &entries[index])
-        .collect::<Vec<_>>();
     let mut total = total_bytes(entries);
-    let mut references = BTreeMap::new();
-    for entry in entries {
-        *references.entry(entry.nar.0.clone()).or_insert(0_u64) += 1;
-    }
-    for entry in selected {
+    let mut references = reference_counts(entries);
+    for &index in selected {
+        let entry = &entries[index];
         total = total.saturating_sub(entry.narinfo_bytes);
         if let Some(count) = references.get_mut(&entry.nar.0) {
             *count -= 1;
@@ -280,10 +276,7 @@ fn apply(
     entries: &[Entry],
     selected: &[usize],
 ) -> Result<(usize, usize), StorageError> {
-    let mut references = BTreeMap::new();
-    for entry in entries {
-        *references.entry(entry.nar.0.clone()).or_insert(0_u64) += 1;
-    }
+    let mut references = reference_counts(entries);
     let mut deleted_nars = 0;
     for &index in selected {
         let entry = &entries[index];
