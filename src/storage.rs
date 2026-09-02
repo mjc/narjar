@@ -559,6 +559,7 @@ impl Storage {
     }
 
     fn create_temp(&self, target: &PublishTarget<'_>) -> Result<(PathBuf, File), StorageError> {
+        ensure_directory(&self.layout.temp_dir(), "temporary directory")?;
         let prefix = target.temp_prefix();
         for _ in 0..TEMP_ATTEMPTS {
             let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -928,6 +929,32 @@ mod tests {
         symlink(&target, &link).expect("create sync directory symlink");
 
         assert!(sync_dir(&link).is_err());
+    }
+
+    #[test]
+    fn publication_rejects_a_symlinked_temporary_directory() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let temporary = storage.layout.temp_dir();
+        let real_temporary = directory.path().join("tmp-real");
+        let target = directory.path().join("external");
+        fs::rename(&temporary, &real_temporary).expect("move real temporary directory");
+        fs::create_dir(&target).expect("create external directory");
+        symlink(&target, &temporary).expect("create temporary directory symlink");
+
+        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+        assert!(
+            storage
+                .publish_nar_unchecked(&nar, Cursor::new(b"must not escape"))
+                .is_err()
+        );
+        assert!(!storage.layout.nar_path(&nar).exists());
+        assert!(
+            fs::read_dir(&target)
+                .expect("read external directory")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
