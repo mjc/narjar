@@ -230,7 +230,10 @@ fn scan_orphans(storage: &Storage, entries: &[Entry]) -> Result<Vec<Orphan>, Sto
         .map(|entry| (entry.nar.0.clone(), ()))
         .collect::<BTreeMap<_, _>>();
     let nar_dir = storage.layout.nar_dir();
-    if !nar_dir.is_dir() {
+    if !fs::symlink_metadata(&nar_dir)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
         return Ok(Vec::new());
     }
 
@@ -739,6 +742,29 @@ mod tests {
         assert_eq!(
             temporary_inventory(&temporary).expect("scan temporary directory"),
             (0, 0)
+        );
+    }
+
+    #[test]
+    fn orphan_scan_does_not_follow_a_symlinked_nar_directory() {
+        let directory = tempfile::tempdir().expect("fixture directory should be created");
+        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let nar_dir = storage.layout.nar_dir();
+        let real_nar_dir = directory.path().join("nar-real");
+        let external = directory.path().join("external");
+        fs::rename(&nar_dir, &real_nar_dir).expect("move real NAR directory");
+        fs::create_dir(&external).expect("create external directory");
+        fs::write(
+            external.join("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl.nar"),
+            b"external",
+        )
+        .expect("write external NAR");
+        symlink(&external, &nar_dir).expect("create NAR directory symlink");
+
+        assert!(
+            scan_orphans(&storage, &[])
+                .expect("scan orphans")
+                .is_empty()
         );
     }
 
