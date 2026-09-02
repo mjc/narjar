@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo},
-    storage::{NarObjectId, StoreHash, nix32_sha256},
+    storage::{NarObjectId, StoreHash, nix32_sha256, open_regular},
 };
 
 pub use crate::narinfo::MAX_NARINFO_BYTES;
@@ -142,7 +142,7 @@ impl Inventory {
             let nar = validated.nar();
             referenced.insert(nar.as_str().to_owned());
             let path = root.join("nar").join(format!("{}.nar", nar.as_str()));
-            let Some(mut file) = fs::File::open(path).map(Some).or_else(|error| {
+            let Some(mut file) = open_regular(&path).map(Some).or_else(|error| {
                 if error.kind() == io::ErrorKind::NotFound {
                     Ok(None)
                 } else {

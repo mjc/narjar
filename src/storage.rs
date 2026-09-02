@@ -409,11 +409,11 @@ impl Storage {
     }
 
     pub fn open_nar(&self, nar: &NarObjectId) -> Result<Option<File>, StorageError> {
-        open_optional(self.layout.nar_path(nar))
+        open_optional(&self.layout.nar_path(nar))
     }
 
     pub fn open_narinfo(&self, store: &StoreHash) -> Result<Option<File>, StorageError> {
-        open_optional(self.layout.narinfo_path(store))
+        open_optional(&self.layout.narinfo_path(store))
     }
 
     pub fn open_pair(
@@ -647,15 +647,15 @@ fn available_bytes(path: &Path) -> io::Result<u64> {
     Ok(available.min(u128::from(u64::MAX)) as u64)
 }
 
-fn open_optional(path: PathBuf) -> Result<Option<File>, StorageError> {
-    match open_regular(&path) {
+fn open_optional(path: &Path) -> Result<Option<File>, StorageError> {
+    match open_regular(path) {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-fn open_regular(path: &Path) -> io::Result<File> {
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)

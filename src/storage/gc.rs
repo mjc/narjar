@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo},
-    storage::{NarObjectId, Storage, StorageError, StoreHash, sync_dir},
+    storage::{NarObjectId, Storage, StorageError, StoreHash, open_regular, sync_dir},
 };
 
 pub struct GcOptions {
@@ -183,7 +183,7 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
         if !item.file_type()?.is_file() {
             return Err(invalid(format!("narinfo is not a regular file: {name}")));
         }
-        let metadata = item.metadata()?;
+        let metadata = open_regular(&item.path())?.metadata()?;
 
         let bytes = read_narinfo(&item.path())?;
         let validated = trusted
@@ -195,14 +195,16 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
                 }
             })?;
         let nar_path = storage.layout.nar_path(validated.nar());
-        let nar_metadata = fs::metadata(&nar_path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                invalid(format!("missing NAR for narinfo: {name}"))
-            } else {
-                error.into()
-            }
-        })?;
-        if !nar_metadata.is_file() || nar_metadata.len() != validated.nar_size() {
+        let nar_metadata = open_regular(&nar_path)
+            .and_then(|file| file.metadata())
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    invalid(format!("missing NAR for narinfo: {name}"))
+                } else {
+                    error.into()
+                }
+            })?;
+        if nar_metadata.len() != validated.nar_size() {
             return Err(invalid(format!("NAR size mismatch for narinfo: {name}")));
         }
 

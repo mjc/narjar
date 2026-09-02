@@ -10,14 +10,14 @@ use std::{
 use data_encoding::BASE64;
 use ed25519_dalek::{Signature, VerifyingKey};
 
-use crate::storage::{NarObjectId, StoreHash};
+use crate::storage::{NarObjectId, StoreHash, open_regular};
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 pub(crate) fn read_narinfo(path: &Path) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    File::open(path)?
+    open_regular(path)?
         .take(MAX_NARINFO_BYTES + 1)
         .read_to_end(&mut bytes)?;
     Ok(bytes)
