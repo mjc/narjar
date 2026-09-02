@@ -1,9 +1,9 @@
 use std::{
     collections::HashSet,
     fmt,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
@@ -22,7 +22,11 @@ struct Record {
 
 impl TokenFile {
     pub fn load(path: &Path) -> Result<Option<Self>, Error> {
-        let mut file = match File::open(path) {
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -149,7 +153,11 @@ impl std::error::Error for Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, process};
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+        process,
+    };
 
     use super::TokenFile;
 
@@ -176,5 +184,21 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn load_rejects_a_symlinked_token_file() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let target = directory.path().join("target");
+        let path = directory.path().join("tokens");
+        fs::write(
+            &target,
+            b"token 0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .expect("write token target");
+        symlink(&target, &path).expect("create token symlink");
+
+        assert!(TokenFile::load(&path).is_err());
+        assert!(target.exists());
     }
 }
