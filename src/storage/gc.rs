@@ -109,7 +109,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         options.min_age,
         now,
     );
-    let after_publications = projected_bytes(&entries, &selected);
+    let after_publications = projected_published_bytes(&entries, &selected);
     let selected_orphans = select_orphans(
         &orphans,
         after_publications + orphan_bytes(&orphans),
@@ -119,13 +119,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         options.min_age,
         now,
     );
-    let selected_orphan_bytes = selected_orphans
-        .iter()
-        .map(|&index| orphans[index].bytes)
-        .sum::<u64>();
-    let after_bytes = after_publications
-        .saturating_add(orphan_bytes(&orphans))
-        .saturating_sub(selected_orphan_bytes);
+    let after_bytes = logical_after_bytes(&entries, &selected, &orphans, &selected_orphans);
     let evicted_bytes = before_bytes.saturating_sub(after_bytes);
     let dry_run = !options.apply;
     let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
@@ -501,7 +495,22 @@ fn select_orphans(
     selected
 }
 
-fn projected_bytes(entries: &[Entry], selected: &[usize]) -> u64 {
+fn logical_after_bytes(
+    entries: &[Entry],
+    selected_entries: &[usize],
+    orphans: &[Orphan],
+    selected_orphans: &[usize],
+) -> u64 {
+    let selected_orphan_bytes = selected_orphans
+        .iter()
+        .map(|&index| orphans[index].bytes)
+        .sum::<u64>();
+    projected_published_bytes(entries, selected_entries)
+        .saturating_add(orphan_bytes(orphans))
+        .saturating_sub(selected_orphan_bytes)
+}
+
+fn projected_published_bytes(entries: &[Entry], selected: &[usize]) -> u64 {
     let mut total = total_bytes(entries);
     let mut references = reference_counts(entries);
     for &index in selected {
