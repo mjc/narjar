@@ -1846,6 +1846,35 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_does_not_remove_a_replaced_stale_temp() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let path = directory.path().join(".tmp/nar-replaced.part");
+        fs::write(&path, b"original").expect("write stale temp");
+
+        let report = storage
+            .reconcile(
+                NonZeroUsize::new(16).expect("nonzero limit"),
+                SystemTime::now() + Duration::from_secs(1),
+            )
+            .expect("classify stale temp");
+        let stale = report
+            .entries()
+            .iter()
+            .find(|entry| entry.relative_path() == Path::new(".tmp/nar-replaced.part"))
+            .expect("stale temp entry");
+        fs::remove_file(&path).expect("remove reported temp");
+        fs::write(&path, b"replacement").expect("write replacement temp");
+
+        assert!(
+            !storage
+                .cleanup_stale_temp(stale)
+                .expect("replacement should not be removed")
+        );
+        assert_eq!(fs::read(&path).expect("read replacement"), b"replacement");
+    }
+
+    #[test]
     fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
         let directory = TestDir::new();
         let storage = Storage::initialize(directory.path()).expect("initialize storage");
