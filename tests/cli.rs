@@ -36,20 +36,29 @@ fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
 }
 
 fn signed_narinfo_for(store_hash: &str, nar_hash: &str, nar_size: u64) -> String {
+    signed_narinfo_for_with_references(store_hash, nar_hash, nar_size, &[])
+}
+
+fn signed_narinfo_for_with_references(
+    store_hash: &str,
+    nar_hash: &str,
+    nar_size: u64,
+    reference_hashes: &[&str],
+) -> String {
     let store_path = format!("/nix/store/{store_hash}-narjar");
-    let fingerprint = format!("1;{store_path};sha256:{nar_hash};{nar_size};");
+    let references = reference_hashes
+        .iter()
+        .map(|hash| format!("/nix/store/{hash}-narjar"))
+        .collect::<Vec<_>>();
+    let fingerprint = format!(
+        "1;{store_path};sha256:{nar_hash};{nar_size};{}",
+        references.join(",")
+    );
     let signature = SigningKey::from_bytes(&[7; 32]).sign(fingerprint.as_bytes());
 
     format!(
-        "StorePath: {store_path}\n\
-         URL: nar/{nar_hash}.nar\n\
-         Compression: none\n\
-         FileHash: sha256:{nar_hash}\n\
-         FileSize: {nar_size}\n\
-         NarHash: sha256:{nar_hash}\n\
-         NarSize: {nar_size}\n\
-         References: \n\
-         Sig: narjar-test:{}\n",
+        "StorePath: {store_path}\nURL: nar/{nar_hash}.nar\nCompression: none\nFileHash: sha256:{nar_hash}\nFileSize: {nar_size}\nNarHash: sha256:{nar_hash}\nNarSize: {nar_size}\nReferences: {}\nSig: narjar-test:{}\n",
+        references.join(" "),
         BASE64.encode(&signature.to_bytes())
     )
 }
@@ -2072,4 +2081,113 @@ fn gc_dry_run_preserves_and_apply_removes_old_pair() {
     assert!(!data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
     assert!(!data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
     assert!(String::from_utf8_lossy(&apply.stdout).contains("\"deleted_narinfos\":1"));
+}
+
+#[test]
+fn gc_deletes_a_shared_nar_only_after_the_last_narinfo() {
+    let data_dir = init_data_dir("operator-gc-shared");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    let second_store = "11111111111111111111111111111111";
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("NAR should be written");
+    fs::write(
+        data_dir.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo_for(STORE_HASH, NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("first narinfo should be written");
+    fs::write(
+        data_dir.join(format!("{second_store}.narinfo")),
+        signed_narinfo_for(second_store, NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("second narinfo should be written");
+
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let output = run(&[
+        "gc",
+        "--data-dir",
+        path,
+        "--target-bytes",
+        "0",
+        "--min-age-seconds",
+        "0",
+        "--apply",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "gc apply failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+    assert!(!data_dir.join(format!("{second_store}.narinfo")).exists());
+    assert!(!data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"deleted_narinfos\":2"));
+    assert!(stdout.contains("\"deleted_nars\":1"));
+}
+
+#[test]
+fn gc_protected_roots_are_not_candidates() {
+    let data_dir = init_data_dir("operator-gc-protected");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("NAR should be written");
+    fs::write(
+        data_dir.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("narinfo should be written");
+    let roots = data_dir.join("protected-roots");
+    fs::write(&roots, format!("/nix/store/{STORE_HASH}-narjar\n"))
+        .expect("protected roots should be written");
+
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let roots_path = roots
+        .to_str()
+        .expect("protected roots path should be UTF-8");
+    let output = run(&[
+        "gc",
+        "--data-dir",
+        path,
+        "--target-bytes",
+        "0",
+        "--protected-roots",
+        roots_path,
+        "--apply",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "gc apply failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+    assert!(data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"candidates\":0"));
+}
+
+#[test]
+fn gc_refuses_to_apply_while_the_cache_is_serving() {
+    let server = RunningServer::start("operator-gc-lock");
+    let path = server
+        .data_dir
+        .to_str()
+        .expect("temporary path should be UTF-8");
+    let output = run(&["gc", "--data-dir", path, "--target-bytes", "0", "--apply"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("locked"));
 }
