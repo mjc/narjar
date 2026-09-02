@@ -330,6 +330,8 @@ Required series:
 - narjar_uploads_in_flight and requests_in_flight
 - narjar_temp_objects observed at startup/reconcile
 - narjar_disk_full_total
+- narjar_capacity_failures_total with fixed `no_space`, `quota`, `inodes`, and
+  `read_only` reasons
 - narjar_publications_total
 - narjar_publication_duration_seconds count/sum/max approximation
 - narjar_ready 0/1
