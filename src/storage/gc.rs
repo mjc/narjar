@@ -626,6 +626,34 @@ mod tests {
         );
     }
 
+    const TEST_STORE_HASH: &str = "00000000000000000000000000000000";
+    const TEST_NAR_ID: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+
+    fn pair_fixture() -> (tempfile::TempDir, Storage, Entry) {
+        let directory = tempfile::tempdir().expect("fixture directory should be created");
+        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let store = StoreHash::parse(TEST_STORE_HASH).expect("store hash should parse");
+        let nar = NarObjectId::parse(TEST_NAR_ID).expect("NAR id should parse");
+        let narinfo_path = directory.path().join(format!("{TEST_STORE_HASH}.narinfo"));
+        let nar_path = storage.layout.nar_path(&nar);
+        fs::write(&narinfo_path, b"published").expect("narinfo should be written");
+        fs::write(&nar_path, b"nar").expect("NAR should be written");
+
+        let entry = Entry {
+            store,
+            nar,
+            store_path: format!("/nix/store/{TEST_STORE_HASH}-narjar"),
+            references: Vec::new(),
+            narinfo_path,
+            nar_path,
+            narinfo_bytes: 9,
+            nar_bytes: 3,
+            modified: SystemTime::now(),
+            protected: false,
+        };
+        (directory, storage, entry)
+    }
+
     #[test]
     fn deletion_boundaries_preserve_published_pair_invariant() {
         let points = [
@@ -636,50 +664,11 @@ mod tests {
         ];
 
         for point in points {
-            let directory = tempfile::tempdir().expect("fixture directory should be created");
-            let storage = Storage::initialize(directory.path()).expect("storage should initialize");
-            let narinfo_path = directory
-                .path()
-                .join("00000000000000000000000000000000.narinfo");
-            let nar_path = storage.layout.nar_path(
-                &NarObjectId::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl")
-                    .expect("NAR id should parse"),
-            );
-            fs::write(&narinfo_path, b"published").expect("narinfo should be written");
-            fs::write(&nar_path, b"nar").expect("NAR should be written");
+            let (_directory, storage, entry) = pair_fixture();
+            let entries = [entry];
 
-            let entry = Entry {
-                store: StoreHash::parse("00000000000000000000000000000000")
-                    .expect("store hash should parse"),
-                nar: NarObjectId::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl")
-                    .expect("NAR id should parse"),
-                store_path: "/nix/store/00000000000000000000000000000000-narjar".to_owned(),
-                references: Vec::new(),
-                narinfo_path,
-                nar_path,
-                narinfo_bytes: 9,
-                nar_bytes: 3,
-                modified: SystemTime::now(),
-                protected: false,
-            };
-
-            assert!(apply_with_failure(&storage, &[entry], &[0], Some(point)).is_err());
-            assert!(
-                !storage
-                    .layout
-                    .root
-                    .join("00000000000000000000000000000000.narinfo")
-                    .exists()
-                    || storage
-                        .layout
-                        .nar_path(
-                            &NarObjectId::parse(
-                                "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl",
-                            )
-                            .expect("NAR id should parse")
-                        )
-                        .exists()
-            );
+            assert!(apply_with_failure(&storage, &entries, &[0], Some(point)).is_err());
+            assert!(!entries[0].narinfo_path.exists() || entries[0].nar_path.exists());
         }
     }
 
