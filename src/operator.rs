@@ -234,6 +234,33 @@ fn report(root: PathBuf, mode: ReportMode, verify_hashes: bool, json: bool) -> R
 }
 
 #[derive(Args)]
+pub(crate) struct Gc {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    max_bytes: Option<u64>,
+    #[arg(long)]
+    target_bytes: Option<u64>,
+    #[arg(long)]
+    max_age_seconds: Option<u64>,
+    #[arg(long, default_value_t = 0)]
+    min_age_seconds: u64,
+    #[arg(long)]
+    protected_roots: Option<PathBuf>,
+    #[arg(long, conflicts_with = "apply")]
+    dry_run: bool,
+    #[arg(long, conflicts_with = "dry_run")]
+    apply: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+pub(crate) fn gc(options: Gc) -> Result<(), Error> {
+    let _ = options;
+    Err(Error::runtime("garbage collection not implemented"))
+}
+
+#[derive(Args)]
 pub(crate) struct Delete {
     #[arg(long)]
     data_dir: PathBuf,

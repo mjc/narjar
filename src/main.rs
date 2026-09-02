@@ -24,6 +24,7 @@ enum Command {
     Key(operator::Key),
     Reconcile(operator::Reconcile),
     Verify(operator::Verify),
+    Gc(operator::Gc),
     ListOrphans(operator::ListOrphans),
     Delete(operator::Delete),
     Stats(operator::Stats),
@@ -56,6 +57,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Verify(args) => operator::verify(args),
         Command::ListOrphans(args) => operator::list_orphans(args),
         Command::Delete(args) => operator::delete(args),
+        Command::Gc(args) => operator::gc(args),
         Command::Stats(args) => operator::stats(args),
         Command::Token(args) => token::run(args),
     }
