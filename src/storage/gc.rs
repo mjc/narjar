@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -26,9 +26,24 @@ pub struct GcReport {
     pub after_bytes: u64,
     pub target_met: bool,
     pub candidates: usize,
+    pub protected: usize,
+    pub eligible: usize,
+    pub evicted: usize,
+    pub shared: usize,
+    pub orphaned: usize,
+    pub temporary: usize,
+    pub malformed: usize,
+    pub missing_roots: usize,
+    pub missing_references: usize,
     pub deleted_narinfos: usize,
     pub deleted_nars: usize,
     pub deleted_orphans: usize,
+}
+
+struct ProtectionReport {
+    protected: usize,
+    missing_roots: usize,
+    missing_references: usize,
 }
 
 struct Entry {
@@ -66,11 +81,14 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     let trusted = TrustedPublicKeys::load(&options.data_dir.join("trusted-public-keys"))
         .map_err(|error| invalid(error.to_string()))?;
     let mut entries = scan(&storage, &trusted)?;
-    protect(&mut entries, options.protected_roots.as_deref())?;
+    let protection = protect(&mut entries, options.protected_roots.as_deref())?;
     let orphans = scan_orphans(&storage, &entries)?;
 
     let before_bytes = total_bytes(&entries) + orphan_bytes(&orphans);
     let now = SystemTime::now();
+    let eligible = eligible_count(&entries, &orphans, now, options.min_age);
+    let shared = shared_count(&entries);
+    let temporary = count_entries(&storage.layout.temp_dir())?;
     let selected = select(
         &entries,
         before_bytes,
@@ -111,6 +129,15 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         after_bytes,
         target_met: target_bytes.is_none_or(|target| after_bytes <= target),
         candidates: selected.len() + selected_orphans.len(),
+        protected: protection.protected,
+        eligible,
+        evicted: selected.len() + selected_orphans.len(),
+        shared,
+        orphaned: orphans.len(),
+        temporary,
+        malformed: 0,
+        missing_roots: protection.missing_roots,
+        missing_references: protection.missing_references,
         deleted_narinfos,
         deleted_nars,
         deleted_orphans,
@@ -211,27 +238,75 @@ fn orphan_bytes(orphans: &[Orphan]) -> u64 {
     orphans.iter().map(|orphan| orphan.bytes).sum()
 }
 
-fn protect(entries: &mut [Entry], path: Option<&Path>) -> Result<(), StorageError> {
+fn eligible_count(
+    entries: &[Entry],
+    orphans: &[Orphan],
+    now: SystemTime,
+    min_age: Duration,
+) -> usize {
+    entries
+        .iter()
+        .filter(|entry| {
+            !entry.protected && now.duration_since(entry.modified).unwrap_or_default() >= min_age
+        })
+        .count()
+        + orphans
+            .iter()
+            .filter(|orphan| now.duration_since(orphan.modified).unwrap_or_default() >= min_age)
+            .count()
+}
+
+fn shared_count(entries: &[Entry]) -> usize {
+    reference_counts(entries)
+        .values()
+        .filter(|&&count| count > 1)
+        .count()
+}
+
+fn count_entries(path: &Path) -> Result<usize, StorageError> {
+    if !path.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for item in fs::read_dir(path)? {
+        item?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn protect(entries: &mut [Entry], path: Option<&Path>) -> Result<ProtectionReport, StorageError> {
     let Some(path) = path else {
-        return Ok(());
+        return Ok(ProtectionReport {
+            protected: 0,
+            missing_roots: 0,
+            missing_references: 0,
+        });
     };
     let contents = fs::read_to_string(path)?;
-    let mut roots = Vec::new();
+    let mut roots = BTreeSet::new();
     for root in contents
         .lines()
         .map(str::trim)
         .filter(|root| !root.is_empty())
     {
         validate_root(root)?;
-        roots.push(root.to_owned());
+        roots.insert(root.to_owned());
     }
 
-    let mut pending = roots;
+    let mut pending = roots.iter().cloned().collect::<Vec<_>>();
+    let mut missing_roots = BTreeSet::new();
+    let mut missing_references = BTreeSet::new();
     while let Some(root) = pending.pop() {
         let Some(index) = entries
             .iter()
             .position(|entry| entry.store_path == root || entry.store.0 == root)
         else {
+            if roots.contains(&root) {
+                missing_roots.insert(root);
+            } else {
+                missing_references.insert(root);
+            }
             continue;
         };
         if entries[index].protected {
@@ -240,7 +315,12 @@ fn protect(entries: &mut [Entry], path: Option<&Path>) -> Result<(), StorageErro
         entries[index].protected = true;
         pending.extend(entries[index].references.iter().cloned());
     }
-    Ok(())
+
+    Ok(ProtectionReport {
+        protected: entries.iter().filter(|entry| entry.protected).count(),
+        missing_roots: missing_roots.len(),
+        missing_references: missing_references.len(),
+    })
 }
 
 fn validate_root(root: &str) -> Result<(), StorageError> {

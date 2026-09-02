@@ -50,6 +50,10 @@ fn signed_narinfo_for_with_references(
         .iter()
         .map(|hash| format!("/nix/store/{hash}-narjar"))
         .collect::<Vec<_>>();
+    let reference_basenames = reference_hashes
+        .iter()
+        .map(|hash| format!("{hash}-narjar"))
+        .collect::<Vec<_>>();
     let fingerprint = format!(
         "1;{store_path};sha256:{nar_hash};{nar_size};{}",
         references.join(",")
@@ -58,7 +62,7 @@ fn signed_narinfo_for_with_references(
 
     format!(
         "StorePath: {store_path}\nURL: nar/{nar_hash}.nar\nCompression: none\nFileHash: sha256:{nar_hash}\nFileSize: {nar_size}\nNarHash: sha256:{nar_hash}\nNarSize: {nar_size}\nReferences: {}\nSig: narjar-test:{}\n",
-        references.join(" "),
+        reference_basenames.join(" "),
         BASE64.encode(&signature.to_bytes())
     )
 }
@@ -2177,7 +2181,73 @@ fn gc_protected_roots_are_not_candidates() {
     );
     assert!(data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
     assert!(data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("\"candidates\":0"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"candidates\":0"));
+    assert!(stdout.contains("\"protected\":1"));
+    assert!(stdout.contains("\"eligible\":0"));
+    assert!(stdout.contains("\"evicted\":0"));
+    assert!(stdout.contains("\"target_met\":false"));
+}
+
+#[test]
+fn gc_reports_missing_protected_references() {
+    let data_dir = init_data_dir("operator-gc-missing-reference");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    let missing_store = "11111111111111111111111111111111";
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("NAR should be written");
+    fs::write(
+        data_dir.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo_for_with_references(
+            STORE_HASH,
+            NARJAR_HASH,
+            NAR_BYTES.len() as u64,
+            &[missing_store],
+        ),
+    )
+    .expect("narinfo should be written");
+    let roots = data_dir.join("protected-roots");
+    fs::write(
+        &roots,
+        format!(
+            "/nix/store/{STORE_HASH}-narjar\n/nix/store/11111111111111111111111111111111-missing\n"
+        ),
+    )
+    .expect("protected roots should be written");
+
+    let output = run(&[
+        "gc",
+        "--data-dir",
+        data_dir.to_str().expect("temporary path should be UTF-8"),
+        "--target-bytes",
+        "0",
+        "--protected-roots",
+        roots
+            .to_str()
+            .expect("protected roots path should be UTF-8"),
+        "--apply",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "gc apply failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+    assert!(data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"protected\":1"));
+    assert!(stdout.contains("\"missing_roots\":1"));
+    assert!(stdout.contains("\"missing_references\":1"));
+    assert!(stdout.contains("\"target_met\":false"));
 }
 
 #[test]
@@ -2195,6 +2265,8 @@ fn gc_refuses_to_apply_while_the_cache_is_serving() {
 #[test]
 fn gc_reclaims_old_orphan_nars() {
     let data_dir = init_data_dir("operator-gc-orphan");
+    fs::write(data_dir.join(".tmp/incomplete"), b"temp")
+        .expect("temporary entry should be written");
     fs::write(data_dir.join(format!("nar/{NAR_ID}.nar")), b"orphan")
         .expect("orphan NAR should be written");
 
@@ -2216,7 +2288,9 @@ fn gc_reclaims_old_orphan_nars() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!data_dir.join(format!("nar/{NAR_ID}.nar")).exists());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("\"deleted_orphans\":1"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"deleted_orphans\":1"));
+    assert!(stdout.contains("\"temporary\":1"));
 }
 
 #[test]

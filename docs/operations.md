@@ -85,6 +85,13 @@ time. The minimum age applies to published narinfos and orphan NARs. A
 protected-roots file accepts canonical /nix/store paths or store hashes, one per
 line; references reachable from present roots are retained transitively.
 
+The report includes the pre/post byte totals and target status, plus counts for
+protected and age-eligible entries, selected evictions, shared NAR objects,
+orphan NARs, temporary entries, and malformed inputs. It also reports missing
+roots and missing transitive references. Malformed published metadata still
+aborts the pass before deletion, so its report count is zero on a successful
+scan; the error identifies the offending path.
+
 Apply removes narinfo first and syncs the cache directory. A referenced NAR is
 removed only after its final narinfo is gone, then the nar directory is synced.
 Old unreferenced NARs are reclaimed subject to the same minimum-age grace
