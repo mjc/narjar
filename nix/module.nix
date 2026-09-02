@@ -32,7 +32,7 @@ let
   ];
   installCredentials = lib.concatMapStringsSep "\n" (credential: ''
     ${pkgs.coreutils}/bin/install -m ${credential.mode} \
-      "$CREDENTIALS_DIRECTORY/${credential.name}" \
+      "$NARJAR_CREDENTIALS_DIRECTORY/${credential.name}" \
       ${lib.escapeShellArg "${cfg.dataDir}/${credential.target}"}
   '') credentials;
   serveArgs = lib.escapeShellArgs [
@@ -152,6 +152,7 @@ in
       '';
 
       serviceConfig = {
+        Environment = "NARJAR_CREDENTIALS_DIRECTORY=%d";
         DynamicUser = lib.mkIf cfg.dynamicUser true;
         User = lib.mkIf (!cfg.dynamicUser) "narjar";
         Group = lib.mkIf (!cfg.dynamicUser) "narjar";
