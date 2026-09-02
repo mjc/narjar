@@ -289,7 +289,10 @@ fn shared_count(entries: &[Entry]) -> usize {
 }
 
 fn temporary_inventory(path: &Path) -> Result<(usize, u64), StorageError> {
-    if !path.is_dir() {
+    if !fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
         return Ok((0, 0));
     }
     let mut count = 0;
@@ -717,6 +720,21 @@ mod tests {
         fs::create_dir(&temporary).expect("temporary directory should be created");
         fs::write(&target, vec![0; 17]).expect("external target should be written");
         symlink(&target, temporary.join("escaped")).expect("temporary symlink should be created");
+
+        assert_eq!(
+            temporary_inventory(&temporary).expect("scan temporary directory"),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn temporary_inventory_does_not_follow_a_symlinked_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let target = directory.path().join("external");
+        let temporary = directory.path().join(".tmp");
+        fs::create_dir(&target).expect("external directory should be created");
+        fs::write(target.join("escaped"), vec![0; 17]).expect("external file should be written");
+        symlink(&target, &temporary).expect("temporary directory symlink should be created");
 
         assert_eq!(
             temporary_inventory(&temporary).expect("scan temporary directory"),
