@@ -2438,6 +2438,7 @@ fn gc_reports_retained_orphan_bytes_after_partial_cleanup() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"accounting_basis\":\"logical\""));
     assert!(stdout.contains(&format!(
         "\"before_bytes\":{}",
         published_bytes + b"old-orphan".len() as u64 + retained_orphan_bytes

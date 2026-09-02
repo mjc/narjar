@@ -25,6 +25,7 @@ pub struct GcOptions {
 }
 
 pub struct GcReport {
+    pub accounting_basis: &'static str,
     pub dry_run: bool,
     pub before_bytes: u64,
     pub after_bytes: u64,
@@ -144,6 +145,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     };
 
     Ok(GcReport {
+        accounting_basis: "logical",
         dry_run,
         before_bytes,
         after_bytes,

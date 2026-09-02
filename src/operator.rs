@@ -283,7 +283,8 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
 
     if json {
         println!(
-            "{{\"dry_run\":{},\"before_bytes\":{},\"after_bytes\":{},\"target_met\":{},\"candidates\":{},\"protected\":{},\"eligible\":{},\"evicted\":{},\"shared\":{},\"orphaned\":{},\"temporary\":{},\"malformed\":{},\"missing_roots\":{},\"missing_references\":{},\"protected_bytes\":{},\"eligible_bytes\":{},\"evicted_bytes\":{},\"shared_bytes\":{},\"orphaned_bytes\":{},\"temporary_bytes\":{},\"malformed_bytes\":{},\"deleted_narinfos\":{},\"deleted_nars\":{},\"deleted_orphans\":{}}}",
+            "{{\"accounting_basis\":\"{}\",\"dry_run\":{},\"before_bytes\":{},\"after_bytes\":{},\"target_met\":{},\"candidates\":{},\"protected\":{},\"eligible\":{},\"evicted\":{},\"shared\":{},\"orphaned\":{},\"temporary\":{},\"malformed\":{},\"missing_roots\":{},\"missing_references\":{},\"protected_bytes\":{},\"eligible_bytes\":{},\"evicted_bytes\":{},\"shared_bytes\":{},\"orphaned_bytes\":{},\"temporary_bytes\":{},\"malformed_bytes\":{},\"deleted_narinfos\":{},\"deleted_nars\":{},\"deleted_orphans\":{}}}",
+            report.accounting_basis,
             report.dry_run,
             report.before_bytes,
             report.after_bytes,
@@ -311,7 +312,8 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         );
     } else {
         println!(
-            "dry_run={} before_bytes={} after_bytes={} target_met={} candidates={} protected={} eligible={} evicted={} shared={} orphaned={} temporary={} malformed={} missing_roots={} missing_references={} protected_bytes={} eligible_bytes={} evicted_bytes={} shared_bytes={} orphaned_bytes={} temporary_bytes={} malformed_bytes={} deleted_narinfos={} deleted_nars={} deleted_orphans={}",
+            "accounting_basis={} dry_run={} before_bytes={} after_bytes={} target_met={} candidates={} protected={} eligible={} evicted={} shared={} orphaned={} temporary={} malformed={} missing_roots={} missing_references={} protected_bytes={} eligible_bytes={} evicted_bytes={} shared_bytes={} orphaned_bytes={} temporary_bytes={} malformed_bytes={} deleted_narinfos={} deleted_nars={} deleted_orphans={}",
+            report.accounting_basis,
             report.dry_run,
             report.before_bytes,
             report.after_bytes,

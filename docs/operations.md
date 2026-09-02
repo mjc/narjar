@@ -85,14 +85,17 @@ time. The minimum age applies to published narinfos and orphan NARs. A
 protected-roots file accepts canonical /nix/store paths or store hashes, one per
 line; references reachable from present roots are retained transitively.
 
-The report includes the pre/post byte totals and target status, plus counts and
-byte totals for protected and age-eligible entries, selected evictions, shared
-NAR objects, orphan NARs, temporary entries, and malformed inputs. It also
-reports missing roots and missing transitive references. Category byte totals
-may overlap when a shared NAR belongs to more than one category. Malformed
+The report labels `before_bytes`, `after_bytes`, and `evicted_bytes` as
+`accounting_basis=logical`: they are sums of logical file lengths, not physical
+space reclaimed. It includes the target status, plus counts and byte totals for
+protected and age-eligible entries, selected evictions, shared NAR objects,
+orphan NARs, temporary entries, and malformed inputs. It also reports missing
+roots and missing transitive references. Category byte totals may overlap when a
+shared NAR belongs to more than one category. Malformed
 published metadata still aborts the pass before deletion, so its report count
 and byte total are zero on a successful scan; the error identifies the
-offending path.
+offending path. Compression, sparse/reflinked extents, and snapshot-held space
+are filesystem observations outside these deterministic logical totals.
 
 Apply removes narinfo first and syncs the cache directory. A referenced NAR is
 removed only after its final narinfo is gone, then the nar directory is synced.
