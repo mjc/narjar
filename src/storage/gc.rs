@@ -28,6 +28,7 @@ pub struct GcReport {
     pub candidates: usize,
     pub deleted_narinfos: usize,
     pub deleted_nars: usize,
+    pub deleted_orphans: usize,
 }
 
 struct Entry {
@@ -41,6 +42,11 @@ struct Entry {
     nar_bytes: u64,
     modified: SystemTime,
     protected: bool,
+}
+struct Orphan {
+    path: PathBuf,
+    bytes: u64,
+    modified: SystemTime,
 }
 
 pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
@@ -61,8 +67,9 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         .map_err(|error| invalid(error.to_string()))?;
     let mut entries = scan(&storage, &trusted)?;
     protect(&mut entries, options.protected_roots.as_deref())?;
+    let orphans = scan_orphans(&storage, &entries)?;
 
-    let before_bytes = total_bytes(&entries);
+    let before_bytes = total_bytes(&entries) + orphan_bytes(&orphans);
     let now = SystemTime::now();
     let selected = select(
         &entries,
@@ -73,12 +80,29 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         options.min_age,
         now,
     );
-    let after_bytes = projected_bytes(&entries, &selected);
+    let after_publications = projected_bytes(&entries, &selected);
+    let selected_orphans = select_orphans(
+        &orphans,
+        after_publications + orphan_bytes(&orphans),
+        target_bytes,
+        options.max_bytes,
+        options.max_age,
+        options.min_age,
+        now,
+    );
+    let after_bytes = after_publications.saturating_sub(
+        selected_orphans
+            .iter()
+            .map(|&index| orphans[index].bytes)
+            .sum(),
+    );
     let dry_run = !options.apply;
-    let (deleted_narinfos, deleted_nars) = if dry_run {
-        (0, 0)
+    let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
+        (0, 0, 0)
     } else {
-        apply(&storage, &entries, &selected)?
+        let (deleted_narinfos, deleted_nars) = apply(&storage, &entries, &selected)?;
+        let deleted_orphans = apply_orphans(&storage, &orphans, &selected_orphans)?;
+        (deleted_narinfos, deleted_nars, deleted_orphans)
     };
 
     Ok(GcReport {
@@ -86,9 +110,10 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         before_bytes,
         after_bytes,
         target_met: target_bytes.is_none_or(|target| after_bytes <= target),
-        candidates: selected.len(),
+        candidates: selected.len() + selected_orphans.len(),
         deleted_narinfos,
         deleted_nars,
+        deleted_orphans,
     })
 }
 
@@ -145,6 +170,45 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
         });
     }
     Ok(entries)
+}
+
+fn scan_orphans(storage: &Storage, entries: &[Entry]) -> Result<Vec<Orphan>, StorageError> {
+    let referenced = entries
+        .iter()
+        .map(|entry| (entry.nar.0.clone(), ()))
+        .collect::<BTreeMap<_, _>>();
+    let nar_dir = storage.layout.nar_dir();
+    if !nar_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut orphans = Vec::new();
+    for item in fs::read_dir(&nar_dir)? {
+        let item = item?;
+        let Some(name) = item.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(identifier) = name.strip_suffix(".nar") else {
+            continue;
+        };
+        if NarObjectId::parse(identifier).is_err() || !item.file_type()?.is_file() {
+            continue;
+        }
+        if referenced.contains_key(identifier) {
+            continue;
+        }
+        let metadata = item.metadata()?;
+        orphans.push(Orphan {
+            path: item.path(),
+            bytes: metadata.len(),
+            modified: metadata.modified()?,
+        });
+    }
+    Ok(orphans)
+}
+
+fn orphan_bytes(orphans: &[Orphan]) -> u64 {
+    orphans.iter().map(|orphan| orphan.bytes).sum()
 }
 
 fn protect(entries: &mut [Entry], path: Option<&Path>) -> Result<(), StorageError> {
@@ -255,6 +319,41 @@ fn select(
     selected
 }
 
+fn select_orphans(
+    orphans: &[Orphan],
+    current_bytes: u64,
+    target_bytes: Option<u64>,
+    max_bytes: Option<u64>,
+    max_age: Option<Duration>,
+    min_age: Duration,
+    now: SystemTime,
+) -> Vec<usize> {
+    let size_pressure = target_bytes
+        .is_some_and(|target| max_bytes.map_or(current_bytes > target, |max| current_bytes > max));
+    let mut order = orphans
+        .iter()
+        .enumerate()
+        .filter(|(_, orphan)| now.duration_since(orphan.modified).unwrap_or_default() >= min_age)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    order.sort_unstable_by_key(|&index| (orphans[index].modified, index));
+
+    let mut remaining = current_bytes;
+    let mut selected = Vec::new();
+    for index in order {
+        let orphan = &orphans[index];
+        let expired = max_age
+            .is_some_and(|age| now.duration_since(orphan.modified).unwrap_or_default() >= age);
+        let pressure = size_pressure && target_bytes.is_some_and(|target| remaining > target);
+        if !expired && !pressure {
+            continue;
+        }
+        selected.push(index);
+        remaining = remaining.saturating_sub(orphan.bytes);
+    }
+    selected
+}
+
 fn projected_bytes(entries: &[Entry], selected: &[usize]) -> u64 {
     let mut total = total_bytes(entries);
     let mut references = reference_counts(entries);
@@ -293,6 +392,20 @@ fn apply(
         }
     }
     Ok((selected.len(), deleted_nars))
+}
+
+fn apply_orphans(
+    storage: &Storage,
+    orphans: &[Orphan],
+    selected: &[usize],
+) -> Result<usize, StorageError> {
+    for &index in selected {
+        fs::remove_file(&orphans[index].path)?;
+    }
+    if !selected.is_empty() {
+        sync_dir(&storage.layout.nar_dir())?;
+    }
+    Ok(selected.len())
 }
 
 fn invalid(message: impl Into<String>) -> StorageError {

@@ -283,7 +283,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
 
     if json {
         println!(
-            "{{\"dry_run\":{},\"before_bytes\":{},\"after_bytes\":{},\"target_met\":{},\"candidates\":{},\"deleted_narinfos\":{},\"deleted_nars\":{}}}",
+            "{{\"dry_run\":{},\"before_bytes\":{},\"after_bytes\":{},\"target_met\":{},\"candidates\":{},\"deleted_narinfos\":{},\"deleted_nars\":{},\"deleted_orphans\":{}}}",
             report.dry_run,
             report.before_bytes,
             report.after_bytes,
@@ -291,10 +291,11 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
             report.candidates,
             report.deleted_narinfos,
             report.deleted_nars,
+            report.deleted_orphans,
         );
     } else {
         println!(
-            "dry_run={} before_bytes={} after_bytes={} target_met={} candidates={} deleted_narinfos={} deleted_nars={}",
+            "dry_run={} before_bytes={} after_bytes={} target_met={} candidates={} deleted_narinfos={} deleted_nars={} deleted_orphans={}",
             report.dry_run,
             report.before_bytes,
             report.after_bytes,
@@ -302,6 +303,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
             report.candidates,
             report.deleted_narinfos,
             report.deleted_nars,
+            report.deleted_orphans,
         );
     }
     Ok(())

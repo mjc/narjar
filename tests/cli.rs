@@ -2191,3 +2191,30 @@ fn gc_refuses_to_apply_while_the_cache_is_serving() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("locked"));
 }
+
+#[test]
+fn gc_reclaims_old_orphan_nars() {
+    let data_dir = init_data_dir("operator-gc-orphan");
+    fs::write(data_dir.join(format!("nar/{NAR_ID}.nar")), b"orphan")
+        .expect("orphan NAR should be written");
+
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let output = run(&[
+        "gc",
+        "--data-dir",
+        path,
+        "--target-bytes",
+        "0",
+        "--min-age-seconds",
+        "0",
+        "--apply",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "gc apply failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!data_dir.join(format!("nar/{NAR_ID}.nar")).exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"deleted_orphans\":1"));
+}
