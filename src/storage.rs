@@ -168,6 +168,7 @@ impl Layout {
         self.nar_dir().join(format!("{}.nar", id.0))
     }
 
+    #[cfg(test)]
     fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
         self.root.join(format!("{}.narinfo", hash.0))
     }
@@ -299,7 +300,7 @@ impl Storage {
         let lock = ProcessLock::acquire(&root_directory)?;
         root_directory.sync_all()?;
 
-        let recovery = RecoveryState::new(&layout.root);
+        let recovery = RecoveryState::new(&root_directory)?;
         let storage = Self {
             layout,
             root: root_directory,
@@ -480,11 +481,19 @@ impl Storage {
     }
 
     pub fn delete_narinfo(&self, store: &StoreHash) -> Result<bool, StorageError> {
-        match fs::remove_file(self.layout.narinfo_path(store)) {
-            Ok(()) => {
-                sync_dir(&self.layout.root)?;
+        let root = self.root_directory()?;
+        let name = OsString::from(format!("{}.narinfo", store.as_str()));
+        match entry_is_regular_at(&root, &name) {
+            Ok(true) => {
+                unlink_at(&root, &name)?;
+                root.sync_all()?;
                 Ok(true)
             }
+            Ok(false) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "narinfo is not a regular file",
+            )
+            .into()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
         }
@@ -969,6 +978,7 @@ fn lock_exclusive(file: &File) -> Result<(), StorageError> {
     }
 }
 
+#[cfg(test)]
 fn sync_dir(path: &Path) -> io::Result<()> {
     open_directory(path)?.sync_all()
 }
@@ -1293,6 +1303,24 @@ mod tests {
                     SystemTime::now()
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn delete_rejects_a_symlinked_narinfo() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
+        let target = directory.path().join("external-narinfo");
+        let link = directory.path().join(format!("{STORE_HASH}.narinfo"));
+        fs::write(&target, b"external narinfo").expect("write external narinfo");
+        symlink(&target, &link).expect("create narinfo symlink");
+
+        assert!(storage.delete_narinfo(&store).is_err());
+        assert!(link.exists());
+        assert_eq!(
+            fs::read(&target).expect("read external narinfo"),
+            b"external narinfo"
         );
     }
 
