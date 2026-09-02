@@ -667,7 +667,11 @@ fn available_bytes(path: &Path) -> io::Result<u64> {
 
 fn ensure_directory(path: &Path, name: &str) -> io::Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(metadata) if metadata.is_dir() && metadata.permissions().mode() & 0o022 == 0 => Ok(()),
+        Ok(metadata) if metadata.is_dir() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} has unsafe permissions: {}", path.display()),
+        )),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{name} is not a directory: {}", path.display()),
@@ -879,6 +883,19 @@ mod tests {
 
         let error = Storage::initialize(directory.path()).expect_err("symlinked lock must fail");
         assert!(error.to_string().contains("lock"));
+    }
+
+    #[test]
+    fn initialization_rejects_writable_storage_directories() {
+        let directory = TestDir::new();
+        let nar = directory.path().join("nar");
+        fs::create_dir(&nar).expect("create NAR directory");
+        fs::set_permissions(&nar, fs::Permissions::from_mode(0o777))
+            .expect("make NAR directory writable");
+
+        let error = Storage::initialize(directory.path())
+            .expect_err("writable storage directory must be rejected");
+        assert!(error.to_string().contains("nar directory"));
     }
 
     #[test]
