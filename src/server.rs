@@ -108,14 +108,23 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         Arc::new(Authorizer::load(&config.data_dir).map_err(|error| {
             Error::runtime(format!("cannot load authorization policy: {error}"))
         })?);
-    let trusted_keys = TrustedPublicKeys::load(&config.data_dir.join("trusted-public-keys"))
+    let trusted_keys_path = config.data_dir.join("trusted-public-keys");
+    let trusted_keys = TrustedPublicKeys::load(&trusted_keys_path)
         .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
-    let inventory = Inventory::scan(&config.data_dir, &trusted_keys, false)
-        .map_err(|error| Error::runtime(format!("cannot inventory cache: {error}")))?;
-    if !inventory.can_serve() {
-        return Err(Error::runtime(
-            "cannot activate trusted public keys: published narinfo is not trusted",
-        ));
+    if storage
+        .recovery_required_for(&trusted_keys_path)
+        .map_err(|error| Error::runtime(format!("cannot inspect cache recovery state: {error}")))?
+    {
+        let inventory = Inventory::scan(&config.data_dir, &trusted_keys, false)
+            .map_err(|error| Error::runtime(format!("cannot inventory cache: {error}")))?;
+        if !inventory.can_serve() {
+            return Err(Error::runtime(
+                "cannot activate trusted public keys: published narinfo is not trusted",
+            ));
+        }
+        storage
+            .finish_recovery(&trusted_keys_path)
+            .map_err(|error| Error::runtime(format!("cannot complete cache recovery: {error}")))?;
     }
     let trusted_keys = Arc::new(trusted_keys);
     let metrics = Arc::new(Metrics::default());

@@ -222,9 +222,13 @@ fn classify_root_entry(name: &OsStr, file_type: &fs::FileType) -> Option<Reconci
         Some("nar" | ".tmp" | "realisations" | "auth") => {
             (!file_type.is_dir()).then_some(ReconcileClass::UnexpectedType)
         }
-        Some("lock" | "nix-cache-info" | "trusted-public-keys") => {
-            (!file_type.is_file()).then_some(ReconcileClass::UnexpectedType)
-        }
+        Some(
+            "lock"
+            | "nix-cache-info"
+            | "trusted-public-keys"
+            | ".narjar-clean"
+            | ".narjar-recovery",
+        ) => (!file_type.is_file()).then_some(ReconcileClass::UnexpectedType),
         Some(name) if valid_store_hash_filename(name) => Some(if file_type.is_file() {
             ReconcileClass::NarInfo
         } else {

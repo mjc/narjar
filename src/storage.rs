@@ -1,7 +1,7 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Cursor, Read},
+    io::{self, Cursor, Read, Write},
     mem::MaybeUninit,
     num::NonZeroUsize,
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
@@ -173,6 +173,31 @@ impl Layout {
     fn lock_path(&self) -> PathBuf {
         self.root.join("lock")
     }
+
+    fn clean_path(&self) -> PathBuf {
+        self.root.join(".narjar-clean")
+    }
+
+    fn recovery_path(&self) -> PathBuf {
+        self.root.join(".narjar-recovery")
+    }
+}
+
+fn root_is_empty(path: &Path) -> io::Result<bool> {
+    match fs::read_dir(path) {
+        Ok(mut entries) => Ok(entries.next().transpose()?.is_none()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+fn trusted_keys_digest(path: &Path) -> Result<[u8; 32], StorageError> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Sha256::digest(contents).into())
 }
 
 enum PublishTarget<'a> {
@@ -263,6 +288,7 @@ pub struct Storage {
 impl Storage {
     pub fn initialize(root: impl AsRef<Path>) -> Result<Self, StorageError> {
         let layout = Layout::new(root.as_ref().to_owned());
+        let root_is_empty = root_is_empty(&layout.root)?;
         fs::create_dir_all(&layout.root)?;
         fs::create_dir_all(layout.nar_dir())?;
         fs::create_dir_all(layout.temp_dir())?;
@@ -271,16 +297,107 @@ impl Storage {
         let lock = ProcessLock::acquire(&layout.lock_path())?;
         sync_dir(&layout.root)?;
 
-        Ok(Self {
+        let storage = Self {
             layout,
             publication_lock: Mutex::new(()),
             _lock: lock,
-        })
+        };
+        if root_is_empty {
+            storage.create_marker(&storage.layout.clean_path())?;
+        }
+        Ok(storage)
     }
 
     #[cfg(test)]
     fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    pub fn recovery_required(&self) -> Result<bool, StorageError> {
+        Ok(!self.marker_exists(&self.layout.clean_path())?
+            || self.marker_exists(&self.layout.recovery_path())?)
+    }
+
+    pub fn recovery_required_for(&self, trusted_keys: &Path) -> Result<bool, StorageError> {
+        if self.recovery_required()? {
+            return Ok(true);
+        }
+
+        let digest = trusted_keys_digest(trusted_keys)?;
+        Ok(self.clean_marker()? != digest.as_slice())
+    }
+
+    /// Records that a full inventory scan has completed successfully.
+    pub fn finish_recovery(&self, trusted_keys: &Path) -> Result<(), StorageError> {
+        self.write_clean_marker(trusted_keys_digest(trusted_keys)?.as_slice())?;
+        self.clear_recovery_marker()
+    }
+
+    fn finish_publication(&self) -> Result<(), StorageError> {
+        self.create_marker(&self.layout.clean_path())?;
+        self.clear_recovery_marker()
+    }
+
+    fn clear_recovery_marker(&self) -> Result<(), StorageError> {
+        match fs::remove_file(self.layout.recovery_path()) {
+            Ok(()) => sync_dir(&self.layout.root)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    fn require_recovery(&self) -> Result<(), StorageError> {
+        self.create_marker(&self.layout.recovery_path())
+    }
+
+    fn create_marker(&self, path: &Path) -> Result<(), StorageError> {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(file) => {
+                file.sync_all()?;
+                sync_dir(&self.layout.root)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                self.marker_exists(path)?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn write_clean_marker(&self, contents: &[u8]) -> Result<(), StorageError> {
+        let path = self.layout.clean_path();
+        self.create_marker(&path)?;
+        let mut marker = OpenOptions::new().write(true).truncate(true).open(path)?;
+        marker.write_all(contents)?;
+        marker.sync_all()?;
+        sync_dir(&self.layout.root)?;
+        Ok(())
+    }
+
+    fn clean_marker(&self) -> Result<Vec<u8>, StorageError> {
+        let path = self.layout.clean_path();
+        self.marker_exists(&path)?;
+        Ok(fs::read(path)?)
+    }
+
+    fn marker_exists(&self, path: &Path) -> Result<bool, StorageError> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("recovery marker {} is not a regular file", path.display()),
+            )
+            .into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn publish_cache_info(&self, source: impl Read) -> Result<PublishOutcome, StorageError> {
@@ -464,6 +581,7 @@ impl Storage {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         admit()?;
+        self.require_recovery()?;
         let destination = target.destination(&self.layout);
         checkpoint(PublishBoundary::BeforeTempCreate)?;
         let (temp_path, mut temp) = self.create_temp(&target)?;
@@ -510,6 +628,7 @@ impl Storage {
         match result {
             Ok(outcome) => {
                 cleanup?;
+                self.finish_publication()?;
                 Ok(outcome)
             }
             Err(error) => {
@@ -777,7 +896,11 @@ mod tests {
         );
         assert!(
             storage
-                .publish_nar_fault(&nar, Cursor::new(b"nar bytes"), PublishBoundary::AfterTempCreate)
+                .publish_nar_fault(
+                    &nar,
+                    Cursor::new(b"nar bytes"),
+                    PublishBoundary::AfterTempCreate
+                )
                 .is_err()
         );
         assert!(
@@ -786,7 +909,6 @@ mod tests {
                 .expect("inspect interrupted recovery marker")
         );
     }
-
 
     #[test]
     fn publication_is_immutable_idempotent_and_pair_gated() {
