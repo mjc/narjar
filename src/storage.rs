@@ -4,7 +4,10 @@ use std::{
     io::{self, Cursor, Read},
     mem::MaybeUninit,
     num::NonZeroUsize,
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process,
     sync::{
@@ -567,9 +570,13 @@ impl Storage {
                 .read(true)
                 .write(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&path)
             {
-                Ok(file) => return Ok((path, file)),
+                Ok(file) => {
+                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                    return Ok((path, file));
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
@@ -752,7 +759,7 @@ mod tests {
         env, fs,
         io::{self, Cursor, Read},
         num::NonZeroUsize,
-        os::unix::fs::symlink,
+        os::unix::fs::{PermissionsExt, symlink},
         path::{Path, PathBuf},
         process,
         sync::{
@@ -858,6 +865,27 @@ mod tests {
 
         let error = Storage::initialize(directory.path()).expect_err("symlinked lock must fail");
         assert!(error.to_string().contains("lock"));
+    }
+
+    #[test]
+    fn temporary_publication_files_are_private() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let (path, file) = storage
+            .create_temp(&PublishTarget::CacheInfo)
+            .expect("create temporary publication file");
+
+        assert_eq!(
+            file.metadata()
+                .expect("read temp metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        drop(file);
+        fs::remove_file(path).expect("remove temporary publication file");
     }
 
     #[test]
