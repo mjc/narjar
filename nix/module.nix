@@ -35,6 +35,13 @@ let
       "$NARJAR_CREDENTIALS_DIRECTORY/${credential.name}" \
       ${lib.escapeShellArg "${cfg.dataDir}/${credential.target}"}
   '') credentials;
+  preStartScript = ''
+    if [ ! -e ${lib.escapeShellArg "${cfg.dataDir}/nix-cache-info"} ]; then
+      ${executable} init --data-dir ${lib.escapeShellArg cfg.dataDir}
+    fi
+    ${installCredentials}
+  '';
+  privilegedPreStart = pkgs.writeShellScript "narjar-pre-start" preStartScript;
   serveArgs = lib.escapeShellArgs [
     "serve"
     "--data-dir"
@@ -144,12 +151,7 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
 
-      preStart = ''
-        if [ ! -e ${lib.escapeShellArg "${cfg.dataDir}/nix-cache-info"} ]; then
-          ${executable} init --data-dir ${lib.escapeShellArg cfg.dataDir}
-        fi
-        ${installCredentials}
-      '';
+      preStart = lib.mkIf cfg.dynamicUser preStartScript;
 
       serviceConfig = {
         Environment = "NARJAR_CREDENTIALS_DIRECTORY=%d";
@@ -158,6 +160,7 @@ in
         Group = lib.mkIf (!cfg.dynamicUser) "narjar";
         StateDirectory = lib.mkIf cfg.dynamicUser stateDirectory;
         StateDirectoryMode = lib.mkIf cfg.dynamicUser "0700";
+        ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";
         ExecStart = "${executable} ${serveArgs}";
         Restart = "on-failure";
         UMask = "0077";
