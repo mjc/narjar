@@ -450,23 +450,53 @@ fn projected_bytes(entries: &[Entry], selected: &[usize]) -> u64 {
     total
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailurePoint {
+    BeforeNarinfoDelete,
+    AfterNarinfoDeleteBeforeSync,
+    AfterNarinfoSyncBeforeNarDelete,
+    AfterNarDeleteBeforeSync,
+    DuringOrphanCleanup,
+}
+
+fn fail_if(failure: Option<FailurePoint>, point: FailurePoint) -> Result<(), StorageError> {
+    if failure == Some(point) {
+        Err(invalid(format!("injected GC failure at {point:?}")))
+    } else {
+        Ok(())
+    }
+}
+
 fn apply(
     storage: &Storage,
     entries: &[Entry],
     selected: &[usize],
 ) -> Result<(usize, usize), StorageError> {
+    apply_with_failure(storage, entries, selected, None)
+}
+
+fn apply_with_failure(
+    storage: &Storage,
+    entries: &[Entry],
+    selected: &[usize],
+    failure: Option<FailurePoint>,
+) -> Result<(usize, usize), StorageError> {
     let mut references = reference_counts(entries);
     let mut deleted_nars = 0;
     for &index in selected {
         let entry = &entries[index];
+        fail_if(failure, FailurePoint::BeforeNarinfoDelete)?;
         fs::remove_file(&entry.narinfo_path)?;
+        fail_if(failure, FailurePoint::AfterNarinfoDeleteBeforeSync)?;
         sync_dir(&storage.layout.root)?;
         let count = references
             .get_mut(&entry.nar.0)
             .expect("scanned reference count");
         *count -= 1;
+        fail_if(failure, FailurePoint::AfterNarinfoSyncBeforeNarDelete)?;
         if *count == 0 {
             fs::remove_file(&entry.nar_path)?;
+            fail_if(failure, FailurePoint::AfterNarDeleteBeforeSync)?;
             sync_dir(&storage.layout.nar_dir())?;
             deleted_nars += 1;
         }
@@ -479,7 +509,17 @@ fn apply_orphans(
     orphans: &[Orphan],
     selected: &[usize],
 ) -> Result<usize, StorageError> {
+    apply_orphans_with_failure(storage, orphans, selected, None)
+}
+
+fn apply_orphans_with_failure(
+    storage: &Storage,
+    orphans: &[Orphan],
+    selected: &[usize],
+    failure: Option<FailurePoint>,
+) -> Result<usize, StorageError> {
     for &index in selected {
+        fail_if(failure, FailurePoint::DuringOrphanCleanup)?;
         fs::remove_file(&orphans[index].path)?;
     }
     if !selected.is_empty() {
@@ -494,7 +534,11 @@ fn invalid(message: impl Into<String>) -> StorageError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, UNIX_EPOCH};
+    use super::*;
+    use std::{
+        fs,
+        time::{Duration, UNIX_EPOCH},
+    };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct Candidate {
@@ -580,5 +624,88 @@ mod tests {
             ),
             vec![0, 1]
         );
+    }
+
+    #[test]
+    fn deletion_boundaries_preserve_published_pair_invariant() {
+        let points = [
+            FailurePoint::BeforeNarinfoDelete,
+            FailurePoint::AfterNarinfoDeleteBeforeSync,
+            FailurePoint::AfterNarinfoSyncBeforeNarDelete,
+            FailurePoint::AfterNarDeleteBeforeSync,
+        ];
+
+        for point in points {
+            let directory = tempfile::tempdir().expect("fixture directory should be created");
+            let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+            let narinfo_path = directory
+                .path()
+                .join("00000000000000000000000000000000.narinfo");
+            let nar_path = storage.layout.nar_path(
+                &NarObjectId::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl")
+                    .expect("NAR id should parse"),
+            );
+            fs::write(&narinfo_path, b"published").expect("narinfo should be written");
+            fs::write(&nar_path, b"nar").expect("NAR should be written");
+
+            let entry = Entry {
+                store: StoreHash::parse("00000000000000000000000000000000")
+                    .expect("store hash should parse"),
+                nar: NarObjectId::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl")
+                    .expect("NAR id should parse"),
+                store_path: "/nix/store/00000000000000000000000000000000-narjar".to_owned(),
+                references: Vec::new(),
+                narinfo_path,
+                nar_path,
+                narinfo_bytes: 9,
+                nar_bytes: 3,
+                modified: SystemTime::now(),
+                protected: false,
+            };
+
+            assert!(apply_with_failure(&storage, &[entry], &[0], Some(point)).is_err());
+            assert!(
+                !storage
+                    .layout
+                    .root
+                    .join("00000000000000000000000000000000.narinfo")
+                    .exists()
+                    || storage
+                        .layout
+                        .nar_path(
+                            &NarObjectId::parse(
+                                "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl",
+                            )
+                            .expect("NAR id should parse")
+                        )
+                        .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_cleanup_failure_preserves_orphan() {
+        let directory = tempfile::tempdir().expect("fixture directory should be created");
+        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let nar = NarObjectId::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl")
+            .expect("NAR id should parse");
+        let path = storage.layout.nar_path(&nar);
+        fs::write(&path, b"orphan").expect("orphan should be written");
+        let orphan = Orphan {
+            path: path.clone(),
+            bytes: 6,
+            modified: SystemTime::now(),
+        };
+
+        assert!(
+            apply_orphans_with_failure(
+                &storage,
+                &[orphan],
+                &[0],
+                Some(FailurePoint::DuringOrphanCleanup),
+            )
+            .is_err()
+        );
+        assert!(path.exists());
     }
 }
