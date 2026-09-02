@@ -130,10 +130,10 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
         };
         let store = StoreHash::parse(route)
             .map_err(|_| invalid(format!("invalid narinfo filename: {name}")))?;
-        let metadata = item.metadata()?;
-        if !metadata.is_file() {
+        if !item.file_type()?.is_file() {
             return Err(invalid(format!("narinfo is not a regular file: {name}")));
         }
+        let metadata = item.metadata()?;
 
         let bytes = read_narinfo(&item.path())?;
         let validated = trusted

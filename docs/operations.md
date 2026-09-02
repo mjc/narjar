@@ -45,6 +45,16 @@ narjar delete
   --store-hash HASH
   [--json]
 
+narjar gc
+  --data-dir PATH
+  [--max-bytes BYTES]
+  [--target-bytes BYTES]
+  [--max-age-seconds SECONDS]
+  [--min-age-seconds SECONDS]
+  [--protected-roots PATH]
+  [--dry-run | --apply]
+  [--json]
+
 narjar list-orphans
   --data-dir PATH
   [--json]
@@ -68,7 +78,19 @@ environment variable, logs, or the hash file.
 delete is offline-only: it refuses while the serve lock is held, removes the
 published narinfo after validation and directory sync, and deliberately leaves
 the NAR object. list-orphans reports NARs unreferenced by any valid narinfo.
-Narjar v0.1 never automatically removes an orphan.
+gc is also offline-only and takes the same data-directory lock. It defaults to
+dry-run unless --apply is explicit, validates the complete published inventory
+before selecting anything, and evicts FIFO by narinfo filesystem modification
+time. The minimum age applies to published narinfos and orphan NARs. A
+protected-roots file accepts canonical /nix/store paths or store hashes, one per
+line; references reachable from present roots are retained transitively.
+
+Apply removes narinfo first and syncs the cache directory. A referenced NAR is
+removed only after its final narinfo is gone, then the nar directory is synced.
+Old unreferenced NARs are reclaimed subject to the same minimum-age grace
+period. Malformed metadata, missing NARs, symlinked narinfos, and invalid policy
+abort the pass before deletion. No online delete endpoint or resident GC worker
+is part of this interface.
 
 ## Configuration and precedence
 

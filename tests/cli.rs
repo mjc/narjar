@@ -2218,3 +2218,32 @@ fn gc_reclaims_old_orphan_nars() {
     assert!(!data_dir.join(format!("nar/{NAR_ID}.nar")).exists());
     assert!(String::from_utf8_lossy(&output.stdout).contains("\"deleted_orphans\":1"));
 }
+
+#[test]
+fn gc_rejects_symlinked_narinfo_without_removing_it() {
+    let data_dir = init_data_dir("operator-gc-symlink");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(
+        data_dir.join("narinfo-target"),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("narinfo target should be written");
+    symlink(
+        data_dir.join("narinfo-target"),
+        data_dir.join(format!("{STORE_HASH}.narinfo")),
+    )
+    .expect("narinfo symlink should be created");
+
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let output = run(&["gc", "--data-dir", path, "--target-bytes", "0", "--apply"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("regular file"));
+    assert!(data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+}
