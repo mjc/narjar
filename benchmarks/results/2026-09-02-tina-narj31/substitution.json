@@ -1,0 +1,18 @@
+[
+  {
+    "candidate": "narjar",
+    "correct_key_returncode": 0,
+    "correct_key_stderr_tail": "copying 1 paths...\ncopying path '/nix/store/667vrjhm6k3r2prbwg6v6nq6mkvr9g4h-narjar-trust-narjar' from 'http://127.0.0.1:47013'...\n",
+    "path": "/nix/store/667vrjhm6k3r2prbwg6v6nq6mkvr9g4h-narjar-trust-narjar",
+    "wrong_key_returncode": 1,
+    "wrong_key_stderr_tail": "copying 1 paths...\nerror: cannot add path '/nix/store/667vrjhm6k3r2prbwg6v6nq6mkvr9g4h-narjar-trust-narjar' because it lacks a signature by a trusted key\n"
+  },
+  {
+    "candidate": "bincache",
+    "correct_key_returncode": 0,
+    "correct_key_stderr_tail": "copying 1 paths...\ncopying path '/nix/store/jg2wn3y78bifxfj93mqdb972cmx0babx-narjar-trust-bincache' from 'http://127.0.0.1:47081'...\n",
+    "path": "/nix/store/jg2wn3y78bifxfj93mqdb972cmx0babx-narjar-trust-bincache",
+    "wrong_key_returncode": 1,
+    "wrong_key_stderr_tail": "copying 1 paths...\nerror: cannot add path '/nix/store/jg2wn3y78bifxfj93mqdb972cmx0babx-narjar-trust-bincache' because it lacks a signature by a trusted key\n"
+  }
+]
