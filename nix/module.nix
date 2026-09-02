@@ -68,6 +68,12 @@ in
       description = "State directory below /var/lib.";
     };
 
+    dynamicUser = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Run with a transient user and systemd-managed state storage.";
+    };
+
     listen = lib.mkOption {
       type = lib.types.str;
       default = "127.0.0.1:5000";
@@ -126,6 +132,13 @@ in
       }
     ];
 
+    users.groups.narjar = lib.mkIf (!cfg.dynamicUser) {};
+    users.users.narjar = lib.mkIf (!cfg.dynamicUser) {
+      isSystemUser = true;
+      group = "narjar";
+    };
+    systemd.tmpfiles.rules = lib.optional (!cfg.dynamicUser) "d ${cfg.dataDir} 0700 narjar narjar -";
+
     systemd.services.narjar = {
       description = "Narjar binary cache";
       wantedBy = [ "multi-user.target" ];
@@ -139,10 +152,11 @@ in
       '';
 
       serviceConfig = {
-        DynamicUser = true;
-        StateDirectory = stateDirectory;
-        StateDirectoryMode = "0700";
-        LoadCredential = map (credential: "${credential.name}:${credential.source}") credentials;
+        DynamicUser = lib.mkIf cfg.dynamicUser true;
+        User = lib.mkIf (!cfg.dynamicUser) "narjar";
+        Group = lib.mkIf (!cfg.dynamicUser) "narjar";
+        StateDirectory = lib.mkIf cfg.dynamicUser stateDirectory;
+        StateDirectoryMode = lib.mkIf cfg.dynamicUser "0700";
         ExecStart = "${executable} ${serveArgs}";
         Restart = "on-failure";
         UMask = "0077";
