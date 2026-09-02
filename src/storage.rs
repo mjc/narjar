@@ -378,10 +378,8 @@ impl Storage {
             PublishTarget::Nar(id),
             CheckedNarReader::new(source, &id.0, expected_length),
             || {
-                if available_bytes(&self.root)? < required_bytes {
-                    return Err(StorageError::InsufficientSpace);
-                }
-                Ok(())
+                let directory = self.nar_temp_directory()?;
+                filesystem_space(&directory)?.required_capacity(required_bytes)
             },
             |_| Ok(()),
         )
@@ -491,7 +489,10 @@ impl Storage {
     }
 
     pub fn is_ready(&self, min_free_bytes: u64) -> Result<bool, StorageError> {
-        Ok(available_bytes(&self.root)? >= min_free_bytes)
+        let directory = self.nar_temp_directory()?;
+        Ok(filesystem_space(&directory)?
+            .required_capacity(min_free_bytes)
+            .is_ok())
     }
 
     pub fn reconcile(
@@ -704,6 +705,7 @@ pub enum PublishOutcome {
 pub enum StorageError {
     Conflict,
     InsufficientSpace,
+    InsufficientInodes,
     Locked,
     MissingNar,
     NarMismatch,
@@ -724,6 +726,7 @@ impl fmt::Display for StorageError {
             Self::InsufficientSpace => {
                 formatter.write_str("configured free space reserve would be violated")
             }
+            Self::InsufficientInodes => formatter.write_str("filesystem has no free inodes"),
             Self::Locked => formatter.write_str("data directory is locked by another process"),
             Self::MissingNar => formatter.write_str("referenced NAR is not published"),
             Self::NarMismatch => formatter.write_str("referenced NAR size does not match narinfo"),
@@ -739,6 +742,7 @@ impl std::error::Error for StorageError {
             Self::Io(error) => Some(error),
             Self::Conflict
             | Self::InsufficientSpace
+            | Self::InsufficientInodes
             | Self::Locked
             | Self::MissingNar
             | Self::NarMismatch
@@ -747,7 +751,43 @@ impl std::error::Error for StorageError {
     }
 }
 
-fn available_bytes(directory: &File) -> io::Result<u64> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CapacityErrorKind {
+    NoSpace,
+    Quota,
+    Inodes,
+    ReadOnly,
+    Other,
+}
+
+pub(crate) fn capacity_error_kind(raw_error: i32) -> CapacityErrorKind {
+    match raw_error {
+        libc::ENOSPC => CapacityErrorKind::NoSpace,
+        libc::EDQUOT => CapacityErrorKind::Quota,
+        libc::EROFS => CapacityErrorKind::ReadOnly,
+        _ => CapacityErrorKind::Other,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilesystemSpace {
+    available_bytes: u64,
+    available_inodes: u64,
+}
+
+impl FilesystemSpace {
+    fn required_capacity(self, required_bytes: u64) -> Result<(), StorageError> {
+        if self.available_bytes < required_bytes {
+            return Err(StorageError::InsufficientSpace);
+        }
+        if self.available_inodes == 0 {
+            return Err(StorageError::InsufficientInodes);
+        }
+        Ok(())
+    }
+}
+
+fn filesystem_space(directory: &File) -> io::Result<FilesystemSpace> {
     let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
 
     // SAFETY: directory owns a valid descriptor for the duration of the call,
@@ -759,7 +799,11 @@ fn available_bytes(directory: &File) -> io::Result<u64> {
     // SAFETY: fstatvfs returned success, so it initialized statistics.
     let statistics = unsafe { statistics.assume_init() };
     let available = (statistics.f_bavail as u128).saturating_mul(statistics.f_frsize as u128);
-    Ok(available.min(u128::from(u64::MAX)) as u64)
+    let inodes = statistics.f_favail as u128;
+    Ok(FilesystemSpace {
+        available_bytes: available.min(u128::from(u64::MAX)) as u64,
+        available_inodes: inodes.min(u128::from(u64::MAX)) as u64,
+    })
 }
 
 fn ensure_directory(path: &Path, name: &str) -> io::Result<()> {
@@ -1124,8 +1168,9 @@ mod tests {
     };
 
     use super::{
-        Layout, NarObjectId, PublishBoundary, PublishOutcome, PublishTarget, ReconcileClass,
-        Storage, StorageError, StoreHash, remove_temp, sync_dir,
+        CapacityErrorKind, FilesystemSpace, Layout, NarObjectId, PublishBoundary, PublishOutcome,
+        PublishTarget, ReconcileClass, Storage, StorageError, StoreHash, capacity_error_kind,
+        remove_temp, sync_dir,
     };
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -1645,6 +1690,32 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn destination_capacity_rejects_inode_exhaustion() {
+        let space = FilesystemSpace {
+            available_bytes: u64::MAX,
+            available_inodes: 0,
+        };
+
+        assert!(matches!(
+            space.required_capacity(1),
+            Err(StorageError::InsufficientInodes)
+        ));
+    }
+
+    #[test]
+    fn capacity_errors_have_stable_categories() {
+        assert_eq!(
+            capacity_error_kind(libc::ENOSPC),
+            CapacityErrorKind::NoSpace
+        );
+        assert_eq!(capacity_error_kind(libc::EDQUOT), CapacityErrorKind::Quota);
+        assert_eq!(
+            capacity_error_kind(libc::EROFS),
+            CapacityErrorKind::ReadOnly
+        );
     }
 
     struct BrokenReader {

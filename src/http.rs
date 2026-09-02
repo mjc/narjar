@@ -6,7 +6,10 @@ use crate::{
     auth::{Authorizer, Permission},
     metrics::Metrics,
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
-    storage::{NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError, StoreHash},
+    storage::{
+        CapacityErrorKind, NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError,
+        StoreHash, capacity_error_kind,
+    },
 };
 
 const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
@@ -308,7 +311,28 @@ impl UploadRequest {
     }
 }
 
-fn respond_cache_info_put(request: tiny_http::Request, storage: &Storage) {
+fn capacity_status(error: &io::Error) -> Option<u16> {
+    match error.raw_os_error().map(capacity_error_kind) {
+        Some(CapacityErrorKind::NoSpace | CapacityErrorKind::Quota) => Some(507),
+        Some(CapacityErrorKind::ReadOnly) => Some(503),
+        Some(CapacityErrorKind::Inodes | CapacityErrorKind::Other) | None => None,
+    }
+}
+
+fn record_capacity_error(metrics: &Metrics, error: &StorageError) {
+    let kind = match error {
+        StorageError::InsufficientSpace => CapacityErrorKind::NoSpace,
+        StorageError::InsufficientInodes => CapacityErrorKind::Inodes,
+        StorageError::Io(error) => error
+            .raw_os_error()
+            .map(capacity_error_kind)
+            .unwrap_or(CapacityErrorKind::Other),
+        _ => CapacityErrorKind::Other,
+    };
+    metrics.capacity_failure(kind);
+}
+
+fn respond_cache_info_put(request: tiny_http::Request, storage: &Storage, metrics: &Metrics) {
     let Some(mut upload) = UploadRequest::accept(request) else {
         return;
     };
@@ -325,11 +349,15 @@ fn respond_cache_info_put(request: tiny_http::Request, storage: &Storage) {
         return;
     }
 
-    let status = match storage.publish_cache_info(bytes.as_slice()) {
+    let result = storage.publish_cache_info(bytes.as_slice());
+    if let Err(error) = &result {
+        record_capacity_error(metrics, error);
+    }
+    let status = match result {
         Ok(PublishOutcome::Created) => 201,
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,
-        Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
+        Err(StorageError::Io(error)) => capacity_status(&error).unwrap_or(500),
         Err(_) => 500,
     };
     upload.respond(status);
@@ -340,19 +368,25 @@ fn respond_nar_put(
     storage: &Storage,
     id: &NarObjectId,
     policy: NarUploadPolicy,
+    metrics: &Metrics,
 ) {
     let Some(mut upload) = UploadRequest::accept(request) else {
         return;
     };
     let length = upload.length();
-    let status = match storage.publish_nar(id, upload.reader(), length as u64, policy) {
+    let result = storage.publish_nar(id, upload.reader(), length as u64, policy);
+    if let Err(error) = &result {
+        record_capacity_error(metrics, error);
+    }
+    let status = match result {
         Ok(PublishOutcome::Created) => 201,
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,
         Err(StorageError::UploadTooLarge) => 413,
         Err(StorageError::InsufficientSpace) => 507,
+        Err(StorageError::InsufficientInodes) => 507,
         Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => 422,
-        Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
+        Err(StorageError::Io(error)) => capacity_status(&error).unwrap_or(500),
         Err(_) => 500,
     };
     upload.respond(status);
@@ -363,6 +397,7 @@ fn respond_narinfo_put(
     storage: &Storage,
     store: &StoreHash,
     trusted: &TrustedPublicKeys,
+    metrics: &Metrics,
 ) {
     let Some(mut upload) = UploadRequest::accept(request) else {
         return;
@@ -378,12 +413,16 @@ fn respond_narinfo_put(
             return;
         }
     };
-    let status = match storage.publish_narinfo(store, validated) {
+    let result = storage.publish_narinfo(store, validated);
+    if let Err(error) = &result {
+        record_capacity_error(metrics, error);
+    }
+    let status = match result {
         Ok(PublishOutcome::Created) => 201,
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,
         Err(StorageError::MissingNar | StorageError::NarMismatch) => 422,
-        Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC) => 507,
+        Err(StorageError::Io(error)) => capacity_status(&error).unwrap_or(500),
         Err(_) => 500,
     };
     upload.respond(status);
@@ -482,9 +521,11 @@ pub fn respond(
 
     if matches!(request.method(), Method::Put) {
         return match route {
-            ReadRoute::Nar(id) => respond_nar_put(request, storage, &id, policy),
-            ReadRoute::NarInfo(store) => respond_narinfo_put(request, storage, &store, trusted),
-            ReadRoute::CacheInfo => respond_cache_info_put(request, storage),
+            ReadRoute::Nar(id) => respond_nar_put(request, storage, &id, policy, metrics),
+            ReadRoute::NarInfo(store) => {
+                respond_narinfo_put(request, storage, &store, trusted, metrics)
+            }
+            ReadRoute::CacheInfo => respond_cache_info_put(request, storage, metrics),
         };
     }
 

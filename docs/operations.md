@@ -232,15 +232,17 @@ serves exact files. Reconciliation is deterministic and operator-triggered.
 
 ## Disk-full and I/O failure
 
-Before accepting a NAR, Narjar requires declared Content-Length no greater than
-the configured maximum and free space greater than length plus reserve. This is
-admission guidance, not a guarantee: concurrent writers and other processes can
-consume space.
+Before accepting a NAR, Narjar checks the receiving `DATA/nar/.tmp`
+filesystem for declared length plus reserve and at least one free inode. This
+is admission guidance, not a guarantee: concurrent writers and other processes
+can consume space or inodes.
 
-ENOSPC returns 507 after closing and attempting to remove the temp. EIO,
+ENOSPC and EDQUOT return 507 after closing and attempting to remove the temp;
+inode exhaustion is also reported as 507 and read-only transitions as 503. EIO,
 sync, or directory-sync failure returns 500 and never claims success. Cleanup
 failure is logged with request ID and temporary identifier, not a raw arbitrary
-path.
+path. Metrics expose fixed-cardinality counters for no-space, quota, inode, and
+read-only pressure.
 
 Once a narinfo is published, a later NAR read/open failure returns 500 and an
 integrity counter. It does not silently return 404 because metadata says the
