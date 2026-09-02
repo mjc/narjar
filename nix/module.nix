@@ -161,6 +161,7 @@ in
         StateDirectory = lib.mkIf cfg.dynamicUser stateDirectory;
         StateDirectoryMode = lib.mkIf cfg.dynamicUser "0700";
         ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";
+        LoadCredential = map (credential: "${credential.name}:${credential.source}") credentials;
         ExecStart = "${executable} ${serveArgs}";
         Restart = "on-failure";
         UMask = "0077";
