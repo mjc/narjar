@@ -119,12 +119,13 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         options.min_age,
         now,
     );
-    let after_bytes = after_publications.saturating_sub(
-        selected_orphans
-            .iter()
-            .map(|&index| orphans[index].bytes)
-            .sum(),
-    );
+    let selected_orphan_bytes = selected_orphans
+        .iter()
+        .map(|&index| orphans[index].bytes)
+        .sum::<u64>();
+    let after_bytes = after_publications
+        .saturating_add(orphan_bytes(&orphans))
+        .saturating_sub(selected_orphan_bytes);
     let evicted_bytes = before_bytes.saturating_sub(after_bytes);
     let dry_run = !options.apply;
     let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {

@@ -2305,6 +2305,66 @@ fn gc_reclaims_old_orphan_nars() {
 }
 
 #[test]
+fn gc_reports_retained_orphan_bytes_after_partial_cleanup() {
+    let data_dir = init_data_dir("operator-gc-retained-orphan");
+    let retained_orphan_nar = "1".repeat(52);
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(data_dir.join(format!("nar/{NAR_ID}.nar")), b"old-orphan")
+        .expect("old orphan should be written");
+    fs::write(
+        data_dir.join(format!("nar/{retained_orphan_nar}.nar")),
+        b"new-orphan",
+    )
+    .expect("new orphan should be written");
+
+    thread::sleep(Duration::from_secs(2));
+    let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
+    let narinfo_bytes = narinfo.len() as u64;
+    fs::write(data_dir.join(format!("{STORE_HASH}.narinfo")), narinfo)
+        .expect("published narinfo should be written");
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("published NAR should be written");
+
+    let published_bytes = narinfo_bytes + NAR_BYTES.len() as u64;
+    let retained_orphan_bytes = b"new-orphan".len() as u64;
+    let target_bytes = published_bytes + retained_orphan_bytes;
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let output = command()
+        .args(["gc", "--data-dir", path, "--target-bytes"])
+        .arg(target_bytes.to_string())
+        .args(["--min-age-seconds", "1", "--json"])
+        .output()
+        .expect("gc should run");
+
+    assert!(
+        output.status.success(),
+        "gc dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!(
+        "\"before_bytes\":{}",
+        published_bytes + b"old-orphan".len() as u64 + retained_orphan_bytes
+    )));
+    assert!(stdout.contains(&format!("\"after_bytes\":{target_bytes}")));
+    assert!(stdout.contains("\"evicted_bytes\":10"));
+    assert!(stdout.contains("\"candidates\":1"));
+    assert!(stdout.contains("\"target_met\":true"));
+    assert!(data_dir.join(format!("nar/{NAR_ID}.nar")).exists());
+    assert!(
+        data_dir
+            .join(format!("nar/{retained_orphan_nar}.nar"))
+            .exists()
+    );
+}
+#[test]
 fn gc_rejects_symlinked_narinfo_without_removing_it() {
     let data_dir = init_data_dir("operator-gc-symlink");
     fs::write(
