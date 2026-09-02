@@ -1,13 +1,12 @@
 use std::{
-    ffi::OsString,
-    ffi::{CString, OsStr},
+    ffi::{CStr, CString, OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Cursor, Read},
     mem::MaybeUninit,
     num::NonZeroUsize,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd},
         unix::ffi::OsStrExt,
         unix::fs::{OpenOptionsExt, PermissionsExt},
     },
@@ -163,6 +162,7 @@ impl Layout {
         self.root.join("nar")
     }
 
+    #[cfg(test)]
     fn nar_path(&self, id: &NarObjectId) -> PathBuf {
         self.nar_dir().join(format!("{}.nar", id.0))
     }
@@ -177,10 +177,6 @@ impl Layout {
 
     fn realisations_dir(&self) -> PathBuf {
         self.root.join("realisations")
-    }
-
-    fn lock_path(&self) -> PathBuf {
-        self.root.join("lock")
     }
 }
 
@@ -241,24 +237,24 @@ struct ProcessLock {
 }
 
 impl ProcessLock {
-    fn acquire(path: &Path) -> Result<Self, StorageError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(0o600)
-            .open(path)
-            .map_err(|error| {
-                io::Error::new(error.kind(), format!("lock {}: {error}", path.display()))
-            })?;
-        if !file.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("lock is not a regular file: {}", path.display()),
-            )
-            .into());
+    fn acquire(root: &File) -> Result<Self, StorageError> {
+        let file = open_at(
+            root,
+            OsStr::new("lock"),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .map_err(|error| io::Error::new(error.kind(), format!("lock: {error}")))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "lock is not a regular file").into(),
+            );
+        }
+        if metadata.permissions().mode() & 0o133 != 0 {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "lock has unsafe permissions").into(),
+            );
         }
         lock_exclusive(&file)?;
         Ok(Self { _file: file })
@@ -283,6 +279,7 @@ impl NarUploadPolicy {
 #[derive(Debug)]
 pub struct Storage {
     layout: Layout,
+    root: File,
     recovery: RecoveryState,
     publication_lock: Mutex<()>,
     _lock: ProcessLock,
@@ -292,17 +289,23 @@ impl Storage {
     pub fn initialize(root: impl AsRef<Path>) -> Result<Self, StorageError> {
         let layout = Layout::new(root.as_ref().to_owned());
         ensure_directory(&layout.root, "data directory")?;
-        let root_is_empty = RecoveryState::root_is_empty(&layout.root)?;
-        ensure_directory(&layout.nar_dir(), "nar directory")?;
-        ensure_directory(&layout.temp_dir(), "temporary directory")?;
-        ensure_directory(&layout.realisations_dir(), "realisations directory")?;
+        let root_directory = open_directory(&layout.root)?;
+        let root_is_empty = read_dir_names(&root_directory)?.is_empty();
+        ensure_directory_at(&root_directory, OsStr::new("nar"), "nar directory")?;
+        ensure_directory_at(&root_directory, OsStr::new(".tmp"), "temporary directory")?;
+        ensure_directory_at(
+            &root_directory,
+            OsStr::new("realisations"),
+            "realisations directory",
+        )?;
 
-        let lock = ProcessLock::acquire(&layout.lock_path())?;
-        sync_dir(&layout.root)?;
+        let lock = ProcessLock::acquire(&root_directory)?;
+        root_directory.sync_all()?;
 
         let recovery = RecoveryState::new(&layout.root);
         let storage = Self {
             layout,
+            root: root_directory,
             recovery,
             publication_lock: Mutex::new(()),
             _lock: lock,
@@ -615,7 +618,7 @@ impl Storage {
     }
 
     fn root_directory(&self) -> Result<File, StorageError> {
-        Ok(open_directory(&self.layout.root)?)
+        Ok(self.root.try_clone()?)
     }
 
     fn nar_directory(&self) -> Result<File, StorageError> {
@@ -727,6 +730,42 @@ fn ensure_directory(path: &Path, name: &str) -> io::Result<()> {
     }
 }
 
+fn ensure_directory_at(parent: &File, name: &OsStr, label: &str) -> io::Result<File> {
+    match open_directory_at(parent, name) {
+        Ok(directory) => validate_directory(&directory, label),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let name = CString::new(name.as_bytes()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage entry name contains a NUL byte",
+                )
+            })?;
+            // SAFETY: parent owns a live directory descriptor, name is
+            // NUL-terminated, and mkdirat does not retain the pointer.
+            let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+            let directory = open_directory_at(parent, OsStr::from_bytes(name.as_bytes()))?;
+            validate_directory(&directory, label)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_directory(directory: &File, name: &str) -> io::Result<File> {
+    if directory.metadata()?.permissions().mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} has unsafe permissions"),
+        ));
+    }
+    directory.try_clone()
+}
+
 fn open_directory(path: &Path) -> io::Result<File> {
     let directory = OpenOptions::new()
         .read(true)
@@ -775,7 +814,7 @@ fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File> {
     let file = open_at(
         directory,
         name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         0,
     )?;
     if !file.metadata()?.is_file() {
@@ -785,6 +824,32 @@ fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+pub(crate) fn entry_is_regular_at(directory: &File, name: &OsStr) -> io::Result<bool> {
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage entry name contains a NUL byte",
+        )
+    })?;
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory owns a live descriptor, name is NUL-terminated, and
+    // metadata points to writable storage for one stat value.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatat returned success, so it initialized metadata.
+    let metadata = unsafe { metadata.assume_init() };
+    Ok((metadata.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG)
 }
 
 fn open_optional_at(directory: &File, name: &OsStr) -> Result<Option<File>, StorageError> {
@@ -817,6 +882,46 @@ fn open_at(parent: &File, name: &OsStr, flags: i32, mode: u32) -> io::Result<Fil
     }
     // SAFETY: openat returned a new owned descriptor.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+pub(crate) fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
+    let directory = open_at(
+        directory,
+        OsStr::new("."),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )?;
+    let fd = directory.into_raw_fd();
+    // SAFETY: fd is a newly opened directory descriptor. On success,
+    // fdopendir transfers ownership to the DIR handle.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        // SAFETY: fdopendir failed and did not transfer ownership.
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: stream is a live DIR handle and remains valid until the
+        // matching closedir below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: d_name is a NUL-terminated entry name owned by stream and is
+        // copied before the next readdir call.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(OsStr::from_bytes(name.to_bytes()).to_owned());
+        }
+    }
+
+    // SAFETY: stream is the sole owner of the duplicated descriptor now.
+    if unsafe { libc::closedir(stream) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(names)
 }
 
 fn rollback_link_at(directory: &File, name: &OsStr) -> Result<(), StorageError> {

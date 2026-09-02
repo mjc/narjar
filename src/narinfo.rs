@@ -16,10 +16,12 @@ const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 pub(crate) fn read_narinfo(path: &Path) -> io::Result<Vec<u8>> {
+    read_narinfo_file(open_regular(path)?)
+}
+
+pub(crate) fn read_narinfo_file(file: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    open_regular(path)?
-        .take(MAX_NARINFO_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(MAX_NARINFO_BYTES + 1).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 

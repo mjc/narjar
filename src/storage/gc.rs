@@ -1,13 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 use crate::{
-    narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo},
-    storage::{NarObjectId, Storage, StorageError, StoreHash, open_regular, sync_dir},
+    narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
+    storage::{
+        NarObjectId, Storage, StorageError, StoreHash, open_regular_at, read_dir_names, unlink_at,
+    },
 };
 
 pub struct GcOptions {
@@ -58,15 +61,15 @@ struct Entry {
     nar: NarObjectId,
     store_path: String,
     references: Vec<String>,
-    narinfo_path: PathBuf,
-    nar_path: PathBuf,
+    narinfo_name: OsString,
+    nar_name: OsString,
     narinfo_bytes: u64,
     nar_bytes: u64,
     modified: SystemTime,
     protected: bool,
 }
 struct Orphan {
-    path: PathBuf,
+    name: OsString,
     bytes: u64,
     modified: SystemTime,
 }
@@ -169,43 +172,58 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
 
 fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError> {
     let mut entries = Vec::new();
-    for item in fs::read_dir(&storage.layout.root)? {
-        let item = item?;
-        let name = item.file_name();
-        let Some(name) = name.to_str() else {
+    let root = storage.root_directory()?;
+    let nar_directory = storage.nar_directory()?;
+    for name in read_dir_names(&root)? {
+        let Some(name_str) = name.to_str() else {
             continue;
         };
-        let Some(route) = name.strip_suffix(".narinfo") else {
+        let Some(route) = name_str.strip_suffix(".narinfo") else {
             continue;
         };
         let store = StoreHash::parse(route)
-            .map_err(|_| invalid(format!("invalid narinfo filename: {name}")))?;
-        if !item.file_type()?.is_file() {
-            return Err(invalid(format!("narinfo is not a regular file: {name}")));
-        }
-        let metadata = open_regular(&item.path())?.metadata()?;
+            .map_err(|_| invalid(format!("invalid narinfo filename: {name_str}")))?;
+        let narinfo = match open_regular_at(&root, &name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(invalid(format!(
+                    "narinfo disappeared during scan: {name_str}"
+                )));
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidData
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Err(invalid(format!(
+                    "narinfo is not a regular file: {name_str}"
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = narinfo.metadata()?;
 
-        let bytes = read_narinfo(&item.path())?;
+        let bytes = read_narinfo_file(narinfo)?;
         let validated = trusted
             .inspect(&store, bytes)
             .map_err(|error| match error {
-                PublishedNarInfoError::Malformed => invalid(format!("malformed narinfo: {name}")),
+                PublishedNarInfoError::Malformed => {
+                    invalid(format!("malformed narinfo: {name_str}"))
+                }
                 PublishedNarInfoError::UntrustedSignature => {
-                    invalid(format!("untrusted narinfo: {name}"))
+                    invalid(format!("untrusted narinfo: {name_str}"))
                 }
             })?;
-        let nar_path = storage.layout.nar_path(validated.nar());
-        let nar_metadata = open_regular(&nar_path)
+        let nar_name = OsString::from(format!("{}.nar", validated.nar().as_str()));
+        let nar_metadata = open_regular_at(&nar_directory, &nar_name)
             .and_then(|file| file.metadata())
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    invalid(format!("missing NAR for narinfo: {name}"))
-                } else {
-                    error.into()
-                }
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => invalid(format!("missing NAR for narinfo: {name_str}")),
+                _ => error.into(),
             })?;
         if nar_metadata.len() != validated.nar_size() {
-            return Err(invalid(format!("NAR size mismatch for narinfo: {name}")));
+            return Err(invalid(format!(
+                "NAR size mismatch for narinfo: {name_str}"
+            )));
         }
 
         entries.push(Entry {
@@ -213,8 +231,8 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
             nar: NarObjectId::parse(validated.nar().as_str()).expect("validated NAR id"),
             store_path: validated.store_path().to_owned(),
             references: validated.references().iter().cloned().collect(),
-            narinfo_path: item.path(),
-            nar_path,
+            narinfo_name: name,
+            nar_name,
             narinfo_bytes: metadata.len(),
             nar_bytes: nar_metadata.len(),
             modified: metadata.modified()?,
@@ -229,32 +247,26 @@ fn scan_orphans(storage: &Storage, entries: &[Entry]) -> Result<Vec<Orphan>, Sto
         .iter()
         .map(|entry| (entry.nar.0.clone(), ()))
         .collect::<BTreeMap<_, _>>();
-    let nar_dir = storage.layout.nar_dir();
-    if !fs::symlink_metadata(&nar_dir)
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false)
-    {
-        return Ok(Vec::new());
-    }
-
+    let nar_directory = storage.nar_directory()?;
     let mut orphans = Vec::new();
-    for item in fs::read_dir(&nar_dir)? {
-        let item = item?;
-        let Some(name) = item.file_name().to_str().map(str::to_owned) else {
+    for name in read_dir_names(&nar_directory)? {
+        let Some(name_str) = name.to_str() else {
             continue;
         };
-        let Some(identifier) = name.strip_suffix(".nar") else {
+        let Some(identifier) = name_str.strip_suffix(".nar") else {
             continue;
         };
-        if NarObjectId::parse(identifier).is_err() || !item.file_type()?.is_file() {
+        if NarObjectId::parse(identifier).is_err()
+            || !super::entry_is_regular_at(&nar_directory, &name)?
+        {
             continue;
         }
         if referenced.contains_key(identifier) {
             continue;
         }
-        let metadata = item.metadata()?;
+        let metadata = open_regular_at(&nar_directory, &name)?.metadata()?;
         orphans.push(Orphan {
-            path: item.path(),
+            name,
             bytes: metadata.len(),
             modified: metadata.modified()?,
         });
@@ -292,18 +304,13 @@ fn shared_count(entries: &[Entry]) -> usize {
 }
 
 fn temporary_inventory(path: &Path) -> Result<(usize, u64), StorageError> {
-    if !fs::symlink_metadata(path)
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false)
-    {
-        return Ok((0, 0));
-    }
+    let directory = super::open_directory(path)?;
     let mut count = 0;
     let mut bytes = 0;
-    for item in fs::read_dir(path)? {
-        let item = item?;
-        if item.file_type()?.is_file() {
-            bytes += item.metadata()?.len();
+    for name in read_dir_names(&directory)? {
+        if super::entry_is_regular_at(&directory, &name)? {
+            let metadata = super::open_regular_at(&directory, &name)?.metadata()?;
+            bytes += metadata.len();
             count += 1;
         }
     }
@@ -569,23 +576,25 @@ fn apply_with_failure(
     failure: Option<FailurePoint>,
 ) -> Result<(usize, usize), StorageError> {
     storage.recovery.require()?;
+    let root = storage.root_directory()?;
+    let nar_directory = storage.nar_directory()?;
     let mut references = reference_counts(entries);
     let mut deleted_nars = 0;
     for &index in selected {
         let entry = &entries[index];
         fail_if(failure, FailurePoint::BeforeNarinfoDelete)?;
-        fs::remove_file(&entry.narinfo_path)?;
+        unlink_at(&root, &entry.narinfo_name)?;
         fail_if(failure, FailurePoint::AfterNarinfoDeleteBeforeSync)?;
-        sync_dir(&storage.layout.root)?;
+        root.sync_all()?;
         let count = references
             .get_mut(&entry.nar.0)
             .expect("scanned reference count");
         *count -= 1;
         fail_if(failure, FailurePoint::AfterNarinfoSyncBeforeNarDelete)?;
         if *count == 0 {
-            fs::remove_file(&entry.nar_path)?;
+            unlink_at(&nar_directory, &entry.nar_name)?;
             fail_if(failure, FailurePoint::AfterNarDeleteBeforeSync)?;
-            sync_dir(&storage.layout.nar_dir())?;
+            nar_directory.sync_all()?;
             deleted_nars += 1;
         }
     }
@@ -606,12 +615,13 @@ fn apply_orphans_with_failure(
     selected: &[usize],
     failure: Option<FailurePoint>,
 ) -> Result<usize, StorageError> {
+    let nar_directory = storage.nar_directory()?;
     for &index in selected {
         fail_if(failure, FailurePoint::DuringOrphanCleanup)?;
-        fs::remove_file(&orphans[index].path)?;
+        unlink_at(&nar_directory, &orphans[index].name)?;
     }
     if !selected.is_empty() {
-        sync_dir(&storage.layout.nar_dir())?;
+        nar_directory.sync_all()?;
     }
     Ok(selected.len())
 }
@@ -731,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn temporary_inventory_does_not_follow_a_symlinked_directory() {
+    fn temporary_inventory_rejects_a_symlinked_directory() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let target = directory.path().join("external");
         let temporary = directory.path().join(".tmp");
@@ -739,14 +749,11 @@ mod tests {
         fs::write(target.join("escaped"), vec![0; 17]).expect("external file should be written");
         symlink(&target, &temporary).expect("temporary directory symlink should be created");
 
-        assert_eq!(
-            temporary_inventory(&temporary).expect("scan temporary directory"),
-            (0, 0)
-        );
+        assert!(temporary_inventory(&temporary).is_err());
     }
 
     #[test]
-    fn orphan_scan_does_not_follow_a_symlinked_nar_directory() {
+    fn orphan_scan_rejects_a_symlinked_nar_directory() {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
         let storage = Storage::initialize(directory.path()).expect("storage should initialize");
         let nar_dir = storage.layout.nar_dir();
@@ -761,11 +768,7 @@ mod tests {
         .expect("write external NAR");
         symlink(&external, &nar_dir).expect("create NAR directory symlink");
 
-        assert!(
-            scan_orphans(&storage, &[])
-                .expect("scan orphans")
-                .is_empty()
-        );
+        assert!(scan_orphans(&storage, &[]).is_err());
     }
 
     const TEST_STORE_HASH: &str = "00000000000000000000000000000000";
@@ -776,8 +779,9 @@ mod tests {
         let storage = Storage::initialize(directory.path()).expect("storage should initialize");
         let store = StoreHash::parse(TEST_STORE_HASH).expect("store hash should parse");
         let nar = NarObjectId::parse(TEST_NAR_ID).expect("NAR id should parse");
-        let narinfo_path = directory.path().join(format!("{TEST_STORE_HASH}.narinfo"));
+        let narinfo_name = OsString::from(format!("{TEST_STORE_HASH}.narinfo"));
         let nar_path = storage.layout.nar_path(&nar);
+        let narinfo_path = directory.path().join(&narinfo_name);
         fs::write(&narinfo_path, b"published").expect("narinfo should be written");
         fs::write(&nar_path, b"nar").expect("NAR should be written");
 
@@ -786,8 +790,8 @@ mod tests {
             nar,
             store_path: format!("/nix/store/{TEST_STORE_HASH}-narjar"),
             references: Vec::new(),
-            narinfo_path,
-            nar_path,
+            narinfo_name,
+            nar_name: OsString::from(format!("{TEST_NAR_ID}.nar")),
             narinfo_bytes: 9,
             nar_bytes: 3,
             modified: SystemTime::now(),
@@ -810,7 +814,14 @@ mod tests {
             let entries = [entry];
 
             assert!(apply_with_failure(&storage, &entries, &[0], Some(point)).is_err());
-            assert!(!entries[0].narinfo_path.exists() || entries[0].nar_path.exists());
+            assert!(
+                !directory.path().join(&entries[0].narinfo_name).exists()
+                    || directory
+                        .path()
+                        .join("nar")
+                        .join(&entries[0].nar_name)
+                        .exists()
+            );
             assert!(
                 storage
                     .recovery_required()
@@ -835,7 +846,7 @@ mod tests {
         let path = storage.layout.nar_path(&nar);
         fs::write(&path, b"orphan").expect("orphan should be written");
         let orphan = Orphan {
-            path: path.clone(),
+            name: OsString::from(format!("{TEST_NAR_ID}.nar")),
             bytes: 6,
             modified: SystemTime::now(),
         };

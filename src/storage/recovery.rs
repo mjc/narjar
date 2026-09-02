@@ -25,14 +25,6 @@ impl RecoveryState {
         }
     }
 
-    pub(super) fn root_is_empty(path: &Path) -> io::Result<bool> {
-        match fs::read_dir(path) {
-            Ok(mut entries) => Ok(entries.next().transpose()?.is_none()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-            Err(error) => Err(error),
-        }
-    }
-
     pub(super) fn initialize_clean(&self) -> Result<(), StorageError> {
         self.create_marker(&self.clean)
     }
