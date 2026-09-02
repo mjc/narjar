@@ -295,8 +295,11 @@ fn temporary_inventory(path: &Path) -> Result<(usize, u64), StorageError> {
     let mut count = 0;
     let mut bytes = 0;
     for item in fs::read_dir(path)? {
-        bytes += item?.metadata()?.len();
-        count += 1;
+        let item = item?;
+        if item.file_type()?.is_file() {
+            bytes += item.metadata()?.len();
+            count += 1;
+        }
     }
     Ok((count, bytes))
 }
@@ -616,6 +619,7 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        os::unix::fs::symlink,
         time::{Duration, UNIX_EPOCH},
     };
 
@@ -702,6 +706,21 @@ mod tests {
                 now,
             ),
             vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn temporary_inventory_does_not_follow_symlinks() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let target = directory.path().join("external");
+        let temporary = directory.path().join(".tmp");
+        fs::create_dir(&temporary).expect("temporary directory should be created");
+        fs::write(&target, vec![0; 17]).expect("external target should be written");
+        symlink(&target, temporary.join("escaped")).expect("temporary symlink should be created");
+
+        assert_eq!(
+            temporary_inventory(&temporary).expect("scan temporary directory"),
+            (0, 0)
         );
     }
 
