@@ -2012,3 +2012,64 @@ fn restored_cache_verifies_before_serving() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn gc_dry_run_preserves_and_apply_removes_old_pair() {
+    let data_dir = init_data_dir("operator-gc");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("NAR should be written");
+    fs::write(
+        data_dir.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("narinfo should be written");
+
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let dry_run = run(&[
+        "gc",
+        "--data-dir",
+        path,
+        "--target-bytes",
+        "0",
+        "--min-age-seconds",
+        "0",
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(
+        dry_run.status.success(),
+        "gc dry-run failed: {}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    assert!(data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+    assert!(data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
+    assert!(String::from_utf8_lossy(&dry_run.stdout).contains("\"dry_run\":true"));
+
+    let apply = run(&[
+        "gc",
+        "--data-dir",
+        path,
+        "--target-bytes",
+        "0",
+        "--min-age-seconds",
+        "0",
+        "--apply",
+        "--json",
+    ]);
+    assert!(
+        apply.status.success(),
+        "gc apply failed: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert!(!data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+    assert!(!data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
+    assert!(String::from_utf8_lossy(&apply.stdout).contains("\"deleted_narinfos\":1"));
+}

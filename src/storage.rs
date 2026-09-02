@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::narinfo::ValidatedNarInfo;
 
-mod gc;
+pub mod gc;
 mod reconcile;
 mod recovery;
 

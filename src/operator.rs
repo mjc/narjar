@@ -12,7 +12,10 @@ use ed25519_dalek::SigningKey;
 use narjar::{
     inventory::{Inventory, InventoryClass, MAX_NARINFO_BYTES, narinfo_is_valid},
     narinfo::TrustedPublicKeys,
-    storage::{Storage, StoreHash},
+    storage::{
+        Storage, StoreHash,
+        gc::{self, GcOptions},
+    },
 };
 
 use crate::error::Error;
@@ -256,8 +259,52 @@ pub(crate) struct Gc {
 }
 
 pub(crate) fn gc(options: Gc) -> Result<(), Error> {
-    let _ = options;
-    Err(Error::runtime("garbage collection not implemented"))
+    let Gc {
+        data_dir,
+        max_bytes,
+        target_bytes,
+        max_age_seconds,
+        min_age_seconds,
+        protected_roots,
+        dry_run: _,
+        apply,
+        json,
+    } = options;
+    let report = gc::run(GcOptions {
+        data_dir,
+        max_bytes,
+        target_bytes,
+        max_age: max_age_seconds.map(std::time::Duration::from_secs),
+        min_age: std::time::Duration::from_secs(min_age_seconds),
+        protected_roots,
+        apply,
+    })
+    .map_err(runtime)?;
+
+    if json {
+        println!(
+            "{{\"dry_run\":{},\"before_bytes\":{},\"after_bytes\":{},\"target_met\":{},\"candidates\":{},\"deleted_narinfos\":{},\"deleted_nars\":{}}}",
+            report.dry_run,
+            report.before_bytes,
+            report.after_bytes,
+            report.target_met,
+            report.candidates,
+            report.deleted_narinfos,
+            report.deleted_nars,
+        );
+    } else {
+        println!(
+            "dry_run={} before_bytes={} after_bytes={} target_met={} candidates={} deleted_narinfos={} deleted_nars={}",
+            report.dry_run,
+            report.before_bytes,
+            report.after_bytes,
+            report.target_met,
+            report.candidates,
+            report.deleted_narinfos,
+            report.deleted_nars,
+        );
+    }
+    Ok(())
 }
 
 #[derive(Args)]

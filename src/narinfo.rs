@@ -153,6 +153,8 @@ impl NamedSignature {
 
 #[derive(Debug)]
 struct ParsedNarInfo {
+    store_path: String,
+    references: BTreeSet<String>,
     nar: NarObjectId,
     nar_size: u64,
     fingerprint: String,
@@ -229,7 +231,11 @@ impl ParsedNarInfo {
         let references = parse_references(required("References")?)?;
         let fingerprint = format!(
             "1;{store_path};sha256:{url_hash};{nar_size};{}",
-            references.into_iter().collect::<Vec<_>>().join(",")
+            references
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
         );
         let signatures = signature_values
             .into_iter()
@@ -240,6 +246,8 @@ impl ParsedNarInfo {
         }
 
         Ok(Self {
+            store_path: store_path.to_owned(),
+            references,
             nar,
             nar_size,
             fingerprint,
@@ -253,6 +261,14 @@ impl ParsedNarInfo {
 pub struct ValidatedNarInfo(ParsedNarInfo);
 
 impl ValidatedNarInfo {
+    pub(crate) fn store_path(&self) -> &str {
+        &self.0.store_path
+    }
+
+    pub(crate) fn references(&self) -> &BTreeSet<String> {
+        &self.0.references
+    }
+
     pub(crate) fn nar(&self) -> &NarObjectId {
         &self.0.nar
     }
