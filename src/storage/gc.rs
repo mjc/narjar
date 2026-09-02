@@ -85,6 +85,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     }
 
     let storage = Storage::initialize(&options.data_dir)?;
+    let trusted_keys_path = options.data_dir.join("trusted-public-keys");
     let trusted = TrustedPublicKeys::load(&options.data_dir.join("trusted-public-keys"))
         .map_err(|error| invalid(error.to_string()))?;
     let mut entries = scan(&storage, &trusted)?;
@@ -129,9 +130,18 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
         (0, 0, 0)
     } else {
-        let (deleted_narinfos, deleted_nars) = apply(&storage, &entries, &selected)?;
-        let deleted_orphans = apply_orphans(&storage, &orphans, &selected_orphans)?;
-        (deleted_narinfos, deleted_nars, deleted_orphans)
+        let result = (|| {
+            let (deleted_narinfos, deleted_nars) = apply(&storage, &entries, &selected)?;
+            let deleted_orphans = apply_orphans(&storage, &orphans, &selected_orphans)?;
+            Ok((deleted_narinfos, deleted_nars, deleted_orphans))
+        })();
+        match result {
+            Ok(deleted) => {
+                storage.recovery.finish(&trusted_keys_path)?;
+                deleted
+            }
+            Err(error) => return Err(error),
+        }
     };
 
     Ok(GcReport {
@@ -537,6 +547,7 @@ fn apply_with_failure(
     selected: &[usize],
     failure: Option<FailurePoint>,
 ) -> Result<(usize, usize), StorageError> {
+    storage.recovery.require()?;
     let mut references = reference_counts(entries);
     let mut deleted_nars = 0;
     for &index in selected {
@@ -720,11 +731,23 @@ mod tests {
         ];
 
         for point in points {
-            let (_directory, storage, entry) = pair_fixture();
+            let (directory, storage, entry) = pair_fixture();
             let entries = [entry];
 
             assert!(apply_with_failure(&storage, &entries, &[0], Some(point)).is_err());
             assert!(!entries[0].narinfo_path.exists() || entries[0].nar_path.exists());
+            assert!(
+                storage
+                    .recovery_required()
+                    .expect("recovery state should be readable")
+            );
+            drop(storage);
+            let reopened = Storage::initialize(directory.path()).expect("storage should reopen");
+            assert!(
+                reopened
+                    .recovery_required()
+                    .expect("recovery state should be readable")
+            );
         }
     }
 
