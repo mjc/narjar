@@ -610,13 +610,17 @@ fn nix_cache_info_get_and_head_match_contract() {
         .expect("GET response should be UTF-8");
     let head = String::from_utf8(server.request("HEAD", "/nix-cache-info"))
         .expect("HEAD response should be UTF-8");
+    let legacy_get = String::from_utf8(server.request("GET", "/main/nix-cache-info"))
+        .expect("legacy GET response should be UTF-8");
+    let legacy_head = String::from_utf8(server.request("HEAD", "/main/nix-cache-info"))
+        .expect("legacy HEAD response should be UTF-8");
     let (signal, status) = server.stop();
 
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 
     let body = "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
-    for response in [&get, &head] {
+    for response in [&get, &head, &legacy_get, &legacy_head] {
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response:?}");
         assert!(
             response.contains("Content-Type: text/x-nix-cache-info\r\n"),
@@ -630,6 +634,11 @@ fn nix_cache_info_get_and_head_match_contract() {
     }
     assert!(get.ends_with(&format!("\r\n\r\n{body}")), "{get:?}");
     assert!(head.ends_with("\r\n\r\n"), "{head:?}");
+    assert!(
+        legacy_get.ends_with(&format!("\r\n\r\n{body}")),
+        "{legacy_get:?}"
+    );
+    assert!(legacy_head.ends_with("\r\n\r\n"), "{legacy_head:?}");
 }
 
 #[test]

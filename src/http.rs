@@ -197,11 +197,18 @@ enum RouteMatch {
 
 impl ReadRoute {
     fn classify(url: &str) -> RouteMatch {
-        if url == "/nix-cache-info" {
-            return RouteMatch::Found(Self::CacheInfo);
-        }
         if url.starts_with("//") || url.contains(['\\', '?', '#']) {
             return RouteMatch::Invalid;
+        }
+        let url = match url.strip_prefix("/main") {
+            Some("") => return RouteMatch::Invalid,
+            Some(path) if path.starts_with('/') => path,
+            Some(_) => return RouteMatch::Missing,
+            None => url,
+        };
+
+        if url == "/nix-cache-info" {
+            return RouteMatch::Found(Self::CacheInfo);
         }
 
         if let Some(path) = url.strip_prefix("/nar/") {
@@ -495,5 +502,28 @@ pub fn respond(
         }
         ReadRoute::Nar(id) => respond_nar(request, storage, &id),
         ReadRoute::NarInfo(store) => respond_narinfo(request, storage, &store, trusted),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadRoute, RouteMatch};
+
+    #[test]
+    fn legacy_main_prefix_maps_to_cache_routes() {
+        assert!(matches!(
+            ReadRoute::classify("/main/nix-cache-info"),
+            RouteMatch::Found(ReadRoute::CacheInfo)
+        ));
+        assert!(matches!(
+            ReadRoute::classify("/main/00000000000000000000000000000000.narinfo"),
+            RouteMatch::Found(ReadRoute::NarInfo(_))
+        ));
+        assert!(matches!(
+            ReadRoute::classify(
+                "/main/nar/0000000000000000000000000000000000000000000000000000.nar"
+            ),
+            RouteMatch::Found(ReadRoute::Nar(_))
+        ));
     }
 }
