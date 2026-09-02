@@ -86,8 +86,8 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
 
     let storage = Storage::initialize(&options.data_dir)?;
     let trusted_keys_path = options.data_dir.join("trusted-public-keys");
-    let trusted = TrustedPublicKeys::load(&options.data_dir.join("trusted-public-keys"))
-        .map_err(|error| invalid(error.to_string()))?;
+    let trusted =
+        TrustedPublicKeys::load(&trusted_keys_path).map_err(|error| invalid(error.to_string()))?;
     let mut entries = scan(&storage, &trusted)?;
     let protection = protect(&mut entries, options.protected_roots.as_deref())?;
     let orphans = scan_orphans(&storage, &entries)?;
