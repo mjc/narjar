@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    fs::{self, File},
     io::{self, Read},
     os::unix::fs::MetadataExt,
     path::Path,
@@ -10,14 +9,13 @@ use std::{
 use data_encoding::BASE64;
 use ed25519_dalek::{Signature, VerifyingKey};
 
-use crate::storage::{NarObjectId, StoreHash, open_regular};
+use crate::storage::{
+    NarObjectId, StoreHash, entry_is_regular_at, open_directory, open_regular, open_regular_at,
+    read_dir_names,
+};
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
-
-pub(crate) fn read_narinfo(path: &Path) -> io::Result<Vec<u8>> {
-    read_narinfo_file(open_regular(path)?)
-}
 
 pub(crate) fn read_narinfo_file(file: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -30,7 +28,7 @@ pub struct TrustedPublicKeys(BTreeMap<String, VerifyingKey>);
 
 impl TrustedPublicKeys {
     pub fn load(path: &Path) -> Result<Self, TrustError> {
-        let mut file = match File::open(path) {
+        let mut file = match open_regular(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(error.into()),
@@ -93,20 +91,19 @@ impl TrustedPublicKeys {
     }
 
     pub fn validate_published(&self, root: &Path) -> Result<(), TrustError> {
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            let name = entry.file_name();
+        let root_directory = open_directory(root)?;
+        for name in read_dir_names(&root_directory)? {
             let Some(route) = name.to_str().and_then(|name| name.strip_suffix(".narinfo")) else {
                 continue;
             };
             let Ok(route) = StoreHash::parse(route) else {
                 continue;
             };
-            if !entry.file_type()?.is_file() {
+            if !entry_is_regular_at(&root_directory, &name)? {
                 return Err(TrustError::UntrustedPublishedNarInfo);
             }
 
-            let bytes = read_narinfo(&entry.path())?;
+            let bytes = read_narinfo_file(open_regular_at(&root_directory, &name)?)?;
             if self.validate(&route, bytes).is_err() {
                 return Err(TrustError::UntrustedPublishedNarInfo);
             }

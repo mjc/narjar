@@ -352,7 +352,7 @@ impl Storage {
             PublishTarget::Nar(id),
             CheckedNarReader::new(source, &id.0, expected_length),
             || {
-                if available_bytes(&self.layout.root)? < required_bytes {
+                if available_bytes(&self.root)? < required_bytes {
                     return Err(StorageError::InsufficientSpace);
                 }
                 Ok(())
@@ -465,7 +465,7 @@ impl Storage {
     }
 
     pub fn is_ready(&self, min_free_bytes: u64) -> Result<bool, StorageError> {
-        Ok(available_bytes(&self.layout.root)? >= min_free_bytes)
+        Ok(available_bytes(&self.root)? >= min_free_bytes)
     }
 
     pub fn reconcile(
@@ -709,8 +709,7 @@ impl std::error::Error for StorageError {
     }
 }
 
-fn available_bytes(path: &Path) -> io::Result<u64> {
-    let directory = open_directory(path)?;
+fn available_bytes(directory: &File) -> io::Result<u64> {
     let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
 
     // SAFETY: directory owns a valid descriptor for the duration of the call,
