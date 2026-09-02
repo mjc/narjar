@@ -283,7 +283,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
 
     if json {
         println!(
-            "{{\"dry_run\":{},\"before_bytes\":{},\"after_bytes\":{},\"target_met\":{},\"candidates\":{},\"protected\":{},\"eligible\":{},\"evicted\":{},\"shared\":{},\"orphaned\":{},\"temporary\":{},\"malformed\":{},\"missing_roots\":{},\"missing_references\":{},\"deleted_narinfos\":{},\"deleted_nars\":{},\"deleted_orphans\":{}}}",
+            "{{\"dry_run\":{},\"before_bytes\":{},\"after_bytes\":{},\"target_met\":{},\"candidates\":{},\"protected\":{},\"eligible\":{},\"evicted\":{},\"shared\":{},\"orphaned\":{},\"temporary\":{},\"malformed\":{},\"missing_roots\":{},\"missing_references\":{},\"protected_bytes\":{},\"eligible_bytes\":{},\"evicted_bytes\":{},\"shared_bytes\":{},\"orphaned_bytes\":{},\"temporary_bytes\":{},\"malformed_bytes\":{},\"deleted_narinfos\":{},\"deleted_nars\":{},\"deleted_orphans\":{}}}",
             report.dry_run,
             report.before_bytes,
             report.after_bytes,
@@ -298,13 +298,20 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
             report.malformed,
             report.missing_roots,
             report.missing_references,
+            report.protected_bytes,
+            report.eligible_bytes,
+            report.evicted_bytes,
+            report.shared_bytes,
+            report.orphaned_bytes,
+            report.temporary_bytes,
+            report.malformed_bytes,
             report.deleted_narinfos,
             report.deleted_nars,
             report.deleted_orphans,
         );
     } else {
         println!(
-            "dry_run={} before_bytes={} after_bytes={} target_met={} candidates={} protected={} eligible={} evicted={} shared={} orphaned={} temporary={} malformed={} missing_roots={} missing_references={} deleted_narinfos={} deleted_nars={} deleted_orphans={}",
+            "dry_run={} before_bytes={} after_bytes={} target_met={} candidates={} protected={} eligible={} evicted={} shared={} orphaned={} temporary={} malformed={} missing_roots={} missing_references={} protected_bytes={} eligible_bytes={} evicted_bytes={} shared_bytes={} orphaned_bytes={} temporary_bytes={} malformed_bytes={} deleted_narinfos={} deleted_nars={} deleted_orphans={}",
             report.dry_run,
             report.before_bytes,
             report.after_bytes,
@@ -319,6 +326,13 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
             report.malformed,
             report.missing_roots,
             report.missing_references,
+            report.protected_bytes,
+            report.eligible_bytes,
+            report.evicted_bytes,
+            report.shared_bytes,
+            report.orphaned_bytes,
+            report.temporary_bytes,
+            report.malformed_bytes,
             report.deleted_narinfos,
             report.deleted_nars,
             report.deleted_orphans,

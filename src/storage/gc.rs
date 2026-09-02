@@ -35,6 +35,13 @@ pub struct GcReport {
     pub malformed: usize,
     pub missing_roots: usize,
     pub missing_references: usize,
+    pub protected_bytes: u64,
+    pub eligible_bytes: u64,
+    pub evicted_bytes: u64,
+    pub shared_bytes: u64,
+    pub orphaned_bytes: u64,
+    pub temporary_bytes: u64,
+    pub malformed_bytes: u64,
     pub deleted_narinfos: usize,
     pub deleted_nars: usize,
     pub deleted_orphans: usize,
@@ -83,12 +90,15 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     let mut entries = scan(&storage, &trusted)?;
     let protection = protect(&mut entries, options.protected_roots.as_deref())?;
     let orphans = scan_orphans(&storage, &entries)?;
+    let protected_bytes = category_bytes(&entries, |entry| entry.protected);
 
     let before_bytes = total_bytes(&entries) + orphan_bytes(&orphans);
     let now = SystemTime::now();
     let eligible = eligible_count(&entries, &orphans, now, options.min_age);
+    let eligible_bytes_total = eligible_bytes(&entries, &orphans, now, options.min_age);
     let shared = shared_count(&entries);
-    let temporary = count_entries(&storage.layout.temp_dir())?;
+    let shared_bytes_total = shared_bytes(&entries);
+    let (temporary, temporary_bytes) = temporary_inventory(&storage.layout.temp_dir())?;
     let selected = select(
         &entries,
         before_bytes,
@@ -114,6 +124,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
             .map(|&index| orphans[index].bytes)
             .sum(),
     );
+    let evicted_bytes = before_bytes.saturating_sub(after_bytes);
     let dry_run = !options.apply;
     let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
         (0, 0, 0)
@@ -138,6 +149,13 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         malformed: 0,
         missing_roots: protection.missing_roots,
         missing_references: protection.missing_references,
+        protected_bytes,
+        eligible_bytes: eligible_bytes_total,
+        evicted_bytes,
+        shared_bytes: shared_bytes_total,
+        orphaned_bytes: orphan_bytes(&orphans),
+        temporary_bytes,
+        malformed_bytes: 0,
         deleted_narinfos,
         deleted_nars,
         deleted_orphans,
@@ -263,16 +281,54 @@ fn shared_count(entries: &[Entry]) -> usize {
         .count()
 }
 
-fn count_entries(path: &Path) -> Result<usize, StorageError> {
+fn temporary_inventory(path: &Path) -> Result<(usize, u64), StorageError> {
     if !path.is_dir() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let mut count = 0;
+    let mut bytes = 0;
     for item in fs::read_dir(path)? {
-        item?;
+        bytes += item?.metadata()?.len();
         count += 1;
     }
-    Ok(count)
+    Ok((count, bytes))
+}
+
+fn category_bytes(entries: &[Entry], include: impl Fn(&Entry) -> bool) -> u64 {
+    let mut total = 0;
+    let mut nars = BTreeMap::new();
+    for entry in entries.iter().filter(|entry| include(entry)) {
+        total += entry.narinfo_bytes;
+        nars.entry(entry.nar.0.clone()).or_insert(entry.nar_bytes);
+    }
+    total + nars.values().copied().sum::<u64>()
+}
+
+fn shared_bytes(entries: &[Entry]) -> u64 {
+    let counts = reference_counts(entries);
+    let mut sizes = BTreeMap::new();
+    for entry in entries {
+        sizes.entry(entry.nar.0.clone()).or_insert(entry.nar_bytes);
+    }
+    counts
+        .into_iter()
+        .filter_map(|(nar, count)| (count > 1).then(|| sizes[&nar]))
+        .sum()
+}
+
+fn eligible_bytes(
+    entries: &[Entry],
+    orphans: &[Orphan],
+    now: SystemTime,
+    min_age: Duration,
+) -> u64 {
+    category_bytes(entries, |entry| {
+        !entry.protected && now.duration_since(entry.modified).unwrap_or_default() >= min_age
+    }) + orphans
+        .iter()
+        .filter(|orphan| now.duration_since(orphan.modified).unwrap_or_default() >= min_age)
+        .map(|orphan| orphan.bytes)
+        .sum::<u64>()
 }
 
 fn protect(entries: &mut [Entry], path: Option<&Path>) -> Result<ProtectionReport, StorageError> {

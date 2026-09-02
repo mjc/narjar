@@ -2291,6 +2291,8 @@ fn gc_reclaims_old_orphan_nars() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"deleted_orphans\":1"));
     assert!(stdout.contains("\"temporary\":1"));
+    assert!(stdout.contains("\"orphaned_bytes\":6"));
+    assert!(stdout.contains("\"temporary_bytes\":4"));
 }
 
 #[test]
