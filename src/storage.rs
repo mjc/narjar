@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     ffi::{CString, OsStr},
     fmt,
     fs::{self, File, OpenOptions},
@@ -178,10 +179,6 @@ impl Layout {
         self.root.join("realisations")
     }
 
-    fn cache_info_path(&self) -> PathBuf {
-        self.root.join("nix-cache-info")
-    }
-
     fn lock_path(&self) -> PathBuf {
         self.root.join("lock")
     }
@@ -194,11 +191,11 @@ enum PublishTarget<'a> {
 }
 
 impl PublishTarget<'_> {
-    fn destination(&self, layout: &Layout) -> PathBuf {
+    fn destination_name(&self) -> OsString {
         match self {
-            Self::CacheInfo => layout.cache_info_path(),
-            Self::Nar(id) => layout.nar_path(id),
-            Self::NarInfo(store) => layout.narinfo_path(store),
+            Self::CacheInfo => OsString::from("nix-cache-info"),
+            Self::Nar(id) => OsString::from(format!("{}.nar", id.as_str())),
+            Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
         }
     }
 
@@ -209,6 +206,13 @@ impl PublishTarget<'_> {
             Self::NarInfo(_) => "narinfo",
         }
     }
+}
+
+#[derive(Debug)]
+struct TemporaryFile {
+    name: OsString,
+    directory: File,
+    file: File,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -516,35 +520,43 @@ impl Storage {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         admit()?;
         self.recovery.require()?;
-        let destination = target.destination(&self.layout);
+        let destination_directory = self.destination_directory(&target)?;
+        let destination_name = target.destination_name();
         checkpoint(PublishBoundary::BeforeTempCreate)?;
-        let (temp_path, mut temp) = self.create_temp(&target)?;
+        let mut temp = self.create_temp(&target)?;
         let result = (|| {
             checkpoint(PublishBoundary::AfterTempCreate)?;
-            io::copy(&mut source, &mut temp)?;
+            io::copy(&mut source, &mut temp.file)?;
             checkpoint(PublishBoundary::AfterStream)?;
-            temp.sync_all()?;
+            temp.file.sync_all()?;
             checkpoint(PublishBoundary::AfterTempSync)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
 
-            match fs::hard_link(&temp_path, &destination) {
+            match hard_link_at(
+                &temp.directory,
+                &temp.name,
+                &destination_directory,
+                &destination_name,
+            ) {
                 Ok(()) => {
-                    let parent = destination
-                        .parent()
-                        .expect("validated storage destination has a parent");
                     if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
-                        rollback_link(&destination, parent)?;
+                        rollback_link_at(&destination_directory, &destination_name)?;
                         return Err(error);
                     }
-                    if let Err(error) = sync_dir(parent) {
-                        rollback_link(&destination, parent)?;
+                    if let Err(error) = destination_directory.sync_all() {
+                        rollback_link_at(&destination_directory, &destination_name)?;
                         return Err(error.into());
                     }
                     checkpoint(PublishBoundary::AfterParentSync)?;
                     Ok(PublishOutcome::Created)
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if files_equal(&temp_path, &destination)? {
+                    if files_equal_at(
+                        &temp.directory,
+                        &temp.name,
+                        &destination_directory,
+                        &destination_name,
+                    )? {
                         Ok(PublishOutcome::Identical)
                     } else {
                         Err(StorageError::Conflict)
@@ -554,10 +566,7 @@ impl Storage {
             }
         })();
 
-        drop(temp);
-        let cleanup = fs::remove_file(&temp_path)
-            .and_then(|()| sync_dir(&self.layout.temp_dir()))
-            .map_err(StorageError::from);
+        let cleanup = remove_temp(&temp).map_err(StorageError::from);
 
         match result {
             Ok(outcome) => {
@@ -572,25 +581,26 @@ impl Storage {
         }
     }
 
-    fn create_temp(&self, target: &PublishTarget<'_>) -> Result<(PathBuf, File), StorageError> {
+    fn create_temp(&self, target: &PublishTarget<'_>) -> Result<TemporaryFile, StorageError> {
         ensure_directory(&self.layout.temp_dir(), "temporary directory")?;
+        let directory = self.temp_directory()?;
         let prefix = target.temp_prefix();
         for _ in 0..TEMP_ATTEMPTS {
             let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-            let path = self
-                .layout
-                .temp_dir()
-                .join(format!("{prefix}-{}-{sequence:016x}.part", process::id()));
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
+            let name = OsString::from(format!("{prefix}-{}-{sequence:016x}.part", process::id()));
+            match open_at(
+                &directory,
+                &name,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            ) {
                 Ok(file) => {
                     file.set_permissions(fs::Permissions::from_mode(0o600))?;
-                    return Ok((path, file));
+                    return Ok(TemporaryFile {
+                        name,
+                        directory,
+                        file,
+                    });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
@@ -611,6 +621,18 @@ impl Storage {
     fn nar_directory(&self) -> Result<File, StorageError> {
         let root = self.root_directory()?;
         Ok(open_directory_at(&root, OsStr::new("nar"))?)
+    }
+
+    fn temp_directory(&self) -> Result<File, StorageError> {
+        let root = self.root_directory()?;
+        Ok(open_directory_at(&root, OsStr::new(".tmp"))?)
+    }
+
+    fn destination_directory(&self, target: &PublishTarget<'_>) -> Result<File, StorageError> {
+        match target {
+            PublishTarget::Nar(_) => self.nar_directory(),
+            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.root_directory(),
+        }
     }
 }
 
@@ -797,9 +819,9 @@ fn open_at(parent: &File, name: &OsStr, flags: i32, mode: u32) -> io::Result<Fil
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn rollback_link(destination: &Path, parent: &Path) -> Result<(), StorageError> {
-    fs::remove_file(destination)?;
-    sync_dir(parent)?;
+fn rollback_link_at(directory: &File, name: &OsStr) -> Result<(), StorageError> {
+    unlink_at(directory, name)?;
+    directory.sync_all()?;
     Ok(())
 }
 
@@ -827,9 +849,14 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     open_directory(path)?.sync_all()
 }
 
-fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
-    let mut left = open_regular(left)?;
-    let mut right = open_regular(right)?;
+fn files_equal_at(
+    left_directory: &File,
+    left_name: &OsStr,
+    right_directory: &File,
+    right_name: &OsStr,
+) -> io::Result<bool> {
+    let mut left = open_regular_at(left_directory, left_name)?;
+    let mut right = open_regular_at(right_directory, right_name)?;
     if left.metadata()?.len() != right.metadata()?.len() {
         return Ok(false);
     }
@@ -847,6 +874,63 @@ fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
             return Ok(true);
         }
     }
+}
+
+fn hard_link_at(
+    source_directory: &File,
+    source_name: &OsStr,
+    destination_directory: &File,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    let source_name = CString::new(source_name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage entry name contains a NUL byte",
+        )
+    })?;
+    let destination_name = CString::new(destination_name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage entry name contains a NUL byte",
+        )
+    })?;
+    // SAFETY: both directory descriptors are live, both names are
+    // NUL-terminated, and linkat does not retain either pointer.
+    let result = unsafe {
+        libc::linkat(
+            source_directory.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_directory.as_raw_fd(),
+            destination_name.as_ptr(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn unlink_at(directory: &File, name: &OsStr) -> io::Result<()> {
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage entry name contains a NUL byte",
+        )
+    })?;
+    // SAFETY: directory owns a live descriptor, name is NUL-terminated, and
+    // unlinkat does not retain the pointer.
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn remove_temp(temp: &TemporaryFile) -> io::Result<()> {
+    unlink_at(&temp.directory, &temp.name).and_then(|()| temp.directory.sync_all())
 }
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -870,7 +954,7 @@ mod tests {
 
     use super::{
         Layout, NarObjectId, PublishBoundary, PublishOutcome, PublishTarget, ReconcileClass,
-        Storage, StorageError, StoreHash, sync_dir,
+        Storage, StorageError, StoreHash, remove_temp, sync_dir,
     };
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -982,12 +1066,14 @@ mod tests {
     fn temporary_publication_files_are_private() {
         let directory = TestDir::new();
         let storage = Storage::initialize(directory.path()).expect("initialize storage");
-        let (path, file) = storage
+        let temporary = storage
             .create_temp(&PublishTarget::CacheInfo)
             .expect("create temporary publication file");
 
         assert_eq!(
-            file.metadata()
+            temporary
+                .file
+                .metadata()
                 .expect("read temp metadata")
                 .permissions()
                 .mode()
@@ -995,8 +1081,7 @@ mod tests {
             0o600
         );
 
-        drop(file);
-        fs::remove_file(path).expect("remove temporary publication file");
+        remove_temp(&temporary).expect("remove temporary publication file");
     }
 
     #[test]
@@ -1033,6 +1118,31 @@ mod tests {
                 .expect("read external directory")
                 .next()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn publication_rejects_a_symlinked_destination_directory() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+        let nar_dir = storage.layout.nar_dir();
+        let real_nar_dir = directory.path().join("nar-real");
+        let external = directory.path().join("external");
+        let external_nar = external.join(format!("{NAR_ID}.nar"));
+        fs::rename(&nar_dir, &real_nar_dir).expect("move real NAR directory");
+        fs::create_dir(&external).expect("create external directory");
+        fs::write(&external_nar, b"must not be compared").expect("write external NAR");
+        symlink(&external, &nar_dir).expect("create NAR directory symlink");
+
+        assert!(
+            storage
+                .publish_nar_unchecked(&nar, Cursor::new(b"must not be compared"))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&external_nar).expect("read external NAR"),
+            b"must not be compared"
         );
     }
 
