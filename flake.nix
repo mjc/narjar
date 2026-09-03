@@ -243,6 +243,11 @@
             env.pkgs.nix
             env.pkgs.direnv
             env.pkgs.nix-direnv
+          ]
+          ++ lib.optionals (env.pkgs.stdenv.hostPlatform.system == "x86_64-linux") [
+            env.pkgs.perf
+            env.pkgs.inferno
+            env.pkgs.cargo-flamegraph
           ];
         };
       }) systems;
