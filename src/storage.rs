@@ -36,6 +36,7 @@ pub use reconcile::{ReconcileClass, ReconcileEntry, ReconcileReport};
 use recovery::RecoveryState;
 
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
+const NIX32_SHA256_LEN: usize = 52;
 const TEMP_ATTEMPTS: u64 = 128;
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 
@@ -82,20 +83,36 @@ fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObject
         .ok_or(InvalidObjectId)
 }
 
-pub(crate) fn nix32_sha256(digest: &[u8]) -> String {
+fn nix32_encoding() -> &'static Encoding {
     static ENCODING: OnceLock<Encoding> = OnceLock::new();
-    let encoding = ENCODING.get_or_init(|| {
+    ENCODING.get_or_init(|| {
         let mut specification = Specification::new();
         specification.symbols.push_str(NIX32);
         specification.bit_order = BitOrder::LeastSignificantFirst;
         specification
             .encoding()
             .expect("Nix base32 specification is valid")
-    });
+    })
+}
+
+#[cfg(test)]
+fn nix32_sha256(digest: &[u8]) -> String {
+    let encoding = nix32_encoding();
     let mut encoded = vec![0; encoding.encode_len(digest.len())];
     encoding.encode_mut(digest, &mut encoded);
     encoded.reverse();
     String::from_utf8(encoded).expect("Nix base32 encoding is ASCII")
+}
+
+fn nix32_sha256_matches(digest: &[u8], expected: &str) -> bool {
+    if digest.len() != Sha256::output_size() || expected.len() != NIX32_SHA256_LEN {
+        return false;
+    }
+
+    let mut encoded = [0; NIX32_SHA256_LEN];
+    nix32_encoding().encode_mut(digest, &mut encoded);
+    encoded.reverse();
+    expected.as_bytes() == encoded
 }
 
 struct CheckedNarReader<'a, R> {
@@ -129,7 +146,8 @@ impl<R: Read> Read for CheckedNarReader<'_, R> {
         let read = self.inner.read(buffer)?;
         if read == 0 {
             let digest = self.hasher.clone().finalize();
-            if self.bytes_read != self.expected_length || nix32_sha256(&digest) != self.expected_id
+            if self.bytes_read != self.expected_length
+                || !nix32_sha256_matches(&digest, self.expected_id)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -168,8 +186,8 @@ impl<R> HashingReader<R> {
         }
     }
 
-    fn finish(self) -> String {
-        nix32_sha256(&self.hasher.finalize())
+    fn matches(self, expected: &str) -> bool {
+        nix32_sha256_matches(&self.hasher.finalize(), expected)
     }
 }
 
@@ -209,15 +227,18 @@ fn validate_xz(
         }
         hasher.update(&buffer[..read]);
     }
-    let actual_nar_hash = nix32_sha256(&hasher.finalize());
-    if expected_nar_hash.is_some_and(|expected_id| actual_nar_hash != expected_id.as_str()) {
+    let actual_nar_hash = hasher.finalize();
+    if expected_nar_hash
+        .is_some_and(|expected_id| !nix32_sha256_matches(&actual_nar_hash, expected_id.as_str()))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "decompressed NAR hash mismatch",
         ));
     }
-    let actual_file_hash = reader.into_inner().finish();
-    if expected_file_hash.is_some_and(|expected_id| actual_file_hash != expected_id.as_str()) {
+    let actual_file_hash = reader.into_inner();
+    if expected_file_hash.is_some_and(|expected_id| !actual_file_hash.matches(expected_id.as_str()))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "compressed NAR hash mismatch",
@@ -244,7 +265,7 @@ pub(crate) fn file_matches(
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(nix32_sha256(&hasher.finalize()) == expected_hash)
+    Ok(nix32_sha256_matches(&hasher.finalize(), expected_hash))
 }
 
 pub(crate) fn nar_file_matches(
@@ -1353,6 +1374,15 @@ mod tests {
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
     const STORE_HASH: &str = "00000000000000000000000000000000";
+
+    #[test]
+    fn nix32_sha256_matches_borrowed_hashes() {
+        let digest = Sha256::digest(b"nar bytes");
+        let hash = super::nix32_sha256(&digest);
+
+        assert!(super::nix32_sha256_matches(&digest, &hash));
+        assert!(!super::nix32_sha256_matches(&digest, NAR_ID));
+    }
 
     #[test]
     fn xz_nars_are_stored_compressed_and_validated_decompressed() {
