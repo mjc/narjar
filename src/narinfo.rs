@@ -175,7 +175,7 @@ impl NamedSignature {
 #[derive(Debug)]
 struct ParsedNarInfo {
     store_path: String,
-    references: Vec<String>,
+    references: String,
     nar: NarObjectId,
     nar_hash: NarObjectId,
     encoding: NarEncoding,
@@ -304,7 +304,7 @@ impl ValidatedNarInfo {
         &self.0.store_path
     }
 
-    pub(crate) fn references(&self) -> &[String] {
+    pub(crate) fn references(&self) -> &str {
         &self.0.references
     }
 
@@ -360,34 +360,31 @@ impl ValidatedNarInfo {
     }
 }
 
-fn parse_references(value: &str) -> Result<Vec<String>, NarInfoError> {
+fn parse_references(value: &str) -> Result<String, NarInfoError> {
     if value.is_empty() {
-        return Ok(Vec::new());
+        return Ok(String::new());
     }
 
-    let mut references = value
-        .split(' ')
-        .map(|reference| {
-            if reference.is_empty() {
-                return Err(NarInfoError);
-            }
-            validate_store_basename(reference)?;
-            Ok(reference.to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut references = value.split(' ').collect::<Vec<_>>();
+    for reference in &references {
+        if reference.is_empty() {
+            return Err(NarInfoError);
+        }
+        validate_store_basename(reference)?;
+    }
     references.sort_unstable();
     references.dedup();
-    Ok(references)
+    Ok(references.join(" "))
 }
 
 fn build_fingerprint(
     store_path: &str,
     nar_hash: &NarObjectId,
     nar_size: u64,
-    references: &[String],
+    references: &str,
 ) -> String {
     let mut fingerprint = format!("1;{store_path};sha256:{};{nar_size};", nar_hash.as_str());
-    for (index, reference) in references.iter().enumerate() {
+    for (index, reference) in references.split_ascii_whitespace().enumerate() {
         if index != 0 {
             fingerprint.push(',');
         }
@@ -525,7 +522,7 @@ mod tests {
     fn parser_deduplicates_references() {
         let references = parse_references(&format!("{STORE_HASH}-package {STORE_HASH}-package"))
             .expect("duplicate references should be accepted");
-        assert_eq!(references.len(), 1);
+        assert_eq!(references, format!("{STORE_HASH}-package"));
     }
 
     #[test]
@@ -534,10 +531,7 @@ mod tests {
             "{STORE_HASH}-zulu {STORE_HASH}-alpha {STORE_HASH}-zulu"
         ))
         .expect("valid references");
-        assert_eq!(
-            references,
-            vec![format!("{STORE_HASH}-alpha"), format!("{STORE_HASH}-zulu"),]
-        );
+        assert_eq!(references, format!("{STORE_HASH}-alpha {STORE_HASH}-zulu"));
     }
 
     #[test]
@@ -551,7 +545,7 @@ mod tests {
     #[test]
     fn fingerprint_formats_references_in_order() {
         let nar_hash = NarObjectId::parse(NAR_HASH).expect("valid nar hash");
-        let references = vec![format!("{STORE_HASH}-alpha"), format!("{STORE_HASH}-zulu")];
+        let references = format!("{STORE_HASH}-alpha {STORE_HASH}-zulu");
 
         assert_eq!(
             build_fingerprint(

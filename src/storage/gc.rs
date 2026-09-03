@@ -244,7 +244,7 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
             store_path: validated.store_path().to_owned(),
             references: validated
                 .references()
-                .iter()
+                .split_ascii_whitespace()
                 .map(|reference| format!("/nix/store/{reference}"))
                 .collect(),
             narinfo_name: name,
