@@ -46,6 +46,7 @@
     machine.succeed("test \"$(stat -Lc %a /var/lib/narjar)\" = 700")
     machine.succeed("test \"$(stat -c %a /var/lib/narjar/trusted-public-keys)\" = 644")
     machine.succeed("test -f /var/lib/narjar/nix-cache-info")
+    machine.succeed("systemctl show narjar.service -p RequiresMountsFor --value | grep -Fx /var/lib/narjar")
     machine.succeed("test \"$(systemctl show narjar.service -p DynamicUser --value)\" = yes")
     machine.succeed("test \"$(systemctl show narjar.service -p NoNewPrivileges --value)\" = yes")
     machine.succeed("test \"$(systemctl show narjar.service -p ProtectSystem --value)\" = strict")

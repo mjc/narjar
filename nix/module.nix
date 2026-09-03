@@ -231,6 +231,7 @@ in {
       description = "Narjar binary cache";
       wantedBy = ["multi-user.target"];
       after = ["network.target"];
+      unitConfig.RequiresMountsFor = [cfg.dataDir];
 
       preStart = lib.mkIf cfg.dynamicUser preStartScript;
 
