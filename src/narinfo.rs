@@ -216,8 +216,8 @@ impl ParsedNarInfo {
         let required = |name| fields.get(name).copied().ok_or(NarInfoError);
         let store_path = required("StorePath")?;
         let store_basename = store_path.strip_prefix("/nix/store/").ok_or(NarInfoError)?;
-        let (store_hash, _) = parse_store_basename(store_basename)?;
-        if &store_hash != route {
+        let (store_hash, _) = validate_store_basename(store_basename)?;
+        if store_hash != route.as_str() {
             return Err(NarInfoError);
         }
 
@@ -262,7 +262,7 @@ impl ParsedNarInfo {
         }
 
         if fields.get("Deriver").is_some_and(|deriver| {
-            *deriver != "unknown-deriver" && parse_store_basename(deriver).is_err()
+            *deriver != "unknown-deriver" && validate_store_basename(deriver).is_err()
         }) {
             return Err(NarInfoError);
         }
@@ -378,7 +378,7 @@ fn parse_references(value: &str) -> Result<BTreeSet<String>, NarInfoError> {
         if reference.is_empty() {
             return Err(NarInfoError);
         }
-        parse_store_basename(reference)?;
+        validate_store_basename(reference)?;
         references.insert(format!("/nix/store/{reference}"));
     }
     Ok(references)
@@ -413,7 +413,7 @@ fn parse_content_address(value: &str) -> Result<(), NarInfoError> {
     valid.then_some(()).ok_or(NarInfoError)
 }
 
-fn parse_store_basename(value: &str) -> Result<(StoreHash, &str), NarInfoError> {
+fn validate_store_basename(value: &str) -> Result<(&str, &str), NarInfoError> {
     let (hash, name) = value.split_once('-').ok_or(NarInfoError)?;
     if name.is_empty()
         || !name
@@ -422,7 +422,7 @@ fn parse_store_basename(value: &str) -> Result<(StoreHash, &str), NarInfoError> 
     {
         return Err(NarInfoError);
     }
-    let hash = StoreHash::parse(hash).map_err(|_| NarInfoError)?;
+    StoreHash::validate(hash).map_err(|_| NarInfoError)?;
     Ok((hash, name))
 }
 
@@ -513,6 +513,14 @@ mod tests {
         let references = parse_references(&format!("{STORE_HASH}-package {STORE_HASH}-package"))
             .expect("duplicate references should be accepted");
         assert_eq!(references.len(), 1);
+    }
+
+    #[test]
+    fn parser_validates_store_basenames_borrowed() {
+        let value = format!("{STORE_HASH}-package");
+        let (hash, name) = validate_store_basename(&value).expect("valid store basename");
+        assert_eq!(hash, STORE_HASH);
+        assert_eq!(name, "package");
     }
 
     #[test]

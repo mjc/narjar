@@ -72,15 +72,23 @@ impl StoreHash {
         parse_nix32(value, 32).map(Self)
     }
 
+    pub(crate) fn validate(value: &str) -> Result<(), InvalidObjectId> {
+        valid_nix32(value, 32).then_some(()).ok_or(InvalidObjectId)
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObjectId> {
-    (value.len() == expected_len && value.bytes().all(|byte| NIX32.as_bytes().contains(&byte)))
+    valid_nix32(value, expected_len)
         .then(|| value.to_owned())
         .ok_or(InvalidObjectId)
+}
+
+fn valid_nix32(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len && value.bytes().all(|byte| NIX32.as_bytes().contains(&byte))
 }
 
 fn nix32_encoding() -> &'static Encoding {
