@@ -223,6 +223,13 @@ pub(crate) fn nar_file_matches(
     Ok(validate_xz(file, Some(nar_hash), nar_size).is_ok_and(|size| size == nar_size))
 }
 
+pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Result<bool> {
+    // Serving trusts the full validation performed before publication. The
+    // service-owned cache tree and process lease keep published files stable
+    // while this cheap availability check runs.
+    Ok(file.metadata()?.len() == expected_size)
+}
+
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 struct Layout {
@@ -527,15 +534,7 @@ impl Storage {
         let Some(file) = self.open_nar_encoded(narinfo.nar(), narinfo.encoding())? else {
             return Ok(false);
         };
-        nar_file_matches(
-            &file,
-            narinfo.encoding(),
-            narinfo.nar_hash(),
-            narinfo.file_hash(),
-            narinfo.file_size(),
-            narinfo.nar_size(),
-        )
-        .map_err(Into::into)
+        nar_file_size_matches(&file, narinfo.file_size()).map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -1336,6 +1335,20 @@ mod tests {
             .read_to_end(&mut decoded)
             .expect("decode stored XZ NAR");
         assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn read_side_nar_check_only_requires_the_declared_file_size() {
+        let directory = TestDir::new();
+        let path = directory.path().join("opaque-nar");
+        fs::write(&path, b"not an XZ stream").expect("write opaque NAR");
+        let file = fs::File::open(path).expect("open opaque NAR");
+
+        assert!(
+            super::nar_file_size_matches(&file, b"not an XZ stream".len() as u64)
+                .expect("read file metadata")
+        );
+        assert!(!super::nar_file_size_matches(&file, 0).expect("read file metadata"));
     }
 
     #[test]
