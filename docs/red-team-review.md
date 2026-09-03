@@ -4,7 +4,7 @@ Status: approved on 2026-08-31 for a conditional thin implementation slice.
 
 ## Verdict
 
-Approve the flat-filesystem, client-signed, compression=none architecture and
+Approve the flat-filesystem, client-signed, compression=none-or-xz architecture and
 its v0.1 protocol contract.
 
 This is not approval for an unconstrained new binary-cache project. bincache
@@ -109,12 +109,13 @@ semantics do not silently enter the trust boundary.
 
 ### Semantic NAR validity and decompression bombs
 
-Resolved by scope. v0.1 accepts only uncompressed bytes and does not decompress,
-recompress, or semantically parse a NAR. Hashing/counting is O(1) memory.
-"Validated" means route, size, hash, metadata, and producer signature validated,
-not that Narjar duplicated Nix's NAR importer. A trusted signer can authorize
-malformed bytes, but consumer Nix still parses and rejects them. Adding a second
-NAR parser would enlarge, not reduce, the attack surface.
+Resolved by scope. Narjar accepts raw bytes and `.nar.xz`, but only streams XZ
+decompression to validate the raw hash and size; it does not recompress or
+semantically parse a NAR. Hashing/counting is O(1) memory and decompressed output
+is capped. "Validated" means route, size, hash, metadata, and producer signature
+validated, not that Narjar duplicated Nix's NAR importer. A trusted signer can
+authorize malformed bytes, but consumer Nix still parses and rejects them.
+Adding a second NAR parser would enlarge, not reduce, the attack surface.
 
 ### Partial visibility and durability
 

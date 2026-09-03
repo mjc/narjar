@@ -1,16 +1,10 @@
-use std::{
-    collections::HashSet,
-    io::{self, Read},
-    path::Path,
-};
-
-use sha2::{Digest, Sha256};
+use std::{collections::HashSet, io, path::Path};
 
 use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
     storage::{
-        NarObjectId, StoreHash, entry_is_regular_at, nix32_sha256, open_directory,
-        open_directory_at, open_regular_at, read_dir_names,
+        NarObjectId, StoreHash, entry_is_regular_at, file_matches, nar_file_matches,
+        open_directory, open_directory_at, open_regular_at, read_dir_names,
     },
 };
 
@@ -147,8 +141,8 @@ impl Inventory {
             };
             let nar = validated.nar();
             referenced.insert(nar.as_str().to_owned());
-            let nar_name = format!("{}.nar", nar.as_str());
-            let Some(mut file) = open_regular_at(&nar_directory, std::ffi::OsStr::new(&nar_name))
+            let nar_name = format!("{}{}", nar.as_str(), validated.encoding().suffix());
+            let Some(file) = open_regular_at(&nar_directory, std::ffi::OsStr::new(&nar_name))
                 .map(Some)
                 .or_else(|error| {
                     if error.kind() == io::ErrorKind::NotFound {
@@ -161,18 +155,20 @@ impl Inventory {
                 entries.push(InventoryEntry::new(InventoryClass::MissingNar, route));
                 continue;
             };
-            let size_matches = file.metadata()?.len() == validated.nar_size();
+            let size_matches = file.metadata()?.len() == validated.file_size();
             let hash_matches = if verify_hashes && size_matches {
-                let mut hasher = Sha256::new();
-                let mut buffer = [0; 64 * 1024];
-                loop {
-                    let read = file.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..read]);
+                if validated.encoding() == crate::narinfo::NarEncoding::None {
+                    file_matches(&file, nar.as_str(), validated.nar_size())?
+                } else {
+                    nar_file_matches(
+                        &file,
+                        validated.encoding(),
+                        validated.nar_hash(),
+                        validated.file_hash(),
+                        validated.file_size(),
+                        validated.nar_size(),
+                    )?
                 }
-                nix32_sha256(&hasher.finalize()) == nar.as_str()
             } else {
                 true
             };
@@ -190,7 +186,10 @@ impl Inventory {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            let Some(identifier) = name.strip_suffix(".nar") else {
+            let Some(identifier) = name
+                .strip_suffix(".nar.xz")
+                .or_else(|| name.strip_suffix(".nar"))
+            else {
                 entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
                 continue;
             };

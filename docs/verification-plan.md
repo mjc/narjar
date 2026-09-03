@@ -16,6 +16,7 @@ The initial allowed set is deliberately small:
 | subtle | Constant-time fixed-size token-hash comparison | Optimizers can defeat a handwritten compare | Password-KDF stack for already-random 256-bit tokens |
 | signal-hook | Portable SIGINT/SIGTERM flag registration | Rust std exposes no stable signal handler API | Async runtime or control-socket framework |
 | libc | Nonblocking advisory lock on `DATA/lock` | Rust 1.85 has no stable file-lock API | Stale PID files or a larger portability crate |
+| lzma-rust2 | Streaming pure-Rust XZ decode/encode | Rust std has no XZ codec; Nix default binary-cache uploads use `.nar.xz` | liblzma/xz2 add a native C library boundary; sevenzip is a different container |
 
 Candidate metadata captured with `cargo info` on 2026-08-31. These are review
 candidates, not loose semver ranges: implementation pins the selected exact

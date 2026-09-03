@@ -221,14 +221,18 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
                     invalid(format!("untrusted narinfo: {name_str}"))
                 }
             })?;
-        let nar_name = OsString::from(format!("{}.nar", validated.nar().as_str()));
+        let nar_name = OsString::from(format!(
+            "{}{}",
+            validated.nar().as_str(),
+            validated.encoding().suffix()
+        ));
         let nar_metadata = open_regular_at(&nar_directory, &nar_name)
             .and_then(|file| file.metadata())
             .map_err(|error| match error.kind() {
                 io::ErrorKind::NotFound => invalid(format!("missing NAR for narinfo: {name_str}")),
                 _ => error.into(),
             })?;
-        if nar_metadata.len() != validated.nar_size() {
+        if nar_metadata.len() != validated.file_size() {
             return Err(invalid(format!(
                 "NAR size mismatch for narinfo: {name_str}"
             )));
@@ -261,7 +265,10 @@ fn scan_orphans(storage: &Storage, entries: &[Entry]) -> Result<Vec<Orphan>, Sto
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        let Some(identifier) = name_str.strip_suffix(".nar") else {
+        let identifier = name_str
+            .strip_suffix(".nar.xz")
+            .or_else(|| name_str.strip_suffix(".nar"));
+        let Some(identifier) = identifier else {
             continue;
         };
         if NarObjectId::parse(identifier).is_err()

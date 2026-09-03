@@ -1,5 +1,7 @@
-use data_encoding::BASE64;
+use data_encoding::{BASE64, BitOrder, Specification};
 use ed25519_dalek::{Signer, SigningKey};
+use lzma_rust2::{XzOptions, XzWriter};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -63,6 +65,33 @@ fn signed_narinfo_for_with_references(
     format!(
         "StorePath: {store_path}\nURL: nar/{nar_hash}.nar\nCompression: none\nFileHash: sha256:{nar_hash}\nFileSize: {nar_size}\nNarHash: sha256:{nar_hash}\nNarSize: {nar_size}\nReferences: {}\nSig: narjar-test:{}\n",
         reference_basenames.join(" "),
+        BASE64.encode(&signature.to_bytes())
+    )
+}
+
+fn nix32_sha256(bytes: &[u8]) -> String {
+    let mut specification = Specification::new();
+    specification
+        .symbols
+        .push_str("0123456789abcdfghijklmnpqrsvwxyz");
+    specification.bit_order = BitOrder::LeastSignificantFirst;
+    let encoding = specification
+        .encoding()
+        .expect("Nix base-32 specification is valid");
+    encoding
+        .encode(&Sha256::digest(bytes))
+        .chars()
+        .rev()
+        .collect()
+}
+
+fn signed_xz_narinfo(file_hash: &str, nar_hash: &str, nar_size: u64, file_size: u64) -> String {
+    let store_path = format!("/nix/store/{STORE_HASH}-narjar");
+    let fingerprint = format!("1;{store_path};sha256:{nar_hash};{nar_size};");
+    let signature = SigningKey::from_bytes(&[7; 32]).sign(fingerprint.as_bytes());
+
+    format!(
+        "StorePath: {store_path}\nURL: nar/{file_hash}.nar.xz\nCompression: xz\nFileHash: sha256:{file_hash}\nFileSize: {file_size}\nNarHash: sha256:{nar_hash}\nNarSize: {nar_size}\nReferences: \nSig: narjar-test:{}\n",
         BASE64.encode(&signature.to_bytes())
     )
 }
@@ -1213,6 +1242,79 @@ fn nar_put_streams_hash_checks_and_retries_immutably() {
 }
 
 #[test]
+fn nar_put_and_get_preserve_xz_bytes() {
+    let server = RunningServer::start("nar-put-xz");
+    let mut compressed = Vec::new();
+    let mut writer =
+        XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
+    writer.write_all(NAR_BYTES).expect("compress NAR");
+    writer.finish().expect("finish XZ stream");
+
+    let path = format!("/nar/{NARJAR_HASH}.nar.xz");
+    let stored_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar.xz"));
+    let uploaded = server.request_with_body("PUT", &path, &[], &compressed);
+    let downloaded = server.request("GET", &path);
+    let stored = fs::read(stored_path).expect("read stored XZ NAR");
+    let (signal, status) = server.stop();
+
+    let (upload_headers, upload_body) = response_parts(&uploaded);
+    assert!(
+        upload_headers.starts_with("HTTP/1.1 201 Created\r\n"),
+        "{upload_headers:?}"
+    );
+    assert!(upload_body.is_empty());
+    let (download_headers, download_body) = response_parts(&downloaded);
+    assert!(
+        download_headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{download_headers:?}"
+    );
+    assert_eq!(download_body, compressed);
+    assert_eq!(stored, compressed);
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn xz_narinfo_gates_and_serves_the_compressed_pair() {
+    let server = RunningServer::start("narinfo-xz");
+    let mut compressed = Vec::new();
+    let mut writer =
+        XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
+    writer.write_all(NAR_BYTES).expect("compress NAR");
+    writer.finish().expect("finish XZ stream");
+    let file_hash = nix32_sha256(&compressed);
+    let narinfo = signed_xz_narinfo(
+        &file_hash,
+        NARJAR_HASH,
+        NAR_BYTES.len() as u64,
+        compressed.len() as u64,
+    );
+
+    let nar_path = format!("/nar/{file_hash}.nar.xz");
+    let uploaded = server.request_with_body("PUT", &nar_path, &[], &compressed);
+    let published = server.request_with_body(
+        "PUT",
+        &format!("/{STORE_HASH}.narinfo"),
+        &[],
+        narinfo.as_bytes(),
+    );
+    let narinfo_get = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
+    let nar_get = server.request("GET", &nar_path);
+    let (signal, status) = server.stop();
+
+    for response in [&uploaded, &published, &narinfo_get, &nar_get] {
+        assert!(
+            String::from_utf8_lossy(response).starts_with("HTTP/1.1 2"),
+            "{response:?}"
+        );
+    }
+    let (_, nar_body) = response_parts(&nar_get);
+    assert_eq!(nar_body, compressed);
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
 fn narinfo_put_rejects_unsigned_metadata_without_publication() {
     let server = RunningServer::start("narinfo-put-unsigned");
     let nar_path = format!("/nar/{NARJAR_HASH}.nar");
@@ -1423,7 +1525,7 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
 }
 
 #[test]
-fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
+fn nar_put_rejects_encoded_malformed_oversized_and_truncated_bodies() {
     let path = format!("/nar/{NARJAR_HASH}.nar");
 
     let server = RunningServer::start("nar-put-invalid");
@@ -1464,7 +1566,7 @@ fn nar_put_rejects_encoded_oversized_and_truncated_bodies() {
         (
             "compressed",
             &compressed,
-            "HTTP/1.1 415 Unsupported Media Type\r\n",
+            "HTTP/1.1 422 Unprocessable Entity\r\n",
         ),
         (
             "oversized",

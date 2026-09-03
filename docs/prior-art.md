@@ -12,7 +12,7 @@ atomic storage, ranges, metrics, reconciliation, real-socket conformance tests,
 and a real-Nix signature-gated end-to-end test.
 
 There is still a narrower design worth evaluating: a static, single-tenant,
-filesystem-only cache that stores compression=none uploads byte-for-byte,
+filesystem-only cache that stores compression=none and xz uploads byte-for-byte,
 requires client-signed narinfo, holds no signing key, has no database, no
 recompression, no online GC, and no background workers. That profile is a
 strict subset between bincache and [Kasha](https://github.com/Zebradil/kasha).

@@ -2,7 +2,7 @@ use std::{
     ffi::{CStr, CString, OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Cursor, Read},
+    io::{self, Cursor, Read, Seek, SeekFrom},
     mem::MaybeUninit,
     num::NonZeroUsize,
     os::{
@@ -25,7 +25,8 @@ use std::path::PathBuf;
 use data_encoding::{BitOrder, Encoding, Specification};
 use sha2::{Digest, Sha256};
 
-use crate::narinfo::ValidatedNarInfo;
+use crate::narinfo::{NarEncoding, ValidatedNarInfo};
+use lzma_rust2::XzReader;
 
 pub mod gc;
 mod reconcile;
@@ -151,6 +152,77 @@ impl<R: Read> Read for CheckedNarReader<'_, R> {
     }
 }
 
+fn validate_xz(file: &File, expected_id: Option<&NarObjectId>, max_bytes: u64) -> io::Result<u64> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = XzReader::new(file, false);
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0u64;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?;
+        if bytes_read > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decompressed NAR exceeds configured size limit",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_id = nix32_sha256(&hasher.finalize());
+    if expected_id.is_some_and(|expected_id| actual_id != expected_id.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed NAR hash mismatch",
+        ));
+    }
+    Ok(bytes_read)
+}
+
+pub(crate) fn file_matches(
+    file: &File,
+    expected_hash: &str,
+    expected_size: u64,
+) -> io::Result<bool> {
+    if file.metadata()?.len() != expected_size {
+        return Ok(false);
+    }
+    let mut file = file.try_clone()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(nix32_sha256(&hasher.finalize()) == expected_hash)
+}
+
+pub(crate) fn nar_file_matches(
+    file: &File,
+    encoding: NarEncoding,
+    nar_hash: &NarObjectId,
+    file_hash: &NarObjectId,
+    file_size: u64,
+    nar_size: u64,
+) -> io::Result<bool> {
+    if encoding == NarEncoding::None {
+        return Ok(file.metadata()?.len() == nar_size);
+    }
+    if !file_matches(file, file_hash.as_str(), file_size)? {
+        return Ok(false);
+    }
+    Ok(validate_xz(file, Some(nar_hash), nar_size).is_ok_and(|size| size == nar_size))
+}
+
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 struct Layout {
@@ -174,6 +246,12 @@ impl Layout {
     }
 
     #[cfg(test)]
+    fn nar_path_encoded(&self, id: &NarObjectId, encoding: NarEncoding) -> PathBuf {
+        self.nar_dir()
+            .join(format!("{}{}", id.0, encoding.suffix()))
+    }
+
+    #[cfg(test)]
     fn nar_temp_dir(&self) -> PathBuf {
         self.nar_dir().join(".tmp")
     }
@@ -191,7 +269,7 @@ impl Layout {
 
 enum PublishTarget<'a> {
     CacheInfo,
-    Nar(&'a NarObjectId),
+    Nar(&'a NarObjectId, NarEncoding),
     NarInfo(&'a StoreHash),
 }
 
@@ -199,7 +277,9 @@ impl PublishTarget<'_> {
     fn destination_name(&self) -> OsString {
         match self {
             Self::CacheInfo => OsString::from("nix-cache-info"),
-            Self::Nar(id) => OsString::from(format!("{}.nar", id.as_str())),
+            Self::Nar(id, encoding) => {
+                OsString::from(format!("{}{}", id.as_str(), encoding.suffix()))
+            }
             Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
         }
     }
@@ -207,7 +287,7 @@ impl PublishTarget<'_> {
     fn temp_prefix(&self) -> &'static str {
         match self {
             Self::CacheInfo => "cache-info",
-            Self::Nar(_) => "nar",
+            Self::Nar(_, _) => "nar",
             Self::NarInfo(_) => "narinfo",
         }
     }
@@ -365,6 +445,7 @@ impl Storage {
     pub fn publish_nar(
         &self,
         id: &NarObjectId,
+        encoding: NarEncoding,
         source: impl Read,
         expected_length: u64,
         policy: NarUploadPolicy,
@@ -374,12 +455,24 @@ impl Storage {
         }
 
         let required_bytes = expected_length.saturating_add(policy.min_free_bytes);
+        let target = PublishTarget::Nar(id, encoding);
         self.publish_with_admission(
-            PublishTarget::Nar(id),
-            CheckedNarReader::new(source, &id.0, expected_length),
+            target,
+            match encoding {
+                NarEncoding::None => {
+                    Box::new(CheckedNarReader::new(source, &id.0, expected_length)) as Box<dyn Read>
+                }
+                NarEncoding::Xz => Box::new(source),
+            },
             || {
                 let directory = self.nar_temp_directory()?;
                 filesystem_space(&directory)?.required_capacity(required_bytes)
+            },
+            |file| match encoding {
+                NarEncoding::None => Ok(()),
+                NarEncoding::Xz => validate_xz(file, None, policy.max_bytes)
+                    .map(|_| ())
+                    .map_err(Into::into),
             },
             |_| Ok(()),
         )
@@ -391,7 +484,7 @@ impl Storage {
         id: &NarObjectId,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish(PublishTarget::Nar(id), source)
+        self.publish(PublishTarget::Nar(id, NarEncoding::None), source)
     }
 
     #[cfg(test)]
@@ -401,9 +494,11 @@ impl Storage {
         source: impl Read,
         fault: PublishBoundary,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish_with(PublishTarget::Nar(id), source, |boundary| {
-            injected_fault(boundary, fault)
-        })
+        self.publish_with(
+            PublishTarget::Nar(id, NarEncoding::None),
+            source,
+            |boundary| injected_fault(boundary, fault),
+        )
     }
 
     pub fn publish_narinfo(
@@ -411,18 +506,36 @@ impl Storage {
         store: &StoreHash,
         narinfo: ValidatedNarInfo,
     ) -> Result<PublishOutcome, StorageError> {
-        let (nar, nar_size, bytes) = narinfo.into_parts();
+        let (nar, encoding, file_hash, nar_hash, file_size, nar_size, bytes) = narinfo.into_parts();
         let nar_directory = self.nar_directory()?;
-        let nar_name = format!("{}.nar", nar.as_str());
+        let nar_name = format!("{}{}", nar.as_str(), encoding.suffix());
         match open_regular_at(&nar_directory, OsStr::new(&nar_name)) {
-            Ok(file) if file.metadata()?.len() == nar_size => {}
-            Ok(_) => return Err(StorageError::NarMismatch),
+            Ok(file) => {
+                if !nar_file_matches(&file, encoding, &nar_hash, &file_hash, file_size, nar_size)? {
+                    return Err(StorageError::NarMismatch);
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(StorageError::MissingNar);
             }
             Err(error) => return Err(error.into()),
         }
         self.publish(PublishTarget::NarInfo(store), Cursor::new(bytes))
+    }
+
+    pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {
+        let Some(file) = self.open_nar_encoded(narinfo.nar(), narinfo.encoding())? else {
+            return Ok(false);
+        };
+        nar_file_matches(
+            &file,
+            narinfo.encoding(),
+            narinfo.nar_hash(),
+            narinfo.file_hash(),
+            narinfo.file_size(),
+            narinfo.nar_size(),
+        )
+        .map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -462,8 +575,16 @@ impl Storage {
     }
 
     pub fn open_nar(&self, nar: &NarObjectId) -> Result<Option<File>, StorageError> {
+        self.open_nar_encoded(nar, NarEncoding::None)
+    }
+
+    pub fn open_nar_encoded(
+        &self,
+        nar: &NarObjectId,
+        encoding: NarEncoding,
+    ) -> Result<Option<File>, StorageError> {
         let directory = self.nar_directory()?;
-        let name = format!("{}.nar", nar.as_str());
+        let name = format!("{}{}", nar.as_str(), encoding.suffix());
         open_optional_at(&directory, OsStr::new(&name))
     }
 
@@ -540,7 +661,7 @@ impl Storage {
         source: impl Read,
         checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish_with_admission(target, source, || Ok(()), checkpoint)
+        self.publish_with_admission(target, source, || Ok(()), |_| Ok(()), checkpoint)
     }
 
     fn publish_with_admission(
@@ -548,6 +669,7 @@ impl Storage {
         target: PublishTarget<'_>,
         mut source: impl Read,
         admit: impl FnOnce() -> Result<(), StorageError>,
+        validate: impl FnOnce(&File) -> Result<(), StorageError>,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
         let _publication = self
@@ -566,6 +688,7 @@ impl Storage {
             checkpoint(PublishBoundary::AfterStream)?;
             temp.file.sync_all()?;
             checkpoint(PublishBoundary::AfterTempSync)?;
+            validate(&temp.file)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
 
             match hard_link_at(
@@ -619,7 +742,7 @@ impl Storage {
 
     fn create_temp(&self, target: &PublishTarget<'_>) -> Result<TemporaryFile, StorageError> {
         let directory = match target {
-            PublishTarget::Nar(_) => self.nar_temp_directory()?,
+            PublishTarget::Nar(_, _) => self.nar_temp_directory()?,
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.temp_directory()?,
         };
         let prefix = target.temp_prefix();
@@ -683,7 +806,7 @@ impl Storage {
 
     fn destination_directory(&self, target: &PublishTarget<'_>) -> Result<File, StorageError> {
         match target {
-            PublishTarget::Nar(_) => self.nar_directory(),
+            PublishTarget::Nar(_, _) => self.nar_directory(),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.root_directory(),
         }
     }
@@ -1154,7 +1277,7 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 mod tests {
     use std::{
         env, fs,
-        io::{self, Cursor, Read},
+        io::{self, Cursor, Read, Write},
         num::NonZeroUsize,
         os::unix::fs::{PermissionsExt, symlink},
         path::{Path, PathBuf},
@@ -1172,9 +1295,48 @@ mod tests {
         PublishTarget, ReconcileClass, Storage, StorageError, StoreHash, capacity_error_kind,
         remove_temp, sync_dir,
     };
+    use crate::narinfo::NarEncoding;
+    use lzma_rust2::{XzOptions, XzReader, XzWriter};
+    use sha2::{Digest, Sha256};
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
     const STORE_HASH: &str = "00000000000000000000000000000000";
+
+    #[test]
+    fn xz_nars_are_stored_compressed_and_validated_decompressed() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let raw = b"nar bytes";
+        let nar = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(raw)))
+            .expect("hash is a valid NAR object id");
+        let mut compressed = Vec::new();
+        let mut writer =
+            XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
+        writer.write_all(raw).expect("compress NAR");
+        writer.finish().expect("finish XZ stream");
+
+        let outcome = storage
+            .publish_nar(
+                &nar,
+                NarEncoding::Xz,
+                Cursor::new(&compressed),
+                compressed.len() as u64,
+                super::NarUploadPolicy::new(1024, 0),
+            )
+            .expect("publish XZ NAR");
+        assert_eq!(outcome, PublishOutcome::Created);
+        assert_eq!(
+            fs::read(storage.layout().nar_path_encoded(&nar, NarEncoding::Xz))
+                .expect("read stored XZ NAR"),
+            compressed
+        );
+
+        let mut decoded = Vec::new();
+        XzReader::new(Cursor::new(compressed), false)
+            .read_to_end(&mut decoded)
+            .expect("decode stored XZ NAR");
+        assert_eq!(decoded, raw);
+    }
 
     #[test]
     fn validated_ids_map_to_exact_layout_paths() {
@@ -1309,7 +1471,7 @@ mod tests {
         let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
 
         let temporary = storage
-            .create_temp(&PublishTarget::Nar(&nar))
+            .create_temp(&PublishTarget::Nar(&nar, NarEncoding::None))
             .expect("create NAR temporary publication file");
         assert_eq!(
             fs::read_dir(storage.layout().temp_dir())
@@ -1540,7 +1702,7 @@ mod tests {
             std::thread::spawn(move || {
                 let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
                 storage.publish_with(
-                    PublishTarget::Nar(&nar),
+                    PublishTarget::Nar(&nar, NarEncoding::None),
                     Cursor::new(b"nar bytes"),
                     |boundary| {
                         if boundary == PublishBoundary::BeforeParentSync {

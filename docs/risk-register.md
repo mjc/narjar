@@ -110,9 +110,10 @@ concurrency.
 Evidence: Nix supports many codecs; prior art adds decompression/recompression
 pipelines.
 
-Owner and mitigation: NARJ-8. compression=none only; reject Content-Encoding
-and compressed suffixes; fixed Content-Length and streamed hard limit; no NAR
-semantic parser or recompressor.
+Owner and mitigation: NARJ-29. Reject HTTP Content-Encoding and unsupported
+compressed suffixes; accept only fixed-length `.nar` and `.nar.xz` bodies; cap
+both received and decompressed bytes; stream XZ validation with no NAR semantic
+parser or recompressor.
 
 Detection and recovery: Per-route byte counters, 413 tests, disk watermark.
 Abort temporary and return admission failure.

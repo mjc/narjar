@@ -157,7 +157,7 @@ wait_for_temp() {
   local upload_pid=$1
   local attempts=0
   while (( attempts < 500 )); do
-    if find "$data_dir/.tmp" -type f -print -quit | grep -q .; then
+    if find "$data_dir/.tmp" "$data_dir/nar/.tmp" -type f -print -quit | grep -q .; then
       return
     fi
     kill -0 "$upload_pid" 2>/dev/null ||
@@ -323,15 +323,15 @@ if substitute "$corrupt_root" "$trusted_key" "$primary_path"   >"$temp_root/corr
 fi
 run mv "$temp_root/primary.nar.backup" "$primary_nar_file"
 
-scenario 'default compression is an explicit v0.1 non-goal'
+scenario 'default xz compression is accepted'
 default_path=$(build_path default-compression "$nonce")
 sign_path "$default_path"
-if nix_cli copy --refresh --option netrc-file "$netrc" \
-  --to "$server_url" "$default_path" \
-  >"$temp_root/default-compression.log" 2>&1; then
-  fail "v0.1 unexpectedly accepted Nix default compressed upload"
-fi
-printf 'SKIP default compression: Nix uses .nar.xz; v0.1 intentionally accepts only uncompressed .nar\n'
+run nix_cli copy --refresh --option netrc-file "$netrc" \
+  --to "$server_url" "$default_path"
+default_root="$temp_root/default-store"
+substitute "$default_root" "$trusted_key" "$default_path"
+expect_file "$default_root$default_path"
+run cmp "$default_path" "$default_root$default_path"
 printf 'SKIP realisations: Nix 2.31.5 emitted no realisation requests in the recorded protocol trace\n'
 
 printf '\nEVIDENCE daemon log\n'

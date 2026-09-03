@@ -22,8 +22,8 @@ under docs/evidence. Third-party implementations are comparison material only.
 | Persistent connections | Optional optimization |
 | Connection close between requests | Required to work |
 | Negative-cache refresh | Required operator behavior; captured |
-| compression=none writes | Required |
-| Precompressed writes | Explicit non-goal |
+| compression=none and xz writes | Required |
+| Other precompressed writes | Explicit non-goal |
 | Chunked request bodies | Explicit non-goal; Content-Length required |
 | Realisations | Explicit v0.1 non-goal unless Linux E2E proves required |
 | NAR listings, logs, mass query | Explicit non-goal |
@@ -34,7 +34,7 @@ under docs/evidence. Third-party implementations are comparison material only.
 | --- | ---: | ---: | --- |
 | GET/HEAD /nix-cache-info | 200 text/x-nix-cache-info | 500 if installation is invalid | fixed Content-Length |
 | GET/HEAD /<32-nix32>.narinfo | 200 text/x-nix-narinfo | 404 | immutable after publication |
-| GET/HEAD /nar/<52-nix32>.nar | 200 application/x-nix-nar | 404 | Accept-Ranges: bytes |
+| GET/HEAD /nar/<52-nix32>.nar[.xz] | 200 application/x-nix-nar | 404 | Accept-Ranges: bytes; bytes are served as stored |
 | GET/HEAD /realisations/<id>.doi | none in v0.1 | 404 | route grammar reserved |
 | GET /healthz | 200 text/plain | n/a | public liveness only; no-store |
 | GET /readyz | 200 or 503 text/plain | n/a | read auth when private; no-store |
@@ -68,13 +68,14 @@ explicit migration because clients cache this file for days.
 | Method and route | New | Identical retry | Invalid/conflict |
 | --- | ---: | ---: | --- |
 | PUT /nix-cache-info | 201 | 200 | 409 if bytes differ |
-| PUT /nar/<52-nix32>.nar | 201 | 200 | 409 immutable-name conflict |
+| PUT /nar/<52-nix32>.nar[.xz] | 201 | 200 | 409 immutable-name conflict |
 | PUT /<32-nix32>.narinfo | 201 | 200 | 409 immutable-name conflict |
 | PUT /realisations/<id>.doi | unsupported | unsupported | 405/404 in v0.1 |
 
 All writes require a write token. Content-Length is required. The server rejects
-Transfer-Encoding request bodies, Content-Encoding, unexpected route suffixes,
-and bodies larger than configured route-specific limits.
+Transfer-Encoding request bodies, HTTP Content-Encoding, unexpected route
+suffixes, and bodies larger than configured route-specific limits. XZ uploads
+are validated against the decompressed NAR hash and size before publication.
 
 Error classes:
 
@@ -85,7 +86,7 @@ Error classes:
 | 409 | immutable name already contains different bytes/identity |
 | 411 | Content-Length missing |
 | 413 | declared or streamed body exceeds limit |
-| 415 | encoded/precompressed upload is outside v0.1 |
+| 415 | HTTP Content-Encoding or unsupported NAR encoding |
 | 422 | hash, size, path, URL, or signature validation failed |
 | 429 | configured concurrency admission limit reached |
 | 500 | internal invariant or unexpected I/O failure |
@@ -123,10 +124,11 @@ Accepted metadata must:
 
 - Be bounded UTF-8 in the line-oriented Nix narinfo format.
 - Contain one StorePath under /nix/store whose hash equals the route.
-- Contain URL exactly nar/<FileHash-nix32>.nar.
-- Declare Compression: none.
+- Contain URL nar/<FileHash-nix32>.nar or nar/<NarHash-nix32>.nar.xz.
+- Declare Compression matching the URL suffix (`none` or `xz`).
 - Include FileHash, FileSize, NarHash, NarSize, References, and at least one Sig.
-- Have FileHash equal NarHash and FileSize equal NarSize for compression=none.
+- Have FileHash equal NarHash and FileSize equal NarSize for compression=none;
+  for xz, FileHash/FileSize describe the stored compressed object.
 - Match the durable NAR's computed hash and size.
 - Use only canonical store-path/reference grammar.
 - Verify at least one signature against configured trusted public keys.

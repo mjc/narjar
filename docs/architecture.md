@@ -7,7 +7,9 @@ authorized by this document until NARJ-20 approves it.
 
 Narjar is a flat, filesystem-only HTTP binary cache. It does not expose a
 native /nix/store, invoke Nix, maintain a database, recompress payloads, own a
-signing key, run background workers, or perform online garbage collection.
+signing key, run background workers, or perform online garbage collection. It
+accepts Nix's raw `.nar` and precompressed `.nar.xz` forms and stores each form
+byte-for-byte.
 
 The differentiator from bincache is deletion of redb, server signing,
 recompression, io_uring-specific paths, sharding, and maintenance state. The
@@ -22,7 +24,7 @@ the correct outcome is to adopt bincache rather than ship Narjar.
 ~~~text
 producer with Nix and signing key
   |
-  | compression=none, Basic/netrc write token
+  | compression=none or xz, Basic/netrc write token
   v
 TLS reverse proxy
   |
@@ -104,6 +106,7 @@ DATA/
     .tmp/
       nar-<random>.part
     <52-char-nix32-sha256>.nar
+    <52-char-nix32-sha256>.nar.xz
   <32-char-store-hash>.narinfo
   realisations/
     .tmp/
@@ -136,17 +139,16 @@ races.
 ## Write flow
 
 ~~~text
-PUT /nar/<file-hash>.nar
+PUT /nar/<file-hash>.nar[.xz]
   -> authorize writer
   -> validate route and Content-Length <= configured maximum
   -> create DATA/nar/.tmp/nar-<random>.part with create-new
-  -> stream body once:
-       count bytes
-       SHA-256 raw NAR bytes
-       write bounded chunks
-  -> reject length/hash/empty mismatch
+  -> stream body once to a private temporary file
+  -> for `.nar`, hash/count the received bytes
+  -> for `.nar.xz`, stream-decode with the XZ reader and hash/count the NAR
+  -> reject length/hash/empty mismatch or an oversized decompressed NAR
   -> sync temporary file
-  -> rename-no-replace to DATA/nar/<file-hash>.nar
+  -> rename-no-replace to DATA/nar/<file-hash>.nar[.xz]
   -> sync DATA/nar
   -> 201 for newly durable object, 200 for identical existing object
 
@@ -155,9 +157,9 @@ PUT /<store-hash>.narinfo
   -> reject body above small metadata limit
   -> parse strict UTF-8 line format
   -> validate StorePath hash equals route
-  -> require URL exactly nar/<file-hash>.nar
-  -> require Compression: none
-  -> validate FileHash/FileSize and NarHash/NarSize
+  -> require URL nar/<file-hash>.nar or nar/<file-hash>.nar.xz
+  -> require Compression to match the URL suffix
+  -> validate encoded FileHash/FileSize and raw NarHash/NarSize
   -> require referenced NAR file metadata and size
   -> verify at least one signature from trusted-public-keys
   -> write canonical original bytes to DATA/.tmp with create-new
@@ -168,16 +170,18 @@ PUT /<store-hash>.narinfo
 ~~~
 
 For compression=none, FileHash and NarHash are both SHA-256 over the received
-raw NAR and FileSize equals NarSize. Narjar deliberately does not parse NAR
-semantics or framing in v0.1. The trusted producer signature authorizes the
-hash and size, and consumer Nix verifies and parses the NAR while importing.
-A second parser would add attack surface without adding authenticity.
+raw NAR and FileSize equals NarSize. For xz, FileHash/FileSize describe the
+stored compressed bytes while NarHash/NarSize describe the streamed decoded
+NAR. Narjar deliberately does not parse NAR semantics or framing. The trusted
+producer signature authorizes the raw hash and size, and consumer Nix verifies
+and parses the NAR while importing. A second parser would add attack surface
+without adding authenticity.
 
-Narjar does not recompress. This makes the upload and stored object identical,
-removes decompression bombs and codec dependencies, and preserves O(1) memory.
-NAR staging is under `DATA/nar/.tmp`, so a split NAR destination can publish
-with a same-filesystem rename; metadata remains staged under `DATA/.tmp`.
-The bandwidth tradeoff is explicit and must be measured.
+Narjar does not recompress. The upload and stored object remain identical; XZ is
+decoded only while validating the raw hash and configured decompressed-size
+limit. NAR staging is under `DATA/nar/.tmp`, so a split NAR destination can
+publish with a same-filesystem rename; metadata remains staged under
+`DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be measured.
 
 ## Publication and crash semantics
 
@@ -207,7 +211,7 @@ reconcile.
 ~~~text
 GET or HEAD /nix-cache-info
 GET or HEAD /<store-hash>.narinfo
-GET or HEAD /nar/<file-hash>.nar
+GET or HEAD /nar/<file-hash>.nar[.xz]
 GET or HEAD /realisations/<id>.doi   optional
 ~~~
 
@@ -229,7 +233,7 @@ negative cache until --refresh; the server cannot invalidate client caches.
 ## Explicit non-goals
 
 - Native /nix/store serving or a server-side Nix installation.
-- xz, zstd, gzip, chunked-NAR storage, or server recompression.
+- zstd, gzip, chunked-NAR storage, or server recompression.
 - Server-side signing or private signing-key custody.
 - Multi-tenancy, quotas, namespaces, UI, database, Redis, S3, mirrors, workers.
 - Online delete, GC, pinning, roots, retention, or payload deduplication.

@@ -17,6 +17,28 @@ use crate::storage::{
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NarEncoding {
+    None,
+    Xz,
+}
+
+impl NarEncoding {
+    pub(crate) const fn compression(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Xz => "xz",
+        }
+    }
+
+    pub(crate) const fn suffix(self) -> &'static str {
+        match self {
+            Self::None => ".nar",
+            Self::Xz => ".nar.xz",
+        }
+    }
+}
+
 pub(crate) fn read_narinfo_file(file: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(MAX_NARINFO_BYTES + 1).read_to_end(&mut bytes)?;
@@ -155,6 +177,10 @@ struct ParsedNarInfo {
     store_path: String,
     references: BTreeSet<String>,
     nar: NarObjectId,
+    nar_hash: NarObjectId,
+    encoding: NarEncoding,
+    file_hash: NarObjectId,
+    file_size: u64,
     nar_size: u64,
     fingerprint: String,
     signatures: Vec<NamedSignature>,
@@ -196,15 +222,32 @@ impl ParsedNarInfo {
         }
 
         let url = required("URL")?;
-        let url_hash = url
-            .strip_prefix("nar/")
-            .and_then(|value| value.strip_suffix(".nar"))
+        let url_value = url.strip_prefix("nar/").ok_or(NarInfoError)?;
+        let (url_hash, encoding) = [NarEncoding::Xz, NarEncoding::None]
+            .into_iter()
+            .find_map(|encoding| {
+                url_value
+                    .strip_suffix(encoding.suffix())
+                    .map(|hash| (hash, encoding))
+            })
             .ok_or(NarInfoError)?;
         let nar = NarObjectId::parse(url_hash).map_err(|_| NarInfoError)?;
-        if required("Compression")? != "none"
-            || required("FileHash")? != format!("sha256:{url_hash}")
-            || required("NarHash")? != format!("sha256:{url_hash}")
-        {
+        if required("Compression")? != encoding.compression() {
+            return Err(NarInfoError);
+        }
+
+        let file_hash = required("FileHash")?
+            .strip_prefix("sha256:")
+            .and_then(|value| NarObjectId::parse(value).ok())
+            .ok_or(NarInfoError)?;
+        if file_hash != nar {
+            return Err(NarInfoError);
+        }
+        let nar_hash = required("NarHash")?
+            .strip_prefix("sha256:")
+            .and_then(|value| NarObjectId::parse(value).ok())
+            .ok_or(NarInfoError)?;
+        if encoding == NarEncoding::None && nar_hash != nar {
             return Err(NarInfoError);
         }
 
@@ -214,7 +257,7 @@ impl ParsedNarInfo {
         let nar_size = required("NarSize")?
             .parse::<u64>()
             .map_err(|_| NarInfoError)?;
-        if nar_size == 0 || file_size != nar_size {
+        if nar_size == 0 || (encoding == NarEncoding::None && file_size != nar_size) {
             return Err(NarInfoError);
         }
 
@@ -229,7 +272,8 @@ impl ParsedNarInfo {
 
         let references = parse_references(required("References")?)?;
         let fingerprint = format!(
-            "1;{store_path};sha256:{url_hash};{nar_size};{}",
+            "1;{store_path};sha256:{};{nar_size};{}",
+            nar_hash.as_str(),
             references
                 .iter()
                 .map(String::as_str)
@@ -248,6 +292,10 @@ impl ParsedNarInfo {
             store_path: store_path.to_owned(),
             references,
             nar,
+            nar_hash,
+            encoding,
+            file_hash,
+            file_size,
             nar_size,
             fingerprint,
             signatures,
@@ -272,6 +320,22 @@ impl ValidatedNarInfo {
         &self.0.nar
     }
 
+    pub(crate) fn nar_hash(&self) -> &NarObjectId {
+        &self.0.nar_hash
+    }
+
+    pub(crate) const fn encoding(&self) -> NarEncoding {
+        self.0.encoding
+    }
+
+    pub(crate) fn file_hash(&self) -> &NarObjectId {
+        &self.0.file_hash
+    }
+
+    pub(crate) const fn file_size(&self) -> u64 {
+        self.0.file_size
+    }
+
     pub(crate) const fn nar_size(&self) -> u64 {
         self.0.nar_size
     }
@@ -280,9 +344,27 @@ impl ValidatedNarInfo {
         self.0.bytes
     }
 
-    pub(crate) fn into_parts(self) -> (NarObjectId, u64, Vec<u8>) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        NarObjectId,
+        NarEncoding,
+        NarObjectId,
+        NarObjectId,
+        u64,
+        u64,
+        Vec<u8>,
+    ) {
         let parsed = self.0;
-        (parsed.nar, parsed.nar_size, parsed.bytes)
+        (
+            parsed.nar,
+            parsed.encoding,
+            parsed.file_hash,
+            parsed.nar_hash,
+            parsed.file_size,
+            parsed.nar_size,
+            parsed.bytes,
+        )
     }
 }
 
@@ -402,6 +484,7 @@ mod tests {
 
     const STORE_HASH: &str = "00000000000000000000000000000000";
     const NAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    const XZ_FILE_HASH: &str = "1111111111111111111111111111111111111111111111111111";
 
     #[test]
     fn parser_rejects_oversized_narinfo() {
@@ -430,5 +513,25 @@ mod tests {
         let references = parse_references(&format!("{STORE_HASH}-package {STORE_HASH}-package"))
             .expect("duplicate references should be accepted");
         assert_eq!(references.len(), 1);
+    }
+
+    #[test]
+    fn parser_accepts_xz_narinfo() {
+        let route = StoreHash::parse(STORE_HASH).expect("valid store hash");
+        let signature = BASE64.encode(&[0; 64]);
+        let bytes = format!(
+            "StorePath: /nix/store/{STORE_HASH}-package\n\
+             URL: nar/{XZ_FILE_HASH}.nar.xz\n\
+             Compression: xz\n\
+             FileHash: sha256:{XZ_FILE_HASH}\n\
+             FileSize: 10\n\
+             NarHash: sha256:{NAR_HASH}\n\
+             NarSize: 1\n\
+             References: \n\
+             Sig: test:{signature}\n"
+        )
+        .into_bytes();
+
+        assert!(ParsedNarInfo::parse(&route, bytes).is_ok());
     }
 }

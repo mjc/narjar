@@ -5,7 +5,7 @@ use tiny_http::{Header, Method, Response, StatusCode};
 use crate::{
     auth::{Authorizer, Permission},
     metrics::Metrics,
-    narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
+    narinfo::{MAX_NARINFO_BYTES, NarEncoding, TrustedPublicKeys},
     storage::{
         CapacityErrorKind, NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError,
         StoreHash, capacity_error_kind,
@@ -59,14 +59,10 @@ fn respond_narinfo(
         Ok(validated) => validated,
         Err(_) => return internal_error(request),
     };
-    match storage.open_nar(validated.nar()) {
-        Ok(Some(nar))
-            if matches!(
-                nar.metadata(),
-                Ok(metadata) if metadata.len() == validated.nar_size()
-            ) => {}
-        Ok(Some(_)) | Err(_) => return internal_error(request),
-        Ok(None) => return not_found(request),
+    match storage.nar_matches(&validated) {
+        Ok(true) => {}
+        Ok(false) => return not_found(request),
+        Err(_) => return internal_error(request),
     }
 
     let response = Response::from_data(validated.into_bytes())
@@ -138,8 +134,13 @@ fn requested_range(request: &tiny_http::Request, length: u64) -> RequestedRange 
     RequestedRange::Partial { start, end }
 }
 
-fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId) {
-    let mut file = match storage.open_nar(nar) {
+fn respond_nar(
+    request: tiny_http::Request,
+    storage: &Storage,
+    nar: &NarObjectId,
+    encoding: NarEncoding,
+) {
+    let mut file = match storage.open_nar_encoded(nar, encoding) {
         Ok(Some(file)) => file,
         Ok(None) => return not_found(request),
         Err(_) => return internal_error(request),
@@ -186,7 +187,7 @@ fn respond_nar(request: tiny_http::Request, storage: &Storage, nar: &NarObjectId
 #[derive(Debug)]
 enum ReadRoute {
     CacheInfo,
-    Nar(NarObjectId),
+    Nar(NarObjectId, NarEncoding),
     NarInfo(StoreHash),
 }
 
@@ -215,17 +216,23 @@ impl ReadRoute {
         }
 
         if let Some(path) = url.strip_prefix("/nar/") {
-            if [".nar.xz", ".nar.zst"].into_iter().any(|suffix| {
-                path.strip_suffix(suffix)
-                    .is_some_and(|id| NarObjectId::parse(id).is_ok())
-            }) {
+            if path
+                .strip_suffix(".nar.zst")
+                .is_some_and(|id| NarObjectId::parse(id).is_ok())
+            {
                 return RouteMatch::UnsupportedEncoding;
             }
-            return match path
-                .strip_suffix(".nar")
+            if let Some(id) = path
+                .strip_suffix(NarEncoding::Xz.suffix())
                 .and_then(|id| NarObjectId::parse(id).ok())
             {
-                Some(id) => RouteMatch::Found(Self::Nar(id)),
+                return RouteMatch::Found(Self::Nar(id, NarEncoding::Xz));
+            }
+            return match path
+                .strip_suffix(NarEncoding::None.suffix())
+                .and_then(|id| NarObjectId::parse(id).ok())
+            {
+                Some(id) => RouteMatch::Found(Self::Nar(id, NarEncoding::None)),
                 None => RouteMatch::Invalid,
             };
         }
@@ -367,6 +374,7 @@ fn respond_nar_put(
     request: tiny_http::Request,
     storage: &Storage,
     id: &NarObjectId,
+    encoding: NarEncoding,
     policy: NarUploadPolicy,
     metrics: &Metrics,
 ) {
@@ -374,7 +382,7 @@ fn respond_nar_put(
         return;
     };
     let length = upload.length();
-    let result = storage.publish_nar(id, upload.reader(), length as u64, policy);
+    let result = storage.publish_nar(id, encoding, upload.reader(), length as u64, policy);
     if let Err(error) = &result {
         record_capacity_error(metrics, error);
     }
@@ -521,7 +529,9 @@ pub fn respond(
 
     if matches!(request.method(), Method::Put) {
         return match route {
-            ReadRoute::Nar(id) => respond_nar_put(request, storage, &id, policy, metrics),
+            ReadRoute::Nar(id, encoding) => {
+                respond_nar_put(request, storage, &id, encoding, policy, metrics)
+            }
             ReadRoute::NarInfo(store) => {
                 respond_narinfo_put(request, storage, &store, trusted, metrics)
             }
@@ -541,7 +551,7 @@ pub fn respond(
                 .with_header(header("Cache-Control", "public, max-age=3600"));
             let _ = request.respond(response);
         }
-        ReadRoute::Nar(id) => respond_nar(request, storage, &id),
+        ReadRoute::Nar(id, encoding) => respond_nar(request, storage, &id, encoding),
         ReadRoute::NarInfo(store) => respond_narinfo(request, storage, &store, trusted),
     }
 }
@@ -549,6 +559,7 @@ pub fn respond(
 #[cfg(test)]
 mod tests {
     use super::{ReadRoute, RouteMatch};
+    use crate::narinfo::NarEncoding;
 
     #[test]
     fn legacy_main_prefix_maps_to_cache_routes() {
@@ -564,7 +575,15 @@ mod tests {
             ReadRoute::classify(
                 "/main/nar/0000000000000000000000000000000000000000000000000000.nar"
             ),
-            RouteMatch::Found(ReadRoute::Nar(_))
+            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::None))
+        ));
+    }
+
+    #[test]
+    fn xz_nar_routes_preserve_the_requested_encoding() {
+        assert!(matches!(
+            ReadRoute::classify("/nar/0000000000000000000000000000000000000000000000000000.nar.xz"),
+            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::Xz))
         ));
     }
 }
