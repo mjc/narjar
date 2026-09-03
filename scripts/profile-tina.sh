@@ -157,6 +157,8 @@ writer_pid=
 wait "$perf_pid"
 perf_pid=
 
+"${sudo_cmd[@]}" chmod 644 "$perf_data"
+
 "${sudo_cmd[@]}" nix develop --command bash -lc \
     "perf script -i '$perf_data' | inferno-collapse-perf > '$folded' && inferno-flamegraph < '$folded' > '$flamegraph' && perf report --stdio --no-children --sort comm,dso,symbol -i '$perf_data'" \
     >"$report" 2>&1
