@@ -198,7 +198,7 @@ impl ParsedNarInfo {
             return Err(NarInfoError);
         }
 
-        let mut fields = BTreeMap::new();
+        let mut fields = Vec::with_capacity(11);
         let mut signature_values = Vec::new();
         for line in text.strip_suffix('\n').ok_or(NarInfoError)?.split('\n') {
             let (name, value) = line.split_once(": ").ok_or(NarInfoError)?;
@@ -206,15 +206,21 @@ impl ParsedNarInfo {
                 "Sig" => signature_values.push(value),
                 "StorePath" | "URL" | "Compression" | "FileHash" | "FileSize" | "NarHash"
                 | "NarSize" | "References" | "Deriver" | "CA" => {
-                    if fields.insert(name, value).is_some() {
+                    if fields.iter().any(|(field, _)| *field == name) {
                         return Err(NarInfoError);
                     }
+                    fields.push((name, value));
                 }
                 _ => return Err(NarInfoError),
             }
         }
 
-        let required = |name| fields.get(name).copied().ok_or(NarInfoError);
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find_map(|(field, value)| (*field == name).then_some(*value))
+        };
+        let required = |name| field(name).ok_or(NarInfoError);
         let store_path = required("StorePath")?;
         let store_basename = store_path.strip_prefix("/nix/store/").ok_or(NarInfoError)?;
         let (store_hash, _) = validate_store_basename(store_basename)?;
@@ -262,12 +268,12 @@ impl ParsedNarInfo {
             return Err(NarInfoError);
         }
 
-        if fields.get("Deriver").is_some_and(|deriver| {
-            *deriver != "unknown-deriver" && validate_store_basename(deriver).is_err()
+        if field("Deriver").is_some_and(|deriver| {
+            deriver != "unknown-deriver" && validate_store_basename(deriver).is_err()
         }) {
             return Err(NarInfoError);
         }
-        if let Some(ca) = fields.get("CA") {
+        if let Some(ca) = field("CA") {
             parse_content_address(ca)?;
         }
 
