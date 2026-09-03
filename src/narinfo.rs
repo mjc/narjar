@@ -271,15 +271,7 @@ impl ParsedNarInfo {
         }
 
         let references = parse_references(required("References")?)?;
-        let fingerprint = format!(
-            "1;{store_path};sha256:{};{nar_size};{}",
-            nar_hash.as_str(),
-            references
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let fingerprint = build_fingerprint(store_path, &nar_hash, nar_size, &references);
         let signatures = signature_values
             .into_iter()
             .map(NamedSignature::parse)
@@ -382,6 +374,22 @@ fn parse_references(value: &str) -> Result<BTreeSet<String>, NarInfoError> {
         references.insert(format!("/nix/store/{reference}"));
     }
     Ok(references)
+}
+
+fn build_fingerprint(
+    store_path: &str,
+    nar_hash: &NarObjectId,
+    nar_size: u64,
+    references: &BTreeSet<String>,
+) -> String {
+    let mut fingerprint = format!("1;{store_path};sha256:{};{nar_size};", nar_hash.as_str());
+    for (index, reference) in references.iter().enumerate() {
+        if index != 0 {
+            fingerprint.push(',');
+        }
+        fingerprint.push_str(reference);
+    }
+    fingerprint
 }
 
 fn parse_content_address(value: &str) -> Result<(), NarInfoError> {
@@ -521,6 +529,26 @@ mod tests {
         let (hash, name) = validate_store_basename(&value).expect("valid store basename");
         assert_eq!(hash, STORE_HASH);
         assert_eq!(name, "package");
+    }
+
+    #[test]
+    fn fingerprint_formats_references_in_order() {
+        let nar_hash = NarObjectId::parse(NAR_HASH).expect("valid nar hash");
+        let references = BTreeSet::from([
+            format!("/nix/store/{STORE_HASH}-zulu"),
+            format!("/nix/store/{STORE_HASH}-alpha"),
+        ]);
+
+        assert_eq!(
+            build_fingerprint(
+                "/nix/store/00000000000000000000000000000000-package",
+                &nar_hash,
+                7,
+                &references,
+            ),
+            format!("1;/nix/store/{STORE_HASH}-package;sha256:{NAR_HASH};7;/nix/store/")
+                + &format!("{STORE_HASH}-alpha,/nix/store/{STORE_HASH}-zulu")
+        );
     }
 
     #[test]
