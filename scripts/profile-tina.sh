@@ -9,6 +9,7 @@ fi
 
 repository=${NARJAR_REPOSITORY:-https://github.com/mjc/narjar.git}
 ref=${NARJAR_REF:-main}
+profiler=${NARJAR_PROFILER:-perf}
 profile_seconds=${NARJAR_PROFILE_SECONDS:-30}
 perf_warmup_seconds=${NARJAR_PERF_WARMUP_SECONDS:-15}
 jobs=${NARJAR_JOBS:-4}
@@ -19,25 +20,38 @@ secret_key="$root/profile-secret-key"
 public_key="$root/profile-public-key"
 netrc="$root/profile.netrc"
 perf_data="$root/perf.data"
+heaptrack_data="$root/heaptrack"
 folded="$root/narjar-tina-release-storage.folded"
 flamegraph="$root/narjar-tina-release-storage.svg"
 perf_log="$root/perf.log"
 report="$root/perf-report.txt"
 server_log="$root/server.log"
 server_pid=
+debuggee_pid=
 perf_pid=
 reader_pids=()
 writer_pid=
 
-if command -v sudo >/dev/null 2>&1; then
-    sudo_cmd=(sudo -n)
-elif command -v doas >/dev/null 2>&1; then
-    sudo_cmd=(doas -n)
-else
-    printf 'profile-tina: sudo or doas is required for perf\n' >&2
-    exit 1
+case "$profiler" in
+    perf|heaptrack) ;;
+    *)
+        printf 'profile-tina: profiler must be perf or heaptrack\n' >&2
+        exit 1
+        ;;
+esac
+
+sudo_cmd=()
+if [[ $profiler == perf ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+        sudo_cmd=(sudo -n)
+    elif command -v doas >/dev/null 2>&1; then
+        sudo_cmd=(doas -n)
+    else
+        printf 'profile-tina: sudo or doas is required for perf\n' >&2
+        exit 1
+    fi
+    "${sudo_cmd[@]}" true
 fi
-"${sudo_cmd[@]}" true
 
 cleanup() {
     for pid in "${reader_pids[@]}"; do
@@ -49,6 +63,9 @@ cleanup() {
     if [[ -n ${perf_pid:-} ]]; then
         "${sudo_cmd[@]}" kill "$perf_pid" 2>/dev/null || true
         wait "$perf_pid" 2>/dev/null || true
+    fi
+    if [[ -n ${debuggee_pid:-} ]]; then
+        kill "$debuggee_pid" 2>/dev/null || true
     fi
     if [[ -n ${server_pid:-} ]]; then
         kill "$server_pid" 2>/dev/null || true
@@ -90,12 +107,23 @@ token=$("$bin" token create --data-dir "$data_dir" --scope write --name profile)
 printf 'machine 127.0.0.1 login profile password %s\n' "$token" >"$netrc"
 chmod 600 "$netrc"
 
-"$bin" serve --data-dir "$data_dir" --listen 127.0.0.1:0 --min-free-bytes 0 >"$server_log" 2>&1 &
-server_pid=$!
+if [[ $profiler == heaptrack ]]; then
+    heaptrack --record-only -o "$heaptrack_data" "$bin" serve --data-dir "$data_dir" \
+        --listen 127.0.0.1:0 --min-free-bytes 0 >"$server_log" 2>&1 &
+    server_pid=$!
+else
+    "$bin" serve --data-dir "$data_dir" --listen 127.0.0.1:0 --min-free-bytes 0 >"$server_log" 2>&1 &
+    server_pid=$!
+    debuggee_pid=$server_pid
+fi
 port=
 for _ in $(seq 1 50); do
+    if [[ $profiler == heaptrack ]]; then
+        debuggee_pid=$(ps -eo pid=,args= | awk -v bin="$bin" -v data_dir="$data_dir" \
+            'index($0, data_dir) && $2 == bin && $3 == "serve" { print $1; exit }')
+    fi
     port=$(sed -n 's/^listening http:\/\/127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$server_log" | head -1)
-    if [[ -n $port ]] && curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null; then
+    if [[ -n $port && -n $debuggee_pid ]] && curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null; then
         break
     fi
     if ! kill -0 "$server_pid" 2>/dev/null; then
@@ -108,11 +136,13 @@ done
 base="http://127.0.0.1:$port"
 
 capture_seconds=$((profile_seconds + perf_warmup_seconds))
-"${sudo_cmd[@]}" nix develop --command bash -lc \
-    "perf record -F 999 --call-graph fp -p $server_pid -o '$perf_data' -- sleep $capture_seconds" \
-    >"$perf_log" 2>&1 &
-perf_pid=$!
-sleep 1
+if [[ $profiler == perf ]]; then
+    "${sudo_cmd[@]}" nix develop --command bash -lc \
+        "perf record -F 999 --call-graph fp -p $debuggee_pid -o '$perf_data' -- sleep $capture_seconds" \
+        >"$perf_log" 2>&1 &
+    perf_pid=$!
+    sleep 1
+fi
 
 # The initial push performs real Nix cache writes into the isolated store.
 "$bin" push --to "$base" --jobs "$jobs" --netrc-file "$netrc" --signing-key-file "$secret_key" "$seed_path"
@@ -154,20 +184,35 @@ done
 wait "$writer_pid" 2>/dev/null || true
 writer_pid=
 
-wait "$perf_pid"
-perf_pid=
+if [[ $profiler == perf ]]; then
+    wait "$perf_pid"
+    perf_pid=
 
-"${sudo_cmd[@]}" chmod 644 "$perf_data"
+    "${sudo_cmd[@]}" chmod 644 "$perf_data"
 
-"${sudo_cmd[@]}" nix develop --command bash -lc \
-    "perf script -i '$perf_data' | inferno-collapse-perf > '$folded' && inferno-flamegraph < '$folded' > '$flamegraph' && perf report --stdio --no-children --sort comm,dso,symbol -i '$perf_data'" \
-    >"$report" 2>&1
+    "${sudo_cmd[@]}" nix develop --command bash -lc \
+        "perf script -i '$perf_data' | inferno-collapse-perf > '$folded' && inferno-flamegraph < '$folded' > '$flamegraph' && perf report --stdio --no-children --sort comm,dso,symbol -i '$perf_data'" \
+        >"$report" 2>&1
 
-printf 'PERF_DATA=%s\n' "$perf_data"
-printf 'FOLDED_STACKS=%s\n' "$folded"
-printf 'FLAMEGRAPH=%s\n' "$flamegraph"
-printf 'PERF_REPORT=%s\n' "$report"
-ls -lh "$perf_data" "$folded" "$flamegraph" "$report"
+    printf 'PERF_DATA=%s\n' "$perf_data"
+    printf 'FOLDED_STACKS=%s\n' "$folded"
+    printf 'FLAMEGRAPH=%s\n' "$flamegraph"
+    printf 'PERF_REPORT=%s\n' "$report"
+    ls -lh "$perf_data" "$folded" "$flamegraph" "$report"
+else
+    kill -TERM "$debuggee_pid"
+    wait "$server_pid"
+    server_pid=
+    debuggee_pid=
+    heaptrack_file="$heaptrack_data.zst"
+    nix develop --command heaptrack_print --file "$heaptrack_file" \
+        --print-peaks 1 --print-allocators 1 --print-temporary 1 \
+        --peak-limit 20 --sub-peak-limit 3 >"$report"
+
+    printf 'HEAPTRACK_DATA=%s\n' "$heaptrack_file"
+    printf 'HEAPTRACK_REPORT=%s\n' "$report"
+    ls -lh "$heaptrack_file" "$report"
+fi
 sed -n '1,80p' "$report"
 printf 'SERVER_LOG:\n'
 cat "$server_log"
