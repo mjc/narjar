@@ -80,34 +80,13 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
 }
 
 fn sign_paths(key_file: &std::path::Path, paths: &[String]) -> Result<(), Error> {
-    let mut child = Command::new("nix")
+    let mut command = Command::new("nix");
+    command
         .arg("store")
         .arg("sign")
         .arg("--key-file")
-        .arg(key_file)
-        .arg("--stdin")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|error| Error::runtime(format!("failed to run nix store sign: {error}")))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::runtime("nix store sign stdin was not piped"))?;
-    for path in paths {
-        writeln!(stdin, "{path}")
-            .map_err(|error| Error::runtime(format!("failed to write signing paths: {error}")))?;
-    }
-    drop(stdin);
-    let status = child
-        .wait()
-        .map_err(|error| Error::runtime(format!("failed to wait for nix store sign: {error}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::runtime(format!(
-            "nix store sign exited with {status}"
-        )))
-    }
+        .arg(key_file);
+    run_path_command(command, paths, "nix store sign").map_err(Error::runtime)
 }
 
 fn closure_paths(installables: &[String]) -> Result<Vec<String>, Error> {
@@ -156,21 +135,31 @@ fn copy_paths(
     if let Some(netrc_file) = netrc_file {
         command.arg("--option").arg("netrc-file").arg(netrc_file);
     }
+    run_path_command(command, paths, "nix copy")
+}
+
+fn run_path_command(mut command: Command, paths: &[String], name: &str) -> Result<(), String> {
     let mut child = command
         .arg("--stdin")
         .stdin(Stdio::piped())
         .spawn()
-        .map_err(|error| error.to_string())?;
-    let mut stdin = child.stdin.take().ok_or("nix stdin was not piped")?;
+        .map_err(|error| format!("failed to run {name}: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{name} stdin was not piped"))?;
     for path in paths {
-        writeln!(stdin, "{path}").map_err(|error| error.to_string())?;
+        writeln!(stdin, "{path}")
+            .map_err(|error| format!("failed to write {name} paths: {error}"))?;
     }
     drop(stdin);
-    let status = child.wait().map_err(|error| error.to_string())?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed to wait for {name}: {error}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("nix copy exited with {status}"))
+        Err(format!("{name} exited with {status}"))
     }
 }
 
