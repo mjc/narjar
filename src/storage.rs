@@ -152,10 +152,41 @@ impl<R: Read> Read for CheckedNarReader<'_, R> {
     }
 }
 
-fn validate_xz(file: &File, expected_id: Option<&NarObjectId>, max_bytes: u64) -> io::Result<u64> {
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> String {
+        nix32_sha256(&self.hasher.finalize())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+fn validate_xz(
+    file: &File,
+    expected_nar_hash: Option<&NarObjectId>,
+    expected_file_hash: Option<&NarObjectId>,
+    max_bytes: u64,
+) -> io::Result<u64> {
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
-    let mut reader = XzReader::new(file, false);
+    let mut reader = XzReader::new(HashingReader::new(file), false);
     let mut hasher = Sha256::new();
     let mut bytes_read = 0u64;
     let mut buffer = [0; 64 * 1024];
@@ -175,11 +206,18 @@ fn validate_xz(file: &File, expected_id: Option<&NarObjectId>, max_bytes: u64) -
         }
         hasher.update(&buffer[..read]);
     }
-    let actual_id = nix32_sha256(&hasher.finalize());
-    if expected_id.is_some_and(|expected_id| actual_id != expected_id.as_str()) {
+    let actual_nar_hash = nix32_sha256(&hasher.finalize());
+    if expected_nar_hash.is_some_and(|expected_id| actual_nar_hash != expected_id.as_str()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "decompressed NAR hash mismatch",
+        ));
+    }
+    let actual_file_hash = reader.into_inner().finish();
+    if expected_file_hash.is_some_and(|expected_id| actual_file_hash != expected_id.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compressed NAR hash mismatch",
         ));
     }
     Ok(bytes_read)
@@ -220,7 +258,11 @@ pub(crate) fn nar_file_matches(
     if !file_matches(file, file_hash.as_str(), file_size)? {
         return Ok(false);
     }
-    Ok(validate_xz(file, Some(nar_hash), nar_size).is_ok_and(|size| size == nar_size))
+    if file.metadata()?.len() != file_size {
+        return Ok(false);
+    }
+    Ok(validate_xz(file, Some(nar_hash), Some(file_hash), nar_size)
+        .is_ok_and(|size| size == nar_size))
 }
 
 pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Result<bool> {
@@ -477,7 +519,7 @@ impl Storage {
             },
             |file| match encoding {
                 NarEncoding::None => Ok(()),
-                NarEncoding::Xz => validate_xz(file, None, policy.max_bytes)
+                NarEncoding::Xz => validate_xz(file, None, None, policy.max_bytes)
                     .map(|_| ())
                     .map_err(Into::into),
             },
@@ -1335,6 +1377,30 @@ mod tests {
             .read_to_end(&mut decoded)
             .expect("decode stored XZ NAR");
         assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn xz_validation_checks_compressed_and_decompressed_hashes_together() {
+        let directory = TestDir::new();
+        let path = directory.path().join("nar.xz");
+        let raw = b"nar bytes";
+        let mut compressed = Vec::new();
+        let mut writer =
+            XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
+        writer.write_all(raw).expect("compress NAR");
+        writer.finish().expect("finish XZ stream");
+        fs::write(&path, &compressed).expect("write XZ NAR");
+        let file = fs::File::open(path).expect("open XZ NAR");
+        let nar_hash = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(raw)))
+            .expect("NAR hash is valid");
+        let file_hash = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(&compressed)))
+            .expect("file hash is valid");
+
+        assert_eq!(
+            super::validate_xz(&file, Some(&nar_hash), Some(&file_hash), raw.len() as u64)
+                .expect("validate XZ NAR"),
+            raw.len() as u64
+        );
     }
 
     #[test]
