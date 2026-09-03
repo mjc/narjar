@@ -7,9 +7,9 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    container: nixos/nix:2.31.5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: DeterminateSystems/nix-installer-action@b67ad2f0e8376a0bc947db191e4484285b6f5b56
       - run: ./ci/check-flake-contract.sh
       - run: nix build -L --no-update-lock-file .#packages.x86_64-linux.default
       - run: nix run -L --no-update-lock-file .#default
