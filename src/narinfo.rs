@@ -96,11 +96,12 @@ impl TrustedPublicKeys {
         route: &StoreHash,
         bytes: Vec<u8>,
     ) -> Result<ValidatedNarInfo, PublishedNarInfoError> {
-        let narinfo =
+        let mut narinfo =
             ParsedNarInfo::parse(route, bytes).map_err(|_| PublishedNarInfoError::Malformed)?;
         if !self.verifies(narinfo.fingerprint.as_bytes(), &narinfo.signatures) {
             return Err(PublishedNarInfoError::UntrustedSignature);
         }
+        narinfo.signatures = Vec::new();
         Ok(ValidatedNarInfo(narinfo))
     }
 
