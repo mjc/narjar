@@ -164,7 +164,7 @@ impl Inventory {
                         &file,
                         validated.encoding(),
                         validated.nar_hash(),
-                        validated.file_hash(),
+                        nar,
                         validated.file_size(),
                         validated.nar_size(),
                     )?

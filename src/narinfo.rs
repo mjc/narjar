@@ -179,7 +179,6 @@ struct ParsedNarInfo {
     nar: NarObjectId,
     nar_hash: NarObjectId,
     encoding: NarEncoding,
-    file_hash: NarObjectId,
     file_size: u64,
     nar_size: u64,
     fingerprint: String,
@@ -238,9 +237,9 @@ impl ParsedNarInfo {
 
         let file_hash = required("FileHash")?
             .strip_prefix("sha256:")
-            .and_then(|value| NarObjectId::parse(value).ok())
             .ok_or(NarInfoError)?;
-        if file_hash != nar {
+        NarObjectId::validate(file_hash).map_err(|_| NarInfoError)?;
+        if file_hash != nar.as_str() {
             return Err(NarInfoError);
         }
         let nar_hash = required("NarHash")?
@@ -286,7 +285,6 @@ impl ParsedNarInfo {
             nar,
             nar_hash,
             encoding,
-            file_hash,
             file_size,
             nar_size,
             fingerprint,
@@ -320,10 +318,6 @@ impl ValidatedNarInfo {
         self.0.encoding
     }
 
-    pub(crate) fn file_hash(&self) -> &NarObjectId {
-        &self.0.file_hash
-    }
-
     pub(crate) const fn file_size(&self) -> u64 {
         self.0.file_size
     }
@@ -336,22 +330,11 @@ impl ValidatedNarInfo {
         self.0.bytes
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        NarObjectId,
-        NarEncoding,
-        NarObjectId,
-        NarObjectId,
-        u64,
-        u64,
-        Vec<u8>,
-    ) {
+    pub(crate) fn into_parts(self) -> (NarObjectId, NarEncoding, NarObjectId, u64, u64, Vec<u8>) {
         let parsed = self.0;
         (
             parsed.nar,
             parsed.encoding,
-            parsed.file_hash,
             parsed.nar_hash,
             parsed.file_size,
             parsed.nar_size,

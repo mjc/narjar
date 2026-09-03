@@ -59,6 +59,10 @@ impl NarObjectId {
         parse_nix32(value, 52).map(Self)
     }
 
+    pub(crate) fn validate(value: &str) -> Result<(), InvalidObjectId> {
+        valid_nix32(value, 52).then_some(()).ok_or(InvalidObjectId)
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -595,12 +599,12 @@ impl Storage {
         store: &StoreHash,
         narinfo: ValidatedNarInfo,
     ) -> Result<PublishOutcome, StorageError> {
-        let (nar, encoding, file_hash, nar_hash, file_size, nar_size, bytes) = narinfo.into_parts();
+        let (nar, encoding, nar_hash, file_size, nar_size, bytes) = narinfo.into_parts();
         let nar_directory = self.nar_directory()?;
         let nar_name = format!("{}{}", nar.as_str(), encoding.suffix());
         match open_regular_at(&nar_directory, OsStr::new(&nar_name)) {
             Ok(file) => {
-                if !nar_file_matches(&file, encoding, &nar_hash, &file_hash, file_size, nar_size)? {
+                if !nar_file_matches(&file, encoding, &nar_hash, &nar, file_size, nar_size)? {
                     return Err(StorageError::NarMismatch);
                 }
             }
