@@ -92,7 +92,10 @@ pub(crate) fn nix32_sha256(digest: &[u8]) -> String {
             .encoding()
             .expect("Nix base32 specification is valid")
     });
-    encoding.encode(digest).chars().rev().collect()
+    let mut encoded = vec![0; encoding.encode_len(digest.len())];
+    encoding.encode_mut(digest, &mut encoded);
+    encoded.reverse();
+    String::from_utf8(encoded).expect("Nix base32 encoding is ASCII")
 }
 
 struct CheckedNarReader<'a, R> {
