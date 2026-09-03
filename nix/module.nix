@@ -7,6 +7,10 @@
   cfg = config.services.narjar;
   executable = lib.getExe' cfg.package "narjar";
   stateDirectory = lib.removePrefix "/var/lib/" cfg.dataDir;
+  runtimeDataDir =
+    if cfg.dynamicUser
+    then "/var/lib/private/${stateDirectory}"
+    else cfg.dataDir;
   credentials = lib.filter (credential: credential.source != null) [
     {
       name = "read.tokens";
@@ -31,27 +35,27 @@
     lib.concatMapStringsSep "\n" (credential: ''
       ${pkgs.coreutils}/bin/install -m ${credential.mode} \
         "$NARJAR_CREDENTIALS_DIRECTORY/${credential.name}" \
-        ${lib.escapeShellArg "${cfg.dataDir}/${credential.target}"}
+        ${lib.escapeShellArg "${runtimeDataDir}/${credential.target}"}
     '')
     credentials;
   preStartScript = ''
-    if [ ! -e ${lib.escapeShellArg "${cfg.dataDir}/nix-cache-info"} ]; then
-      ${executable} init --data-dir ${lib.escapeShellArg cfg.dataDir}
+    if [ ! -e ${lib.escapeShellArg "${runtimeDataDir}/nix-cache-info"} ]; then
+      ${executable} init --data-dir ${lib.escapeShellArg runtimeDataDir}
     fi
     ${lib.optionalString (cfg.auth.readTokens == null) ''
-      ${pkgs.coreutils}/bin/rm -f ${lib.escapeShellArg "${cfg.dataDir}/auth/read.tokens"}
+      ${pkgs.coreutils}/bin/rm -f ${lib.escapeShellArg "${runtimeDataDir}/auth/read.tokens"}
     ''}
     ${installCredentials}
   '';
   privilegedPreStartScript = ''
     ${preStartScript}
-    ${pkgs.coreutils}/bin/chown -R narjar:narjar ${lib.escapeShellArg cfg.dataDir}
+    ${pkgs.coreutils}/bin/chown -R narjar:narjar ${lib.escapeShellArg runtimeDataDir}
   '';
   privilegedPreStart = pkgs.writeShellScript "narjar-pre-start" privilegedPreStartScript;
   serveArgs = lib.escapeShellArgs [
     "serve"
     "--data-dir"
-    cfg.dataDir
+    runtimeDataDir
     "--listen"
     cfg.listen
     "--workers"
@@ -67,7 +71,7 @@
     [
       "gc"
       "--data-dir"
-      cfg.dataDir
+      runtimeDataDir
       "--apply"
     ]
     ++ lib.optionals (cfg.gc.maxBytes != null) [
@@ -265,7 +269,7 @@ in {
         ProtectKernelTunables = true;
         ProtectProc = "invisible";
         ProtectSystem = "strict";
-        ReadWritePaths = [cfg.dataDir];
+        ReadWritePaths = [runtimeDataDir];
         RemoveIPC = true;
         RestrictAddressFamilies = [
           "AF_INET"
@@ -294,7 +298,7 @@ in {
         TimeoutStartSec = "infinity";
         PrivateTmp = true;
         ProtectSystem = "strict";
-        ReadWritePaths = [cfg.dataDir];
+        ReadWritePaths = [runtimeDataDir];
         UMask = "0077";
       };
     };
