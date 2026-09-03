@@ -1,4 +1,10 @@
-use std::{num::NonZeroUsize, path::PathBuf, process::Command, thread};
+use std::{
+    io::Write,
+    num::NonZeroUsize,
+    path::PathBuf,
+    process::{Command, Stdio},
+    thread,
+};
 
 use clap::Args;
 
@@ -112,11 +118,17 @@ fn copy_paths(
     if let Some(netrc_file) = netrc_file {
         command.arg("--option").arg("netrc-file").arg(netrc_file);
     }
-    let status = command
-        .arg("--")
-        .args(paths)
-        .status()
+    let mut child = command
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .spawn()
         .map_err(|error| error.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("nix stdin was not piped")?;
+    for path in paths {
+        writeln!(stdin, "{path}").map_err(|error| error.to_string())?;
+    }
+    drop(stdin);
+    let status = child.wait().map_err(|error| error.to_string())?;
     if status.success() {
         Ok(())
     } else {
