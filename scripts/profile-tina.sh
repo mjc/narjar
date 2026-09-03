@@ -108,7 +108,7 @@ printf 'machine 127.0.0.1 login profile password %s\n' "$token" >"$netrc"
 chmod 600 "$netrc"
 
 if [[ $profiler == heaptrack ]]; then
-    heaptrack --record-only -o "$heaptrack_data" "$bin" serve --data-dir "$data_dir" \
+    nix develop --command heaptrack --record-only -o "$heaptrack_data" "$bin" serve --data-dir "$data_dir" \
         --listen 127.0.0.1:0 --min-free-bytes 0 >"$server_log" 2>&1 &
     server_pid=$!
 else
