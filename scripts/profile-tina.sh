@@ -216,6 +216,8 @@ fi
 sed -n '1,80p' "$report"
 printf 'SERVER_LOG:\n'
 cat "$server_log"
-printf 'PERF_LOG:\n'
-cat "$perf_log"
+if [[ $profiler == perf ]]; then
+    printf 'PERF_LOG:\n'
+    cat "$perf_log"
+fi
 printf 'PROFILE_ROOT_RETAINED=%s\n' "$root"
