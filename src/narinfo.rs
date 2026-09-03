@@ -101,6 +101,7 @@ impl TrustedPublicKeys {
         if !self.verifies(narinfo.fingerprint.as_bytes(), &narinfo.signatures) {
             return Err(PublishedNarInfoError::UntrustedSignature);
         }
+        narinfo.fingerprint = String::new();
         narinfo.signatures = Vec::new();
         Ok(ValidatedNarInfo(narinfo))
     }
