@@ -1,6 +1,7 @@
 mod config;
 mod error;
 mod operator;
+mod push;
 mod server;
 mod token;
 
@@ -29,6 +30,7 @@ enum Command {
     Delete(operator::Delete),
     Stats(operator::Stats),
     Token(token::Token),
+    Push(push::Push),
 }
 
 fn main() -> ExitCode {
@@ -60,6 +62,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Gc(args) => operator::gc(args),
         Command::Stats(args) => operator::stats(args),
         Command::Token(args) => token::run(args),
+        Command::Push(args) => push::run(args),
     }
 }
 
@@ -148,5 +151,23 @@ mod tests {
         .expect("gc policy should parse");
 
         assert!(matches!(cli.command, super::Command::Gc(_)));
+    }
+
+    #[test]
+    fn push_command_accepts_parallel_copy_options() {
+        let cli = Cli::try_parse_from([
+            "narjar",
+            "push",
+            "--to",
+            "https://cache.example",
+            "--jobs",
+            "4",
+            "--netrc-file",
+            "/tmp/netrc",
+            "/run/current-system",
+        ])
+        .expect("push options should parse");
+
+        assert!(matches!(cli.command, super::Command::Push(_)));
     }
 }

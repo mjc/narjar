@@ -63,6 +63,13 @@ narjar stats
   --url HTTP_URL
   [--netrc-file PATH]
   [--json]
+
+narjar push
+  --to STORE_URI
+  [--jobs N]
+  [--netrc-file PATH]
+  [--refresh]
+  INSTALLABLE...
 ~~~
 
 init creates the deterministic layout, nix-cache-info, empty token files, and
@@ -74,6 +81,14 @@ label atomically to the scope file, and prints the secret once to stdout.
 Callers redirect stdout to a mode-0600 secret store. token revoke removes one
 label by atomic file replacement. The secret itself is never in argv, an
 environment variable, logs, or the hash file.
+
+push is a client-side convenience command for native Nix copies. It resolves
+the requested installables once with `nix path-info --recursive`, partitions
+the resulting closure across bounded workers, and invokes native `nix copy`
+for each partition. Publication remains Narjar's existing atomic per-object
+operation; push does not parse NARs or implement a second Nix store protocol.
+The `nix` executable must be in PATH, and `--netrc-file` is passed to Nix as an
+HTTP credential file that must already have restrictive permissions.
 
 delete is offline-only: it refuses while the serve lock is held, removes the
 published narinfo after validation and directory sync, and deliberately leaves
