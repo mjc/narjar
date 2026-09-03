@@ -504,27 +504,35 @@ impl Storage {
         }
 
         let required_bytes = expected_length.saturating_add(policy.min_free_bytes);
-        let target = PublishTarget::Nar(id, encoding);
-        self.publish_with_admission(
-            target,
+        let admit = || {
+            let directory = self.nar_temp_directory()?;
+            filesystem_space(&directory)?.required_capacity(required_bytes)
+        };
+        let validate = |file: &File| -> Result<(), StorageError> {
             match encoding {
-                NarEncoding::None => {
-                    Box::new(CheckedNarReader::new(source, &id.0, expected_length)) as Box<dyn Read>
-                }
-                NarEncoding::Xz => Box::new(source),
-            },
-            || {
-                let directory = self.nar_temp_directory()?;
-                filesystem_space(&directory)?.required_capacity(required_bytes)
-            },
-            |file| match encoding {
                 NarEncoding::None => Ok(()),
                 NarEncoding::Xz => validate_xz(file, None, None, policy.max_bytes)
                     .map(|_| ())
                     .map_err(Into::into),
-            },
-            |_| Ok(()),
-        )
+            }
+        };
+
+        match encoding {
+            NarEncoding::None => self.publish_with_admission(
+                PublishTarget::Nar(id, encoding),
+                CheckedNarReader::new(source, &id.0, expected_length),
+                admit,
+                validate,
+                |_| Ok(()),
+            ),
+            NarEncoding::Xz => self.publish_with_admission(
+                PublishTarget::Nar(id, encoding),
+                source,
+                admit,
+                validate,
+                |_| Ok(()),
+            ),
+        }
     }
 
     #[cfg(test)]
