@@ -242,7 +242,11 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
             store,
             nar: NarObjectId::parse(validated.nar().as_str()).expect("validated NAR id"),
             store_path: validated.store_path().to_owned(),
-            references: validated.references().iter().cloned().collect(),
+            references: validated
+                .references()
+                .iter()
+                .map(|reference| format!("/nix/store/{reference}"))
+                .collect(),
             narinfo_name: name,
             nar_name,
             narinfo_bytes: metadata.len(),

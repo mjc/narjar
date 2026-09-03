@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt,
     io::{self, Read},
     os::unix::fs::MetadataExt,
@@ -175,7 +175,7 @@ impl NamedSignature {
 #[derive(Debug)]
 struct ParsedNarInfo {
     store_path: String,
-    references: BTreeSet<String>,
+    references: Vec<String>,
     nar: NarObjectId,
     nar_hash: NarObjectId,
     encoding: NarEncoding,
@@ -304,7 +304,7 @@ impl ValidatedNarInfo {
         &self.0.store_path
     }
 
-    pub(crate) fn references(&self) -> &BTreeSet<String> {
+    pub(crate) fn references(&self) -> &[String] {
         &self.0.references
     }
 
@@ -360,19 +360,23 @@ impl ValidatedNarInfo {
     }
 }
 
-fn parse_references(value: &str) -> Result<BTreeSet<String>, NarInfoError> {
+fn parse_references(value: &str) -> Result<Vec<String>, NarInfoError> {
     if value.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(Vec::new());
     }
 
-    let mut references = BTreeSet::new();
-    for reference in value.split(' ') {
-        if reference.is_empty() {
-            return Err(NarInfoError);
-        }
-        validate_store_basename(reference)?;
-        references.insert(format!("/nix/store/{reference}"));
-    }
+    let mut references = value
+        .split(' ')
+        .map(|reference| {
+            if reference.is_empty() {
+                return Err(NarInfoError);
+            }
+            validate_store_basename(reference)?;
+            Ok(reference.to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    references.sort_unstable();
+    references.dedup();
     Ok(references)
 }
 
@@ -380,13 +384,14 @@ fn build_fingerprint(
     store_path: &str,
     nar_hash: &NarObjectId,
     nar_size: u64,
-    references: &BTreeSet<String>,
+    references: &[String],
 ) -> String {
     let mut fingerprint = format!("1;{store_path};sha256:{};{nar_size};", nar_hash.as_str());
     for (index, reference) in references.iter().enumerate() {
         if index != 0 {
             fingerprint.push(',');
         }
+        fingerprint.push_str("/nix/store/");
         fingerprint.push_str(reference);
     }
     fingerprint
@@ -524,6 +529,18 @@ mod tests {
     }
 
     #[test]
+    fn parser_keeps_compact_sorted_references() {
+        let references = parse_references(&format!(
+            "{STORE_HASH}-zulu {STORE_HASH}-alpha {STORE_HASH}-zulu"
+        ))
+        .expect("valid references");
+        assert_eq!(
+            references,
+            vec![format!("{STORE_HASH}-alpha"), format!("{STORE_HASH}-zulu"),]
+        );
+    }
+
+    #[test]
     fn parser_validates_store_basenames_borrowed() {
         let value = format!("{STORE_HASH}-package");
         let (hash, name) = validate_store_basename(&value).expect("valid store basename");
@@ -534,10 +551,7 @@ mod tests {
     #[test]
     fn fingerprint_formats_references_in_order() {
         let nar_hash = NarObjectId::parse(NAR_HASH).expect("valid nar hash");
-        let references = BTreeSet::from([
-            format!("/nix/store/{STORE_HASH}-zulu"),
-            format!("/nix/store/{STORE_HASH}-alpha"),
-        ]);
+        let references = vec![format!("{STORE_HASH}-alpha"), format!("{STORE_HASH}-zulu")];
 
         assert_eq!(
             build_fingerprint(
