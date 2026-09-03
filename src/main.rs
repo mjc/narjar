@@ -164,6 +164,8 @@ mod tests {
             "4",
             "--netrc-file",
             "/tmp/netrc",
+            "--signing-key-file",
+            "/tmp/narjar-secret-key",
             "/run/current-system",
         ])
         .expect("push options should parse");

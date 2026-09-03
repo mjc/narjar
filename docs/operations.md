@@ -68,6 +68,7 @@ narjar push
   --to STORE_URI
   [--jobs N]
   [--netrc-file PATH]
+  [--signing-key-file PATH]
   [--refresh]
   INSTALLABLE...
 ~~~
@@ -85,10 +86,12 @@ environment variable, logs, or the hash file.
 push is a client-side convenience command for native Nix copies. It resolves
 the requested installables once with `nix path-info --recursive`, partitions
 the resulting closure across bounded workers, and invokes native `nix copy`
-for each partition. Publication remains Narjar's existing atomic per-object
-operation; push does not parse NARs or implement a second Nix store protocol.
-The `nix` executable must be in PATH, and `--netrc-file` is passed to Nix as an
-HTTP credential file that must already have restrictive permissions.
+for each partition. With `--signing-key-file`, it first invokes `nix store sign`
+over the complete closure so each native copy can publish trusted narinfo
+metadata. Publication remains Narjar's existing atomic per-object operation;
+push does not parse NARs or implement a second Nix store protocol. The `nix`
+executable must be in PATH, and `--netrc-file` is passed to Nix as an HTTP
+credential file that must already have restrictive permissions.
 
 delete is offline-only: it refuses while the serve lock is held, removes the
 published narinfo after validation and directory sync, and deliberately leaves

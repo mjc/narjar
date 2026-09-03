@@ -24,6 +24,10 @@ pub(crate) struct Push {
     #[arg(long)]
     netrc_file: Option<PathBuf>,
 
+    /// Secret key file used to sign the local store paths before copying.
+    #[arg(long)]
+    signing_key_file: Option<PathBuf>,
+
     /// Re-check and re-upload paths already present at the destination.
     #[arg(long)]
     refresh: bool,
@@ -35,6 +39,9 @@ pub(crate) struct Push {
 
 pub(crate) fn run(args: Push) -> Result<(), Error> {
     let paths = closure_paths(&args.paths)?;
+    if let Some(key_file) = args.signing_key_file.as_deref() {
+        sign_paths(key_file, &paths)?;
+    }
     let worker_count = args.jobs.get().min(paths.len());
     let chunk_size = paths.len().div_ceil(worker_count);
     let mut workers = Vec::with_capacity(worker_count);
@@ -69,6 +76,37 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error::runtime(format!("{failures} push workers failed")))
+    }
+}
+
+fn sign_paths(key_file: &std::path::Path, paths: &[String]) -> Result<(), Error> {
+    let mut child = Command::new("nix")
+        .arg("store")
+        .arg("sign")
+        .arg("--key-file")
+        .arg(key_file)
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| Error::runtime(format!("failed to run nix store sign: {error}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::runtime("nix store sign stdin was not piped"))?;
+    for path in paths {
+        writeln!(stdin, "{path}")
+            .map_err(|error| Error::runtime(format!("failed to write signing paths: {error}")))?;
+    }
+    drop(stdin);
+    let status = child
+        .wait()
+        .map_err(|error| Error::runtime(format!("failed to wait for nix store sign: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::runtime(format!(
+            "nix store sign exited with {status}"
+        )))
     }
 }
 
