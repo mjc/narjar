@@ -107,6 +107,12 @@
     "--min-free-bytes"
     (toString cfg.minFreeBytes)
   ];
+  commonServiceConfig = {
+    PrivateTmp = true;
+    ProtectSystem = "strict";
+    ReadWritePaths = [runtimeDataDir];
+    UMask = "0077";
+  };
   gcArgs = lib.escapeShellArgs (
     [
       "gc"
@@ -277,68 +283,64 @@ in {
 
       preStart = lib.mkIf cfg.dynamicUser preStartScript;
 
-      serviceConfig = {
-        Environment = "NARJAR_CREDENTIALS_DIRECTORY=%d";
-        DynamicUser = lib.mkIf cfg.dynamicUser true;
-        User = lib.mkIf (!cfg.dynamicUser) "narjar";
-        Group = lib.mkIf (!cfg.dynamicUser) "narjar";
-        StateDirectory = lib.mkIf cfg.dynamicUser stateDirectory;
-        StateDirectoryMode = lib.mkIf cfg.dynamicUser "0700";
-        ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";
-        LoadCredential = map (credential: "${credential.name}:${credential.source}") credentials;
-        ExecStart = "${executable} ${serveArgs}";
-        Restart = "on-failure";
-        UMask = "0077";
+      serviceConfig =
+        commonServiceConfig
+        // {
+          Environment = "NARJAR_CREDENTIALS_DIRECTORY=%d";
+          DynamicUser = lib.mkIf cfg.dynamicUser true;
+          User = lib.mkIf (!cfg.dynamicUser) "narjar";
+          Group = lib.mkIf (!cfg.dynamicUser) "narjar";
+          StateDirectory = lib.mkIf cfg.dynamicUser stateDirectory;
+          StateDirectoryMode = lib.mkIf cfg.dynamicUser "0700";
+          ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";
+          LoadCredential = map (credential: "${credential.name}:${credential.source}") credentials;
+          ExecStart = "${executable} ${serveArgs}";
+          Restart = "on-failure";
 
-        AmbientCapabilities = "";
-        CapabilityBoundingSet = "";
-        LockPersonality = true;
-        MemoryDenyWriteExecute = true;
-        NoNewPrivileges = true;
-        PrivateDevices = true;
-        PrivateTmp = true;
-        ProcSubset = "pid";
-        ProtectClock = true;
-        ProtectControlGroups = true;
-        ProtectHome = true;
-        ProtectHostname = true;
-        ProtectKernelLogs = true;
-        ProtectKernelModules = true;
-        ProtectKernelTunables = true;
-        ProtectProc = "invisible";
-        ProtectSystem = "strict";
-        ReadWritePaths = [runtimeDataDir];
-        RemoveIPC = true;
-        RestrictAddressFamilies = [
-          "AF_INET"
-          "AF_INET6"
-        ];
-        RestrictNamespaces = true;
-        RestrictRealtime = true;
-        SystemCallArchitectures = "native";
-        SystemCallFilter = [
-          "@system-service"
-          "~@privileged"
-          "~@resources"
-        ];
-      };
+          AmbientCapabilities = "";
+          CapabilityBoundingSet = "";
+          LockPersonality = true;
+          MemoryDenyWriteExecute = true;
+          NoNewPrivileges = true;
+          PrivateDevices = true;
+          ProcSubset = "pid";
+          ProtectClock = true;
+          ProtectControlGroups = true;
+          ProtectHome = true;
+          ProtectHostname = true;
+          ProtectKernelLogs = true;
+          ProtectKernelModules = true;
+          ProtectKernelTunables = true;
+          ProtectProc = "invisible";
+          RemoveIPC = true;
+          RestrictAddressFamilies = [
+            "AF_INET"
+            "AF_INET6"
+          ];
+          RestrictNamespaces = true;
+          RestrictRealtime = true;
+          SystemCallArchitectures = "native";
+          SystemCallFilter = [
+            "@system-service"
+            "~@privileged"
+            "~@resources"
+          ];
+        };
     };
     systemd.services.narjar-gc = lib.mkIf cfg.gc.enable {
       description = "Narjar offline garbage collection";
       after = ["network.target"];
       unitConfig.RequiresMountsFor = [cfg.dataDir];
 
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStartPre = "${pkgs.systemd}/bin/systemctl stop narjar.service";
-        ExecStart = "${executable} ${gcArgs}";
-        ExecStopPost = "${pkgs.systemd}/bin/systemctl start narjar.service";
-        TimeoutStartSec = "infinity";
-        PrivateTmp = true;
-        ProtectSystem = "strict";
-        ReadWritePaths = [runtimeDataDir];
-        UMask = "0077";
-      };
+      serviceConfig =
+        commonServiceConfig
+        // {
+          Type = "oneshot";
+          ExecStartPre = "${pkgs.systemd}/bin/systemctl stop narjar.service";
+          ExecStart = "${executable} ${gcArgs}";
+          ExecStopPost = "${pkgs.systemd}/bin/systemctl start narjar.service";
+          TimeoutStartSec = "infinity";
+        };
     };
 
     systemd.timers.narjar-gc = lib.mkIf cfg.gc.enable {
