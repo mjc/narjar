@@ -467,7 +467,7 @@ impl Storage {
         let layout = Layout::new(root_path.clone());
         ensure_directory(&root_path, "data directory")?;
         let root_directory = open_directory(&root_path)?;
-        let root_is_empty = read_dir_names(&root_directory)?.is_empty();
+        let root_is_empty = directory_is_empty(&root_directory)?;
         let nar_directory =
             ensure_directory_at(&root_directory, OsStr::new("nar"), "nar directory")?;
         ensure_directory_at(
@@ -1239,6 +1239,68 @@ pub(crate) fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
         return Err(io::Error::last_os_error());
     }
     Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn directory_is_empty(directory: &File) -> io::Result<bool> {
+    let directory = open_at(
+        directory,
+        OsStr::new("."),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )?;
+    let mut buffer = [0u8; 1024];
+
+    loop {
+        // SAFETY: directory owns a live directory descriptor and buffer is
+        // valid writable storage for the requested byte count.
+        let bytes = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                directory.as_raw_fd(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+            )
+        };
+        if bytes < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let bytes = bytes as usize;
+        if bytes == 0 {
+            return Ok(true);
+        }
+
+        let mut offset = 0;
+        while offset < bytes {
+            if bytes - offset < 19 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "short getdents64 record",
+                ));
+            }
+            let reclen = u16::from_ne_bytes([buffer[offset + 16], buffer[offset + 17]]) as usize;
+            if reclen < 19 || reclen > bytes - offset {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid getdents64 record length",
+                ));
+            }
+            let name = &buffer[offset + 19..offset + reclen];
+            let name = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .map_or(name, |end| &name[..end]);
+            if name != b"." && name != b".." {
+                return Ok(false);
+            }
+            offset += reclen;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn directory_is_empty(directory: &File) -> io::Result<bool> {
+    read_dir_names(directory).map(|names| names.is_empty())
 }
 
 fn rollback_link_at(directory: &File, name: &OsStr) -> Result<(), StorageError> {
