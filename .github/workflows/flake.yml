@@ -12,7 +12,11 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@b67ad2f0e8376a0bc947db191e4484285b6f5b56
       - run: ./ci/check-flake-contract.sh
       - run: nix build -L --no-update-lock-file .#packages.x86_64-linux.default
-      - run: nix run -L --no-update-lock-file .#default
+      - run: |
+          data_dir="$(mktemp -d)"
+          nix run -L --no-update-lock-file .#default -- init --data-dir "$data_dir"
+          test -f "$data_dir/nix-cache-info"
+          test -d "$data_dir/nar"
       - run: nix build -L --no-update-lock-file .#packages.x86_64-linux.narjar-static
       - run: nix build -L --no-update-lock-file .#checks.x86_64-linux.static-elf
       - run: nix run -L --no-update-lock-file .#provenance

@@ -7,10 +7,31 @@
   cfg = config.services.narjar;
   executable = lib.getExe' cfg.package "narjar";
   stateDirectory = lib.removePrefix "/var/lib/" cfg.dataDir;
+  canonicalDataDir =
+    lib.match "^/var/lib/[^/]+$" cfg.dataDir != null
+    && !builtins.elem stateDirectory ["." ".."];
   runtimeDataDir =
     if cfg.dynamicUser
     then "/var/lib/private/${stateDirectory}"
     else cfg.dataDir;
+  fixedPaths = [
+    runtimeDataDir
+    "${runtimeDataDir}/nar"
+    "${runtimeDataDir}/nar/.tmp"
+    "${runtimeDataDir}/.tmp"
+    "${runtimeDataDir}/realisations"
+    "${runtimeDataDir}/realisations/.tmp"
+    "${runtimeDataDir}/auth"
+    "${runtimeDataDir}/lock"
+    "${runtimeDataDir}/.narjar-clean"
+    "${runtimeDataDir}/nix-cache-info"
+    "${runtimeDataDir}/trusted-public-keys"
+    "${runtimeDataDir}/auth/write.tokens"
+  ];
+  optionalFixedPaths = [
+    "${runtimeDataDir}/.narjar-recovery"
+    "${runtimeDataDir}/auth/read.tokens"
+  ];
   credentials = lib.filter (credential: credential.source != null) [
     {
       name = "read.tokens";
@@ -38,18 +59,37 @@
         ${lib.escapeShellArg "${runtimeDataDir}/${credential.target}"}
     '')
     credentials;
-  preStartScript = ''
+  validateFixedPaths =
+    lib.concatMapStringsSep "\n" (path: ''
+      test ! -L ${lib.escapeShellArg path}
+    '') (fixedPaths ++ optionalFixedPaths);
+  chownFixedPaths =
+    lib.concatMapStringsSep "\n" (path: ''
+      ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- ${lib.escapeShellArg path}
+    '') fixedPaths;
+  chownOptionalFixedPaths =
+    lib.concatMapStringsSep "\n" (path: ''
+      if [ -e ${lib.escapeShellArg path} ]; then
+        ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- ${lib.escapeShellArg path}
+      fi
+    '') optionalFixedPaths;
+  preStartBody = ''
+    test ! -L ${lib.escapeShellArg runtimeDataDir}
     if [ ! -e ${lib.escapeShellArg "${runtimeDataDir}/nix-cache-info"} ]; then
       ${executable} init --data-dir ${lib.escapeShellArg runtimeDataDir}
     fi
+    ${validateFixedPaths}
     ${lib.optionalString (cfg.auth.readTokens == null) ''
       ${pkgs.coreutils}/bin/rm -f ${lib.escapeShellArg "${runtimeDataDir}/auth/read.tokens"}
     ''}
     ${installCredentials}
   '';
+  preStartScript = "set -eu\n${preStartBody}";
   privilegedPreStartScript = ''
-    ${preStartScript}
-    ${pkgs.coreutils}/bin/chown -R narjar:narjar ${lib.escapeShellArg runtimeDataDir}
+    set -eu
+    ${preStartBody}
+    ${chownFixedPaths}
+    ${chownOptionalFixedPaths}
   '';
   privilegedPreStart = pkgs.writeShellScript "narjar-pre-start" privilegedPreStartScript;
   serveArgs = lib.escapeShellArgs [
@@ -209,10 +249,8 @@ in {
     assertions = [
       {
         assertion =
-          lib.hasPrefix "/var/lib/" cfg.dataDir
-          && stateDirectory != ""
-          && !(lib.hasInfix ".." stateDirectory);
-        message = "services.narjar.dataDir must be a directory below /var/lib";
+          canonicalDataDir;
+        message = "services.narjar.dataDir must be one canonical directory below /var/lib, such as /var/lib/narjar";
       }
       {
         assertion =

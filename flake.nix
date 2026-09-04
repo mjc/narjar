@@ -332,6 +332,9 @@
             fi
             touch $out
           '';
+          module-evaluation = env.pkgs.writeText "narjar-module-evaluation" (
+            import ./nix/module-eval-test.nix {pkgs = env.pkgs;}
+          );
         in
         {
           inherit
@@ -340,6 +343,7 @@
             lock-consistency
             runtime-smoke
             runtime-closure
+            module-evaluation
             ;
           cargo-artifacts = env.cargoArtifacts;
           compile = env.narjar;
