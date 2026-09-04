@@ -441,10 +441,20 @@ revalidates the inventory before serving.
 
 The auth values are host paths consumed by systemd `LoadCredential`, not
 credential contents. Do not use `builtins.readFile` or Nix string literals for
-secrets. systemd supplies a dynamic unprivileged user, a mode-0700
+secrets. On each activation, configured credentials are copied to a
+same-directory temporary file, synced, atomically renamed into place, and the
+parent directory is synced. A failed replacement therefore leaves the old
+complete file. `readTokens = null` removes the managed read-token file;
+`writeTokens = null` and `trustedPublicKeys = null` preserve their
+operator-managed files. systemd supplies a dynamic unprivileged user, a mode-0700
 `StateDirectory`, and the only writable path. The unit drops capabilities and
 enables `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, kernel and
 namespace protections, and an AF_INET/AF_INET6-only address-family allowlist.
+The module also sets `RequiresMountsFor` for the configured data path. On the
+tested native-ZFS deployment this resolves to the generated
+`var-lib-narjar.mount` unit; filesystems whose mount integration does not
+provide a path mount unit must supply an administrator-owned readiness
+dependency. Narjar never mounts or creates the dataset.
 The NixOS VM check performs state initialization and HTTP requests under those
 restrictions, and verifies the credential and state modes.
 

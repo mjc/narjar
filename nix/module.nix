@@ -8,7 +8,8 @@
   executable = lib.getExe' cfg.package "narjar";
   stateDirectory = lib.removePrefix "/var/lib/" cfg.dataDir;
   canonicalDataDir =
-    lib.match "^/var/lib/[^/]+$" cfg.dataDir != null
+    lib.match "^/var/lib/[^/]+$" cfg.dataDir
+    != null
     && !builtins.elem stateDirectory ["." ".."];
   runtimeDataDir =
     if cfg.dynamicUser
@@ -52,27 +53,51 @@
       mode = "0644";
     }
   ];
-  installCredentials =
-    lib.concatMapStringsSep "\n" (credential: ''
-      ${pkgs.coreutils}/bin/install -m ${credential.mode} \
-        "$NARJAR_CREDENTIALS_DIRECTORY/${credential.name}" \
-        ${lib.escapeShellArg "${runtimeDataDir}/${credential.target}"}
-    '')
-    credentials;
-  validateFixedPaths =
-    lib.concatMapStringsSep "\n" (path: ''
-      test ! -L ${lib.escapeShellArg path}
-    '') (fixedPaths ++ optionalFixedPaths);
+  credentialOwner = lib.optionalString (!cfg.dynamicUser) ''
+    ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- "$credential_tmp"
+  '';
+  installCredentials = lib.optionalString (credentials != []) ''
+    credential_tmp=
+    cleanup_credential_tmp() {
+      if [ -n "$credential_tmp" ]; then
+        ${pkgs.coreutils}/bin/rm -f -- "$credential_tmp"
+      fi
+    }
+    trap cleanup_credential_tmp EXIT
+    install_credential() {
+      local source="$1" target="$2" mode="$3" directory
+      directory=''${target%/*}
+      credential_tmp=$(${pkgs.coreutils}/bin/mktemp "$directory/.narjar-credential.XXXXXX")
+      ${pkgs.coreutils}/bin/install -m "$mode" -- "$source" "$credential_tmp"
+      ${credentialOwner}
+      ${pkgs.coreutils}/bin/sync -d "$credential_tmp"
+      ${pkgs.coreutils}/bin/mv -fT -- "$credential_tmp" "$target"
+      credential_tmp=
+      ${pkgs.coreutils}/bin/sync "$directory"
+    }
+    ${lib.concatMapStringsSep "\n" (credential: ''
+        install_credential \
+          "$NARJAR_CREDENTIALS_DIRECTORY/${credential.name}" \
+          ${lib.escapeShellArg "${runtimeDataDir}/${credential.target}"} \
+          ${lib.escapeShellArg credential.mode}
+      '')
+      credentials}
+  '';
+  validateFixedPaths = lib.concatMapStringsSep "\n" (path: ''
+    test ! -L ${lib.escapeShellArg path}
+  '') (fixedPaths ++ optionalFixedPaths);
   chownFixedPaths =
     lib.concatMapStringsSep "\n" (path: ''
       ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- ${lib.escapeShellArg path}
-    '') fixedPaths;
+    '')
+    fixedPaths;
   chownOptionalFixedPaths =
     lib.concatMapStringsSep "\n" (path: ''
       if [ -e ${lib.escapeShellArg path} ]; then
         ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- ${lib.escapeShellArg path}
       fi
-    '') optionalFixedPaths;
+    '')
+    optionalFixedPaths;
   preStartBody = ''
     test ! -L ${lib.escapeShellArg runtimeDataDir}
     if [ ! -e ${lib.escapeShellArg "${runtimeDataDir}/nix-cache-info"} ]; then
@@ -80,7 +105,10 @@
     fi
     ${validateFixedPaths}
     ${lib.optionalString (cfg.auth.readTokens == null) ''
-      ${pkgs.coreutils}/bin/rm -f ${lib.escapeShellArg "${runtimeDataDir}/auth/read.tokens"}
+      if [ -e ${lib.escapeShellArg "${runtimeDataDir}/auth/read.tokens"} ]; then
+        ${pkgs.coreutils}/bin/rm -f -- ${lib.escapeShellArg "${runtimeDataDir}/auth/read.tokens"}
+        ${pkgs.coreutils}/bin/sync ${lib.escapeShellArg "${runtimeDataDir}/auth"}
+      fi
     ''}
     ${installCredentials}
   '';
@@ -234,19 +262,19 @@ in {
       readTokens = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        description = "Host path loaded as the read token credential.";
+        description = "Host path loaded as the read token credential; null removes the managed read-token file.";
       };
 
       writeTokens = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        description = "Host path loaded as the write token credential.";
+        description = "Host path loaded as the write token credential; null preserves the operator-managed file.";
       };
 
       trustedPublicKeys = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        description = "Host path loaded as the trusted public keys credential.";
+        description = "Host path loaded as the trusted public keys credential; null preserves the operator-managed file.";
       };
     };
   };
