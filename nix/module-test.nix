@@ -51,6 +51,26 @@
     virtualisation.diskSize = 2048;
   };
 
+  nodes.blocked = {...}: {
+    imports = [self.nixosModules.default];
+
+    services.narjar = {
+      enable = true;
+      dataDir = "/var/lib/narjar-mounted";
+      dynamicUser = false;
+      minFreeBytes = 0;
+    };
+
+    systemd.mounts = [
+      {
+        what = "/dev/narjar-missing";
+        where = "/var/lib/narjar-mounted";
+        type = "ext4";
+        options = "noauto,x-systemd.device-timeout=1ms";
+      }
+    ];
+  };
+
   testScript = ''
     machine.wait_for_unit("narjar.service")
     machine.wait_for_unit("nginx.service")
