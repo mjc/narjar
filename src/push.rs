@@ -16,8 +16,8 @@ pub(crate) struct Push {
     #[arg(long, value_parser = non_empty)]
     to: String,
 
-    /// Maximum number of native `nix copy` workers.
-    #[arg(long, default_value_t = NonZeroUsize::new(8).unwrap())]
+    /// Maximum number of native `nix copy` workers; each worker is internally concurrent.
+    #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
     jobs: NonZeroUsize,
 
     /// Netrc file passed to Nix for HTTP authentication.
@@ -176,4 +176,26 @@ fn non_empty(value: &str) -> Result<String, String> {
     (!value.is_empty())
         .then(|| value.to_owned())
         .ok_or_else(|| "must not be empty".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{Args, Command, FromArgMatches};
+
+    use super::Push;
+
+    #[test]
+    fn push_defaults_to_one_copy_worker() {
+        let matches = Push::augment_args(Command::new("push"))
+            .try_get_matches_from([
+                "push",
+                "--to",
+                "https://cache.example",
+                "/run/current-system",
+            ])
+            .expect("push options should parse");
+        let push = Push::from_arg_matches(&matches).expect("push arguments should parse");
+
+        assert_eq!(push.jobs.get(), 1);
+    }
 }
