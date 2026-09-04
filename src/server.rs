@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{self, Write},
+    net::{TcpListener, TcpStream},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -11,18 +12,17 @@ use std::{
 
 use crossbeam_channel::{Sender, TrySendError, bounded};
 
-use signal_hook::{
-    consts::{SIGINT, SIGTERM},
-    flag,
-};
-use tiny_http::{Request, Response, Server, StatusCode};
-
 use narjar::{
     auth::Authorizer,
     http::respond,
+    http_server::{Request, StatusCode, write_status},
     inventory::Inventory,
     narinfo::TrustedPublicKeys,
     storage::{NarUploadPolicy, Storage},
+};
+use signal_hook::{
+    consts::{SIGINT, SIGTERM},
+    flag,
 };
 
 use crate::{config::ServeConfig, error::Error};
@@ -61,28 +61,28 @@ impl Drop for Admission {
 }
 
 struct AcceptedRequest {
-    request: Request,
+    stream: TcpStream,
     _admission: Admission,
 }
 
 fn try_dispatch(
     sender: &Sender<AcceptedRequest>,
     admissions: &Arc<Admissions>,
-    request: Request,
-) -> Option<Request> {
+    stream: TcpStream,
+) -> Option<TcpStream> {
     let admission = match admissions.try_acquire() {
         Some(admission) => admission,
-        None => return Some(request),
+        None => return Some(stream),
     };
     let accepted = AcceptedRequest {
-        request,
+        stream,
         _admission: admission,
     };
 
     match sender.try_send(accepted) {
         Ok(()) => None,
         Err(TrySendError::Full(accepted) | TrySendError::Disconnected(accepted)) => {
-            Some(accepted.request)
+            Some(accepted.stream)
         }
     }
 }
@@ -129,8 +129,11 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let trusted_keys = Arc::new(trusted_keys);
     let metrics = Arc::new(Metrics::default());
 
-    let server = Server::http(config.listen)
+    let listener = TcpListener::bind(config.listen)
         .map_err(|error| Error::runtime(format!("cannot listen on {}: {error}", config.listen)))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| Error::runtime(format!("cannot configure listener: {error}")))?;
     let stopping = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&stopping))
         .and_then(|_| flag::register(SIGTERM, Arc::clone(&stopping)))
@@ -138,7 +141,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
 
     println!(
         "listening http://{} workers={} max_in_flight={} max_nar_bytes={} min_free_bytes={}",
-        server.server_addr(),
+        listener
+            .local_addr()
+            .map_err(|error| Error::runtime(format!("cannot inspect listener: {error}")))?,
         config.workers,
         config.max_in_flight,
         config.max_nar_bytes,
@@ -162,19 +167,21 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             let metrics = Arc::clone(&metrics);
             thread::spawn(move || {
                 while let Ok(accepted) = receiver.recv() {
-                    let AcceptedRequest {
-                        request,
-                        _admission,
-                    } = accepted;
-                    respond(
-                        request,
-                        &storage,
-                        &authorizer,
-                        &trusted_keys,
-                        upload_policy,
-                        &metrics,
-                        min_free_bytes,
-                    );
+                    let AcceptedRequest { stream, _admission } = accepted;
+                    match Request::read(stream) {
+                        Ok(request) => respond(
+                            request,
+                            &storage,
+                            &authorizer,
+                            &trusted_keys,
+                            upload_policy,
+                            &metrics,
+                            min_free_bytes,
+                        ),
+                        Err((mut stream, _error)) => {
+                            let _ = write_status(&mut stream, StatusCode(400));
+                        }
+                    }
                 }
             })
         })
@@ -182,10 +189,17 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     drop(receiver);
 
     while !stopping.load(Ordering::Acquire) {
-        if let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(50)) {
-            if let Some(request) = try_dispatch(&sender, &admissions, request) {
-                let _ = request.respond(Response::empty(StatusCode(429)));
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                if let Some(mut stream) = try_dispatch(&sender, &admissions, stream) {
+                    let _ = write_status(&mut stream, StatusCode(429));
+                }
             }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Error::runtime(format!("cannot accept connection: {error}"))),
         }
     }
     drop(sender);

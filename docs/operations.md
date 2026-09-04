@@ -194,9 +194,9 @@ Each admitted upload owns at most one temporary file, one descriptor, one hash
 state, and one fixed buffer. Reads own one file and one fixed buffer. Memory is
 therefore O(workers * buffer-size), independent of NAR size.
 
-Header parsing limits come from tiny_http plus Narjar route checks. Content-
+Header parsing limits come from Narjar's fixed parser plus route checks. Content-
 Length is required before upload admission. Narjar does not promise an in-
-process socket timeout that tiny_http cannot enforce. The required reverse
+process socket timeout that its blocking listener cannot enforce. The required reverse
 proxy sets header, request-body progress, and response timeouts; direct private
 use relies on the fixed worker bound. NAR size and minimum free-space checks
 happen before and during the stream.
@@ -447,7 +447,7 @@ restrictions, and verifies the credential and state modes.
 
 `GET /healthz` is the liveness endpoint. `GET /readyz` is the readiness
 endpoint and requires a read token when private-read mode is enabled. Socket
-activation is an explicit v0.1 non-goal because tiny_http owns the listener.
+activation is an explicit v0.1 non-goal because Narjar owns the listener.
 
 For public service, terminate TLS and enforce stream timeouts at a reverse
 proxy. This nginx location is also exercised by the NixOS VM check:

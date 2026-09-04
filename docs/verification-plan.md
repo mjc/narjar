@@ -8,7 +8,7 @@ The initial allowed set is deliberately small:
 
 | Crate | Purpose | Why standard library is insufficient | Rejected alternative |
 | --- | --- | --- | --- |
-| tiny_http | Blocking HTTP/1.1 server and streamed request/response bodies | Correct HTTP parsing and connection handling are security boundaries | tokio/hyper/axum add an async stack not needed for a bounded worker pool |
+| std::net + httparse | Blocking HTTP/1.1 listener and streamed request/response bodies | Correct HTTP parsing and connection handling are security boundaries; httparse supplies zero-copy request syntax validation | tokio/hyper/axum add an async stack not needed for a bounded worker pool |
 | sha2 | Streaming SHA-256 required by Nix hashes and token hashing | Rust std has no cryptographic hash | OpenSSL/ring add native/TLS surface |
 | ed25519-dalek | Verify Nix narinfo signatures | Rust std has no Ed25519 | Server signing and private-key custody |
 | data-encoding | Strict Base64 and custom Nix32 encoding | Hand-rolled codecs are protocol/security risk | General serialization framework |
@@ -24,7 +24,7 @@ versions in Cargo.lock and upgrades only after the same dependency gates.
 
 | Crate | Candidate | License | Declared MSRV | Features and static/audit impact |
 | --- | --- | --- | ---: | --- |
-| tiny_http | 0.12.0 | MIT OR Apache-2.0 | undeclared; prove on 1.85 | no default features; TLS features forbidden; pure-Rust HTTP plus small parser/date/log dependencies |
+| httparse | 1.10.1 | MIT OR Apache-2.0 | undeclared; prove on 1.85 | default features off with `std`; zero-copy HTTP/1.x syntax parser; no listener, TLS, date, logging, or body buffering |
 | sha2 | 0.11.0 | MIT OR Apache-2.0 | 1.85 | default features off unless required; pure RustCrypto digest stack; no native library |
 | ed25519-dalek | 3.0.0 | BSD-3-Clause | 1.85 | verification only; default features off, with `fast` admitted only by measurement; curve/signature transitive audit is the main crypto surface |
 | data-encoding | 2.11.1 | MIT | 1.48 | `std` only; pure Rust; custom Nix32 alphabet configured locally |

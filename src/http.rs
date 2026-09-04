@@ -1,9 +1,8 @@
 use std::io::{self, Read, Seek, SeekFrom};
 
-use tiny_http::{Header, Method, Response, StatusCode};
-
 use crate::{
     auth::{Authorizer, Permission},
+    http_server::{Method, Request, Response, ResponseHeader as Header, StatusCode, static_header},
     metrics::Metrics,
     narinfo::{MAX_NARINFO_BYTES, NarEncoding, TrustedPublicKeys},
     storage::{
@@ -15,28 +14,27 @@ use crate::{
 const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
-fn header(name: &str, value: &str) -> Header {
-    Header::from_bytes(name, value).expect("static response header is valid")
+fn header(name: &'static str, value: &'static str) -> Header {
+    static_header(name, value)
 }
 
-fn not_found(request: tiny_http::Request) {
+fn not_found(request: Request) {
     let _ = request.respond(Response::empty(StatusCode(404)));
 }
 
-fn internal_error(request: tiny_http::Request) {
+fn internal_error(request: Request) {
     let _ = request.respond(Response::empty(StatusCode(500)));
 }
 
 fn nar_response<R: Read>(status: StatusCode, reader: R, content_length: usize) -> Response<R> {
-    Response::new(status, Vec::new(), reader, Some(content_length), None)
-        .with_chunked_threshold(usize::MAX)
+    Response::new(status, reader, content_length)
         .with_header(header("Content-Type", "application/x-nix-nar"))
         .with_header(header("Cache-Control", IMMUTABLE_CACHE_CONTROL))
         .with_header(header("Accept-Ranges", "bytes"))
 }
 
 fn respond_narinfo(
-    request: tiny_http::Request,
+    request: Request,
     storage: &Storage,
     store: &StoreHash,
     trusted: &TrustedPublicKeys,
@@ -79,7 +77,7 @@ enum RequestedRange {
     Invalid,
 }
 
-fn requested_range(request: &tiny_http::Request, length: u64) -> RequestedRange {
+fn requested_range(request: &Request, length: u64) -> RequestedRange {
     let mut headers = request
         .headers()
         .iter()
@@ -134,12 +132,7 @@ fn requested_range(request: &tiny_http::Request, length: u64) -> RequestedRange 
     RequestedRange::Partial { start, end }
 }
 
-fn respond_nar(
-    request: tiny_http::Request,
-    storage: &Storage,
-    nar: &NarObjectId,
-    encoding: NarEncoding,
-) {
+fn respond_nar(request: Request, storage: &Storage, nar: &NarObjectId, encoding: NarEncoding) {
     let mut file = match storage.open_nar_encoded(nar, encoding) {
         Ok(Some(file)) => file,
         Ok(None) => return not_found(request),
@@ -167,15 +160,15 @@ fn respond_nar(
             };
             let response =
                 nar_response(StatusCode(206), file.take(response_length), content_length)
-                    .with_header(header(
+                    .with_header(Header::owned(
                         "Content-Range",
-                        &format!("bytes {start}-{end}/{length}"),
+                        format!("bytes {start}-{end}/{length}"),
                     ));
             let _ = request.respond(response);
         }
         RequestedRange::Unsatisfiable => {
             let response = Response::empty(StatusCode(416))
-                .with_header(header("Content-Range", &format!("bytes */{length}")));
+                .with_header(Header::owned("Content-Range", format!("bytes */{length}")));
             let _ = request.respond(response);
         }
         RequestedRange::Invalid => {
@@ -254,12 +247,12 @@ impl ReadRoute {
     }
 }
 
-fn method_not_allowed(request: tiny_http::Request, allow: &str) {
+fn method_not_allowed(request: Request, allow: &'static str) {
     let response = Response::empty(StatusCode(405)).with_header(header("Allow", allow));
     let _ = request.respond(response);
 }
 
-fn has_header(request: &tiny_http::Request, name: &'static str) -> bool {
+fn has_header(request: &Request, name: &'static str) -> bool {
     request
         .headers()
         .iter()
@@ -267,12 +260,12 @@ fn has_header(request: &tiny_http::Request, name: &'static str) -> bool {
 }
 
 struct UploadRequest {
-    request: tiny_http::Request,
+    request: Request,
     length: usize,
 }
 
 impl UploadRequest {
-    fn accept(request: tiny_http::Request) -> Option<Self> {
+    fn accept(request: Request) -> Option<Self> {
         let length = if has_header(&request, "Transfer-Encoding") {
             Err(400)
         } else if has_header(&request, "Content-Encoding") {
@@ -293,7 +286,11 @@ impl UploadRequest {
         self.length
     }
 
-    fn reader(&mut self) -> &mut dyn Read {
+    fn body_complete(&self) -> bool {
+        self.request.body_complete()
+    }
+
+    fn reader(&mut self) -> impl Read + '_ {
         self.request.as_reader()
     }
 
@@ -339,7 +336,7 @@ fn record_capacity_error(metrics: &Metrics, error: &StorageError) {
     metrics.capacity_failure(kind);
 }
 
-fn respond_cache_info_put(request: tiny_http::Request, storage: &Storage, metrics: &Metrics) {
+fn respond_cache_info_put(request: Request, storage: &Storage, metrics: &Metrics) {
     let Some(mut upload) = UploadRequest::accept(request) else {
         return;
     };
@@ -371,7 +368,7 @@ fn respond_cache_info_put(request: tiny_http::Request, storage: &Storage, metric
 }
 
 fn respond_nar_put(
-    request: tiny_http::Request,
+    request: Request,
     storage: &Storage,
     id: &NarObjectId,
     encoding: NarEncoding,
@@ -383,6 +380,9 @@ fn respond_nar_put(
     };
     let length = upload.length();
     let result = storage.publish_nar(id, encoding, upload.reader(), length as u64, policy);
+    if !upload.body_complete() {
+        return;
+    }
     if let Err(error) = &result {
         record_capacity_error(metrics, error);
     }
@@ -401,7 +401,7 @@ fn respond_nar_put(
 }
 
 fn respond_narinfo_put(
-    request: tiny_http::Request,
+    request: Request,
     storage: &Storage,
     store: &StoreHash,
     trusted: &TrustedPublicKeys,
@@ -436,13 +436,13 @@ fn respond_narinfo_put(
     upload.respond(status);
 }
 
-fn unauthorized(request: tiny_http::Request) {
+fn unauthorized(request: Request) {
     let challenge = header("WWW-Authenticate", "Basic realm=\"narjar\"");
     let _ = request.respond(Response::empty(StatusCode(401)).with_header(challenge));
 }
 
 pub fn respond(
-    request: tiny_http::Request,
+    request: Request,
     storage: &Storage,
     authorizer: &Authorizer,
     trusted: &TrustedPublicKeys,
@@ -546,7 +546,7 @@ pub fn respond(
 
     match route {
         ReadRoute::CacheInfo => {
-            let response = Response::from_data(NIX_CACHE_INFO)
+            let response = Response::from_data(NIX_CACHE_INFO.to_vec())
                 .with_header(header("Content-Type", "text/x-nix-cache-info"))
                 .with_header(header("Cache-Control", "public, max-age=3600"));
             let _ = request.respond(response);

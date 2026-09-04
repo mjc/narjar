@@ -1,11 +1,12 @@
 use std::path::Path;
 
+use crate::{
+    http_server::Request,
+    token_file::{Error as TokenFileError, TokenFile},
+};
 use data_encoding::BASE64;
 use sha2::{Digest, Sha256};
 use subtle::{Choice, ConstantTimeEq};
-use tiny_http::Request;
-
-use crate::token_file::{Error as TokenFileError, TokenFile};
 
 const TOKEN_BYTES: usize = 32;
 
@@ -94,7 +95,8 @@ fn authorization_token_hash(request: &Request) -> Option<[u8; TOKEN_BYTES]> {
         .headers()
         .iter()
         .filter(|header| header.field.equiv("Authorization"));
-    let value = headers.next()?.value.as_str();
+    let header = headers.next()?;
+    let value = header.value.as_str();
     if headers.next().is_some() {
         return None;
     }

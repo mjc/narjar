@@ -150,8 +150,8 @@ or range/delete race.
 
 Resolved with an explicit boundary. A fixed worker set, bounded admission queue,
 Content-Length, object limits, fixed buffers, and reverse-proxy connection/body
-timeouts bound process resources. tiny_http does not justify pretending to
-offer an in-process socket deadline it cannot enforce. Public internet
+timeouts bound process resources. The blocking listener and fixed request parser
+do not pretend to offer an in-process socket deadline they cannot enforce. Public internet
 deployment without the required proxy is unsupported.
 
 ### Disk full, EIO, corruption, and crash recovery
@@ -194,7 +194,7 @@ directory without changing current identities.
 
 ### Dependency and framework pressure
 
-Resolved by a seven-crate candidate ceiling and gates. No async runtime, web
+Resolved by a small direct-dependency ceiling and gates. No async runtime, web
 framework, TLS stack, codec, DB, serialization/config/CLI/logging/metrics
 framework, general thread pool, or NAR parser is approved. Standard library
 code handles the small fixed formats. New dependencies require a recorded
