@@ -115,6 +115,24 @@ build_path() {
     }'
 }
 
+build_referencing_path() {
+  local base=$1
+  local label=$2
+  local build_nonce="$label-$nonce"
+  # shellcheck disable=SC2016
+  NARJAR_E2E_BUILD_NONCE="$build_nonce" NARJAR_E2E_REFERENCE="$base" run nix-build --impure --no-out-link --expr 'let
+      nonce = builtins.getEnv "NARJAR_E2E_BUILD_NONCE";
+      reference = builtins.storePath (builtins.getEnv "NARJAR_E2E_REFERENCE");
+    in
+    derivation {
+      name = "narjar-e2e-" + nonce;
+      system = builtins.currentSystem;
+      builder = "/bin/sh";
+      args = [ "-c" "printf %s \"$NARJAR_E2E_REFERENCE\" > \"$out\"" ];
+      NARJAR_E2E_REFERENCE = reference;
+    }'
+}
+
 sign_path() {
   nix_cli store sign --key-file "$secret_key" "$1"
 }
@@ -332,6 +350,44 @@ default_root="$temp_root/default-store"
 substitute "$default_root" "$trusted_key" "$default_path"
 expect_file "$default_root$default_path"
 run cmp "$default_path" "$default_root$default_path"
+
+scenario 'offline GC retains a protected real-Nix closure'
+gc_base=$(build_path gc-base "$nonce")
+gc_root=$(build_referencing_path "$gc_base" gc-root)
+sign_path "$gc_base"
+sign_path "$gc_root"
+cache_copy_to "$gc_root"
+gc_roots="$temp_root/gc-roots"
+printf '%s\n' "$gc_root" > "$gc_roots"
+stop_server
+run narjar gc --data-dir "$data_dir" \
+  --max-age-seconds 0 \
+  --protected-roots "$gc_roots" \
+  --apply \
+  --json
+start_server
+gc_protected_root="$temp_root/gc-protected-store"
+substitute "$gc_protected_root" "$trusted_key" "$gc_root"
+expect_file "$gc_protected_root$gc_root"
+expect_file "$gc_protected_root$gc_base"
+gc_evicted_root="$temp_root/gc-evicted-store"
+if substitute "$gc_evicted_root" "$trusted_key" "$refresh_path" >"$temp_root/gc-evicted.log" 2>&1; then
+  fail "GC-retained cache path was not evicted"
+fi
+cache_copy_to "$refresh_path"
+gc_repush_root="$temp_root/gc-repush-store"
+substitute "$gc_repush_root" "$trusted_key" "$refresh_path"
+expect_file "$gc_repush_root$refresh_path"
+
+scenario 'injected GC recovery marker is cleared on restart'
+stop_server
+run touch "$data_dir/.narjar-recovery"
+start_server
+gc_restart_root="$temp_root/gc-restart-store"
+substitute "$gc_restart_root" "$trusted_key" "$gc_root"
+expect_file "$gc_restart_root$gc_root"
+expect_file "$gc_restart_root$gc_base"
+
 printf 'SKIP realisations: Nix 2.31.5 emitted no realisation requests in the recorded protocol trace\n'
 
 printf '\nEVIDENCE daemon log\n'

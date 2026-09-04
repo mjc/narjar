@@ -8,7 +8,8 @@ authorized by this document until NARJ-20 approves it.
 Narjar is a flat, filesystem-only HTTP binary cache. It does not expose a
 native /nix/store, invoke Nix, maintain a database, recompress payloads, own a
 signing key, run background workers, or perform online garbage collection. It
-accepts Nix's raw `.nar` and precompressed `.nar.xz` forms and stores each form
+does provide a bounded, operator-invoked offline retention pass. It accepts
+Nix's raw `.nar` and precompressed `.nar.xz` forms and stores each form
 byte-for-byte.
 
 The differentiator from bincache is deletion of redb, server signing,
@@ -130,11 +131,27 @@ raw request path.
 No startup index or full scan is needed to serve: an exact route maps to an
 exact file. Startup creates required directories, validates ownership/modes,
 acquires the process lock, validates nix-cache-info, and removes no data.
-Offline reconcile performs the potentially unbounded scan.
+Offline reconcile and GC perform the potentially unbounded scans.
 
-A future GC can derive reachability from all published narinfos without changing
-the layout. v0.1 has no delete endpoint and no online GC, eliminating read/delete
-races.
+## Offline retention and GC
+
+`narjar gc` is disabled by default and requires the same exclusive DATA lease
+as serving. It first validates every published narinfo and its referenced NAR,
+then computes deterministic FIFO candidates from narinfo modification time.
+Optional protected roots retain their transitive `References` closure; a
+minimum age protects both recent publications and unreferenced NARs. The policy
+is an explicit maximum/target logical byte count and/or maximum age, never an
+access-time heuristic or resident worker.
+
+Apply removes and syncs narinfo first. It removes and syncs a NAR only after
+its final published reference is gone; old unreferenced NARs use the same age
+grace. A crash can therefore leave a harmless orphan but never a durable
+narinfo for a deleted NAR. Apply marks recovery before mutation and clears it
+only after a fresh validated inventory; startup revalidates a marked cache
+before serving. Logical totals intentionally exclude compression, CoW,
+reflinks, and snapshot-held physical blocks.
+
+There is no HTTP delete/GC endpoint and no online read/delete race.
 
 ## Write flow
 
@@ -236,7 +253,8 @@ negative cache until --refresh; the server cannot invalidate client caches.
 - zstd, gzip, chunked-NAR storage, or server recompression.
 - Server-side signing or private signing-key custody.
 - Multi-tenancy, quotas, namespaces, UI, database, Redis, S3, mirrors, workers.
-- Online delete, GC, pinning, roots, retention, or payload deduplication.
+- Online delete or GC, access-time retention, a resident retention worker, or
+  payload deduplication.
 - NAR listings, build logs, mass query, debug-info indexes, pull-through cache.
 - Built-in TLS, ACME, OIDC, mTLS, or proxy configuration generation.
 - Multiple HTTP ranges or conditional mutation.

@@ -281,15 +281,18 @@ must preserve a coherent published set.
 
 Evidence: Content sharing and mutable indexes make GC difficult in prior art.
 
-Owner and mitigation: NARJ-13/NARJ-14. No online delete or GC in v0.1; immutable
-files; backup narinfo and NAR tree; restore then reconcile; stale temporaries
-are outside the published set.
+Owner and mitigation: NARJ-32. No online delete or GC; immutable files; the
+offline GC command takes the DATA lease, validates the full inventory, retains
+configured root closures, removes/syncs narinfo before the last referenced NAR,
+and age-gates orphan cleanup. Back up narinfo and NAR trees, restore then
+reconcile; stale temporaries are outside the published set.
 
 Detection and recovery: Restore drill and reconcile report. Missing NAR causes
 narinfo quarantine; orphan NAR is retained.
 
-Residual/disposition/proof: Low for v0.1 safety, High for disk growth and
-operator capacity planning; disk watermark is mandatory.
+Residual/disposition/proof: Low for offline deletion safety, Medium for
+operator capacity planning because GC reports logical rather than physical
+snapshot/compression space; monitor destination capacity separately.
 
 ## R16: Real-Nix and Linux proof gaps
 
@@ -346,8 +349,10 @@ proof remains a release gate.
 
 ### D7: No online GC or deletion
 
-Accepted for v0.1. Avoids reader/deletion races and mutable reachability state.
-Capacity planning and offline reconciliation remain required.
+Accepted for v0.1. Avoids reader/deletion races. Bounded offline retention uses
+an exclusive lease and a temporary in-memory validated inventory rather than
+resident mutable reachability state. Capacity planning and offline
+reconciliation remain required.
 
 ### D8: Greenfield implementation is conditional
 

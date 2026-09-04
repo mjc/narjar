@@ -1,0 +1,8 @@
+{
+  "commit": "c61a28f31ec302e74b072be290816702b7465303",
+  "filesystem": "zroot/home zfs rw,relatime,xattr,noacl,casesensitive",
+  "kernel": "Linux 7.2.2 x86_64 GNU/Linux",
+  "nix": "nix (Nix) 2.31.5",
+  "page_size": 4096,
+  "rustc": "rustc 1.85.1 (4eb161250 2025-03-15)"
+}

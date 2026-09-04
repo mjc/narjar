@@ -1,0 +1,12 @@
+{"paths":0,"operation":"inventory","wall_ms":2.683,"peak_rss_kib":2276}
+{"paths":0,"operation":"dry_run","wall_ms":1.547,"peak_rss_kib":48}
+{"paths":0,"operation":"apply","wall_ms":14.425,"peak_rss_kib":3124}
+{"paths":100,"operation":"inventory","wall_ms":19.633,"peak_rss_kib":3140}
+{"paths":100,"operation":"dry_run","wall_ms":11.555,"peak_rss_kib":3144}
+{"paths":100,"operation":"apply","wall_ms":428.535,"peak_rss_kib":3148}
+{"paths":1000,"operation":"inventory","wall_ms":87.953,"peak_rss_kib":3672}
+{"paths":1000,"operation":"dry_run","wall_ms":75.187,"peak_rss_kib":3672}
+{"paths":1000,"operation":"apply","wall_ms":3717.706,"peak_rss_kib":3672}
+{"paths":10000,"operation":"inventory","wall_ms":777.625,"peak_rss_kib":9088}
+{"paths":10000,"operation":"dry_run","wall_ms":780.991,"peak_rss_kib":9088}
+{"paths":10000,"operation":"apply","wall_ms":37371.121,"peak_rss_kib":9088}

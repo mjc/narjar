@@ -487,7 +487,12 @@ fn select(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    order.sort_unstable_by_key(|&index| (entries[index].modified, index));
+    order.sort_unstable_by(|&left, &right| {
+        entries[left]
+            .modified
+            .cmp(&entries[right].modified)
+            .then_with(|| entries[left].store.0.cmp(&entries[right].store.0))
+    });
 
     let mut remaining = current_bytes;
     let mut selected = Vec::new();
@@ -529,7 +534,12 @@ fn select_orphans(
         .filter(|(_, orphan)| now.duration_since(orphan.modified).unwrap_or_default() >= min_age)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    order.sort_unstable_by_key(|&index| (orphans[index].modified, index));
+    order.sort_unstable_by(|&left, &right| {
+        orphans[left]
+            .modified
+            .cmp(&orphans[right].modified)
+            .then_with(|| orphans[left].name.cmp(&orphans[right].name))
+    });
 
     let mut remaining = current_bytes;
     let mut selected = Vec::new();

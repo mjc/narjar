@@ -193,6 +193,14 @@ Fixture states include:
 - unknown file and invalid filename;
 - interrupted token/public-key file replacement.
 
+GC coverage additionally uses deterministic 0, 100, 1,000, and 10,000
+published-path fixtures. It records full-inventory, dry-run, and apply wall
+time plus peak RSS at 10,000 paths. The serving path must retain no
+population-sized index; the offline command may materialize its bounded
+inventory. GC fixtures cover protected closures, shared NAR reference counts,
+age-gated orphans, dry-run/apply candidate identity, impossible targets, and
+every narinfo/NAR directory-sync failure boundary.
+
 Reconcile is read-only by default and emits a stable report. Any cleanup
 requires an explicit subcommand and age threshold. A restore drill copies a
 backup into an empty DATA directory, runs reconcile, then completes real-Nix

@@ -295,9 +295,9 @@ published pair. list-orphans filters the read-only report.
 
 No command turns an orphan into a published path.
 
-## Deletion and future GC
+## Deletion and retention GC
 
-v0.1 supports only offline logical deletion of one store hash:
+`delete` supports offline logical deletion of one store hash:
 
 1. Stop serve and acquire the exclusive lock.
 2. Parse and validate the named narinfo.
@@ -310,10 +310,13 @@ Clients may retain positive narinfo cache entries until refresh/TTL and then
 receive a NAR 200 if they already know its URL; therefore deletion is not a
 confidential-erasure feature.
 
-Future offline mark-and-sweep can parse References from existing narinfos and
-optional roots/manifests added under a new reserved directory. Existing caches
-without publication timestamps are retained conservatively. This needs no
-incompatible migration. Access-time retention and online GC remain rejected.
+`gc` is the bounded offline retention operation. It validates the entire
+published inventory before planning or deleting, protects the transitive
+`References` closure of configured roots, and orders eligible narinfos by
+publication time. Its size accounting is logical file length, so snapshots,
+compression, reflinks, CoW, and sparse allocation remain filesystem/operator
+concerns. NARJ-32 deliberately rejects access-time retention, online GC, a
+resident worker, and an HTTP delete/GC API.
 
 ## Observability
 

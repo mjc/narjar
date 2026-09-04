@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 
@@ -2465,6 +2465,95 @@ fn gc_refuses_to_apply_while_the_cache_is_serving() {
 }
 
 #[test]
+fn gc_sigterm_leaves_a_cache_recoverable_before_restart() {
+    let data_dir = init_data_dir("operator-gc-sigterm");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("shared NAR should be written");
+    for index in 0..100 {
+        let store = format!("{index:032o}");
+        fs::write(
+            data_dir.join(format!("{store}.narinfo")),
+            signed_narinfo_for(&store, NARJAR_HASH, NAR_BYTES.len() as u64),
+        )
+        .expect("narinfo should be written");
+    }
+
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let mut gc = command()
+        .args(["gc", "--data-dir", path, "--target-bytes", "0", "--apply"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("gc should start");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !data_dir.join(".narjar-recovery").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "gc did not create the recovery marker"
+        );
+        assert!(
+            gc.try_wait().expect("gc should be waitable").is_none(),
+            "gc finished before the interruption fixture observed recovery"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let pid = gc.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("SIGTERM should be sent")
+            .success()
+    );
+    assert!(
+        !gc.wait().expect("gc should exit after SIGTERM").success(),
+        "interrupted GC must not claim successful completion"
+    );
+    assert!(
+        data_dir.join(".narjar-recovery").exists(),
+        "interrupted GC must retain the recovery marker"
+    );
+
+    let mut server = command()
+        .args(["serve", "--data-dir", path, "--listen", "127.0.0.1:0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("server should start");
+    let mut line = String::new();
+    BufReader::new(server.stdout.take().expect("server stdout should be piped"))
+        .read_line(&mut line)
+        .expect("server startup line should be readable");
+    assert!(line.starts_with("listening http://127.0.0.1:"), "{line}");
+    assert!(
+        !data_dir.join(".narjar-recovery").exists(),
+        "server recovery should clear the marker after a valid inventory"
+    );
+    let server_pid = server.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &server_pid])
+            .status()
+            .expect("SIGTERM should be sent")
+            .success()
+    );
+    assert!(
+        server
+            .wait()
+            .expect("server should exit after SIGTERM")
+            .success()
+    );
+}
+
+#[test]
 fn gc_reclaims_old_orphan_nars() {
     let data_dir = init_data_dir("operator-gc-orphan");
     fs::write(data_dir.join(".tmp/incomplete"), b"temp")
@@ -2498,7 +2587,7 @@ fn gc_reclaims_old_orphan_nars() {
 }
 
 #[test]
-fn gc_reports_retained_orphan_bytes_after_partial_cleanup() {
+fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
     let data_dir = init_data_dir("operator-gc-retained-orphan");
     let retained_orphan_nar = "1".repeat(52);
     fs::write(
@@ -2529,7 +2618,7 @@ fn gc_reports_retained_orphan_bytes_after_partial_cleanup() {
     let retained_orphan_bytes = b"new-orphan".len() as u64;
     let target_bytes = published_bytes + retained_orphan_bytes;
     let path = data_dir.to_str().expect("temporary path should be UTF-8");
-    let output = command()
+    let dry_run = command()
         .args(["gc", "--data-dir", path, "--target-bytes"])
         .arg(target_bytes.to_string())
         .args(["--min-age-seconds", "1", "--json"])
@@ -2537,26 +2626,60 @@ fn gc_reports_retained_orphan_bytes_after_partial_cleanup() {
         .expect("gc should run");
 
     assert!(
-        output.status.success(),
+        dry_run.status.success(),
         "gc dry-run failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&dry_run.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"accounting_basis\":\"logical\""));
-    assert!(stdout.contains(&format!(
+    let dry_run_stdout = String::from_utf8_lossy(&dry_run.stdout);
+    assert!(dry_run_stdout.contains("\"accounting_basis\":\"logical\""));
+    assert!(dry_run_stdout.contains(&format!(
         "\"before_bytes\":{}",
         published_bytes + b"old-orphan".len() as u64 + retained_orphan_bytes
     )));
-    assert!(stdout.contains(&format!("\"after_bytes\":{target_bytes}")));
-    assert!(stdout.contains("\"evicted_bytes\":10"));
-    assert!(stdout.contains("\"candidates\":1"));
-    assert!(stdout.contains("\"target_met\":true"));
+    assert!(dry_run_stdout.contains(&format!("\"after_bytes\":{target_bytes}")));
+    assert!(dry_run_stdout.contains("\"evicted_bytes\":10"));
+    assert!(dry_run_stdout.contains("\"candidates\":1"));
+    assert!(dry_run_stdout.contains("\"target_met\":true"));
     assert!(data_dir.join(format!("nar/{NAR_ID}.nar")).exists());
     assert!(
         data_dir
             .join(format!("nar/{retained_orphan_nar}.nar"))
             .exists()
     );
+
+    let apply = command()
+        .args(["gc", "--data-dir", path, "--target-bytes"])
+        .arg(target_bytes.to_string())
+        .args(["--min-age-seconds", "1", "--apply", "--json"])
+        .output()
+        .expect("gc should run");
+    assert!(
+        apply.status.success(),
+        "gc apply failed: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let apply_stdout = String::from_utf8_lossy(&apply.stdout);
+    assert!(apply_stdout.contains("\"dry_run\":false"));
+    assert!(apply_stdout.contains(&format!("\"after_bytes\":{target_bytes}")));
+    assert!(apply_stdout.contains("\"evicted_bytes\":10"));
+    assert!(apply_stdout.contains("\"candidates\":1"));
+    assert!(apply_stdout.contains("\"target_met\":true"));
+    assert!(!data_dir.join(format!("nar/{NAR_ID}.nar")).exists());
+    assert!(
+        data_dir
+            .join(format!("nar/{retained_orphan_nar}.nar"))
+            .exists()
+    );
+    let direct_after_bytes = fs::metadata(data_dir.join(format!("{STORE_HASH}.narinfo")))
+        .expect("published narinfo should remain")
+        .len()
+        + fs::metadata(data_dir.join(format!("nar/{NARJAR_HASH}.nar")))
+            .expect("published NAR should remain")
+            .len()
+        + fs::metadata(data_dir.join(format!("nar/{retained_orphan_nar}.nar")))
+            .expect("retained orphan should remain")
+            .len();
+    assert_eq!(direct_after_bytes, target_bytes);
 }
 #[test]
 fn gc_rejects_symlinked_narinfo_without_removing_it() {

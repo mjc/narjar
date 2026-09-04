@@ -142,9 +142,10 @@ never becomes a joined path.
 ### Ranges, deletion, and read races
 
 Resolved. Only one validated byte range is supported. Readers open the final
-immutable file before responding. v0.1 deletion is offline, requires the serve
-lock, removes/syncs narinfo first, and leaves NAR bytes. There is no online GC
-or range/delete race.
+immutable file before responding. Deletion and retention GC are offline and
+require the serve lock. GC removes/syncs narinfo first, removes a NAR only
+after its final reference, and may leave only harmless unreferenced NAR bytes
+after interruption. There is no online GC or range/delete race.
 
 ### Slow clients, floods, descriptors, and memory
 
@@ -186,11 +187,12 @@ premise is explicitly revised.
 
 ### GC safety and backup/restore
 
-Resolved by exclusion. There is no automatic/online GC, access-time retention,
-or pin database. Offline deletion only removes publication metadata. Backups
-copy immutable finals excluding temporaries and run verify. Future offline
-mark-and-sweep can consume existing References plus a reserved roots/manifests
-directory without changing current identities.
+Resolved with bounded offline scope. There is no automatic/online GC,
+access-time retention, or pin database. The explicit GC command uses the
+DATA lease, validates the full inventory, retains configured roots and their
+`References` closure, and deletes narinfo before its final referenced NAR.
+Backups copy immutable finals excluding temporaries and run verify; snapshot
+space remains outside GC's logical accounting.
 
 ### Dependency and framework pressure
 
@@ -210,7 +212,8 @@ Required:
 - Native Nix PUT of nix-cache-info, compression=none NAR, then narinfo.
 - Client-signed narinfo verification and immutable durable publication.
 - Bounded workers, health/readiness/metrics, safe token operations.
-- Offline reconcile, verify, logical delete, and orphan listing.
+- Offline reconcile, verify, logical delete, bounded retention GC, and orphan
+  listing.
 - Static x86_64-linux packaging, Nix package/module, systemd, and OCI artifact.
 - Real-socket and real-Nix push/substitute/trust acceptance.
 
@@ -221,7 +224,8 @@ Explicit non-goals:
 - Server-side signing/private-key custody.
 - Realisations, listings, build logs, mass-query writes, mirrors.
 - Database, S3, Redis, queues, workers, multi-tenancy, quotas, UI.
-- Online GC/deletion, retention, pins, payload deduplication.
+- Online GC/deletion, access-time retention, a resident GC worker, and payload
+  deduplication.
 - Native TLS, ACME, socket activation, TOML, control API.
 - Multi-range responses and conditional-write extensions.
 
