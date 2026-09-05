@@ -1,6 +1,8 @@
 # NARJ-75 benchmark constitution
 
-Status: frozen version 1, 2026-09-05. The machine-readable thresholds are in
+Status: frozen version 2, 2026-09-05. Version 2 expands the previously stated
+budgets into explicit machine-readable fields; no numeric threshold changed.
+The machine-readable thresholds are in
 [`benchmarks/constitution.json`](../benchmarks/constitution.json). Candidate
 results must not alter this file; a changed constitution gets a new version,
 reason, and review before measurement.

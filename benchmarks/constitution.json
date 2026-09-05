@@ -1,6 +1,8 @@
 {
-  "version": 1,
+  "version": 2,
+  "supersedes_version": 1,
   "frozen_on": "2026-09-05",
+  "change_reason": "Expanded previously stated ticket budgets into explicit machine-readable fields; no numeric threshold changed. Required before semantic candidate measurements.",
   "repetitions": 15,
   "warmup": 3,
   "wire_compression": "none",
