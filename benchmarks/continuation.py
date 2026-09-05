@@ -31,10 +31,41 @@ from typing import Any, Sequence
 BINCACHE_COMMIT = "556a9c8f97a3c994a9de85f567a2ef16ce6513ab"
 BINCACHE_FLAKE = f"github:wyattgill9/bincache/{BINCACHE_COMMIT}"
 SEED = 29030
+FROZEN_WARMUPS = 3
+_command_log: Path | None = None
+_command_log_lock = threading.Lock()
+
+
+def set_command_log(path: Path) -> None:
+    global _command_log
+    _command_log = path
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+
+
+def log_line(line: str) -> None:
+    if _command_log is None:
+        return
+    with _command_log_lock, _command_log.open("a") as stream:
+        stream.write(line + "\n")
+
+
+def log_command(args: Sequence[str]) -> None:
+    log_line(shlex.join(str(arg) for arg in args))
+
+
+def run_logged(args: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    log_command(args)
+    return subprocess.run(args, **kwargs)
+
+
+def popen_logged(args: Sequence[str], **kwargs: Any) -> subprocess.Popen[Any]:
+    log_command(args)
+    return subprocess.Popen(args, **kwargs)
 
 
 def command(*args: str) -> str:
-    return subprocess.run(args, check=True, text=True, capture_output=True).stdout.strip()
+    return run_logged(args, check=True, text=True, capture_output=True).stdout.strip()
 
 
 def optional_command(*args: str) -> str | None:
@@ -76,6 +107,7 @@ class Run:
     output: Path
     work: Path
     repetitions: int
+    warmups: int
     quick: bool
     narjar: Path
     bincache: Path
@@ -86,6 +118,8 @@ class Run:
             raise SystemExit("the continuation benchmark requires Linux /proc")
         if not args.quick and args.repetitions < 15:
             raise SystemExit("--repetitions must be at least 15")
+        if not args.quick and args.warmups != FROZEN_WARMUPS:
+            raise SystemExit(f"--warmups must be {FROZEN_WARMUPS} for decision evidence")
         if args.output.exists():
             raise SystemExit(f"output already exists: {args.output}")
 
@@ -94,11 +128,17 @@ class Run:
             raise SystemExit("NARJAR_BIN must point to the release binary")
 
         args.output.mkdir(parents=True)
+        set_command_log(args.output / "commands.txt")
+        log_line(
+            f"NARJAR_BIN={shlex.quote(narjar)} "
+            + shlex.join([sys.executable, *sys.argv])
+        )
         work = Path(tempfile.mkdtemp(prefix=".continuation-", dir=args.output.parent))
         return cls(
             output=args.output,
             work=work,
             repetitions=1 if args.quick else args.repetitions,
+            warmups=1 if args.quick else args.warmups,
             quick=args.quick,
             narjar=Path(narjar).resolve(),
             bincache=resolve_bincache(args.bincache_bin),
@@ -130,7 +170,7 @@ class Candidate:
 
         if self.name == "narjar":
             public = self.root / "public-key"
-            subprocess.run(
+            run_logged(
                 [
                     "nix-store",
                     "--generate-binary-cache-key",
@@ -154,7 +194,7 @@ class Candidate:
                 "benchmark",
             )
         else:
-            generated = subprocess.run(
+            generated = run_logged(
                 [str(self.binary), "keygen", "--name", "bincache-benchmark"],
                 check=True,
                 text=True,
@@ -239,7 +279,7 @@ class Candidate:
                 *self.server_command(port, limited_data),
             ]
         started = time.perf_counter_ns()
-        self.process = subprocess.Popen(
+        self.process = popen_logged(
             server_command,
             stdout=self._log,
             stderr=subprocess.STDOUT,
@@ -289,7 +329,7 @@ class Candidate:
 
     def _sign(self, paths: Sequence[str]) -> None:
         if self.name == "narjar":
-            subprocess.run(
+            run_logged(
                 [
                     "nix",
                     "store",
@@ -320,11 +360,11 @@ class Candidate:
         for offset in range(0, len(paths), 128):
             batch = paths[offset : offset + 128]
             self._sign(batch)
-            subprocess.run(self._copy_args(batch), check=True)
+            run_logged(self._copy_args(batch), check=True)
 
     def publish_result(self, path: str) -> subprocess.CompletedProcess[str]:
         self._sign([path])
-        return subprocess.run(
+        return run_logged(
             self._copy_args([path]),
             text=True,
             capture_output=True,
@@ -338,7 +378,7 @@ class Candidate:
     ) -> subprocess.CompletedProcess[str]:
         if self.url is None:
             raise RuntimeError(f"{self.name} is not running")
-        return subprocess.run(
+        return run_logged(
             [
                 "nix",
                 "--store",
@@ -391,7 +431,7 @@ class Candidate:
         sampler.start()
         started = time.perf_counter_ns()
         try:
-            subprocess.run(
+            run_logged(
                 self._copy_args([path]),
                 check=True,
                 stdout=subprocess.DEVNULL,
@@ -417,10 +457,13 @@ class Candidate:
     ) -> tuple[int, float, bytes]:
         if self.url is None:
             raise RuntimeError(f"{self.name} is not running")
+        request_headers = {"Accept-Encoding": "identity", **(headers or {})}
+        url = f"{self.url}/{path.lstrip('/')}"
+        log_line(f"HTTP {method} {url} headers={json.dumps(request_headers, sort_keys=True)}")
         request = urllib.request.Request(
-            f"{self.url}/{path.lstrip('/')}",
+            url,
             method=method,
-            headers=headers or {},
+            headers=request_headers,
         )
         started = time.perf_counter_ns()
         try:
@@ -468,7 +511,7 @@ class Candidate:
         peak_rss = [self.rss_kib()]
         started = time.perf_counter_ns()
         processes = [
-            subprocess.Popen(
+            popen_logged(
                 self._copy_args([path]),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -499,6 +542,10 @@ class Candidate:
         ).decode()
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
         size = nar_file.stat().st_size
+        log_line(
+            f"HTTP PUT {self.url}/{object_path} "
+            f"headers={json.dumps({'Authorization': '<redacted>', 'Content-Length': str(size)}, sort_keys=True)}"
+        )
         connection.putrequest("PUT", f"/{object_path}")
         connection.putheader("Authorization", f"Basic {authorization}")
         connection.putheader("Content-Length", str(size))
@@ -535,6 +582,11 @@ class Recorder:
             "repetition": repetition,
             "value": value,
             "unit": unit,
+            "cache_state": context.pop("cache_state", "not-applicable"),
+            "corpus_category": context.pop(
+                "corpus_category", "flat-baseline-control"
+            ),
+            "command_log": "commands.txt",
             **context,
         }
         self.rows.append(row)
@@ -587,6 +639,12 @@ def parse_args() -> argparse.Namespace:
         help="measured repetitions per case after warm-up (default: 15)",
     )
     parser.add_argument(
+        "--warmups",
+        type=int,
+        default=FROZEN_WARMUPS,
+        help=f"warmups per measured scenario (frozen default: {FROZEN_WARMUPS})",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
         help="run one repetition over a ten-path corpus; not decision evidence",
@@ -604,6 +662,8 @@ def environment(run: Run) -> dict[str, Any]:
     return {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "host": platform.node(),
+        "target": platform.machine(),
+        "kernel": platform.release(),
         "platform": platform.platform(),
         "uname": " ".join(platform.uname()),
         "cpu_count": os.cpu_count(),
@@ -615,13 +675,24 @@ def environment(run: Run) -> dict[str, Any]:
             "findmnt", "-T", str(run.output), "-no", "SOURCE,FSTYPE,OPTIONS"
         ),
         "nix": command("nix", "--version"),
+        "python": platform.python_version(),
+        "git": optional_command("git", "--version"),
         "unshare": optional_command("unshare", "--version"),
         "rustc": optional_command("rustc", "--version"),
         "narjar_binary": str(run.narjar),
+        "narjar_output": str(run.narjar.parent.parent),
+        "narjar_binary_sha256": command(
+            "nix", "hash", "file", "--type", "sha256", str(run.narjar)
+        ),
         "narjar_commit": optional_command("git", "rev-parse", "HEAD"),
         "bincache_binary": str(run.bincache),
+        "bincache_output": str(run.bincache.parent.parent),
+        "bincache_binary_sha256": command(
+            "nix", "hash", "file", "--type", "sha256", str(run.bincache)
+        ),
         "bincache_commit": BINCACHE_COMMIT,
         "repetitions": run.repetitions,
+        "warmups": run.warmups,
         "random_seed": SEED,
         "quick": run.quick,
     }
@@ -659,8 +730,9 @@ def benchmark_startup(
         published = target
 
         for candidate in candidates:
-            candidate.start()
-            candidate.stop()
+            for _ in range(run.warmups):
+                candidate.start()
+                candidate.stop()
 
         schedule = [
             candidate
@@ -680,6 +752,7 @@ def benchmark_startup(
                 repetition,
                 startup_ms,
                 "ms",
+                cache_state="warm",
                 cache_paths=target,
                 order=order_index,
             )
@@ -689,6 +762,7 @@ def benchmark_startup(
                 repetition,
                 candidate.rss_kib(),
                 "KiB",
+                cache_state="warm",
                 cache_paths=target,
                 order=order_index,
             )
@@ -726,18 +800,19 @@ def benchmark_io(
     rng: random.Random,
 ) -> None:
     payload_bytes = 1 * 1024 * 1024 if run.quick else 16 * 1024 * 1024
-    paths = make_payloads(run, run.repetitions + 1, payload_bytes)
+    paths = make_payloads(run, run.repetitions + run.warmups, payload_bytes)
 
     for candidate in candidates:
         candidate.start()
     try:
         for candidate in candidates:
-            candidate.publish([paths[0]])
+            for path in paths[:run.warmups]:
+                candidate.publish([path])
 
         schedule = [
             (candidate, path)
             for candidate in candidates
-            for path in paths[1:]
+            for path in paths[run.warmups:]
         ]
         rng.shuffle(schedule)
         repetitions = {candidate.name: 0 for candidate in candidates}
@@ -751,6 +826,7 @@ def benchmark_io(
                 repetition,
                 result["wall_ms"],
                 "ms",
+                cache_state="warm",
                 order=order_index,
                 payload_bytes=payload_bytes,
             )
@@ -760,6 +836,7 @@ def benchmark_io(
                 repetition,
                 payload_bytes / result["wall_ms"] * 1_000 / (1024 * 1024),
                 "MiB/s",
+                cache_state="warm",
                 order=order_index,
                 payload_bytes=payload_bytes,
             )
@@ -769,6 +846,7 @@ def benchmark_io(
                 repetition,
                 result["server_cpu_ms"],
                 "ms",
+                cache_state="warm",
                 order=order_index,
                 payload_bytes=payload_bytes,
             )
@@ -778,6 +856,7 @@ def benchmark_io(
                 repetition,
                 result["peak_rss_kib"],
                 "KiB",
+                cache_state="warm",
                 order=order_index,
                 payload_bytes=payload_bytes,
             )
@@ -787,6 +866,7 @@ def benchmark_io(
                 repetition,
                 result["stored_bytes"],
                 "bytes",
+                cache_state="warm",
                 order=order_index,
                 payload_bytes=payload_bytes,
             )
@@ -815,9 +895,10 @@ def benchmark_io(
                     if case == "missing_404"
                     else nar_info[candidate.name][0]
                 )
-                if cold:
-                    candidate.evict_cache()
-                candidate.request(method, path, headers)
+                for _ in range(run.warmups):
+                    if cold:
+                        candidate.evict_cache()
+                    candidate.request(method, path, headers)
 
             request_schedule = [
                 candidate
@@ -851,6 +932,7 @@ def benchmark_io(
                     repetition,
                     status,
                     "HTTP",
+                    cache_state="cold" if cold else "warm",
                     order=order_index,
                     response_bytes=len(body),
                 )
@@ -860,6 +942,7 @@ def benchmark_io(
                     repetition,
                     elapsed_ms,
                     "ms",
+                    cache_state="cold" if cold else "warm",
                     order=order_index,
                     response_bytes=len(body),
                 )
@@ -871,6 +954,7 @@ def benchmark_io(
                         repetition,
                         logical_bytes / elapsed_ms * 1_000 / (1024 * 1024),
                         "MiB/s",
+                        cache_state="cold" if cold else "warm",
                         order=order_index,
                         response_bytes=len(body),
                     )
@@ -879,15 +963,16 @@ def benchmark_io(
         for width in widths:
             for candidate in candidates:
                 path = nar_info[candidate.name][0]
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=width
-                ) as executor:
-                    list(
-                        executor.map(
-                            lambda _: candidate.request("GET", path),
-                            range(width),
+                for _ in range(run.warmups):
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=width
+                    ) as executor:
+                        list(
+                            executor.map(
+                                lambda _: candidate.request("GET", path),
+                                range(width),
+                            )
                         )
-                    )
 
             request_schedule = [
                 candidate
@@ -920,6 +1005,7 @@ def benchmark_io(
                     repetition,
                     logical_bytes / elapsed_ms * 1_000 / (1024 * 1024),
                     "MiB/s",
+                    cache_state="warm",
                     order=order_index,
                 )
     finally:
@@ -935,14 +1021,17 @@ def benchmark_streaming(
 ) -> None:
     sizes = [4 * 1024 * 1024] if run.quick else [100 * 1024 * 1024, 1024 * 1024 * 1024]
     for size in sizes:
-        path = make_payloads(run, 1, size, "streaming")[0]
+        paths = make_payloads(run, run.warmups + 1, size, "streaming")
         order = candidates.copy()
         rng.shuffle(order)
         for candidate in candidates:
             candidate.start()
         try:
+            for candidate in candidates:
+                for path in paths[:run.warmups]:
+                    candidate.publish_timed(path)
             for order_index, candidate in enumerate(order):
-                result = candidate.publish_timed(path)
+                result = candidate.publish_timed(paths[-1])
                 for case, key, unit in (
                     ("streaming_upload_wall", "wall_ms", "ms"),
                     ("streaming_upload_server_cpu", "server_cpu_ms", "ms"),
@@ -955,6 +1044,7 @@ def benchmark_streaming(
                         0,
                         result[key],
                         unit,
+                        cache_state="warm",
                         order=order_index,
                         payload_bytes=size,
                     )
@@ -972,7 +1062,7 @@ def benchmark_recovery(
     payload_bytes = 1 * 1024 * 1024 if run.quick else 4 * 1024 * 1024
     paths = make_payloads(
         run,
-        run.repetitions + 2,
+        run.repetitions + run.warmups + 1,
         payload_bytes,
         "recovery",
     )
@@ -981,7 +1071,10 @@ def benchmark_recovery(
     try:
         for candidate in candidates:
             candidate.publish([paths[0]])
-            candidate.publish_concurrent(paths[1])
+            for _ in range(run.warmups):
+                candidate.publish_timed(paths[0])
+            for path in paths[1:1 + run.warmups]:
+                candidate.publish_concurrent(path)
 
         duplicate_schedule = [
             candidate
@@ -1014,7 +1107,7 @@ def benchmark_recovery(
         concurrent_schedule = [
             (candidate, path)
             for candidate in candidates
-            for path in paths[2:]
+            for path in paths[1 + run.warmups:]
         ]
         rng.shuffle(concurrent_schedule)
         repetitions = {candidate.name: 0 for candidate in candidates}
@@ -1058,7 +1151,7 @@ def benchmark_recovery(
     )[0]
     nar_file = run.work / "interrupted.nar"
     with nar_file.open("wb") as stream:
-        subprocess.run(
+        run_logged(
             ["nix", "nar", "pack", interrupted_path],
             check=True,
             stdout=stream,
@@ -1111,7 +1204,7 @@ def benchmark_recovery(
 
         if candidate.name == "bincache":
             started = time.perf_counter_ns()
-            subprocess.run(
+            run_logged(
                 [
                     str(candidate.binary),
                     "reconcile",
@@ -1215,7 +1308,7 @@ def benchmark_trust(
 ) -> None:
     wrong_secret = run.work / "wrong-secret-key"
     wrong_public = run.work / "wrong-public-key"
-    subprocess.run(
+    run_logged(
         [
             "nix-store",
             "--generate-binary-cache-key",
@@ -1319,6 +1412,7 @@ def write_report(run: Run, recorder: Recorder) -> None:
         "# Continuation benchmark",
         "",
         f"- bincache ref: `{BINCACHE_COMMIT}`",
+        f"- warmups: {run.warmups}",
         f"- repetitions: {run.repetitions}",
         f"- random seed: {SEED}",
         f"- quick smoke run: {'yes; not decision evidence' if run.quick else 'no'}",
@@ -1348,35 +1442,6 @@ def main() -> int:
     try:
         (run.output / "environment.json").write_text(
             json.dumps(environment(run), indent=2, sort_keys=True) + "\n"
-        )
-        benchmark_command = [
-            "nix",
-            "run",
-            ".#continuation-benchmark",
-            "--",
-            "--output",
-            str(run.output),
-            "--bincache-bin",
-            str(run.bincache),
-            "--repetitions",
-            str(run.repetitions),
-        ]
-        if run.quick:
-            benchmark_command.append("--quick")
-        (run.output / "commands.txt").write_text(
-            shlex.join(
-                [
-                    "nix",
-                    "build",
-                    "--no-write-lock-file",
-                    "--no-link",
-                    "--print-out-paths",
-                    BINCACHE_FLAKE,
-                ]
-            )
-            + "\n"
-            + shlex.join(benchmark_command)
-            + "\n"
         )
         for candidate in candidates:
             candidate.prepare()
