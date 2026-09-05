@@ -9,6 +9,7 @@ PROFILE_SECONDS=60
 JOBS=1
 PORT=0
 MAX_NAR_BYTES=$((16 * 1024 * 1024 * 1024))
+HOT_NAR_MAX_GIB=1
 
 usage() {
   cat <<'EOF'
@@ -22,6 +23,7 @@ Options:
   --seconds N        perf capture duration (default: 60)
   --jobs N           narjar push concurrency (default: 1)
   --port N           Local server port (default: 0, auto-select)
+  --hot-nar-max-gib N  Maximum hot NAR size for tmpfs profiling (default: 1)
   -h, --help         Show this help
 
 Run from the development shell, for example:
@@ -36,6 +38,7 @@ while (($#)); do
     --seconds) PROFILE_SECONDS=$2; shift 2 ;;
     --jobs) JOBS=$2; shift 2 ;;
     --port) PORT=$2; shift 2 ;;
+    --hot-nar-max-gib) HOT_NAR_MAX_GIB=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -81,9 +84,13 @@ BIN="$TARGET/profiling/narjar"
 DATA="$OUTPUT/data"
 MANIFEST="$OUTPUT/system-store.tsv"
 TARGET_BYTES=$((SIZE_GIB * 1024 * 1024 * 1024))
+HOT_NAR_MAX_BYTES=$((HOT_NAR_MAX_GIB * 1024 * 1024 * 1024))
 PROFILE_RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes"
 SERVER_URI="http://127.0.0.1:$PORT"
 CACHE_URI="$SERVER_URI?compression=none"
+HOT_DATA=""
+READ_STORE_HASH=""
+READ_NAR_BYTES=""
 SERVER_PID=""
 PERF_PID=""
 HEAPTRACK_PID=""
@@ -104,6 +111,9 @@ cleanup() {
   for pid in "${WORKLOAD_PIDS[@]}"; do
     kill "$pid" 2>/dev/null || true
   done
+  if [[ -n "$HOT_DATA" && "$HOT_DATA" == /dev/shm/narjar-profile-data.* ]]; then
+    rm -rf -- "$HOT_DATA"
+  fi
   wait 2>/dev/null || true
   exit "$status"
 }
@@ -232,7 +242,7 @@ start_perf_server() {
     -o "$OUTPUT/perf.data" \
     -g --call-graph fp -F 997 \
     "$BIN" serve \
-      --data-dir "$DATA" \
+      --data-dir "$HOT_DATA" \
       --listen "127.0.0.1:$PORT" \
       --workers 1 \
       --max-in-flight 64 \
@@ -286,8 +296,7 @@ push_system_store() {
 }
 
 prepare_read_workload() {
-  local store_hash nar_url
-  store_hash=$(basename "${PATHS[0]}" | cut -d- -f1)
+  local store_hash=$READ_STORE_HASH nar_url
   nar_url=$(curl --fail --silent --show-error --no-compressed \
     "$SERVER_URI/$store_hash.narinfo" | awk '$1 == "URL:" { print $2; exit }')
   [[ -n "$nar_url" ]] || { echo "narinfo did not contain a NAR URL" >&2; exit 1; }
@@ -296,6 +305,44 @@ prepare_read_workload() {
   else
     NAR_ENDPOINT="$SERVER_URI/$nar_url"
   fi
+}
+
+prepare_hot_dataset() {
+  local path store_hash nar_url nar_file nar_bytes
+  local selected_hash="" selected_url="" selected_file="" selected_bytes=0
+
+  for path in "${PATHS[@]}"; do
+    store_hash=$(basename "$path" | cut -d- -f1)
+    nar_url=$(awk '$1 == "URL:" { print $2; exit }' "$DATA/$store_hash.narinfo")
+    [[ -n "$nar_url" ]] || continue
+    nar_file="$DATA/$nar_url"
+    [[ -f "$nar_file" ]] || continue
+    nar_bytes=$(stat -c '%s' "$nar_file")
+    if ((nar_bytes <= HOT_NAR_MAX_BYTES && nar_bytes > selected_bytes)); then
+      selected_hash=$store_hash
+      selected_url=$nar_url
+      selected_file=$nar_file
+      selected_bytes=$nar_bytes
+    fi
+  done
+
+  if [[ -z "$selected_hash" ]]; then
+    echo "no stored NAR fits --hot-nar-max-gib=$HOT_NAR_MAX_GIB" >&2
+    exit 1
+  fi
+
+  HOT_DATA=$(mktemp -d /dev/shm/narjar-profile-data.XXXXXX)
+  "$BIN" init --data-dir "$HOT_DATA"
+  cp -p -- "$DATA/nix-cache-info" "$HOT_DATA/nix-cache-info"
+  cp -p -- "$DATA/trusted-public-keys" "$HOT_DATA/trusted-public-keys"
+  cp -p -- "$DATA/auth/write.tokens" "$HOT_DATA/auth/write.tokens"
+  cp -p -- "$DATA/$selected_hash.narinfo" "$HOT_DATA/$selected_hash.narinfo"
+  mkdir -p -- "$HOT_DATA/$(dirname "$selected_url")"
+  cp -p -- "$selected_file" "$HOT_DATA/$selected_url"
+
+  READ_STORE_HASH=$selected_hash
+  READ_NAR_BYTES=$selected_bytes
+  echo "hot profiling dataset: tmpfs NAR $selected_url ($selected_bytes bytes)"
 }
 
 run_read_workload() {
@@ -332,9 +379,10 @@ run_read_workload() {
   WORKLOAD_PIDS=()
 }
 
-echo "populating the SSD-backed cache for CPU profile"
+echo "populating the ${SIZE_GIB} GiB corpus for profiling"
 start_server "$OUTPUT/flamegraph-populate-server.log"
 push_system_store 2>&1 | tee "$OUTPUT/flamegraph-populate.log"
+prepare_hot_dataset
 prepare_read_workload
 stop_server
 PORT=0
@@ -369,7 +417,7 @@ CACHE_URI="$SERVER_URI?compression=none"
   cd "$OUTPUT"
   exec setsid heaptrack \
     "$BIN" serve \
-      --data-dir "$DATA" \
+      --data-dir "$HOT_DATA" \
       --listen "127.0.0.1:$PORT" \
       --workers 1 \
       --max-in-flight 64 \
@@ -422,6 +470,10 @@ heaptrack_print "$HEAPTRACK_FILE" | tee "$OUTPUT/heaptrack.txt"
   echo "size_gib=$SIZE_GIB"
   echo "selected_paths=${#PATHS[@]}"
   echo "selected_bytes=$TOTAL_BYTES"
+  echo "hot_nar_max_gib=$HOT_NAR_MAX_GIB"
+  echo "hot_data=tmpfs"
+  echo "hot_store_hash=$READ_STORE_HASH"
+  echo "hot_stored_nar_bytes=$READ_NAR_BYTES"
   echo "profile_seconds=$PROFILE_SECONDS"
   echo "jobs=$JOBS"
   echo "rustflags=$PROFILE_RUSTFLAGS"

@@ -123,8 +123,10 @@ The static Linux and OCI outputs are available on `x86_64-linux`.
 
 On Linux, the development shell includes `perf`, Inferno, and heaptrack. The
 profiling script first cleans both Cargo targets, rebuilds with debug info and
-frame pointers, warms an SSD-backed cache with at least 20 GiB of real Nix
-store paths, then captures CPU and heap profiles:
+frame pointers, populates at least 20 GiB of real Nix store paths, then copies
+the largest stored NAR up to 1 GiB into `/dev/shm` for CPU and heap capture so
+the filesystem is not the read bottleneck. Use `--hot-nar-max-gib` to change
+that tmpfs NAR ceiling:
 
 ```sh
 nix develop --command scripts/profile-tina.sh --size-gib 20 --seconds 60
