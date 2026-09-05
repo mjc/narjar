@@ -1,7 +1,8 @@
 # NARJ-75 benchmark constitution
 
-Status: frozen version 2, 2026-09-05. Version 2 expands the previously stated
-budgets into explicit machine-readable fields; no numeric threshold changed.
+Status: frozen version 3, 2026-09-05. Version 3 restores ticket fields omitted
+from version 2 and separates exact-CAS admission from aggressive-delta
+admission; it was frozen before any semantic candidate measurement.
 The machine-readable thresholds are in
 [`benchmarks/constitution.json`](../benchmarks/constitution.json). Candidate
 results must not alter this file; a changed constitution gets a new version,
@@ -37,11 +38,14 @@ and RSS control, not a substitute for those six semantic slices.
 The hard gates cover ingest, full GET, 90%-resume Range TTFB, read
 amplification, offline maintenance, active/idle memory, startup, replication,
 delta depth/working-set limits, dependency closure, backup, recovery, and
-security. Replication is bounded by `max(3 * new_physical_bytes, 0.05 *
-live_physical_bytes)`. A delta candidate must add at least 15% savings, have
-depth at most two, and reconstruct no unit over 8 MiB. A hybrid cache is capped
-at 10% of logical live bytes and must hit at least 95% of the trace. Compaction
-may use one configured segment plus reserve and no second full-cache copy.
+security. Read amplification is bounded by twice the response bytes plus 1
+MiB. Replication is bounded by `max(3 * new_physical_bytes, 0.05 *
+live_physical_bytes)`. A gix/delta candidate must improve on exact semantic CAS
+by either 10 percentage points or 15% relative. An aggressive-delta candidate
+must then add at least 15% beyond the best non-delta candidate, have depth at
+most two, and reconstruct no unit over 8 MiB. A hybrid cache is capped at 10%
+of logical live bytes and must hit at least 95% of the trace. Compaction may
+use one configured segment plus reserve and no second full-cache copy.
 Dependencies retain Rust 1.85, have zero advisories, and report binary,
 closure, build-time, and transitive growth. Backup must restore into empty
 DATA and pass reconcile plus independent Nix verification; security must pass

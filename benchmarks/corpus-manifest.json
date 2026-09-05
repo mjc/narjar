@@ -1,7 +1,15 @@
 {
   "version": 1,
   "status": "frozen-slice-contract",
-  "note": "This defines selection and weighting before the reproducible corpus is populated; it is not candidate result data.",
+  "note": "This freezes deterministic selection and weighting before the reproducible source corpus is populated; it is not candidate result data.",
+  "selection_protocol": {
+    "source_manifest": "benchmarks/corpus-roots.jsonl",
+    "membership": "every source record matching a slice selector belongs to that slice",
+    "overlap": "allowed and reported; a root is never removed from one matching slice because it matches another",
+    "ordering": "ascending raw UTF-8 bytes of id",
+    "empty_slice": "invalid benchmark",
+    "cherry_picking": "forbidden"
+  },
   "required_record_fields": [
     "id",
     "nar_size_bytes",
@@ -14,16 +22,16 @@
     "unusual_name_count"
   ],
   "slices": [
-    {"name": "many-small-files", "selector": "file_count >= 10000 AND nar_size_bytes / file_count <= 4096", "weight_percent": 16.6666667},
-    {"name": "shared-subtrees", "selector": "unique_content_bytes / nar_size_bytes <= 0.50 AND directory_count >= 100", "weight_percent": 16.6666667},
-    {"name": "duplicate-content", "selector": "unique_content_bytes / nar_size_bytes <= 0.25", "weight_percent": 16.6666667},
-    {"name": "large-contents", "selector": "nar_size_bytes >= 1073741824 AND file_count <= 1000", "weight_percent": 16.6666667},
-    {"name": "symlink-and-executable", "selector": "symlink_count >= 10 AND executable_count >= 10", "weight_percent": 16.6666667},
-    {"name": "deep-and-irregular-names", "selector": "max_depth >= 32 AND unusual_name_count >= 10", "weight_percent": 16.6666667}
+    {"name": "many-small-files", "selector": "file_count >= 10000 AND nar_size_bytes / file_count <= 4096", "weight": 1},
+    {"name": "shared-subtrees", "selector": "unique_content_bytes / nar_size_bytes <= 0.50 AND directory_count >= 100", "weight": 1},
+    {"name": "duplicate-content", "selector": "unique_content_bytes / nar_size_bytes <= 0.25", "weight": 1},
+    {"name": "large-contents", "selector": "nar_size_bytes >= 1073741824 AND file_count <= 1000", "weight": 1},
+    {"name": "symlink-and-executable", "selector": "symlink_count >= 10 AND executable_count >= 10", "weight": 1},
+    {"name": "deep-and-irregular-names", "selector": "max_depth >= 32 AND unusual_name_count >= 10", "weight": 1}
   ],
   "aggregation": {
     "per_slice_metric": "median over the slice's measured roots",
-    "overall_metric": "weighted median of slice medians",
+    "overall_metric": "equal-weight median of the six slice medians; for six values use the arithmetic mean of the third and fourth sorted values",
     "improvement_required_percent": 15,
     "regression_limit_percent": 5,
     "minimum_slices_improved": 4
