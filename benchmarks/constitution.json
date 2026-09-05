@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "frozen_on": "2026-09-05",
+  "repetitions": 15,
+  "warmup": 3,
+  "wire_compression": "none",
+  "primary_savings_gate_percent": {"reject_below": 25, "strong_at_or_above": 50},
+  "matched_baseline": "raw NAR with transparent filesystem compression",
+  "hard_gates": {
+    "ingest_wall_ratio_max": 1.5,
+    "ingest_cpu_per_gib_ratio_max": 3.0,
+    "full_get_throughput_ratio_min": 0.8,
+    "full_get_cpu_ratio_max": 2.0,
+    "resume_ttfb_p95_ratio_max": 2.0,
+    "read_amplification_ratio_max": 2.0,
+    "offline_wall_ratio_max": 3.0,
+    "offline_peak_rss_mib_max": 256,
+    "active_memory_per_operation_mib_max": 16,
+    "idle_rss_mib_max": 30,
+    "startup_ms_max": 100
+  },
+  "corpus_categories_required": 6,
+  "corpus_categories_required_improved": 4,
+  "corpus_regression_percent_max": 5,
+  "stop_rules": [
+    "Do not tune thresholds after observing candidate results.",
+    "Do not call a quick smoke run decision evidence.",
+    "A 25-50 percent result selects the simpler design only when every hard gate passes.",
+    "Record host, filesystem, kernel, CPU governor, commit, tool versions, cache state, and exact command."
+  ]
+}
