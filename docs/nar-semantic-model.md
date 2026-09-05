@@ -28,8 +28,9 @@ not a NAR serialization oracle.
 Git’s [`base_name_compare`](https://github.com/git/git/blob/v2.55.0/tree.c)
 compares a directory’s end-of-name as a virtual `/`. Thus the prospective pair
 `a.` (file) and `a` (directory) compares as `a.` < `a/` in Git, while NAR’s
-byte ordering compares `a` < `a.`. They cannot coexist as Git siblings, but
-the counterexample proves a serializer must sort canonical NAR entries itself.
+byte ordering compares `a` < `a.`. The distinct names can coexist as Git
+siblings, and their reversed order proves a serializer must sort canonical NAR
+entries itself.
 
 Canonical byte vectors and the negative fixture manifest are in
 [`docs/evidence/nar-vectors.json`](evidence/nar-vectors.json). They are
@@ -66,9 +67,24 @@ fixture manifest records the malformed forms that must be rejected, including
 duplicates, order violations, padding, unknown tags, truncation, trailing
 bytes, and forbidden names.
 
+## Current parser behavior and Narjar obligations
+
+| Input property | Nix 2.35.2 behavior | Narjar codec obligation |
+| --- | --- | --- |
+| non-zero string/content padding | rejected by `readPadding` | reject |
+| oversized tag/name/target | rejected at 32/255/4095 bytes | reject at the same limits unless a later versioned decision changes them |
+| empty or NUL-containing symlink target | rejected | reject |
+| duplicate or descending directory name | rejected by strict ascending comparison | reject |
+| depth reaching 64 | rejected | reject |
+| bytes after the root node | `parseDump` returns without checking EOF | reject so one object has exactly one canonical byte stream |
+
+The trailing-byte rule is intentionally stricter than the cited Nix parser;
+it prevents multiple byte streams from representing the same semantic root.
+
 The versioned source anchors are the
 [Nix 2.35 NAR manual](https://nix.dev/manual/nix/2.35/protocols/nix-archive/),
 [Nix 2.35.2 `archive.cc`](https://github.com/NixOS/nix/blob/2.35.2/src/libutil/archive.cc),
+[Nix 2.35.2 `serialise.cc`](https://github.com/NixOS/nix/blob/2.35.2/src/libutil/serialise.cc),
 [Git v2.55.0 `tree.c`](https://github.com/git/git/blob/v2.55.0/tree.c), and
 [Git v2.55.0 `tree.h`](https://github.com/git/git/blob/v2.55.0/tree.h).
 Git's [data model reference](https://git-scm.com/docs/gitdatamodel/2.55.0)

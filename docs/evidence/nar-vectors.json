@@ -1,12 +1,21 @@
 {
   "format": "NAR 1",
-  "source_version": "Nix 2.35.2 archive.cc and NAR manual",
+  "source_version": "Nix 2.35.2 archive.cc, serialise.cc, and NAR manual",
   "vectors": {
     "empty_root_file": "0d000000000000006e69782d617263686976652d3100000001000000000000002800000000000000040000000000000074797065000000000700000000000000726567756c6172000800000000000000636f6e74656e7473000000000000000001000000000000002900000000000000",
     "root_symlink_x": "0d000000000000006e69782d617263686976652d310000000100000000000000280000000000000004000000000000007479706500000000070000000000000073796d6c696e6b00060000000000000074617267657400000100000000000000780000000000000001000000000000002900000000000000",
     "executable_root_abc": "0d000000000000006e69782d617263686976652d3100000001000000000000002800000000000000040000000000000074797065000000000700000000000000726567756c6172000a0000000000000065786563757461626c6500000000000000000000000000000800000000000000636f6e74656e74730300000000000000616263000000000001000000000000002900000000000000",
     "empty_root_directory": "0d000000000000006e69782d617263686976652d31000000010000000000000028000000000000000400000000000000747970650000000009000000000000006469726563746f72790000000000000001000000000000002900000000000000",
-    "directory_name_80_empty_file": "0d000000000000006e69782d617263686976652d31000000010000000000000028000000000000000400000000000000747970650000000009000000000000006469726563746f7279000000000000000500000000000000656e7472790000000100000000000000800000000000000001000000000000002800000000000000040000000000000074797065000000000700000000000000726567756c6172000800000000000000636f6e74656e747300000000000000000100000000000000290000000000000001000000000000002900000000000000"
+    "directory_name_80_empty_file": "0d000000000000006e69782d617263686976652d31000000010000000000000028000000000000000400000000000000747970650000000009000000000000006469726563746f7279000000000000000500000000000000656e7472790000000100000000000000280000000000000004000000000000006e616d65000000000100000000000000800000000000000004000000000000006e6f64650000000001000000000000002800000000000000040000000000000074797065000000000700000000000000726567756c6172000800000000000000636f6e74656e74730000000000000000010000000000000029000000000000000100000000000000290000000000000001000000000000002900000000000000",
+    "ordering_divergence_directory": "0d000000000000006e69782d617263686976652d31000000010000000000000028000000000000000400000000000000747970650000000009000000000000006469726563746f7279000000000000000500000000000000656e7472790000000100000000000000280000000000000004000000000000006e616d65000000000100000000000000610000000000000004000000000000006e6f646500000000010000000000000028000000000000000400000000000000747970650000000009000000000000006469726563746f72790000000000000001000000000000002900000000000000010000000000000029000000000000000500000000000000656e7472790000000100000000000000280000000000000004000000000000006e616d65000000000200000000000000612e00000000000004000000000000006e6f64650000000001000000000000002800000000000000040000000000000074797065000000000700000000000000726567756c6172000800000000000000636f6e74656e74730000000000000000010000000000000029000000000000000100000000000000290000000000000001000000000000002900000000000000"
+  },
+  "decoded_vectors": {
+    "empty_root_file": {"kind": "regular", "executable": false, "contents_hex": ""},
+    "root_symlink_x": {"kind": "symlink", "target_hex": "78"},
+    "executable_root_abc": {"kind": "regular", "executable": true, "contents_hex": "616263"},
+    "empty_root_directory": {"kind": "directory", "entries": []},
+    "directory_name_80_empty_file": {"kind": "directory", "entries": [{"name_hex": "80", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]},
+    "ordering_divergence_directory": {"kind": "directory", "entries": [{"name_hex": "61", "node": {"kind": "directory", "entries": []}}, {"name_hex": "612e", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]}
   },
   "ordering_counterexample": {
     "entries": [
@@ -15,19 +24,23 @@
     ],
     "git_order": "a. < a/",
     "nar_byte_order": "a < a.",
+    "coexist_as_git_siblings": true,
     "conclusion": "Git base_name_compare cannot be used as a NAR serializer ordering oracle"
   },
-  "negative_cases": [
-    {"name": "duplicate_name", "mutation": "repeat an entry name"},
-    {"name": "out_of_order_name", "mutation": "encode b before a"},
-    {"name": "bad_length", "mutation": "increase a u64 length beyond remaining bytes"},
-    {"name": "nonzero_padding", "mutation": "replace required zero padding with 01"},
-    {"name": "unknown_tag", "mutation": "replace a known tag with unknown"},
-    {"name": "truncated", "mutation": "remove the final byte"},
-    {"name": "trailing_bytes", "mutation": "append one byte after the root node"},
-    {"name": "empty_target", "mutation": "encode a symlink target of length zero"},
-    {"name": "dot_name", "mutation": "encode name ."},
-    {"name": "slash_name", "mutation": "encode name /"},
-    {"name": "nul_name", "mutation": "encode a name containing 00"}
-  ]
+  "negative_vectors": {
+    "duplicate_name": {"node": {"kind": "directory", "entries": [{"name_hex": "61", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}, {"name_hex": "61", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]}, "error": "order"},
+    "out_of_order_name": {"node": {"kind": "directory", "entries": [{"name_hex": "62", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}, {"name_hex": "61", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]}, "error": "order"},
+    "bad_length": {"base": "empty_root_file", "patch": {"offset": 0, "hex": "0e00000000000000"}, "error": "length"},
+    "nonzero_padding": {"base": "empty_root_file", "patch": {"offset": 21, "hex": "01"}, "error": "padding"},
+    "unknown_tag": {"base": "empty_root_file", "patch": {"offset": 48, "hex": "78"}, "error": "tag"},
+    "truncated": {"base": "empty_root_file", "truncate": 1, "error": "truncated"},
+    "trailing_bytes": {"base": "empty_root_file", "append_hex": "00", "error": "trailing"},
+    "empty_target": {"node": {"kind": "symlink", "target_hex": ""}, "error": "target"},
+    "empty_name": {"node": {"kind": "directory", "entries": [{"name_hex": "", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]}, "error": "name"},
+    "dot_name": {"node": {"kind": "directory", "entries": [{"name_hex": "2e", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]}, "error": "name"},
+    "dotdot_name": {"node": {"kind": "directory", "entries": [{"name_hex": "2e2e", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]}, "error": "name"},
+    "slash_name": {"node": {"kind": "directory", "entries": [{"name_hex": "612f62", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]}, "error": "name"},
+    "nul_name": {"node": {"kind": "directory", "entries": [{"name_hex": "610062", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]}, "error": "name"},
+    "depth_limit": {"nested_directories": 64, "error": "depth"}
+  }
 }
