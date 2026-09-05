@@ -1,5 +1,11 @@
 # NARJ-75 flat-baseline rerun
 
+> **Superseded:** this run is not decision evidence. The harness accepted
+> `--warmups 3` but executed only one warmup per scenario, and `commands.txt`
+> was reconstructed rather than emitted by the command wrappers. Use
+> `../2026-09-05-narj75-baseline-corrected/` instead. The measurements below
+> are retained only as historical raw evidence.
+
 This is the fresh current flat-cache baseline required before semantic-storage
 candidate comparisons. It is not a semantic candidate result and does not
 claim the 25% physical-byte savings gate; the matched raw-NAR transparent
@@ -9,7 +15,7 @@ frozen constitution.
 The run used Narjar commit `655b9cd1ffba40de97ed22fb28319ac14e7d3baa`, pinned
 bincache commit `556a9c8f97a3c994a9de85f567a2ef16ce6513ab`, Tina's AMD Ryzen 9
 5950X, performance governor, ZFS `zroot/home`, Linux 7.2.2, Nix 2.31.5,
-Rust 1.85.1, seed 29030, three warmups, and 15 measured repetitions. Wire
+Rust 1.85.1, seed 29030, one effective warmup, and 15 measured repetitions. Wire
 compression was disabled with `compression=none`. The 10,000-root corpus is
 the benchmark's cardinality corpus; its file payload is 38,890 bytes.
 
