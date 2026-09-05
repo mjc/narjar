@@ -27,7 +27,7 @@
     }:
     let
       lib = nixpkgs.lib;
-      rustVersion = "1.85.1";
+      rustVersion = "1.98.1";
       supportedSystems = [
         "aarch64-darwin"
         "x86_64-linux"
