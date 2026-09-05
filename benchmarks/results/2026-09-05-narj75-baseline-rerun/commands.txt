@@ -1,2 +1,7 @@
 nix build --no-write-lock-file --no-link --print-out-paths github:wyattgill9/bincache/556a9c8f97a3c994a9de85f567a2ef16ce6513ab
 nix run '.#continuation-benchmark' -- --output benchmarks/results/2026-09-05-narj75-baseline-rerun --bincache-bin /nix/store/vjy4bxyh0faj1v99ya0lvvvbxwvhap8m-bincache-0.0.0/bin/bincache --repetitions 15
+# Inner upload command emitted by the harness (ports, netrc paths, and path list are per run):
+nix copy --refresh --option netrc-file <candidate-netrc> --to 'http://127.0.0.1:<port>?compression=none' <nix-store-path>...
+# Read controls used for GET/HEAD/Range:
+curl --fail --silent --show-error --no-compressed -H 'Accept-Encoding: identity' <nar-endpoint>
+curl --fail --silent --show-error --no-compressed -H 'Accept-Encoding: identity' -H 'Range: bytes=0-1048575' <nar-endpoint>
