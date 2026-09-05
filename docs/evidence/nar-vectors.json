@@ -17,6 +17,21 @@
     "directory_name_80_empty_file": {"kind": "directory", "entries": [{"name_hex": "80", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]},
     "ordering_divergence_directory": {"kind": "directory", "entries": [{"name_hex": "61", "node": {"kind": "directory", "entries": []}}, {"name_hex": "612e", "node": {"kind": "regular", "executable": false, "contents_hex": ""}}]}
   },
+  "generated_fixture_provenance": {
+    "generators": ["nix-store (Nix) 2.31.5", "nix-store (Nix) 2.35.2"],
+    "command": "nix-store --dump FIXTURE",
+    "fixture_recipe": {
+      "executable_root_abc": "regular file containing abc with mode 0755",
+      "empty_root_directory": "empty directory",
+      "root_symlink_x": "symbolic link with target x"
+    },
+    "byte_identical_across_generators": true,
+    "vector_sha256": {
+      "executable_root_abc": "04583e14eca2499ffa993852389e3a193aab5da20abc3b625a75d3f9876dc99e",
+      "empty_root_directory": "a50a5ab6d992f5598edd92105059fae9acfc192981e08bd88534c2167e92526a",
+      "root_symlink_x": "bb941e86b07436518c49d07e4afba93e6343ba70f36e17bdeaa76f3f32f4dfb4"
+    }
+  },
   "ordering_counterexample": {
     "entries": [
       {"name_hex": "61", "kind": "directory", "git_comparison_bytes": "612f"},

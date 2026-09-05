@@ -35,7 +35,10 @@ entries itself.
 Canonical byte vectors and the negative fixture manifest are in
 [`docs/evidence/nar-vectors.json`](evidence/nar-vectors.json). They are
 hand-built from the format above and cover root file, root symlink, empty
-directory, executable content, unusual byte names, and malformed inputs.
+directory, executable content, unusual byte names, and malformed inputs. Real
+`nix-store --dump` output from Nix 2.31.5 and 2.35.2 was byte-identical to the
+named executable-file, empty-directory, and symlink vectors; the manifest
+records both generator versions, construction recipes, and SHA-256 identities.
 
 ## Field mapping and mismatches
 

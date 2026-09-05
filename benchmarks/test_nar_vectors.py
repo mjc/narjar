@@ -1,3 +1,4 @@
+import hashlib
 import json
 import unittest
 from pathlib import Path
@@ -171,6 +172,18 @@ class NarVectorTest(unittest.TestCase):
             node = self.manifest["decoded_vectors"][name]
             self.assertEqual(decode_nar(data), node)
             self.assertEqual(encode_nar(node), data)
+
+    def test_generated_fixture_hashes_match_vectors(self):
+        provenance = self.manifest["generated_fixture_provenance"]
+        self.assertTrue(provenance["byte_identical_across_generators"])
+        self.assertEqual(
+            provenance["generators"],
+            ["nix-store (Nix) 2.31.5", "nix-store (Nix) 2.35.2"],
+        )
+        for name, expected in provenance["vector_sha256"].items():
+            with self.subTest(name=name):
+                raw = bytes.fromhex(self.manifest["vectors"][name])
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), expected)
 
     def test_malformed_byte_vectors_fail_closed(self):
         required = {
