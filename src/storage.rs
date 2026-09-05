@@ -1148,12 +1148,7 @@ pub(crate) fn entry_identity_at(
     ))
 }
 
-#[cfg(target_os = "linux")]
-fn metadata_change_time(metadata: &libc::stat) -> (i64, i64) {
-    (metadata.st_ctime as i64, metadata.st_ctime_nsec as i64)
-}
-
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn metadata_change_time(metadata: &libc::stat) -> (i64, i64) {
     (metadata.st_ctime, metadata.st_ctime_nsec)
 }
