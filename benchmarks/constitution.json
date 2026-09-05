@@ -21,6 +21,7 @@
     "rust_version",
     "tool_versions",
     "command_log",
+    "wire_compression",
     "corpus_manifest",
     "corpus_category",
     "cache_state",

@@ -17,8 +17,9 @@ cache runs are labelled separately. Quick runs are smoke tests only.
 
 Every result records the commit, binary and closure identity, host, target,
 kernel, filesystem, governor, Nix/Rust/tool versions, exact command, corpus
-manifest and category, cache state, repetition count, raw samples, median and
-p95. Missing provenance or metric fields is a failed result. Run
+manifest and category, cache state, observed wire compression, repetition
+count, raw samples, median and p95. Missing provenance or metric fields is a
+failed result. Run
 `python benchmarks/test_constitution.py` to exercise the boundary evaluator.
 
 The primary metric is median physical-byte savings over the matched baseline:

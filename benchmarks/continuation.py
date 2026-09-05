@@ -476,7 +476,7 @@ class Candidate:
         elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
         return status, elapsed_ms, body
 
-    def nar_info(self, store_path: str) -> tuple[str, int]:
+    def nar_info(self, store_path: str) -> tuple[str, int, str]:
         store_hash = Path(store_path).name.split("-", 1)[0]
         status, _, body = self.request("GET", f"{store_hash}.narinfo")
         if status != 200:
@@ -486,7 +486,7 @@ class Candidate:
             for line in body.decode().splitlines()
             if ": " in line
         )
-        return fields["URL"], int(fields["NarSize"])
+        return fields["URL"], int(fields["NarSize"]), fields["Compression"]
 
     def evict_cache(self) -> None:
         for entry in self.data_dir.rglob("*"):
@@ -619,7 +619,7 @@ class Recorder:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a pinned, matched Narjar/bincache benchmark."
+        description="Run a pinned Narjar/bincache operational benchmark."
     )
     parser.add_argument(
         "--output",
@@ -875,6 +875,19 @@ def benchmark_io(
             candidate.name: candidate.nar_info(paths[0])
             for candidate in candidates
         }
+        wire_compression = {
+            candidate.name: {
+                "accept_encoding": "identity",
+                "upload_compression_query": "none",
+                "narinfo_compression": nar_info[candidate.name][2],
+                "nar_url": nar_info[candidate.name][0],
+                "constitution_matched": nar_info[candidate.name][2] == "none",
+            }
+            for candidate in candidates
+        }
+        (run.output / "wire-compression.json").write_text(
+            json.dumps(wire_compression, indent=2, sort_keys=True) + "\n"
+        )
         operations = [
             ("get_warm", "GET", {}, 200, False),
             ("get_cold", "GET", {}, 200, True),
@@ -1407,6 +1420,9 @@ def write_report(run: Run, recorder: Recorder) -> None:
     (run.output / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )
+    wire_compression = json.loads(
+        (run.output / "wire-compression.json").read_text()
+    )
 
     lines = [
         "# Continuation benchmark",
@@ -1416,6 +1432,11 @@ def write_report(run: Run, recorder: Recorder) -> None:
         f"- repetitions: {run.repetitions}",
         f"- random seed: {SEED}",
         f"- quick smoke run: {'yes; not decision evidence' if run.quick else 'no'}",
+        "- observed wire compression: "
+        + ", ".join(
+            f"{name}={entry['narinfo_compression']}"
+            for name, entry in sorted(wire_compression.items())
+        ),
         "",
         "| Case | Candidate | n | Median | p95 | Min | Max | Unit |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
