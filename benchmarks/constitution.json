@@ -8,6 +8,7 @@
   "wire_compression": "none",
   "primary_savings_gate_percent": {"reject_below": 25, "strong_at_or_above": 50},
   "matched_baseline": "raw NAR with transparent filesystem compression",
+  "corpus_manifest": "benchmarks/corpus-manifest.json",
   "corpus_categories": [
     "many-small-files",
     "shared-subtrees",

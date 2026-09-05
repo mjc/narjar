@@ -27,7 +27,9 @@ design only if all hard gates pass. 50% or more is strong evidence, still
 subject to all hard gates. Corpus robustness requires improvement in four of
 six categories and no category expansion over 5%.
 
-The six frozen corpus slices are many-small-files, shared-subtrees,
+The six frozen corpus slices and their exact selectors are in
+[`benchmarks/corpus-manifest.json`](../benchmarks/corpus-manifest.json):
+many-small-files, shared-subtrees,
 duplicate-content, large-contents, symlink-and-executable, and
 deep-and-irregular-names. The cardinality-only 10,000-root run is a startup
 and RSS control, not a substitute for those six semantic slices.
