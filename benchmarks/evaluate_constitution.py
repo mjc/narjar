@@ -17,11 +17,16 @@ def validate_provenance(record):
     return sorted(required - record.keys())
 
 
+def validate_metrics(record):
+    required = {"savings_percent", "median", "p95", "unit"}
+    return sorted(required - record.keys())
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: evaluate_constitution.py RECORD.json")
     record = json.load(open(sys.argv[1]))
-    missing = validate_provenance(record)
+    missing = validate_provenance(record) + validate_metrics(record)
     if missing:
         raise SystemExit("missing provenance: " + ", ".join(missing))
     print(classify(float(record["savings_percent"])))

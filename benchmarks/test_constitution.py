@@ -1,6 +1,6 @@
 import unittest
 
-from evaluate_constitution import classify, validate_provenance
+from evaluate_constitution import classify, validate_metrics, validate_provenance
 
 
 class ConstitutionTest(unittest.TestCase):
@@ -13,6 +13,17 @@ class ConstitutionTest(unittest.TestCase):
     def test_missing_provenance_is_rejected(self):
         self.assertIn("commit", validate_provenance({"savings_percent": 25}))
         self.assertIn("repetitions", validate_provenance({"savings_percent": 25}))
+
+    def test_missing_metrics_is_rejected(self):
+        record = {
+            "commit": "abc",
+            "host": "tina",
+            "filesystem": "zfs",
+            "command": "benchmark",
+            "cache_state": "warm",
+            "repetitions": 15,
+        }
+        self.assertEqual(validate_metrics(record), ["median", "p95", "savings_percent", "unit"])
 
 
 if __name__ == "__main__":
