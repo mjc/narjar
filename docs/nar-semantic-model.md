@@ -71,3 +71,6 @@ The versioned source anchors are the
 [Nix 2.35.2 `archive.cc`](https://github.com/NixOS/nix/blob/2.35.2/src/libutil/archive.cc),
 [Git v2.55.0 `tree.c`](https://github.com/git/git/blob/v2.55.0/tree.c), and
 [Git v2.55.0 `tree.h`](https://github.com/git/git/blob/v2.55.0/tree.h).
+Git's [data model reference](https://git-scm.com/docs/gitdatamodel/2.55.0)
+provides the tree/blob/gitlink type and mode mapping; its object identity is
+the header plus body under the repository's selected hash algorithm.
