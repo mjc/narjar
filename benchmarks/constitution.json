@@ -6,6 +6,14 @@
   "wire_compression": "none",
   "primary_savings_gate_percent": {"reject_below": 25, "strong_at_or_above": 50},
   "matched_baseline": "raw NAR with transparent filesystem compression",
+  "corpus_categories": [
+    "many-small-files",
+    "shared-subtrees",
+    "duplicate-content",
+    "large-contents",
+    "symlink-and-executable",
+    "deep-and-irregular-names"
+  ],
   "hard_gates": {
     "ingest_wall_ratio_max": 1.5,
     "ingest_cpu_per_gib_ratio_max": 3.0,
@@ -15,10 +23,31 @@
     "read_amplification_ratio_max": 2.0,
     "offline_wall_ratio_max": 3.0,
     "offline_peak_rss_mib_max": 256,
+    "replication_bytes_max_multiplier_new_physical": 3.0,
+    "replication_bytes_max_percent_live_physical": 5,
+    "delta_additional_savings_percent_min": 15,
+    "delta_max_chain_depth": 2,
+    "delta_max_reconstructed_unit_mib": 8,
+    "hybrid_cache_max_logical_live_percent": 10,
+    "hybrid_cache_trace_hit_rate_min_percent": 95,
     "active_memory_per_operation_mib_max": 16,
     "idle_rss_mib_max": 30,
-    "startup_ms_max": 100
+    "idle_rss_ratio_to_flat_max": 2.0,
+    "startup_ms_max": 100,
+    "startup_p95_ratio_to_flat_max": 2.0,
+    "compaction_full_cache_copies_max": 1,
+    "dependency_rust_minimum": "1.85",
+    "dependency_advisories_max": 0,
+    "backup_restore_verify_required": true,
+    "security_auth_and_secret_log_tests_required": true
   },
+  "operational_invariants": [
+    "No resident database or GC worker.",
+    "Verify, GC, recovery, and repack are deterministic offline operations.",
+    "Compaction uses one configured segment plus reserve and never a second full-cache copy.",
+    "Backup restore into an empty DATA directory passes reconcile and independent Nix verification.",
+    "Authorization tests cover read/write capability separation and logs contain no secrets."
+  ],
   "corpus_categories_required": 6,
   "corpus_categories_required_improved": 4,
   "corpus_regression_percent_max": 5,

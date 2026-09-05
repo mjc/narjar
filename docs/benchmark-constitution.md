@@ -25,9 +25,23 @@ design only if all hard gates pass. 50% or more is strong evidence, still
 subject to all hard gates. Corpus robustness requires improvement in four of
 six categories and no category expansion over 5%.
 
+The six frozen corpus slices are many-small-files, shared-subtrees,
+duplicate-content, large-contents, symlink-and-executable, and
+deep-and-irregular-names. The cardinality-only 10,000-root run is a startup
+and RSS control, not a substitute for those six semantic slices.
+
 The hard gates cover ingest, full GET, 90%-resume Range TTFB, read
 amplification, offline maintenance, active/idle memory, startup, replication,
 delta depth/working-set limits, dependency closure, backup, recovery, and
-security. Their exact values are frozen in the JSON artifact. The final
-decision quotes this constitution verbatim and records rejected alternatives;
-thresholds are never tuned to fit observed results.
+security. Replication is bounded by `max(3 * new_physical_bytes, 0.05 *
+live_physical_bytes)`. A delta candidate must add at least 15% savings, have
+depth at most two, and reconstruct no unit over 8 MiB. A hybrid cache is capped
+at 10% of logical live bytes and must hit at least 95% of the trace. Compaction
+may use one configured segment plus reserve and no second full-cache copy.
+Dependencies retain Rust 1.85, have zero advisories, and report binary,
+closure, build-time, and transitive growth. Backup must restore into empty
+DATA and pass reconcile plus independent Nix verification; security must pass
+the auth-capability matrix and secret-free log checks. Their exact values are
+frozen in the JSON artifact. The final decision quotes this constitution
+verbatim and records rejected alternatives; thresholds are never tuned to fit
+observed results.
