@@ -35,3 +35,39 @@ Canonical byte vectors and the negative fixture manifest are in
 [`docs/evidence/nar-vectors.json`](evidence/nar-vectors.json). They are
 hand-built from the format above and cover root file, root symlink, empty
 directory, executable content, unusual byte names, and malformed inputs.
+
+## Field mapping and mismatches
+
+| NAR field/semantic | Git-shaped representation | Result |
+| --- | --- | --- |
+| root node kind | separate root descriptor; tree for directory | lossless only with the descriptor; a Git tree cannot be a root file or symlink |
+| regular `contents` | blob body, mode 100644 or 100755 | lossless for bytes and executable bit |
+| symlink `target` | blob body, mode 120000 | lossless as bytes, but checkout behavior is not NAR semantics |
+| directory `entry`/`name`/`node` | tree entry `<mode> <name>\\0<oid>` | node mapping is possible; NAR serialization must be regenerated |
+| NAR byte name | Git tree name | only names allowed by both formats; NAR forbids empty, `.`, `..`, `/`, and NUL |
+| NAR entry order | Git `base_name_compare` order | mismatch: Git appends virtual `/` for directories; sort independently |
+| executable marker | Git mode 100755 | preserve as a typed bit, never infer from contents |
+| NAR framing/padding | absent from Git object identity | never hash a Git tree as if it were a NAR; canonical re-emission owns framing |
+
+Git tree entries use mode 040000 (tree), 100644 (regular), 100755
+(executable), 120000 (symlink), or 160000 (gitlink). Narjar may create only
+the first four; 160000 is rejected because NAR has no gitlink/submodule node.
+Git raw entry names cannot contain NUL or `/`; filesystem checkout restrictions
+are a separate compatibility concern. Git object identity includes its object
+header and selected repository hash algorithm, which is distinct from the NAR
+byte stream and does not determine NarHash.
+
+The format admits empty file contents and empty directories. Length fields are
+u64, so large values are representable by framing, while the implementation
+must impose bounded streaming/resource limits. Nix's parser currently limits
+tag length to 32, name length to 255, target length to 4095, and nesting depth
+to 64; those implementation limits are distinct from the u64 wire type. The
+fixture manifest records the malformed forms that must be rejected, including
+duplicates, order violations, padding, unknown tags, truncation, trailing
+bytes, and forbidden names.
+
+The versioned source anchors are the
+[Nix 2.35 NAR manual](https://nix.dev/manual/nix/2.35/protocols/nix-archive/),
+[Nix 2.35.2 `archive.cc`](https://github.com/NixOS/nix/blob/2.35.2/src/libutil/archive.cc),
+[Git v2.55.0 `tree.c`](https://github.com/git/git/blob/v2.55.0/tree.c), and
+[Git v2.55.0 `tree.h`](https://github.com/git/git/blob/v2.55.0/tree.h).
