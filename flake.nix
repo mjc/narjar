@@ -333,7 +333,9 @@
             touch $out
           '';
           module-evaluation = env.pkgs.writeText "narjar-module-evaluation" (
-            import ./nix/module-eval-test.nix {pkgs = env.pkgs;}
+            import ./nix/module-eval-test.nix {
+              pkgs = import nixpkgs {system = "x86_64-linux";};
+            }
           );
         in
         {

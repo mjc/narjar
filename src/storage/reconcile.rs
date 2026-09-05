@@ -61,6 +61,8 @@ impl ReconcileReport {
 struct FileIdentity {
     device: u64,
     inode: u64,
+    change_time_seconds: i64,
+    change_time_nanoseconds: i64,
 }
 
 pub(super) fn scan(
@@ -178,7 +180,12 @@ pub(super) fn cleanup_stale_temp(
         .file_name()
         .expect("validated temporary entry has a filename");
     let identity = match entry_identity_at(&directory, name) {
-        Ok((device, inode)) => FileIdentity { device, inode },
+        Ok((device, inode, change_time_seconds, change_time_nanoseconds)) => FileIdentity {
+            device,
+            inode,
+            change_time_seconds,
+            change_time_nanoseconds,
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
@@ -211,13 +218,18 @@ impl BoundedEntries {
         &mut self,
         relative_path: PathBuf,
         class: ReconcileClass,
-        (device, inode): (u64, u64),
+        (device, inode, change_time_seconds, change_time_nanoseconds): (u64, u64, i64, i64),
     ) {
         self.seen += 1;
         self.entries.push(ReconcileEntry {
             relative_path,
             class,
-            identity: FileIdentity { device, inode },
+            identity: FileIdentity {
+                device,
+                inode,
+                change_time_seconds,
+                change_time_nanoseconds,
+            },
         });
         if self.entries.len() > self.limit {
             self.entries.pop();

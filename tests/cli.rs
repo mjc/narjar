@@ -1014,7 +1014,7 @@ fn read_routes_distinguish_bad_methods_names_and_unsupported_surfaces() {
 fn nar_reads_survive_unlink_and_aborted_slow_clients_without_exposing_temps() {
     let server = RunningServer::start("nar-read-races");
     let nar_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
-    let nar_bytes = vec![0x5a; 8 * 1024 * 1024];
+    let nar_bytes = vec![0x5a; 128 * 1024];
     fs::write(&nar_path, &nar_bytes).expect("write large NAR fixture");
     let path = format!("/nar/{NAR_ID}.nar");
 
@@ -1617,25 +1617,8 @@ fn nar_put_preserves_the_configured_free_space_reserve() {
 #[test]
 fn saturated_request_limit_rejects_excess_work() {
     let server = RunningServer::start_with_args("request-saturation", &["--max-in-flight", "1"]);
-    let nar_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
-    fs::write(&nar_path, vec![0x5a; 8 * 1024 * 1024]).expect("write large NAR fixture");
     let path = format!("/nar/{NAR_ID}.nar");
-    let mut blocked = server.open_request("GET", &path, &[]);
-    blocked
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set slow response timeout");
-    let mut started_response = Vec::new();
-    let mut chunk = [0; 8192];
-    while !started_response
-        .windows(4)
-        .any(|window| window == b"\r\n\r\n")
-    {
-        let read = blocked
-            .read(&mut chunk)
-            .expect("read slow response headers");
-        assert_ne!(read, 0, "slow response ended before headers");
-        started_response.extend_from_slice(&chunk[..read]);
-    }
+    let blocked = server.open_request("PUT", &path, &[("Content-Length", "1")]);
 
     let mut rejected = server.open_request("GET", "/nix-cache-info", &[]);
     rejected

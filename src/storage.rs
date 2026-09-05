@@ -1134,9 +1134,28 @@ pub(crate) fn entry_is_directory_at(directory: &File, name: &OsStr) -> io::Resul
     Ok(entry_mode_at(directory, name)? & libc::S_IFMT == libc::S_IFDIR)
 }
 
-pub(crate) fn entry_identity_at(directory: &File, name: &OsStr) -> io::Result<(u64, u64)> {
+pub(crate) fn entry_identity_at(
+    directory: &File,
+    name: &OsStr,
+) -> io::Result<(u64, u64, i64, i64)> {
     let metadata = entry_stat_at(directory, name)?;
-    Ok((metadata.st_dev as u64, metadata.st_ino as u64))
+    let (change_time_seconds, change_time_nanoseconds) = metadata_change_time(&metadata);
+    Ok((
+        metadata.st_dev as u64,
+        metadata.st_ino as u64,
+        change_time_seconds,
+        change_time_nanoseconds,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn metadata_change_time(metadata: &libc::stat) -> (i64, i64) {
+    (metadata.st_ctime as i64, metadata.st_ctime_nsec as i64)
+}
+
+#[cfg(target_os = "macos")]
+fn metadata_change_time(metadata: &libc::stat) -> (i64, i64) {
+    (metadata.st_ctime, metadata.st_ctime_nsec)
 }
 
 fn entry_mode_at(directory: &File, name: &OsStr) -> io::Result<libc::mode_t> {
