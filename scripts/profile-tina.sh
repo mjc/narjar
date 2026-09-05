@@ -186,8 +186,11 @@ done < "$MANIFEST"
 nix-store --generate-binary-cache-key narjar-profile "$OUTPUT/secret-key" "$OUTPUT/public-key"
 "$BIN" init --data-dir "$DATA"
 cp "$OUTPUT/public-key" "$DATA/trusted-public-keys"
+printf '+ %q token create --data-dir %q --scope write\n' "$BIN" "$DATA" >&3
+set +x
 TOKEN=$("$BIN" token create --data-dir "$DATA" --scope write)
 printf 'machine 127.0.0.1 login narjar password %s\n' "$TOKEN" > "$OUTPUT/profile.netrc"
+set -x
 chmod 600 "$OUTPUT/profile.netrc" "$OUTPUT/secret-key"
 
 start_server() {
@@ -335,7 +338,6 @@ prepare_hot_dataset() {
   "$BIN" init --data-dir "$HOT_DATA"
   cp -p -- "$DATA/nix-cache-info" "$HOT_DATA/nix-cache-info"
   cp -p -- "$DATA/trusted-public-keys" "$HOT_DATA/trusted-public-keys"
-  cp -p -- "$DATA/auth/write.tokens" "$HOT_DATA/auth/write.tokens"
   cp -p -- "$DATA/$selected_hash.narinfo" "$HOT_DATA/$selected_hash.narinfo"
   mkdir -p -- "$HOT_DATA/$(dirname "$selected_url")"
   cp -p -- "$selected_file" "$HOT_DATA/$selected_url"

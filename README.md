@@ -135,8 +135,8 @@ nix develop --command scripts/profile-tina.sh --size-gib 20 --seconds 60
 The script prints an output directory such as `/tmp/narjar-profile.XXXXXX`.
 It contains the raw and rendered profiles, heaptrack report, build log,
 workload logs, metadata, and `commands.log`, which records the commands that
-were actually executed. The HTTP workload uses `compression=none` and sends
-`Accept-Encoding: identity`.
+were actually executed while omitting generated token values. The HTTP
+workload uses `compression=none` and sends `Accept-Encoding: identity`.
 
 The copied analysis helpers can summarize the results without opening a GUI:
 
