@@ -9,21 +9,29 @@ CONSTITUTION = json.loads(Path(__file__).with_name("constitution.json").read_tex
 
 
 def classify(savings_percent):
-    if savings_percent < 25:
+    thresholds = CONSTITUTION["primary_savings_gate_percent"]
+    if savings_percent < thresholds["reject_below"]:
         return "reject"
-    if savings_percent >= 50:
+    if savings_percent >= thresholds["strong_at_or_above"]:
         return "strong"
     return "conditional"
 
 
+def missing_fields(record, required):
+    empty = (None, "", [], {})
+    return sorted(
+        field
+        for field in required
+        if field not in record or record[field] in empty
+    )
+
+
 def validate_provenance(record):
-    required = set(CONSTITUTION["provenance_required_fields"])
-    return sorted(required - record.keys())
+    return missing_fields(record, CONSTITUTION["provenance_required_fields"])
 
 
 def validate_metrics(record):
-    required = set(CONSTITUTION["metric_required_fields"])
-    return sorted(required - record.keys())
+    return missing_fields(record, CONSTITUTION["metric_required_fields"])
 
 
 def main():

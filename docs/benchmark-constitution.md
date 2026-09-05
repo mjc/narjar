@@ -1,8 +1,10 @@
 # NARJ-75 benchmark constitution
 
-Status: frozen version 3, 2026-09-05. Version 3 restores ticket fields omitted
-from version 2 and separates exact-CAS admission from aggressive-delta
-admission; it was frozen before any semantic candidate measurement.
+Status: frozen version 4, 2026-09-05. Version 4 adds observed wire compression
+to required provenance after the flat control exposed an unmatched external
+comparator. Thresholds are unchanged, and no semantic candidate has been
+measured. Version 3 restored ticket fields omitted from version 2 and
+separated exact-CAS admission from aggressive-delta admission.
 The machine-readable thresholds are in
 [`benchmarks/constitution.json`](../benchmarks/constitution.json). Candidate
 results must not alter this file; a changed constitution gets a new version,

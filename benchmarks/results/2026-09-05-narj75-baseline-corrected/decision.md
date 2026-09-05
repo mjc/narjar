@@ -4,7 +4,7 @@ This is the fresh current flat-cache control required before semantic-storage
 candidate comparisons. It is not a semantic candidate result and does not
 claim the 25% physical-byte savings gate. Candidate decisions still require
 the six-category corpus and the matched raw-NAR transparent-filesystem-
-compression baseline frozen by constitution version 3.
+compression baseline frozen by constitution version 4.
 
 The run used Narjar commit `26577b3e8d7e996407d071acaf456cb0d0c1a401`,
 pinned bincache commit `556a9c8f97a3c994a9de85f567a2ef16ce6513ab`, Tina's

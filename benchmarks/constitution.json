@@ -1,8 +1,8 @@
 {
-  "version": 3,
-  "supersedes_version": 2,
+  "version": 4,
+  "supersedes_version": 3,
   "frozen_on": "2026-09-05",
-  "change_reason": "Corrected omitted ticket fields and separated the exact-CAS admission gate from the aggressive-delta gate before semantic candidate measurements.",
+  "change_reason": "Require observed wire compression in provenance after the flat control exposed an unmatched external comparator; thresholds are unchanged and no semantic candidate has been measured.",
   "repetitions": 15,
   "warmup": 3,
   "wire_compression": "none",
