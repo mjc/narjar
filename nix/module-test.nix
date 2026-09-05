@@ -154,5 +154,11 @@
     static.succeed("test \"$(stat -c %U:%G /var/lib/narjar-static/auth/write.tokens)\" = narjar:narjar")
     static.succeed("test \"$(stat -c %U:%G /var/lib/narjar-static/trusted-public-keys)\" = narjar:narjar")
 
+    blocked.succeed("systemctl show narjar.service -p RequiresMountsFor --value | grep -Fx /var/lib/narjar-mounted")
+    blocked.succeed("systemctl start --no-block narjar.service")
+    blocked.succeed("sleep 1")
+    blocked.succeed("! systemctl is-active --quiet narjar.service")
+    blocked.succeed("test ! -e /var/lib/narjar-mounted/nix-cache-info")
+
   '';
 }
