@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "corpus_id": "narjar-real-nix-v1",
+  "source": {
+    "description": "Pinned NixOS generations and their complete closures",
+    "nixpkgs_revisions": [
+      "REPLACE_WITH_NIXPKGS_COMMIT_1",
+      "REPLACE_WITH_NIXPKGS_COMMIT_2",
+      "REPLACE_WITH_NIXPKGS_COMMIT_3"
+    ],
+    "distribution": "Do not commit raw NARs; publish only approved manifests or regeneration roots."
+  },
+  "requirements": {
+    "min_generations": 10,
+    "min_nixpkgs_revisions": 3,
+    "required_families": [
+      "nixos",
+      "toolchain",
+      "kernel",
+      "python",
+      "node",
+      "browser",
+      "debug"
+    ]
+  },
+  "subsets": {
+    "core": { "weight": 0.8 },
+    "stress": { "weight": 0.2 }
+  },
+  "targets": [
+    {
+      "id": "machine-generation-001",
+      "root": "/nix/store/REPLACE_WITH_SYSTEM_GENERATION",
+      "generation": 1,
+      "nixpkgs_revision": "REPLACE_WITH_NIXPKGS_COMMIT_1",
+      "flake_ref": "REPLACE_WITH_FLAKE_REF",
+      "flake_attr": "nixosConfigurations.REPLACE_WITH_HOST.config.system.build.toplevel",
+      "machine": "REPLACE_WITH_MACHINE",
+      "families": ["nixos", "toolchain", "kernel"],
+      "subset": "core"
+    }
+  ]
+}
