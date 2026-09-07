@@ -1,0 +1,377 @@
+{
+  "schema_version": 1,
+  "corpus_id": "narjar-real-nix-v1-candidate",
+  "source": {
+    "description": "Retained Tina NixOS generations and realized workload closures",
+    "nixpkgs_revisions": [
+      "79386e0686b21452da450490c7ac464ecf067cf1",
+      "3633f4ab859cd646d244802286d916f107ffeda7",
+      "71adb03f126f41a5ccbd27e2bcba3a54baec61d5"
+    ],
+  "distribution": "Raw NAR exports stay outside the repository.",
+  "license_policy": "Nixpkgs package metadata is authoritative; audit licenses before redistribution. Local NAR exports are benchmark inputs, not a redistribution grant."
+  },
+  "requirements": {
+    "min_generations": 10,
+    "min_nixpkgs_revisions": 3,
+    "required_families": ["nixos", "kernel", "toolchain", "python", "node", "browser"]
+  },
+  "subsets": {
+    "core": {"weight": 0.8},
+    "stress": {"weight": 0.2}
+  },
+  "targets": [
+    {
+      "id": "tina-generation-2213",
+      "root": "/nix/store/lfqc4shypbvlja4g23l16dql2959lp85-nixos-system-tina-linux6-18-26.11.20260818.79386e0",
+      "generation": 2213,
+      "nixpkgs_revision": "79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=229eddf4742d8616c9adf0567d10caf904f279d9",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "tina-generation-2214",
+      "root": "/nix/store/grmbny5bvv780fwdmv75mhsvsjlc73as-nixos-system-tina-linux6-18-26.11.20260818.79386e0",
+      "generation": 2214,
+      "nixpkgs_revision": "79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=229eddf4742d8616c9adf0567d10caf904f279d9",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "tina-generation-2215",
+      "root": "/nix/store/bv5iis827dzplc2797nrkxbwvbhcglrl-nixos-system-tina-linux6-18-26.11.20260818.79386e0",
+      "generation": 2215,
+      "nixpkgs_revision": "79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=229eddf4742d8616c9adf0567d10caf904f279d9",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "tina-generation-2222",
+      "root": "/nix/store/13882pz007gybs9vr7wdkrl9cmw9a1wr-nixos-system-tina-linux7-2-26.11.20260830.3633f4a",
+      "generation": 2222,
+      "nixpkgs_revision": "3633f4ab859cd646d244802286d916f107ffeda7",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=f74d0d2f11150a9b86c1d37be92e426c76352b13",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "tina-generation-2217",
+      "root": "/nix/store/808a6s57m2bgm5jw2r0gqzqdyry9w4za-nixos-system-tina-linux7-2-26.11.20260830.3633f4a",
+      "generation": 2217,
+      "nixpkgs_revision": "3633f4ab859cd646d244802286d916f107ffeda7",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=f74d0d2f11150a9b86c1d37be92e426c76352b13",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "tina-generation-2218",
+      "root": "/nix/store/mz39f1j6ak6naarcgd232zzlj059wl2j-nixos-system-tina-linux7-2-26.11.20260830.3633f4a",
+      "generation": 2218,
+      "nixpkgs_revision": "3633f4ab859cd646d244802286d916f107ffeda7",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=f74d0d2f11150a9b86c1d37be92e426c76352b13",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "tina-generation-2223",
+      "root": "/nix/store/892r8qmhvvpwq0567p2mjlazp79q4jcz-nixos-system-tina-linux7-2-26.11.20260901.71adb03",
+      "generation": 2223,
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=d7abebc9f4237e6c0572ab5853fd232bd0de17db",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "tina-generation-2224",
+      "root": "/nix/store/y7whm7qyyv9p0q4zmrjwgi4qhynk2rx0-nixos-system-tina-linux7-2-26.11.20260901.71adb03",
+      "generation": 2224,
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=d7abebc9f4237e6c0572ab5853fd232bd0de17db",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "tina-generation-2225",
+      "root": "/nix/store/hcwq0kcqhxk792qx3xj55hs3jckw2sqq-nixos-system-tina-linux7-2-26.11.20260901.71adb03",
+      "generation": 2225,
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=d7abebc9f4237e6c0572ab5853fd232bd0de17db",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "tina-generation-2279",
+      "root": "/nix/store/wzlphk4lxpn66vylbkn6z1a0jh2sqm2w-nixos-system-tina-linux7-2-26.11.20260901.71adb03",
+      "generation": 2279,
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "git+file:///home/mjc/cfg/nixos?rev=d7abebc9f4237e6c0572ab5853fd232bd0de17db",
+      "flake_attr": "nixosConfigurations.tina.config.system.build.toplevel",
+      "machine": "tina",
+      "families": ["nixos", "kernel"],
+      "subset": "core"
+    },
+    {
+      "id": "workload-rust",
+      "root": "/nix/store/cqlx62f919g8xf2f39bmykslpjdh9z0j-rustc-1.97.1",
+      "generation": "workload-20260901",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "github:NixOS/nixpkgs/71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_attr": "legacyPackages.x86_64-linux.rustc-unwrapped^out",
+      "machine": "tina",
+      "families": ["toolchain"],
+      "subset": "stress"
+    },
+    {
+      "id": "workload-python",
+      "root": "/nix/store/10xrzbbi4sj4va3jny7rcpji6mp0pp28-python3.14-psutil-7.2.2",
+      "generation": "workload-20260901",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "github:NixOS/nixpkgs/71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_attr": "legacyPackages.x86_64-linux.python3Packages.psutil",
+      "machine": "tina",
+      "families": ["python"],
+      "subset": "stress"
+    },
+    {
+      "id": "workload-node",
+      "root": "/nix/store/lfaydgacdyngci7p60s8wwvgdm74fjkx-nodejs-24.19.0",
+      "generation": "workload-20260901",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "github:NixOS/nixpkgs/71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_attr": "legacyPackages.x86_64-linux.nodejs",
+      "machine": "tina",
+      "families": ["node"],
+      "subset": "stress"
+    },
+    {
+      "id": "workload-browser",
+      "root": "/nix/store/3qgx41z8882ff85y9prdc5zgbb2id6y8-chromium-152.0.7977.64",
+      "generation": "workload-20260901",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "github:NixOS/nixpkgs/71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_attr": "legacyPackages.x86_64-linux.chromium",
+      "machine": "tina",
+      "families": ["browser", "static-assets"],
+      "subset": "stress"
+    },
+    {
+      "id": "workload-browser-old",
+      "root": "/nix/store/b3zmxxdfbv1q13fy1vkgxaszmnkwkf0z-chromium-151.0.7922.137",
+      "generation": "workload-20260818",
+      "nixpkgs_revision": "79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_ref": "github:NixOS/nixpkgs/79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_attr": "legacyPackages.x86_64-linux.chromium",
+      "machine": "tina",
+      "families": [
+        "browser",
+        "static-assets"
+      ],
+      "subset": "stress"
+    },
+    {
+      "id": "workload-llvm19",
+      "root": "/nix/store/i66lagr7kckm4m5dk230y1dcpqyb4qwr-clang-19.1.7",
+      "generation": "workload-20260818",
+      "nixpkgs_revision": "79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_ref": "github:NixOS/nixpkgs/79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_attr": "legacyPackages.x86_64-linux.llvmPackages_19.clang-unwrapped",
+      "machine": "tina",
+      "families": [
+        "toolchain"
+      ],
+      "subset": "stress"
+    },
+    {
+      "id": "workload-llvm20",
+      "root": "/nix/store/65lb9lhiljkp992bn4qxw95x7zx7nchh-clang-20.1.8",
+      "generation": "workload-20260901",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "github:NixOS/nixpkgs/71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_attr": "legacyPackages.x86_64-linux.llvmPackages_20.clang-unwrapped",
+      "machine": "tina",
+      "families": [
+        "toolchain"
+      ],
+      "subset": "stress"
+    },
+    {
+      "id": "workload-llvm19-debug",
+      "root": "/nix/store/dnwdwvjvmwsamm2ls739c168fnbiwn30-clang-19.1.7-debug",
+      "generation": "workload-20260818",
+      "nixpkgs_revision": "79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_ref": "github:NixOS/nixpkgs/79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_attr": "legacyPackages.x86_64-linux.llvmPackages_19.clang-unwrapped^debug",
+      "machine": "tina",
+      "families": [
+        "toolchain",
+        "debug"
+      ],
+      "subset": "stress"
+    },
+    {
+      "id": "workload-llvm20-debug",
+      "root": "/nix/store/9hflngzqkcdpslal6vs87y58kvvkwi6q-clang-20.1.8-debug",
+      "generation": "workload-20260901",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "github:NixOS/nixpkgs/71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_attr": "legacyPackages.x86_64-linux.llvmPackages_20.clang-unwrapped^debug",
+      "machine": "tina",
+      "families": [
+        "toolchain",
+        "debug"
+      ],
+      "subset": "stress"
+    },
+    {
+      "id": "repro-generation-2213",
+      "root": "/nix/store/z224sfnj4zpb57a3dny4wv158bvwacdq-nixos-system-narjar-2213-26.11.20260818.79386e0",
+      "generation": "repro-2213",
+      "nixpkgs_revision": "79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2213.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    },
+    {
+      "id": "repro-generation-2214",
+      "root": "/nix/store/xbr31s17jlgnb1wwxnfdd8ira1a91pas-nixos-system-narjar-2214-26.11.20260818.79386e0",
+      "generation": "repro-2214",
+      "nixpkgs_revision": "79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2214.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    },
+    {
+      "id": "repro-generation-2215",
+      "root": "/nix/store/apahqsj5wdn68fzjngzxds8rlnr18z23-nixos-system-narjar-2215-26.11.20260818.79386e0",
+      "generation": "repro-2215",
+      "nixpkgs_revision": "79386e0686b21452da450490c7ac464ecf067cf1",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2215.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    },
+    {
+      "id": "repro-generation-2217",
+      "root": "/nix/store/52f1ln3lazafnhvfyjqh0xwr2bbss8pj-nixos-system-narjar-2217-26.11.20260830.3633f4a",
+      "generation": "repro-2217",
+      "nixpkgs_revision": "3633f4ab859cd646d244802286d916f107ffeda7",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2217.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    },
+    {
+      "id": "repro-generation-2218",
+      "root": "/nix/store/ynvk8wyls573cvzh623b3dmzsxlxbpbm-nixos-system-narjar-2218-26.11.20260830.3633f4a",
+      "generation": "repro-2218",
+      "nixpkgs_revision": "3633f4ab859cd646d244802286d916f107ffeda7",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2218.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    },
+    {
+      "id": "repro-generation-2222",
+      "root": "/nix/store/fraxcx97qk7047yd7nkzkq46g2f053zv-nixos-system-narjar-2222-26.11.20260830.3633f4a",
+      "generation": "repro-2222",
+      "nixpkgs_revision": "3633f4ab859cd646d244802286d916f107ffeda7",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2222.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    },
+    {
+      "id": "repro-generation-2223",
+      "root": "/nix/store/cmfqidyqpr1k09l7xhyjyc23ixzj6map-nixos-system-narjar-2223-26.11.20260901.71adb03",
+      "generation": "repro-2223",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2223.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    },
+    {
+      "id": "repro-generation-2224",
+      "root": "/nix/store/k7yqqaypwxl0kr7y850akf5rfxv869zh-nixos-system-narjar-2224-26.11.20260901.71adb03",
+      "generation": "repro-2224",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2224.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    },
+    {
+      "id": "repro-generation-2225",
+      "root": "/nix/store/agijkljazsf9s79c8qkp51pbx7vmkbwg-nixos-system-narjar-2225-26.11.20260901.71adb03",
+      "generation": "repro-2225",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2225.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    },
+    {
+      "id": "repro-generation-2279",
+      "root": "/nix/store/znhzdl4avjf6agnxsb64abq3462f5qyb-nixos-system-narjar-2279-26.11.20260901.71adb03",
+      "generation": "repro-2279",
+      "nixpkgs_revision": "71adb03f126f41a5ccbd27e2bcba3a54baec61d5",
+      "flake_ref": "path:./benchmarks/reproducible-flake",
+      "flake_attr": "nixosConfigurations.generation-2279.config.system.build.toplevel",
+      "machine": "narjar-public",
+      "families": [
+        "nixos"
+      ],
+      "subset": "core"
+    }
+  ]
+}
