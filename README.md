@@ -122,6 +122,7 @@ nix build .#narjar
 nix run .
 nix run .#provenance
 nix run .#nix-e2e
+nix run .#oci-e2e
 nix build .#packages.x86_64-linux.narjar-static
 nix build .#packages.x86_64-linux.narjar-oci
 ```

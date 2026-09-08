@@ -135,6 +135,22 @@
             ];
             text = builtins.readFile ./tests/nix-e2e.sh;
           };
+          ociE2E = pkgs.writeShellApplication {
+            name = "narjar-oci-e2e";
+            runtimeInputs = [
+              pkgs.coreutils
+              pkgs.curl
+              pkgs.gawk
+              pkgs.jq
+              pkgs.nix
+              pkgs.skopeo
+              pkgs.podman
+            ];
+            text = ''
+              export NARJAR_OCI_ARCHIVE=${ociImage}
+              ${builtins.readFile ./tests/oci-e2e.sh}
+            '';
+          };
           continuationBenchmark = pkgs.writeShellApplication {
             name = "narjar-continuation-benchmark";
             runtimeInputs = [
@@ -158,6 +174,7 @@
             provenance
             nixE2E
             continuationBenchmark
+            ociE2E
             ;
         };
 
@@ -269,6 +286,11 @@
           type = "app";
           program = lib.getExe env.nixE2E;
           meta.description = "Run the real-Nix end-to-end verification";
+        };
+        oci-e2e = {
+          type = "app";
+          program = lib.getExe env.ociE2E;
+          meta.description = "Run the OCI image persistent-volume verification";
         };
         continuation-benchmark = {
           type = "app";
