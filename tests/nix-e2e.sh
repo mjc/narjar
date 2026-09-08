@@ -199,6 +199,7 @@ trusted_key=$(<"$public_key")
 wrong_key=$(<"$wrong_public_key")
 
 run mkdir -p "$data_dir"
+run narjar init --data-dir "$data_dir"
 token=$(run narjar token create --data-dir "$data_dir" --scope write --name nix-e2e)
 run cp "$public_key" "$data_dir/trusted-public-keys"
 umask 077
