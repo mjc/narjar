@@ -3,3 +3,4 @@
 result
 result-*
 fuzz/target/
+benchmarks/__pycache__/
