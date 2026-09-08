@@ -134,6 +134,8 @@
     (toString cfg.maxNarBytes)
     "--min-free-bytes"
     (toString cfg.minFreeBytes)
+    "--shutdown-grace-seconds"
+    (toString cfg.shutdownGraceSeconds)
   ];
   commonServiceConfig = {
     PrivateTmp = true;
@@ -216,6 +218,11 @@ in {
     minFreeBytes = lib.mkOption {
       type = lib.types.ints.unsigned;
       default = 1024 * 1024 * 1024;
+    };
+
+    shutdownGraceSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 30;
     };
 
     gc = {

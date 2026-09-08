@@ -145,6 +145,7 @@
             ];
             text = ''
               export NARJAR_BIN=${lib.getExe build.narjar}
+              export NARJAR_BENCHMARK_LAUNCH_COMMAND="nix run .#continuation-benchmark --"
               exec python3 ${./benchmarks/continuation.py} "$@"
             '';
           };
@@ -272,7 +273,7 @@
         continuation-benchmark = {
           type = "app";
           program = lib.getExe env.continuationBenchmark;
-          meta.description = "Run the matched bincache continuation benchmark";
+          meta.description = "Run the pinned Narjar/bincache operational benchmark";
         };
       }) systems;
 
@@ -372,6 +373,9 @@
           static-cargo-artifacts = static.cargoArtifacts;
           static-package = static.narjar;
           nixos-module = env.pkgs.testers.runNixOSTest (import ./nix/module-test.nix { inherit self; });
+          filesystem-conformance = env.pkgs.testers.runNixOSTest (
+            import ./nix/filesystem-conformance-test.nix { inherit self; }
+          );
           oci-archive =
             env.pkgs.runCommand "narjar-oci-archive"
               {
