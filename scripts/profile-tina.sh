@@ -9,7 +9,9 @@ PROFILE_SECONDS=60
 JOBS=1
 PORT=0
 MAX_NAR_BYTES=$((16 * 1024 * 1024 * 1024))
+MAX_SELECTED_NAR_GIB=1
 HOT_NAR_MAX_GIB=1
+REUSE_DATA=""
 
 usage() {
   cat <<'EOF'
@@ -23,7 +25,9 @@ Options:
   --seconds N        perf capture duration (default: 60)
   --jobs N           narjar push concurrency (default: 1)
   --port N           Local server port (default: 0, auto-select)
+  --max-selected-nar-gib N  Maximum size of one corpus NAR (default: 1)
   --hot-nar-max-gib N  Maximum hot NAR size for tmpfs profiling (default: 1)
+  --reuse-data DIR   Reuse a previously populated Narjar data directory
   -h, --help         Show this help
 
 Run from the development shell, for example:
@@ -38,7 +42,9 @@ while (($#)); do
     --seconds) PROFILE_SECONDS=$2; shift 2 ;;
     --jobs) JOBS=$2; shift 2 ;;
     --port) PORT=$2; shift 2 ;;
+    --max-selected-nar-gib) MAX_SELECTED_NAR_GIB=$2; shift 2 ;;
     --hot-nar-max-gib) HOT_NAR_MAX_GIB=$2; shift 2 ;;
+    --reuse-data) REUSE_DATA=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -85,6 +91,7 @@ DATA="$OUTPUT/data"
 MANIFEST="$OUTPUT/system-store.tsv"
 TARGET_BYTES=$((SIZE_GIB * 1024 * 1024 * 1024))
 HOT_NAR_MAX_BYTES=$((HOT_NAR_MAX_GIB * 1024 * 1024 * 1024))
+MAX_SELECTED_NAR_BYTES=$((MAX_SELECTED_NAR_GIB * 1024 * 1024 * 1024))
 PROFILE_RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes"
 SERVER_URI="http://127.0.0.1:$PORT"
 CACHE_URI="$SERVER_URI?compression=none"
@@ -136,8 +143,9 @@ CARGO_TARGET_DIR="$TARGET" \
 
 echo "selecting at least ${SIZE_GIB} GiB of real Nix store NARs"
 nix path-info --all --json > "$OUTPUT/path-info.json"
-python - "$TARGET_BYTES" "$MAX_NAR_BYTES" "$MANIFEST" "$OUTPUT/path-info.json" <<'PY'
+python - "$TARGET_BYTES" "$MAX_SELECTED_NAR_BYTES" "$MANIFEST" "$OUTPUT/path-info.json" <<'PY'
 import json
+import os
 import sys
 
 target_bytes = int(sys.argv[1])
@@ -152,9 +160,13 @@ if isinstance(items, dict):
     items = [{"path": path, **info} for path, info in items.items()]
 
 entries = []
+excluded_benchmark_sources = 0
 for item in items:
     path = item.get("path")
     size = int(item.get("narSize", 0))
+    if path and os.path.isdir(path) and os.path.isdir(os.path.join(path, "benchmarks", "results")):
+        excluded_benchmark_sources += 1
+        continue
     if path and path.startswith("/nix/store/") and 0 < size <= max_nar_bytes:
         entries.append((size, path))
 
@@ -173,7 +185,10 @@ with open(manifest, "w") as output:
     for path, size in selected:
         output.write(f"{path}\t{size}\n")
 
-print(f"selected {len(selected)} paths ({total} bytes)")
+print(
+    f"selected {len(selected)} paths ({total} bytes); "
+    f"excluded {excluded_benchmark_sources} benchmark source paths"
+)
 PY
 
 PATHS=()
@@ -183,15 +198,20 @@ while IFS=$'\t' read -r path size; do
   TOTAL_BYTES=$((TOTAL_BYTES + size))
 done < "$MANIFEST"
 
-nix-store --generate-binary-cache-key narjar-profile "$OUTPUT/secret-key" "$OUTPUT/public-key"
-"$BIN" init --data-dir "$DATA"
-cp "$OUTPUT/public-key" "$DATA/trusted-public-keys"
-printf '+ %q token create --data-dir %q --scope write\n' "$BIN" "$DATA" >&3
-set +x
-TOKEN=$("$BIN" token create --data-dir "$DATA" --scope write)
-printf 'machine 127.0.0.1 login narjar password %s\n' "$TOKEN" > "$OUTPUT/profile.netrc"
-set -x
-chmod 600 "$OUTPUT/profile.netrc" "$OUTPUT/secret-key"
+if [[ -n "$REUSE_DATA" ]]; then
+  DATA=$(cd "$REUSE_DATA" && pwd)
+  [[ -d "$DATA" ]] || { echo "reuse data directory does not exist: $DATA" >&2; exit 1; }
+else
+  nix-store --generate-binary-cache-key narjar-profile "$OUTPUT/secret-key" "$OUTPUT/public-key"
+  "$BIN" init --data-dir "$DATA"
+  cp "$OUTPUT/public-key" "$DATA/trusted-public-keys"
+  printf '+ %q token create --data-dir %q --scope write\n' "$BIN" "$DATA" >&3
+  set +x
+  TOKEN=$("$BIN" token create --data-dir "$DATA" --scope write)
+  printf 'machine 127.0.0.1 login narjar password %s\n' "$TOKEN" > "$OUTPUT/profile.netrc"
+  set -x
+  chmod 600 "$OUTPUT/profile.netrc" "$OUTPUT/secret-key"
+fi
 
 start_server() {
   "$BIN" serve \
@@ -381,9 +401,24 @@ run_read_workload() {
   WORKLOAD_PIDS=()
 }
 
-echo "populating the ${SIZE_GIB} GiB corpus for profiling"
-start_server "$OUTPUT/flamegraph-populate-server.log"
-push_system_store 2>&1 | tee "$OUTPUT/flamegraph-populate.log"
+if [[ -n "$REUSE_DATA" ]]; then
+  echo "reusing populated corpus from $DATA"
+  PATHS=()
+  TOTAL_BYTES=0
+  while IFS= read -r narinfo; do
+    store_hash=${narinfo##*/}
+    store_hash=${store_hash%.narinfo}
+    PATHS+=("$store_hash")
+  done < <(find "$DATA" -maxdepth 1 -type f -name '*.narinfo' -printf '%p\n' | sort)
+  while IFS= read -r nar_file; do
+    TOTAL_BYTES=$((TOTAL_BYTES + $(stat -c '%s' "$nar_file")))
+  done < <(find "$DATA/nar" -maxdepth 1 -type f -name '*.nar' -printf '%p\n')
+  start_server "$OUTPUT/flamegraph-populate-server.log"
+else
+  echo "populating the ${SIZE_GIB} GiB corpus for profiling"
+  start_server "$OUTPUT/flamegraph-populate-server.log"
+  push_system_store 2>&1 | tee "$OUTPUT/flamegraph-populate.log"
+fi
 prepare_hot_dataset
 prepare_read_workload
 stop_server
@@ -472,6 +507,7 @@ heaptrack_print "$HEAPTRACK_FILE" | tee "$OUTPUT/heaptrack.txt"
   echo "size_gib=$SIZE_GIB"
   echo "selected_paths=${#PATHS[@]}"
   echo "selected_bytes=$TOTAL_BYTES"
+  echo "max_selected_nar_gib=$MAX_SELECTED_NAR_GIB"
   echo "hot_nar_max_gib=$HOT_NAR_MAX_GIB"
   echo "hot_data=tmpfs"
   echo "hot_store_hash=$READ_STORE_HASH"
