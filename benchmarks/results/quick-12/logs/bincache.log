@@ -1,0 +1,42 @@
+[2m2026-09-01T08:10:59.351523Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m0 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:10:59.351686Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:10:59.375397Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m0 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:10:59.375590Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:00.245206Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m0 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:11:00.245455Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:00.299325Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0m1pcyhqiil5nhc3fclicy1pjx1kmb74wd-narjar-continuation-8
+[2m2026-09-01T08:11:00.314249Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0m23kz3pb7lyn3i2hl78lpqy20xplq53fx-narjar-continuation-7
+[2m2026-09-01T08:11:00.327817Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mm4jxsc98dyyzv3ak58l6csw4jf1anqmq-narjar-continuation-1
+[2m2026-09-01T08:11:00.370186Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mhx7zffvlbbpna7iplawgn8497nk14kci-narjar-continuation-0
+[2m2026-09-01T08:11:00.376834Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mdm9iiw8ly1js9xr0gsbnba97f9ap3jay-narjar-continuation-2
+[2m2026-09-01T08:11:00.383627Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mqqfkhai9avs4q4m0xvdhv79nk7x2dsam-narjar-continuation-6
+[2m2026-09-01T08:11:00.391852Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mi22bg905d37gx28j2j2bp839vnhhsl03-narjar-continuation-3
+[2m2026-09-01T08:11:00.398655Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mx6j0ax2fgxv70flnyk7kvir15r0arh7z-narjar-continuation-5
+[2m2026-09-01T08:11:00.402285Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0majsbgyacbb1kc2hiyk39673mkflq85zm-narjar-continuation-4
+[2m2026-09-01T08:11:00.406164Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0m5gab06096s336y52ir45gy1r0ik3ipjn-narjar-continuation-9
+[2m2026-09-01T08:11:00.507084Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m10 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:11:00.507276Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:00.802386Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m10 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:11:00.802585Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:01.088466Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m10 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:11:01.088664Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:01.219983Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0m4pjvsss78v13zs9skqzbj2y0lm4dfqhy-upload-1048576-0.bin
+[2m2026-09-01T08:11:01.368726Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0m7a2bzz2ss1fymvn3jdvccbvw5lmq53f6-upload-1048576-1.bin
+[2m2026-09-01T08:11:01.518799Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m12 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:11:01.518995Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:01.588249Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mgga9l9x333p1grifzsqhr6h96d80x4mb-streaming-4194304-0.bin
+[2m2026-09-01T08:11:01.867589Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m13 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:11:01.867755Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:02.104691Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mm51n7zph9iiq4bp128lmm0kzv01j59kd-recovery-1048576-0.bin
+[2m2026-09-01T08:11:02.170343Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mih9srkrswqr3pkcvw4qh8a97wnqchaxy-recovery-1048576-1.bin
+[2m2026-09-01T08:11:02.174531Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mih9srkrswqr3pkcvw4qh8a97wnqchaxy-recovery-1048576-1.bin
+[2m2026-09-01T08:11:02.440240Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mdg7gfyv12nipch6n8xkgmsphq9r56jd8-recovery-1048576-2.bin
+[2m2026-09-01T08:11:02.444655Z[0m [32m INFO[0m [2mbincache_ingest::ingest[0m[2m:[0m published [3mpath[0m[2m=[0mdg7gfyv12nipch6n8xkgmsphq9r56jd8-recovery-1048576-2.bin
+[2m2026-09-01T08:11:02.848917Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m16 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:11:02.849139Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:02.973192Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m16 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:JhsX1rx0oYmap43DR4fU9pEc7pEbV1tIFaoD1BN0r5w=
+[2m2026-09-01T08:11:02.973429Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:08.037414Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m0 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:+K6EZI0eg6Hq3dvh2doSqQ9LRbi9LUZwLD9S6dKmiYQ=
+[2m2026-09-01T08:11:08.037586Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T08:11:12.253186Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m0 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:+K6EZI0eg6Hq3dvh2doSqQ9LRbi9LUZwLD9S6dKmiYQ=
+[2m2026-09-01T08:11:12.253386Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0

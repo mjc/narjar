@@ -109,6 +109,18 @@ class ConstitutionTest(unittest.TestCase):
             incomplete.pop(field)
             self.assertIn(field, validate_metrics(incomplete))
 
+    def test_nested_evidence_record_is_validated(self):
+        provenance = {
+            field: "present" for field in CONSTITUTION["provenance_required_fields"]
+        }
+        metric = {field: 1 for field in CONSTITUTION["metric_required_fields"]}
+        self.assertEqual(
+            validate_provenance({"provenance": provenance, "metric": metric}), []
+        )
+        self.assertEqual(
+            validate_metrics({"provenance": provenance, "metric": metric}), []
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

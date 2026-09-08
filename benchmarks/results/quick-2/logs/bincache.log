@@ -1,0 +1,4 @@
+[2m2026-09-01T07:50:26.479542Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m0 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:XhP2E8oYRyG39IQ6awLATOZdpi09zGC5xrjFEB0qxgk=
+[2m2026-09-01T07:50:26.479758Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0
+[2m2026-09-01T07:50:26.508281Z[0m [32m INFO[0m [2mbincache::boot[0m[2m:[0m bincache starting [3mpaths[0m[2m=[0m0 [3mshards[0m[2m=[0m1 [3mstore_dir[0m[2m=[0m/nix/store [3mpublic_key[0m[2m=[0mbincache-benchmark:XhP2E8oYRyG39IQ6awLATOZdpi09zGC5xrjFEB0qxgk=
+[2m2026-09-01T07:50:26.508521Z[0m [32m INFO[0m [2mbincache_serve::shard[0m[2m:[0m listening [3mshard[0m[2m=[0m0

@@ -27,11 +27,15 @@ def missing_fields(record, required):
 
 
 def validate_provenance(record):
-    return missing_fields(record, CONSTITUTION["provenance_required_fields"])
+    return missing_fields(
+        record.get("provenance", record), CONSTITUTION["provenance_required_fields"]
+    )
 
 
 def validate_metrics(record):
-    return missing_fields(record, CONSTITUTION["metric_required_fields"])
+    return missing_fields(
+        record.get("metric", record), CONSTITUTION["metric_required_fields"]
+    )
 
 
 def main():
@@ -41,7 +45,8 @@ def main():
     missing = validate_provenance(record) + validate_metrics(record)
     if missing:
         raise SystemExit("missing required fields: " + ", ".join(missing))
-    print(classify(float(record["savings_percent"])))
+    metric = record.get("metric", record)
+    print(classify(float(metric["savings_percent"])))
 
 
 if __name__ == "__main__":

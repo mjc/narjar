@@ -1,0 +1,4 @@
+{"cache_paths": 0, "candidate": "bincache", "case": "startup", "order": 0, "repetition": 0, "unit": "ms", "value": 24.408657}
+{"cache_paths": 0, "candidate": "bincache", "case": "settled_idle_rss", "order": 0, "repetition": 0, "unit": "KiB", "value": 11388}
+{"cache_paths": 0, "candidate": "narjar", "case": "startup", "order": 1, "repetition": 0, "unit": "ms", "value": 5.150083}
+{"cache_paths": 0, "candidate": "narjar", "case": "settled_idle_rss", "order": 1, "repetition": 0, "unit": "KiB", "value": 1948}

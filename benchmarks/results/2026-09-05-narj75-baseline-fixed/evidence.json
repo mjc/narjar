@@ -1,0 +1,72 @@
+{
+  "metric": {
+    "candidate": "narjar",
+    "case": "startup_10000_paths",
+    "median": 53.365984,
+    "p95": 58.621774,
+    "savings_percent": 0,
+    "unit": "ms"
+  },
+  "provenance": {
+    "binary_identity": {
+      "bincache": {
+        "path": "/nix/store/vjy4bxyh0faj1v99ya0lvvvbxwvhap8m-bincache-0.0.0/bin/bincache",
+        "sha256": "sha256-qRhiTuHoBFuCN9hikCj+P1+J9bvBx5ZqADjcnH9sO/U="
+      },
+      "narjar": {
+        "path": "/nix/store/9m6j2jd7j2j6s5n74wiiijvjdjdv4jvw-narjar-0.1.0/bin/narjar",
+        "sha256": "sha256-e5VCRZnSL1gQk2DybCEkCZwjUmVtqSqgRrjxEugHb94="
+      }
+    },
+    "cache_state": "warm and cold page-cache controls",
+    "closure_identity": {
+      "bincache": {
+        "bytes": 51956840,
+        "output": "/nix/store/vjy4bxyh0faj1v99ya0lvvvbxwvhap8m-bincache-0.0.0"
+      },
+      "narjar": {
+        "bytes": 45076512,
+        "output": "/nix/store/9m6j2jd7j2j6s5n74wiiijvjdjdv4jvw-narjar-0.1.0"
+      },
+      "narjar-static": {
+        "bytes": 2193552
+      }
+    },
+    "command_log": "commands.txt",
+    "commit": "6aac1cbc43fb5102dd3e8296e5a94dbbb6f834b1",
+    "corpus_category": "flat-baseline-control",
+    "corpus_manifest": "benchmarks/corpus-manifest.json",
+    "filesystem": "zroot/home zfs rw,relatime,xattr,noacl,casesensitive",
+    "governor": "performance",
+    "host": "tina",
+    "kernel": "7.2.2",
+    "nix_version": "nix (Nix) 2.31.5",
+    "raw_samples": "samples.jsonl",
+    "repetitions": 15,
+    "rust_version": "rustc 1.85.1 (4eb161250 2025-03-15)",
+    "target": "x86_64",
+    "tool_versions": {
+      "git": "git version 2.51.2",
+      "python": "3.13.12",
+      "rustc": "rustc 1.85.1 (4eb161250 2025-03-15)",
+      "unshare": "unshare from util-linux 2.42.2"
+    },
+    "warmups": 3,
+    "wire_compression": {
+      "bincache": {
+        "accept_encoding": "identity",
+        "constitution_matched": false,
+        "nar_url": "nar/1h5biq2r3r3i8dvwjv79ghf05qvdlhr6xw04la1krbs16794r9n8.nar.zst",
+        "narinfo_compression": "zstd",
+        "upload_compression_query": "none"
+      },
+      "narjar": {
+        "accept_encoding": "identity",
+        "constitution_matched": true,
+        "nar_url": "nar/17z8cmcb4fcwngn3y4z8c3wca07rr45hzbwh9r243m8wxr2mpf5v.nar",
+        "narinfo_compression": "none",
+        "upload_compression_query": "none"
+      }
+    }
+  }
+}

@@ -1,0 +1,82 @@
+[
+  {
+    "candidate": "bincache",
+    "case": "binary_size",
+    "max": 3724120,
+    "median": 3724120,
+    "min": 3724120,
+    "n": 1,
+    "p95": 3724120,
+    "unit": "bytes"
+  },
+  {
+    "candidate": "narjar",
+    "case": "binary_size",
+    "max": 1431168,
+    "median": 1431168,
+    "min": 1431168,
+    "n": 1,
+    "p95": 1431168,
+    "unit": "bytes"
+  },
+  {
+    "candidate": "bincache",
+    "case": "runtime_closure_size",
+    "max": 51957664,
+    "median": 51957664,
+    "min": 51957664,
+    "n": 1,
+    "p95": 51957664,
+    "unit": "bytes"
+  },
+  {
+    "candidate": "narjar",
+    "case": "runtime_closure_size",
+    "max": 44444720,
+    "median": 44444720,
+    "min": 44444720,
+    "n": 1,
+    "p95": 44444720,
+    "unit": "bytes"
+  },
+  {
+    "candidate": "bincache",
+    "case": "settled_idle_rss",
+    "max": 11516,
+    "median": 11454.0,
+    "min": 11392,
+    "n": 2,
+    "p95": 11516,
+    "unit": "KiB"
+  },
+  {
+    "candidate": "narjar",
+    "case": "settled_idle_rss",
+    "max": 2096,
+    "median": 2048.0,
+    "min": 2000,
+    "n": 2,
+    "p95": 2096,
+    "unit": "KiB"
+  },
+  {
+    "candidate": "bincache",
+    "case": "startup",
+    "max": 30.714916,
+    "median": 26.5109725,
+    "min": 22.307029,
+    "n": 2,
+    "p95": 30.714916,
+    "unit": "ms"
+  },
+  {
+    "candidate": "narjar",
+    "case": "startup",
+    "max": 7.404668,
+    "median": 5.0319145,
+    "min": 2.659161,
+    "n": 2,
+    "p95": 7.404668,
+    "unit": "ms"
+  }
+]

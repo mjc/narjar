@@ -1,0 +1,1 @@
+nix build --no-write-lock-file --no-link --print-out-paths github:wyattgill9/bincache/556a9c8f97a3c994a9de85f567a2ef16ce6513ab

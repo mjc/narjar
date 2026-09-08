@@ -1,0 +1,6 @@
+listening http://127.0.0.1:44629 workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824
+listening http://127.0.0.1:52717 workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824
+listening http://127.0.0.1:60483 workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824
+listening http://127.0.0.1:54153 workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824
+listening http://127.0.0.1:46297 workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824
+listening http://127.0.0.1:47893 workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824

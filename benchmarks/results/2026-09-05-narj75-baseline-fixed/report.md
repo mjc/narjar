@@ -1,0 +1,143 @@
+# Continuation benchmark
+
+- bincache ref: `556a9c8f97a3c994a9de85f567a2ef16ce6513ab`
+- warmups: 3
+- repetitions: 15
+- random seed: 29030
+- quick smoke run: no
+- observed wire compression: bincache=zstd, narjar=none
+
+| Case | Candidate | n | Median | p95 | Min | Max | Unit |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| binary_size | bincache | 1 | 3723296.000 | 3723296.000 | 3723296.000 | 3723296.000 | bytes |
+| binary_size | narjar | 1 | 2062960.000 | 2062960.000 | 2062960.000 | 2062960.000 | bytes |
+| binary_size | narjar-static | 1 | 2193072.000 | 2193072.000 | 2193072.000 | 2193072.000 | bytes |
+| concurrent_get_1 | bincache | 15 | 314.042 | 464.155 | 133.926 | 464.155 | MiB/s |
+| concurrent_get_1 | narjar | 15 | 264.429 | 514.123 | 205.564 | 514.123 | MiB/s |
+| concurrent_get_32 | bincache | 15 | 431.031 | 518.310 | 281.856 | 518.310 | MiB/s |
+| concurrent_get_32 | narjar | 15 | 484.043 | 630.337 | 292.838 | 630.337 | MiB/s |
+| concurrent_get_8 | bincache | 15 | 467.574 | 991.716 | 352.882 | 991.716 | MiB/s |
+| concurrent_get_8 | narjar | 15 | 480.814 | 661.773 | 416.518 | 661.773 | MiB/s |
+| concurrent_upload_peak_rss | bincache | 15 | 36084.000 | 38724.000 | 31676.000 | 38724.000 | KiB |
+| concurrent_upload_peak_rss | narjar | 15 | 2348.000 | 2348.000 | 2348.000 | 2348.000 | KiB |
+| concurrent_upload_server_cpu | bincache | 15 | 40.000 | 50.000 | 20.000 | 50.000 | ms |
+| concurrent_upload_server_cpu | narjar | 15 | 30.000 | 50.000 | 20.000 | 50.000 | ms |
+| concurrent_upload_wall | bincache | 15 | 171.802 | 197.486 | 128.873 | 197.486 | ms |
+| concurrent_upload_wall | narjar | 15 | 1415.988 | 1473.983 | 1374.591 | 1473.983 | ms |
+| correct_key_substituted | bincache | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |
+| correct_key_substituted | narjar | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |
+| duplicate_upload_physical_bytes | bincache | 15 | 0.000 | 0.000 | 0.000 | 0.000 | bytes |
+| duplicate_upload_physical_bytes | narjar | 15 | 0.000 | 0.000 | 0.000 | 0.000 | bytes |
+| duplicate_upload_wall | bincache | 15 | 52.745 | 74.062 | 40.035 | 74.062 | ms |
+| duplicate_upload_wall | narjar | 15 | 77.092 | 107.809 | 47.010 | 107.809 | ms |
+| enospc_client_failed | bincache | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |
+| enospc_client_failed | narjar | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |
+| enospc_service_alive | bincache | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |
+| enospc_service_alive | narjar | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |
+| enospc_visibility_after_failure | bincache | 1 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP status |
+| enospc_visibility_after_failure | narjar | 1 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP status |
+| enospc_visibility_after_restart | bincache | 1 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP status |
+| enospc_visibility_after_restart | narjar | 1 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP status |
+| get_cold_latency | bincache | 15 | 13.584 | 25.625 | 10.251 | 25.625 | ms |
+| get_cold_latency | narjar | 15 | 46.723 | 75.984 | 17.121 | 75.984 | ms |
+| get_cold_server_cpu | bincache | 15 | 10.000 | 20.000 | 0.000 | 20.000 | ms |
+| get_cold_server_cpu | narjar | 15 | 10.000 | 20.000 | 0.000 | 20.000 | ms |
+| get_cold_status | bincache | 15 | 200.000 | 200.000 | 200.000 | 200.000 | HTTP |
+| get_cold_status | narjar | 15 | 200.000 | 200.000 | 200.000 | 200.000 | HTTP |
+| get_cold_storage_read_bytes | bincache | 15 | 0.000 | 0.000 | 0.000 | 0.000 | bytes |
+| get_cold_storage_read_bytes | narjar | 15 | 0.000 | 0.000 | 0.000 | 0.000 | bytes |
+| get_cold_throughput | bincache | 15 | 1177.898 | 1560.775 | 624.401 | 1560.775 | MiB/s |
+| get_cold_throughput | narjar | 15 | 342.446 | 934.504 | 210.573 | 934.504 | MiB/s |
+| get_cold_ttfb | bincache | 15 | 0.345 | 1.566 | 0.323 | 1.566 | ms |
+| get_cold_ttfb | narjar | 15 | 24.176 | 48.913 | 6.407 | 48.913 | ms |
+| get_warm_latency | bincache | 15 | 56.976 | 162.036 | 18.327 | 162.036 | ms |
+| get_warm_latency | narjar | 15 | 44.063 | 76.815 | 31.596 | 76.815 | ms |
+| get_warm_server_cpu | bincache | 15 | 10.000 | 30.000 | 0.000 | 30.000 | ms |
+| get_warm_server_cpu | narjar | 15 | 10.000 | 20.000 | 10.000 | 20.000 | ms |
+| get_warm_status | bincache | 15 | 200.000 | 200.000 | 200.000 | 200.000 | HTTP |
+| get_warm_status | narjar | 15 | 200.000 | 200.000 | 200.000 | 200.000 | HTTP |
+| get_warm_storage_read_bytes | bincache | 15 | 0.000 | 0.000 | 0.000 | 0.000 | bytes |
+| get_warm_storage_read_bytes | narjar | 15 | 0.000 | 0.000 | 0.000 | 0.000 | bytes |
+| get_warm_throughput | bincache | 15 | 280.821 | 873.022 | 98.744 | 873.022 | MiB/s |
+| get_warm_throughput | narjar | 15 | 363.120 | 506.394 | 208.293 | 506.394 | MiB/s |
+| get_warm_ttfb | bincache | 15 | 2.680 | 5.617 | 0.646 | 5.617 | ms |
+| get_warm_ttfb | narjar | 15 | 19.648 | 44.341 | 3.468 | 44.341 | ms |
+| head_warm_latency | bincache | 15 | 0.288 | 0.334 | 0.202 | 0.334 | ms |
+| head_warm_latency | narjar | 15 | 48.709 | 49.501 | 44.427 | 49.501 | ms |
+| head_warm_status | bincache | 15 | 200.000 | 200.000 | 200.000 | 200.000 | HTTP |
+| head_warm_status | narjar | 15 | 200.000 | 200.000 | 200.000 | 200.000 | HTTP |
+| interrupted_upload_recovery_wall | bincache | 1 | 38.065 | 38.065 | 38.065 | 38.065 | ms |
+| interrupted_upload_recovery_wall | narjar | 1 | 58.234 | 58.234 | 58.234 | 58.234 | ms |
+| interrupted_upload_restart_status | bincache | 1 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP |
+| interrupted_upload_restart_status | narjar | 1 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP |
+| interrupted_upload_server_alive | bincache | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |
+| interrupted_upload_server_alive | narjar | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |
+| interrupted_upload_status | bincache | 1 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP |
+| interrupted_upload_status | narjar | 1 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP |
+| missing_404_latency | bincache | 15 | 0.726 | 4.476 | 0.556 | 4.476 | ms |
+| missing_404_latency | narjar | 15 | 48.569 | 51.989 | 42.002 | 51.989 | ms |
+| missing_404_status | bincache | 15 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP |
+| missing_404_status | narjar | 15 | 404.000 | 404.000 | 404.000 | 404.000 | HTTP |
+| range_warm_latency | bincache | 15 | 0.262 | 0.368 | 0.230 | 0.368 | ms |
+| range_warm_latency | narjar | 15 | 48.605 | 51.753 | 45.356 | 51.753 | ms |
+| range_warm_status | bincache | 15 | 206.000 | 206.000 | 206.000 | 206.000 | HTTP |
+| range_warm_status | narjar | 15 | 206.000 | 206.000 | 206.000 | 206.000 | HTTP |
+| reconcile_steps | bincache | 1 | 3.000 | 3.000 | 3.000 | 3.000 | steps |
+| reconcile_steps | narjar | 1 | 1.000 | 1.000 | 1.000 | 1.000 | steps |
+| reconcile_wall | bincache | 1 | 89.480 | 89.480 | 89.480 | 89.480 | ms |
+| reconcile_wall | narjar | 1 | 58.234 | 58.234 | 58.234 | 58.234 | ms |
+| resume_90_latency | bincache | 15 | 2.937 | 13.824 | 1.185 | 13.824 | ms |
+| resume_90_latency | narjar | 15 | 37.043 | 53.136 | 3.658 | 53.136 | ms |
+| resume_90_status | bincache | 15 | 206.000 | 206.000 | 206.000 | 206.000 | HTTP |
+| resume_90_status | narjar | 15 | 206.000 | 206.000 | 206.000 | 206.000 | HTTP |
+| resume_90_storage_read_bytes | bincache | 15 | 0.000 | 0.000 | 0.000 | 0.000 | bytes |
+| resume_90_storage_read_bytes | narjar | 15 | 0.000 | 0.000 | 0.000 | 0.000 | bytes |
+| resume_90_ttfb | bincache | 15 | 1.203 | 4.369 | 0.351 | 4.369 | ms |
+| resume_90_ttfb | narjar | 15 | 32.541 | 51.152 | 1.290 | 51.152 | ms |
+| runtime_closure_size | bincache | 1 | 51956840.000 | 51956840.000 | 51956840.000 | 51956840.000 | bytes |
+| runtime_closure_size | narjar | 1 | 45076512.000 | 45076512.000 | 45076512.000 | 45076512.000 | bytes |
+| runtime_closure_size | narjar-static | 1 | 2193552.000 | 2193552.000 | 2193552.000 | 2193552.000 | bytes |
+| settled_idle_rss_0_paths | bincache | 15 | 12196.000 | 12300.000 | 11972.000 | 12300.000 | KiB |
+| settled_idle_rss_0_paths | narjar | 15 | 3044.000 | 3092.000 | 2932.000 | 3092.000 | KiB |
+| settled_idle_rss_10000_paths | bincache | 15 | 17532.000 | 17556.000 | 17484.000 | 17556.000 | KiB |
+| settled_idle_rss_10000_paths | narjar | 15 | 2396.000 | 2436.000 | 2316.000 | 2436.000 | KiB |
+| settled_idle_rss_1000_paths | bincache | 15 | 4452.000 | 8816.000 | 4328.000 | 8816.000 | KiB |
+| settled_idle_rss_1000_paths | narjar | 15 | 2564.000 | 2628.000 | 2444.000 | 2628.000 | KiB |
+| settled_idle_rss_100_paths | bincache | 15 | 12152.000 | 12264.000 | 11972.000 | 12264.000 | KiB |
+| settled_idle_rss_100_paths | narjar | 15 | 3044.000 | 3112.000 | 2872.000 | 3112.000 | KiB |
+| startup_0_paths | bincache | 15 | 27.233 | 30.285 | 23.983 | 30.285 | ms |
+| startup_0_paths | narjar | 15 | 52.934 | 56.290 | 52.322 | 56.290 | ms |
+| startup_10000_paths | bincache | 15 | 39.504 | 72.908 | 26.589 | 72.908 | ms |
+| startup_10000_paths | narjar | 15 | 53.366 | 58.622 | 51.350 | 58.622 | ms |
+| startup_1000_paths | bincache | 15 | 32.176 | 119.748 | 25.228 | 119.748 | ms |
+| startup_1000_paths | narjar | 15 | 52.393 | 57.875 | 51.724 | 57.875 | ms |
+| startup_100_paths | bincache | 15 | 27.757 | 35.030 | 22.856 | 35.030 | ms |
+| startup_100_paths | narjar | 15 | 52.596 | 57.213 | 51.706 | 57.213 | ms |
+| streaming_upload_peak_rss_104857600_bytes | bincache | 1 | 22320.000 | 22320.000 | 22320.000 | 22320.000 | KiB |
+| streaming_upload_peak_rss_104857600_bytes | narjar | 1 | 1260.000 | 1260.000 | 1260.000 | 1260.000 | KiB |
+| streaming_upload_peak_rss_1073741824_bytes | bincache | 1 | 21404.000 | 21404.000 | 21404.000 | 21404.000 | KiB |
+| streaming_upload_peak_rss_1073741824_bytes | narjar | 1 | 1828.000 | 1828.000 | 1828.000 | 1828.000 | KiB |
+| streaming_upload_physical_bytes_104857600_bytes | bincache | 1 | 512.000 | 512.000 | 512.000 | 512.000 | bytes |
+| streaming_upload_physical_bytes_104857600_bytes | narjar | 1 | 104926208.000 | 104926208.000 | 104926208.000 | 104926208.000 | bytes |
+| streaming_upload_physical_bytes_1073741824_bytes | bincache | 1 | 1074449408.000 | 1074449408.000 | 1074449408.000 | 1074449408.000 | bytes |
+| streaming_upload_physical_bytes_1073741824_bytes | narjar | 1 | 1074427392.000 | 1074427392.000 | 1074427392.000 | 1074427392.000 | bytes |
+| streaming_upload_server_cpu_104857600_bytes | bincache | 1 | 260.000 | 260.000 | 260.000 | 260.000 | ms |
+| streaming_upload_server_cpu_104857600_bytes | narjar | 1 | 280.000 | 280.000 | 280.000 | 280.000 | ms |
+| streaming_upload_server_cpu_1073741824_bytes | bincache | 1 | 3550.000 | 3550.000 | 3550.000 | 3550.000 | ms |
+| streaming_upload_server_cpu_1073741824_bytes | narjar | 1 | 3150.000 | 3150.000 | 3150.000 | 3150.000 | ms |
+| streaming_upload_wall_104857600_bytes | bincache | 1 | 1021.291 | 1021.291 | 1021.291 | 1021.291 | ms |
+| streaming_upload_wall_104857600_bytes | narjar | 1 | 2325.006 | 2325.006 | 2325.006 | 2325.006 | ms |
+| streaming_upload_wall_1073741824_bytes | bincache | 1 | 13018.392 | 13018.392 | 13018.392 | 13018.392 | ms |
+| streaming_upload_wall_1073741824_bytes | narjar | 1 | 18971.807 | 18971.807 | 18971.807 | 18971.807 | ms |
+| upload_peak_rss | bincache | 15 | 11108.000 | 11308.000 | 10560.000 | 11308.000 | KiB |
+| upload_peak_rss | narjar | 15 | 2480.000 | 2480.000 | 2476.000 | 2480.000 | KiB |
+| upload_physical_bytes | bincache | 15 | 512.000 | 512.000 | 512.000 | 512.000 | bytes |
+| upload_physical_bytes | narjar | 15 | 1024.000 | 33582080.000 | 1024.000 | 33582080.000 | bytes |
+| upload_server_cpu | bincache | 15 | 60.000 | 70.000 | 50.000 | 70.000 | ms |
+| upload_server_cpu | narjar | 15 | 40.000 | 70.000 | 30.000 | 70.000 | ms |
+| upload_throughput | bincache | 15 | 41.305 | 50.797 | 29.855 | 50.797 | MiB/s |
+| upload_throughput | narjar | 15 | 10.179 | 10.688 | 9.569 | 10.688 | MiB/s |
+| upload_wall | bincache | 15 | 387.358 | 535.923 | 314.979 | 535.923 | ms |
+| upload_wall | narjar | 15 | 1571.894 | 1672.110 | 1497.059 | 1672.110 | ms |
+| wrong_key_rejected | bincache | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |
+| wrong_key_rejected | narjar | 1 | 1.000 | 1.000 | 1.000 | 1.000 | bool |

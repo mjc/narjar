@@ -1,5 +1,9 @@
 import hashlib
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -184,6 +188,41 @@ class NarVectorTest(unittest.TestCase):
             with self.subTest(name=name):
                 raw = bytes.fromhex(self.manifest["vectors"][name])
                 self.assertEqual(hashlib.sha256(raw).hexdigest(), expected)
+
+    def test_current_nix_dump_matches_generated_fixtures(self):
+        nix_store = shutil.which("nix-store")
+        if nix_store is None:
+            self.skipTest("nix-store is not available")
+        version = subprocess.run(
+            [nix_store, "--version"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+        self.assertIn(version, self.manifest["generated_fixture_provenance"]["generators"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "executable"
+            executable.write_bytes(b"abc")
+            executable.chmod(0o755)
+            empty = root / "empty"
+            empty.mkdir()
+            symlink = root / "symlink"
+            symlink.symlink_to("x")
+            for name, fixture in (
+                ("executable_root_abc", executable),
+                ("empty_root_directory", empty),
+                ("root_symlink_x", symlink),
+            ):
+                store_path = subprocess.run(
+                    [nix_store, "--add", os.fspath(fixture)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                dumped = subprocess.run(
+                    [nix_store, "--dump", store_path],
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                self.assertEqual(dumped, bytes.fromhex(self.manifest["vectors"][name]))
 
     def test_malformed_byte_vectors_fail_closed(self):
         required = {

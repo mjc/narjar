@@ -20,8 +20,9 @@ cache runs are labelled separately. Quick runs are smoke tests only.
 Every result records the commit, binary and closure identity, host, target,
 kernel, filesystem, governor, Nix/Rust/tool versions, exact command, corpus
 manifest and category, cache state, observed wire compression, repetition
-count, raw samples, median and p95. Missing provenance or metric fields is a
-failed result. Run
+count, raw samples, median and p95. `provenance.json` carries the run-level
+record and `evidence.json` combines it with a schema-valid baseline metric.
+Missing provenance or metric fields is a failed result. Run
 `python benchmarks/test_constitution.py` to exercise the boundary evaluator.
 
 The primary metric is median physical-byte savings over the matched baseline:
@@ -30,6 +31,9 @@ the candidate. 25% through below 50% is conditional and chooses the simpler
 design only if all hard gates pass. 50% or more is strong evidence, still
 subject to all hard gates. Corpus robustness requires improvement in four of
 six categories and no category expansion over 5%.
+Storage-byte samples use allocated filesystem blocks (`st_blocks * 512`), not
+logical file lengths, so transparent filesystem compression is included in the
+measurement.
 
 The six frozen corpus slices and their exact selectors are in
 [`benchmarks/corpus-manifest.json`](../benchmarks/corpus-manifest.json):

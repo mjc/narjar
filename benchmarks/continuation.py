@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the matched Narjar/bincache continuation benchmark."""
+"""Run the pinned Narjar/bincache operational benchmark."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 BINCACHE_COMMIT = "556a9c8f97a3c994a9de85f567a2ef16ce6513ab"
-BINCACHE_FLAKE = f"github:wyattgill9/bincache/{BINCACHE_COMMIT}"
+BINCACHE_EXPR = Path(__file__).with_name("bincache.nix").resolve()
 SEED = 29030
 FROZEN_WARMUPS = 3
 _command_log: Path | None = None
@@ -84,7 +84,9 @@ def resolve_bincache(explicit: Path | None) -> Path:
         "--no-write-lock-file",
         "--no-link",
         "--print-out-paths",
-        BINCACHE_FLAKE,
+        "--impure",
+        "--file",
+        str(BINCACHE_EXPR),
     )
     return Path(output.splitlines()[-1]) / "bin" / "bincache"
 
@@ -129,6 +131,12 @@ class Run:
 
         args.output.mkdir(parents=True)
         set_command_log(args.output / "commands.txt")
+        launch_command = os.environ.get("NARJAR_BENCHMARK_LAUNCH_COMMAND")
+        if launch_command is None:
+            launch_command = "nix develop --command " + shlex.join(
+                [sys.executable, *sys.argv]
+            )
+        log_line("launch_command: " + launch_command)
         log_line(
             f"NARJAR_BIN={shlex.quote(narjar)} "
             + shlex.join([sys.executable, *sys.argv])
@@ -143,6 +151,16 @@ class Run:
             narjar=Path(narjar).resolve(),
             bincache=resolve_bincache(args.bincache_bin),
         )
+
+
+@dataclass(frozen=True)
+class HttpResult:
+    status: int
+    elapsed_ms: float
+    ttfb_ms: float
+    body: bytes
+    server_cpu_ms: float
+    storage_read_bytes: int
 
 
 @dataclass
@@ -405,13 +423,27 @@ class Candidate:
     def process_cpu_seconds(self) -> float:
         if self.process is None:
             raise RuntimeError(f"{self.name} is not running")
-        fields = Path(f"/proc/{self.process.pid}/stat").read_text().rsplit(")", 1)[1].split()
-        ticks = int(fields[11]) + int(fields[12])
+        ticks = 0
+        task_dir = Path(f"/proc/{self.process.pid}/task")
+        for task in task_dir.iterdir():
+            try:
+                fields = (task / "stat").read_text().rsplit(")", 1)[1].split()
+            except FileNotFoundError:
+                continue
+            ticks += int(fields[11]) + int(fields[12])
         return ticks / os.sysconf("SC_CLK_TCK")
 
-    def disk_bytes(self) -> int:
+    def storage_read_bytes(self) -> int:
+        if self.process is None:
+            raise RuntimeError(f"{self.name} is not running")
+        for line in Path(f"/proc/{self.process.pid}/io").read_text().splitlines():
+            if line.startswith("read_bytes:"):
+                return int(line.split()[1])
+        raise RuntimeError(f"read_bytes missing for {self.name}")
+
+    def physical_bytes(self) -> int:
         return sum(
-            entry.stat().st_size
+            entry.stat().st_blocks * 512
             for entry in self.data_dir.rglob("*")
             if entry.is_file()
         )
@@ -419,7 +451,7 @@ class Candidate:
     def publish_timed(self, path: str) -> dict[str, float]:
         self._sign([path])
         before_cpu = self.process_cpu_seconds()
-        before_disk = self.disk_bytes()
+        before_disk = self.physical_bytes()
         peak_rss = [self.rss_kib()]
         finished = threading.Event()
 
@@ -446,7 +478,7 @@ class Candidate:
             "wall_ms": elapsed_ms,
             "server_cpu_ms": (self.process_cpu_seconds() - before_cpu) * 1_000,
             "peak_rss_kib": max(peak_rss),
-            "stored_bytes": self.disk_bytes() - before_disk,
+            "physical_bytes": self.physical_bytes() - before_disk,
         }
 
     def request(
@@ -454,7 +486,7 @@ class Candidate:
         method: str,
         path: str,
         headers: dict[str, str] | None = None,
-    ) -> tuple[int, float, bytes]:
+    ) -> HttpResult:
         if self.url is None:
             raise RuntimeError(f"{self.name} is not running")
         request_headers = {"Accept-Encoding": "identity", **(headers or {})}
@@ -465,22 +497,37 @@ class Candidate:
             method=method,
             headers=request_headers,
         )
+        before_cpu = self.process_cpu_seconds()
+        before_read = self.storage_read_bytes()
         started = time.perf_counter_ns()
+        ttfb_ms = None
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
+                ttfb_ms = (time.perf_counter_ns() - started) / 1_000_000
                 body = response.read()
                 status = response.status
         except urllib.error.HTTPError as error:
+            ttfb_ms = (time.perf_counter_ns() - started) / 1_000_000
             body = error.read()
             status = error.code
         elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-        return status, elapsed_ms, body
+        return HttpResult(
+            status,
+            elapsed_ms,
+            ttfb_ms if ttfb_ms is not None else elapsed_ms,
+            body,
+            (self.process_cpu_seconds() - before_cpu) * 1_000,
+            self.storage_read_bytes() - before_read,
+        )
 
     def nar_info(self, store_path: str) -> tuple[str, int, str]:
         store_hash = Path(store_path).name.split("-", 1)[0]
-        status, _, body = self.request("GET", f"{store_hash}.narinfo")
-        if status != 200:
-            raise RuntimeError(f"{self.name} returned {status} for {store_hash}.narinfo")
+        result = self.request("GET", f"{store_hash}.narinfo")
+        if result.status != 200:
+            raise RuntimeError(
+                f"{self.name} returned {result.status} for {store_hash}.narinfo"
+            )
+        body = result.body
         fields = dict(
             line.split(": ", 1)
             for line in body.decode().splitlines()
@@ -507,7 +554,7 @@ class Candidate:
     def publish_concurrent(self, path: str) -> dict[str, float]:
         self._sign([path])
         before_cpu = self.process_cpu_seconds()
-        before_disk = self.disk_bytes()
+        before_disk = self.physical_bytes()
         peak_rss = [self.rss_kib()]
         started = time.perf_counter_ns()
         processes = [
@@ -530,7 +577,7 @@ class Candidate:
             "wall_ms": (time.perf_counter_ns() - started) / 1_000_000,
             "server_cpu_ms": (self.process_cpu_seconds() - before_cpu) * 1_000,
             "peak_rss_kib": max(peak_rss),
-            "stored_bytes": self.disk_bytes() - before_disk,
+            "physical_bytes": self.physical_bytes() - before_disk,
         }
 
     def interrupt_upload(self, nar_file: Path, object_path: str) -> tuple[int, bool]:
@@ -558,8 +605,8 @@ class Candidate:
         finally:
             connection.close()
         time.sleep(0.1)
-        status, _, _ = self.request("HEAD", object_path)
-        return status, self.process.poll() is None
+        result = self.request("HEAD", object_path)
+        return result.status, self.process.poll() is None
 
 
 class Recorder:
@@ -695,6 +742,10 @@ def environment(run: Run) -> dict[str, Any]:
         "warmups": run.warmups,
         "random_seed": SEED,
         "quick": run.quick,
+        "launch_command": os.environ.get(
+            "NARJAR_BENCHMARK_LAUNCH_COMMAND",
+            "nix develop --command " + shlex.join([sys.executable, *sys.argv]),
+        ),
     }
 
 
@@ -861,10 +912,10 @@ def benchmark_io(
                 payload_bytes=payload_bytes,
             )
             recorder.add(
-                "upload_stored_bytes",
+                "upload_physical_bytes",
                 candidate.name,
                 repetition,
-                result["stored_bytes"],
+                result["physical_bytes"],
                 "bytes",
                 cache_state="warm",
                 order=order_index,
@@ -893,6 +944,7 @@ def benchmark_io(
             ("get_cold", "GET", {}, 200, True),
             ("head_warm", "HEAD", {}, 200, False),
             ("range_warm", "GET", {"Range": "bytes=0-65535"}, 206, False),
+            ("resume_90", "GET", None, 206, True),
             (
                 "missing_404",
                 "GET",
@@ -911,7 +963,11 @@ def benchmark_io(
                 for _ in range(run.warmups):
                     if cold:
                         candidate.evict_cache()
-                    candidate.request(method, path, headers)
+                    request_headers = headers
+                    if case == "resume_90":
+                        resume_start = int(nar_info[candidate.name][1] * 0.9)
+                        request_headers = {"Range": f"bytes={resume_start}-"}
+                    candidate.request(method, path, request_headers)
 
             request_schedule = [
                 candidate
@@ -930,9 +986,18 @@ def benchmark_io(
                 )
                 if cold:
                     candidate.evict_cache()
-                status, elapsed_ms, body = candidate.request(method, path, headers)
+                request_headers = headers
+                if case == "resume_90":
+                    resume_start = int(nar_info[candidate.name][1] * 0.9)
+                    request_headers = {"Range": f"bytes={resume_start}-"}
+                result = candidate.request(method, path, request_headers)
+                status, elapsed_ms, body = (
+                    result.status,
+                    result.elapsed_ms,
+                    result.body,
+                )
                 valid_statuses = {expected}
-                if case == "range_warm" and candidate.name == "bincache":
+                if case in {"range_warm", "resume_90"} and candidate.name == "bincache":
                     valid_statuses.add(200)
                 if status not in valid_statuses:
                     raise RuntimeError(
@@ -970,6 +1035,59 @@ def benchmark_io(
                         cache_state="cold" if cold else "warm",
                         order=order_index,
                         response_bytes=len(body),
+                    )
+                    recorder.add(
+                        f"{case}_ttfb",
+                        candidate.name,
+                        repetition,
+                        result.ttfb_ms,
+                        "ms",
+                        cache_state="cold" if cold else "warm",
+                        order=order_index,
+                        response_bytes=len(body),
+                    )
+                    recorder.add(
+                        f"{case}_server_cpu",
+                        candidate.name,
+                        repetition,
+                        result.server_cpu_ms,
+                        "ms",
+                        cache_state="cold" if cold else "warm",
+                        order=order_index,
+                        response_bytes=len(body),
+                    )
+                    recorder.add(
+                        f"{case}_storage_read_bytes",
+                        candidate.name,
+                        repetition,
+                        result.storage_read_bytes,
+                        "bytes",
+                        cache_state="cold" if cold else "warm",
+                        order=order_index,
+                        response_bytes=len(body),
+                    )
+                if case == "resume_90":
+                    recorder.add(
+                        "resume_90_ttfb",
+                        candidate.name,
+                        repetition,
+                        result.ttfb_ms,
+                        "ms",
+                        cache_state="cold" if cold else "warm",
+                        order=order_index,
+                        response_bytes=len(body),
+                        range_start=int(nar_info[candidate.name][1] * 0.9),
+                    )
+                    recorder.add(
+                        "resume_90_storage_read_bytes",
+                        candidate.name,
+                        repetition,
+                        result.storage_read_bytes,
+                        "bytes",
+                        cache_state="cold" if cold else "warm",
+                        order=order_index,
+                        response_bytes=len(body),
+                        range_start=int(nar_info[candidate.name][1] * 0.9),
                     )
 
         widths = [1, 2] if run.quick else [1, 8, 32]
@@ -1009,7 +1127,7 @@ def benchmark_io(
                         )
                     )
                 elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-                if any(status != 200 for status, _, _ in responses):
+                if any(response.status != 200 for response in responses):
                     raise RuntimeError(f"{candidate.name} concurrent GET failed")
                 logical_bytes = nar_info[candidate.name][1] * width
                 recorder.add(
@@ -1049,7 +1167,7 @@ def benchmark_streaming(
                     ("streaming_upload_wall", "wall_ms", "ms"),
                     ("streaming_upload_server_cpu", "server_cpu_ms", "ms"),
                     ("streaming_upload_peak_rss", "peak_rss_kib", "KiB"),
-                    ("streaming_upload_stored_bytes", "stored_bytes", "bytes"),
+                    ("streaming_upload_physical_bytes", "physical_bytes", "bytes"),
                 ):
                     recorder.add(
                         f"{case}_{size}_bytes",
@@ -1109,10 +1227,10 @@ def benchmark_recovery(
                 order=order_index,
             )
             recorder.add(
-                "duplicate_upload_stored_bytes",
+                "duplicate_upload_physical_bytes",
                 candidate.name,
                 repetition,
-                result["stored_bytes"],
+                result["physical_bytes"],
                 "bytes",
                 order=order_index,
             )
@@ -1195,7 +1313,7 @@ def benchmark_recovery(
         candidate.stop()
 
         recovery_ms = candidate.start()
-        restarted_status, _, _ = candidate.request("HEAD", object_path)
+        restarted_status = candidate.request("HEAD", object_path).status
         recorder.add(
             "interrupted_upload_restart_status",
             candidate.name,
@@ -1266,10 +1384,14 @@ def benchmark_enospc(
             result = candidate.publish_result(payload)
             time.sleep(0.1)
             alive = candidate.process is not None and candidate.process.poll() is None
-            status = candidate.request("HEAD", f"{store_hash}.narinfo")[0] if alive else 0
+            status = (
+                candidate.request("HEAD", f"{store_hash}.narinfo").status
+                if alive
+                else 0
+            )
             candidate.stop()
             candidate.start()
-            restart_status = candidate.request("HEAD", f"{store_hash}.narinfo")[0]
+            restart_status = candidate.request("HEAD", f"{store_hash}.narinfo").status
         finally:
             candidate.stop()
 
@@ -1415,13 +1537,96 @@ def measure_closures(run: Run, recorder: Recorder) -> None:
         recorder.add("runtime_closure_size", name, 0, closure_bytes, "bytes")
 
 
-def write_report(run: Run, recorder: Recorder) -> None:
+def write_report(
+    run: Run,
+    recorder: Recorder,
+    run_environment: dict[str, Any],
+) -> None:
     summary = recorder.summary()
     (run.output / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )
     wire_compression = json.loads(
         (run.output / "wire-compression.json").read_text()
+    )
+    closure_identity = {
+        row["candidate"]: {
+            "bytes": row["median"],
+            **(
+                {"output": run_environment[f"{row['candidate']}_output"]}
+                if run_environment.get(f"{row['candidate']}_output")
+                else {}
+            ),
+        }
+        for row in summary
+        if row["case"] == "runtime_closure_size"
+    }
+    provenance = {
+        "commit": run_environment["narjar_commit"],
+        "binary_identity": {
+            "narjar": {
+                "path": run_environment["narjar_binary"],
+                "sha256": run_environment["narjar_binary_sha256"],
+            },
+            "bincache": {
+                "path": run_environment["bincache_binary"],
+                "sha256": run_environment["bincache_binary_sha256"],
+            },
+        },
+        "closure_identity": closure_identity,
+        "host": run_environment["host"],
+        "target": run_environment["target"],
+        "kernel": run_environment["kernel"],
+        "filesystem": run_environment["filesystem"],
+        "governor": run_environment["cpu_governor"],
+        "nix_version": run_environment["nix"],
+        "rust_version": run_environment["rustc"],
+        "tool_versions": {
+            key: run_environment[key]
+            for key in ("python", "git", "unshare", "rustc")
+            if run_environment[key] is not None
+        },
+        "command_log": "commands.txt",
+        "wire_compression": wire_compression,
+        "corpus_manifest": "benchmarks/corpus-manifest.json",
+        "corpus_category": "flat-baseline-control",
+        "cache_state": "warm and cold page-cache controls",
+        "warmups": run.warmups,
+        "repetitions": run.repetitions,
+        "raw_samples": "samples.jsonl",
+    }
+    (run.output / "provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n"
+    )
+    startup_cases = {
+        row["case"]
+        for row in summary
+        if row["case"].startswith("startup_")
+        and row["candidate"] == "narjar"
+    }
+    baseline_case = (
+        "startup_10000_paths"
+        if "startup_10000_paths" in startup_cases
+        else sorted(startup_cases)[-1]
+    )
+    baseline = next(
+        row
+        for row in summary
+        if row["case"] == baseline_case and row["candidate"] == "narjar"
+    )
+    evidence = {
+        "provenance": provenance,
+        "metric": {
+            "case": baseline["case"],
+            "candidate": baseline["candidate"],
+            "savings_percent": 0,
+            "median": baseline["median"],
+            "p95": baseline["p95"],
+            "unit": baseline["unit"],
+        },
+    }
+    (run.output / "evidence.json").write_text(
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n"
     )
 
     lines = [
@@ -1461,8 +1666,9 @@ def main() -> int:
         ),
     ]
     try:
+        run_environment = environment(run)
         (run.output / "environment.json").write_text(
-            json.dumps(environment(run), indent=2, sort_keys=True) + "\n"
+            json.dumps(run_environment, indent=2, sort_keys=True) + "\n"
         )
         for candidate in candidates:
             candidate.prepare()
@@ -1475,7 +1681,7 @@ def main() -> int:
         benchmark_enospc(run, candidates, recorder)
         benchmark_trust(run, candidates, recorder)
         measure_closures(run, recorder)
-        write_report(run, recorder)
+        write_report(run, recorder, run_environment)
         print(run.output)
         return 0
     finally:

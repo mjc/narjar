@@ -1,0 +1,139 @@
+--- a/crates/bincache-ingest/src/upload.rs
++++ b/crates/bincache-ingest/src/upload.rs
+@@ -15,17 +15,9 @@
+ 
+ use snafu::OptionExt as _;
+ use snafu::ResultExt as _;
+-use std::io::Write as _;
+-
+-/// Compressed output is drained into the staging file whenever the encoder has produced at
+-/// least this much, so peak memory is one chunk of compressed output rather than the whole
+-/// artifact.
+-const DRAIN_THRESHOLD: usize = 256 * 1024;
+-
+-/// Everything bincache stores is zstd, per the client floor of Nix 2.4 declared in
+-/// `research/DESIGN_V2.md`.
++/// Keep the comparator byte-for-byte with the Nix upload.
+ pub const STORED_AS: bincache_core::compression::Compression =
+-    bincache_core::compression::Compression::Zstd;
++    bincache_core::compression::Compression::None;
+ 
+ #[derive(Debug, snafu::Snafu)]
+ #[snafu(visibility(pub))]
+@@ -33,9 +25,6 @@
+     #[snafu(display("the staging file could not be written"))]
+     Stage { source: bincache_store::nar::Error },
+ 
+-    #[snafu(display("zstd compression failed"))]
+-    Compress { source: std::io::Error },
+-
+     #[snafu(display("uploaded bytes hash to {found} but the request target declares {expected}"))]
+     HashMismatch { expected: bincache_core::hash::Sha256, found: bincache_core::hash::Sha256 },
+ 
+@@ -53,7 +42,7 @@
+     pub const fn fault(&self) -> crate::fault::Fault {
+         match self {
+             Self::HashMismatch { .. } | Self::Empty => crate::fault::Fault::Client,
+-            Self::Stage { .. } | Self::Compress { .. } | Self::Record { .. } => {
++            Self::Stage { .. } | Self::Record { .. } => {
+                 crate::fault::Fault::Server
+             }
+         }
+@@ -80,10 +69,8 @@
+     }
+ }
+ 
+-/// Bytes arriving from the socket, being hashed and compressed on the way to staging.
+-/// Both digests run here: `nar` over what arrived, `file` over what is written out.
++/// Bytes arriving from the socket, hashed and staged without a second representation.
+ pub struct Receiving {
+-    encoder: zstd::stream::write::Encoder<'static, Vec<u8>>,
+     nar: bincache_core::hash::Hasher,
+     file: bincache_core::hash::Hasher,
+     nar_size: u64,
+@@ -119,12 +106,9 @@
+     pub fn new(
+         staged: bincache_store::nar::Staged,
+         expected: bincache_core::hash::Sha256,
+-        level: Level,
++        _level: Level,
+     ) -> Result<Self, Error> {
+-        let encoder =
+-            zstd::stream::write::Encoder::new(Vec::new(), level.get()).context(CompressSnafu)?;
+         let state = Receiving {
+-            encoder,
+             nar: bincache_core::hash::Hasher::default(),
+             file: bincache_core::hash::Hasher::default(),
+             nar_size: 0,
+@@ -137,23 +121,14 @@
+     pub async fn write(&mut self, chunk: &[u8]) -> Result<(), Error> {
+         self.state.nar.update(chunk);
+         self.state.nar_size += u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+-        self.state.encoder.write_all(chunk).context(CompressSnafu)?;
+-        if self.state.encoder.get_ref().len() >= DRAIN_THRESHOLD {
+-            self.drain().await?;
+-        }
++        self.state.file.update(chunk);
++        self.staged.write(bytes::Bytes::copy_from_slice(chunk)).await.context(StageSnafu)?;
+         Ok(())
+     }
+ 
+-    /// Flushes the encoder. After this the artifact's own hash is known, which is what
+-    /// names it on disk.
+-    pub async fn finish(mut self) -> Result<Upload<Compressed>, Error> {
+-        self.drain().await?;
+-        let Receiving { encoder, nar, mut file, nar_size } = self.state;
+-
+-        let tail = encoder.finish().context(CompressSnafu)?;
+-        file.update(&tail);
+-        self.staged.write(bytes::Bytes::from(tail)).await.context(StageSnafu)?;
+-
++    /// After this the artifact's own hash is known, which is what names it on disk.
++    pub async fn finish(self) -> Result<Upload<Compressed>, Error> {
++        let Receiving { nar, file, nar_size } = self.state;
+         let state = Compressed {
+             nar_hash: nar.finish(),
+             nar_size,
+@@ -163,15 +138,6 @@
+         Ok(Upload { staged: self.staged, expected: self.expected, state })
+     }
+ 
+-    /// Moves whatever the encoder has produced so far out of memory and into staging.
+-    async fn drain(&mut self) -> Result<(), Error> {
+-        let produced = core::mem::take(self.state.encoder.get_mut());
+-        if produced.is_empty() {
+-            return Ok(());
+-        }
+-        self.state.file.update(&produced);
+-        self.staged.write(bytes::Bytes::from(produced)).await.context(StageSnafu)
+-    }
+ }
+ 
+ impl Upload<Compressed> {
+@@ -284,10 +250,9 @@
+         assert_eq!(reader.size(), entry.file_size);
+     }
+ 
+-    /// The stored artifact must decompress back to exactly what was uploaded, which is the
+-    /// property a client checks after it downloads.
++    /// The stored artifact must be exactly what was uploaded.
+     #[compio::test]
+-    async fn the_stored_artifact_decompresses_to_the_uploaded_bytes() {
++    async fn the_stored_artifact_is_the_uploaded_bytes() {
+         let harness = harness("roundtrip").await;
+         let body = b"nix-archive-1(type,regular,contents,".repeat(500);
+         let nar_hash = bincache_core::hash::Sha256::digest(&body);
+@@ -301,11 +266,10 @@
+             .expect("stores");
+ 
+         let path = harness.store.path(&entry.url());
+-        let compressed = std::fs::read(path).expect("reads the artifact");
+-        let decompressed = zstd::stream::decode_all(compressed.as_slice()).expect("decompresses");
+-        assert_eq!(decompressed, body);
+-        assert_eq!(bincache_core::hash::Sha256::digest(&decompressed), nar_hash);
+-        assert_eq!(entry.file_hash, bincache_core::hash::Sha256::digest(&compressed));
++        let stored = std::fs::read(path).expect("reads the artifact");
++        assert_eq!(stored, body);
++        assert_eq!(bincache_core::hash::Sha256::digest(&stored), nar_hash);
++        assert_eq!(entry.file_hash, bincache_core::hash::Sha256::digest(&stored));
+     }

@@ -1,0 +1,12 @@
+{"cache_paths": 0, "candidate": "bincache", "case": "startup_0_paths", "order": 0, "repetition": 0, "unit": "ms", "value": 22.211998}
+{"cache_paths": 0, "candidate": "bincache", "case": "settled_idle_rss_0_paths", "order": 0, "repetition": 0, "unit": "KiB", "value": 11488}
+{"cache_paths": 0, "candidate": "narjar", "case": "startup_0_paths", "order": 1, "repetition": 0, "unit": "ms", "value": 4.966706}
+{"cache_paths": 0, "candidate": "narjar", "case": "settled_idle_rss_0_paths", "order": 1, "repetition": 0, "unit": "KiB", "value": 2048}
+{"cache_paths": 10, "candidate": "narjar", "case": "startup_10_paths", "order": 0, "repetition": 0, "unit": "ms", "value": 2.650795}
+{"cache_paths": 10, "candidate": "narjar", "case": "settled_idle_rss_10_paths", "order": 0, "repetition": 0, "unit": "KiB", "value": 2092}
+{"cache_paths": 10, "candidate": "bincache", "case": "startup_10_paths", "order": 1, "repetition": 0, "unit": "ms", "value": 28.838344}
+{"cache_paths": 10, "candidate": "bincache", "case": "settled_idle_rss_10_paths", "order": 1, "repetition": 0, "unit": "KiB", "value": 11528}
+{"candidate": "narjar", "case": "binary_size", "repetition": 0, "unit": "bytes", "value": 1431168}
+{"candidate": "narjar", "case": "runtime_closure_size", "repetition": 0, "unit": "bytes", "value": 44444720}
+{"candidate": "bincache", "case": "binary_size", "repetition": 0, "unit": "bytes", "value": 3724120}
+{"candidate": "bincache", "case": "runtime_closure_size", "repetition": 0, "unit": "bytes", "value": 51957664}

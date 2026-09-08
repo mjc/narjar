@@ -1,0 +1,122 @@
+[
+  {
+    "candidate": "bincache",
+    "case": "binary_size",
+    "max": 3724120,
+    "median": 3724120,
+    "min": 3724120,
+    "n": 1,
+    "p95": 3724120,
+    "unit": "bytes"
+  },
+  {
+    "candidate": "narjar",
+    "case": "binary_size",
+    "max": 1431168,
+    "median": 1431168,
+    "min": 1431168,
+    "n": 1,
+    "p95": 1431168,
+    "unit": "bytes"
+  },
+  {
+    "candidate": "bincache",
+    "case": "runtime_closure_size",
+    "max": 51957664,
+    "median": 51957664,
+    "min": 51957664,
+    "n": 1,
+    "p95": 51957664,
+    "unit": "bytes"
+  },
+  {
+    "candidate": "narjar",
+    "case": "runtime_closure_size",
+    "max": 44444720,
+    "median": 44444720,
+    "min": 44444720,
+    "n": 1,
+    "p95": 44444720,
+    "unit": "bytes"
+  },
+  {
+    "candidate": "bincache",
+    "case": "settled_idle_rss_0_paths",
+    "max": 11488,
+    "median": 11488,
+    "min": 11488,
+    "n": 1,
+    "p95": 11488,
+    "unit": "KiB"
+  },
+  {
+    "candidate": "narjar",
+    "case": "settled_idle_rss_0_paths",
+    "max": 2048,
+    "median": 2048,
+    "min": 2048,
+    "n": 1,
+    "p95": 2048,
+    "unit": "KiB"
+  },
+  {
+    "candidate": "bincache",
+    "case": "settled_idle_rss_10_paths",
+    "max": 11528,
+    "median": 11528,
+    "min": 11528,
+    "n": 1,
+    "p95": 11528,
+    "unit": "KiB"
+  },
+  {
+    "candidate": "narjar",
+    "case": "settled_idle_rss_10_paths",
+    "max": 2092,
+    "median": 2092,
+    "min": 2092,
+    "n": 1,
+    "p95": 2092,
+    "unit": "KiB"
+  },
+  {
+    "candidate": "bincache",
+    "case": "startup_0_paths",
+    "max": 22.211998,
+    "median": 22.211998,
+    "min": 22.211998,
+    "n": 1,
+    "p95": 22.211998,
+    "unit": "ms"
+  },
+  {
+    "candidate": "narjar",
+    "case": "startup_0_paths",
+    "max": 4.966706,
+    "median": 4.966706,
+    "min": 4.966706,
+    "n": 1,
+    "p95": 4.966706,
+    "unit": "ms"
+  },
+  {
+    "candidate": "bincache",
+    "case": "startup_10_paths",
+    "max": 28.838344,
+    "median": 28.838344,
+    "min": 28.838344,
+    "n": 1,
+    "p95": 28.838344,
+    "unit": "ms"
+  },
+  {
+    "candidate": "narjar",
+    "case": "startup_10_paths",
+    "max": 2.650795,
+    "median": 2.650795,
+    "min": 2.650795,
+    "n": 1,
+    "p95": 2.650795,
+    "unit": "ms"
+  }
+]
