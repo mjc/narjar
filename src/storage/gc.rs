@@ -131,21 +131,17 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
         (0, 0, 0)
     } else {
-        let result = (|| {
+        let result: Result<(usize, usize, usize), StorageError> = (|| {
             let (deleted_narinfos, deleted_nars) = apply(&storage, &entries, &selected)?;
             let deleted_orphans = apply_orphans(&storage, &orphans, &selected_orphans)?;
             Ok((deleted_narinfos, deleted_nars, deleted_orphans))
         })();
-        match result {
-            Ok(deleted) => {
-                let remaining_entries = scan(&storage, &trusted)?;
-                let remaining_orphans = scan_orphans(&storage, &remaining_entries)?;
-                after_bytes = total_bytes(&remaining_entries) + orphan_bytes(&remaining_orphans);
-                storage.recovery.finish(&trusted_keys_path)?;
-                deleted
-            }
-            Err(error) => return Err(error),
-        }
+        let deleted = result?;
+        let remaining_entries = scan(&storage, &trusted)?;
+        let remaining_orphans = scan_orphans(&storage, &remaining_entries)?;
+        after_bytes = total_bytes(&remaining_entries) + orphan_bytes(&remaining_orphans);
+        storage.recovery.finish(&trusted_keys_path)?;
+        deleted
     };
     let evicted_bytes = before_bytes.saturating_sub(after_bytes);
 
