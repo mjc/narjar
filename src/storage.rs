@@ -405,13 +405,23 @@ fn injected_fault(boundary: PublishBoundary, fault: PublishBoundary) -> Result<(
     }
 }
 
+/// The lease is held on the opened DATA directory, not `DATA/lock`.
+///
+/// This keeps replacing the lock pathname from creating a second lease. It
+/// relies on local-filesystem `flock` semantics for directory file
+/// descriptions; distributed filesystems are outside the supported guarantee.
 #[derive(Debug)]
 struct ProcessLock {
     _file: File,
 }
 
 impl ProcessLock {
-    fn acquire(root: &File) -> Result<Self, StorageError> {
+    fn acquire(parent: File) -> Result<Self, StorageError> {
+        lock_exclusive(&parent)?;
+        Ok(Self { _file: parent })
+    }
+
+    fn validate_lock_file(root: &File) -> Result<(), StorageError> {
         let file = open_at(
             root,
             OsStr::new("lock"),
@@ -430,8 +440,7 @@ impl ProcessLock {
                 io::Error::new(io::ErrorKind::InvalidData, "lock has unsafe permissions").into(),
             );
         }
-        lock_exclusive(&file)?;
-        Ok(Self { _file: file })
+        Ok(())
     }
 }
 
@@ -457,6 +466,7 @@ pub struct Storage {
     root: File,
     recovery: RecoveryState,
     publication_lock: Mutex<()>,
+    temporary_objects: AtomicU64,
     _lock: ProcessLock,
 }
 
@@ -468,6 +478,8 @@ impl Storage {
         ensure_directory(&root_path, "data directory")?;
         let root_directory = open_directory(&root_path)?;
         let root_is_empty = directory_is_empty(&root_directory)?;
+        let lock = ProcessLock::acquire(root_directory.try_clone()?)?;
+        ProcessLock::validate_lock_file(&root_directory)?;
         let nar_directory =
             ensure_directory_at(&root_directory, OsStr::new("nar"), "nar directory")?;
         ensure_directory_at(
@@ -487,7 +499,6 @@ impl Storage {
             "realisation temporary directory",
         )?;
 
-        let lock = ProcessLock::acquire(&root_directory)?;
         root_directory.sync_all()?;
 
         let recovery = RecoveryState::new(&root_directory)?;
@@ -497,6 +508,7 @@ impl Storage {
             root: root_directory,
             recovery,
             publication_lock: Mutex::new(()),
+            temporary_objects: AtomicU64::new(0),
             _lock: lock,
         };
         if root_is_empty {
@@ -701,6 +713,22 @@ impl Storage {
             .is_ok())
     }
 
+    pub(crate) fn capacity(&self) -> Result<StorageCapacity, StorageError> {
+        let directory = self.nar_directory()?;
+        let space = filesystem_space(&directory)?;
+        Ok(StorageCapacity {
+            total_bytes: space.total_bytes,
+            available_bytes: space.available_bytes,
+            total_inodes: space.total_inodes,
+            available_inodes: space.available_inodes,
+            read_only: space.read_only,
+        })
+    }
+
+    pub(crate) fn temporary_objects(&self) -> u64 {
+        self.temporary_objects.load(Ordering::Relaxed)
+    }
+
     pub fn reconcile(
         &self,
         limit: NonZeroUsize,
@@ -810,7 +838,7 @@ impl Storage {
             }
         })();
 
-        let cleanup = remove_temp(&temp).map_err(StorageError::from);
+        let cleanup = self.remove_temp(&temp);
 
         match result {
             Ok(outcome) => {
@@ -842,6 +870,7 @@ impl Storage {
             ) {
                 Ok(file) => {
                     file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                    self.temporary_objects.fetch_add(1, Ordering::Relaxed);
                     return Ok(TemporaryFile {
                         name,
                         directory,
@@ -858,6 +887,12 @@ impl Storage {
             "cannot allocate unique temporary file",
         )
         .into())
+    }
+
+    fn remove_temp(&self, temp: &TemporaryFile) -> Result<(), StorageError> {
+        remove_temp(temp).map_err(StorageError::from).inspect(|_| {
+            self.temporary_objects.fetch_sub(1, Ordering::Relaxed);
+        })
     }
 
     fn root_directory(&self) -> Result<File, StorageError> {
@@ -979,12 +1014,27 @@ pub(crate) fn capacity_error_kind(raw_error: i32) -> CapacityErrorKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FilesystemSpace {
+    total_bytes: u64,
     available_bytes: u64,
+    total_inodes: u64,
     available_inodes: u64,
+    read_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StorageCapacity {
+    pub(crate) total_bytes: u64,
+    pub(crate) available_bytes: u64,
+    pub(crate) total_inodes: u64,
+    pub(crate) available_inodes: u64,
+    pub(crate) read_only: bool,
 }
 
 impl FilesystemSpace {
     fn required_capacity(self, required_bytes: u64) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::Io(io::Error::from_raw_os_error(libc::EROFS)));
+        }
         if self.available_bytes < required_bytes {
             return Err(StorageError::InsufficientSpace);
         }
@@ -1006,11 +1056,16 @@ fn filesystem_space(directory: &File) -> io::Result<FilesystemSpace> {
 
     // SAFETY: fstatvfs returned success, so it initialized statistics.
     let statistics = unsafe { statistics.assume_init() };
+    let total = (statistics.f_blocks as u128).saturating_mul(statistics.f_frsize as u128);
     let available = (statistics.f_bavail as u128).saturating_mul(statistics.f_frsize as u128);
+    let total_inodes = statistics.f_files as u128;
     let inodes = statistics.f_favail as u128;
     Ok(FilesystemSpace {
+        total_bytes: total.min(u128::from(u64::MAX)) as u64,
         available_bytes: available.min(u128::from(u64::MAX)) as u64,
+        total_inodes: total_inodes.min(u128::from(u64::MAX)) as u64,
         available_inodes: inodes.min(u128::from(u64::MAX)) as u64,
+        read_only: statistics.f_flag & libc::ST_RDONLY != 0,
     })
 }
 
@@ -1239,6 +1294,60 @@ pub(crate) fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
         return Err(io::Error::last_os_error());
     }
     Ok(names)
+}
+
+pub(crate) fn for_each_dir_name<F>(directory: &File, mut visit: F) -> io::Result<()>
+where
+    F: FnMut(&OsStr) -> io::Result<bool>,
+{
+    let directory = open_at(
+        directory,
+        OsStr::new("."),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )?;
+    let fd = directory.into_raw_fd();
+    // SAFETY: fd is a newly opened directory descriptor. On success,
+    // fdopendir transfers ownership to the DIR handle.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        // SAFETY: fdopendir failed and did not transfer ownership.
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut callback_result = Ok(());
+    loop {
+        // SAFETY: stream is a live DIR handle and remains valid until the
+        // matching closedir below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: d_name is a NUL-terminated entry name owned by stream and is
+        // valid for the duration of this callback.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let name = OsStr::from_bytes(name.to_bytes());
+        match visit(name) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                callback_result = Err(error);
+                break;
+            }
+        }
+    }
+
+    // SAFETY: stream is the sole owner of the duplicated descriptor now.
+    let close_result = if unsafe { libc::closedir(stream) } != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    callback_result.and(close_result)
 }
 
 #[cfg(target_os = "linux")]
@@ -2051,13 +2160,32 @@ mod tests {
     #[test]
     fn destination_capacity_rejects_inode_exhaustion() {
         let space = FilesystemSpace {
+            total_bytes: u64::MAX,
             available_bytes: u64::MAX,
+            total_inodes: u64::MAX,
             available_inodes: 0,
+            read_only: false,
         };
 
         assert!(matches!(
             space.required_capacity(1),
             Err(StorageError::InsufficientInodes)
+        ));
+    }
+
+    #[test]
+    fn read_only_filesystems_are_not_ready() {
+        let space = FilesystemSpace {
+            total_bytes: u64::MAX,
+            available_bytes: u64::MAX,
+            total_inodes: u64::MAX,
+            available_inodes: u64::MAX,
+            read_only: true,
+        };
+
+        assert!(matches!(
+            space.required_capacity(1),
+            Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EROFS)
         ));
     }
 
@@ -2113,6 +2241,57 @@ mod tests {
 
         drop(first);
         Storage::initialize(directory.path()).expect("reacquire released process lock");
+    }
+
+    #[test]
+    fn process_lock_survives_lockfile_replacement() {
+        let directory = TestDir::new();
+        let first = Storage::initialize(directory.path()).expect("acquire first process lock");
+        let lock = directory.path().join("lock");
+        fs::remove_file(&lock).expect("remove lock pathname");
+        fs::write(&lock, b"replacement").expect("replace lock pathname");
+
+        assert!(matches!(
+            Storage::initialize(directory.path()),
+            Err(StorageError::Locked)
+        ));
+
+        drop(first);
+        Storage::initialize(directory.path()).expect("reacquire after lease release");
+    }
+
+    #[test]
+    fn process_lock_replacement_blocks_a_child_process() {
+        let directory = TestDir::new();
+        let first = Storage::initialize(directory.path()).expect("acquire first process lock");
+        let lock = directory.path().join("lock");
+        fs::remove_file(&lock).expect("remove lock pathname");
+        fs::write(&lock, b"replacement").expect("replace lock pathname");
+
+        let status = process::Command::new(env::current_exe().expect("test executable path"))
+            .args([
+                "--exact",
+                "storage::tests::process_lock_replacement_probe",
+                "--nocapture",
+            ])
+            .env("NARJAR_LOCK_PROBE_DATA", directory.path())
+            .status()
+            .expect("run lock probe child");
+        assert!(status.success(), "child process should observe the lease");
+
+        drop(first);
+        Storage::initialize(directory.path()).expect("reacquire after lease release");
+    }
+
+    #[test]
+    fn process_lock_replacement_probe() {
+        let Some(path) = env::var_os("NARJAR_LOCK_PROBE_DATA") else {
+            return;
+        };
+        assert!(matches!(
+            Storage::initialize(Path::new(&path)),
+            Err(StorageError::Locked)
+        ));
     }
 
     #[test]

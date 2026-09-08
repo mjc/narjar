@@ -2,12 +2,14 @@ use std::{
     fs,
     io::{self, Write},
     net::{TcpListener, TcpStream},
+    os::unix::fs::PermissionsExt,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Sender, TrySendError, bounded};
@@ -22,7 +24,7 @@ use narjar::{
 };
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
-    flag,
+    low_level,
 };
 
 use crate::{config::ServeConfig, error::Error};
@@ -97,6 +99,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             config.data_dir.display()
         )));
     }
+    require_initialized_data(&config.data_dir)?;
 
     let storage = Arc::new(Storage::initialize(&config.data_dir).map_err(|error| {
         Error::runtime(format!(
@@ -115,9 +118,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .recovery_required_for(&trusted_keys_path)
         .map_err(|error| Error::runtime(format!("cannot inspect cache recovery state: {error}")))?
     {
-        let inventory = Inventory::scan(&config.data_dir, &trusted_keys, false)
-            .map_err(|error| Error::runtime(format!("cannot inventory cache: {error}")))?;
-        if !inventory.can_serve() {
+        if !Inventory::can_serve_streaming(&config.data_dir, &trusted_keys)
+            .map_err(|error| Error::runtime(format!("cannot validate cache: {error}")))?
+        {
             return Err(Error::runtime(
                 "cannot activate trusted public keys: published narinfo is not trusted",
             ));
@@ -135,19 +138,33 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .set_nonblocking(true)
         .map_err(|error| Error::runtime(format!("cannot configure listener: {error}")))?;
     let stopping = Arc::new(AtomicBool::new(false));
-    flag::register(SIGINT, Arc::clone(&stopping))
-        .and_then(|_| flag::register(SIGTERM, Arc::clone(&stopping)))
+    let signal_count = Arc::new(AtomicUsize::new(0));
+    for signal in [SIGINT, SIGTERM] {
+        let stopping = Arc::clone(&stopping);
+        let signal_count = Arc::clone(&signal_count);
+        // SAFETY: the handler only performs atomic operations and `_exit`,
+        // both of which are async-signal-safe.
+        unsafe {
+            low_level::register(signal, move || {
+                if signal_count.fetch_add(1, Ordering::Relaxed) > 0 {
+                    libc::_exit(128 + signal);
+                }
+                stopping.store(true, Ordering::Release);
+            })
+        }
         .map_err(|error| Error::runtime(format!("cannot install signal handler: {error}")))?;
+    }
 
     println!(
-        "listening http://{} workers={} max_in_flight={} max_nar_bytes={} min_free_bytes={}",
+        "listening http://{} workers={} max_in_flight={} max_nar_bytes={} min_free_bytes={} shutdown_grace_seconds={}",
         listener
             .local_addr()
             .map_err(|error| Error::runtime(format!("cannot inspect listener: {error}")))?,
         config.workers,
         config.max_in_flight,
         config.max_nar_bytes,
-        config.min_free_bytes
+        config.min_free_bytes,
+        config.shutdown_grace_seconds
     );
     io::stdout()
         .flush()
@@ -191,6 +208,10 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     while !stopping.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                if stopping.load(Ordering::Acquire) {
+                    drop(stream);
+                    break;
+                }
                 if let Some(mut stream) = try_dispatch(&sender, &admissions, stream) {
                     let _ = write_status(&mut stream, StatusCode(429));
                 }
@@ -204,6 +225,13 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
     drop(sender);
 
+    let deadline = Instant::now() + Duration::from_secs(config.shutdown_grace_seconds.get());
+    while handles.iter().any(|handle| !handle.is_finished()) {
+        if Instant::now() >= deadline {
+            return Err(Error::runtime("shutdown grace period expired"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     for handle in handles {
         handle
             .join()
@@ -211,6 +239,92 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+fn require_initialized_data(root: &Path) -> Result<(), Error> {
+    require_directory(root, "data directory")?;
+    for directory in [
+        "nar",
+        "nar/.tmp",
+        ".tmp",
+        "realisations",
+        "realisations/.tmp",
+        "auth",
+    ] {
+        require_directory(&root.join(directory), directory)?;
+    }
+    for file in ["nix-cache-info", "trusted-public-keys", "auth/write.tokens"] {
+        require_private_file(&root.join(file), file)?;
+    }
+
+    let clean = root.join(".narjar-clean");
+    let recovery = root.join(".narjar-recovery");
+    let clean_present = path_exists(&clean)?;
+    let recovery_present = path_exists(&recovery)?;
+    if clean_present {
+        require_private_file(&clean, ".narjar-clean")?;
+    }
+    if recovery_present {
+        require_private_file(&recovery, ".narjar-recovery")?;
+    }
+    if !clean_present && !recovery_present {
+        return Err(Error::runtime(
+            "data directory is not initialized; run `narjar init --data-dir ...`",
+        ));
+    }
+    Ok(())
+}
+
+fn require_directory(path: &Path, name: &str) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        Error::runtime(format!(
+            "{name} is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(Error::runtime(format!(
+            "{name} is not a directory: {}",
+            path.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(Error::runtime(format!(
+            "{name} has unsafe permissions: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_private_file(path: &Path, name: &str) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        Error::runtime(format!(
+            "{name} is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::runtime(format!(
+            "{name} is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(Error::runtime(format!(
+            "{name} must have 0600 permissions: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn path_exists(path: &Path) -> Result<bool, Error> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::runtime(error.to_string())),
+    }
 }
 
 #[cfg(test)]

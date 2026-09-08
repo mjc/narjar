@@ -24,11 +24,13 @@ enum Command {
     Init(operator::Init),
     Key(operator::Key),
     Reconcile(operator::Reconcile),
+    Cleanup(operator::Cleanup),
     Verify(operator::Verify),
     Gc(operator::Gc),
     ListOrphans(operator::ListOrphans),
     Delete(operator::Delete),
     Stats(operator::Stats),
+    Doctor(operator::Doctor),
     Token(token::Token),
     Push(push::Push),
 }
@@ -56,11 +58,13 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Init(args) => operator::init(args),
         Command::Key(args) => operator::key(args),
         Command::Reconcile(args) => operator::reconcile(args),
+        Command::Cleanup(args) => operator::cleanup(args),
         Command::Verify(args) => operator::verify(args),
         Command::ListOrphans(args) => operator::list_orphans(args),
         Command::Delete(args) => operator::delete(args),
         Command::Gc(args) => operator::gc(args),
         Command::Stats(args) => operator::stats(args),
+        Command::Doctor(args) => operator::doctor(args),
         Command::Token(args) => token::run(args),
         Command::Push(args) => push::run(args),
     }
@@ -151,6 +155,19 @@ mod tests {
         .expect("gc policy should parse");
 
         assert!(matches!(cli.command, super::Command::Gc(_)));
+    }
+
+    #[test]
+    fn serve_rejects_zero_shutdown_grace() {
+        let result = Cli::try_parse_from([
+            "narjar",
+            "serve",
+            "--data-dir",
+            "/cache",
+            "--shutdown-grace-seconds",
+            "0",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

@@ -1,9 +1,16 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
+    mem::MaybeUninit,
     net::TcpStream,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    num::NonZeroUsize,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use clap::{Args, Subcommand};
@@ -13,7 +20,7 @@ use narjar::{
     inventory::{Inventory, InventoryClass, MAX_NARINFO_BYTES, narinfo_is_valid},
     narinfo::TrustedPublicKeys,
     storage::{
-        Storage, StoreHash,
+        ReconcileClass, Storage, StoreHash,
         gc::{self, GcOptions},
     },
 };
@@ -38,36 +45,155 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
     } = options;
 
     if root.exists() {
-        let mut entries = fs::read_dir(&root).map_err(runtime)?;
-        if entries.next().transpose().map_err(runtime)?.is_some() {
-            return Err(Error::runtime(format!(
-                "data directory is not empty: {}",
-                root.display()
-            )));
-        }
+        reject_unexpected_init_entries(&root)?;
+        reject_unexpected_auth_entries(&root)?;
     } else {
         fs::create_dir_all(&root).map_err(runtime)?;
     }
 
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(runtime)?;
+    create_recovery_marker(&root)?;
     let storage = Storage::initialize(&root).map_err(runtime)?;
     for directory in ["nar", ".tmp", "realisations"] {
-        fs::set_permissions(root.join(directory), fs::Permissions::from_mode(0o700))
-            .map_err(runtime)?;
+        ensure_directory(&root.join(directory), 0o700)?;
     }
-    fs::create_dir(root.join("auth")).map_err(runtime)?;
-    fs::set_permissions(root.join("auth"), fs::Permissions::from_mode(0o700)).map_err(runtime)?;
+    ensure_directory(&root.join("auth"), 0o700)?;
     create_file(
         &root.join("nix-cache-info"),
         format!("StoreDir: /nix/store\nWantMassQuery: 0\nPriority: {priority}\n").as_bytes(),
         0o600,
+        false,
     )?;
-    create_file(&root.join("trusted-public-keys"), b"", 0o600)?;
-    create_file(&root.join("auth/write.tokens"), b"", 0o600)?;
-    if private_read {
-        create_file(&root.join("auth/read.tokens"), b"", 0o600)?;
+    create_file(&root.join("trusted-public-keys"), b"", 0o600, true)?;
+    create_file(&root.join("auth/write.tokens"), b"", 0o600, true)?;
+    if private_read || path_exists(&root.join("auth/read.tokens"))? {
+        create_file(&root.join("auth/read.tokens"), b"", 0o600, true)?;
     }
+    storage
+        .finish_recovery(&root.join("trusted-public-keys"))
+        .map_err(runtime)?;
     drop(storage);
+    Ok(())
+}
+
+const INIT_ROOT_ENTRIES: &[&str] = &[
+    ".narjar-clean",
+    ".narjar-recovery",
+    ".tmp",
+    "auth",
+    "nar",
+    "nix-cache-info",
+    "lock",
+    "realisations",
+    "trusted-public-keys",
+];
+
+fn reject_unexpected_init_entries(root: &Path) -> Result<(), Error> {
+    let mut unexpected = BTreeSet::new();
+    for entry in fs::read_dir(root).map_err(runtime)? {
+        let entry = entry.map_err(runtime)?;
+        let name = entry.file_name();
+        if !INIT_ROOT_ENTRIES
+            .iter()
+            .any(|allowed| name == std::ffi::OsStr::new(allowed))
+        {
+            unexpected.insert(name.to_string_lossy().into_owned());
+        }
+    }
+    if unexpected.is_empty() {
+        return Ok(());
+    }
+    Err(Error::runtime(format!(
+        "data directory has unexpected entries: {}",
+        unexpected.into_iter().collect::<Vec<_>>().join(", ")
+    )))
+}
+
+fn reject_unexpected_auth_entries(root: &Path) -> Result<(), Error> {
+    let auth = root.join("auth");
+    let metadata = match fs::symlink_metadata(&auth) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(runtime(error)),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(Error::runtime(format!(
+            "initialization entry is not a directory: {}",
+            auth.display()
+        )));
+    }
+    let mut unexpected = BTreeSet::new();
+    for entry in fs::read_dir(&auth).map_err(runtime)? {
+        let name = entry.map_err(runtime)?.file_name();
+        if !matches!(name.to_str(), Some("read.tokens" | "write.tokens")) {
+            unexpected.insert(name.to_string_lossy().into_owned());
+        }
+    }
+    if unexpected.is_empty() {
+        return Ok(());
+    }
+    Err(Error::runtime(format!(
+        "auth directory has unexpected entries: {}",
+        unexpected.into_iter().collect::<Vec<_>>().join(", ")
+    )))
+}
+
+fn path_exists(path: &Path) -> Result<bool, Error> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(runtime(error)),
+    }
+}
+
+fn create_recovery_marker(root: &Path) -> Result<(), Error> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.join(".narjar-recovery"))
+    {
+        Ok(file) => {
+            file.sync_all().map_err(runtime)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(root.join(".narjar-recovery")).map_err(runtime)?;
+            if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+                return Err(Error::runtime(
+                    "initialization recovery marker is not a regular 0600 file",
+                ));
+            }
+        }
+        Err(error) => return Err(runtime(error)),
+    }
+    File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(runtime)
+}
+
+fn ensure_directory(path: &Path, mode: u32) -> Result<(), Error> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(runtime)?;
+            if !metadata.file_type().is_dir() {
+                return Err(Error::runtime(format!(
+                    "initialization entry is not a directory: {}",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) => return Err(runtime(error)),
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(runtime)?;
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(runtime)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(runtime)?;
+    }
     Ok(())
 }
 
@@ -119,11 +245,13 @@ fn generate_key(options: GenerateKey) -> Result<(), Error> {
         &secret_path,
         format!("{name}:{}\n", BASE64.encode(&secret)).as_bytes(),
         0o600,
+        false,
     )?;
     if let Err(error) = create_file(
         &public_path,
         format!("{name}:{}\n", BASE64.encode(public.as_bytes())).as_bytes(),
         0o644,
+        false,
     ) {
         let _ = fs::remove_file(&secret_path);
         return Err(error);
@@ -139,14 +267,50 @@ pub(crate) struct Reconcile {
     verify_hashes: bool,
     #[arg(long)]
     json: bool,
+    #[arg(long)]
+    structural: bool,
+    #[arg(long, default_value_t = 10_000)]
+    limit: usize,
+    #[arg(long, default_value_t = 3_600)]
+    min_age_seconds: u64,
 }
 
 pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
+    if options.structural {
+        return structural_report(
+            options.data_dir,
+            options.limit,
+            options.min_age_seconds,
+            options.json,
+        );
+    }
     report(
         options.data_dir,
         ReportMode::Reconcile,
         options.verify_hashes,
         options.json,
+    )
+}
+
+#[derive(Args)]
+pub(crate) struct Cleanup {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long, default_value_t = 3_600)]
+    min_age_seconds: u64,
+    #[arg(long, default_value_t = 10_000)]
+    limit: usize,
+    #[arg(long)]
+    json: bool,
+}
+
+pub(crate) fn cleanup(options: Cleanup) -> Result<(), Error> {
+    structural_scan(
+        options.data_dir,
+        options.limit,
+        options.min_age_seconds,
+        options.json,
+        true,
     )
 }
 
@@ -234,6 +398,66 @@ fn report(root: PathBuf, mode: ReportMode, verify_hashes: bool, json: bool) -> R
         return Err(Error::runtime("verification found invalid published pairs"));
     }
     Ok(())
+}
+
+fn structural_report(
+    root: PathBuf,
+    limit: usize,
+    min_age_seconds: u64,
+    json: bool,
+) -> Result<(), Error> {
+    structural_scan(root, limit, min_age_seconds, json, false)
+}
+
+fn structural_scan(
+    root: PathBuf,
+    limit: usize,
+    min_age_seconds: u64,
+    json: bool,
+    cleanup: bool,
+) -> Result<(), Error> {
+    let limit =
+        NonZeroUsize::new(limit).ok_or_else(|| Error::usage("limit must be greater than zero"))?;
+    let stale_before = SystemTime::now()
+        .checked_sub(Duration::from_secs(min_age_seconds))
+        .ok_or_else(|| Error::usage("minimum age is out of range"))?;
+    let storage = Storage::initialize(&root).map_err(runtime)?;
+    let report = storage.reconcile(limit, stale_before).map_err(runtime)?;
+
+    for entry in report.entries() {
+        let action = if cleanup && entry.class() == ReconcileClass::TempStale {
+            if storage.cleanup_stale_temp(entry).map_err(runtime)? {
+                "deleted"
+            } else {
+                "kept_replaced"
+            }
+        } else if cleanup {
+            "kept"
+        } else {
+            "inspect"
+        };
+        print_structural_entry(entry.class(), entry.relative_path(), action, json);
+    }
+
+    if report.truncated() {
+        return Err(Error::runtime(format!(
+            "structural reconciliation reached the --limit of {limit} entries"
+        )));
+    }
+    Ok(())
+}
+
+fn print_structural_entry(class: ReconcileClass, path: &Path, action: &str, json: bool) {
+    if json {
+        println!(
+            "{{\"class\":\"{}\",\"path\":\"{}\",\"action\":\"{}\"}}",
+            class.as_str(),
+            json_escape(&path.to_string_lossy()),
+            action
+        );
+    } else {
+        println!("{}\t{}\t{}", class.as_str(), path.display(), action);
+    }
 }
 
 #[derive(Args)]
@@ -387,6 +611,310 @@ pub(crate) fn delete(options: Delete) -> Result<(), Error> {
 }
 
 #[derive(Args)]
+pub(crate) struct Doctor {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DoctorSeverity {
+    Ok,
+    Warning,
+    Error,
+    Unavailable,
+}
+
+impl DoctorSeverity {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+struct DoctorPath {
+    path: &'static str,
+    required: bool,
+    kind: &'static str,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    severity: DoctorSeverity,
+    detail: String,
+}
+
+struct DoctorCapacity {
+    path: &'static str,
+    total_bytes: u64,
+    available_bytes: u64,
+    total_inodes: u64,
+    available_inodes: u64,
+    read_only: bool,
+    device: u64,
+}
+
+struct DoctorReport {
+    root: PathBuf,
+    paths: Vec<DoctorPath>,
+    capacities: Vec<DoctorCapacity>,
+    mount: DoctorSeverity,
+    mount_detail: String,
+    lease: DoctorSeverity,
+    lease_detail: String,
+}
+
+const DOCTOR_DIRECTORIES: &[&str] = &[
+    "",
+    "nar",
+    "nar/.tmp",
+    ".tmp",
+    "realisations",
+    "realisations/.tmp",
+    "auth",
+];
+const DOCTOR_FILES: &[&str] = &[
+    "lock",
+    "nix-cache-info",
+    "trusted-public-keys",
+    "auth/write.tokens",
+];
+
+pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
+    let report = inspect_doctor(&options.data_dir)?;
+    if options.json {
+        println!("{}", doctor_json(&report));
+    } else {
+        print_doctor(&report);
+    }
+    Ok(())
+}
+
+fn inspect_doctor(root: &Path) -> Result<DoctorReport, Error> {
+    let mut paths = Vec::new();
+    for path in DOCTOR_DIRECTORIES {
+        paths.push(inspect_doctor_path(root, path, true, true));
+    }
+    for path in DOCTOR_FILES {
+        paths.push(inspect_doctor_path(root, path, true, false));
+    }
+    paths.push(inspect_doctor_path(root, "auth/read.tokens", false, false));
+
+    let mut capacities = Vec::new();
+    for (path, relative) in [("root", Path::new("")), ("nar", Path::new("nar"))] {
+        if let Ok(capacity) = doctor_capacity(&root.join(relative)) {
+            capacities.push(DoctorCapacity { path, ..capacity });
+        }
+    }
+    let mount = match capacities.as_slice() {
+        [root_capacity, nar_capacity] if root_capacity.device == nar_capacity.device => (
+            DoctorSeverity::Ok,
+            "root and NAR destination report the same device".to_owned(),
+        ),
+        [root_capacity, nar_capacity] => (
+            DoctorSeverity::Warning,
+            format!(
+                "root device {} differs from NAR destination device {}",
+                root_capacity.device, nar_capacity.device
+            ),
+        ),
+        _ => (
+            DoctorSeverity::Unavailable,
+            "mount identity is unavailable".to_owned(),
+        ),
+    };
+
+    let lease = match File::open(root) {
+        Ok(file) => match doctor_try_lease(&file) {
+            Ok(()) => (DoctorSeverity::Ok, "lease is available".to_owned()),
+            Err(error)
+                if error.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    || error.raw_os_error() == Some(libc::EAGAIN) =>
+            {
+                (
+                    DoctorSeverity::Warning,
+                    "lease is held by another process".to_owned(),
+                )
+            }
+            Err(error) => (DoctorSeverity::Unavailable, error.to_string()),
+        },
+        Err(error) => (DoctorSeverity::Unavailable, error.to_string()),
+    };
+
+    Ok(DoctorReport {
+        root: root.to_owned(),
+        paths,
+        capacities,
+        mount: mount.0,
+        mount_detail: mount.1,
+        lease: lease.0,
+        lease_detail: lease.1,
+    })
+}
+
+fn inspect_doctor_path(
+    root: &Path,
+    relative: &'static str,
+    required: bool,
+    directory: bool,
+) -> DoctorPath {
+    let path = root.join(relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => {
+            return DoctorPath {
+                path: relative,
+                required,
+                kind: "missing",
+                mode: None,
+                uid: None,
+                gid: None,
+                severity: DoctorSeverity::Ok,
+                detail: "optional".to_owned(),
+            };
+        }
+        Err(error) => {
+            return DoctorPath {
+                path: relative,
+                required,
+                kind: "missing",
+                mode: None,
+                uid: None,
+                gid: None,
+                severity: if required {
+                    DoctorSeverity::Error
+                } else {
+                    DoctorSeverity::Unavailable
+                },
+                detail: error.to_string(),
+            };
+        }
+    };
+    let kind = if metadata.file_type().is_symlink() {
+        "symlink"
+    } else if metadata.is_dir() {
+        "directory"
+    } else if metadata.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    let mode = metadata.mode() & 0o7777;
+    let wrong_type = (directory && kind != "directory") || (!directory && kind != "file");
+    let unsafe_mode = if directory {
+        mode & 0o022 != 0
+    } else {
+        mode & 0o133 != 0
+    };
+    let severity = if wrong_type || unsafe_mode {
+        DoctorSeverity::Error
+    } else {
+        DoctorSeverity::Ok
+    };
+    let detail = if wrong_type {
+        format!(
+            "expected {}, found {kind}",
+            if directory {
+                "directory"
+            } else {
+                "regular file"
+            }
+        )
+    } else if unsafe_mode {
+        format!("unsafe permissions {mode:04o}")
+    } else {
+        "matches portable layout contract".to_owned()
+    };
+    DoctorPath {
+        path: relative,
+        required,
+        kind,
+        mode: Some(mode),
+        uid: Some(metadata.uid()),
+        gid: Some(metadata.gid()),
+        severity,
+        detail,
+    }
+}
+
+fn doctor_capacity(path: &Path) -> Result<DoctorCapacity, std::io::Error> {
+    let file = File::open(path)?;
+    let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let statistics = unsafe { statistics.assume_init() };
+    let scale = statistics.f_frsize as u128;
+    let bytes = |blocks: libc::fsblkcnt_t| {
+        (blocks as u128)
+            .saturating_mul(scale)
+            .min(u128::from(u64::MAX)) as u64
+    };
+    Ok(DoctorCapacity {
+        path: "",
+        total_bytes: bytes(statistics.f_blocks),
+        available_bytes: bytes(statistics.f_bavail),
+        total_inodes: (statistics.f_files as u128).min(u128::from(u64::MAX)) as u64,
+        available_inodes: (statistics.f_favail as u128).min(u128::from(u64::MAX)) as u64,
+        read_only: statistics.f_flag & libc::ST_RDONLY != 0,
+        device: file.metadata()?.dev(),
+    })
+}
+
+fn doctor_try_lease(file: &File) -> Result<(), std::io::Error> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn doctor_json(report: &DoctorReport) -> String {
+    let paths = report.paths.iter().map(|path| format!("{{\"path\":\"{}\",\"required\":{},\"kind\":\"{}\",\"mode\":{},\"uid\":{},\"gid\":{},\"severity\":\"{}\",\"detail\":\"{}\"}}", json_escape(path.path), path.required, json_escape(path.kind), path.mode.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.uid.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.gid.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.severity.as_str(), json_escape(&path.detail))).collect::<Vec<_>>().join(",");
+    let capacities = report.capacities.iter().map(|capacity| format!("{{\"path\":\"{}\",\"total_bytes\":{},\"available_bytes\":{},\"total_inodes\":{},\"available_inodes\":{},\"read_only\":{},\"device\":{}}}", capacity.path, capacity.total_bytes, capacity.available_bytes, capacity.total_inodes, capacity.available_inodes, capacity.read_only, capacity.device)).collect::<Vec<_>>().join(",");
+    format!(
+        "{{\"schema\":1,\"data_dir\":\"{}\",\"mount\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"lease\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"paths\":[{}],\"capacity\":[{}]}}",
+        json_escape(&report.root.to_string_lossy()),
+        report.mount.as_str(),
+        json_escape(&report.mount_detail),
+        report.lease.as_str(),
+        json_escape(&report.lease_detail),
+        paths,
+        capacities
+    )
+}
+
+fn print_doctor(report: &DoctorReport) {
+    println!("data_dir\t{}", report.root.display());
+    println!("mount\t{}\t{}", report.mount.as_str(), report.mount_detail);
+    println!("lease\t{}\t{}", report.lease.as_str(), report.lease_detail);
+    for capacity in &report.capacities {
+        println!(
+            "capacity\t{}\t{} bytes available / {} total\t{} inodes available / {} total\tread_only={}",
+            capacity.path,
+            capacity.available_bytes,
+            capacity.total_bytes,
+            capacity.available_inodes,
+            capacity.total_inodes,
+            capacity.read_only
+        );
+    }
+    for path in &report.paths {
+        println!(
+            "path\t{}\t{}\t{}\t{}",
+            path.path,
+            path.severity.as_str(),
+            path.kind,
+            path.detail
+        );
+    }
+}
+
+#[derive(Args)]
 pub(crate) struct Stats {
     #[arg(long)]
     url: String,
@@ -481,15 +1009,47 @@ fn netrc_authorization_from_str(text: &str, authority: &str) -> Result<String, E
     Ok(BASE64.encode(format!("{login}:{password}").as_bytes()))
 }
 
-fn create_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Error> {
-    let mut file = OpenOptions::new()
+fn create_file(path: &Path, bytes: &[u8], mode: u32, preserve_existing: bool) -> Result<(), Error> {
+    match OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(mode)
         .open(path)
-        .map_err(runtime)?;
-    file.write_all(bytes).map_err(runtime)?;
-    file.sync_all().map_err(runtime)
+    {
+        Ok(mut file) => {
+            file.write_all(bytes).map_err(runtime)?;
+            file.sync_all().map_err(runtime)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(runtime)?;
+            if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != mode {
+                return Err(Error::runtime(format!(
+                    "initialization entry is not a regular {:o} file: {}",
+                    mode,
+                    path.display()
+                )));
+            }
+            if !preserve_existing {
+                let existing = fs::read(path).map_err(runtime)?;
+                if existing != bytes {
+                    return Err(Error::runtime(format!(
+                        "initialization file differs from requested configuration: {}",
+                        path.display()
+                    )));
+                }
+            }
+            File::open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(runtime)?;
+        }
+        Err(error) => return Err(runtime(error)),
+    }
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(runtime)?;
+    }
+    Ok(())
 }
 
 fn valid_key_name(value: &str) -> Result<String, String> {
@@ -552,5 +1112,146 @@ machine other.example password other-secret
         .expect("IPv6 machine should match");
 
         assert_eq!(authorization, BASE64.encode(b"cache-user:cache-secret"));
+    }
+
+    #[test]
+    fn init_resumes_partial_layout_and_is_idempotent() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        fs::create_dir(directory.path().join("nar")).expect("partial layout should be created");
+
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: true,
+        })
+        .expect("partial initialization should resume");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: true,
+        })
+        .expect("completed initialization should be idempotent");
+
+        assert!(directory.path().join(".narjar-clean").is_file());
+        assert!(!directory.path().join(".narjar-recovery").exists());
+        assert!(directory.path().join("auth/read.tokens").is_file());
+    }
+
+    #[test]
+    fn init_preserves_existing_trust_and_token_material() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: true,
+        })
+        .expect("initialization should succeed");
+
+        fs::write(
+            directory.path().join("trusted-public-keys"),
+            b"cache.example-1:public-key",
+        )
+        .expect("trust material should be writable");
+        fs::write(directory.path().join("auth/write.tokens"), b"write-secret")
+            .expect("write token should be writable");
+        fs::write(directory.path().join("auth/read.tokens"), b"read-secret")
+            .expect("read token should be writable");
+
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: true,
+        })
+        .expect("retry should preserve existing material");
+
+        assert_eq!(
+            fs::read(directory.path().join("trusted-public-keys")).unwrap(),
+            b"cache.example-1:public-key"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("auth/write.tokens")).unwrap(),
+            b"write-secret"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("auth/read.tokens")).unwrap(),
+            b"read-secret"
+        );
+    }
+
+    #[test]
+    fn init_rejects_unknown_entries_before_creating_recovery_state() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        fs::write(directory.path().join("unexpected"), b"do not touch")
+            .expect("unexpected entry should be created");
+
+        let error = init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+        })
+        .expect_err("unknown entries should fail closed");
+
+        assert!(error.to_string().contains("unexpected"));
+        assert!(!directory.path().join(".narjar-recovery").exists());
+    }
+
+    #[test]
+    fn doctor_json_reports_layout_and_capacity_without_inventory() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+        })
+        .expect("cache should initialize");
+
+        let report = inspect_doctor(directory.path()).expect("doctor should inspect cache");
+        let json = doctor_json(&report);
+        assert!(json.contains("\"schema\":1"));
+        assert!(json.contains("\"mount\":{\"severity\":\"ok\""));
+        assert!(json.contains("\"path\":\"nar\""));
+        assert!(json.contains("\"total_bytes\":"));
+        assert!(json.contains("\"lease\":{\"severity\":\"ok\""));
+    }
+
+    #[test]
+    fn doctor_marks_wrong_fixed_path_type_as_error() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+        })
+        .expect("cache should initialize");
+        fs::remove_dir_all(directory.path().join("nar"))
+            .expect("nar directory should be removable");
+        fs::write(directory.path().join("nar"), b"wrong type")
+            .expect("replacement should be writable");
+
+        let report = inspect_doctor(directory.path()).expect("doctor should inspect cache");
+        let nar = report
+            .paths
+            .iter()
+            .find(|path| path.path == "nar")
+            .expect("nar path should be reported");
+        assert!(matches!(nar.severity, DoctorSeverity::Error));
+        assert_eq!(nar.kind, "file");
+    }
+
+    #[test]
+    fn doctor_detects_a_held_data_lease() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+        })
+        .expect("cache should initialize");
+        let held = File::open(directory.path()).expect("data directory should open");
+        doctor_try_lease(&held).expect("test should hold the lease");
+
+        let report = inspect_doctor(directory.path()).expect("doctor should inspect cache");
+        assert!(matches!(report.lease, DoctorSeverity::Warning));
+        assert!(report.lease_detail.contains("held"));
     }
 }

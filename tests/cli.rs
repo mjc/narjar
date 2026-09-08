@@ -22,6 +22,7 @@ const CONFIG_ENV: &[&str] = &[
     "NARJAR_MAX_IN_FLIGHT",
     "NARJAR_MAX_NAR_BYTES",
     "NARJAR_MIN_FREE_BYTES",
+    "NARJAR_SHUTDOWN_GRACE_SECONDS",
 ];
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -168,6 +169,57 @@ fn serve_requires_data_dir() {
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
         "error: one or more required arguments were not provided\n"
+    );
+}
+
+#[test]
+fn serve_rejects_uninitialized_data_dir() {
+    let data_dir = data_dir("uninitialized-data-dir");
+    let output = run(&[
+        "serve",
+        "--data-dir",
+        data_dir.to_str().expect("temporary path should be UTF-8"),
+        "--listen",
+        "127.0.0.1:0",
+        "--workers",
+        "1",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("stderr should be UTF-8")
+            .contains("nar is unavailable")
+    );
+}
+
+#[test]
+fn serve_rejects_partial_data_dir() {
+    let data_dir = data_dir("partial-data-dir");
+    fs::create_dir(data_dir.path().join("nar")).expect("partial NAR directory should exist");
+    fs::create_dir(data_dir.path().join("nar/.tmp"))
+        .expect("partial NAR temporary directory should exist");
+    fs::create_dir(data_dir.path().join(".tmp")).expect("partial temporary directory should exist");
+    fs::create_dir(data_dir.path().join("realisations"))
+        .expect("partial realisations directory should exist");
+    fs::create_dir(data_dir.path().join("realisations/.tmp"))
+        .expect("partial realisation temporary directory should exist");
+    fs::create_dir(data_dir.path().join("auth")).expect("partial auth directory should exist");
+    let output = run(&[
+        "serve",
+        "--data-dir",
+        data_dir.to_str().expect("temporary path should be UTF-8"),
+        "--listen",
+        "127.0.0.1:0",
+        "--workers",
+        "1",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("stderr should be UTF-8")
+            .contains("nix-cache-info is unavailable")
     );
 }
 
@@ -399,8 +451,17 @@ impl RunningServer {
         trusted_keys: Option<&str>,
     ) -> Self {
         let data_dir = data_dir(test);
+        let output = run(&[
+            "init",
+            "--data-dir",
+            data_dir.to_str().expect("temporary path should be UTF-8"),
+        ]);
+        assert!(
+            output.status.success(),
+            "test data initialization failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let auth_dir = data_dir.path().join("auth");
-        fs::create_dir(&auth_dir).expect("test auth directory should be created");
         let write_tokens = auth_dir.join("write.tokens");
         fs::write(&write_tokens, TEST_WRITE_TOKEN).expect("test write token should be written");
         fs::set_permissions(
@@ -646,7 +707,7 @@ fn serve_reports_listener_and_stops_on_sigterm() {
     );
     assert!(
         server.startup_line.ends_with(
-            " workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824\n"
+            " workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824 shutdown_grace_seconds=30\n"
         ),
         "startup line omits effective limits: {:?}",
         server.startup_line
@@ -655,6 +716,83 @@ fn serve_reports_listener_and_stops_on_sigterm() {
     let (signal, status) = server.stop();
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn second_sigterm_exits_a_stalled_request_immediately() {
+    let mut server =
+        RunningServer::start_with_args("second-sigterm", &["--shutdown-grace-seconds", "30"]);
+    let mut stalled = TcpStream::connect(&server.address).expect("stalled request should connect");
+    stalled
+        .write_all(format!("PUT /nar/{NAR_ID}.nar HTTP/1.1\r\n").as_bytes())
+        .expect("partial request should be written");
+    thread::sleep(Duration::from_millis(100));
+
+    let pid = server
+        .child
+        .as_ref()
+        .expect("server child should exist")
+        .id();
+    Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("first SIGTERM should be sent");
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("second SIGTERM should be sent");
+    let status = server
+        .child
+        .take()
+        .expect("server child should be available")
+        .wait()
+        .expect("server should exit after the second signal");
+
+    assert!(!status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "second signal should bypass the grace period: {started:?}"
+    );
+}
+
+#[test]
+fn shutdown_grace_deadline_terminates_a_stalled_request() {
+    let mut server =
+        RunningServer::start_with_args("shutdown-deadline", &["--shutdown-grace-seconds", "1"]);
+    let mut stalled = TcpStream::connect(&server.address).expect("stalled request should connect");
+    stalled
+        .write_all(format!("PUT /nar/{NAR_ID}.nar HTTP/1.1\r\n").as_bytes())
+        .expect("partial request should be written");
+    thread::sleep(Duration::from_millis(100));
+
+    let pid = server
+        .child
+        .as_ref()
+        .expect("server child should exist")
+        .id();
+    Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("SIGTERM should be sent");
+    let started = Instant::now();
+    let status = server
+        .child
+        .take()
+        .expect("server child should be available")
+        .wait()
+        .expect("server should exit at the grace deadline");
+
+    assert!(!status.success());
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "shutdown should honor the configured grace period: {started:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "shutdown should remain bounded: {started:?}"
+    );
 }
 
 #[test]
@@ -1709,7 +1847,7 @@ fn configured_empty_read_token_set_stays_private() {
 
 #[test]
 fn token_create_and_revoke_rotate_hashed_write_credentials() {
-    let data_dir = data_dir("token-lifecycle");
+    let data_dir = init_data_dir("token-lifecycle");
     let root_path = data_dir.path().to_owned();
     let root = root_path.to_str().expect("temporary path should be UTF-8");
     let old = run(&[
@@ -1832,7 +1970,7 @@ fn nix_cache_info_put_is_durable_idempotent_and_immutable() {
     assert!(
         response_parts(&created)
             .0
-            .starts_with("HTTP/1.1 201 Created\r\n"),
+            .starts_with("HTTP/1.1 200 OK\r\n"),
         "{:?}",
         String::from_utf8_lossy(&created)
     );
@@ -2031,6 +2169,101 @@ fn reconcile_and_verify_classify_operator_findings() {
 }
 
 #[test]
+fn structural_reconcile_reports_temp_age_and_shape() {
+    let data_dir = init_data_dir("operator-structural-reconcile");
+    fs::write(data_dir.join(".tmp/nar-young.part"), b"temporary")
+        .expect("temporary file should be written");
+    fs::write(data_dir.join(".tmp/cache-info-young.part"), b"temporary")
+        .expect("cache-info temporary file should be written");
+    fs::write(data_dir.join("nar/.tmp/nar-young.part"), b"temporary")
+        .expect("NAR temporary file should be written");
+    fs::write(
+        data_dir.join("realisations/.tmp/realisation-young.part"),
+        b"temporary",
+    )
+    .expect("realisation temporary file should be written");
+    fs::write(data_dir.join(".tmp/not-a-temp"), b"unexpected")
+        .expect("invalid temporary file should be written");
+    fs::create_dir(data_dir.join(".tmp/nar-directory.part"))
+        .expect("unexpected temporary directory should be created");
+
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let output = run(&[
+        "reconcile",
+        "--data-dir",
+        path,
+        "--structural",
+        "--min-age-seconds",
+        "3600",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "structural reconcile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).expect("report should be UTF-8");
+    assert!(report.contains(
+        "{\"class\":\"temp_young\",\"path\":\".tmp/nar-young.part\",\"action\":\"inspect\"}"
+    ));
+    for path in [
+        ".tmp/cache-info-young.part",
+        "nar/.tmp/nar-young.part",
+        "realisations/.tmp/realisation-young.part",
+    ] {
+        assert!(
+            report.contains(&format!(
+                "{{\"class\":\"temp_young\",\"path\":\"{path}\",\"action\":\"inspect\"}}"
+            )),
+            "{report}"
+        );
+    }
+    assert!(report.contains(
+        "{\"class\":\"invalid_filename\",\"path\":\".tmp/not-a-temp\",\"action\":\"inspect\"}"
+    ));
+    assert!(report.contains(
+        "{\"class\":\"unexpected_type\",\"path\":\".tmp/nar-directory.part\",\"action\":\"inspect\"}"
+    ));
+}
+
+#[test]
+fn cleanup_deletes_stale_temps_and_reports_the_action() {
+    let data_dir = init_data_dir("operator-structural-cleanup");
+    let temporary = data_dir.join(".tmp/nar-stale.part");
+    fs::write(&temporary, b"temporary").expect("temporary file should be written");
+    let unknown = data_dir.join("unknown-file");
+    fs::write(&unknown, b"unknown").expect("unknown file should be written");
+
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let output = run(&[
+        "cleanup",
+        "--data-dir",
+        path,
+        "--min-age-seconds",
+        "0",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "cleanup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).expect("report should be UTF-8");
+    assert!(report.contains(
+        "{\"class\":\"temp_stale\",\"path\":\".tmp/nar-stale.part\",\"action\":\"deleted\"}"
+    ));
+    assert!(
+        report
+            .contains("{\"class\":\"unknown_file\",\"path\":\"unknown-file\",\"action\":\"kept\"}")
+    );
+    assert!(
+        !temporary.exists(),
+        "stale temporary file should be removed"
+    );
+    assert!(unknown.exists(), "unknown file should survive cleanup");
+}
+
+#[test]
 fn delete_is_offline_and_leaves_shared_nar_objects() {
     let server = RunningServer::start("operator-delete");
     let nar_path = format!("/nar/{NARJAR_HASH}.nar");
@@ -2201,8 +2434,20 @@ fn restored_cache_verifies_before_serving() {
     )
     .expect("narinfo should be written");
 
-    let restored = init_data_dir("backup-restored");
+    let restored = data_dir("backup-restored");
+    for directory in [
+        "nar",
+        "nar/.tmp",
+        ".tmp",
+        "realisations",
+        "realisations/.tmp",
+        "auth",
+    ] {
+        fs::create_dir_all(restored.join(directory)).expect("restore directory should be created");
+    }
     for relative in [
+        ".narjar-clean",
+        "lock",
         "nix-cache-info",
         "trusted-public-keys",
         "auth/write.tokens",
@@ -2212,17 +2457,76 @@ fn restored_cache_verifies_before_serving() {
         fs::copy(source.join(relative), restored.join(relative))
             .expect("backup file should be restored");
     }
-    let output = run(&[
-        "verify",
-        "--data-dir",
-        restored.to_str().expect("restored path should be UTF-8"),
-        "--json",
-    ]);
+    let path = restored.to_str().expect("restored path should be UTF-8");
+    let reconcile = run(&["reconcile", "--data-dir", path, "--verify-hashes", "--json"]);
     assert!(
-        output.status.success(),
+        reconcile.status.success(),
+        "restored cache failed reconciliation: {}{}",
+        String::from_utf8_lossy(&reconcile.stdout),
+        String::from_utf8_lossy(&reconcile.stderr)
+    );
+    let verify = run(&["verify", "--data-dir", path, "--json"]);
+    assert!(
+        verify.status.success(),
         "restored cache failed verification: {}{}",
-        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let doctor = run(&["doctor", "--data-dir", path, "--json"]);
+    assert!(
+        doctor.status.success(),
+        "restored cache failed doctor preflight: {}{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+
+    let server = RunningServer::start_in(restored, &[]);
+    let (ready_headers, ready_body) = response_parts(&server.request("GET", "/readyz"));
+    assert!(ready_headers.starts_with("HTTP/1.1 200"), "{ready_headers}");
+    assert_eq!(ready_body, b"ready\n");
+    let (nar_headers, nar_body) =
+        response_parts(&server.request("GET", &format!("/nar/{NARJAR_HASH}.nar")));
+    assert!(nar_headers.starts_with("HTTP/1.1 200"), "{nar_headers}");
+    assert_eq!(nar_body, NAR_BYTES);
+    let (signal, status) = server.stop();
+    assert!(signal.success(), "restored server should receive SIGTERM");
+    assert!(status.success(), "restored server should shut down cleanly");
+}
+
+#[test]
+fn dirty_start_rejects_a_malformed_published_narinfo() {
+    let data_dir = init_data_dir("dirty-start-malformed-narinfo");
+    fs::remove_file(data_dir.join(".narjar-clean")).expect("clean marker should exist");
+    let recovery = data_dir.join(".narjar-recovery");
+    fs::write(&recovery, b"").expect("recovery marker should be created");
+    fs::set_permissions(
+        &recovery,
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("recovery marker should be private");
+    fs::write(
+        data_dir.join("00000000000000000000000000000000.narinfo"),
+        b"not a narinfo\n",
+    )
+    .expect("malformed narinfo should be written");
+
+    let output = run(&[
+        "serve",
+        "--data-dir",
+        data_dir.to_str().expect("temporary path should be UTF-8"),
+        "--listen",
+        "127.0.0.1:0",
+    ]);
+    assert!(!output.status.success(), "dirty start must fail closed");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("published narinfo is not trusted"),
+        "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        data_dir.join(".narjar-recovery").exists(),
+        "failed recovery must retain its marker"
     );
 }
 

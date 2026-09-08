@@ -5,7 +5,7 @@ GET	/nix-cache-info	200	-
 GET	/00000000000000000000000000000000.narinfo	404	-
 HEAD	/00000000000000000000000000000000.narinfo	404	-
 HEAD	/nar/0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl.nar	404	-
-PUT	/nix-cache-info	201	cache-info
+PUT	/nix-cache-info	200	cache-info
 PUT	/nar/0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl.nar	201	nar
 PUT	/00000000000000000000000000000000.narinfo	201	narinfo
 PUT	/nix-cache-info	200	cache-info

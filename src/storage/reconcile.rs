@@ -41,6 +41,21 @@ impl ReconcileEntry {
     }
 }
 
+impl ReconcileClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NarObject => "nar_object",
+            Self::NarInfo => "narinfo",
+            Self::Realisation => "realisation",
+            Self::TempYoung => "temp_young",
+            Self::TempStale => "temp_stale",
+            Self::InvalidFilename => "invalid_filename",
+            Self::UnexpectedType => "unexpected_type",
+            Self::UnknownFile => "unknown_file",
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct ReconcileReport {
     entries: Vec<ReconcileEntry>,
@@ -96,6 +111,12 @@ pub(super) fn scan(
         };
         found.record(relative, class, entry_identity_at(&nar_directory, &name)?);
     }
+    scan_temps(
+        &mut found,
+        &storage.nar_temp_directory()?,
+        Path::new("nar/.tmp"),
+        stale_before,
+    )?;
 
     scan_temps(
         &mut found,
@@ -279,7 +300,7 @@ fn valid_temp_filename(name: &OsStr) -> bool {
     let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".part")) else {
         return false;
     };
-    let Some(body) = ["nar-", "narinfo-", "realisation-"]
+    let Some(body) = ["cache-info-", "nar-", "narinfo-", "realisation-"]
         .into_iter()
         .find_map(|prefix| stem.strip_prefix(prefix))
     else {

@@ -3,8 +3,8 @@ use std::{collections::HashSet, io, path::Path};
 use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
     storage::{
-        NarObjectId, StoreHash, entry_is_regular_at, file_matches, nar_file_matches,
-        open_directory, open_directory_at, open_regular_at, read_dir_names,
+        NarObjectId, StoreHash, entry_is_regular_at, file_matches, for_each_dir_name,
+        nar_file_matches, open_directory, open_directory_at, open_regular_at, read_dir_names,
     },
 };
 
@@ -100,6 +100,40 @@ pub struct Inventory {
 }
 
 impl Inventory {
+    pub fn can_serve_streaming(root: &Path, trusted: &TrustedPublicKeys) -> io::Result<bool> {
+        let root_directory = open_directory(root)?;
+        let mut can_serve = true;
+        for_each_dir_name(&root_directory, |name| {
+            let Some(name) = name.to_str() else {
+                return Ok(true);
+            };
+            let Some(route) = name.strip_suffix(".narinfo") else {
+                return Ok(true);
+            };
+            let Ok(store) = StoreHash::parse(route) else {
+                return Ok(true);
+            };
+            let name = std::ffi::OsStr::new(name);
+            if !entry_is_regular_at(&root_directory, name)? {
+                can_serve = false;
+                return Ok(false);
+            }
+            match trusted.inspect(
+                &store,
+                read_narinfo_file(open_regular_at(&root_directory, name)?)?,
+            ) {
+                Ok(_) => Ok(true),
+                Err(
+                    PublishedNarInfoError::Malformed | PublishedNarInfoError::UntrustedSignature,
+                ) => {
+                    can_serve = false;
+                    Ok(false)
+                }
+            }
+        })?;
+        Ok(can_serve)
+    }
+
     pub fn scan(root: &Path, trusted: &TrustedPublicKeys, verify_hashes: bool) -> io::Result<Self> {
         let mut entries = Vec::new();
         let mut referenced = HashSet::new();

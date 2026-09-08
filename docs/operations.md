@@ -143,13 +143,15 @@ NARJAR_WORKERS
 NARJAR_MAX_IN_FLIGHT
 NARJAR_MAX_NAR_BYTES
 NARJAR_MIN_FREE_BYTES
+NARJAR_SHUTDOWN_GRACE_SECONDS
 ~~~
 
 The compiled defaults bind to loopback, use 8 workers, admit at most 64
 in-flight requests, cap one NAR at 16 GiB, and preserve a 1 GiB free-space
 reserve. `--data-dir` has no default. A flag or environment value may override
-each numeric policy; zero is valid only for the free-space reserve. Listen
-addresses must be numeric IP socket addresses so startup never depends on DNS.
+each numeric policy; the shutdown grace defaults to 30 seconds and must be
+positive, while zero is valid only for the free-space reserve. Listen addresses
+must be numeric IP socket addresses so startup never depends on DNS.
 
 A TOML configuration file is an explicit v0.1 non-goal. It would add a parser
 and duplicate the systemd/container environment boundary. If future option
@@ -295,6 +297,37 @@ published pair. list-orphans filters the read-only report.
 
 No command turns an orphan into a published path.
 
+## Backup and restore
+
+The portable backup boundary is the complete data directory, copied while the
+serving process is stopped and the DATA lease is released. A live `rsync` is
+convergent synchronization, not a point-in-time backup: it may capture a NAR
+and its narinfo at different moments.
+
+For a consistent portable copy:
+
+1. Stop Narjar and wait for the process to exit.
+2. Copy the complete data directory, including `.narjar-clean`,
+   `.narjar-recovery`, `lock`, `nar/`, `.tmp/`, `realisations/`, `nix-cache-info`,
+   `trusted-public-keys`, and `auth/`.
+3. Preserve the directory and file permissions; do not expose the copy while
+   it contains credentials.
+4. On the destination, run `doctor`, `reconcile --verify-hashes`, and `verify`
+   before starting Narjar.
+5. Start Narjar and require `GET /readyz` to return `200` before routing
+   consumers to it.
+
+`trusted-public-keys` and `auth/*.tokens` are part of the service boundary. Keep
+them only when restoring the same trust and authorization boundary, and protect
+the backup accordingly. If they are intentionally excluded, install fresh
+trust material and rotate all tokens before starting the destination; a
+restore without those files must not be treated as ready.
+
+Filesystem snapshots are an external alternative, but the snapshot must include
+the recovery marker, trust material, and credentials according to that same
+policy. A corrupt or incomplete copy must remain offline: `doctor`,
+`reconcile`, or `verify` must pass before readiness is considered meaningful.
+
 ## Deletion and retention GC
 
 `delete` supports offline logical deletion of one store hash:
@@ -344,17 +377,28 @@ GET /metrics exposes Prometheus text generated directly from atomic counters,
 without a metrics crate. Private-read mode requires read authorization.
 Required series:
 
-- narjar_http_requests_total by method/route/status class
-- narjar_http_bytes_in_total and bytes_out_total
-- narjar_auth_failures_total by read/write
-- narjar_validation_failures_total by stable class
-- narjar_uploads_in_flight and requests_in_flight
-- narjar_temp_objects observed at startup/reconcile
-- narjar_disk_full_total
-- narjar_capacity_failures_total with fixed `no_space`, `quota`, `inodes`, and
-  `read_only` reasons
-- narjar_publications_total
-- narjar_publication_duration_seconds count/sum/max approximation
+- `narjar_http_requests_total{method,route,status}` uses fixed method, route,
+  and HTTP status-class values (`2xx` through `5xx` plus `other`).
+- `narjar_http_bytes_in_total` counts accepted upload body bytes and
+  `narjar_http_bytes_out_total` counts served artifact and endpoint bytes.
+- `narjar_auth_failures_total{scope}` uses only `read` and `write` scopes.
+- `narjar_validation_failures_total{class}` uses only `body`, `nar`, and
+  `narinfo` classes.
+- `narjar_uploads_in_flight` and `narjar_requests_in_flight` are RAII gauges
+  and return to zero after each request completes.
+- `narjar_temp_objects` is the current process's temporary-publication count;
+  it is updated at create/remove boundaries and does not perform an online
+  cache inventory.
+- `narjar_disk_full_total` and `narjar_capacity_failures_total{reason}` use
+  fixed `no_space`, `quota`, `inodes`, and `read_only` reasons.
+- `narjar_publications_total` and the
+  `narjar_publication_duration_seconds` count/sum/max summary cover each
+  publication attempt.
+- `narjar_storage_capacity_bytes{kind}` and
+  `narjar_storage_capacity_inodes{kind}` report `total` and `available`
+  values from `statvfs` on the NAR destination; `narjar_storage_read_only`
+  reports its read-only flag. These are O(1) descriptor queries and omit the
+  series when the destination probe fails.
 - narjar_ready 0/1
 
 Labels are fixed enums; no request IDs, paths, token names, or hashes become
@@ -366,7 +410,9 @@ SIGINT/SIGTERM set a shutdown flag, stop admitting new requests, and wait up to
 the configured grace period for workers. In-flight uploads may finish within
 the grace period; after it, process termination leaves only reconcile-safe
 temporaries or already durable immutable files. A second signal exits
-immediately.
+immediately. Set systemd `TimeoutStopSec` above the grace period, plus a small
+supervisor margin, when the service should be allowed to drain rather than be
+externally killed.
 
 Implementation may use signal-hook as the one justified signal dependency.
 There is no control socket.
@@ -396,6 +442,7 @@ A minimal NixOS configuration is:
     maxInFlight = 64;
     maxNarBytes = 16 * 1024 * 1024 * 1024;
     minFreeBytes = 1024 * 1024 * 1024;
+    shutdownGraceSeconds = 30;
 
     auth.trustedPublicKeys = "/run/keys/narjar-trusted-public-keys";
     auth.readTokens = "/run/keys/narjar-read-tokens";
@@ -457,6 +504,15 @@ provide a path mount unit must supply an administrator-owned readiness
 dependency. Narjar never mounts or creates the dataset.
 The NixOS VM check performs state initialization and HTTP requests under those
 restrictions, and verifies the credential and state modes.
+
+The separate `filesystem-conformance` NixOS check exercises a real empty
+block device formatted as ext4 and a tmpfs DATA mount. It verifies initial
+layout creation, restart/reopen across an unmount/remount, and HTTP service.
+The existing NixOS module check separately verifies refusal when a declared
+DATA mount is unavailable. XFS, btrfs, ZFS, overlay, bind-mount variants,
+quota/inode exhaustion, read-only remounts, and Darwin APFS remain unverified
+until host-specific lanes provide those fixtures; they must not be advertised
+as covered by the portable check.
 
 `GET /healthz` is the liveness endpoint. `GET /readyz` is the readiness
 endpoint and requires a read token when private-read mode is enabled. Socket

@@ -79,6 +79,7 @@ serving process stopped:
 
 ```sh
 nix run . -- verify --data-dir ./cache
+nix run . -- doctor --data-dir ./cache --json
 nix run . -- reconcile --data-dir ./cache --verify-hashes
 nix run . -- list-orphans --data-dir ./cache --verify-hashes
 nix run . -- stats --url http://127.0.0.1:5000
@@ -92,6 +93,15 @@ for accounting; compression, snapshots, reflinks, and sparse extents are
 filesystem concerns outside that accounting. `delete` removes publication
 metadata but deliberately leaves the NAR object; garbage collection handles
 reclaiming unreferenced objects.
+
+`doctor` is a bounded, non-mutating preflight. It reports the fixed layout,
+permissions and ownership, destination capacity/inodes, read-only state, mount
+device observations, and whether the DATA lease is currently available. Its
+JSON output has schema version `1`; unavailable platform facts are reported as
+unavailable rather than inferred.
+
+For the stopped-service backup and restore procedure, including trust and
+credential handling, see [the backup and restore runbook](docs/operations.md#backup-and-restore).
 
 ## Build and test
 
