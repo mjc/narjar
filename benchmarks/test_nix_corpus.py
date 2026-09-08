@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from benchmarks.nix_corpus import sri_sha256, validate_manifest
+from benchmarks.nix_corpus import build_command, sri_sha256, validate_manifest
 
 
 def entry(path: str = "/nix/store/example") -> dict:
@@ -46,6 +46,30 @@ class CorpusManifestTests(unittest.TestCase):
         errors = validate_manifest(manifest)
         self.assertTrue(any("duplicate path" in error for error in errors))
         self.assertTrue(any("unknown paths" in error for error in errors))
+
+    def test_build_command_pins_sorted_input_overrides(self) -> None:
+        target = {
+            "id": "generation-1",
+            "flake_ref": "flake",
+            "flake_attr": "nixosConfigurations.generation",
+            "input_overrides": {"z-input": "z-ref", "a-input": "a-ref"},
+        }
+        self.assertEqual(
+            build_command(target),
+            [
+                "nix",
+                "build",
+                "--no-link",
+                "--print-out-paths",
+                "--override-input",
+                "a-input",
+                "a-ref",
+                "--override-input",
+                "z-input",
+                "z-ref",
+                "flake#nixosConfigurations.generation",
+            ],
+        )
 
     def test_coverage_requirements_are_enforced(self) -> None:
         manifest = {

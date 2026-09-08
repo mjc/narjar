@@ -3,13 +3,17 @@
 `benchmarks/nix_corpus.py` is the single collection and validation command for
 the real-Nix corpus. It exports uncompressed NAR streams and records both the
 Nix `narHash`/`narSize` and a SHA-256 of the exact exported bytes.
+The harness prints every external command to stderr, so regeneration logs
+preserve the exact build, closure, and byte-export commands.
 
 Start from `benchmarks/corpus-spec.example.json`, replace the pinned commits,
 flake attributes, and (when already materialized) generation roots, and add one
 target for each permitted generation. `--build` materializes a target with
-`nix build <flake_ref>#<flake_attr>` before collecting its closure. A target's
-closure is collected with `nix-store --query --requisites`; missing roots or
-metadata fail the run.
+`nix build <flake_ref>#<flake_attr>` before collecting its closure. Targets may
+also declare `input_overrides` when a historical flake input needs a public,
+pinned replacement; the harness emits deterministic `--override-input` flags.
+A target's closure is collected with `nix-store --query --requisites`; missing
+roots or metadata fail the run.
 
 ```sh
 python benchmarks/nix_corpus.py collect \

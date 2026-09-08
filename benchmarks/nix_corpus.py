@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -43,13 +44,14 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def run(command: list[str]) -> str:
+    print(f"$ {shlex.join(command)}", file=sys.stderr)
     try:
         result = subprocess.run(command, check=True, text=True, capture_output=True)
     except FileNotFoundError as exc:
         raise RuntimeError(f"required command is not installed: {command[0]}") from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout).strip()
-        raise RuntimeError(f"{' '.join(command)} failed: {detail}") from exc
+        raise RuntimeError(f"{shlex.join(command)} failed: {detail}") from exc
     return result.stdout
 
 
@@ -88,8 +90,10 @@ def sri_sha256(hex_digest: str) -> str:
 
 
 def dump_nar(store_path: str, destination: Path | None = None) -> tuple[int, str]:
+    command = ["nix-store", "--dump", store_path]
+    print(f"$ {shlex.join(command)}", file=sys.stderr)
     process = subprocess.Popen(
-        ["nix-store", "--dump", store_path],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -133,13 +137,30 @@ def target_fields(target: dict[str, Any]) -> tuple[str, str, list[str], list[str
     return target["id"], target["subset"], families, [str(target["generation"]), target["nixpkgs_revision"]]
 
 
+def build_command(target: dict[str, Any]) -> list[str]:
+    attribute = target.get("flake_attr")
+    if not attribute:
+        raise ValueError(f"target {target['id']} has no flake_attr for rebuilding")
+    command = ["nix", "build", "--no-link", "--print-out-paths"]
+    overrides = target.get("input_overrides", {})
+    if not isinstance(overrides, dict) or not all(
+        isinstance(name, str) and isinstance(reference, str)
+        for name, reference in overrides.items()
+    ):
+        raise ValueError(f"target {target['id']} has invalid input_overrides")
+    for name, reference in sorted(overrides.items()):
+        command.extend(["--override-input", name, reference])
+    command.append(f"{target['flake_ref']}#{attribute}")
+    return command
+
+
 def resolve_root(target: dict[str, Any], build: bool) -> str:
     root = target.get("root")
     if build or not root:
         attribute = target.get("flake_attr")
         if not attribute:
             raise ValueError(f"target {target['id']} has no flake_attr for rebuilding")
-        output = run(["nix", "build", "--no-link", "--print-out-paths", f"{target['flake_ref']}#{attribute}"])
+        output = run(build_command(target))
         roots = [line for line in output.splitlines() if line]
         if len(roots) != 1:
             raise ValueError(f"flake target {target['id']} returned {len(roots)} paths")
@@ -372,9 +393,18 @@ def validate_command(manifest_path: Path, artifact_root: Path | None, store: boo
             if entry.get("artifact_sha256") and digest != entry["artifact_sha256"]:
                 errors.append(f"store/artifact bytes differ for {entry['path']}")
     if rebuild:
-        rebuilt: dict[tuple[str, str], str | Exception] = {}
+        rebuilt: dict[tuple[str, str, tuple[str, ...]], str | Exception] = {}
         for target in manifest.get("targets", []):
-            key = (target.get("flake_ref", ""), target.get("flake_attr", ""))
+            try:
+                build_args = build_command(target)
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            key = (
+                target.get("flake_ref", ""),
+                target.get("flake_attr", ""),
+                tuple(build_args[4:-1]),
+            )
             if key in rebuilt:
                 result = rebuilt[key]
                 if isinstance(result, Exception):
