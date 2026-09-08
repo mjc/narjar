@@ -27,7 +27,7 @@
     }:
     let
       lib = nixpkgs.lib;
-      rustVersion = "1.85.1";
+      rustVersion = "1.98.1";
       supportedSystems = [
         "aarch64-darwin"
         "x86_64-linux"
@@ -334,7 +334,9 @@
             touch $out
           '';
           module-evaluation = env.pkgs.writeText "narjar-module-evaluation" (
-            import ./nix/module-eval-test.nix {pkgs = env.pkgs;}
+            import ./nix/module-eval-test.nix {
+              pkgs = import nixpkgs {system = "x86_64-linux";};
+            }
           );
         in
         {

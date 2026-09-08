@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as FmtWrite,
     io::{self, Cursor, Read, Write},
     net::TcpStream,
     ops::Range,
@@ -389,22 +390,27 @@ impl<R> Response<R> {
     where
         R: Read,
     {
+        let mut headers = String::new();
         write!(
-            stream,
+            &mut headers,
             "HTTP/1.1 {} {}\r\n",
             self.status.0,
             reason(self.status.0)
-        )?;
+        )
+        .expect("writing response status to String cannot fail");
         for header in self.headers[..self.header_count].iter().flatten() {
-            write!(stream, "{}: ", header.name)?;
+            write!(&mut headers, "{}: ", header.name)
+                .expect("writing response header to String cannot fail");
             match &header.value {
-                HeaderValueOwned::Static(value) => stream.write_all(value.as_bytes())?,
-                HeaderValueOwned::Owned(value) => stream.write_all(value.as_bytes())?,
+                HeaderValueOwned::Static(value) => headers.push_str(value),
+                HeaderValueOwned::Owned(value) => headers.push_str(value),
             }
-            stream.write_all(b"\r\n")?;
+            headers.push_str("\r\n");
         }
-        writeln!(stream, "Content-Length: {}\r", self.content_length)?;
-        stream.write_all(b"Connection: close\r\n\r\n")?;
+        writeln!(&mut headers, "Content-Length: {}\r", self.content_length)
+            .expect("writing response length to String cannot fail");
+        headers.push_str("Connection: close\r\n\r\n");
+        stream.write_all(headers.as_bytes())?;
         if !head {
             io::copy(&mut self.body, stream)?;
         }
