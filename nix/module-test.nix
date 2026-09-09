@@ -84,7 +84,7 @@
         what = "/dev/narjar-missing";
         where = "/var/lib/narjar-mounted";
         type = "ext4";
-        options = "noauto,x-systemd.device-timeout=1ms";
+        options = "noauto,nofail,x-systemd.device-timeout=1ms";
       }
     ];
   };
