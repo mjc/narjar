@@ -21,6 +21,8 @@ Narjar completed the full benchmark successfully. The important medians are:
 The result confirms that the remaining performance work is in Narjar's
 publication and request path, not idle arena retention: RSS remains small,
 while metadata/Range and upload latency remain materially behind Bincache.
-The next implementation is NARJ-109's dedicated publication worker, with
-the existing streaming and bounded-queue constraints and no jemalloc or
-`MALLOC_ARENA_MAX` workaround.
+The next performance implementation is NARJ-109's dedicated publication
+worker, with the existing streaming and bounded-queue constraints and no
+jemalloc or `MALLOC_ARENA_MAX` workaround. Independently, the tracker’s
+immediate verification priority is NARJ-112, which unblocks the urgent
+real-Nix corpus issue NARJ-81.
