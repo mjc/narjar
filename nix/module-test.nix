@@ -130,7 +130,7 @@
     static.succeed("systemctl stop narjar.service")
     static.succeed("rm -f /var/lib/narjar-static/nix-cache-info && touch /var/lib/narjar-static/incompatible")
     static.succeed("! systemctl start narjar.service")
-    static.succeed("journalctl -u narjar.service -b --no-pager | grep -F 'data directory is not empty'")
+    static.succeed("journalctl -u narjar.service -b --no-pager | grep -F 'data directory has unexpected entries'")
     static.succeed("systemctl stop narjar.service || true")
     static.succeed("systemctl reset-failed narjar.service")
     static.succeed("rm -rf /var/lib/narjar-static && install -d -m 0700 -o narjar -g narjar /var/lib/narjar-static")
