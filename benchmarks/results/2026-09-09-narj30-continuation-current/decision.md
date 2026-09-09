@@ -6,7 +6,8 @@ Bincache reference. It used three warmups, 15 measured repetitions, the
 candidates. `commands.txt` contains the commands and requests executed;
 `samples.jsonl` contains the raw measurements.
 
-Narjar completed the full benchmark successfully. The important medians are:
+Narjar completed the full benchmark successfully. `samples.jsonl` contains
+1,336 raw samples. The important medians are:
 
 | Case | Narjar | Bincache |
 | --- | ---: | ---: |
