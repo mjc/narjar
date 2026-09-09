@@ -1,0 +1,16 @@
+{
+  "bincache": {
+    "accept_encoding": "identity",
+    "constitution_matched": true,
+    "nar_url": "nar/17z8cmcb4fcwngn3y4z8c3wca07rr45hzbwh9r243m8wxr2mpf5v.nar",
+    "narinfo_compression": "none",
+    "upload_compression_query": "none"
+  },
+  "narjar": {
+    "accept_encoding": "identity",
+    "constitution_matched": true,
+    "nar_url": "nar/17z8cmcb4fcwngn3y4z8c3wca07rr45hzbwh9r243m8wxr2mpf5v.nar",
+    "narinfo_compression": "none",
+    "upload_compression_query": "none"
+  }
+}

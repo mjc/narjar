@@ -1,0 +1,16 @@
+[
+  {
+    "candidate": "narjar",
+    "steps": [
+      "restart serve; reconciliation is automatic"
+    ]
+  },
+  {
+    "candidate": "bincache",
+    "steps": [
+      "stop serve",
+      "run bincache reconcile",
+      "start serve"
+    ]
+  }
+]
