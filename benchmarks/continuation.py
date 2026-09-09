@@ -187,6 +187,12 @@ class Candidate:
         token_file = self.root / "push-token"
 
         if self.name == "narjar":
+            command(
+                str(self.binary),
+                "init",
+                "--data-dir",
+                str(self.data_dir),
+            )
             public = self.root / "public-key"
             run_logged(
                 [
