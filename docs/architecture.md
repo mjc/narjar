@@ -118,7 +118,7 @@ DATA/
   auth/
     read.tokens                         mode 0600, hashed records
     write.tokens                        mode 0600, hashed records
-  trusted-public-keys                   mode 0644
+  trusted-public-keys                   mode 0600
   lock                                  single-writer process lock
 ~~~
 

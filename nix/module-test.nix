@@ -32,7 +32,7 @@
         printf '%s\n' 'write 0000000000000000000000000000000000000000000000000000000000000000' > /run/narjar-test/write.tokens
         printf '%s\n' 'narjar-test:11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=' > /run/narjar-test/trusted-public-keys
         chmod 0600 /run/narjar-test/write.tokens
-        chmod 0644 /run/narjar-test/trusted-public-keys
+        chmod 0600 /run/narjar-test/trusted-public-keys
       '';
     };
     systemd.services.narjar.requires = ["narjar-test-credentials.service"];
@@ -96,7 +96,7 @@
     machine.succeed("curl --fail http://127.0.0.1:5000/healthz")
     machine.succeed("curl --fail http://127.0.0.1/readyz")
     machine.succeed("test \"$(stat -Lc %a /var/lib/narjar)\" = 700")
-    machine.succeed("test \"$(stat -c %a /var/lib/narjar/trusted-public-keys)\" = 644")
+    machine.succeed("test \"$(stat -c %a /var/lib/narjar/trusted-public-keys)\" = 600")
     machine.succeed("test \"$(stat -c %a /var/lib/narjar/auth/write.tokens)\" = 600")
     machine.succeed("cmp /run/narjar-test/write.tokens /var/lib/narjar/auth/write.tokens")
     machine.succeed("test -f /var/lib/narjar/nix-cache-info")
@@ -146,7 +146,7 @@
     assert before == after, (before, after)
 
     static.succeed("printf '%s\\n' 'preserved 0000000000000000000000000000000000000000000000000000000000000000' > /var/lib/narjar-static/auth/write.tokens && chmod 0600 /var/lib/narjar-static/auth/write.tokens")
-    static.succeed("printf '%s\\n' 'narjar-test:11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=' > /var/lib/narjar-static/trusted-public-keys && chmod 0644 /var/lib/narjar-static/trusted-public-keys")
+    static.succeed("printf '%s\\n' 'narjar-test:11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=' > /var/lib/narjar-static/trusted-public-keys && chmod 0600 /var/lib/narjar-static/trusted-public-keys")
     static.succeed("systemctl restart narjar.service")
     static.wait_for_unit("narjar.service")
     static.succeed("grep -Fx 'preserved 0000000000000000000000000000000000000000000000000000000000000000' /var/lib/narjar-static/auth/write.tokens")

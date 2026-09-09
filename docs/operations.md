@@ -181,7 +181,7 @@ The service runs as a dedicated unprivileged user.
 | auth token files | 0600 | hashes, still security-sensitive |
 | generated signing secret | 0600 | create outside DATA and provision as a runtime credential |
 | generated signing public key | 0644 | distribute to producers and trust stores as required |
-| trusted-public-keys | 0644 or stricter | public material |
+| trusted-public-keys | 0600 | trust boundary material |
 | lock | 0600 | single serving process |
 
 The reverse proxy does not read DATA.

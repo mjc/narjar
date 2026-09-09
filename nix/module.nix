@@ -50,7 +50,7 @@
       name = "trusted-public-keys";
       source = cfg.auth.trustedPublicKeys;
       target = "trusted-public-keys";
-      mode = "0644";
+      mode = "0600";
     }
   ];
   credentialOwner = lib.optionalString (!cfg.dynamicUser) ''
