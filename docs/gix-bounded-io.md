@@ -50,7 +50,9 @@ The 32-reader result is consistent with each `try_find` owning a complete
 8 MiB output buffer. It is not an O(1)-with-payload read path: the result is
 about 256 MiB before allocator/page-accounting differences. The write path is
 bounded for the generated 1 GiB stream, but that does not make whole-file
-reads viable.
+reads viable. NARJ-75's frozen per-operation working-set budget is 16 MiB;
+an 8 MiB object is below that individual limit, but a whole-file object can
+exceed it as soon as the object size crosses the budget.
 
 ## Boundary behavior
 
@@ -68,9 +70,12 @@ reads viable.
 
 Whole-file gix objects are rejected from Narjar's hot read path. A future gix
 prototype would need bounded chunks, an explicit EOF/length wrapper, a strict
-process concurrency budget, and separate tests for packed/delta objects. The
-current evidence does not justify adding gix to Narjar or treating its
-per-object allocation limit as a process-wide memory limit.
+process concurrency budget, caller-side expected-OID validation, and separate
+tests for packed/delta objects. The current evidence does not justify adding
+gix to Narjar or treating its per-object allocation limit as a process-wide
+memory limit. The result is therefore **no gix for whole-file hot I/O**;
+bounded chunks remain a separately authorized prototype, not an accepted
+configuration.
 
 Raw probe outputs and the exact commands are summarized in
 [`docs/evidence/gix-bounded-io.tsv`](evidence/gix-bounded-io.tsv). The existing
