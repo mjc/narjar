@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+BINARY="$ROOT/target/release/nar-report"
+SOURCE="$SCRIPT_DIR/nar-report.rs"
+
+MANIFEST=""
+SCANNER="$ROOT/target/release/nar-scan"
+SCAN=""
+ARTIFACT_ROOT=""
+OUTPUT=""
+THRESHOLDS=(0)
+OBJECT_OVERHEAD_BYTES=128
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nar-report --manifest FILE --output DIR [options]
+
+Options:
+  --scanner PATH                 nar-scan binary (default: target/release/nar-scan)
+  --scan PATH                   reuse an existing scanner TSV
+  --artifact-root DIR           resolve relative manifest artifacts under DIR
+  --threshold BYTES             include an object-size threshold (repeatable)
+  --object-overhead-bytes BYTES estimated bytes per unique object (default: 128)
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+log_command() {
+  printf '$' >&2
+  printf ' %q' "$@" >&2
+  printf '\n' >&2
+}
+
+while (($#)); do
+  case "$1" in
+    --manifest) MANIFEST=${2:-}; shift 2 ;;
+    --scanner) SCANNER=${2:-}; shift 2 ;;
+    --scan) SCAN=${2:-}; shift 2 ;;
+    --artifact-root) ARTIFACT_ROOT=${2:-}; shift 2 ;;
+    --output) OUTPUT=${2:-}; shift 2 ;;
+    --threshold) THRESHOLDS+=("${2:-}"); shift 2 ;;
+    --object-overhead-bytes) OBJECT_OVERHEAD_BYTES=${2:-}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$MANIFEST" ]] || die "--manifest is required"
+[[ -n "$OUTPUT" ]] || die "--output is required"
+[[ -f "$MANIFEST" ]] || die "manifest does not exist: $MANIFEST"
+[[ ! -e "$OUTPUT" ]] || die "output already exists: $OUTPUT"
+command -v jq > /dev/null || die "jq is required; run inside nix develop"
+command -v rustc > /dev/null || die "rustc is required; run inside nix develop"
+
+mkdir -p "$OUTPUT"
+COMMAND_LOG="$OUTPUT/commands.txt"
+: > "$COMMAND_LOG"
+chmod 600 "$COMMAND_LOG"
+
+if [[ ! -x "$BINARY" || "$SOURCE" -nt "$BINARY" ]]; then
+  mkdir -p "$(dirname -- "$BINARY")"
+  log_command rustc -O -o "$BINARY" "$SOURCE"
+  rustc -D warnings -O -o "$BINARY" "$SOURCE"
+fi
+
+ENTRIES="$OUTPUT/entries.json"
+INPUTS="$OUTPUT/objects.inputs.txt"
+: > "$INPUTS"
+
+while IFS= read -r entry; do
+  artifact=$(jq -r '.artifact // empty' <<< "$entry")
+  [[ -n "$artifact" ]] || die "manifest entry has no artifact"
+  if [[ ! -f "$artifact" && -n "$ARTIFACT_ROOT" ]]; then
+    artifact="$ARTIFACT_ROOT/$(basename -- "$artifact")"
+  fi
+  [[ -f "$artifact" ]] || die "missing artifact: $artifact"
+  jq --arg artifact "$artifact" '. + {artifact: $artifact}' <<< "$entry"
+done < <(jq -c '.entries[]' "$MANIFEST") > "$ENTRIES"
+
+if [[ -z "$SCAN" ]]; then
+  SCAN="$OUTPUT/objects.tsv"
+  jq -r '.artifact' "$ENTRIES" | sort -u > "$INPUTS"
+  log_command "$SCANNER" --input-list "$INPUTS" --output "$SCAN"
+  "$SCANNER" --input-list "$INPUTS" --output "$SCAN" 2>&1 | tee -a "$COMMAND_LOG"
+else
+  [[ -f "$SCAN" ]] || die "scan does not exist: $SCAN"
+  cp -- "$SCAN" "$OUTPUT/objects.tsv"
+  printf '$ reused %q\n' "$SCAN" >> "$COMMAND_LOG"
+  SCAN="$OUTPUT/objects.tsv"
+fi
+
+ENRICHED="$OUTPUT/objects-enriched.tsv"
+log_command "$BINARY" --scan "$SCAN" --output "$ENRICHED"
+"$BINARY" --scan "$SCAN" --output "$ENRICHED" 2>&1 | tee -a "$COMMAND_LOG"
+
+SCAN_JSON="$OUTPUT/objects.json"
+jq -Rsc '
+  split("\n") | map(select(length > 0) | split("\t")) |
+  {
+    objects: map(select(.[0] == "O") | {
+      path: .[1], kind: .[2], size: (.[3] | tonumber), digest: .[4],
+      offset: (if .[5] == "-" then null else (.[5] | tonumber) end),
+      executable: (.[6] == "1"), payload_hex: .[7], identity: (.[8] | tonumber),
+      collision: (.[9] == "1")
+    }),
+    nars: map(select(.[0] == "N") | {
+      path: .[1], raw_size: (.[2] | tonumber), raw_sha256: .[3], root: .[4],
+      entries: (.[5] | tonumber), files: (.[6] | tonumber), symlinks: (.[7] | tonumber),
+      identity: (.[8] | tonumber), collision: (.[9] == "1")
+    })
+  }
+' "$ENRICHED" > "$SCAN_JSON"
+
+jq -n \
+  --slurpfile manifest "$MANIFEST" \
+  --slurpfile entries "$ENTRIES" \
+  --slurpfile scan "$SCAN_JSON" \
+  --argjson thresholds "$(printf '%s\n' "${THRESHOLDS[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) | tonumber) | unique | sort')" \
+  --argjson object_overhead "$OBJECT_OVERHEAD_BYTES" '
+  def size_bucket($size):
+    if $size < 1024 then "<1KiB"
+    elif $size < 1024 * 1024 then "1KiB-1MiB"
+    elif $size < 16 * 1024 * 1024 then "1MiB-16MiB"
+    elif $size < 1024 * 1024 * 1024 then "16MiB-1GiB"
+    else ">=1GiB" end;
+  def aggregate_objects($objects; $minimum):
+    ($objects | map(select(.size >= $minimum))) as $selected |
+    ($selected | group_by([.kind, .size, .identity]) | map(.[0])) as $unique |
+    {
+      occurrences: ($selected | length),
+      unique_objects: ($unique | length),
+      total_payload_bytes: ($selected | map(.size) | add // 0),
+      unique_payload_bytes: ($unique | map(.size) | add // 0),
+      duplicate_payload_bytes: (($selected | map(.size) | add // 0) - ($unique | map(.size) | add // 0)),
+      collision_count: ($selected | map(select(.collision)) | length)
+    };
+  def aggregate_nars($nars):
+    ($nars | group_by(.identity) | map(.[0])) as $unique |
+    {
+      artifact_occurrences: ($nars | length),
+      logical_nar_bytes: ($nars | map(.raw_size) | add // 0),
+      unique_nar_bytes: ($unique | map(.raw_size) | add // 0),
+      duplicate_nar_bytes: (($nars | map(.raw_size) | add // 0) - ($unique | map(.raw_size) | add // 0)),
+      collision_count: ($nars | map(select(.collision)) | length)
+    };
+  def field_values($entry; $field):
+    if ($entry[$field] | type) == "array" then $entry[$field]
+    elif $entry[$field] == null then ["unknown"]
+    else [($entry[$field] | tostring)] end;
+  def build_slices($entries):
+    reduce $entries[] as $entry
+      ({all: {all: []}, targets: {}, machines: {}, families: {}, generations: {}, subsets: {}};
+       .all.all |= (. + [$entry.artifact] | unique) |
+       reduce [["targets", "targets"], ["machines", "machines"], ["families", "families"], ["generations", "generations"], ["subsets", "subset"]][] as $dimension
+         (.;
+          reduce (field_values($entry; $dimension[1])[]) as $value
+            (.;
+             .[$dimension[0]][$value] = ((.[$dimension[0]][$value] // []) + [$entry.artifact] | unique)
+            )
+       )
+      );
+  $manifest[0] as $manifest |
+  $entries as $entries |
+  $scan[0] as $scan |
+  (reduce $scan.objects[] as $object ({}; .[$object.path] += [$object])) as $objects_by_path |
+  (reduce $scan.nars[] as $nar ({}; .[$nar.path] = $nar)) as $nars_by_path |
+  (build_slices($entries)) as $slices |
+  def slice_report($paths):
+    ([$paths[] as $path | ($objects_by_path[$path] // [])[]]) as $objects |
+    ([$paths[] as $path | $nars_by_path[$path] | select(. != null)]) as $nars |
+    (aggregate_objects($objects; 0)) as $stats |
+    $stats + {
+      estimated_object_overhead_bytes: ($stats.unique_objects * $object_overhead),
+      artifact_files: ($paths | length),
+      nar: aggregate_nars($nars)
+    };
+  {
+    schema_version: 1,
+    manifest_schema_version: $manifest.schema_version,
+    manifest_entries: ($entries | length),
+    scanner_artifacts: ($scan.nars | length),
+    objects: aggregate_objects($scan.objects; 0),
+    size_buckets: (reduce ["<1KiB", "1KiB-1MiB", "1MiB-16MiB", "16MiB-1GiB", ">=1GiB"][] as $bucket
+      ({}; .[$bucket] = aggregate_objects([$scan.objects[] | select(size_bucket(.size) == $bucket)]; 0))),
+    nar: aggregate_nars($scan.nars),
+    slices: (reduce ($slices | to_entries[]) as $dimension ({};
+      .[$dimension.key] = (reduce ($dimension.value | to_entries[]) as $group ({};
+        .[$group.key] = slice_report($group.value)
+      ))
+    )),
+    thresholds: (reduce $thresholds[] as $threshold ({}; .[($threshold | tostring)] = aggregate_objects($scan.objects; $threshold))),
+    object_overhead_bytes: $object_overhead,
+    whole_nar_deduplication: {
+      logical_manifest_nar_bytes: ($entries | map(.nar_size) | add // 0),
+      unique_artifact_nar_bytes: ($scan.nars | group_by(.path) | map(.[0].raw_size) | add // 0)
+    }
+  }
+  | .whole_nar_deduplication.already_whole_nar_deduplicated_bytes =
+      (.whole_nar_deduplication.logical_manifest_nar_bytes - .whole_nar_deduplication.unique_artifact_nar_bytes)
+' > "$OUTPUT/report.json"
+
+jq . "$OUTPUT/report.json"
