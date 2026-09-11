@@ -207,11 +207,20 @@ operation times out. A reverse proxy may use stricter limits, but direct use
 does not depend on proxy enforcement. NAR size and minimum free-space checks
 happen before and during the stream.
 
-The lock granularity is immutable destination name. Narjar does not create a
-global per-object mutex: concurrent writers stream to separate temporary files,
-then atomic link-no-replace selects one winner. Losers compare the winner and
-return identical success or conflict. This trades duplicate transient I/O for
-no lock map, no unbounded key retention, and deterministic crash behavior.
+Publication is globally serialized by one bounded publication worker and the
+storage publication mutex. The mutex currently covers admission, temporary-file
+creation, the complete request-body stream, validation, durable link, directory
+sync, cleanup, and recovery bookkeeping. Reads continue on the read workers,
+but a later PUT waits behind an earlier slow PUT. The queue is bounded and
+exposes depth and wait metrics; excess requests receive 429 when admission is
+full.
+
+This is an intentional v0.1 simplicity tradeoff: a single recovery marker and
+one publication order are easy to reason about across crashes. Concurrent
+writers still use private temporary files and atomic link-no-replace, so a
+retry is identical success or a deterministic conflict. A future narrower
+commit section must preserve those durability and recovery invariants; it is
+not implied by the current per-object atomicity.
 
 ## Durable upload state machine
 

@@ -10,6 +10,10 @@ use std::{
     os::unix::fs::symlink,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -1656,6 +1660,67 @@ fn xz_publications_serialize_at_1_8_and_32_way_concurrency() {
         assert!(signal.success(), "SIGTERM should be sent");
         assert!(status.success(), "narjar should shut down cleanly");
     }
+}
+
+#[test]
+fn stalled_publication_blocks_following_put_and_reports_queue_wait() {
+    let server = RunningServer::start_with_workers(
+        "publication-head-of-line",
+        2,
+        &["--io-timeout-seconds", "2"],
+    );
+    let path = format!("/nar/{NARJAR_HASH}.nar");
+    let mut stalled = server.open_request("PUT", &path, &[("Content-Length", "6")]);
+    thread::sleep(Duration::from_millis(50));
+
+    thread::scope(|scope| {
+        let completed = Arc::new(AtomicBool::new(false));
+        let second_completed = Arc::clone(&completed);
+        let server_ref = &server;
+        let path_ref = &path;
+        let second = scope.spawn(move || {
+            let response = server_ref.request_with_body("PUT", path_ref, &[], NAR_BYTES);
+            second_completed.store(true, Ordering::Release);
+            response
+        });
+
+        let mut queued = false;
+        for _ in 0..100 {
+            let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
+                .expect("metrics should be UTF-8");
+            if metrics.contains("narjar_publication_queue_depth 1") {
+                queued = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(queued, "following publication never entered the queue");
+        assert!(!completed.load(Ordering::Acquire));
+
+        stalled
+            .write_all(NAR_BYTES)
+            .expect("stalled upload body should be writable");
+        let first_response = read_http_response(&mut stalled);
+        assert!(first_response.starts_with(b"HTTP/1.1 201 Created\r\n"));
+
+        let second_response = second.join().expect("following upload should not panic");
+        assert!(second_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    });
+
+    let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
+        .expect("metrics should be UTF-8");
+    assert!(
+        metrics.contains("narjar_publication_queue_depth 0"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("narjar_publication_queue_wait_seconds_count 2"),
+        "{metrics}"
+    );
+
+    let (signal, status) = server.stop();
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
 }
 
 #[test]

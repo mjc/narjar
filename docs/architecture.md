@@ -200,6 +200,16 @@ limit. NAR staging is under `DATA/nar/.tmp`, so a split NAR destination can
 publish with a same-filesystem rename; metadata remains staged under
 `DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be measured.
 
+Publication is currently globally serialized. A bounded publication worker
+drains valid PUTs in order, and the storage publication mutex remains held from
+admission through request-body streaming, validation, durable link, directory
+sync, cleanup, and recovery bookkeeping. A slow upload therefore creates
+head-of-line blocking for later PUTs, while read workers can continue serving
+GET/HEAD requests. Queue depth and queue-wait summaries are exposed in metrics.
+The design is retained for v0.1 because the single recovery marker and ordered
+commit path make crash recovery straightforward; splitting preparation from the
+short durable commit section requires a separate recovery-state design.
+
 ## Publication and crash semantics
 
 The narinfo rename is the visibility point. A crash can leave:
