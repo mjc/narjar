@@ -207,8 +207,10 @@ sync, cleanup, and recovery bookkeeping. A slow upload therefore creates
 head-of-line blocking for later PUTs, while read workers can continue serving
 GET/HEAD requests. Queue depth and queue-wait summaries are exposed in metrics.
 The design is retained for v0.1 because the single recovery marker and ordered
-commit path make crash recovery straightforward; splitting preparation from the
-short durable commit section requires a separate recovery-state design.
+commit path make crash recovery straightforward; the matched contention
+measurement and decision are recorded in
+[`publication-lock-adr.md`](publication-lock-adr.md). Splitting preparation
+from the short durable commit section requires a separate recovery-state design.
 
 ## Publication and crash semantics
 

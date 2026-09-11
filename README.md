@@ -7,7 +7,8 @@ online garbage collector.
 
 The detailed protocol and operational rules are in [`docs/`](docs/), especially
 [`docs/protocol-v0.1.md`](docs/protocol-v0.1.md) and
-[`docs/operations.md`](docs/operations.md).
+[`docs/operations.md`](docs/operations.md). The measured publication-lock
+decision is recorded in [`docs/publication-lock-adr.md`](docs/publication-lock-adr.md).
 
 ## Quick start
 

@@ -1,0 +1,13 @@
+# Narjar publication lock contention
+
+One throttled 1073741824-byte raw NAR upload at 67108864 bytes/sec was overlapped with independent small PUTs.
+
+See [commands.txt](./commands.txt), [samples.tsv](./samples.tsv), [summary.tsv](./summary.tsv), and [metrics/](./metrics/).
+
+```text
+publishers	samples	p50_ms	p95_ms	p99_ms	min_ms	max_ms	slow_wall_ms	slow_mib_s	small_requests_s	server_cpu_ms	server_peak_rss_kib	queue_wait_count	queue_wait_sum_ms	queue_wait_max_ms
+1	1	16083.008	16083.008	16083.008	16083.008	16083.008	17760.825	57.655	0.062	1010.000	7112	2	16027.130	16027.104
+2	2	16601.379	16616.666	16616.666	16601.379	16616.666	17773.671	57.613	0.120	1020.000	7156	3	33106.015	16562.132
+8	8	16291.662	16345.604	16345.604	16253.090	16345.604	17793.817	57.548	0.489	990.000	7340	9	129973.936	16293.723
+32	32	16330.578	16614.176	16642.573	16040.071	16642.573	17763.146	57.647	1.923	960.000	7908	33	521080.775	16581.148
+```
