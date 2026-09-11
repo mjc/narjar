@@ -14,7 +14,7 @@ def entry(path: str = "/nix/store/example") -> dict:
         "artifact_sha256": hashlib.sha256(b"nar").hexdigest(),
         "artifact": "example.nar",
         "targets": ["generation-1"],
-        "machines": ["tina"],
+        "machines": ["default-nixos"],
         "families": ["nixos"],
         "generations": ["1"],
         "nixpkgs_revisions": ["abc"],

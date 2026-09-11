@@ -15,7 +15,7 @@ REUSE_DATA=""
 
 usage() {
   cat <<'EOF'
-Usage: scripts/profile-tina.sh [options]
+Usage: scripts/profile.sh [options]
 
 Profile narjar serving real paths from the current Nix system store.
 
@@ -31,7 +31,7 @@ Options:
   -h, --help         Show this help
 
 Run from the development shell, for example:
-  nix develop --command scripts/profile-tina.sh --size-gib 20
+  nix develop --command scripts/profile.sh --size-gib 20
 EOF
 }
 

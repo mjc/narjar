@@ -140,7 +140,7 @@ the filesystem is not the read bottleneck. Use `--hot-nar-max-gib` to change
 that tmpfs NAR ceiling:
 
 ```sh
-nix develop --command scripts/profile-tina.sh --size-gib 20 --seconds 60
+nix develop --command scripts/profile.sh --size-gib 20 --seconds 60
 ```
 
 The script prints an output directory such as `/tmp/narjar-profile.XXXXXX`.
