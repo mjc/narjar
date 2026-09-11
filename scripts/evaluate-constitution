@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CONSTITUTION="$SCRIPT_DIR/../benchmarks/constitution.json"
+
+usage() {
+  echo "Usage: scripts/evaluate-constitution RECORD.json"
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+[[ $# -eq 1 ]] || { usage >&2; exit 2; }
+RECORD=$1
+[[ -f "$RECORD" ]] || die "record does not exist: $RECORD"
+command -v jq > /dev/null || die "jq is required; run inside nix develop"
+
+MISSING=$(jq -nr \
+  --slurpfile constitution "$CONSTITUTION" \
+  --slurpfile record "$RECORD" '
+    def missing($record; $required):
+      [$required[] as $field | select(
+        (($record | has($field)) | not)
+        or ($record[$field] == null)
+        or ($record[$field] == "")
+        or ($record[$field] == [])
+        or ($record[$field] == {})
+      ) | $field];
+    $constitution[0] as $constitution |
+    $record[0] as $record |
+    ($record | if has("provenance") then .provenance else . end) as $provenance |
+    ($record | if has("metric") then .metric else . end) as $metric |
+    (missing($provenance; $constitution.provenance_required_fields)
+      + missing($metric; $constitution.metric_required_fields)
+      | unique
+      | join(", "))
+  ')
+[[ -z "$MISSING" ]] || die "missing required fields: $MISSING"
+
+jq -nr \
+  --slurpfile constitution "$CONSTITUTION" \
+  --slurpfile record "$RECORD" '
+    $constitution[0] as $constitution |
+    $record[0] as $record |
+    ($record | if has("metric") then .metric else . end) as $metric |
+    ($constitution.primary_savings_gate_percent) as $thresholds |
+    if ($metric.savings_percent | tonumber) < $thresholds.reject_below then "reject"
+    elif ($metric.savings_percent | tonumber) >= $thresholds.strong_at_or_above then "strong"
+    else "conditional" end
+  '

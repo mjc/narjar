@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+REENCODER="$ROOT/target/release/nar-reencode"
+NAR_ROOT=""
+OUTPUT=""
+WORK=$(mktemp -d)
+trap 'rm -rf -- "$WORK"' EXIT
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nar-roundtrip --root DIR --output FILE [--reencoder PATH]
+
+Compare every .nar file below DIR with nar-reencode using disk-backed,
+streamed comparison and report the first differing byte.
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+while (($#)); do
+  case "$1" in
+    --root) NAR_ROOT=${2:-}; shift 2 ;;
+    --reencoder) REENCODER=${2:-}; shift 2 ;;
+    --output) OUTPUT=${2:-}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$NAR_ROOT" ]] || die "--root is required"
+[[ -n "$OUTPUT" ]] || die "--output is required"
+[[ -d "$NAR_ROOT" ]] || die "artifact root does not exist: $NAR_ROOT"
+[[ -x "$REENCODER" ]] || die "reencoder is not executable: $REENCODER"
+command -v jq > /dev/null || die "jq is required; run inside nix develop"
+command -v cmp > /dev/null || die "cmp is required"
+command -v find > /dev/null || die "find is required"
+command -v sha256sum > /dev/null || die "sha256sum is required"
+mkdir -p "$(dirname -- "$OUTPUT")"
+
+compare_one() {
+  local path=$1 name=$(basename -- "$1") temp="$WORK/$name" stderr="$WORK/$name.stderr" started finished rc equal first_difference size digest
+  started=$(date +%s%N)
+  printf '$ %q < %q\n' "$REENCODER" "$path" >&2
+  set +e
+  "$REENCODER" < "$path" > "$temp" 2> "$stderr"
+  rc=$?
+  set -e
+  finished=$(date +%s%N)
+  size=$(wc -c < "$path" | tr -d '[:space:]')
+  digest=$(sha256sum "$path" | cut -d ' ' -f 1)
+  first_difference=null
+  equal=false
+  if (( rc == 0 )) && cmp -s -- "$path" "$temp"; then
+    equal=true
+  else
+    set +e
+    first_difference=$(cmp -l -- "$path" "$temp" 2>/dev/null | head -n 1 | awk '{ print $1 - 1 }')
+    set -e
+    [[ -n "$first_difference" ]] || first_difference=null
+  fi
+  jq -n \
+    --arg path "$path" \
+    --argjson size_bytes "$size" \
+    --arg sha256 "$digest" \
+    --argjson equal "$equal" \
+    --argjson first_difference "$first_difference" \
+    --argjson returncode "$rc" \
+    --arg stderr "$(tail -c 4000 "$stderr")" \
+    --arg encoder "$REENCODER" \
+    --argjson seconds "$(awk -v ns=$((finished - started)) 'BEGIN { printf "%.3f", ns / 1000000000 }')" \
+    '{path: $path, size_bytes: $size_bytes, sha256: $sha256, equal: $equal, first_difference: $first_difference, returncode: $returncode, stderr: $stderr, command: [$encoder], seconds: $seconds}'
+}
+
+RESULTS="$WORK/results.jsonl"
+: > "$RESULTS"
+while IFS= read -r -d '' path; do
+  compare_one "$path" >> "$RESULTS"
+done < <(find "$NAR_ROOT" -type f -name '*.nar' -print0 | sort -z)
+
+jq -s \
+  --arg encoder "$REENCODER" \
+  --arg artifact_root "$NAR_ROOT" \
+  '{schema_version: 1, encoder: $encoder, artifact_root: $artifact_root, nar_count: length, equal_count: (map(select(.equal)) | length), mismatch_count: (map(select(.equal | not)) | length), results: .}' \
+  "$RESULTS" > "$OUTPUT"
+jq '{schema_version, encoder, artifact_root, nar_count, equal_count, mismatch_count}' "$OUTPUT"
+if (( $(jq '.mismatch_count' "$OUTPUT") != 0 )); then
+  exit 1
+fi

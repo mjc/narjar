@@ -23,7 +23,7 @@ manifest and category, cache state, observed wire compression, repetition
 count, raw samples, median and p95. `provenance.json` carries the run-level
 record and `evidence.json` combines it with a schema-valid baseline metric.
 Missing provenance or metric fields is a failed result. Run
-`python benchmarks/test_constitution.py` to exercise the boundary evaluator.
+`tests/evaluate-constitution.sh` to exercise the boundary evaluator.
 
 The primary metric is median physical-byte savings over the matched baseline:
 `100 * (baseline_bytes - candidate_bytes) / baseline_bytes`. Below 25% rejects

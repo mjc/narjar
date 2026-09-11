@@ -31,7 +31,7 @@ Build and run the RSS harness with the optimized encoder benchmark:
 
 ```sh
 cargo build --release --bin nar-encode-bench
-python benchmarks/nar_encode_memory.py --output /tmp/narjar-narj77.json
+scripts/nar-encode-memory --output /tmp/narjar-narj77.json
 ```
 
 The benchmark writes to `io::sink()` and therefore measures encoding work and
@@ -66,7 +66,7 @@ materialize file contents.
 Run the corpus report after building `nar-scan`:
 
 ```sh
-python benchmarks/exact_dedup.py \
+scripts/nar-report \
   --manifest benchmarks/corpus-manifest.json \
   --scanner target/release/nar-scan \
   --output /tmp/narjar-exact-dedup \
@@ -108,7 +108,7 @@ Use the FIFO-backed harness to measure the scanner against generated regular
 file streams without storing the payloads:
 
 ```sh
-python benchmarks/nar_memory.py \
+scripts/nar-memory \
   --scanner target/release/nar-scan \
   --output /tmp/narjar-nar-memory.json
 ```

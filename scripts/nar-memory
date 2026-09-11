@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+SCANNER="$ROOT/target/release/nar-scan"
+OUTPUT=""
+SIZES=()
+WORK=$(mktemp -d)
+trap 'rm -rf -- "$WORK"' EXIT
+CHUNK_SIZE=$((1024 * 1024))
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nar-memory --output FILE [--scanner PATH] [--size SIZE ...]
+
+Measure nar-scan RSS while consuming generated regular-file NAR streams.
+Sizes use B, KiB, MiB, or GiB suffixes.
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+parse_size() {
+  local value=$1 number multiplier
+  case "$value" in
+    *GiB) number=${value%GiB}; multiplier=$((1 << 30)) ;;
+    *MiB) number=${value%MiB}; multiplier=$((1 << 20)) ;;
+    *KiB) number=${value%KiB}; multiplier=$((1 << 10)) ;;
+    *B) number=${value%B}; multiplier=1 ;;
+    *) number=$value; multiplier=1 ;;
+  esac
+  [[ "$number" =~ ^[0-9]+$ ]] || die "invalid size: $value"
+  (( number > 0 )) || die "size must be positive"
+  printf '%s\n' $((number * multiplier))
+}
+
+write_u64_le() {
+  local value=$1 index byte
+  for ((index = 0; index < 8; index++)); do
+    printf -v byte '%02x' $((value & 255))
+    printf '%b' "\\x$byte"
+    value=$((value >> 8))
+  done
+}
+
+nar_string() {
+  local value=$1 length=${#1} padding
+  write_u64_le "$length"
+  printf '%s' "$value"
+  padding=$(( (8 - length % 8) % 8 ))
+  if (( padding > 0 )); then
+    dd if=/dev/zero bs=1 count="$padding" status=none
+  fi
+}
+
+write_nar() {
+  local fifo=$1 size=$2 full_chunks=$((size / CHUNK_SIZE)) remainder=$((size % CHUNK_SIZE))
+  {
+    nar_string nix-archive-1
+    nar_string '('
+    nar_string type
+    nar_string regular
+    nar_string contents
+    write_u64_le "$size"
+    if (( full_chunks > 0 )); then
+      dd if=/dev/zero bs="$CHUNK_SIZE" count="$full_chunks" status=none
+    fi
+    if (( remainder > 0 )); then
+      dd if=/dev/zero bs=1 count="$remainder" status=none
+    fi
+    local padding=$(( (8 - size % 8) % 8 ))
+    if (( padding > 0 )); then
+      dd if=/dev/zero bs=1 count="$padding" status=none
+    fi
+    nar_string ')'
+  } > "$fifo"
+}
+
+rss_kib() {
+  local pid=$1
+  awk '$1 == "VmHWM:" { print $2; found = 1 } END { if (!found) print 0 }' "/proc/$pid/status" 2>/dev/null || printf '0\n'
+}
+
+measure() {
+  local size=$1 fifo="$WORK/input-$size.nar" input_list="$WORK/input-$size.txt" stderr="$WORK/stderr-$size" pid writer_pid peak current rc started finished
+  mkfifo "$fifo"
+  printf '%s\n' "$fifo" > "$input_list"
+  started=$(date +%s%N)
+  printf '$ %q --input-list %q --output /dev/null\n' "$SCANNER" "$input_list" >&2
+  "$SCANNER" --input-list "$input_list" --output /dev/null > /dev/null 2> "$stderr" &
+  pid=$!
+  write_nar "$fifo" "$size" &
+  writer_pid=$!
+  peak=0
+  while kill -0 "$pid" 2>/dev/null; do
+    current=$(rss_kib "$pid")
+    if (( current > peak )); then peak=$current; fi
+    sleep 0.01
+  done
+  set +e
+  wait "$writer_pid"
+  wait "$pid"
+  rc=$?
+  set -e
+  finished=$(date +%s%N)
+  (( rc == 0 )) || die "scanner failed for $size bytes: $(cat "$stderr")"
+  jq -n \
+    --argjson size_bytes "$size" \
+    --argjson peak_rss_kib "$peak" \
+    --argjson seconds "$(awk -v ns=$((finished - started)) 'BEGIN { printf "%.3f", ns / 1000000000 }')" \
+    '{size_bytes: $size_bytes, peak_rss_kib: $peak_rss_kib, seconds: $seconds}'
+}
+
+while (($#)); do
+  case "$1" in
+    --scanner) SCANNER=${2:-}; shift 2 ;;
+    --output) OUTPUT=${2:-}; shift 2 ;;
+    --size) SIZES+=("$(parse_size "${2:-}")"); shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$OUTPUT" ]] || die "--output is required"
+[[ -x "$SCANNER" ]] || die "scanner is not executable: $SCANNER"
+[[ -d /proc ]] || die "Linux /proc is required"
+command -v jq > /dev/null || die "jq is required; run inside nix develop"
+if ((${#SIZES[@]} == 0)); then
+  SIZES=(1048576 1073741824 21474836480)
+fi
+mkdir -p "$(dirname -- "$OUTPUT")"
+
+RESULTS="$WORK/results.jsonl"
+: > "$RESULTS"
+for size in "${SIZES[@]}"; do
+  measure "$size" >> "$RESULTS"
+done
+jq -s --arg scanner "$SCANNER" '{schema_version: 1, scanner: $scanner, generated_zero_stream: true, results: .}' "$RESULTS" > "$OUTPUT"
+jq . "$OUTPUT"

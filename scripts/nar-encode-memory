@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+ENCODER="$ROOT/target/release/nar-encode-bench"
+OUTPUT=""
+SIZES=()
+WORK=$(mktemp -d)
+trap 'rm -rf -- "$WORK"' EXIT
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nar-encode-memory --output FILE [--encoder PATH] [--size SIZE ...]
+
+Measure nar-encode-bench RSS while streaming regular NAR bodies to stdout.
+Sizes use B, KiB, MiB, or GiB suffixes.
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+parse_size() {
+  local value=$1 number multiplier
+  case "$value" in
+    *GiB) number=${value%GiB}; multiplier=$((1 << 30)) ;;
+    *MiB) number=${value%MiB}; multiplier=$((1 << 20)) ;;
+    *KiB) number=${value%KiB}; multiplier=$((1 << 10)) ;;
+    *B) number=${value%B}; multiplier=1 ;;
+    *) number=$value; multiplier=1 ;;
+  esac
+  [[ "$number" =~ ^[0-9]+$ ]] || die "invalid size: $value"
+  (( number > 0 )) || die "size must be positive"
+  printf '%s\n' $((number * multiplier))
+}
+
+rss_kib() {
+  local pid=$1
+  awk '$1 == "VmHWM:" { print $2; found = 1 } END { if (!found) print 0 }' "/proc/$pid/status" 2>/dev/null || printf '0\n'
+}
+
+measure() {
+  local size=$1 stdout="$WORK/stdout-$size" stderr="$WORK/stderr-$size" pid peak current rc started finished
+  started=$(date +%s%N)
+  printf '$ %q %q\n' "$ENCODER" "$size" >&2
+  "$ENCODER" "$size" > "$stdout" 2> "$stderr" &
+  pid=$!
+  peak=0
+  while kill -0 "$pid" 2>/dev/null; do
+    current=$(rss_kib "$pid")
+    if (( current > peak )); then peak=$current; fi
+    sleep 0.01
+  done
+  set +e
+  wait "$pid"
+  rc=$?
+  set -e
+  finished=$(date +%s%N)
+  (( rc == 0 )) || die "encoder failed for $size bytes: $(cat "$stderr")"
+  current=$(rss_kib "$pid")
+  if (( current > peak )); then peak=$current; fi
+  local fields raw_size digest
+  fields=$(tr '\n' ' ' < "$stdout")
+  raw_size=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^raw_size=/) { split($i, a, "="); print a[2] } }' <<< "$fields")
+  digest=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^sha256=/) { split($i, a, "="); print a[2] } }' <<< "$fields")
+  [[ "$raw_size" =~ ^[0-9]+$ ]] || die "encoder omitted raw_size for $size bytes"
+  (( raw_size >= size )) || die "encoder emitted $raw_size bytes for $size bytes"
+  jq -n \
+    --argjson size_bytes "$size" \
+    --argjson peak_rss_kib "$peak" \
+    --argjson seconds "$(awk -v ns=$((finished - started)) 'BEGIN { printf "%.3f", ns / 1000000000 }')" \
+    --arg sha256 "$digest" \
+    '{size_bytes: $size_bytes, peak_rss_kib: $peak_rss_kib, seconds: $seconds, sha256: $sha256}'
+}
+
+while (($#)); do
+  case "$1" in
+    --encoder) ENCODER=${2:-}; shift 2 ;;
+    --output) OUTPUT=${2:-}; shift 2 ;;
+    --size) SIZES+=("$(parse_size "${2:-}")"); shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$OUTPUT" ]] || die "--output is required"
+[[ -x "$ENCODER" ]] || die "encoder is not executable: $ENCODER"
+command -v jq > /dev/null || die "jq is required; run inside nix develop"
+command -v awk > /dev/null || die "awk is required"
+command -v date > /dev/null || die "date is required"
+if ((${#SIZES[@]} == 0)); then
+  SIZES=(1048576 1073741824 21474836480)
+fi
+mkdir -p "$(dirname -- "$OUTPUT")"
+
+CASES="$WORK/cases.jsonl"
+: > "$CASES"
+for size in "${SIZES[@]}"; do
+  measure "$size" >> "$CASES"
+done
+jq -s --arg encoder "$ENCODER" '{schema_version: 1, encoder: $encoder, cases: .}' "$CASES" > "$OUTPUT"
+jq . "$OUTPUT"
