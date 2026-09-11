@@ -478,7 +478,12 @@ impl Storage {
         ensure_directory(&root_path, "data directory")?;
         let root_directory = open_directory(&root_path)?;
         let root_is_empty = directory_is_empty(&root_directory)?;
-        let lock = ProcessLock::acquire(root_directory.try_clone()?)?;
+        let lock = ProcessLock::acquire(open_at(
+            &root_directory,
+            OsStr::new("."),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )?)?;
         ProcessLock::validate_lock_file(&root_directory)?;
         let nar_directory =
             ensure_directory_at(&root_directory, OsStr::new("nar"), "nar directory")?;
