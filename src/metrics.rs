@@ -1,6 +1,6 @@
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -130,6 +130,10 @@ pub struct Metrics {
     publication_count: AtomicU64,
     publication_micros: AtomicU64,
     publication_max_micros: AtomicU64,
+    publication_queue_depth: AtomicU64,
+    publication_queue_wait_count: AtomicU64,
+    publication_queue_wait_micros: AtomicU64,
+    publication_queue_wait_max_micros: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -155,6 +159,10 @@ impl Default for Metrics {
             publication_count: AtomicU64::new(0),
             publication_micros: AtomicU64::new(0),
             publication_max_micros: AtomicU64::new(0),
+            publication_queue_depth: AtomicU64::new(0),
+            publication_queue_wait_count: AtomicU64::new(0),
+            publication_queue_wait_micros: AtomicU64::new(0),
+            publication_queue_wait_max_micros: AtomicU64::new(0),
         }
     }
 }
@@ -210,6 +218,27 @@ impl Metrics {
             .fetch_max(micros, Ordering::Relaxed);
     }
 
+    pub fn publication_enqueued(&self) {
+        self.publication_queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn publication_enqueue_failed(&self) {
+        let queued = self.publication_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(queued > 0);
+    }
+
+    pub fn publication_dequeued(&self, queued_at: Instant) {
+        let queued = self.publication_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(queued > 0);
+        let micros = queued_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.publication_queue_wait_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.publication_queue_wait_micros
+            .fetch_add(micros, Ordering::Relaxed);
+        self.publication_queue_wait_max_micros
+            .fetch_max(micros, Ordering::Relaxed);
+    }
+
     pub(crate) fn capacity_failure(&self, kind: CapacityErrorKind) {
         let counter = match kind {
             CapacityErrorKind::NoSpace => &self.capacity_no_space,
@@ -255,6 +284,8 @@ impl Metrics {
              # HELP narjar_capacity_failures_total Capacity failures by reason.\n# TYPE narjar_capacity_failures_total counter\nnarjar_capacity_failures_total{{reason=\"no_space\"}} {}\nnarjar_capacity_failures_total{{reason=\"quota\"}} {}\nnarjar_capacity_failures_total{{reason=\"inodes\"}} {}\nnarjar_capacity_failures_total{{reason=\"read_only\"}} {}\n\
              # HELP narjar_publications_total Publication attempts.\n# TYPE narjar_publications_total counter\nnarjar_publications_total {}\n\
              # HELP narjar_publication_duration_seconds Publication duration summary.\n# TYPE narjar_publication_duration_seconds summary\nnarjar_publication_duration_seconds_count {}\nnarjar_publication_duration_seconds_sum {}\nnarjar_publication_duration_seconds_max {}\n\
+             # HELP narjar_publication_queue_depth Valid PUT requests waiting for the publication worker.\n# TYPE narjar_publication_queue_depth gauge\nnarjar_publication_queue_depth {}\n\
+             # HELP narjar_publication_queue_wait_seconds Queue wait before serialized publication.\n# TYPE narjar_publication_queue_wait_seconds summary\nnarjar_publication_queue_wait_seconds_count {}\nnarjar_publication_queue_wait_seconds_sum {}\nnarjar_publication_queue_wait_seconds_max {}\n\
              # HELP narjar_ready Whether the configured destination is ready.\n# TYPE narjar_ready gauge\nnarjar_ready {}\n",
             load(&self.bytes_in), load(&self.bytes_out), load(&self.auth_read_failures),
             load(&self.auth_write_failures), load(&self.validation_body_failures),
@@ -263,7 +294,10 @@ impl Metrics {
             load(&self.disk_full), load(&self.capacity_no_space), load(&self.capacity_quota),
             load(&self.capacity_inodes), load(&self.capacity_read_only), load(&self.publications),
             load(&self.publication_count), load(&self.publication_micros) as f64 / 1_000_000.0,
-            load(&self.publication_max_micros) as f64 / 1_000_000.0, u8::from(ready),
+            load(&self.publication_max_micros) as f64 / 1_000_000.0,
+            load(&self.publication_queue_depth), load(&self.publication_queue_wait_count),
+            load(&self.publication_queue_wait_micros) as f64 / 1_000_000.0,
+            load(&self.publication_queue_wait_max_micros) as f64 / 1_000_000.0, u8::from(ready),
         ));
         if let Some(capacity) = capacity {
             output.push_str(&format!(
@@ -377,6 +411,7 @@ mod tests {
         assert!(exposition.contains("narjar_requests_in_flight 0"));
         assert!(exposition.contains("narjar_temp_objects 1"));
         assert!(exposition.contains("narjar_publications_total 1"));
+        assert!(exposition.contains("narjar_publication_queue_depth 0"));
         assert!(exposition.contains("narjar_ready 1"));
     }
 

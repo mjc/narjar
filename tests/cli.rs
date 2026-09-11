@@ -38,6 +38,39 @@ fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
     signed_narinfo_for(STORE_HASH, nar_hash, nar_size)
 }
 
+fn read_http_response(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    let mut header_end = None;
+    let mut content_length = None;
+    loop {
+        let mut buffer = [0; 4096];
+        let count = stream
+            .read(&mut buffer)
+            .expect("response should be readable");
+        assert_ne!(count, 0, "response ended before its declared body");
+        response.extend_from_slice(&buffer[..count]);
+        if header_end.is_none() {
+            header_end = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|offset| offset + 4);
+            if let Some(header_end) = header_end {
+                let headers = std::str::from_utf8(&response[..header_end])
+                    .expect("response headers should be UTF-8");
+                content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .map(|value| value.trim().parse::<usize>().expect("valid Content-Length"));
+            }
+        }
+        if let (Some(header_end), Some(content_length)) = (header_end, content_length)
+            && response.len() >= header_end + content_length
+        {
+            return response;
+        }
+    }
+}
+
 fn signed_narinfo_for(store_hash: &str, nar_hash: &str, nar_size: u64) -> String {
     signed_narinfo_for_with_references(store_hash, nar_hash, nar_size, &[])
 }
@@ -436,6 +469,10 @@ impl RunningServer {
         Self::start_with_auth(test, extra_args, None, None)
     }
 
+    fn start_with_workers(test: &str, workers: usize, extra_args: &[&str]) -> Self {
+        Self::start_with_auth_and_workers(test, workers, extra_args, None, None)
+    }
+
     fn start_with_read_tokens(test: &str, read_tokens: &str) -> Self {
         Self::start_with_auth(test, &[], Some(read_tokens), None)
     }
@@ -446,6 +483,16 @@ impl RunningServer {
 
     fn start_with_auth(
         test: &str,
+        extra_args: &[&str],
+        read_tokens: Option<&str>,
+        trusted_keys: Option<&str>,
+    ) -> Self {
+        Self::start_with_auth_and_workers(test, 1, extra_args, read_tokens, trusted_keys)
+    }
+
+    fn start_with_auth_and_workers(
+        test: &str,
+        workers: usize,
         extra_args: &[&str],
         read_tokens: Option<&str>,
         trusted_keys: Option<&str>,
@@ -488,12 +535,16 @@ impl RunningServer {
         fs::write(data_dir.path().join("trusted-public-keys"), trusted_key)
             .expect("test trusted key should be written");
 
-        Self::start_in(data_dir, extra_args)
+        Self::start_in_with_workers(data_dir, workers, extra_args)
     }
 
     fn start_in(temp_dir: TestDir, extra_args: &[&str]) -> Self {
+        Self::start_in_with_workers(temp_dir, 1, extra_args)
+    }
+
+    fn start_in_with_workers(temp_dir: TestDir, workers: usize, extra_args: &[&str]) -> Self {
         let data_dir = temp_dir.path().to_owned();
-        let mut child = Self::spawn(&data_dir, extra_args);
+        let mut child = Self::spawn(&data_dir, workers, extra_args);
         let mut startup_line = String::new();
         BufReader::new(child.stdout.take().expect("stdout should be piped"))
             .read_line(&mut startup_line)
@@ -514,7 +565,7 @@ impl RunningServer {
         }
     }
 
-    fn spawn(data_dir: &Path, extra_args: &[&str]) -> Child {
+    fn spawn(data_dir: &Path, workers: usize, extra_args: &[&str]) -> Child {
         let mut process = command();
         process
             .args([
@@ -524,7 +575,7 @@ impl RunningServer {
                 "--listen",
                 "127.0.0.1:0",
                 "--workers",
-                "1",
+                &workers.to_string(),
             ])
             .args(extra_args)
             .stdout(Stdio::piped())
@@ -722,10 +773,11 @@ fn serve_reports_listener_and_stops_on_sigterm() {
 fn second_sigterm_exits_a_stalled_request_immediately() {
     let mut server =
         RunningServer::start_with_args("second-sigterm", &["--shutdown-grace-seconds", "30"]);
-    let mut stalled = TcpStream::connect(&server.address).expect("stalled request should connect");
-    stalled
-        .write_all(format!("PUT /nar/{NAR_ID}.nar HTTP/1.1\r\n").as_bytes())
-        .expect("partial request should be written");
+    let _stalled = server.open_request(
+        "PUT",
+        &format!("/nar/{NAR_ID}.nar"),
+        &[("Content-Length", "1")],
+    );
     thread::sleep(Duration::from_millis(100));
 
     let pid = server
@@ -761,11 +813,59 @@ fn second_sigterm_exits_a_stalled_request_immediately() {
 fn shutdown_grace_deadline_terminates_a_stalled_request() {
     let mut server =
         RunningServer::start_with_args("shutdown-deadline", &["--shutdown-grace-seconds", "1"]);
-    let mut stalled = TcpStream::connect(&server.address).expect("stalled request should connect");
-    stalled
-        .write_all(format!("PUT /nar/{NAR_ID}.nar HTTP/1.1\r\n").as_bytes())
-        .expect("partial request should be written");
+    let _stalled = server.open_request(
+        "PUT",
+        &format!("/nar/{NAR_ID}.nar"),
+        &[("Content-Length", "1")],
+    );
     thread::sleep(Duration::from_millis(100));
+
+    let pid = server
+        .child
+        .as_ref()
+        .expect("server child should exist")
+        .id();
+    Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("SIGTERM should be sent");
+    let started = Instant::now();
+    let status = server
+        .child
+        .take()
+        .expect("server child should be available")
+        .wait()
+        .expect("server should exit at the grace deadline");
+
+    assert!(!status.success());
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "shutdown should honor the configured grace period: {started:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "shutdown should remain bounded: {started:?}"
+    );
+}
+
+#[test]
+fn shutdown_grace_deadline_covers_a_queued_publication() {
+    let mut server = RunningServer::start_with_args(
+        "shutdown-queued-publication",
+        &["--max-in-flight", "3", "--shutdown-grace-seconds", "1"],
+    );
+    let path = format!("/nar/{NAR_ID}.nar");
+    let _active = server.open_request("PUT", &path, &[("Content-Length", "1")]);
+    thread::sleep(Duration::from_millis(50));
+    let _queued = server.open_request("PUT", &path, &[("Content-Length", "1")]);
+    thread::sleep(Duration::from_millis(50));
+
+    let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
+        .expect("metrics should be UTF-8");
+    assert!(
+        metrics.contains("narjar_publication_queue_depth 1"),
+        "{metrics}"
+    );
 
     let pid = server
         .child
@@ -831,6 +931,39 @@ fn nix_cache_info_get_and_head_match_contract() {
         "{legacy_get:?}"
     );
     assert!(legacy_head.ends_with("\r\n\r\n"), "{legacy_head:?}");
+}
+
+#[test]
+fn http11_connection_serves_two_sequential_requests() {
+    let server = RunningServer::start("http11-keep-alive");
+    let mut stream = TcpStream::connect(&server.address).expect("connect to narjar");
+
+    for _ in 0..2 {
+        stream
+            .write_all(
+                format!(
+                    "GET /nix-cache-info HTTP/1.1\r\nHost: {}\r\n\r\n",
+                    server.address
+                )
+                .as_bytes(),
+            )
+            .expect("write HTTP/1.1 request");
+        let response =
+            String::from_utf8(read_http_response(&mut stream)).expect("response should be UTF-8");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response:?}");
+        assert!(
+            response.contains("Connection: keep-alive\r\n"),
+            "{response:?}"
+        );
+        assert!(
+            response.ends_with("\r\n\r\nStoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n")
+        );
+    }
+
+    drop(stream);
+    let (signal, status) = server.stop();
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
 }
 
 #[test]
@@ -1033,6 +1166,8 @@ fn nar_get_and_head_support_one_byte_range() {
         &path,
         &[("Range", "bytes=0-1"), ("Range", "bytes=4-5")],
     );
+    let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
+        .expect("metrics should be UTF-8");
     let (signal, status) = server.stop();
 
     assert!(signal.success(), "SIGTERM should be sent");
@@ -1095,6 +1230,20 @@ fn nar_get_and_head_support_one_byte_range() {
         );
         assert!(body.is_empty());
     }
+    assert!(
+        metrics.contains("narjar_http_bytes_out_total 13"),
+        "{metrics}"
+    );
+    assert!(
+        metrics
+            .contains("narjar_http_requests_total{method=\"GET\",route=\"nar\",status=\"2xx\"} 3"),
+        "{metrics}"
+    );
+    assert!(
+        metrics
+            .contains("narjar_http_requests_total{method=\"HEAD\",route=\"nar\",status=\"2xx\"} 1"),
+        "{metrics}"
+    );
 }
 
 #[test]
@@ -1413,6 +1562,48 @@ fn nar_put_and_get_preserve_xz_bytes() {
 }
 
 #[test]
+fn xz_publications_serialize_at_1_8_and_32_way_concurrency() {
+    let mut compressed = Vec::new();
+    let mut writer =
+        XzWriter::new(&mut compressed, XzOptions::with_preset(6)).expect("create XZ writer");
+    writer.write_all(NAR_BYTES).expect("compress NAR");
+    writer.finish().expect("finish XZ stream");
+
+    for concurrency in [1, 8, 32] {
+        let server = RunningServer::start_with_workers("xz-publication-lane", 8, &[]);
+        let path = format!("/nar/{NARJAR_HASH}.nar.xz");
+        let responses = thread::scope(|scope| {
+            (0..concurrency)
+                .map(|_| scope.spawn(|| server.request_with_body("PUT", &path, &[], &compressed)))
+                .map(|handle| handle.join().expect("upload should not panic"))
+                .collect::<Vec<_>>()
+        });
+        for response in responses {
+            assert!(
+                response.starts_with(b"HTTP/1.1 20"),
+                "unexpected upload response: {response:?}"
+            );
+        }
+        let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
+            .expect("metrics should be UTF-8");
+        assert!(
+            metrics.contains("narjar_publication_queue_depth 0"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(&format!(
+                "narjar_publication_queue_wait_seconds_count {concurrency}"
+            )),
+            "{metrics}"
+        );
+
+        let (signal, status) = server.stop();
+        assert!(signal.success(), "SIGTERM should be sent");
+        assert!(status.success(), "narjar should shut down cleanly");
+    }
+}
+
+#[test]
 fn xz_narinfo_gates_and_serves_the_compressed_pair() {
     let server = RunningServer::start("narinfo-xz");
     let mut compressed = Vec::new();
@@ -1637,7 +1828,7 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
         ),
     )
     .expect("new-only trust file should be written");
-    let mut child = RunningServer::spawn(&data_dir, &[]);
+    let mut child = RunningServer::spawn(&data_dir, 1, &[]);
     let mut startup_line = String::new();
     BufReader::new(child.stdout.take().expect("stdout should be piped"))
         .read_line(&mut startup_line)
@@ -1771,6 +1962,47 @@ fn saturated_request_limit_rejects_excess_work() {
     );
 
     drop(blocked);
+    let (signal, status) = server.stop();
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn reads_continue_while_a_publication_waits_for_its_body() {
+    let server = RunningServer::start_with_args("publication-lane", &["--max-in-flight", "2"]);
+    let path = format!("/nar/{NAR_ID}.nar");
+    fs::write(
+        server.data_dir.join(format!("nar/{NAR_ID}.nar")),
+        b"0123456789",
+    )
+    .expect("write NAR fixture");
+    let stalled = server.open_request("PUT", &path, &[("Content-Length", "1")]);
+    thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    let response = server.request("GET", "/nix-cache-info");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "GET waited for the stalled publication: {:?}",
+        started.elapsed()
+    );
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{response:?}");
+
+    let started = Instant::now();
+    let range = server.request_with_headers("GET", &path, &[("Range", "bytes=2-5")]);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "range GET waited for the stalled publication: {:?}",
+        started.elapsed()
+    );
+    let (headers, body) = response_parts(&range);
+    assert!(
+        headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+        "{headers:?}"
+    );
+    assert_eq!(body, b"2345");
+
+    drop(stalled);
     let (signal, status) = server.stop();
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");

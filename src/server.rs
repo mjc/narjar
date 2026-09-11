@@ -16,8 +16,8 @@ use crossbeam_channel::{Sender, TrySendError, bounded};
 
 use narjar::{
     auth::Authorizer,
-    http::respond,
-    http_server::{Request, StatusCode, write_status},
+    http::{PublicationRequest, prepare_publication, respond},
+    http_server::{Method, Request, StatusCode, write_status},
     inventory::Inventory,
     narinfo::TrustedPublicKeys,
     storage::{NarUploadPolicy, Storage},
@@ -65,6 +65,12 @@ impl Drop for Admission {
 struct AcceptedRequest {
     stream: TcpStream,
     _admission: Admission,
+}
+
+struct QueuedPublication {
+    request: PublicationRequest,
+    _admission: Admission,
+    queued_at: Instant,
 }
 
 fn try_dispatch(
@@ -175,6 +181,23 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let max_in_flight = config.max_in_flight.get();
     let admissions = Arc::new(Admissions::new(max_in_flight));
     let (sender, receiver) = bounded::<AcceptedRequest>(max_in_flight);
+    let (publication_sender, publication_receiver) = bounded::<QueuedPublication>(max_in_flight);
+    let publication_handle = {
+        let storage = Arc::clone(&storage);
+        let trusted_keys = Arc::clone(&trusted_keys);
+        let metrics = Arc::clone(&metrics);
+        thread::Builder::new()
+            .name("narjar-publication".to_owned())
+            .spawn(move || {
+                while let Ok(publication) = publication_receiver.recv() {
+                    metrics.publication_dequeued(publication.queued_at);
+                    publication
+                        .request
+                        .respond(&storage, &trusted_keys, upload_policy, &metrics);
+                }
+            })
+            .map_err(|error| Error::runtime(format!("cannot start publication worker: {error}")))?
+    };
     let handles: Vec<_> = (0..config.workers.get())
         .map(|_| {
             let receiver = receiver.clone();
@@ -182,21 +205,63 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             let authorizer = Arc::clone(&authorizer);
             let trusted_keys = Arc::clone(&trusted_keys);
             let metrics = Arc::clone(&metrics);
+            let publication_sender = publication_sender.clone();
             thread::spawn(move || {
                 while let Ok(accepted) = receiver.recv() {
-                    let AcceptedRequest { stream, _admission } = accepted;
-                    match Request::read(stream) {
-                        Ok(request) => respond(
-                            request,
-                            &storage,
-                            &authorizer,
-                            &trusted_keys,
-                            upload_policy,
-                            &metrics,
-                            min_free_bytes,
-                        ),
-                        Err((mut stream, _error)) => {
-                            let _ = write_status(&mut stream, StatusCode(400));
+                    let AcceptedRequest {
+                        mut stream,
+                        _admission,
+                    } = accepted;
+                    let mut admission = Some(_admission);
+                    loop {
+                        match Request::read(stream) {
+                            Ok(request) if matches!(request.method(), Method::Put) => {
+                                let Some(request) =
+                                    prepare_publication(request, &authorizer, &metrics)
+                                else {
+                                    break;
+                                };
+                                let publication = QueuedPublication {
+                                    request,
+                                    _admission: admission
+                                        .take()
+                                        .expect("request admission is present"),
+                                    queued_at: Instant::now(),
+                                };
+                                metrics.publication_enqueued();
+                                match publication_sender.try_send(publication) {
+                                    Ok(()) => break,
+                                    Err(
+                                        TrySendError::Full(publication)
+                                        | TrySendError::Disconnected(publication),
+                                    ) => {
+                                        metrics.publication_enqueue_failed();
+                                        publication.request.reject(&metrics, 429);
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(request) => match respond(
+                                request,
+                                &storage,
+                                &authorizer,
+                                &trusted_keys,
+                                upload_policy,
+                                &metrics,
+                                min_free_bytes,
+                            ) {
+                                Some(next_stream) => stream = next_stream,
+                                None => break,
+                            },
+                            Err((_stream, error))
+                                if error.kind() == io::ErrorKind::UnexpectedEof =>
+                            {
+                                break;
+                            }
+                            Err((mut stream, _error)) => {
+                                let _ = write_status(&mut stream, StatusCode(400));
+                                break;
+                            }
                         }
                     }
                 }
@@ -237,6 +302,16 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .join()
             .map_err(|_| Error::runtime("request worker panicked"))?;
     }
+    drop(publication_sender);
+    while !publication_handle.is_finished() {
+        if Instant::now() >= deadline {
+            return Err(Error::runtime("shutdown grace period expired"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    publication_handle
+        .join()
+        .map_err(|_| Error::runtime("publication worker panicked"))?;
 
     Ok(())
 }
