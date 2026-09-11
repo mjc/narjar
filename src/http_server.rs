@@ -1,9 +1,15 @@
 use std::{
     fmt::Write as FmtWrite,
-    io::{self, Cursor, Read, Write},
+    fs::File,
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     net::TcpStream,
     ops::Range,
 };
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_PORTABLE_FILE_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
@@ -79,6 +85,7 @@ pub struct Request {
     header_count: usize,
     body_length: Option<usize>,
     body_complete: bool,
+    keep_alive: bool,
 }
 
 impl Request {
@@ -97,6 +104,7 @@ impl Request {
             header_count: 0,
             body_length: None,
             body_complete: true,
+            keep_alive: false,
         };
 
         let mut received = 0;
@@ -115,6 +123,12 @@ impl Request {
             }
             let read = match request.stream.read(&mut request.buffer[received..]) {
                 Ok(read) if read != 0 => read,
+                Ok(_) if received == 0 => {
+                    return Err((
+                        request.stream,
+                        io::Error::from(io::ErrorKind::UnexpectedEof),
+                    ));
+                }
                 Ok(_) => return Err((request.stream, invalid_data("request ended early"))),
                 Err(error) => return Err((request.stream, error)),
             };
@@ -236,6 +250,15 @@ impl Request {
         if let Some(error) = content_length_error {
             return Err((request.stream, invalid_data(error)));
         }
+        request.keep_alive = version == b"HTTP/1.1"
+            && !request.headers().iter().any(|header| {
+                header.field.equiv("Connection")
+                    && header
+                        .value
+                        .as_str()
+                        .split(',')
+                        .any(|value| value.trim().eq_ignore_ascii_case("close"))
+            });
         request.header_end = header_end;
         request.body_prefix_len = received - header_end;
         request.body_length = content_length;
@@ -272,10 +295,31 @@ impl Request {
         self.body_complete
     }
 
-    pub fn respond<R: Read>(self, response: Response<R>) -> io::Result<()> {
+    pub fn close_after_response(&mut self) {
+        self.keep_alive = false;
+    }
+
+    pub fn respond<R: Read>(self, response: Response<R>) -> io::Result<Option<TcpStream>> {
         let head = self.method == Method::Head;
         let mut stream = self.stream;
-        response.write_to(&mut stream, head)
+        response.write_to(&mut stream, head, self.keep_alive)?;
+        Ok(self.keep_alive.then_some(stream))
+    }
+
+    pub fn respond_file(
+        self,
+        response: Response<io::Empty>,
+        mut file: File,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<Option<TcpStream>> {
+        let head = self.method == Method::Head;
+        let mut stream = self.stream;
+        response.write_headers(&mut stream, self.keep_alive)?;
+        if !head {
+            copy_file_to_stream(&mut file, &mut stream, offset, length)?;
+        }
+        Ok(self.keep_alive.then_some(stream))
     }
 }
 
@@ -386,10 +430,7 @@ impl<R> Response<R> {
         self
     }
 
-    fn write_to(mut self, stream: &mut TcpStream, head: bool) -> io::Result<()>
-    where
-        R: Read,
-    {
+    fn write_headers(&self, stream: &mut TcpStream, keep_alive: bool) -> io::Result<()> {
         let mut headers = String::new();
         write!(
             &mut headers,
@@ -409,12 +450,106 @@ impl<R> Response<R> {
         }
         writeln!(&mut headers, "Content-Length: {}\r", self.content_length)
             .expect("writing response length to String cannot fail");
-        headers.push_str("Connection: close\r\n\r\n");
-        stream.write_all(headers.as_bytes())?;
+        headers.push_str(if keep_alive {
+            "Connection: keep-alive\r\n\r\n"
+        } else {
+            "Connection: close\r\n\r\n"
+        });
+        stream.write_all(headers.as_bytes())
+    }
+
+    fn write_to(mut self, stream: &mut TcpStream, head: bool, keep_alive: bool) -> io::Result<()>
+    where
+        R: Read,
+    {
+        self.write_headers(stream, keep_alive)?;
         if !head {
             io::copy(&mut self.body, stream)?;
         }
         Ok(())
+    }
+}
+
+fn copy_file_to_stream(
+    file: &mut File,
+    stream: &mut TcpStream,
+    offset: u64,
+    length: u64,
+) -> io::Result<()> {
+    #[cfg(test)]
+    if FORCE_PORTABLE_FILE_COPY.with(std::cell::Cell::get) {
+        return copy_file_to_stream_portable(file, stream, offset, length);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        copy_file_to_stream_linux(file, stream, offset, length)
+    }
+    #[cfg(not(target_os = "linux"))]
+    copy_file_to_stream_portable(file, stream, offset, length)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_file_to_stream_linux(
+    file: &mut File,
+    stream: &mut TcpStream,
+    offset: u64,
+    length: u64,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut offset = i64::try_from(offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset is too large"))?;
+    let mut remaining = length;
+    let mut sent_any = false;
+    while remaining != 0 {
+        let count = remaining.min(usize::MAX as u64) as usize;
+        // SAFETY: both descriptors stay open for the call, `offset` is valid,
+        // and `count` does not exceed `usize::MAX`.
+        let sent =
+            unsafe { libc::sendfile(stream.as_raw_fd(), file.as_raw_fd(), &raw mut offset, count) };
+        if sent > 0 {
+            sent_any = true;
+            remaining -= sent as u64;
+            continue;
+        }
+        if sent == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file ended before the declared response length",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if !sent_any
+            && matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            )
+        {
+            return copy_file_to_stream_portable(file, stream, offset as u64, remaining);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn copy_file_to_stream_portable(
+    file: &mut File,
+    stream: &mut TcpStream,
+    offset: u64,
+    length: u64,
+) -> io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    let copied = io::copy(&mut file.take(length), stream)?;
+    if copied == length {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "file ended before the declared response length",
+        ))
     }
 }
 
@@ -426,7 +561,7 @@ pub fn static_header(name: &'static str, value: &'static str) -> ResponseHeader 
 }
 
 pub fn write_status(stream: &mut TcpStream, status: StatusCode) -> io::Result<()> {
-    Response::empty(status).write_to(stream, false)
+    Response::empty(status).write_to(stream, false, false)
 }
 
 fn status(code: u16) -> StatusCode {
@@ -462,9 +597,14 @@ fn invalid_data(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, net::TcpListener, thread};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
-    use super::{Method, Request};
+    use super::{FORCE_PORTABLE_FILE_COPY, Method, Request, Response, StatusCode};
 
     #[test]
     fn parses_headers_without_allocating_header_storage() {
@@ -491,5 +631,75 @@ mod tests {
         std::io::Read::read_to_end(&mut request.as_reader(), &mut body).expect("read body");
         assert_eq!(body, b"body");
         sender.join().expect("sender should finish");
+    }
+
+    #[test]
+    fn file_response_streams_an_exact_range() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("nar");
+        fs::write(&path, b"0123456789").expect("write NAR fixture");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let sender = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            stream
+                .write_all(b"GET /nar/example.nar HTTP/1.1\r\nConnection: close\r\n\r\n")
+                .expect("write request");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("read response");
+            response
+        });
+        let (stream, _) = listener.accept().expect("accept test request");
+        let request = Request::read(stream).expect("parse request");
+        let file = fs::File::open(path).expect("open NAR fixture");
+        request
+            .respond_file(
+                Response::new(StatusCode(206), std::io::empty(), 4),
+                file,
+                2,
+                4,
+            )
+            .expect("write file response");
+        let response = sender.join().expect("sender should finish");
+        assert_eq!(
+            response,
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nConnection: close\r\n\r\n2345"
+        );
+    }
+
+    #[test]
+    fn file_response_forces_the_portable_fallback() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("nar");
+        fs::write(&path, b"0123456789").expect("write NAR fixture");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let sender = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            stream
+                .write_all(b"GET /nar/example.nar HTTP/1.1\r\nConnection: close\r\n\r\n")
+                .expect("write request");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("read response");
+            response
+        });
+        let (stream, _) = listener.accept().expect("accept test request");
+        let request = Request::read(stream).expect("parse request");
+        FORCE_PORTABLE_FILE_COPY.with(|force| force.set(true));
+        request
+            .respond_file(
+                Response::new(StatusCode(206), std::io::empty(), 4),
+                fs::File::open(path).expect("open NAR fixture"),
+                2,
+                4,
+            )
+            .expect("write file response");
+        FORCE_PORTABLE_FILE_COPY.with(|force| force.set(false));
+        assert!(
+            sender
+                .join()
+                .expect("sender should finish")
+                .ends_with(b"\r\n\r\n2345")
+        );
     }
 }
