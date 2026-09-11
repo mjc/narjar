@@ -139,53 +139,11 @@ CARGO_TARGET_DIR="$TARGET" \
 
 echo "selecting at least ${SIZE_GIB} GiB of real Nix store NARs"
 nix path-info --all --json > "$OUTPUT/path-info.json"
-python - "$TARGET_BYTES" "$MAX_SELECTED_NAR_BYTES" "$MANIFEST" "$OUTPUT/path-info.json" <<'PY'
-import json
-import os
-import sys
-
-target_bytes = int(sys.argv[1])
-max_nar_bytes = int(sys.argv[2])
-manifest = sys.argv[3]
-path_info = sys.argv[4]
-
-with open(path_info) as source:
-    items = json.load(source)
-
-if isinstance(items, dict):
-    items = [{"path": path, **info} for path, info in items.items()]
-
-entries = []
-excluded_benchmark_sources = 0
-for item in items:
-    path = item.get("path")
-    size = int(item.get("narSize", 0))
-    if path and os.path.isdir(path) and os.path.isdir(os.path.join(path, "benchmarks", "results")):
-        excluded_benchmark_sources += 1
-        continue
-    if path and path.startswith("/nix/store/") and 0 < size <= max_nar_bytes:
-        entries.append((size, path))
-
-selected = []
-total = 0
-for size, path in sorted(entries, reverse=True):
-    selected.append((path, size))
-    total += size
-    if total >= target_bytes:
-        break
-
-if total < target_bytes:
-    raise SystemExit(f"system store has only {total} bytes of usable NARs")
-
-with open(manifest, "w") as output:
-    for path, size in selected:
-        output.write(f"{path}\t{size}\n")
-
-print(
-    f"selected {len(selected)} paths ({total} bytes); "
-    f"excluded {excluded_benchmark_sources} benchmark source paths"
-)
-PY
+"$SCRIPT_DIR/select-profile-corpus" \
+  --path-info "$OUTPUT/path-info.json" \
+  --output "$MANIFEST" \
+  --target-bytes "$TARGET_BYTES" \
+  --max-nar-bytes "$MAX_SELECTED_NAR_BYTES"
 
 PATHS=()
 TOTAL_BYTES=0

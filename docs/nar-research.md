@@ -86,7 +86,7 @@ store path that is absent from the destination store and the cache's trusted
 public key:
 
 ```sh
-python benchmarks/nix_range_trace.py \
+scripts/nix-range-trace \
   --cache-url http://cache.example:5102 \
   --store-path /nix/store/<hash>-<name> \
   --nar-bytes <raw-nar-size> \

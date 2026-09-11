@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+BINARY="$SCRIPT_DIR/../target/release/nix-range-trace"
+SOURCE="$SCRIPT_DIR/nix-range-trace.rs"
+
+if [[ ! -x "$BINARY" || "$SOURCE" -nt "$BINARY" ]]; then
+  echo "Compiling nix-range-trace..." >&2
+  mkdir -p "$(dirname -- "$BINARY")"
+  rustc -D warnings -O -o "$BINARY" "$SOURCE"
+fi
+
+exec "$BINARY" "$@"

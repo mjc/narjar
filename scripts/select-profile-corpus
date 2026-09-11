@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/select-profile-corpus --path-info FILE --output FILE \
+  --target-bytes BYTES --max-nar-bytes BYTES
+EOF
+}
+
+PATH_INFO=""
+OUTPUT=""
+TARGET_BYTES=""
+MAX_NAR_BYTES=""
+
+while (($#)); do
+  case "$1" in
+    --path-info) PATH_INFO=$2; shift 2 ;;
+    --output) OUTPUT=$2; shift 2 ;;
+    --target-bytes) TARGET_BYTES=$2; shift 2 ;;
+    --max-nar-bytes) MAX_NAR_BYTES=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$PATH_INFO" && -f "$PATH_INFO" ]] || {
+  echo "path-info JSON does not exist: $PATH_INFO" >&2
+  exit 2
+}
+[[ -n "$OUTPUT" && -n "$TARGET_BYTES" && -n "$MAX_NAR_BYTES" ]] || {
+  usage >&2
+  exit 2
+}
+[[ "$TARGET_BYTES" =~ ^[0-9]+$ && "$MAX_NAR_BYTES" =~ ^[0-9]+$ ]] || {
+  echo "byte limits must be non-negative integers" >&2
+  exit 2
+}
+command -v jq >/dev/null || {
+  echo "jq is required; run inside 'nix develop'" >&2
+  exit 1
+}
+
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/narjar-profile-selection.XXXXXX")
+trap 'rm -rf -- "$WORK_DIR"' EXIT
+
+candidate_file=$WORK_DIR/candidates.tsv
+: > "$candidate_file"
+excluded=0
+while IFS=$'\t' read -r path size; do
+  [[ -n "$path" && "$path" == /nix/store/* && "$size" =~ ^[0-9]+$ ]] || continue
+  ((size > 0 && size <= MAX_NAR_BYTES)) || continue
+  if [[ -d "$path" && -d "$path/benchmarks/results" ]]; then
+    excluded=$((excluded + 1))
+    continue
+  fi
+  printf '%s\t%s\n' "$path" "$size" >> "$candidate_file"
+done < <(
+  jq -r '
+    if type == "object" then
+      to_entries | map(.value + {path: .key})
+    elif type == "array" then
+      .
+    else
+      error("path-info must be an object or array")
+    end
+    | .[]
+    | [(.path // ""), ((.narSize // 0) | tonumber)]
+    | @tsv
+  ' "$PATH_INFO"
+)
+
+total=0
+selected=0
+: > "$OUTPUT"
+while IFS=$'\t' read -r path size; do
+  printf '%s\t%s\n' "$path" "$size" >> "$OUTPUT"
+  total=$((total + size))
+  selected=$((selected + 1))
+  ((total >= TARGET_BYTES)) && break
+done < <(sort -t$'\t' -k2,2nr -k1,1r "$candidate_file")
+
+if ((total < TARGET_BYTES)); then
+  echo "system store has only $total bytes of usable NARs" >&2
+  exit 1
+fi
+
+printf 'selected %d paths (%d bytes); excluded %d benchmark source paths\n' \
+  "$selected" "$total" "$excluded"
