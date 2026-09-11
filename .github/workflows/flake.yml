@@ -8,8 +8,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - uses: DeterminateSystems/nix-installer-action@b67ad2f0e8376a0bc947db191e4484285b6f5b56
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
       - run: ./ci/check-flake-contract.sh
       - run: nix build -L --no-update-lock-file .#packages.x86_64-linux.default
       - run: |
