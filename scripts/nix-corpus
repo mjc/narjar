@@ -204,8 +204,22 @@ resolve_root() {
   realpath "$root"
 }
 
+path_info() {
+  local path=$1
+  run_capture nix path-info --json "$path" | jq -e '
+    if type == "array" and length == 1 then .[0]
+    elif type == "object" and has("path") then .
+    elif type == "object" and length == 1 then to_entries[0].value + {path: to_entries[0].key}
+    else error("nix path-info returned an invalid record")
+    end |
+    if (.narHash | type) != "string" or (.narSize | type) != "number" then
+      error("nix path-info omitted narHash/narSize")
+    else . end
+  '
+}
+
 validate_rebuilds() {
-  local manifest=$1 target expected_root resolved_root target_id
+  local manifest=$1 target expected_root resolved_root target_id resolved_info expected_info
   while IFS= read -r target; do
     target_id=$(jq -r '.id // "<unknown>"' <<< "$target")
     if ! resolved_root=$(resolve_root "$target" true); then
@@ -213,8 +227,15 @@ validate_rebuilds() {
       continue
     fi
     expected_root=$(jq -r '.resolved_root // empty' <<< "$target")
-    if [[ -n "$expected_root" && "$resolved_root" != "$expected_root" ]]; then
-      printf 'rebuilt root differs for %s: %s != %s\n' "$target_id" "$resolved_root" "$expected_root"
+    if [[ -n "$expected_root" ]]; then
+      if ! resolved_info=$(path_info "$resolved_root") || ! expected_info=$(path_info "$expected_root"); then
+        printf 'failed to read rebuilt metadata: %s\n' "$target_id"
+        continue
+      fi
+      if [[ "$(jq -r '.narHash' <<< "$resolved_info")" != "$(jq -r '.narHash' <<< "$expected_info")" ||
+        "$(jq -r '.narSize' <<< "$resolved_info")" != "$(jq -r '.narSize' <<< "$expected_info")" ]]; then
+        printf 'rebuilt content differs for %s: %s != %s\n' "$target_id" "$resolved_root" "$expected_root"
+      fi
     fi
   done < <(jq -c '.targets[]? | select(type == "object")' "$manifest")
 }

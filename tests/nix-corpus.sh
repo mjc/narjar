@@ -66,7 +66,7 @@ printf '%s\n' \
   'printf "\n" >> "$NIX_CORPUS_TEST_LOG"' \
   'case "$1" in' \
   '  build) printf "%s\n" /nix/store/mock-root ;;' \
-  '  path-info) printf "[{\"path\":\"/nix/store/mock-root\",\"narHash\":\"%s\",\"narSize\":3,\"deriver\":\"/nix/store/mock.drv\"}]\n" "$NAR_HASH" ;;' \
+  '  path-info) if [[ "${NIX_CORPUS_TEST_MISMATCH:-}" == 1 && "$3" == /nix/store/expected-root ]]; then printf "[{\"path\":\"%s\",\"narHash\":\"sha256-different\",\"narSize\":3,\"deriver\":\"/nix/store/mock.drv\"}]\n" "$3"; else printf "[{\"path\":\"%s\",\"narHash\":\"%s\",\"narSize\":3,\"deriver\":\"/nix/store/mock.drv\"}]\n" "$3" "$NAR_HASH"; fi ;;' \
   '  hash) exec "$REAL_NIX" "$@" ;;' \
   '  *) exit 1 ;;' \
   'esac' > "$MOCK_BIN/nix"
@@ -101,5 +101,15 @@ PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" collect \
   --spec "$WORK/spec.json" --manifest "$WORK/collected.json" --export-dir "$WORK/export" --build
 jq -e '.entries | length == 1 and .[0].path == "/nix/store/mock-root" and .[0].artifact_sha256 != null' \
   "$WORK/collected.json" > /dev/null
+jq '.targets[0].resolved_root = "/nix/store/expected-root"' \
+  "$WORK/collected.json" > "$WORK/rebuild.json"
+PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/rebuild.json" --rebuild
+if NIX_CORPUS_TEST_MISMATCH=1 PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/rebuild.json" --rebuild > /dev/null 2> "$WORK/rebuild.err"; then
+  echo "mismatched rebuild unexpectedly validated" >&2
+  exit 1
+fi
+grep -q 'rebuilt content differs' "$WORK/rebuild.err"
 PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate --manifest "$WORK/collected.json" --store
 grep -q 'build --no-link --print-out-paths --override-input a-input a-ref --override-input z-input z-ref flake#nixosConfigurations.generation' "$NIX_CORPUS_TEST_LOG"
