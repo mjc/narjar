@@ -28,10 +28,16 @@ scripts/nix-corpus validate \
   --manifest benchmarks/corpus-manifest.json \
   --artifact-root /path/to/uncompressed-nars
 
-# Expensive byte-for-byte check against the local Nix store:
+# Expensive byte-for-byte check against the local Nix store, plus rebuild
+# validation against each target's recorded NAR identity:
 scripts/nix-corpus validate \
   --manifest benchmarks/corpus-manifest.json --store --rebuild
 ```
+
+`--rebuild` permits a rebuilt root to have a different store path name. It
+compares the rebuilt root's `narHash` and `narSize` with the metadata recorded
+for the target's expected root in the manifest, so historical expected roots
+do not need to remain in the local store.
 
 Keep the spec and manifest in version control; keep large NAR exports and
 regeneration roots outside the repository. The manifest's `requirements` block
