@@ -11,8 +11,13 @@ The probe used one coherent graph: `gix-odb 0.84.0`, `gix-pack 0.74.2`,
 `gix-object 0.64.1`, `gix-hash 0.26.2`, and `gix-features 0.49.1`. `cargo
 check` and `cargo run` both passed against those exact versions. The run
 streamed a small blob through the loose writer and read it back through the
-loose store. The probe also type-checked the pack writer signature with an
-explicit allocation limit.
+loose store, rejected a read over the loose allocation limit, completed four
+concurrent lookups, and rejected a truncated pack. The probe also
+type-checked the pack writer signature with an explicit allocation limit and
+compiled with both SHA feature flags enabled. A static-musl build was
+attempted through the repository dev shell and failed before compiling the
+probe because `x86_64-unknown-linux-musl` is not installed in that toolchain
+(`can't find crate for core`/`std`).
 
 Primary references:
 
@@ -42,7 +47,7 @@ source was inspected for buffering, limits, and publication behavior.
 | Corruption and resource limits | Supported with constraints | Pack and delta paths expose allocation limits for untrusted metadata and decoded entries. This is per-allocation protection, not a process-wide RSS or total-work budget. Hostile-pack tests remain required before any adoption. |
 | Atomic publication and fsync | Custom work required | The loose writer uses `tempfile::Persist`; the pack writer stages temporary files and returns paths. Neither gives Narjar's required file-sync, directory-sync, no-replace publication, recovery marker, or startup inventory contract. |
 | Interrupted maintenance/recovery | Custom work required | Pack/index generation has interruption and temporary-file handling, but recovery policy and durable inventory are application responsibilities. No Narjar recovery proof was obtained from these crates. |
-| Static-musl and unsafe/transitive surface | Not audited here | The exact API probe was a native debug build. Static packaging, transitive unsafe inventory, and reachable advisories need a separate build/security gate and are not claimed by this document. |
+| Static-musl and unsafe/transitive surface | Static-musl unproven; inventory separate | The native probe compiled, and both SHA features compiled. The repository toolchain lacks the musl target, so static packaging failed before codegen with `can't find crate for core`/`std`. Transitive unsafe inventory and reachable advisories still need a separate security gate. |
 
 ## Recommendation
 
@@ -53,6 +58,10 @@ selection policy, and application-owned durability/recovery surface leave the
 core cache path custom either way. Adding the crates would also introduce a
 large maintenance and advisory-tracking surface for a storage format Narjar
 does not serve.
+
+The runtime probe is intentionally small: it does not claim deep-delta,
+missing-base, truncated-index, or interrupted-pack restart coverage. Those
+remain required before a hostile-input adoption decision.
 
 If a future prototype is authorized, it should use only narrow `gix-odb` and
 `gix-pack` APIs, disable both caches initially, set explicit allocation limits,
