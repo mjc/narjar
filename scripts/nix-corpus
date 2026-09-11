@@ -219,7 +219,7 @@ path_info() {
 }
 
 validate_rebuilds() {
-  local manifest=$1 target expected_root resolved_root target_id resolved_info expected_info
+  local manifest=$1 target expected_root resolved_root target_id resolved_info expected_hash expected_size
   while IFS= read -r target; do
     target_id=$(jq -r '.id // "<unknown>"' <<< "$target")
     if ! resolved_root=$(resolve_root "$target" true); then
@@ -228,12 +228,18 @@ validate_rebuilds() {
     fi
     expected_root=$(jq -r '.resolved_root // empty' <<< "$target")
     if [[ -n "$expected_root" ]]; then
-      if ! resolved_info=$(path_info "$resolved_root") || ! expected_info=$(path_info "$expected_root"); then
+      if ! resolved_info=$(path_info "$resolved_root"); then
         printf 'failed to read rebuilt metadata: %s\n' "$target_id"
         continue
       fi
-      if [[ "$(jq -r '.narHash' <<< "$resolved_info")" != "$(jq -r '.narHash' <<< "$expected_info")" ||
-        "$(jq -r '.narSize' <<< "$resolved_info")" != "$(jq -r '.narSize' <<< "$expected_info")" ]]; then
+      if ! read -r expected_hash expected_size < <(jq -er --arg root "$expected_root" '
+        .entries[]? | select(.path == $root) | [.nar_hash, (.nar_size | tostring)] | @tsv
+      ' "$manifest"); then
+        printf 'manifest has no metadata for expected root: %s\n' "$target_id"
+        continue
+      fi
+      if [[ "$(jq -r '.narHash' <<< "$resolved_info")" != "$expected_hash" ||
+        "$(jq -r '.narSize' <<< "$resolved_info")" != "$expected_size" ]]; then
         printf 'rebuilt content differs for %s: %s != %s\n' "$target_id" "$resolved_root" "$expected_root"
       fi
     fi
