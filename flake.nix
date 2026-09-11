@@ -156,13 +156,17 @@
             runtimeInputs = [
               build.narjar
               pkgs.coreutils
+              pkgs.findutils
+              pkgs.gawk
+              pkgs.jq
               pkgs.nix
-              pkgs.python3
+              pkgs.vmtouch
             ];
             text = ''
               export NARJAR_BIN=${lib.getExe build.narjar}
+              export NARJAR_BINCACHE_EXPR=${./benchmarks/bincache.nix}
               export NARJAR_BENCHMARK_LAUNCH_COMMAND="nix run .#continuation-benchmark --"
-              exec python3 ${./benchmarks/continuation.py} "$@"
+              exec ${builtins.readFile ./scripts/continuation-benchmark} "$@"
             '';
           };
         in
@@ -269,6 +273,7 @@
             env.pkgs.cargo-flamegraph
             env.pkgs.heaptrack
             env.pkgs.wrk
+            env.pkgs.vmtouch
           ];
         };
       }) systems;

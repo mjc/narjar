@@ -1,0 +1,886 @@
+#!/usr/bin/env bash
+set -Ee -o pipefail
+
+ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
+BINCACHE_COMMIT=556a9c8f97a3c994a9de85f567a2ef16ce6513ab
+SEED=29030
+FROZEN_WARMUPS=3
+: "${NARJAR_BIN:=}"
+: "${BINCACHE_EXPR:=}"
+: "${NARJAR_BENCHMARK_LAUNCH_COMMAND:=scripts/continuation-benchmark}"
+OUTPUT=""
+BINCACHE_BIN=""
+REPETITIONS=15
+WARMUPS=$FROZEN_WARMUPS
+QUICK=0
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/continuation-benchmark --output DIR [options]
+
+Options:
+  --output DIR       New directory for environment metadata and raw samples
+  --bincache-bin PATH
+                     Use an existing bincache binary
+  --repetitions N    Measured repetitions (default: 15)
+  --warmups N        Warmups per scenario (default: 3)
+  --quick            One repetition over a ten-path corpus; not decision evidence
+  -h, --help         Show this help
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --output) OUTPUT=$2; shift 2 ;;
+    --bincache-bin) BINCACHE_BIN=$2; shift 2 ;;
+    --repetitions) REPETITIONS=$2; shift 2 ;;
+    --warmups) WARMUPS=$2; shift 2 ;;
+    --quick) QUICK=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$OUTPUT" ]] || { usage >&2; exit 2; }
+[[ ! -e "$OUTPUT" ]] || { echo "output already exists: $OUTPUT" >&2; exit 1; }
+[[ -n "$NARJAR_BIN" && -x "$NARJAR_BIN" ]] || {
+  echo "NARJAR_BIN must point to an executable release binary" >&2
+  exit 1
+}
+[[ "$(uname -s)" == Linux ]] || { echo "Linux /proc is required" >&2; exit 1; }
+if (( ! QUICK && REPETITIONS < 15 )); then
+  echo "--repetitions must be at least 15" >&2
+  exit 1
+fi
+if (( ! QUICK && WARMUPS != FROZEN_WARMUPS )); then
+  echo "--warmups must be $FROZEN_WARMUPS for decision evidence" >&2
+  exit 1
+fi
+for command in awk curl date findmnt jq nix nix-store stat vmtouch; do
+  command -v "$command" >/dev/null || {
+    echo "missing '$command'; run inside 'nix develop'" >&2
+    exit 1
+  }
+done
+
+[[ -n "$BINCACHE_EXPR" ]] || BINCACHE_EXPR=$ROOT/benchmarks/bincache.nix
+mkdir -p "$OUTPUT"
+OUTPUT=$(cd -- "$OUTPUT" && pwd)
+COMMAND_LOG=$OUTPUT/commands.txt
+SAMPLES=$OUTPUT/samples.jsonl
+: > "$COMMAND_LOG"
+: > "$SAMPLES"
+chmod 600 "$COMMAND_LOG"
+WORK=$(mktemp -d "$OUTPUT/.continuation.XXXXXX")
+SERVER_PIDS=""
+NAR_URL_narjar=""
+NAR_BYTES_narjar=0
+NAR_COMPRESSION_narjar=""
+NAR_URL_bincache=""
+NAR_BYTES_bincache=0
+NAR_COMPRESSION_bincache=""
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  for pid in $SERVER_PIDS; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  rm -rf -- "$WORK"
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+log_command() {
+  {
+    printf '$'
+    printf ' %q' "$@"
+    printf '\n'
+  } >> "$COMMAND_LOG"
+}
+
+run_logged() {
+  log_command "$@"
+  "$@"
+}
+
+record() {
+  local case_name=$1 candidate=$2 repetition=$3 value=$4 unit=$5
+  local cache_state=not-applicable context='{}'
+  if (( $# >= 6 )); then cache_state=$6; fi
+  if (( $# >= 7 )); then context=$7; fi
+  jq -cn --arg case "$case_name" --arg candidate "$candidate" \
+    --argjson repetition "$repetition" --argjson value "$value" \
+    --arg unit "$unit" --arg cache_state "$cache_state" --argjson context "$context" \
+    '{case:$case,candidate:$candidate,repetition:$repetition,value:$value,unit:$unit,
+      cache_state:$cache_state,corpus_category:"flat-baseline-control",
+      command_log:"commands.txt"} + $context' >> "$SAMPLES"
+}
+
+now_ns() { date +%s%N; }
+
+proc_cpu_ticks() {
+  awk -F') ' '{split($2, fields, " "); total += fields[12] + fields[13]}
+    END { print total + 0 }' "/proc/$1/task"/*/stat
+}
+
+proc_cpu_ms() {
+  awk -v before="$1" -v after="$2" -v hz="$(getconf CLK_TCK)" \
+    'BEGIN { printf "%.3f", (after-before)*1000/hz }'
+}
+
+proc_rss_kib() {
+  awk '/^Rss:/{print $2; found=1} END{if (!found) exit 1}' "/proc/$1/smaps_rollup"
+}
+
+physical_bytes() {
+  find "$1" -type f -printf '%b\n' 2>/dev/null |
+    awk '{total += $1 * 512} END {print total + 0}'
+}
+
+resolve_bincache() {
+  if [[ -n "$BINCACHE_BIN" ]]; then
+    BINCACHE_BIN=$(cd -- "$(dirname -- "$BINCACHE_BIN")" && pwd)/$(basename -- "$BINCACHE_BIN")
+  else
+    BINCACHE_BIN=$(run_logged nix build --no-write-lock-file --no-link --print-out-paths \
+      --impure --file "$BINCACHE_EXPR" | tail -1)/bin/bincache
+  fi
+}
+
+candidate_root() { printf '%s/.candidate-%s' "$WORK" "$1"; }
+candidate_data() { printf '%s/data' "$(candidate_root "$1")"; }
+candidate_bin() {
+  if [[ "$1" == narjar ]]; then
+    printf '%s\n' "$NARJAR_BIN"
+  else
+    printf '%s\n' "$BINCACHE_BIN"
+  fi
+}
+
+candidate_prepare() {
+  local candidate=$1 root data secret public token keygen
+  root=$(candidate_root "$candidate")
+  data=$(candidate_data "$candidate")
+  mkdir -p "$data" "$OUTPUT/logs"
+  secret=$root/secret-key
+  public=$root/public-key
+  if [[ "$candidate" == narjar ]]; then
+    run_logged "$NARJAR_BIN" init --data-dir "$data"
+    run_logged nix-store --generate-binary-cache-key narjar-benchmark "$secret" "$public"
+    cp -- "$public" "$data/trusted-public-keys"
+    token=$(run_logged "$NARJAR_BIN" token create --data-dir "$data" --scope write --name benchmark)
+  else
+    keygen=$root/keygen.txt
+    log_command "$BINCACHE_BIN" keygen --name bincache-benchmark
+    "$BINCACHE_BIN" keygen --name bincache-benchmark > "$secret" 2> "$keygen"
+    cat "$keygen" >> "$COMMAND_LOG"
+    sed 's/^trusted-public-keys entry: //' "$keygen" > "$public"
+    token=$(run_logged "$BINCACHE_BIN" token)
+  fi
+  printf '%s\n' "$token" > "$root/push-token"
+  printf 'machine 127.0.0.1 login benchmark password %s\n' "$token" > "$root/netrc"
+  chmod 600 "$root/netrc"
+}
+
+candidate_start() {
+  local candidate=$1 root data log pid port
+  root=$(candidate_root "$candidate")
+  data=$(candidate_data "$candidate")
+  log=$OUTPUT/logs/$candidate.log
+  if [[ "$candidate" == narjar ]]; then
+    log_command "$NARJAR_BIN" serve --data-dir "$data" --listen 127.0.0.1:0 --workers 1
+    "$NARJAR_BIN" serve --data-dir "$data" --listen 127.0.0.1:0 --workers 1 > "$log" 2>&1 &
+  else
+    log_command "$BINCACHE_BIN" serve --data-dir "$data" --secret-key-file "$root/secret-key" \
+      --push-token-file "$root/push-token" --listen 127.0.0.1:0 --shards 1
+    "$BINCACHE_BIN" serve --data-dir "$data" --secret-key-file "$root/secret-key" \
+      --push-token-file "$root/push-token" --listen 127.0.0.1:0 --shards 1 > "$log" 2>&1 &
+  fi
+  pid=$!
+  SERVER_PIDS="$SERVER_PIDS $pid"
+  for _ in $(seq 1 300); do
+    port=$(sed -n 's/^listening http:\/\/127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$log" | head -1)
+    if [[ -n "$port" ]] && curl --silent --show-error --max-time 1 \
+      "http://127.0.0.1:$port/nix-cache-info" >/dev/null; then
+      CANDIDATE_URL=http://127.0.0.1:$port
+      CANDIDATE_PID=$pid
+      return
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      cat "$log" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+candidate_start_limited() {
+  local candidate=$1 limit=$2 root data log pid port limited limited_script
+  root=$(candidate_root "$candidate")
+  data=$(candidate_data "$candidate")
+  limited=$root/limited-data
+  log=$OUTPUT/logs/$candidate-enospc.log
+  mkdir -p "$limited"
+  read -r -d '' limited_script <<'EOF' || true
+set -eu; mount -t tmpfs -o "size=$1M" tmpfs "$2"; cp -a "$3/." "$2/"; shift 3; exec "$@"
+EOF
+  if [[ "$candidate" == narjar ]]; then
+    log_command unshare -Urm --map-root-user sh -c "$limited_script" \
+      benchmark-enospc "$limit" "$limited" "$data" "$NARJAR_BIN" serve \
+      --data-dir "$limited" --listen 127.0.0.1:0 --workers 1
+    unshare -Urm --map-root-user sh -c \
+      "$limited_script" \
+      benchmark-enospc "$limit" "$limited" "$data" "$NARJAR_BIN" serve \
+      --data-dir "$limited" --listen 127.0.0.1:0 --workers 1 > "$log" 2>&1 &
+  else
+    log_command unshare -Urm --map-root-user sh -c "$limited_script" \
+      benchmark-enospc "$limit" "$limited" "$data" "$BINCACHE_BIN" serve \
+      --data-dir "$limited" --secret-key-file "$root/secret-key" \
+      --push-token-file "$root/push-token" --listen 127.0.0.1:0 --shards 1
+    unshare -Urm --map-root-user sh -c \
+      "$limited_script" \
+      benchmark-enospc "$limit" "$limited" "$data" "$BINCACHE_BIN" serve \
+      --data-dir "$limited" --secret-key-file "$root/secret-key" \
+      --push-token-file "$root/push-token" --listen 127.0.0.1:0 --shards 1 > "$log" 2>&1 &
+  fi
+  pid=$!
+  SERVER_PIDS="$SERVER_PIDS $pid"
+  for _ in $(seq 1 300); do
+    port=$(sed -n 's/^listening http:\/\/127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$log" | head -1)
+    if [[ -n "$port" ]] && curl --silent --show-error --max-time 1 \
+      "http://127.0.0.1:$port/nix-cache-info" >/dev/null; then
+      CANDIDATE_URL=http://127.0.0.1:$port
+      CANDIDATE_PID=$pid
+      return
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      cat "$log" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+candidate_stop() {
+  if [[ -n "$CANDIDATE_PID" ]] && kill -0 "$CANDIDATE_PID" 2>/dev/null; then
+    kill -TERM "$CANDIDATE_PID" 2>/dev/null || true
+    wait "$CANDIDATE_PID" 2>/dev/null || true
+  fi
+  CANDIDATE_PID=""
+  CANDIDATE_URL=""
+}
+
+candidate_evict_cache() {
+  local candidate=$1 data
+  data=$(candidate_data "$candidate")
+  run_logged vmtouch -e "$data" >/dev/null
+}
+
+candidate_sign() {
+  local candidate=$1
+  shift
+  if [[ "$candidate" == narjar ]]; then
+    run_logged nix store sign --key-file "$(candidate_root "$candidate")/secret-key" "$@"
+  fi
+}
+
+candidate_copy() {
+  local candidate=$1
+  shift
+  candidate_sign "$candidate" "$@"
+  log_command nix copy --refresh --option netrc-file "$(candidate_root "$candidate")/netrc" \
+    --to "$CANDIDATE_URL?compression=none" "$@"
+  nix copy --refresh --option netrc-file "$(candidate_root "$candidate")/netrc" \
+    --to "$CANDIDATE_URL?compression=none" "$@"
+}
+
+candidate_copy_paths_file() {
+  local candidate=$1 paths_file=$2 path count=0
+  local -a batch
+  batch=()
+  while IFS= read -r path; do
+    batch+=( "$path" )
+    count=$((count + 1))
+    if (( count == 128 )); then
+      candidate_copy "$candidate" "${batch[@]}"
+      batch=()
+      count=0
+    fi
+  done < "$paths_file"
+  if (( count )); then
+    candidate_copy "$candidate" "${batch[@]}"
+  fi
+}
+
+candidate_publish_timed() {
+  local candidate=$1 path=$2 root data before_cpu before_disk start copy_pid err rss
+  root=$(candidate_root "$candidate")
+  data=$(candidate_data "$candidate")
+  candidate_sign "$candidate" "$path"
+  before_cpu=$(proc_cpu_ticks "$CANDIDATE_PID")
+  before_disk=$(physical_bytes "$data")
+  start=$(now_ns)
+  err=$WORK/copy.err
+  log_command nix copy --refresh --option netrc-file "$root/netrc" \
+    --to "$CANDIDATE_URL?compression=none" "$path"
+  nix copy --refresh --option netrc-file "$root/netrc" \
+    --to "$CANDIDATE_URL?compression=none" "$path" > /dev/null 2> "$err" &
+  copy_pid=$!
+  CANDIDATE_PEAK_RSS=$(proc_rss_kib "$CANDIDATE_PID")
+  while kill -0 "$copy_pid" 2>/dev/null; do
+    rss=$(proc_rss_kib "$CANDIDATE_PID" 2>/dev/null || printf 0)
+    ((rss > CANDIDATE_PEAK_RSS)) && CANDIDATE_PEAK_RSS=$rss
+    sleep 0.005
+  done
+  wait "$copy_pid" || { cat "$err" >> "$COMMAND_LOG"; return 1; }
+  [[ ! -s "$err" ]] || cat "$err" >> "$COMMAND_LOG"
+  CANDIDATE_WALL_MS=$(awk -v start="$start" -v end="$(now_ns)" 'BEGIN{printf "%.3f",(end-start)/1000000}')
+  CANDIDATE_CPU_MS=$(proc_cpu_ms "$before_cpu" "$(proc_cpu_ticks "$CANDIDATE_PID")")
+  CANDIDATE_PHYSICAL_BYTES=$(( $(physical_bytes "$data") - before_disk ))
+}
+
+candidate_publish_concurrent() {
+  local candidate=$1 path=$2 root data before_cpu before_disk start first second rss
+  root=$(candidate_root "$candidate")
+  data=$(candidate_data "$candidate")
+  candidate_sign "$candidate" "$path"
+  before_cpu=$(proc_cpu_ticks "$CANDIDATE_PID")
+  before_disk=$(physical_bytes "$data")
+  start=$(now_ns)
+  first=$WORK/concurrent-one.err
+  second=$WORK/concurrent-two.err
+  log_command nix copy --refresh --option netrc-file "$root/netrc" --to "$CANDIDATE_URL?compression=none" "$path"
+  nix copy --refresh --option netrc-file "$root/netrc" --to "$CANDIDATE_URL?compression=none" "$path" > /dev/null 2> "$first" &
+  local first_pid=$!
+  log_command nix copy --refresh --option netrc-file "$root/netrc" --to "$CANDIDATE_URL?compression=none" "$path"
+  nix copy --refresh --option netrc-file "$root/netrc" --to "$CANDIDATE_URL?compression=none" "$path" > /dev/null 2> "$second" &
+  local second_pid=$!
+  CANDIDATE_PEAK_RSS=$(proc_rss_kib "$CANDIDATE_PID")
+  while kill -0 "$first_pid" 2>/dev/null || kill -0 "$second_pid" 2>/dev/null; do
+    rss=$(proc_rss_kib "$CANDIDATE_PID" 2>/dev/null || printf 0)
+    ((rss > CANDIDATE_PEAK_RSS)) && CANDIDATE_PEAK_RSS=$rss
+    sleep 0.005
+  done
+  wait "$first_pid" || { cat "$first" >> "$COMMAND_LOG"; return 1; }
+  wait "$second_pid" || { cat "$second" >> "$COMMAND_LOG"; return 1; }
+  [[ ! -s "$first" ]] || cat "$first" >> "$COMMAND_LOG"
+  [[ ! -s "$second" ]] || cat "$second" >> "$COMMAND_LOG"
+  CANDIDATE_WALL_MS=$(awk -v start="$start" -v end="$(now_ns)" 'BEGIN{printf "%.3f",(end-start)/1000000}')
+  CANDIDATE_CPU_MS=$(proc_cpu_ms "$before_cpu" "$(proc_cpu_ticks "$CANDIDATE_PID")")
+  CANDIDATE_PHYSICAL_BYTES=$(( $(physical_bytes "$data") - before_disk ))
+}
+
+candidate_request() {
+  local candidate=$1 method=$2 path=$3 range="" root body err meta url
+  [[ $# -lt 4 ]] || range=$4
+  root=$(candidate_root "$candidate")
+  body=$WORK/request-body
+  err=$WORK/request.err
+  meta=$WORK/request.meta
+  path=$(printf '%s' "$path" | sed 's#^/##')
+  url=$CANDIDATE_URL/$path
+  set -- curl --silent --show-error --max-time 30 --netrc-file "$root/netrc" \
+    -H 'Accept-Encoding: identity' -X "$method"
+  [[ -z "$range" ]] || set -- "$@" -H "Range: $range"
+  set -- "$@" -o "$body" -w '%{http_code}\t%{time_total}\t%{time_starttransfer}\t%{size_download}' "$url"
+  log_command "$@"
+  "$@" > "$meta" 2> "$err" || true
+  [[ ! -s "$err" ]] || cat "$err" >> "$COMMAND_LOG"
+  IFS=$'\t' read -r REQUEST_STATUS REQUEST_SECONDS REQUEST_TTFB REQUEST_BYTES < "$meta"
+  REQUEST_BODY=$body
+  [[ -n "$REQUEST_STATUS" ]] || REQUEST_STATUS=000
+  [[ -n "$REQUEST_SECONDS" ]] || REQUEST_SECONDS=0
+  [[ -n "$REQUEST_TTFB" ]] || REQUEST_TTFB=$REQUEST_SECONDS
+  [[ -n "$REQUEST_BYTES" ]] || REQUEST_BYTES=0
+}
+
+make_corpus() {
+  local count=$1
+  run_logged nix eval --json --expr \
+    'builtins.genList (i: builtins.toFile ("narjar-continuation-" + builtins.toString i) (builtins.toString i)) '"$count" |
+    jq -r '.[]'
+}
+
+make_payloads() {
+  local count=$1 size=$2 label=$3 index path
+  : > "$WORK/$label.paths"
+  mkdir -p "$WORK/payloads"
+  for ((index=0; index<count; index++)); do
+    path=$WORK/payloads/$label-$size-$index.bin
+    head -c "$size" /dev/urandom > "$path"
+    run_logged nix store add-file "$path" >> "$WORK/$label.paths"
+  done
+}
+
+payload_path() { sed -n "$(( $1 + 1 ))p" "$WORK/$2.paths"; }
+
+record_request() {
+  local case_name=$1 candidate=$2 repetition=$3 state=$4 context=$5 latency
+  record "$case_name"_status "$candidate" "$repetition" "$REQUEST_STATUS" HTTP "$state" "$context"
+  latency=$(awk -v seconds="$REQUEST_SECONDS" 'BEGIN{printf "%.6f",seconds*1000}')
+  record "$case_name"_latency "$candidate" "$repetition" "$latency" ms "$state" "$context"
+}
+
+benchmark_startup() {
+  local targets target candidate repetition started startup rss path index
+  if ((QUICK)); then targets="0 10"; else targets="0 100 1000 10000"; fi
+  make_corpus 10000 > "$WORK/corpus.paths"
+  for target in $targets; do
+    for candidate in narjar bincache; do
+      candidate_start "$candidate"
+      if ((target)); then
+        head -n "$target" "$WORK/corpus.paths" > "$WORK/corpus-selected.paths"
+        candidate_copy_paths_file "$candidate" "$WORK/corpus-selected.paths"
+      fi
+      candidate_stop
+    done
+    for candidate in narjar bincache; do
+      for ((repetition=0; repetition<WARMUPS; repetition++)); do
+        candidate_start "$candidate"; candidate_stop
+      done
+      for ((repetition=0; repetition<REPETITIONS; repetition++)); do
+        started=$(now_ns)
+        candidate_start "$candidate"
+        sleep 0.2
+        startup=$(awk -v start="$started" -v end="$(now_ns)" 'BEGIN{printf "%.3f",(end-start)/1000000}')
+        rss=$(proc_rss_kib "$CANDIDATE_PID")
+        record "startup_${target}_paths" "$candidate" "$repetition" "$startup" ms warm \
+          "{\"cache_paths\":$target,\"order\":$repetition}"
+        record "settled_idle_rss_${target}_paths" "$candidate" "$repetition" "$rss" KiB warm \
+          "{\"cache_paths\":$target,\"order\":$repetition}"
+        candidate_stop
+      done
+    done
+  done
+}
+
+benchmark_io() {
+  local size candidate repetition path throughput
+  if ((QUICK)); then size=1048576; else size=16777216; fi
+  make_payloads $((REPETITIONS + WARMUPS)) "$size" upload
+  for candidate in narjar bincache; do
+    candidate_start "$candidate"
+    for ((repetition=0; repetition<WARMUPS; repetition++)); do
+      candidate_copy "$candidate" "$(payload_path "$repetition" upload)"
+    done
+    for ((repetition=0; repetition<REPETITIONS; repetition++)); do
+      path=$(payload_path "$((repetition + WARMUPS))" upload)
+      candidate_publish_timed "$candidate" "$path"
+      record upload_wall "$candidate" "$repetition" "$CANDIDATE_WALL_MS" ms warm "{\"payload_bytes\":$size}"
+      throughput=$(awk -v bytes="$size" -v ms="$CANDIDATE_WALL_MS" 'BEGIN{printf "%.6f",bytes/ms*1000/1048576}')
+      record upload_throughput "$candidate" "$repetition" "$throughput" MiB/s warm "{\"payload_bytes\":$size}"
+      record upload_server_cpu "$candidate" "$repetition" "$CANDIDATE_CPU_MS" ms warm "{\"payload_bytes\":$size}"
+      record upload_peak_rss "$candidate" "$repetition" "$CANDIDATE_PEAK_RSS" KiB warm "{\"payload_bytes\":$size}"
+      record upload_physical_bytes "$candidate" "$repetition" "$CANDIDATE_PHYSICAL_BYTES" bytes warm "{\"payload_bytes\":$size}"
+    done
+    # shellcheck disable=SC2034
+    IFS=$'\t' read -r nar_url nar_bytes nar_compression < <(
+      candidate_nar_info "$candidate" "$(payload_path 0 upload)"
+    )
+    eval "NAR_URL_$candidate=\$nar_url"
+    eval "NAR_BYTES_$candidate=\$nar_bytes"
+    eval "NAR_COMPRESSION_$candidate=\$nar_compression"
+    candidate_stop
+  done
+  jq -n --arg narjar_url "$NAR_URL_narjar" --arg narjar_compression "$NAR_COMPRESSION_narjar" \
+    --argjson narjar_bytes "$NAR_BYTES_narjar" --arg bincache_url "$NAR_URL_bincache" \
+    --arg bincache_compression "$NAR_COMPRESSION_bincache" --argjson bincache_bytes "$NAR_BYTES_bincache" \
+    '{narjar:{accept_encoding:"identity",upload_compression_query:"none",narinfo_compression:$narjar_compression,nar_url:$narjar_url,nar_size:$narjar_bytes,constitution_matched:($narjar_compression=="none")},
+      bincache:{accept_encoding:"identity",upload_compression_query:"none",narinfo_compression:$bincache_compression,nar_url:$bincache_url,nar_size:$bincache_bytes,constitution_matched:($bincache_compression=="none")}}' \
+    > "$OUTPUT/wire-compression.json"
+}
+
+candidate_nar_info() {
+  local candidate=$1 store_path=$2
+  candidate_request "$candidate" GET "$(basename "$store_path" | cut -d- -f1).narinfo"
+  [[ "$REQUEST_STATUS" == 200 ]] || return 1
+  printf '%s\t%s\t%s\n' \
+    "$(awk -F': ' '$1=="URL"{print $2}' "$REQUEST_BODY")" \
+    "$(awk -F': ' '$1=="NarSize"{print $2}' "$REQUEST_BODY")" \
+    "$(awk -F': ' '$1=="Compression"{print $2}' "$REQUEST_BODY")"
+}
+
+benchmark_requests() {
+  local candidate case_name method path range expected state repetition latency throughput nar_bytes
+  for candidate in narjar bincache; do
+    candidate_start "$candidate"
+    eval "path=\$NAR_URL_$candidate"
+    eval "nar_bytes=\$NAR_BYTES_$candidate"
+    for case_name in get_warm get_cold head_warm range_warm resume_90 missing_404; do
+      range=""
+      case "$case_name" in
+        get_warm|get_cold) method=GET; expected=200; state=warm ;;
+        head_warm) method=HEAD; expected=200; state=warm ;;
+        range_warm) method=GET; range='bytes=0-65535'; expected=206; state=warm ;;
+        resume_90) method=GET; range="bytes=$((nar_bytes * 9 / 10))-"; expected=206; state=cold ;;
+        missing_404) method=GET; path=00000000000000000000000000000000.narinfo; expected=404; state=warm ;;
+      esac
+      for ((repetition=0; repetition<WARMUPS + REPETITIONS; repetition++)); do
+        if [[ "$case_name" == get_cold || "$case_name" == resume_90 ]]; then
+          candidate_evict_cache "$candidate"
+        fi
+        candidate_request "$candidate" "$method" "$path" "$range"
+        ((repetition < WARMUPS)) && continue
+        [[ "$REQUEST_STATUS" == "$expected" || ( "$candidate" == bincache && "$REQUEST_STATUS" == 200 && "$case_name" == range_warm ) || ( "$candidate" == bincache && "$REQUEST_STATUS" == 200 && "$case_name" == resume_90 ) ]] || return 1
+        record_request "$case_name" "$candidate" "$((repetition - WARMUPS))" "$state" \
+          "{\"order\":$((repetition - WARMUPS)),\"response_bytes\":$REQUEST_BYTES}"
+        if [[ "$case_name" == get_warm || "$case_name" == get_cold ]]; then
+          throughput=$(awk -v bytes="$nar_bytes" -v seconds="$REQUEST_SECONDS" 'BEGIN{printf "%.6f",bytes/seconds/1048576}')
+          latency=$(awk -v seconds="$REQUEST_TTFB" 'BEGIN{printf "%.6f",seconds*1000}')
+          record "$case_name"_throughput "$candidate" "$((repetition - WARMUPS))" "$throughput" MiB/s "$state" '{}'
+          record "$case_name"_ttfb "$candidate" "$((repetition - WARMUPS))" "$latency" ms "$state" '{}'
+        fi
+      done
+    done
+    candidate_stop
+  done
+}
+
+candidate_concurrent_get() {
+  local candidate=$1 path=$2 width=$3 index pid status_file url root
+  local pids=""
+  root=$(candidate_root "$candidate")
+  url=$CANDIDATE_URL/$(printf '%s' "$path" | sed 's#^/##')
+  start=$(now_ns)
+  for ((index=0; index<width; index++)); do
+    status_file=$WORK/get-$candidate-$index.status
+    log_command curl --silent --show-error --max-time 30 --netrc-file "$root/netrc" \
+      -H 'Accept-Encoding: identity' -o "$WORK/get-$candidate-$index.body" \
+      -w '%{http_code}' "$url"
+    curl --silent --show-error --max-time 30 --netrc-file "$root/netrc" \
+      -H 'Accept-Encoding: identity' -o "$WORK/get-$candidate-$index.body" \
+      -w '%{http_code}' "$url" > "$status_file" 2>/dev/null &
+    pids="$pids $!"
+  done
+  for pid in $pids; do
+    wait "$pid" || return 1
+  done
+  for ((index=0; index<width; index++)); do
+    [[ "$(<"$WORK/get-$candidate-$index.status")" == 200 ]] || return 1
+  done
+  elapsed=$(awk -v start="$start" -v end="$(now_ns)" 'BEGIN{printf "%.6f",(end-start)/1000000}')
+  printf '%s\n' "$elapsed"
+}
+
+benchmark_concurrent_gets() {
+  local widths width candidate repetition path elapsed throughput nar_bytes
+  if ((QUICK)); then widths=1; else widths="1 8 32"; fi
+  for candidate in narjar bincache; do
+    candidate_start "$candidate"
+    eval "path=\$NAR_URL_$candidate"
+    eval "nar_bytes=\$NAR_BYTES_$candidate"
+    for width in $widths; do
+      for ((repetition=0; repetition<WARMUPS; repetition++)); do
+        candidate_concurrent_get "$candidate" "$path" "$width" >/dev/null
+      done
+      for ((repetition=0; repetition<REPETITIONS; repetition++)); do
+        elapsed=$(candidate_concurrent_get "$candidate" "$path" "$width")
+        throughput=$(awk -v bytes="$nar_bytes" -v width="$width" -v ms="$elapsed" \
+          'BEGIN{printf "%.6f",bytes*width/ms*1000/1048576}')
+        record "concurrent_get_${width}" "$candidate" "$repetition" "$throughput" MiB/s warm \
+          "{\"width\":$width}"
+      done
+    done
+    candidate_stop
+  done
+}
+
+candidate_interrupt_upload() {
+  local candidate=$1 nar_file=$2 object_path=$3 root size half err meta
+  root=$(candidate_root "$candidate")
+  size=$(stat -c '%s' "$nar_file")
+  half=$((size / 2))
+  err=$WORK/interrupt.err
+  meta=$WORK/interrupt.meta
+  log_command head -c "$half" "$nar_file" '|' curl --silent --show-error \
+    --max-time 30 --netrc-file "$root/netrc" -X PUT --data-binary @- \
+    -o /dev/null -w '%{http_code}' "$CANDIDATE_URL/$object_path"
+  head -c "$half" "$nar_file" |
+    curl --silent --show-error --max-time 30 --netrc-file "$root/netrc" \
+      -X PUT --data-binary @- -o /dev/null -w '%{http_code}' \
+      "$CANDIDATE_URL/$object_path" > "$meta" 2> "$err" || true
+  [[ ! -s "$err" ]] || cat "$err" >> "$COMMAND_LOG"
+}
+
+benchmark_recovery() {
+  local size candidate repetition path start status restart_status alive recovery_ms object_id
+  if ((QUICK)); then size=1048576; else size=4194304; fi
+  make_payloads $((REPETITIONS + WARMUPS + 1)) "$size" recovery
+  for candidate in narjar bincache; do
+    candidate_start "$candidate"
+    candidate_copy "$candidate" "$(payload_path 0 recovery)"
+    for ((repetition=0; repetition<WARMUPS; repetition++)); do
+      candidate_publish_timed "$candidate" "$(payload_path 0 recovery)"
+    done
+    for ((repetition=1; repetition<=WARMUPS; repetition++)); do
+      candidate_publish_concurrent "$candidate" "$(payload_path "$repetition" recovery)"
+    done
+    for ((repetition=0; repetition<REPETITIONS; repetition++)); do
+      candidate_publish_timed "$candidate" "$(payload_path 0 recovery)"
+      record duplicate_upload_wall "$candidate" "$repetition" "$CANDIDATE_WALL_MS" ms
+      record duplicate_upload_physical_bytes "$candidate" "$repetition" "$CANDIDATE_PHYSICAL_BYTES" bytes
+    done
+    for ((repetition=0; repetition<REPETITIONS; repetition++)); do
+      path=$(payload_path "$((repetition + WARMUPS + 1))" recovery)
+      candidate_publish_concurrent "$candidate" "$path"
+      record concurrent_upload_wall "$candidate" "$repetition" "$CANDIDATE_WALL_MS" ms
+      record concurrent_upload_server_cpu "$candidate" "$repetition" "$CANDIDATE_CPU_MS" ms
+      record concurrent_upload_peak_rss "$candidate" "$repetition" "$CANDIDATE_PEAK_RSS" KiB
+    done
+    candidate_stop
+  done
+
+  make_payloads 1 "$size" interrupted
+  run_logged nix nar pack "$(payload_path 0 interrupted)" > "$WORK/interrupted.nar"
+  object_id=$(run_logged nix hash file --type sha256 --base32 "$WORK/interrupted.nar" | cut -d: -f2)
+  object_id=$object_id.nar
+  : > "$WORK/recovery-operations.jsonl"
+  for candidate in narjar bincache; do
+    candidate_start "$candidate"
+    candidate_interrupt_upload "$candidate" "$WORK/interrupted.nar" "$object_id"
+    candidate_request "$candidate" HEAD "$object_id"
+    status=$REQUEST_STATUS
+    if kill -0 "$CANDIDATE_PID" 2>/dev/null; then alive=1; else alive=0; fi
+    candidate_stop
+    start=$(now_ns)
+    candidate_start "$candidate"
+    candidate_request "$candidate" HEAD "$object_id"
+    restart_status=$REQUEST_STATUS
+    recovery_ms=$(awk -v start="$start" -v end="$(now_ns)" 'BEGIN{printf "%.3f",(end-start)/1000000}')
+    candidate_stop
+    [[ "$status" == 404 && "$restart_status" == 404 && "$alive" == 1 ]] || return 1
+    record interrupted_upload_status "$candidate" 0 "$status" HTTP
+    record interrupted_upload_server_alive "$candidate" 0 "$alive" bool
+    record interrupted_upload_restart_status "$candidate" 0 "$restart_status" HTTP
+    record interrupted_upload_recovery_wall "$candidate" 0 "$recovery_ms" ms
+    if [[ "$candidate" == bincache ]]; then
+      start=$(now_ns)
+      run_logged "$BINCACHE_BIN" reconcile --data-dir "$(candidate_data "$candidate")" >/dev/null
+      recovery_ms=$(awk -v start="$start" -v end="$(now_ns)" 'BEGIN{printf "%.3f",(end-start)/1000000}')
+      record reconcile_steps "$candidate" 0 3 steps
+      printf '%s\n' '{"candidate":"bincache","steps":["stop serve","run bincache reconcile","start serve"]}' >> "$WORK/recovery-operations.jsonl"
+    else
+      record reconcile_steps "$candidate" 0 1 steps
+      printf '%s\n' '{"candidate":"narjar","steps":["restart serve; reconciliation is automatic"]}' >> "$WORK/recovery-operations.jsonl"
+    fi
+    record reconcile_wall "$candidate" 0 "$recovery_ms" ms
+  done
+  jq -s '.' "$WORK/recovery-operations.jsonl" > "$OUTPUT/recovery-operations.json"
+}
+
+benchmark_enospc() {
+  local size candidate result alive status restart_status start recovery_ms stderr_tail
+  command -v unshare >/dev/null || { echo "unshare is required for ENOSPC" >&2; return 1; }
+  if ((QUICK)); then size=16777216; else size=67108864; fi
+  make_payloads 1 "$size" enospc
+  : > "$WORK/enospc.jsonl"
+  for candidate in narjar bincache; do
+    candidate_start_limited "$candidate" 8
+    if candidate_copy "$candidate" "$(payload_path 0 enospc)"; then result=0; else result=$?; fi
+    sleep 0.1
+    if kill -0 "$CANDIDATE_PID" 2>/dev/null; then alive=1; else alive=0; fi
+    if ((alive)); then
+      candidate_request "$candidate" HEAD "$(basename "$(payload_path 0 enospc)" | cut -d- -f1).narinfo"
+      status=$REQUEST_STATUS
+    else
+      status=0
+    fi
+    candidate_stop
+    candidate_start "$candidate"
+    candidate_request "$candidate" HEAD "$(basename "$(payload_path 0 enospc)" | cut -d- -f1).narinfo"
+    restart_status=$REQUEST_STATUS
+    candidate_stop
+    ((result != 0 && alive == 1 && status == 404 && restart_status == 404)) || return 1
+    record enospc_client_failed "$candidate" 0 1 bool
+    record enospc_service_alive "$candidate" 0 "$alive" bool
+    record enospc_visibility_after_failure "$candidate" 0 "$status" 'HTTP status'
+    record enospc_visibility_after_restart "$candidate" 0 "$restart_status" 'HTTP status'
+    stderr_tail=$(tail -c 4000 "$OUTPUT/logs/$candidate-enospc.log" | jq -Rs .)
+    jq -n --arg candidate "$candidate" --argjson returncode "$result" \
+      --argjson payload_bytes "$size" --argjson alive "$alive" --argjson status "$status" \
+      --argjson restart "$restart_status" --argjson stderr "$stderr_tail" \
+      '{candidate:$candidate,client_returncode:$returncode,client_stderr_tail:$stderr,
+        data_limit_mib:8,payload_bytes:$payload_bytes,server_alive:($alive==1),
+        status_after_failure:$status,status_after_restart:$restart}' >> "$WORK/enospc.jsonl"
+  done
+  jq -s '.' "$WORK/enospc.jsonl" > "$OUTPUT/enospc.json"
+}
+
+candidate_substitute() {
+  local candidate=$1 path=$2 store_root=$3 trusted_key=$4 output=$5
+  if run_logged nix --store "local?root=$store_root" copy --refresh --from "$CANDIDATE_URL" \
+    --option netrc-file "$(candidate_root "$candidate")/netrc" \
+    --option require-sigs true --option trusted-public-keys "$trusted_key" "$path" \
+    > "$output" 2>&1; then
+    return 0
+  else
+    return $?
+  fi
+}
+
+benchmark_trust() {
+  local wrong_secret=$WORK/wrong-secret-key wrong_public=$WORK/wrong-public-key wrong_key
+  local candidate flake_uri expression path wrong_status correct_status wrong_log correct_log
+  run_logged nix-store --generate-binary-cache-key wrong-benchmark-key "$wrong_secret" "$wrong_public"
+  wrong_key=$(<"$wrong_public")
+  : > "$WORK/substitution.jsonl"
+  for candidate in narjar bincache; do
+    flake_uri=path:$ROOT
+    printf -v expression "let pkgs = import (builtins.getFlake \"%s\").inputs.nixpkgs { system = builtins.currentSystem; }; in pkgs.runCommand \"narjar-trust-%s\" {} \"printf matched-substitution-proof > \$out\"" "$flake_uri" "$candidate"
+    path=$(run_logged nix build --no-link --print-out-paths --impure --expr "$expression" | tail -1)
+    candidate_start "$candidate"
+    candidate_copy "$candidate" "$path"
+    wrong_log=$WORK/wrong-$candidate.log
+    correct_log=$WORK/correct-$candidate.log
+    if candidate_substitute "$candidate" "$path" "$WORK/wrong-store-$candidate" "$wrong_key" "$wrong_log"; then
+      wrong_status=0
+    else
+      wrong_status=$?
+    fi
+    if candidate_substitute "$candidate" "$path" "$WORK/correct-store-$candidate" "$(cat "$(candidate_root "$candidate")/public-key")" "$correct_log"; then
+      correct_status=0
+    else
+      correct_status=$?
+    fi
+    candidate_stop
+    ((wrong_status != 0 && correct_status == 0)) || return 1
+    record wrong_key_rejected "$candidate" 0 1 bool
+    record correct_key_substituted "$candidate" 0 1 bool
+    jq -n --arg candidate "$candidate" --arg path "$path" --argjson wrong "$wrong_status" \
+      --argjson correct "$correct_status" --arg wrong_tail "$(tail -c 4000 "$wrong_log")" \
+      --arg correct_tail "$(tail -c 4000 "$correct_log")" \
+      '{candidate:$candidate,correct_key_returncode:$correct,correct_key_stderr_tail:$correct_tail,
+        path:$path,wrong_key_returncode:$wrong,wrong_key_stderr_tail:$wrong_tail}' >> "$WORK/substitution.jsonl"
+  done
+  jq -s '.' "$WORK/substitution.jsonl" > "$OUTPUT/substitution.json"
+}
+
+measure_closures() {
+  local candidate binary output closure
+  for candidate in narjar bincache; do
+    binary=$(candidate_bin "$candidate")
+    output=$(dirname -- "$(dirname -- "$binary")")
+    closure=$(run_logged nix path-info -S "$output" | awk '{print $NF}')
+    record binary_size "$candidate" 0 "$(stat -c '%s' "$binary")" bytes
+    record runtime_closure_size "$candidate" 0 "$closure" bytes
+  done
+  if (( ! QUICK )); then
+    local static_output static_binary
+    static_output=$(run_logged nix build --no-link --print-out-paths .#narjar-static | tail -1)
+    static_binary=$static_output/bin/narjar
+    closure=$(run_logged nix path-info -S "$static_output" | awk '{print $NF}')
+    record binary_size narjar-static 0 "$(stat -c '%s' "$static_binary")" bytes
+    record runtime_closure_size narjar-static 0 "$closure" bytes
+  fi
+}
+
+benchmark_streaming() {
+  local sizes size candidate repetition
+  if ((QUICK)); then sizes=4194304; else sizes="104857600 1073741824"; fi
+  for size in $sizes; do
+    make_payloads $((WARMUPS + 1)) "$size" streaming
+    for candidate in narjar bincache; do
+      candidate_start "$candidate"
+      for ((repetition=0; repetition<WARMUPS; repetition++)); do
+        candidate_publish_timed "$candidate" "$(payload_path "$repetition" streaming)"
+      done
+      candidate_publish_timed "$candidate" "$(payload_path "$WARMUPS" streaming)"
+      record "streaming_upload_wall_${size}_bytes" "$candidate" 0 "$CANDIDATE_WALL_MS" ms warm "{\"payload_bytes\":$size}"
+      record "streaming_upload_server_cpu_${size}_bytes" "$candidate" 0 "$CANDIDATE_CPU_MS" ms warm "{\"payload_bytes\":$size}"
+      record "streaming_upload_peak_rss_${size}_bytes" "$candidate" 0 "$CANDIDATE_PEAK_RSS" KiB warm "{\"payload_bytes\":$size}"
+      record "streaming_upload_physical_bytes_${size}_bytes" "$candidate" 0 "$CANDIDATE_PHYSICAL_BYTES" bytes warm "{\"payload_bytes\":$size}"
+      candidate_stop
+    done
+  done
+}
+
+write_report() {
+  local commit narjar_sha bincache_sha host target kernel filesystem platform uname_string cpu_count cpu_model governor
+  local nix_version rust_version git_version unshare_version narjar_output bincache_output
+  jq -s 'group_by([.case,.candidate,.unit]) | map({
+    case:.[0].case,candidate:.[0].candidate,unit:.[0].unit,n:length,
+    median:(sort_by(.value)|if length%2==1 then .[length/2|floor].value else ((.[length/2-1].value + .[length/2].value)/2) end),
+    p95:(sort_by(.value)|.[(length*0.95|ceil)-1].value),
+    min:(map(.value)|min),max:(map(.value)|max)})' "$SAMPLES" > "$OUTPUT/summary.json"
+  commit=$(git rev-parse HEAD 2>/dev/null || printf unknown)
+  narjar_sha=$(run_logged nix hash file --type sha256 "$NARJAR_BIN")
+  bincache_sha=$(run_logged nix hash file --type sha256 "$BINCACHE_BIN")
+  host=$(hostname)
+  target=$(uname -m)
+  kernel=$(uname -r)
+  platform=$(uname -srm)
+  uname_string=$(uname -a)
+  cpu_count=$(getconf _NPROCESSORS_ONLN)
+  cpu_model=$(awk -F': ' '$1=="model name"{print $2; exit}' /proc/cpuinfo)
+  governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)
+  nix_version=$(nix --version)
+  rust_version=$(rustc --version 2>/dev/null || printf unknown)
+  git_version=$(git --version 2>/dev/null || printf unknown)
+  unshare_version=$(unshare --version 2>/dev/null || printf unknown)
+  narjar_output=$(dirname -- "$(dirname -- "$NARJAR_BIN")")
+  bincache_output=$(dirname -- "$(dirname -- "$BINCACHE_BIN")")
+  filesystem=$(findmnt -T "$OUTPUT" -no SOURCE,FSTYPE,OPTIONS)
+  jq -n --arg commit "$commit" --arg narjar "$NARJAR_BIN" --arg narjar_sha "$narjar_sha" \
+    --arg narjar_output "$narjar_output" --arg bincache "$BINCACHE_BIN" --arg bincache_sha "$bincache_sha" \
+    --arg bincache_output "$bincache_output" --arg nix "$nix_version" --arg rustc "$rust_version" \
+    --arg git "$git_version" --arg unshare "$unshare_version" --arg host "$host" --arg target "$target" \
+    --arg kernel "$kernel" --arg platform "$platform" --arg uname "$uname_string" --argjson cpu_count "$cpu_count" \
+    --arg cpu_model "$cpu_model" --arg governor "$governor" --arg filesystem "$filesystem" \
+    --arg launch "$NARJAR_BENCHMARK_LAUNCH_COMMAND" --argjson repetitions "$REPETITIONS" \
+    --argjson warmups "$WARMUPS" --argjson quick "$QUICK" --argjson seed "$SEED" \
+    '{recorded_at:(now|todateiso8601),host:$host,target:$target,kernel:$kernel,filesystem:$filesystem,nix:$nix,
+      platform:$platform,uname:$uname,cpu_count:$cpu_count,cpu_model:$cpu_model,cpu_governor:$governor,
+      rust_version:$rustc,git:$git,unshare:$unshare,narjar_binary:$narjar,narjar_binary_sha256:$narjar_sha,
+      narjar_output:$narjar_output,bincache_binary:$bincache,bincache_binary_sha256:$bincache_sha,bincache_output:$bincache_output,narjar_commit:$commit,
+      bincache_commit:"'$BINCACHE_COMMIT'",repetitions:$repetitions,warmups:$warmups,random_seed:$seed,
+      quick:($quick==1),launch_command:$launch,command_log:"commands.txt",raw_samples:"samples.jsonl",
+      corpus_manifest:"benchmarks/corpus-manifest.json",corpus_category:"flat-baseline-control",
+      cache_state:"warm and cold page-cache controls"}' > "$OUTPUT/environment.json"
+  jq -n --argjson rows "$(cat "$OUTPUT/summary.json")" \
+    --slurpfile environment "$OUTPUT/environment.json" --slurpfile wire "$OUTPUT/wire-compression.json" \
+    '($environment[0]) as $e |
+     ([ $rows[] | select(.case == "runtime_closure_size") |
+        {key:.candidate,value:{bytes:.median,output:($e[(.candidate + "_output")])}} ] | from_entries) as $closures |
+     {commit:$e.narjar_commit,binary_identity:{narjar:{path:$e.narjar_binary,sha256:$e.narjar_binary_sha256},
+       bincache:{path:$e.bincache_binary,sha256:$e.bincache_binary_sha256}},closure_identity:$closures,
+       host:$e.host,target:$e.target,kernel:$e.kernel,platform:$e.platform,filesystem:$e.filesystem,
+       governor:$e.cpu_governor,nix_version:$e.nix,rust_version:$e.rust_version,
+       tool_versions:{git:$e.git,unshare:$e.unshare,rustc:$e.rust_version},command_log:$e.command_log,
+       wire_compression:$wire[0],corpus_manifest:$e.corpus_manifest,corpus_category:$e.corpus_category,
+       cache_state:$e.cache_state,warmups:$e.warmups,repetitions:$e.repetitions,raw_samples:$e.raw_samples}' \
+    > "$OUTPUT/provenance.json"
+  jq -n --argjson rows "$(cat "$OUTPUT/summary.json")" --slurpfile provenance "$OUTPUT/provenance.json" \
+    '($rows | map(select(.candidate == "narjar" and (.case | startswith("startup_"))))) as $startup |
+     (if any($startup[]; .case == "startup_10000_paths") then
+        ($startup | map(select(.case == "startup_10000_paths"))[0])
+      else $startup | sort_by(.case) | .[-1] end) as $baseline |
+     {provenance:$provenance[0],metric:{case:$baseline.case,candidate:$baseline.candidate,savings_percent:0,
+       median:$baseline.median,p95:$baseline.p95,unit:$baseline.unit}}' \
+    > "$OUTPUT/evidence.json"
+  {
+    printf '%s\n\n' '# Continuation benchmark'
+    printf '%s\n' '- Warmups: '"$WARMUPS" '- Repetitions: '"$REPETITIONS" '- Quick: '"$QUICK"
+    printf '%s\n' "- Bincache ref: \`$BINCACHE_COMMIT\`" "- Wire compression: \`none\` upload query; narinfo values are recorded in \`wire-compression.json\`."
+    printf '\n| Case | Candidate | n | Median | p95 | Min | Max | Unit |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |\n'
+    jq -r '.[] | "| \(.case) | \(.candidate) | \(.n) | \(.median) | \(.p95) | \(.min) | \(.max) | \(.unit) |"' "$OUTPUT/summary.json"
+  } > "$OUTPUT/report.md"
+}
+
+resolve_bincache
+for candidate in narjar bincache; do candidate_prepare "$candidate"; done
+benchmark_startup
+benchmark_io
+benchmark_requests
+benchmark_concurrent_gets
+benchmark_streaming
+benchmark_recovery
+benchmark_enospc
+benchmark_trust
+measure_closures
+write_report
+echo "$OUTPUT"
