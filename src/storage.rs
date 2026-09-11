@@ -2263,6 +2263,19 @@ mod tests {
     }
 
     #[test]
+    fn process_lock_release_does_not_depend_on_storage_directory_handles() {
+        let directory = TestDir::new();
+        let first = Storage::initialize(directory.path()).expect("acquire first process lock");
+        let lingering_directory_handle = first.root.try_clone().expect("clone directory handle");
+
+        drop(first);
+        Storage::initialize(directory.path())
+            .expect("reacquire without waiting for directory handles");
+
+        drop(lingering_directory_handle);
+    }
+
+    #[test]
     fn process_lock_survives_lockfile_replacement() {
         let directory = TestDir::new();
         let first = Storage::initialize(directory.path()).expect("acquire first process lock");
