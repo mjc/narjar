@@ -1,0 +1,419 @@
+0narj87-gix-high-level v0.1.0 (/tmp/narj87-gix-cost/high-level)
+1gix v0.87.1
+2gix-actor v0.42.0
+3bstr v1.13.1
+4memchr v2.8.3
+4regex-automata v0.4.18
+3gix-date v0.16.0
+4bstr v1.13.1 (*)
+4gix-error v0.3.2
+5bstr v1.13.1 (*)
+4itoa v1.0.18
+4jiff v0.2.35
+5jiff-core v0.1.0
+3gix-error v0.3.2 (*)
+2gix-attributes v0.35.0
+3bstr v1.13.1 (*)
+3gix-features v0.49.1
+4crc32fast v1.5.1
+5cfg-if v1.0.4
+4gix-path v0.12.6
+5bstr v1.13.1 (*)
+5gix-trace v0.1.21
+5gix-validate v0.11.4
+6bstr v1.13.1 (*)
+5thiserror v2.0.20
+6thiserror-impl v2.0.20 (proc-macro)
+7proc-macro2 v1.0.107
+8unicode-ident v1.0.24
+7quote v1.0.47
+8proc-macro2 v1.0.107 (*)
+7syn v3.0.5
+8proc-macro2 v1.0.107 (*)
+8quote v1.0.47 (*)
+8unicode-ident v1.0.24
+4gix-trace v0.1.21
+4gix-utils v0.3.6
+5bstr v1.13.1 (*)
+5fastrand v2.5.0
+5getrandom v0.4.3
+6cfg-if v1.0.4
+6libc v0.2.189
+5unicode-normalization v0.1.25
+6tinyvec v1.13.2
+7tinyvec_macros v0.1.1
+4libc v0.2.189
+4once_cell v1.21.4
+4prodash v31.0.0
+5parking_lot v0.12.5
+6lock_api v0.4.14
+7scopeguard v1.2.0
+6parking_lot_core v0.9.12
+7cfg-if v1.0.4
+7libc v0.2.189
+7smallvec v1.16.1
+4walkdir v2.5.0
+5same-file v1.0.6
+3gix-glob v0.27.1
+4bitflags v2.13.2
+4bstr v1.13.1 (*)
+4gix-features v0.49.1 (*)
+4gix-path v0.12.6 (*)
+3gix-path v0.12.6 (*)
+3gix-quote v0.8.0
+4bstr v1.13.1 (*)
+4gix-error v0.3.2 (*)
+4gix-utils v0.3.6 (*)
+3gix-trace v0.1.21
+3smallvec v1.16.1
+3thiserror v2.0.20 (*)
+3unicode-bom v2.0.3
+2gix-command v0.10.1
+3bstr v1.13.1 (*)
+3gix-path v0.12.6 (*)
+3gix-quote v0.8.0 (*)
+3gix-trace v0.1.21
+2gix-commitgraph v0.39.0
+3bstr v1.13.1 (*)
+3gix-chunk v0.8.0
+4gix-error v0.3.2 (*)
+3gix-error v0.3.2 (*)
+3gix-hash v0.26.2
+4faster-hex v0.10.0
+5heapless v0.8.0
+6hash32 v0.3.1
+7byteorder v1.5.0
+6stable_deref_trait v1.2.1
+4gix-features v0.49.1 (*)
+4sha1-checked v0.10.0
+5digest v0.10.7
+6block-buffer v0.10.4
+7generic-array v0.14.7
+8typenum v1.20.1
+8version_check v0.9.5
+6crypto-common v0.1.7
+7generic-array v0.14.7 (*)
+7typenum v1.20.1
+5sha1 v0.10.7
+6cfg-if v1.0.4
+6cpufeatures v0.2.17
+6digest v0.10.7 (*)
+4sha2 v0.11.0
+5cfg-if v1.0.4
+5cpufeatures v0.3.1
+5digest v0.11.3
+6block-buffer v0.12.1
+7hybrid-array v0.4.15
+8typenum v1.20.1
+6crypto-common v0.2.2
+7hybrid-array v0.4.15 (*)
+4thiserror v2.0.20 (*)
+3memmap2 v0.9.11
+4libc v0.2.189
+3nonempty v0.12.0
+2gix-config v0.60.0
+3bstr v1.13.1 (*)
+3gix-config-value v0.19.1
+4bitflags v2.13.2
+4bstr v1.13.1 (*)
+4gix-path v0.12.6 (*)
+4libc v0.2.189
+4thiserror v2.0.20 (*)
+3gix-features v0.49.1 (*)
+3gix-glob v0.27.1 (*)
+3gix-path v0.12.6 (*)
+3gix-ref v0.67.1
+4gix-actor v0.42.0 (*)
+4gix-features v0.49.1 (*)
+4gix-fs v0.22.1
+5bstr v1.13.1 (*)
+5gix-features v0.49.1 (*)
+5gix-path v0.12.6 (*)
+5gix-utils v0.3.6 (*)
+5thiserror v2.0.20 (*)
+4gix-hash v0.26.2 (*)
+4gix-lock v24.0.0
+5gix-tempfile v24.0.0
+6dashmap v6.2.1
+7cfg-if v1.0.4
+7crossbeam-utils v0.8.23
+7hashbrown v0.14.5
+7lock_api v0.4.14 (*)
+7once_cell v1.21.4
+7parking_lot_core v0.9.12 (*)
+6gix-fs v0.22.1 (*)
+6libc v0.2.189
+6parking_lot v0.12.5 (*)
+6tempfile v3.27.0
+7fastrand v2.5.0
+7getrandom v0.4.3 (*)
+7once_cell v1.21.4
+7rustix v1.1.4
+8bitflags v2.13.2
+8linux-raw-sys v0.12.1
+5gix-utils v0.3.6 (*)
+5thiserror v2.0.20 (*)
+4gix-object v0.64.1
+5bstr v1.13.1 (*)
+5gix-actor v0.42.0 (*)
+5gix-command v0.10.1 (*)
+5gix-date v0.16.0 (*)
+5gix-features v0.49.1 (*)
+5gix-hash v0.26.2 (*)
+5gix-hashtable v0.16.0
+6gix-hash v0.26.2 (*)
+6hashbrown v0.17.1
+7allocator-api2 v0.2.21
+7equivalent v1.0.2
+7foldhash v0.2.0
+6parking_lot v0.12.5 (*)
+5gix-tempfile v24.0.0 (*)
+5gix-utils v0.3.6 (*)
+5gix-validate v0.11.4 (*)
+5itoa v1.0.18
+5smallvec v1.16.1
+5thiserror v2.0.20 (*)
+4gix-path v0.12.6 (*)
+4gix-tempfile v24.0.0 (*)
+4gix-utils v0.3.6 (*)
+4gix-validate v0.11.4 (*)
+4memmap2 v0.9.11 (*)
+4thiserror v2.0.20 (*)
+3gix-sec v0.14.2
+4bitflags v2.13.2
+4libc v0.2.189
+3gix-utils v0.3.6 (*)
+3smallvec v1.16.1
+3thiserror v2.0.20 (*)
+3unicode-bom v2.0.3
+2gix-date v0.16.0 (*)
+2gix-diff v0.67.1
+3bstr v1.13.1 (*)
+3gix-command v0.10.1 (*)
+3gix-filter v0.34.0
+4bstr v1.13.1 (*)
+4encoding_rs v0.8.35
+5cfg-if v1.0.4
+4gix-attributes v0.35.0 (*)
+4gix-command v0.10.1 (*)
+4gix-hash v0.26.2 (*)
+4gix-object v0.64.1 (*)
+4gix-packetline v0.22.2
+5bstr v1.13.1 (*)
+5faster-hex v0.10.0 (*)
+5gix-trace v0.1.21
+5thiserror v2.0.20 (*)
+4gix-path v0.12.6 (*)
+4gix-quote v0.8.0 (*)
+4gix-trace v0.1.21
+4gix-utils v0.3.6 (*)
+4smallvec v1.16.1
+4thiserror v2.0.20 (*)
+3gix-fs v0.22.1 (*)
+3gix-hash v0.26.2 (*)
+3gix-imara-diff v0.2.5
+4bstr v1.13.1 (*)
+4hashbrown v0.17.1 (*)
+3gix-object v0.64.1 (*)
+3gix-path v0.12.6 (*)
+3gix-tempfile v24.0.0 (*)
+3gix-trace v0.1.21
+3gix-traverse v0.61.0
+4bitflags v2.13.2
+4gix-commitgraph v0.39.0 (*)
+4gix-date v0.16.0 (*)
+4gix-hash v0.26.2 (*)
+4gix-hashtable v0.16.0 (*)
+4gix-object v0.64.1 (*)
+4gix-revwalk v0.35.0
+5gix-commitgraph v0.39.0 (*)
+5gix-date v0.16.0 (*)
+5gix-error v0.3.2 (*)
+5gix-hash v0.26.2 (*)
+5gix-hashtable v0.16.0 (*)
+5gix-object v0.64.1 (*)
+5smallvec v1.16.1
+5thiserror v2.0.20 (*)
+4smallvec v1.16.1
+4thiserror v2.0.20 (*)
+3gix-worktree v0.56.0
+4bstr v1.13.1 (*)
+4gix-attributes v0.35.0 (*)
+4gix-fs v0.22.1 (*)
+4gix-glob v0.27.1 (*)
+4gix-hash v0.26.2 (*)
+4gix-ignore v0.22.1
+5bstr v1.13.1 (*)
+5gix-glob v0.27.1 (*)
+5gix-path v0.12.6 (*)
+5gix-trace v0.1.21
+5unicode-bom v2.0.3
+4gix-index v0.55.0
+5bitflags v2.13.2
+5bstr v1.13.1 (*)
+5filetime v0.2.29
+6cfg-if v1.0.4
+6libc v0.2.189
+5fnv v1.0.7
+5gix-bitmap v0.4.0
+6gix-error v0.3.2 (*)
+5gix-features v0.49.1 (*)
+5gix-fs v0.22.1 (*)
+5gix-hash v0.26.2 (*)
+5gix-lock v24.0.0 (*)
+5gix-object v0.64.1 (*)
+5gix-traverse v0.61.0 (*)
+5gix-utils v0.3.6 (*)
+5gix-validate v0.11.4 (*)
+5hashbrown v0.17.1 (*)
+5itoa v1.0.18
+5libc v0.2.189
+5memmap2 v0.9.11 (*)
+5rustix v1.1.4 (*)
+5smallvec v1.16.1
+5thiserror v2.0.20 (*)
+4gix-object v0.64.1 (*)
+4gix-path v0.12.6 (*)
+4gix-validate v0.11.4 (*)
+3thiserror v2.0.20 (*)
+2gix-discover v0.55.0
+3bstr v1.13.1 (*)
+3gix-fs v0.22.1 (*)
+3gix-path v0.12.6 (*)
+3gix-ref v0.67.1 (*)
+3gix-sec v0.14.2 (*)
+3thiserror v2.0.20 (*)
+2gix-error v0.3.2 (*)
+2gix-features v0.49.1 (*)
+2gix-filter v0.34.0 (*)
+2gix-fs v0.22.1 (*)
+2gix-glob v0.27.1 (*)
+2gix-hash v0.26.2 (*)
+2gix-hashtable v0.16.0 (*)
+2gix-ignore v0.22.1 (*)
+2gix-index v0.55.0 (*)
+2gix-lock v24.0.0 (*)
+2gix-object v0.64.1 (*)
+2gix-odb v0.84.0
+3arc-swap v1.9.2
+4rustversion v1.0.23 (proc-macro)
+3gix-features v0.49.1 (*)
+3gix-fs v0.22.1 (*)
+3gix-hash v0.26.2 (*)
+3gix-hashtable v0.16.0 (*)
+3gix-object v0.64.1 (*)
+3gix-pack v0.74.2
+4clru v0.6.3
+5hashbrown v0.16.1
+6allocator-api2 v0.2.21
+6equivalent v1.0.2
+6foldhash v0.2.0
+4gix-chunk v0.8.0 (*)
+4gix-error v0.3.2 (*)
+4gix-features v0.49.1 (*)
+4gix-hash v0.26.2 (*)
+4gix-hashtable v0.16.0 (*)
+4gix-object v0.64.1 (*)
+4gix-path v0.12.6 (*)
+4gix-zlib v0.1.0
+5thiserror v2.0.20 (*)
+5zlib-rs v0.6.7
+4memmap2 v0.9.11 (*)
+4smallvec v1.16.1
+4thiserror v2.0.20 (*)
+3gix-path v0.12.6 (*)
+3gix-quote v0.8.0 (*)
+3gix-zlib v0.1.0 (*)
+3memmap2 v0.9.11 (*)
+3parking_lot v0.12.5 (*)
+3tempfile v3.27.0 (*)
+3thiserror v2.0.20 (*)
+2gix-pack v0.74.2 (*)
+2gix-path v0.12.6 (*)
+2gix-pathspec v0.20.0
+3bitflags v2.13.2
+3bstr v1.13.1 (*)
+3gix-attributes v0.35.0 (*)
+3gix-config-value v0.19.1 (*)
+3gix-glob v0.27.1 (*)
+3gix-path v0.12.6 (*)
+3thiserror v2.0.20 (*)
+2gix-protocol v0.65.1
+3bstr v1.13.1 (*)
+3gix-date v0.16.0 (*)
+3gix-features v0.49.1 (*)
+3gix-hash v0.26.2 (*)
+3gix-macros v0.1.6 (proc-macro)
+4proc-macro2 v1.0.107 (*)
+4quote v1.0.47 (*)
+4syn v2.0.119
+5proc-macro2 v1.0.107 (*)
+5quote v1.0.47 (*)
+5unicode-ident v1.0.24
+3gix-ref v0.67.1 (*)
+3gix-shallow v0.13.0
+4bstr v1.13.1 (*)
+4gix-hash v0.26.2 (*)
+4gix-lock v24.0.0 (*)
+4nonempty v0.12.0
+4thiserror v2.0.20 (*)
+3gix-transport v0.59.2
+4bstr v1.13.1 (*)
+4gix-command v0.10.1 (*)
+4gix-features v0.49.1 (*)
+4gix-packetline v0.22.2 (*)
+4gix-path v0.12.6 (*)
+4gix-quote v0.8.0 (*)
+4gix-sec v0.14.2 (*)
+4gix-url v0.38.0
+5bstr v1.13.1 (*)
+5gix-path v0.12.6 (*)
+5gix-utils v0.3.6 (*)
+5percent-encoding v2.3.2
+5thiserror v2.0.20 (*)
+4thiserror v2.0.20 (*)
+3gix-utils v0.3.6 (*)
+3nonempty v0.12.0
+3thiserror v2.0.20 (*)
+2gix-quote v0.8.0 (*)
+2gix-ref v0.67.1 (*)
+2gix-refspec v0.45.1
+3bstr v1.13.1 (*)
+3gix-hash v0.26.2 (*)
+3gix-validate v0.11.4 (*)
+3smallvec v1.16.1
+3thiserror v2.0.20 (*)
+2gix-revision v0.49.1
+3bitflags v2.13.2
+3bstr v1.13.1 (*)
+3gix-commitgraph v0.39.0 (*)
+3gix-date v0.16.0 (*)
+3gix-error v0.3.2 (*)
+3gix-hash v0.26.2 (*)
+3gix-hashtable v0.16.0 (*)
+3gix-object v0.64.1 (*)
+3gix-revwalk v0.35.0 (*)
+3gix-trace v0.1.21
+3nonempty v0.12.0
+2gix-revwalk v0.35.0 (*)
+2gix-sec v0.14.2 (*)
+2gix-shallow v0.13.0 (*)
+2gix-submodule v0.34.0
+3bstr v1.13.1 (*)
+3gix-config v0.60.0 (*)
+3gix-path v0.12.6 (*)
+3gix-pathspec v0.20.0 (*)
+3gix-refspec v0.45.1 (*)
+3gix-url v0.38.0 (*)
+3thiserror v2.0.20 (*)
+2gix-tempfile v24.0.0 (*)
+2gix-trace v0.1.21
+2gix-traverse v0.61.0 (*)
+2gix-url v0.38.0 (*)
+2gix-utils v0.3.6 (*)
+2gix-validate v0.11.4 (*)
+2gix-worktree v0.56.0 (*)
+2gix-zlib v0.1.0 (*)
+2nonempty v0.12.0
+2smallvec v1.16.1
+2thiserror v2.0.20 (*)

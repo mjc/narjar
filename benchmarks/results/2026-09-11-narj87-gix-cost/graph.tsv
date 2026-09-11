@@ -1,0 +1,6 @@
+variant	root_direct_dependencies	total_resolved_packages	unique_package_names	duplicate_name_versions
+baseline	11	47	46	1
+loose	4	96	90	6
+packed-read	5	96	90	6
+pack-write	6	102	96	6
+high-level	1	146	138	7

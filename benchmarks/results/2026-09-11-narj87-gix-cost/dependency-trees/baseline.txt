@@ -1,0 +1,1644 @@
+narjar v0.1.0 (/home/mjc/projects/narjar)
+├── libc v0.2.189
+├── sha2 v0.11.0
+│   ├── cfg-if feature "default"
+│   │   └── cfg-if v1.0.4
+│   ├── cpufeatures feature "default"
+│   │   └── cpufeatures v0.3.1
+│   └── digest feature "default"
+│       ├── digest v0.11.3
+│       │   ├── block-buffer feature "default"
+│       │   │   └── block-buffer v0.12.1
+│       │   │       └── hybrid-array feature "default"
+│       │   │           └── hybrid-array v0.4.15
+│       │   │               ├── typenum feature "const-generics"
+│       │   │               │   └── typenum v1.20.1
+│       │   │               └── typenum feature "default"
+│       │   │                   └── typenum v1.20.1
+│       │   ├── const-oid feature "default"
+│       │   │   └── const-oid v0.10.2
+│       │   └── crypto-common feature "default"
+│       │       └── crypto-common v0.2.2
+│       │           └── hybrid-array feature "default"
+│       │               └── hybrid-array v0.4.15
+│       │                   ├── typenum feature "const-generics"
+│       │                   │   └── typenum v1.20.1
+│       │                   └── typenum feature "default"
+│       │                       └── typenum v1.20.1
+│       └── digest feature "block-api"
+│           └── digest v0.11.3
+│               ├── block-buffer feature "default"
+│               │   └── block-buffer v0.12.1
+│               │       └── hybrid-array feature "default"
+│               │           └── hybrid-array v0.4.15
+│               │               ├── typenum feature "const-generics"
+│               │               │   └── typenum v1.20.1
+│               │               └── typenum feature "default"
+│               │                   └── typenum v1.20.1
+│               ├── const-oid feature "default"
+│               │   └── const-oid v0.10.2
+│               └── crypto-common feature "default"
+│                   └── crypto-common v0.2.2
+│                       └── hybrid-array feature "default"
+│                           └── hybrid-array v0.4.15
+│                               ├── typenum feature "const-generics"
+│                               │   └── typenum v1.20.1
+│                               └── typenum feature "default"
+│                                   └── typenum v1.20.1
+├── signal-hook v0.4.4
+│   ├── libc feature "default"
+│   │   ├── libc v0.2.189
+│   │   └── libc feature "std"
+│   │       └── libc v0.2.189
+│   └── signal-hook-registry feature "default"
+│       └── signal-hook-registry v1.4.8
+│           ├── libc feature "default"
+│           │   ├── libc v0.2.189
+│           │   └── libc feature "std"
+│           │       └── libc v0.2.189
+│           └── errno feature "default"
+│               ├── errno v0.3.14
+│               │   └── libc v0.2.189
+│               └── errno feature "std"
+│                   ├── errno v0.3.14
+│                   │   └── libc v0.2.189
+│                   └── libc feature "std"
+│                       └── libc v0.2.189
+├── subtle v2.6.1
+├── tempfile v3.27.0
+│   ├── fastrand feature "default"
+│   │   ├── fastrand v2.5.0
+│   │   └── fastrand feature "std"
+│   │       ├── fastrand v2.5.0
+│   │       └── fastrand feature "alloc"
+│   │           └── fastrand v2.5.0
+│   ├── once_cell feature "std"
+│   │   ├── once_cell v1.21.4
+│   │   └── once_cell feature "alloc"
+│   │       ├── once_cell v1.21.4
+│   │       └── once_cell feature "race"
+│   │           └── once_cell v1.21.4
+│   ├── rustix feature "default"
+│   │   ├── rustix v1.1.4
+│   │   │   ├── bitflags v2.13.2
+│   │   │   ├── linux-raw-sys feature "auxvec"
+│   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │   ├── linux-raw-sys feature "elf"
+│   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │   ├── linux-raw-sys feature "errno"
+│   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │   ├── linux-raw-sys feature "general"
+│   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │   ├── linux-raw-sys feature "ioctl"
+│   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │   └── linux-raw-sys feature "no_std"
+│   │   │       └── linux-raw-sys v0.12.1
+│   │   └── rustix feature "std"
+│   │       ├── rustix v1.1.4
+│   │       │   ├── bitflags v2.13.2
+│   │       │   ├── linux-raw-sys feature "auxvec"
+│   │       │   │   └── linux-raw-sys v0.12.1
+│   │       │   ├── linux-raw-sys feature "elf"
+│   │       │   │   └── linux-raw-sys v0.12.1
+│   │       │   ├── linux-raw-sys feature "errno"
+│   │       │   │   └── linux-raw-sys v0.12.1
+│   │       │   ├── linux-raw-sys feature "general"
+│   │       │   │   └── linux-raw-sys v0.12.1
+│   │       │   ├── linux-raw-sys feature "ioctl"
+│   │       │   │   └── linux-raw-sys v0.12.1
+│   │       │   └── linux-raw-sys feature "no_std"
+│   │       │       └── linux-raw-sys v0.12.1
+│   │       ├── rustix feature "alloc"
+│   │       │   └── rustix v1.1.4
+│   │       │       ├── bitflags v2.13.2
+│   │       │       ├── linux-raw-sys feature "auxvec"
+│   │       │       │   └── linux-raw-sys v0.12.1
+│   │       │       ├── linux-raw-sys feature "elf"
+│   │       │       │   └── linux-raw-sys v0.12.1
+│   │       │       ├── linux-raw-sys feature "errno"
+│   │       │       │   └── linux-raw-sys v0.12.1
+│   │       │       ├── linux-raw-sys feature "general"
+│   │       │       │   └── linux-raw-sys v0.12.1
+│   │       │       ├── linux-raw-sys feature "ioctl"
+│   │       │       │   └── linux-raw-sys v0.12.1
+│   │       │       └── linux-raw-sys feature "no_std"
+│   │       │           └── linux-raw-sys v0.12.1
+│   │       └── bitflags feature "std"
+│   │           └── bitflags v2.13.2
+│   └── rustix feature "fs"
+│       └── rustix v1.1.4
+│           ├── bitflags v2.13.2
+│           ├── linux-raw-sys feature "auxvec"
+│           │   └── linux-raw-sys v0.12.1
+│           ├── linux-raw-sys feature "elf"
+│           │   └── linux-raw-sys v0.12.1
+│           ├── linux-raw-sys feature "errno"
+│           │   └── linux-raw-sys v0.12.1
+│           ├── linux-raw-sys feature "general"
+│           │   └── linux-raw-sys v0.12.1
+│           ├── linux-raw-sys feature "ioctl"
+│           │   └── linux-raw-sys v0.12.1
+│           └── linux-raw-sys feature "no_std"
+│               └── linux-raw-sys v0.12.1
+├── clap feature "derive"
+│   └── clap v4.6.6
+│       ├── clap_builder v4.6.6
+│       │   ├── anstyle feature "default"
+│       │   │   ├── anstyle v1.0.14
+│       │   │   └── anstyle feature "std"
+│       │   │       └── anstyle v1.0.14
+│       │   └── clap_lex feature "default"
+│       │       └── clap_lex v1.1.0
+│       └── clap_derive feature "default"
+│           └── clap_derive v4.6.4 (proc-macro)
+│               ├── heck feature "default"
+│               │   └── heck v0.5.0
+│               ├── proc-macro2 feature "default"
+│               │   ├── proc-macro2 v1.0.107
+│               │   │   └── unicode-ident feature "default"
+│               │   │       └── unicode-ident v1.0.24
+│               │   └── proc-macro2 feature "proc-macro"
+│               │       └── proc-macro2 v1.0.107
+│               │           └── unicode-ident feature "default"
+│               │               └── unicode-ident v1.0.24
+│               ├── quote feature "default"
+│               │   ├── quote v1.0.47
+│               │   │   └── proc-macro2 v1.0.107
+│               │   │       └── unicode-ident feature "default"
+│               │   │           └── unicode-ident v1.0.24
+│               │   └── quote feature "proc-macro"
+│               │       ├── quote v1.0.47
+│               │       │   └── proc-macro2 v1.0.107
+│               │       │       └── unicode-ident feature "default"
+│               │       │           └── unicode-ident v1.0.24
+│               │       └── proc-macro2 feature "proc-macro"
+│               │           └── proc-macro2 v1.0.107
+│               │               └── unicode-ident feature "default"
+│               │                   └── unicode-ident v1.0.24
+│               ├── syn feature "default"
+│               │   ├── syn v3.0.5
+│               │   │   ├── proc-macro2 v1.0.107
+│               │   │   │   └── unicode-ident feature "default"
+│               │   │   │       └── unicode-ident v1.0.24
+│               │   │   ├── quote v1.0.47
+│               │   │   │   └── proc-macro2 v1.0.107
+│               │   │   │       └── unicode-ident feature "default"
+│               │   │   │           └── unicode-ident v1.0.24
+│               │   │   └── unicode-ident feature "default"
+│               │   │       └── unicode-ident v1.0.24
+│               │   ├── syn feature "clone-impls"
+│               │   │   └── syn v3.0.5
+│               │   │       ├── proc-macro2 v1.0.107
+│               │   │       │   └── unicode-ident feature "default"
+│               │   │       │       └── unicode-ident v1.0.24
+│               │   │       ├── quote v1.0.47
+│               │   │       │   └── proc-macro2 v1.0.107
+│               │   │       │       └── unicode-ident feature "default"
+│               │   │       │           └── unicode-ident v1.0.24
+│               │   │       └── unicode-ident feature "default"
+│               │   │           └── unicode-ident v1.0.24
+│               │   ├── syn feature "derive"
+│               │   │   └── syn v3.0.5
+│               │   │       ├── proc-macro2 v1.0.107
+│               │   │       │   └── unicode-ident feature "default"
+│               │   │       │       └── unicode-ident v1.0.24
+│               │   │       ├── quote v1.0.47
+│               │   │       │   └── proc-macro2 v1.0.107
+│               │   │       │       └── unicode-ident feature "default"
+│               │   │       │           └── unicode-ident v1.0.24
+│               │   │       └── unicode-ident feature "default"
+│               │   │           └── unicode-ident v1.0.24
+│               │   ├── syn feature "parsing"
+│               │   │   └── syn v3.0.5
+│               │   │       ├── proc-macro2 v1.0.107
+│               │   │       │   └── unicode-ident feature "default"
+│               │   │       │       └── unicode-ident v1.0.24
+│               │   │       ├── quote v1.0.47
+│               │   │       │   └── proc-macro2 v1.0.107
+│               │   │       │       └── unicode-ident feature "default"
+│               │   │       │           └── unicode-ident v1.0.24
+│               │   │       └── unicode-ident feature "default"
+│               │   │           └── unicode-ident v1.0.24
+│               │   ├── syn feature "printing"
+│               │   │   └── syn v3.0.5
+│               │   │       ├── proc-macro2 v1.0.107
+│               │   │       │   └── unicode-ident feature "default"
+│               │   │       │       └── unicode-ident v1.0.24
+│               │   │       ├── quote v1.0.47
+│               │   │       │   └── proc-macro2 v1.0.107
+│               │   │       │       └── unicode-ident feature "default"
+│               │   │       │           └── unicode-ident v1.0.24
+│               │   │       └── unicode-ident feature "default"
+│               │   │           └── unicode-ident v1.0.24
+│               │   └── syn feature "proc-macro"
+│               │       ├── syn v3.0.5
+│               │       │   ├── proc-macro2 v1.0.107
+│               │       │   │   └── unicode-ident feature "default"
+│               │       │   │       └── unicode-ident v1.0.24
+│               │       │   ├── quote v1.0.47
+│               │       │   │   └── proc-macro2 v1.0.107
+│               │       │   │       └── unicode-ident feature "default"
+│               │       │   │           └── unicode-ident v1.0.24
+│               │       │   └── unicode-ident feature "default"
+│               │       │       └── unicode-ident v1.0.24
+│               │       ├── proc-macro2 feature "proc-macro"
+│               │       │   └── proc-macro2 v1.0.107
+│               │       │       └── unicode-ident feature "default"
+│               │       │           └── unicode-ident v1.0.24
+│               │       └── quote feature "proc-macro"
+│               │           ├── quote v1.0.47
+│               │           │   └── proc-macro2 v1.0.107
+│               │           │       └── unicode-ident feature "default"
+│               │           │           └── unicode-ident v1.0.24
+│               │           └── proc-macro2 feature "proc-macro"
+│               │               └── proc-macro2 v1.0.107
+│               │                   └── unicode-ident feature "default"
+│               │                       └── unicode-ident v1.0.24
+│               └── syn feature "full"
+│                   └── syn v3.0.5
+│                       ├── proc-macro2 v1.0.107
+│                       │   └── unicode-ident feature "default"
+│                       │       └── unicode-ident v1.0.24
+│                       ├── quote v1.0.47
+│                       │   └── proc-macro2 v1.0.107
+│                       │       └── unicode-ident feature "default"
+│                       │           └── unicode-ident v1.0.24
+│                       └── unicode-ident feature "default"
+│                           └── unicode-ident v1.0.24
+├── clap feature "env"
+│   ├── clap v4.6.6
+│   │   ├── clap_builder v4.6.6
+│   │   │   ├── anstyle feature "default"
+│   │   │   │   ├── anstyle v1.0.14
+│   │   │   │   └── anstyle feature "std"
+│   │   │   │       └── anstyle v1.0.14
+│   │   │   └── clap_lex feature "default"
+│   │   │       └── clap_lex v1.1.0
+│   │   └── clap_derive feature "default"
+│   │       └── clap_derive v4.6.4 (proc-macro)
+│   │           ├── heck feature "default"
+│   │           │   └── heck v0.5.0
+│   │           ├── proc-macro2 feature "default"
+│   │           │   ├── proc-macro2 v1.0.107
+│   │           │   │   └── unicode-ident feature "default"
+│   │           │   │       └── unicode-ident v1.0.24
+│   │           │   └── proc-macro2 feature "proc-macro"
+│   │           │       └── proc-macro2 v1.0.107
+│   │           │           └── unicode-ident feature "default"
+│   │           │               └── unicode-ident v1.0.24
+│   │           ├── quote feature "default"
+│   │           │   ├── quote v1.0.47
+│   │           │   │   └── proc-macro2 v1.0.107
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   └── quote feature "proc-macro"
+│   │           │       ├── quote v1.0.47
+│   │           │       │   └── proc-macro2 v1.0.107
+│   │           │       │       └── unicode-ident feature "default"
+│   │           │       │           └── unicode-ident v1.0.24
+│   │           │       └── proc-macro2 feature "proc-macro"
+│   │           │           └── proc-macro2 v1.0.107
+│   │           │               └── unicode-ident feature "default"
+│   │           │                   └── unicode-ident v1.0.24
+│   │           ├── syn feature "default"
+│   │           │   ├── syn v3.0.5
+│   │           │   │   ├── proc-macro2 v1.0.107
+│   │           │   │   │   └── unicode-ident feature "default"
+│   │           │   │   │       └── unicode-ident v1.0.24
+│   │           │   │   ├── quote v1.0.47
+│   │           │   │   │   └── proc-macro2 v1.0.107
+│   │           │   │   │       └── unicode-ident feature "default"
+│   │           │   │   │           └── unicode-ident v1.0.24
+│   │           │   │   └── unicode-ident feature "default"
+│   │           │   │       └── unicode-ident v1.0.24
+│   │           │   ├── syn feature "clone-impls"
+│   │           │   │   └── syn v3.0.5
+│   │           │   │       ├── proc-macro2 v1.0.107
+│   │           │   │       │   └── unicode-ident feature "default"
+│   │           │   │       │       └── unicode-ident v1.0.24
+│   │           │   │       ├── quote v1.0.47
+│   │           │   │       │   └── proc-macro2 v1.0.107
+│   │           │   │       │       └── unicode-ident feature "default"
+│   │           │   │       │           └── unicode-ident v1.0.24
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   ├── syn feature "derive"
+│   │           │   │   └── syn v3.0.5
+│   │           │   │       ├── proc-macro2 v1.0.107
+│   │           │   │       │   └── unicode-ident feature "default"
+│   │           │   │       │       └── unicode-ident v1.0.24
+│   │           │   │       ├── quote v1.0.47
+│   │           │   │       │   └── proc-macro2 v1.0.107
+│   │           │   │       │       └── unicode-ident feature "default"
+│   │           │   │       │           └── unicode-ident v1.0.24
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   ├── syn feature "parsing"
+│   │           │   │   └── syn v3.0.5
+│   │           │   │       ├── proc-macro2 v1.0.107
+│   │           │   │       │   └── unicode-ident feature "default"
+│   │           │   │       │       └── unicode-ident v1.0.24
+│   │           │   │       ├── quote v1.0.47
+│   │           │   │       │   └── proc-macro2 v1.0.107
+│   │           │   │       │       └── unicode-ident feature "default"
+│   │           │   │       │           └── unicode-ident v1.0.24
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   ├── syn feature "printing"
+│   │           │   │   └── syn v3.0.5
+│   │           │   │       ├── proc-macro2 v1.0.107
+│   │           │   │       │   └── unicode-ident feature "default"
+│   │           │   │       │       └── unicode-ident v1.0.24
+│   │           │   │       ├── quote v1.0.47
+│   │           │   │       │   └── proc-macro2 v1.0.107
+│   │           │   │       │       └── unicode-ident feature "default"
+│   │           │   │       │           └── unicode-ident v1.0.24
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   └── syn feature "proc-macro"
+│   │           │       ├── syn v3.0.5
+│   │           │       │   ├── proc-macro2 v1.0.107
+│   │           │       │   │   └── unicode-ident feature "default"
+│   │           │       │   │       └── unicode-ident v1.0.24
+│   │           │       │   ├── quote v1.0.47
+│   │           │       │   │   └── proc-macro2 v1.0.107
+│   │           │       │   │       └── unicode-ident feature "default"
+│   │           │       │   │           └── unicode-ident v1.0.24
+│   │           │       │   └── unicode-ident feature "default"
+│   │           │       │       └── unicode-ident v1.0.24
+│   │           │       ├── proc-macro2 feature "proc-macro"
+│   │           │       │   └── proc-macro2 v1.0.107
+│   │           │       │       └── unicode-ident feature "default"
+│   │           │       │           └── unicode-ident v1.0.24
+│   │           │       └── quote feature "proc-macro"
+│   │           │           ├── quote v1.0.47
+│   │           │           │   └── proc-macro2 v1.0.107
+│   │           │           │       └── unicode-ident feature "default"
+│   │           │           │           └── unicode-ident v1.0.24
+│   │           │           └── proc-macro2 feature "proc-macro"
+│   │           │               └── proc-macro2 v1.0.107
+│   │           │                   └── unicode-ident feature "default"
+│   │           │                       └── unicode-ident v1.0.24
+│   │           └── syn feature "full"
+│   │               └── syn v3.0.5
+│   │                   ├── proc-macro2 v1.0.107
+│   │                   │   └── unicode-ident feature "default"
+│   │                   │       └── unicode-ident v1.0.24
+│   │                   ├── quote v1.0.47
+│   │                   │   └── proc-macro2 v1.0.107
+│   │                   │       └── unicode-ident feature "default"
+│   │                   │           └── unicode-ident v1.0.24
+│   │                   └── unicode-ident feature "default"
+│   │                       └── unicode-ident v1.0.24
+│   └── clap_builder feature "env"
+│       └── clap_builder v4.6.6
+│           ├── anstyle feature "default"
+│           │   ├── anstyle v1.0.14
+│           │   └── anstyle feature "std"
+│           │       └── anstyle v1.0.14
+│           └── clap_lex feature "default"
+│               └── clap_lex v1.1.0
+├── clap feature "std"
+│   ├── clap v4.6.6
+│   │   ├── clap_builder v4.6.6
+│   │   │   ├── anstyle feature "default"
+│   │   │   │   ├── anstyle v1.0.14
+│   │   │   │   └── anstyle feature "std"
+│   │   │   │       └── anstyle v1.0.14
+│   │   │   └── clap_lex feature "default"
+│   │   │       └── clap_lex v1.1.0
+│   │   └── clap_derive feature "default"
+│   │       └── clap_derive v4.6.4 (proc-macro)
+│   │           ├── heck feature "default"
+│   │           │   └── heck v0.5.0
+│   │           ├── proc-macro2 feature "default"
+│   │           │   ├── proc-macro2 v1.0.107
+│   │           │   │   └── unicode-ident feature "default"
+│   │           │   │       └── unicode-ident v1.0.24
+│   │           │   └── proc-macro2 feature "proc-macro"
+│   │           │       └── proc-macro2 v1.0.107
+│   │           │           └── unicode-ident feature "default"
+│   │           │               └── unicode-ident v1.0.24
+│   │           ├── quote feature "default"
+│   │           │   ├── quote v1.0.47
+│   │           │   │   └── proc-macro2 v1.0.107
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   └── quote feature "proc-macro"
+│   │           │       ├── quote v1.0.47
+│   │           │       │   └── proc-macro2 v1.0.107
+│   │           │       │       └── unicode-ident feature "default"
+│   │           │       │           └── unicode-ident v1.0.24
+│   │           │       └── proc-macro2 feature "proc-macro"
+│   │           │           └── proc-macro2 v1.0.107
+│   │           │               └── unicode-ident feature "default"
+│   │           │                   └── unicode-ident v1.0.24
+│   │           ├── syn feature "default"
+│   │           │   ├── syn v3.0.5
+│   │           │   │   ├── proc-macro2 v1.0.107
+│   │           │   │   │   └── unicode-ident feature "default"
+│   │           │   │   │       └── unicode-ident v1.0.24
+│   │           │   │   ├── quote v1.0.47
+│   │           │   │   │   └── proc-macro2 v1.0.107
+│   │           │   │   │       └── unicode-ident feature "default"
+│   │           │   │   │           └── unicode-ident v1.0.24
+│   │           │   │   └── unicode-ident feature "default"
+│   │           │   │       └── unicode-ident v1.0.24
+│   │           │   ├── syn feature "clone-impls"
+│   │           │   │   └── syn v3.0.5
+│   │           │   │       ├── proc-macro2 v1.0.107
+│   │           │   │       │   └── unicode-ident feature "default"
+│   │           │   │       │       └── unicode-ident v1.0.24
+│   │           │   │       ├── quote v1.0.47
+│   │           │   │       │   └── proc-macro2 v1.0.107
+│   │           │   │       │       └── unicode-ident feature "default"
+│   │           │   │       │           └── unicode-ident v1.0.24
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   ├── syn feature "derive"
+│   │           │   │   └── syn v3.0.5
+│   │           │   │       ├── proc-macro2 v1.0.107
+│   │           │   │       │   └── unicode-ident feature "default"
+│   │           │   │       │       └── unicode-ident v1.0.24
+│   │           │   │       ├── quote v1.0.47
+│   │           │   │       │   └── proc-macro2 v1.0.107
+│   │           │   │       │       └── unicode-ident feature "default"
+│   │           │   │       │           └── unicode-ident v1.0.24
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   ├── syn feature "parsing"
+│   │           │   │   └── syn v3.0.5
+│   │           │   │       ├── proc-macro2 v1.0.107
+│   │           │   │       │   └── unicode-ident feature "default"
+│   │           │   │       │       └── unicode-ident v1.0.24
+│   │           │   │       ├── quote v1.0.47
+│   │           │   │       │   └── proc-macro2 v1.0.107
+│   │           │   │       │       └── unicode-ident feature "default"
+│   │           │   │       │           └── unicode-ident v1.0.24
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   ├── syn feature "printing"
+│   │           │   │   └── syn v3.0.5
+│   │           │   │       ├── proc-macro2 v1.0.107
+│   │           │   │       │   └── unicode-ident feature "default"
+│   │           │   │       │       └── unicode-ident v1.0.24
+│   │           │   │       ├── quote v1.0.47
+│   │           │   │       │   └── proc-macro2 v1.0.107
+│   │           │   │       │       └── unicode-ident feature "default"
+│   │           │   │       │           └── unicode-ident v1.0.24
+│   │           │   │       └── unicode-ident feature "default"
+│   │           │   │           └── unicode-ident v1.0.24
+│   │           │   └── syn feature "proc-macro"
+│   │           │       ├── syn v3.0.5
+│   │           │       │   ├── proc-macro2 v1.0.107
+│   │           │       │   │   └── unicode-ident feature "default"
+│   │           │       │   │       └── unicode-ident v1.0.24
+│   │           │       │   ├── quote v1.0.47
+│   │           │       │   │   └── proc-macro2 v1.0.107
+│   │           │       │   │       └── unicode-ident feature "default"
+│   │           │       │   │           └── unicode-ident v1.0.24
+│   │           │       │   └── unicode-ident feature "default"
+│   │           │       │       └── unicode-ident v1.0.24
+│   │           │       ├── proc-macro2 feature "proc-macro"
+│   │           │       │   └── proc-macro2 v1.0.107
+│   │           │       │       └── unicode-ident feature "default"
+│   │           │       │           └── unicode-ident v1.0.24
+│   │           │       └── quote feature "proc-macro"
+│   │           │           ├── quote v1.0.47
+│   │           │           │   └── proc-macro2 v1.0.107
+│   │           │           │       └── unicode-ident feature "default"
+│   │           │           │           └── unicode-ident v1.0.24
+│   │           │           └── proc-macro2 feature "proc-macro"
+│   │           │               └── proc-macro2 v1.0.107
+│   │           │                   └── unicode-ident feature "default"
+│   │           │                       └── unicode-ident v1.0.24
+│   │           └── syn feature "full"
+│   │               └── syn v3.0.5
+│   │                   ├── proc-macro2 v1.0.107
+│   │                   │   └── unicode-ident feature "default"
+│   │                   │       └── unicode-ident v1.0.24
+│   │                   ├── quote v1.0.47
+│   │                   │   └── proc-macro2 v1.0.107
+│   │                   │       └── unicode-ident feature "default"
+│   │                   │           └── unicode-ident v1.0.24
+│   │                   └── unicode-ident feature "default"
+│   │                       └── unicode-ident v1.0.24
+│   └── clap_builder feature "std"
+│       ├── clap_builder v4.6.6
+│       │   ├── anstyle feature "default"
+│       │   │   ├── anstyle v1.0.14
+│       │   │   └── anstyle feature "std"
+│       │   │       └── anstyle v1.0.14
+│       │   └── clap_lex feature "default"
+│       │       └── clap_lex v1.1.0
+│       └── anstyle feature "std"
+│           └── anstyle v1.0.14
+├── crossbeam-channel feature "std"
+│   ├── crossbeam-channel v0.5.16
+│   │   └── crossbeam-utils v0.8.23
+│   └── crossbeam-utils feature "std"
+│       └── crossbeam-utils v0.8.23
+├── data-encoding feature "alloc"
+│   └── data-encoding v2.11.1
+├── ed25519-dalek feature "signature"
+│   └── ed25519-dalek v3.0.0
+│       ├── ed25519 v3.0.0
+│       │   └── signature v3.0.0
+│       ├── sha2 v0.11.0
+│       │   ├── cfg-if feature "default"
+│       │   │   └── cfg-if v1.0.4
+│       │   ├── cpufeatures feature "default"
+│       │   │   └── cpufeatures v0.3.1
+│       │   └── digest feature "default"
+│       │       ├── digest v0.11.3
+│       │       │   ├── block-buffer feature "default"
+│       │       │   │   └── block-buffer v0.12.1
+│       │       │   │       └── hybrid-array feature "default"
+│       │       │   │           └── hybrid-array v0.4.15
+│       │       │   │               ├── typenum feature "const-generics"
+│       │       │   │               │   └── typenum v1.20.1
+│       │       │   │               └── typenum feature "default"
+│       │       │   │                   └── typenum v1.20.1
+│       │       │   ├── const-oid feature "default"
+│       │       │   │   └── const-oid v0.10.2
+│       │       │   └── crypto-common feature "default"
+│       │       │       └── crypto-common v0.2.2
+│       │       │           └── hybrid-array feature "default"
+│       │       │               └── hybrid-array v0.4.15
+│       │       │                   ├── typenum feature "const-generics"
+│       │       │                   │   └── typenum v1.20.1
+│       │       │                   └── typenum feature "default"
+│       │       │                       └── typenum v1.20.1
+│       │       └── digest feature "block-api"
+│       │           └── digest v0.11.3
+│       │               ├── block-buffer feature "default"
+│       │               │   └── block-buffer v0.12.1
+│       │               │       └── hybrid-array feature "default"
+│       │               │           └── hybrid-array v0.4.15
+│       │               │               ├── typenum feature "const-generics"
+│       │               │               │   └── typenum v1.20.1
+│       │               │               └── typenum feature "default"
+│       │               │                   └── typenum v1.20.1
+│       │               ├── const-oid feature "default"
+│       │               │   └── const-oid v0.10.2
+│       │               └── crypto-common feature "default"
+│       │                   └── crypto-common v0.2.2
+│       │                       └── hybrid-array feature "default"
+│       │                           └── hybrid-array v0.4.15
+│       │                               ├── typenum feature "const-generics"
+│       │                               │   └── typenum v1.20.1
+│       │                               └── typenum feature "default"
+│       │                                   └── typenum v1.20.1
+│       ├── signature v3.0.0
+│       ├── subtle v2.6.1
+│       └── curve25519-dalek feature "digest"
+│           └── curve25519-dalek v5.0.0
+│               ├── cfg-if feature "default"
+│               │   └── cfg-if v1.0.4
+│               ├── cpufeatures feature "default"
+│               │   └── cpufeatures v0.3.1
+│               ├── curve25519-dalek-derive feature "default"
+│               │   └── curve25519-dalek-derive v0.1.1 (proc-macro)
+│               │       ├── proc-macro2 feature "default"
+│               │       │   ├── proc-macro2 v1.0.107
+│               │       │   │   └── unicode-ident feature "default"
+│               │       │   │       └── unicode-ident v1.0.24
+│               │       │   └── proc-macro2 feature "proc-macro"
+│               │       │       └── proc-macro2 v1.0.107
+│               │       │           └── unicode-ident feature "default"
+│               │       │               └── unicode-ident v1.0.24
+│               │       ├── quote feature "default"
+│               │       │   ├── quote v1.0.47
+│               │       │   │   └── proc-macro2 v1.0.107
+│               │       │   │       └── unicode-ident feature "default"
+│               │       │   │           └── unicode-ident v1.0.24
+│               │       │   └── quote feature "proc-macro"
+│               │       │       ├── quote v1.0.47
+│               │       │       │   └── proc-macro2 v1.0.107
+│               │       │       │       └── unicode-ident feature "default"
+│               │       │       │           └── unicode-ident v1.0.24
+│               │       │       └── proc-macro2 feature "proc-macro"
+│               │       │           └── proc-macro2 v1.0.107
+│               │       │               └── unicode-ident feature "default"
+│               │       │                   └── unicode-ident v1.0.24
+│               │       ├── syn feature "default"
+│               │       │   ├── syn v2.0.119
+│               │       │   │   ├── proc-macro2 v1.0.107
+│               │       │   │   │   └── unicode-ident feature "default"
+│               │       │   │   │       └── unicode-ident v1.0.24
+│               │       │   │   ├── quote v1.0.47
+│               │       │   │   │   └── proc-macro2 v1.0.107
+│               │       │   │   │       └── unicode-ident feature "default"
+│               │       │   │   │           └── unicode-ident v1.0.24
+│               │       │   │   └── unicode-ident feature "default"
+│               │       │   │       └── unicode-ident v1.0.24
+│               │       │   ├── syn feature "clone-impls"
+│               │       │   │   └── syn v2.0.119
+│               │       │   │       ├── proc-macro2 v1.0.107
+│               │       │   │       │   └── unicode-ident feature "default"
+│               │       │   │       │       └── unicode-ident v1.0.24
+│               │       │   │       ├── quote v1.0.47
+│               │       │   │       │   └── proc-macro2 v1.0.107
+│               │       │   │       │       └── unicode-ident feature "default"
+│               │       │   │       │           └── unicode-ident v1.0.24
+│               │       │   │       └── unicode-ident feature "default"
+│               │       │   │           └── unicode-ident v1.0.24
+│               │       │   ├── syn feature "derive"
+│               │       │   │   └── syn v2.0.119
+│               │       │   │       ├── proc-macro2 v1.0.107
+│               │       │   │       │   └── unicode-ident feature "default"
+│               │       │   │       │       └── unicode-ident v1.0.24
+│               │       │   │       ├── quote v1.0.47
+│               │       │   │       │   └── proc-macro2 v1.0.107
+│               │       │   │       │       └── unicode-ident feature "default"
+│               │       │   │       │           └── unicode-ident v1.0.24
+│               │       │   │       └── unicode-ident feature "default"
+│               │       │   │           └── unicode-ident v1.0.24
+│               │       │   ├── syn feature "parsing"
+│               │       │   │   └── syn v2.0.119
+│               │       │   │       ├── proc-macro2 v1.0.107
+│               │       │   │       │   └── unicode-ident feature "default"
+│               │       │   │       │       └── unicode-ident v1.0.24
+│               │       │   │       ├── quote v1.0.47
+│               │       │   │       │   └── proc-macro2 v1.0.107
+│               │       │   │       │       └── unicode-ident feature "default"
+│               │       │   │       │           └── unicode-ident v1.0.24
+│               │       │   │       └── unicode-ident feature "default"
+│               │       │   │           └── unicode-ident v1.0.24
+│               │       │   ├── syn feature "printing"
+│               │       │   │   └── syn v2.0.119
+│               │       │   │       ├── proc-macro2 v1.0.107
+│               │       │   │       │   └── unicode-ident feature "default"
+│               │       │   │       │       └── unicode-ident v1.0.24
+│               │       │   │       ├── quote v1.0.47
+│               │       │   │       │   └── proc-macro2 v1.0.107
+│               │       │   │       │       └── unicode-ident feature "default"
+│               │       │   │       │           └── unicode-ident v1.0.24
+│               │       │   │       └── unicode-ident feature "default"
+│               │       │   │           └── unicode-ident v1.0.24
+│               │       │   └── syn feature "proc-macro"
+│               │       │       ├── syn v2.0.119
+│               │       │       │   ├── proc-macro2 v1.0.107
+│               │       │       │   │   └── unicode-ident feature "default"
+│               │       │       │   │       └── unicode-ident v1.0.24
+│               │       │       │   ├── quote v1.0.47
+│               │       │       │   │   └── proc-macro2 v1.0.107
+│               │       │       │   │       └── unicode-ident feature "default"
+│               │       │       │   │           └── unicode-ident v1.0.24
+│               │       │       │   └── unicode-ident feature "default"
+│               │       │       │       └── unicode-ident v1.0.24
+│               │       │       ├── proc-macro2 feature "proc-macro"
+│               │       │       │   └── proc-macro2 v1.0.107
+│               │       │       │       └── unicode-ident feature "default"
+│               │       │       │           └── unicode-ident v1.0.24
+│               │       │       └── quote feature "proc-macro"
+│               │       │           ├── quote v1.0.47
+│               │       │           │   └── proc-macro2 v1.0.107
+│               │       │           │       └── unicode-ident feature "default"
+│               │       │           │           └── unicode-ident v1.0.24
+│               │       │           └── proc-macro2 feature "proc-macro"
+│               │       │               └── proc-macro2 v1.0.107
+│               │       │                   └── unicode-ident feature "default"
+│               │       │                       └── unicode-ident v1.0.24
+│               │       └── syn feature "full"
+│               │           └── syn v2.0.119
+│               │               ├── proc-macro2 v1.0.107
+│               │               │   └── unicode-ident feature "default"
+│               │               │       └── unicode-ident v1.0.24
+│               │               ├── quote v1.0.47
+│               │               │   └── proc-macro2 v1.0.107
+│               │               │       └── unicode-ident feature "default"
+│               │               │           └── unicode-ident v1.0.24
+│               │               └── unicode-ident feature "default"
+│               │                   └── unicode-ident v1.0.24
+│               ├── digest feature "block-api"
+│               │   └── digest v0.11.3
+│               │       ├── block-buffer feature "default"
+│               │       │   └── block-buffer v0.12.1
+│               │       │       └── hybrid-array feature "default"
+│               │       │           └── hybrid-array v0.4.15
+│               │       │               ├── typenum feature "const-generics"
+│               │       │               │   └── typenum v1.20.1
+│               │       │               └── typenum feature "default"
+│               │       │                   └── typenum v1.20.1
+│               │       ├── const-oid feature "default"
+│               │       │   └── const-oid v0.10.2
+│               │       └── crypto-common feature "default"
+│               │           └── crypto-common v0.2.2
+│               │               └── hybrid-array feature "default"
+│               │                   └── hybrid-array v0.4.15
+│               │                       ├── typenum feature "const-generics"
+│               │                       │   └── typenum v1.20.1
+│               │                       └── typenum feature "default"
+│               │                           └── typenum v1.20.1
+│               └── subtle feature "const-generics"
+│                   └── subtle v2.6.1
+│               [build-dependencies]
+│               └── rustc_version feature "default"
+│                   └── rustc_version v0.4.1
+│                       └── semver feature "default"
+│                           ├── semver v1.0.28
+│                           └── semver feature "std"
+│                               └── semver v1.0.28
+├── httparse feature "std"
+│   └── httparse v1.10.1
+├── lzma-rust2 feature "encoder"
+│   └── lzma-rust2 v0.20.1
+│       └── sha2 feature "default"
+│           ├── sha2 v0.11.0
+│           │   ├── cfg-if feature "default"
+│           │   │   └── cfg-if v1.0.4
+│           │   ├── cpufeatures feature "default"
+│           │   │   └── cpufeatures v0.3.1
+│           │   └── digest feature "default"
+│           │       ├── digest v0.11.3
+│           │       │   ├── block-buffer feature "default"
+│           │       │   │   └── block-buffer v0.12.1
+│           │       │   │       └── hybrid-array feature "default"
+│           │       │   │           └── hybrid-array v0.4.15
+│           │       │   │               ├── typenum feature "const-generics"
+│           │       │   │               │   └── typenum v1.20.1
+│           │       │   │               └── typenum feature "default"
+│           │       │   │                   └── typenum v1.20.1
+│           │       │   ├── const-oid feature "default"
+│           │       │   │   └── const-oid v0.10.2
+│           │       │   └── crypto-common feature "default"
+│           │       │       └── crypto-common v0.2.2
+│           │       │           └── hybrid-array feature "default"
+│           │       │               └── hybrid-array v0.4.15
+│           │       │                   ├── typenum feature "const-generics"
+│           │       │                   │   └── typenum v1.20.1
+│           │       │                   └── typenum feature "default"
+│           │       │                       └── typenum v1.20.1
+│           │       └── digest feature "block-api"
+│           │           └── digest v0.11.3
+│           │               ├── block-buffer feature "default"
+│           │               │   └── block-buffer v0.12.1
+│           │               │       └── hybrid-array feature "default"
+│           │               │           └── hybrid-array v0.4.15
+│           │               │               ├── typenum feature "const-generics"
+│           │               │               │   └── typenum v1.20.1
+│           │               │               └── typenum feature "default"
+│           │               │                   └── typenum v1.20.1
+│           │               ├── const-oid feature "default"
+│           │               │   └── const-oid v0.10.2
+│           │               └── crypto-common feature "default"
+│           │                   └── crypto-common v0.2.2
+│           │                       └── hybrid-array feature "default"
+│           │                           └── hybrid-array v0.4.15
+│           │                               ├── typenum feature "const-generics"
+│           │                               │   └── typenum v1.20.1
+│           │                               └── typenum feature "default"
+│           │                                   └── typenum v1.20.1
+│           ├── sha2 feature "alloc"
+│           │   ├── sha2 v0.11.0
+│           │   │   ├── cfg-if feature "default"
+│           │   │   │   └── cfg-if v1.0.4
+│           │   │   ├── cpufeatures feature "default"
+│           │   │   │   └── cpufeatures v0.3.1
+│           │   │   └── digest feature "default"
+│           │   │       ├── digest v0.11.3
+│           │   │       │   ├── block-buffer feature "default"
+│           │   │       │   │   └── block-buffer v0.12.1
+│           │   │       │   │       └── hybrid-array feature "default"
+│           │   │       │   │           └── hybrid-array v0.4.15
+│           │   │       │   │               ├── typenum feature "const-generics"
+│           │   │       │   │               │   └── typenum v1.20.1
+│           │   │       │   │               └── typenum feature "default"
+│           │   │       │   │                   └── typenum v1.20.1
+│           │   │       │   ├── const-oid feature "default"
+│           │   │       │   │   └── const-oid v0.10.2
+│           │   │       │   └── crypto-common feature "default"
+│           │   │       │       └── crypto-common v0.2.2
+│           │   │       │           └── hybrid-array feature "default"
+│           │   │       │               └── hybrid-array v0.4.15
+│           │   │       │                   ├── typenum feature "const-generics"
+│           │   │       │                   │   └── typenum v1.20.1
+│           │   │       │                   └── typenum feature "default"
+│           │   │       │                       └── typenum v1.20.1
+│           │   │       └── digest feature "block-api"
+│           │   │           └── digest v0.11.3
+│           │   │               ├── block-buffer feature "default"
+│           │   │               │   └── block-buffer v0.12.1
+│           │   │               │       └── hybrid-array feature "default"
+│           │   │               │           └── hybrid-array v0.4.15
+│           │   │               │               ├── typenum feature "const-generics"
+│           │   │               │               │   └── typenum v1.20.1
+│           │   │               │               └── typenum feature "default"
+│           │   │               │                   └── typenum v1.20.1
+│           │   │               ├── const-oid feature "default"
+│           │   │               │   └── const-oid v0.10.2
+│           │   │               └── crypto-common feature "default"
+│           │   │                   └── crypto-common v0.2.2
+│           │   │                       └── hybrid-array feature "default"
+│           │   │                           └── hybrid-array v0.4.15
+│           │   │                               ├── typenum feature "const-generics"
+│           │   │                               │   └── typenum v1.20.1
+│           │   │                               └── typenum feature "default"
+│           │   │                                   └── typenum v1.20.1
+│           │   └── digest feature "alloc"
+│           │       └── digest v0.11.3
+│           │           ├── block-buffer feature "default"
+│           │           │   └── block-buffer v0.12.1
+│           │           │       └── hybrid-array feature "default"
+│           │           │           └── hybrid-array v0.4.15
+│           │           │               ├── typenum feature "const-generics"
+│           │           │               │   └── typenum v1.20.1
+│           │           │               └── typenum feature "default"
+│           │           │                   └── typenum v1.20.1
+│           │           ├── const-oid feature "default"
+│           │           │   └── const-oid v0.10.2
+│           │           └── crypto-common feature "default"
+│           │               └── crypto-common v0.2.2
+│           │                   └── hybrid-array feature "default"
+│           │                       └── hybrid-array v0.4.15
+│           │                           ├── typenum feature "const-generics"
+│           │                           │   └── typenum v1.20.1
+│           │                           └── typenum feature "default"
+│           │                               └── typenum v1.20.1
+│           └── sha2 feature "oid"
+│               ├── sha2 v0.11.0
+│               │   ├── cfg-if feature "default"
+│               │   │   └── cfg-if v1.0.4
+│               │   ├── cpufeatures feature "default"
+│               │   │   └── cpufeatures v0.3.1
+│               │   └── digest feature "default"
+│               │       ├── digest v0.11.3
+│               │       │   ├── block-buffer feature "default"
+│               │       │   │   └── block-buffer v0.12.1
+│               │       │   │       └── hybrid-array feature "default"
+│               │       │   │           └── hybrid-array v0.4.15
+│               │       │   │               ├── typenum feature "const-generics"
+│               │       │   │               │   └── typenum v1.20.1
+│               │       │   │               └── typenum feature "default"
+│               │       │   │                   └── typenum v1.20.1
+│               │       │   ├── const-oid feature "default"
+│               │       │   │   └── const-oid v0.10.2
+│               │       │   └── crypto-common feature "default"
+│               │       │       └── crypto-common v0.2.2
+│               │       │           └── hybrid-array feature "default"
+│               │       │               └── hybrid-array v0.4.15
+│               │       │                   ├── typenum feature "const-generics"
+│               │       │                   │   └── typenum v1.20.1
+│               │       │                   └── typenum feature "default"
+│               │       │                       └── typenum v1.20.1
+│               │       └── digest feature "block-api"
+│               │           └── digest v0.11.3
+│               │               ├── block-buffer feature "default"
+│               │               │   └── block-buffer v0.12.1
+│               │               │       └── hybrid-array feature "default"
+│               │               │           └── hybrid-array v0.4.15
+│               │               │               ├── typenum feature "const-generics"
+│               │               │               │   └── typenum v1.20.1
+│               │               │               └── typenum feature "default"
+│               │               │                   └── typenum v1.20.1
+│               │               ├── const-oid feature "default"
+│               │               │   └── const-oid v0.10.2
+│               │               └── crypto-common feature "default"
+│               │                   └── crypto-common v0.2.2
+│               │                       └── hybrid-array feature "default"
+│               │                           └── hybrid-array v0.4.15
+│               │                               ├── typenum feature "const-generics"
+│               │                               │   └── typenum v1.20.1
+│               │                               └── typenum feature "default"
+│               │                                   └── typenum v1.20.1
+│               └── digest feature "oid"
+│                   └── digest v0.11.3
+│                       ├── block-buffer feature "default"
+│                       │   └── block-buffer v0.12.1
+│                       │       └── hybrid-array feature "default"
+│                       │           └── hybrid-array v0.4.15
+│                       │               ├── typenum feature "const-generics"
+│                       │               │   └── typenum v1.20.1
+│                       │               └── typenum feature "default"
+│                       │                   └── typenum v1.20.1
+│                       ├── const-oid feature "default"
+│                       │   └── const-oid v0.10.2
+│                       └── crypto-common feature "default"
+│                           └── crypto-common v0.2.2
+│                               └── hybrid-array feature "default"
+│                                   └── hybrid-array v0.4.15
+│                                       ├── typenum feature "const-generics"
+│                                       │   └── typenum v1.20.1
+│                                       └── typenum feature "default"
+│                                           └── typenum v1.20.1
+├── lzma-rust2 feature "optimization"
+│   └── lzma-rust2 v0.20.1
+│       └── sha2 feature "default"
+│           ├── sha2 v0.11.0
+│           │   ├── cfg-if feature "default"
+│           │   │   └── cfg-if v1.0.4
+│           │   ├── cpufeatures feature "default"
+│           │   │   └── cpufeatures v0.3.1
+│           │   └── digest feature "default"
+│           │       ├── digest v0.11.3
+│           │       │   ├── block-buffer feature "default"
+│           │       │   │   └── block-buffer v0.12.1
+│           │       │   │       └── hybrid-array feature "default"
+│           │       │   │           └── hybrid-array v0.4.15
+│           │       │   │               ├── typenum feature "const-generics"
+│           │       │   │               │   └── typenum v1.20.1
+│           │       │   │               └── typenum feature "default"
+│           │       │   │                   └── typenum v1.20.1
+│           │       │   ├── const-oid feature "default"
+│           │       │   │   └── const-oid v0.10.2
+│           │       │   └── crypto-common feature "default"
+│           │       │       └── crypto-common v0.2.2
+│           │       │           └── hybrid-array feature "default"
+│           │       │               └── hybrid-array v0.4.15
+│           │       │                   ├── typenum feature "const-generics"
+│           │       │                   │   └── typenum v1.20.1
+│           │       │                   └── typenum feature "default"
+│           │       │                       └── typenum v1.20.1
+│           │       └── digest feature "block-api"
+│           │           └── digest v0.11.3
+│           │               ├── block-buffer feature "default"
+│           │               │   └── block-buffer v0.12.1
+│           │               │       └── hybrid-array feature "default"
+│           │               │           └── hybrid-array v0.4.15
+│           │               │               ├── typenum feature "const-generics"
+│           │               │               │   └── typenum v1.20.1
+│           │               │               └── typenum feature "default"
+│           │               │                   └── typenum v1.20.1
+│           │               ├── const-oid feature "default"
+│           │               │   └── const-oid v0.10.2
+│           │               └── crypto-common feature "default"
+│           │                   └── crypto-common v0.2.2
+│           │                       └── hybrid-array feature "default"
+│           │                           └── hybrid-array v0.4.15
+│           │                               ├── typenum feature "const-generics"
+│           │                               │   └── typenum v1.20.1
+│           │                               └── typenum feature "default"
+│           │                                   └── typenum v1.20.1
+│           ├── sha2 feature "alloc"
+│           │   ├── sha2 v0.11.0
+│           │   │   ├── cfg-if feature "default"
+│           │   │   │   └── cfg-if v1.0.4
+│           │   │   ├── cpufeatures feature "default"
+│           │   │   │   └── cpufeatures v0.3.1
+│           │   │   └── digest feature "default"
+│           │   │       ├── digest v0.11.3
+│           │   │       │   ├── block-buffer feature "default"
+│           │   │       │   │   └── block-buffer v0.12.1
+│           │   │       │   │       └── hybrid-array feature "default"
+│           │   │       │   │           └── hybrid-array v0.4.15
+│           │   │       │   │               ├── typenum feature "const-generics"
+│           │   │       │   │               │   └── typenum v1.20.1
+│           │   │       │   │               └── typenum feature "default"
+│           │   │       │   │                   └── typenum v1.20.1
+│           │   │       │   ├── const-oid feature "default"
+│           │   │       │   │   └── const-oid v0.10.2
+│           │   │       │   └── crypto-common feature "default"
+│           │   │       │       └── crypto-common v0.2.2
+│           │   │       │           └── hybrid-array feature "default"
+│           │   │       │               └── hybrid-array v0.4.15
+│           │   │       │                   ├── typenum feature "const-generics"
+│           │   │       │                   │   └── typenum v1.20.1
+│           │   │       │                   └── typenum feature "default"
+│           │   │       │                       └── typenum v1.20.1
+│           │   │       └── digest feature "block-api"
+│           │   │           └── digest v0.11.3
+│           │   │               ├── block-buffer feature "default"
+│           │   │               │   └── block-buffer v0.12.1
+│           │   │               │       └── hybrid-array feature "default"
+│           │   │               │           └── hybrid-array v0.4.15
+│           │   │               │               ├── typenum feature "const-generics"
+│           │   │               │               │   └── typenum v1.20.1
+│           │   │               │               └── typenum feature "default"
+│           │   │               │                   └── typenum v1.20.1
+│           │   │               ├── const-oid feature "default"
+│           │   │               │   └── const-oid v0.10.2
+│           │   │               └── crypto-common feature "default"
+│           │   │                   └── crypto-common v0.2.2
+│           │   │                       └── hybrid-array feature "default"
+│           │   │                           └── hybrid-array v0.4.15
+│           │   │                               ├── typenum feature "const-generics"
+│           │   │                               │   └── typenum v1.20.1
+│           │   │                               └── typenum feature "default"
+│           │   │                                   └── typenum v1.20.1
+│           │   └── digest feature "alloc"
+│           │       └── digest v0.11.3
+│           │           ├── block-buffer feature "default"
+│           │           │   └── block-buffer v0.12.1
+│           │           │       └── hybrid-array feature "default"
+│           │           │           └── hybrid-array v0.4.15
+│           │           │               ├── typenum feature "const-generics"
+│           │           │               │   └── typenum v1.20.1
+│           │           │               └── typenum feature "default"
+│           │           │                   └── typenum v1.20.1
+│           │           ├── const-oid feature "default"
+│           │           │   └── const-oid v0.10.2
+│           │           └── crypto-common feature "default"
+│           │               └── crypto-common v0.2.2
+│           │                   └── hybrid-array feature "default"
+│           │                       └── hybrid-array v0.4.15
+│           │                           ├── typenum feature "const-generics"
+│           │                           │   └── typenum v1.20.1
+│           │                           └── typenum feature "default"
+│           │                               └── typenum v1.20.1
+│           └── sha2 feature "oid"
+│               ├── sha2 v0.11.0
+│               │   ├── cfg-if feature "default"
+│               │   │   └── cfg-if v1.0.4
+│               │   ├── cpufeatures feature "default"
+│               │   │   └── cpufeatures v0.3.1
+│               │   └── digest feature "default"
+│               │       ├── digest v0.11.3
+│               │       │   ├── block-buffer feature "default"
+│               │       │   │   └── block-buffer v0.12.1
+│               │       │   │       └── hybrid-array feature "default"
+│               │       │   │           └── hybrid-array v0.4.15
+│               │       │   │               ├── typenum feature "const-generics"
+│               │       │   │               │   └── typenum v1.20.1
+│               │       │   │               └── typenum feature "default"
+│               │       │   │                   └── typenum v1.20.1
+│               │       │   ├── const-oid feature "default"
+│               │       │   │   └── const-oid v0.10.2
+│               │       │   └── crypto-common feature "default"
+│               │       │       └── crypto-common v0.2.2
+│               │       │           └── hybrid-array feature "default"
+│               │       │               └── hybrid-array v0.4.15
+│               │       │                   ├── typenum feature "const-generics"
+│               │       │                   │   └── typenum v1.20.1
+│               │       │                   └── typenum feature "default"
+│               │       │                       └── typenum v1.20.1
+│               │       └── digest feature "block-api"
+│               │           └── digest v0.11.3
+│               │               ├── block-buffer feature "default"
+│               │               │   └── block-buffer v0.12.1
+│               │               │       └── hybrid-array feature "default"
+│               │               │           └── hybrid-array v0.4.15
+│               │               │               ├── typenum feature "const-generics"
+│               │               │               │   └── typenum v1.20.1
+│               │               │               └── typenum feature "default"
+│               │               │                   └── typenum v1.20.1
+│               │               ├── const-oid feature "default"
+│               │               │   └── const-oid v0.10.2
+│               │               └── crypto-common feature "default"
+│               │                   └── crypto-common v0.2.2
+│               │                       └── hybrid-array feature "default"
+│               │                           └── hybrid-array v0.4.15
+│               │                               ├── typenum feature "const-generics"
+│               │                               │   └── typenum v1.20.1
+│               │                               └── typenum feature "default"
+│               │                                   └── typenum v1.20.1
+│               └── digest feature "oid"
+│                   └── digest v0.11.3
+│                       ├── block-buffer feature "default"
+│                       │   └── block-buffer v0.12.1
+│                       │       └── hybrid-array feature "default"
+│                       │           └── hybrid-array v0.4.15
+│                       │               ├── typenum feature "const-generics"
+│                       │               │   └── typenum v1.20.1
+│                       │               └── typenum feature "default"
+│                       │                   └── typenum v1.20.1
+│                       ├── const-oid feature "default"
+│                       │   └── const-oid v0.10.2
+│                       └── crypto-common feature "default"
+│                           └── crypto-common v0.2.2
+│                               └── hybrid-array feature "default"
+│                                   └── hybrid-array v0.4.15
+│                                       ├── typenum feature "const-generics"
+│                                       │   └── typenum v1.20.1
+│                                       └── typenum feature "default"
+│                                           └── typenum v1.20.1
+├── lzma-rust2 feature "std"
+│   └── lzma-rust2 v0.20.1
+│       └── sha2 feature "default"
+│           ├── sha2 v0.11.0
+│           │   ├── cfg-if feature "default"
+│           │   │   └── cfg-if v1.0.4
+│           │   ├── cpufeatures feature "default"
+│           │   │   └── cpufeatures v0.3.1
+│           │   └── digest feature "default"
+│           │       ├── digest v0.11.3
+│           │       │   ├── block-buffer feature "default"
+│           │       │   │   └── block-buffer v0.12.1
+│           │       │   │       └── hybrid-array feature "default"
+│           │       │   │           └── hybrid-array v0.4.15
+│           │       │   │               ├── typenum feature "const-generics"
+│           │       │   │               │   └── typenum v1.20.1
+│           │       │   │               └── typenum feature "default"
+│           │       │   │                   └── typenum v1.20.1
+│           │       │   ├── const-oid feature "default"
+│           │       │   │   └── const-oid v0.10.2
+│           │       │   └── crypto-common feature "default"
+│           │       │       └── crypto-common v0.2.2
+│           │       │           └── hybrid-array feature "default"
+│           │       │               └── hybrid-array v0.4.15
+│           │       │                   ├── typenum feature "const-generics"
+│           │       │                   │   └── typenum v1.20.1
+│           │       │                   └── typenum feature "default"
+│           │       │                       └── typenum v1.20.1
+│           │       └── digest feature "block-api"
+│           │           └── digest v0.11.3
+│           │               ├── block-buffer feature "default"
+│           │               │   └── block-buffer v0.12.1
+│           │               │       └── hybrid-array feature "default"
+│           │               │           └── hybrid-array v0.4.15
+│           │               │               ├── typenum feature "const-generics"
+│           │               │               │   └── typenum v1.20.1
+│           │               │               └── typenum feature "default"
+│           │               │                   └── typenum v1.20.1
+│           │               ├── const-oid feature "default"
+│           │               │   └── const-oid v0.10.2
+│           │               └── crypto-common feature "default"
+│           │                   └── crypto-common v0.2.2
+│           │                       └── hybrid-array feature "default"
+│           │                           └── hybrid-array v0.4.15
+│           │                               ├── typenum feature "const-generics"
+│           │                               │   └── typenum v1.20.1
+│           │                               └── typenum feature "default"
+│           │                                   └── typenum v1.20.1
+│           ├── sha2 feature "alloc"
+│           │   ├── sha2 v0.11.0
+│           │   │   ├── cfg-if feature "default"
+│           │   │   │   └── cfg-if v1.0.4
+│           │   │   ├── cpufeatures feature "default"
+│           │   │   │   └── cpufeatures v0.3.1
+│           │   │   └── digest feature "default"
+│           │   │       ├── digest v0.11.3
+│           │   │       │   ├── block-buffer feature "default"
+│           │   │       │   │   └── block-buffer v0.12.1
+│           │   │       │   │       └── hybrid-array feature "default"
+│           │   │       │   │           └── hybrid-array v0.4.15
+│           │   │       │   │               ├── typenum feature "const-generics"
+│           │   │       │   │               │   └── typenum v1.20.1
+│           │   │       │   │               └── typenum feature "default"
+│           │   │       │   │                   └── typenum v1.20.1
+│           │   │       │   ├── const-oid feature "default"
+│           │   │       │   │   └── const-oid v0.10.2
+│           │   │       │   └── crypto-common feature "default"
+│           │   │       │       └── crypto-common v0.2.2
+│           │   │       │           └── hybrid-array feature "default"
+│           │   │       │               └── hybrid-array v0.4.15
+│           │   │       │                   ├── typenum feature "const-generics"
+│           │   │       │                   │   └── typenum v1.20.1
+│           │   │       │                   └── typenum feature "default"
+│           │   │       │                       └── typenum v1.20.1
+│           │   │       └── digest feature "block-api"
+│           │   │           └── digest v0.11.3
+│           │   │               ├── block-buffer feature "default"
+│           │   │               │   └── block-buffer v0.12.1
+│           │   │               │       └── hybrid-array feature "default"
+│           │   │               │           └── hybrid-array v0.4.15
+│           │   │               │               ├── typenum feature "const-generics"
+│           │   │               │               │   └── typenum v1.20.1
+│           │   │               │               └── typenum feature "default"
+│           │   │               │                   └── typenum v1.20.1
+│           │   │               ├── const-oid feature "default"
+│           │   │               │   └── const-oid v0.10.2
+│           │   │               └── crypto-common feature "default"
+│           │   │                   └── crypto-common v0.2.2
+│           │   │                       └── hybrid-array feature "default"
+│           │   │                           └── hybrid-array v0.4.15
+│           │   │                               ├── typenum feature "const-generics"
+│           │   │                               │   └── typenum v1.20.1
+│           │   │                               └── typenum feature "default"
+│           │   │                                   └── typenum v1.20.1
+│           │   └── digest feature "alloc"
+│           │       └── digest v0.11.3
+│           │           ├── block-buffer feature "default"
+│           │           │   └── block-buffer v0.12.1
+│           │           │       └── hybrid-array feature "default"
+│           │           │           └── hybrid-array v0.4.15
+│           │           │               ├── typenum feature "const-generics"
+│           │           │               │   └── typenum v1.20.1
+│           │           │               └── typenum feature "default"
+│           │           │                   └── typenum v1.20.1
+│           │           ├── const-oid feature "default"
+│           │           │   └── const-oid v0.10.2
+│           │           └── crypto-common feature "default"
+│           │               └── crypto-common v0.2.2
+│           │                   └── hybrid-array feature "default"
+│           │                       └── hybrid-array v0.4.15
+│           │                           ├── typenum feature "const-generics"
+│           │                           │   └── typenum v1.20.1
+│           │                           └── typenum feature "default"
+│           │                               └── typenum v1.20.1
+│           └── sha2 feature "oid"
+│               ├── sha2 v0.11.0
+│               │   ├── cfg-if feature "default"
+│               │   │   └── cfg-if v1.0.4
+│               │   ├── cpufeatures feature "default"
+│               │   │   └── cpufeatures v0.3.1
+│               │   └── digest feature "default"
+│               │       ├── digest v0.11.3
+│               │       │   ├── block-buffer feature "default"
+│               │       │   │   └── block-buffer v0.12.1
+│               │       │   │       └── hybrid-array feature "default"
+│               │       │   │           └── hybrid-array v0.4.15
+│               │       │   │               ├── typenum feature "const-generics"
+│               │       │   │               │   └── typenum v1.20.1
+│               │       │   │               └── typenum feature "default"
+│               │       │   │                   └── typenum v1.20.1
+│               │       │   ├── const-oid feature "default"
+│               │       │   │   └── const-oid v0.10.2
+│               │       │   └── crypto-common feature "default"
+│               │       │       └── crypto-common v0.2.2
+│               │       │           └── hybrid-array feature "default"
+│               │       │               └── hybrid-array v0.4.15
+│               │       │                   ├── typenum feature "const-generics"
+│               │       │                   │   └── typenum v1.20.1
+│               │       │                   └── typenum feature "default"
+│               │       │                       └── typenum v1.20.1
+│               │       └── digest feature "block-api"
+│               │           └── digest v0.11.3
+│               │               ├── block-buffer feature "default"
+│               │               │   └── block-buffer v0.12.1
+│               │               │       └── hybrid-array feature "default"
+│               │               │           └── hybrid-array v0.4.15
+│               │               │               ├── typenum feature "const-generics"
+│               │               │               │   └── typenum v1.20.1
+│               │               │               └── typenum feature "default"
+│               │               │                   └── typenum v1.20.1
+│               │               ├── const-oid feature "default"
+│               │               │   └── const-oid v0.10.2
+│               │               └── crypto-common feature "default"
+│               │                   └── crypto-common v0.2.2
+│               │                       └── hybrid-array feature "default"
+│               │                           └── hybrid-array v0.4.15
+│               │                               ├── typenum feature "const-generics"
+│               │                               │   └── typenum v1.20.1
+│               │                               └── typenum feature "default"
+│               │                                   └── typenum v1.20.1
+│               └── digest feature "oid"
+│                   └── digest v0.11.3
+│                       ├── block-buffer feature "default"
+│                       │   └── block-buffer v0.12.1
+│                       │       └── hybrid-array feature "default"
+│                       │           └── hybrid-array v0.4.15
+│                       │               ├── typenum feature "const-generics"
+│                       │               │   └── typenum v1.20.1
+│                       │               └── typenum feature "default"
+│                       │                   └── typenum v1.20.1
+│                       ├── const-oid feature "default"
+│                       │   └── const-oid v0.10.2
+│                       └── crypto-common feature "default"
+│                           └── crypto-common v0.2.2
+│                               └── hybrid-array feature "default"
+│                                   └── hybrid-array v0.4.15
+│                                       ├── typenum feature "const-generics"
+│                                       │   └── typenum v1.20.1
+│                                       └── typenum feature "default"
+│                                           └── typenum v1.20.1
+└── lzma-rust2 feature "xz"
+    ├── lzma-rust2 v0.20.1
+    │   └── sha2 feature "default"
+    │       ├── sha2 v0.11.0
+    │       │   ├── cfg-if feature "default"
+    │       │   │   └── cfg-if v1.0.4
+    │       │   ├── cpufeatures feature "default"
+    │       │   │   └── cpufeatures v0.3.1
+    │       │   └── digest feature "default"
+    │       │       ├── digest v0.11.3
+    │       │       │   ├── block-buffer feature "default"
+    │       │       │   │   └── block-buffer v0.12.1
+    │       │       │   │       └── hybrid-array feature "default"
+    │       │       │   │           └── hybrid-array v0.4.15
+    │       │       │   │               ├── typenum feature "const-generics"
+    │       │       │   │               │   └── typenum v1.20.1
+    │       │       │   │               └── typenum feature "default"
+    │       │       │   │                   └── typenum v1.20.1
+    │       │       │   ├── const-oid feature "default"
+    │       │       │   │   └── const-oid v0.10.2
+    │       │       │   └── crypto-common feature "default"
+    │       │       │       └── crypto-common v0.2.2
+    │       │       │           └── hybrid-array feature "default"
+    │       │       │               └── hybrid-array v0.4.15
+    │       │       │                   ├── typenum feature "const-generics"
+    │       │       │                   │   └── typenum v1.20.1
+    │       │       │                   └── typenum feature "default"
+    │       │       │                       └── typenum v1.20.1
+    │       │       └── digest feature "block-api"
+    │       │           └── digest v0.11.3
+    │       │               ├── block-buffer feature "default"
+    │       │               │   └── block-buffer v0.12.1
+    │       │               │       └── hybrid-array feature "default"
+    │       │               │           └── hybrid-array v0.4.15
+    │       │               │               ├── typenum feature "const-generics"
+    │       │               │               │   └── typenum v1.20.1
+    │       │               │               └── typenum feature "default"
+    │       │               │                   └── typenum v1.20.1
+    │       │               ├── const-oid feature "default"
+    │       │               │   └── const-oid v0.10.2
+    │       │               └── crypto-common feature "default"
+    │       │                   └── crypto-common v0.2.2
+    │       │                       └── hybrid-array feature "default"
+    │       │                           └── hybrid-array v0.4.15
+    │       │                               ├── typenum feature "const-generics"
+    │       │                               │   └── typenum v1.20.1
+    │       │                               └── typenum feature "default"
+    │       │                                   └── typenum v1.20.1
+    │       ├── sha2 feature "alloc"
+    │       │   ├── sha2 v0.11.0
+    │       │   │   ├── cfg-if feature "default"
+    │       │   │   │   └── cfg-if v1.0.4
+    │       │   │   ├── cpufeatures feature "default"
+    │       │   │   │   └── cpufeatures v0.3.1
+    │       │   │   └── digest feature "default"
+    │       │   │       ├── digest v0.11.3
+    │       │   │       │   ├── block-buffer feature "default"
+    │       │   │       │   │   └── block-buffer v0.12.1
+    │       │   │       │   │       └── hybrid-array feature "default"
+    │       │   │       │   │           └── hybrid-array v0.4.15
+    │       │   │       │   │               ├── typenum feature "const-generics"
+    │       │   │       │   │               │   └── typenum v1.20.1
+    │       │   │       │   │               └── typenum feature "default"
+    │       │   │       │   │                   └── typenum v1.20.1
+    │       │   │       │   ├── const-oid feature "default"
+    │       │   │       │   │   └── const-oid v0.10.2
+    │       │   │       │   └── crypto-common feature "default"
+    │       │   │       │       └── crypto-common v0.2.2
+    │       │   │       │           └── hybrid-array feature "default"
+    │       │   │       │               └── hybrid-array v0.4.15
+    │       │   │       │                   ├── typenum feature "const-generics"
+    │       │   │       │                   │   └── typenum v1.20.1
+    │       │   │       │                   └── typenum feature "default"
+    │       │   │       │                       └── typenum v1.20.1
+    │       │   │       └── digest feature "block-api"
+    │       │   │           └── digest v0.11.3
+    │       │   │               ├── block-buffer feature "default"
+    │       │   │               │   └── block-buffer v0.12.1
+    │       │   │               │       └── hybrid-array feature "default"
+    │       │   │               │           └── hybrid-array v0.4.15
+    │       │   │               │               ├── typenum feature "const-generics"
+    │       │   │               │               │   └── typenum v1.20.1
+    │       │   │               │               └── typenum feature "default"
+    │       │   │               │                   └── typenum v1.20.1
+    │       │   │               ├── const-oid feature "default"
+    │       │   │               │   └── const-oid v0.10.2
+    │       │   │               └── crypto-common feature "default"
+    │       │   │                   └── crypto-common v0.2.2
+    │       │   │                       └── hybrid-array feature "default"
+    │       │   │                           └── hybrid-array v0.4.15
+    │       │   │                               ├── typenum feature "const-generics"
+    │       │   │                               │   └── typenum v1.20.1
+    │       │   │                               └── typenum feature "default"
+    │       │   │                                   └── typenum v1.20.1
+    │       │   └── digest feature "alloc"
+    │       │       └── digest v0.11.3
+    │       │           ├── block-buffer feature "default"
+    │       │           │   └── block-buffer v0.12.1
+    │       │           │       └── hybrid-array feature "default"
+    │       │           │           └── hybrid-array v0.4.15
+    │       │           │               ├── typenum feature "const-generics"
+    │       │           │               │   └── typenum v1.20.1
+    │       │           │               └── typenum feature "default"
+    │       │           │                   └── typenum v1.20.1
+    │       │           ├── const-oid feature "default"
+    │       │           │   └── const-oid v0.10.2
+    │       │           └── crypto-common feature "default"
+    │       │               └── crypto-common v0.2.2
+    │       │                   └── hybrid-array feature "default"
+    │       │                       └── hybrid-array v0.4.15
+    │       │                           ├── typenum feature "const-generics"
+    │       │                           │   └── typenum v1.20.1
+    │       │                           └── typenum feature "default"
+    │       │                               └── typenum v1.20.1
+    │       └── sha2 feature "oid"
+    │           ├── sha2 v0.11.0
+    │           │   ├── cfg-if feature "default"
+    │           │   │   └── cfg-if v1.0.4
+    │           │   ├── cpufeatures feature "default"
+    │           │   │   └── cpufeatures v0.3.1
+    │           │   └── digest feature "default"
+    │           │       ├── digest v0.11.3
+    │           │       │   ├── block-buffer feature "default"
+    │           │       │   │   └── block-buffer v0.12.1
+    │           │       │   │       └── hybrid-array feature "default"
+    │           │       │   │           └── hybrid-array v0.4.15
+    │           │       │   │               ├── typenum feature "const-generics"
+    │           │       │   │               │   └── typenum v1.20.1
+    │           │       │   │               └── typenum feature "default"
+    │           │       │   │                   └── typenum v1.20.1
+    │           │       │   ├── const-oid feature "default"
+    │           │       │   │   └── const-oid v0.10.2
+    │           │       │   └── crypto-common feature "default"
+    │           │       │       └── crypto-common v0.2.2
+    │           │       │           └── hybrid-array feature "default"
+    │           │       │               └── hybrid-array v0.4.15
+    │           │       │                   ├── typenum feature "const-generics"
+    │           │       │                   │   └── typenum v1.20.1
+    │           │       │                   └── typenum feature "default"
+    │           │       │                       └── typenum v1.20.1
+    │           │       └── digest feature "block-api"
+    │           │           └── digest v0.11.3
+    │           │               ├── block-buffer feature "default"
+    │           │               │   └── block-buffer v0.12.1
+    │           │               │       └── hybrid-array feature "default"
+    │           │               │           └── hybrid-array v0.4.15
+    │           │               │               ├── typenum feature "const-generics"
+    │           │               │               │   └── typenum v1.20.1
+    │           │               │               └── typenum feature "default"
+    │           │               │                   └── typenum v1.20.1
+    │           │               ├── const-oid feature "default"
+    │           │               │   └── const-oid v0.10.2
+    │           │               └── crypto-common feature "default"
+    │           │                   └── crypto-common v0.2.2
+    │           │                       └── hybrid-array feature "default"
+    │           │                           └── hybrid-array v0.4.15
+    │           │                               ├── typenum feature "const-generics"
+    │           │                               │   └── typenum v1.20.1
+    │           │                               └── typenum feature "default"
+    │           │                                   └── typenum v1.20.1
+    │           └── digest feature "oid"
+    │               └── digest v0.11.3
+    │                   ├── block-buffer feature "default"
+    │                   │   └── block-buffer v0.12.1
+    │                   │       └── hybrid-array feature "default"
+    │                   │           └── hybrid-array v0.4.15
+    │                   │               ├── typenum feature "const-generics"
+    │                   │               │   └── typenum v1.20.1
+    │                   │               └── typenum feature "default"
+    │                   │                   └── typenum v1.20.1
+    │                   ├── const-oid feature "default"
+    │                   │   └── const-oid v0.10.2
+    │                   └── crypto-common feature "default"
+    │                       └── crypto-common v0.2.2
+    │                           └── hybrid-array feature "default"
+    │                               └── hybrid-array v0.4.15
+    │                                   ├── typenum feature "const-generics"
+    │                                   │   └── typenum v1.20.1
+    │                                   └── typenum feature "default"
+    │                                       └── typenum v1.20.1
+    └── lzma-rust2 feature "sha2"
+        └── lzma-rust2 v0.20.1
+            └── sha2 feature "default"
+                ├── sha2 v0.11.0
+                │   ├── cfg-if feature "default"
+                │   │   └── cfg-if v1.0.4
+                │   ├── cpufeatures feature "default"
+                │   │   └── cpufeatures v0.3.1
+                │   └── digest feature "default"
+                │       ├── digest v0.11.3
+                │       │   ├── block-buffer feature "default"
+                │       │   │   └── block-buffer v0.12.1
+                │       │   │       └── hybrid-array feature "default"
+                │       │   │           └── hybrid-array v0.4.15
+                │       │   │               ├── typenum feature "const-generics"
+                │       │   │               │   └── typenum v1.20.1
+                │       │   │               └── typenum feature "default"
+                │       │   │                   └── typenum v1.20.1
+                │       │   ├── const-oid feature "default"
+                │       │   │   └── const-oid v0.10.2
+                │       │   └── crypto-common feature "default"
+                │       │       └── crypto-common v0.2.2
+                │       │           └── hybrid-array feature "default"
+                │       │               └── hybrid-array v0.4.15
+                │       │                   ├── typenum feature "const-generics"
+                │       │                   │   └── typenum v1.20.1
+                │       │                   └── typenum feature "default"
+                │       │                       └── typenum v1.20.1
+                │       └── digest feature "block-api"
+                │           └── digest v0.11.3
+                │               ├── block-buffer feature "default"
+                │               │   └── block-buffer v0.12.1
+                │               │       └── hybrid-array feature "default"
+                │               │           └── hybrid-array v0.4.15
+                │               │               ├── typenum feature "const-generics"
+                │               │               │   └── typenum v1.20.1
+                │               │               └── typenum feature "default"
+                │               │                   └── typenum v1.20.1
+                │               ├── const-oid feature "default"
+                │               │   └── const-oid v0.10.2
+                │               └── crypto-common feature "default"
+                │                   └── crypto-common v0.2.2
+                │                       └── hybrid-array feature "default"
+                │                           └── hybrid-array v0.4.15
+                │                               ├── typenum feature "const-generics"
+                │                               │   └── typenum v1.20.1
+                │                               └── typenum feature "default"
+                │                                   └── typenum v1.20.1
+                ├── sha2 feature "alloc"
+                │   ├── sha2 v0.11.0
+                │   │   ├── cfg-if feature "default"
+                │   │   │   └── cfg-if v1.0.4
+                │   │   ├── cpufeatures feature "default"
+                │   │   │   └── cpufeatures v0.3.1
+                │   │   └── digest feature "default"
+                │   │       ├── digest v0.11.3
+                │   │       │   ├── block-buffer feature "default"
+                │   │       │   │   └── block-buffer v0.12.1
+                │   │       │   │       └── hybrid-array feature "default"
+                │   │       │   │           └── hybrid-array v0.4.15
+                │   │       │   │               ├── typenum feature "const-generics"
+                │   │       │   │               │   └── typenum v1.20.1
+                │   │       │   │               └── typenum feature "default"
+                │   │       │   │                   └── typenum v1.20.1
+                │   │       │   ├── const-oid feature "default"
+                │   │       │   │   └── const-oid v0.10.2
+                │   │       │   └── crypto-common feature "default"
+                │   │       │       └── crypto-common v0.2.2
+                │   │       │           └── hybrid-array feature "default"
+                │   │       │               └── hybrid-array v0.4.15
+                │   │       │                   ├── typenum feature "const-generics"
+                │   │       │                   │   └── typenum v1.20.1
+                │   │       │                   └── typenum feature "default"
+                │   │       │                       └── typenum v1.20.1
+                │   │       └── digest feature "block-api"
+                │   │           └── digest v0.11.3
+                │   │               ├── block-buffer feature "default"
+                │   │               │   └── block-buffer v0.12.1
+                │   │               │       └── hybrid-array feature "default"
+                │   │               │           └── hybrid-array v0.4.15
+                │   │               │               ├── typenum feature "const-generics"
+                │   │               │               │   └── typenum v1.20.1
+                │   │               │               └── typenum feature "default"
+                │   │               │                   └── typenum v1.20.1
+                │   │               ├── const-oid feature "default"
+                │   │               │   └── const-oid v0.10.2
+                │   │               └── crypto-common feature "default"
+                │   │                   └── crypto-common v0.2.2
+                │   │                       └── hybrid-array feature "default"
+                │   │                           └── hybrid-array v0.4.15
+                │   │                               ├── typenum feature "const-generics"
+                │   │                               │   └── typenum v1.20.1
+                │   │                               └── typenum feature "default"
+                │   │                                   └── typenum v1.20.1
+                │   └── digest feature "alloc"
+                │       └── digest v0.11.3
+                │           ├── block-buffer feature "default"
+                │           │   └── block-buffer v0.12.1
+                │           │       └── hybrid-array feature "default"
+                │           │           └── hybrid-array v0.4.15
+                │           │               ├── typenum feature "const-generics"
+                │           │               │   └── typenum v1.20.1
+                │           │               └── typenum feature "default"
+                │           │                   └── typenum v1.20.1
+                │           ├── const-oid feature "default"
+                │           │   └── const-oid v0.10.2
+                │           └── crypto-common feature "default"
+                │               └── crypto-common v0.2.2
+                │                   └── hybrid-array feature "default"
+                │                       └── hybrid-array v0.4.15
+                │                           ├── typenum feature "const-generics"
+                │                           │   └── typenum v1.20.1
+                │                           └── typenum feature "default"
+                │                               └── typenum v1.20.1
+                └── sha2 feature "oid"
+                    ├── sha2 v0.11.0
+                    │   ├── cfg-if feature "default"
+                    │   │   └── cfg-if v1.0.4
+                    │   ├── cpufeatures feature "default"
+                    │   │   └── cpufeatures v0.3.1
+                    │   └── digest feature "default"
+                    │       ├── digest v0.11.3
+                    │       │   ├── block-buffer feature "default"
+                    │       │   │   └── block-buffer v0.12.1
+                    │       │   │       └── hybrid-array feature "default"
+                    │       │   │           └── hybrid-array v0.4.15
+                    │       │   │               ├── typenum feature "const-generics"
+                    │       │   │               │   └── typenum v1.20.1
+                    │       │   │               └── typenum feature "default"
+                    │       │   │                   └── typenum v1.20.1
+                    │       │   ├── const-oid feature "default"
+                    │       │   │   └── const-oid v0.10.2
+                    │       │   └── crypto-common feature "default"
+                    │       │       └── crypto-common v0.2.2
+                    │       │           └── hybrid-array feature "default"
+                    │       │               └── hybrid-array v0.4.15
+                    │       │                   ├── typenum feature "const-generics"
+                    │       │                   │   └── typenum v1.20.1
+                    │       │                   └── typenum feature "default"
+                    │       │                       └── typenum v1.20.1
+                    │       └── digest feature "block-api"
+                    │           └── digest v0.11.3
+                    │               ├── block-buffer feature "default"
+                    │               │   └── block-buffer v0.12.1
+                    │               │       └── hybrid-array feature "default"
+                    │               │           └── hybrid-array v0.4.15
+                    │               │               ├── typenum feature "const-generics"
+                    │               │               │   └── typenum v1.20.1
+                    │               │               └── typenum feature "default"
+                    │               │                   └── typenum v1.20.1
+                    │               ├── const-oid feature "default"
+                    │               │   └── const-oid v0.10.2
+                    │               └── crypto-common feature "default"
+                    │                   └── crypto-common v0.2.2
+                    │                       └── hybrid-array feature "default"
+                    │                           └── hybrid-array v0.4.15
+                    │                               ├── typenum feature "const-generics"
+                    │                               │   └── typenum v1.20.1
+                    │                               └── typenum feature "default"
+                    │                                   └── typenum v1.20.1
+                    └── digest feature "oid"
+                        └── digest v0.11.3
+                            ├── block-buffer feature "default"
+                            │   └── block-buffer v0.12.1
+                            │       └── hybrid-array feature "default"
+                            │           └── hybrid-array v0.4.15
+                            │               ├── typenum feature "const-generics"
+                            │               │   └── typenum v1.20.1
+                            │               └── typenum feature "default"
+                            │                   └── typenum v1.20.1
+                            ├── const-oid feature "default"
+                            │   └── const-oid v0.10.2
+                            └── crypto-common feature "default"
+                                └── crypto-common v0.2.2
+                                    └── hybrid-array feature "default"
+                                        └── hybrid-array v0.4.15
+                                            ├── typenum feature "const-generics"
+                                            │   └── typenum v1.20.1
+                                            └── typenum feature "default"
+                                                └── typenum v1.20.1

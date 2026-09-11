@@ -1,0 +1,5 @@
+variant	static_binary_delta_vs_baseline_bytes	package_nar_delta_vs_baseline_bytes	closure_delta_vs_baseline_bytes	resolved_package_delta	unsafe_package_instance_delta
+loose	-1342392	-3857776	-46438024	49	35
+packed-read	-1331800	-3847176	-46427424	49	35
+pack-write	-912264	-3427640	-46007888	55	38
+high-level	-197496	-2712872	-46093072	99	61

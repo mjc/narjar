@@ -1,0 +1,17 @@
+variant	mode	readers	max_rss_kib	measurement
+loose	native	1	2556	/run/current-system/sw/bin/time -f %M
+loose	native	32	2252	/run/current-system/sw/bin/time -f %M
+packed-read	native	1	2180	/run/current-system/sw/bin/time -f %M
+packed-read	native	32	2180	/run/current-system/sw/bin/time -f %M
+pack-write	native	1	2796	/run/current-system/sw/bin/time -f %M
+pack-write	native	32	2796	/run/current-system/sw/bin/time -f %M
+high-level	native	1	3012	/run/current-system/sw/bin/time -f %M
+high-level	native	32	3012	/run/current-system/sw/bin/time -f %M
+loose	static	1	768	/run/current-system/sw/bin/time -f %M
+loose	static	32	776	/run/current-system/sw/bin/time -f %M
+packed-read	static	1	768	/run/current-system/sw/bin/time -f %M
+packed-read	static	32	808	/run/current-system/sw/bin/time -f %M
+pack-write	static	1	1024	/run/current-system/sw/bin/time -f %M
+pack-write	static	32	1044	/run/current-system/sw/bin/time -f %M
+high-level	static	1	768	/run/current-system/sw/bin/time -f %M
+high-level	static	32	816	/run/current-system/sw/bin/time -f %M

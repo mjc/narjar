@@ -1,0 +1,11 @@
+[package]
+name = "narj87-gix-loose"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+gix-hash = { version = "=0.26.2", default-features = false, features = ["sha1", "sha256"] }
+gix-object = { version = "=0.64.1", default-features = false, features = ["sha1", "sha256"] }
+gix-odb = { version = "=0.84.0", default-features = false, features = ["sha1", "sha256"] }
+tempfile = "=3.27.0"

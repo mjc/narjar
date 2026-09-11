@@ -1,0 +1,30 @@
+Measurement commit: eb3adc0d22d8267324db614edf927d03f17750fe
+Host: tina; Linux 7.2.2 x86_64; nix 2.31.5; rustc/cargo 1.98.1
+
+Native compilation and checks:
+nix develop -c cargo check --manifest-path /tmp/narj87-gix-cost/{loose,packed-read,pack-write,high-level}/Cargo.toml --locked
+nix develop -c cargo build --manifest-path /tmp/narj87-gix-cost/<variant>/Cargo.toml --locked --release
+nix develop -c cargo clean --manifest-path /tmp/narj87-gix-cost/<variant>/Cargo.toml
+nix develop -c cargo build --manifest-path /tmp/narj87-gix-cost/<variant>/Cargo.toml --locked --release
+
+Rust 1.85 compatibility:
+nix shell --impure --expr 'let repo = builtins.getFlake "/home/mjc/projects/narjar"; pkgs = import repo.inputs.nixpkgs { system = "x86_64-linux"; overlays = [ (import repo.inputs.rust-overlay) ]; }; in pkgs.rust-bin.stable."1.85.1".default' -c cargo check --manifest-path /tmp/narj87-gix-cost/<variant>/Cargo.toml --locked
+
+Static-musl build:
+nix build --impure --no-link --print-out-paths --expr '(import /tmp/narj87-gix-cost/static.nix { variant = "<variant>"; })'
+nix path-info -s -S /nix/store/<result>
+
+Dependency graph and advisories:
+nix develop -c cargo metadata --manifest-path /tmp/narj87-gix-cost/<variant>/Cargo.toml --locked --format-version=1
+nix develop -c cargo tree --manifest-path /tmp/narj87-gix-cost/<variant>/Cargo.toml --locked
+nix shell nixpkgs#cargo-audit -c cargo audit --json --file /tmp/narj87-gix-cost/<variant>/Cargo.lock
+
+Binary, startup, and RSS measurements:
+size -A <binary>
+hyperfine --warmup 3 --runs 15 --export-json benchmarks/results/2026-09-11-narj87-gix-cost/startup/<variant>-native.json <binary>
+GIX_PROBE_HOLD_MS=2500 GIX_PROBE_READERS=<1-or-32> /run/current-system/sw/bin/time -f %M -o /tmp/narj87-gix-cost/rss-hwm <binary>
+
+Probe corrections recorded during the run:
+- The high-level facade initially failed without a hash feature; it was corrected to default-features=false with basic, sha1, and sha256.
+- A first static expression using pkgsStatic for Crane produced cross-toolchain build-script SIGSEGVs; static.nix was corrected to use normal pkgs plus the musl target and static C compiler, matching Narjar's flake.
+- No baseline startup JSON is retained: narjar --help returned exit 2 in the attempted hyperfine invocation, so startup figures are candidate-only.

@@ -1,0 +1,6 @@
+variant	clean_release_seconds	warm_release_seconds	method
+baseline-cargo-native	3.536	0.038	cargo build --manifest-path Cargo.toml --locked --release with isolated CARGO_TARGET_DIR
+loose	7.897	0.064	cargo build --manifest-path --locked --release after cargo clean
+packed-read	1.765	0.711	cargo build --manifest-path --locked --release after cargo clean
+pack-write	4.891	0.053	cargo build --manifest-path --locked --release after cargo clean
+high-level	11.544	0.082	cargo build --manifest-path --locked --release after cargo clean

@@ -1,0 +1,6 @@
+variant	unsafe_package_instances	unsafe_source_tokens	license_unknown_packages	interpretation
+baseline	32	22612	0	lexical source-token inventory, not semantic unsafe analysis
+loose	67	26578	0	lexical source-token inventory, not semantic unsafe analysis
+packed-read	67	26578	0	lexical source-token inventory, not semantic unsafe analysis
+pack-write	70	26584	0	lexical source-token inventory, not semantic unsafe analysis
+high-level	93	28293	0	lexical source-token inventory, not semantic unsafe analysis

@@ -1,0 +1,7 @@
+variant	path	package_nar_bytes	closure_bytes	closure_paths	binaries_in_package
+baseline-narjar-native	/nix/store/vwg72qpqixkqxkcvqm8np02lprlkw0vp-narjar-0.1.0	4415608	47428680	7	5
+baseline-narjar-static	/nix/store/aa8fcrwf41c6k6kg5jgmncyqj1f9pkhn-narjar-0.1.0	4848432	4848432	1	5
+loose-static	/nix/store/7myz7j716nni8rgksp8wxbk4m30vipdj-narj87-gix-loose-static-0.1.0	990656	990656	1	1
+packed-read-static	/nix/store/5mayk4zb20m12r6a6qh3ymg0hachbg63-narj87-gix-packed-read-static-0.1.0	1001256	1001256	1	1
+pack-write-static	/nix/store/rv0bqnfg23ph3wj0pxwjwkafplqk8saw-narj87-gix-pack-write-static-0.1.0	1420792	1420792	1	1
+high-level-static	/nix/store/hhayz0y7zanlzi5lg6zh68msgkv3y607-narj87-gix-high-level-static-0.1.0	2135560	2135560	1	1
