@@ -340,6 +340,7 @@
           '';
           runtime-smoke = env.pkgs.runCommand "narjar-runtime-smoke" { } ''
             mkdir data
+            ${env.narjar}/bin/narjar init --data-dir "$PWD/data"
             ${env.narjar}/bin/narjar serve \
               --data-dir "$PWD/data" \
               --listen 127.0.0.1:0 \
