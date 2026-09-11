@@ -61,6 +61,24 @@ complete raw NAR length and SHA-256 plus structural counts. The decoder hashes
 and counts the original stream while emitting bounded file chunks; it does not
 materialize file contents.
 
+## Candidate-neutral tree sharing report
+
+Build `nar-tree-report` to derive domain-separated semantic tree identities
+from the same streaming events:
+
+```sh
+cargo build --release --bin nar-tree-report
+target/release/nar-tree-report \
+  --input-list /path/to/nars.txt \
+  --output /tmp/tree-report.tsv
+```
+
+The report emits one `N` row per NAR, a global `G` reconciliation row, and `T`
+rows for unique tree identities. It counts only tree preimage bytes; file and
+symlink payload bytes are intentionally excluded. The NARJ-82 full-corpus
+result is retained at
+[`benchmarks/results/2026-09-11-narj82-tree-sharing/report.md`](../benchmarks/results/2026-09-11-narj82-tree-sharing/report.md).
+
 ## Exact reuse report
 
 Run the corpus report after building `nar-scan`:

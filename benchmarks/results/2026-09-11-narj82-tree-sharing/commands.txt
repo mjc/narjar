@@ -1,0 +1,11 @@
+# Corpus preflight
+jq -r '.entries[].artifact' benchmarks/corpus-manifest.json > WORK/paths
+test $(wc -l < WORK/paths) -eq 7080
+test $(while IFS= read -r path; do test -f "$path" || printf '%s\n' "$path"; done < WORK/paths | wc -l) -eq 0
+
+# Build and scan (WORK is a temporary directory outside the repository)
+env RUSTC_WRAPPER= cargo build --release --bin nar-tree-report
+target/release/nar-tree-report --input-list WORK/paths --output WORK/report.tsv
+
+# Report extraction
+awk -F '\t' '$1 == "G" { print }' WORK/report.tsv
