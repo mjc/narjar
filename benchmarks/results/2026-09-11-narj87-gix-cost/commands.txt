@@ -9,6 +9,7 @@ nix develop -c cargo build --manifest-path /tmp/narj87-gix-cost/<variant>/Cargo.
 
 Rust 1.85 compatibility:
 nix shell --impure --expr 'let repo = builtins.getFlake "/home/mjc/projects/narjar"; pkgs = import repo.inputs.nixpkgs { system = "x86_64-linux"; overlays = [ (import repo.inputs.rust-overlay) ]; }; in pkgs.rust-bin.stable."1.85.1".default' -c cargo check --manifest-path /tmp/narj87-gix-cost/<variant>/Cargo.toml --locked
+nix shell --impure --expr 'let repo = builtins.getFlake "/home/mjc/projects/narjar"; pkgs = import repo.inputs.nixpkgs { system = "x86_64-linux"; overlays = [ (import repo.inputs.rust-overlay) ]; }; in pkgs.rust-bin.stable."1.85.1".default.override { targets = [ "x86_64-apple-darwin" ]; }' -c cargo check --manifest-path /tmp/narj87-gix-cost/<variant>/Cargo.toml --target x86_64-apple-darwin --locked
 
 Static-musl build:
 nix build --impure --no-link --print-out-paths --expr '(import /tmp/narj87-gix-cost/static.nix { variant = "<variant>"; })'

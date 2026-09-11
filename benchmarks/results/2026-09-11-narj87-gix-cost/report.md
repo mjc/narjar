@@ -27,7 +27,7 @@ All sizes are bytes unless noted. Candidate binaries are one-binary probes; the 
 
 The full machine-readable tables are next to this report. Static-musl builds succeeded for every candidate and produced single-path closures. `cargo audit` returned zero vulnerabilities, warnings, or informational findings for the baseline and all candidates. Release binaries contained zero debug bytes.
 
-Every candidate also passed `cargo check --locked` under Rust 1.85.1. The build-time figures were collected sequentially on the measurement host with its configured compiler cache; they are comparative observations for this run, not clean-machine forecasts.
+Every candidate passed `cargo check --locked` under Rust 1.85.1 on Linux and for the `x86_64-apple-darwin` target. The build-time figures were collected sequentially on the measurement host with its configured compiler cache; they are comparative observations for this run, not clean-machine forecasts.
 
 The loose candidate is the smallest gix graph tested, but still resolves 96 packages versus the current graph's 47. Adding packed reads did not enlarge the resolved graph in this feature configuration and added about 10 KiB to the static binary. Pack writing added about 420 KiB over loose. The high-level facade added about 1.15 MiB over loose, 50 more resolved packages, and the highest lexical unsafe-token inventory.
 

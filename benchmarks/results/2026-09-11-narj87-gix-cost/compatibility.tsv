@@ -1,6 +1,6 @@
-variant	rust_1_85_cargo_check	static_musl_build	cargo_audit
-baseline	pass	n/a	pass: 0 vulnerabilities, 0 warnings, 0 informational
-loose	pass	pass	pass: 0 vulnerabilities, 0 warnings, 0 informational
-packed-read	pass	pass	pass: 0 vulnerabilities, 0 warnings, 0 informational
-pack-write	pass	pass	pass: 0 vulnerabilities, 0 warnings, 0 informational
-high-level	pass	pass	pass: 0 vulnerabilities, 0 warnings, 0 informational
+variant	rust_1_85_cargo_check	darwin_check	static_musl_build	cargo_audit
+baseline	pass	n/a	n/a	pass: 0 vulnerabilities, 0 warnings, 0 informational
+loose	pass	pass	pass	pass: 0 vulnerabilities, 0 warnings, 0 informational
+packed-read	pass	pass	pass	pass: 0 vulnerabilities, 0 warnings, 0 informational
+pack-write	pass	pass	pass	pass: 0 vulnerabilities, 0 warnings, 0 informational
+high-level	pass	pass	pass	pass: 0 vulnerabilities, 0 warnings, 0 informational
