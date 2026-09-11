@@ -1,0 +1,11 @@
+# operation	size_bytes	readers	result	peak_vm_hwm_kib	notes
+loose-write-read	1	1	pass		independent OID matched
+loose-write-read	65536	1	pass		independent OID matched
+loose-write-read	8388608	1	pass		independent OID matched
+loose-write	1073741824	0	pass	10708	generated reader; independent OID matched
+loose-read	8388608	1	pass		independent OID matched
+loose-read	8388608	8	pass		independent OID matched
+loose-read	8388608	32	pass	261640	caller-owned full output Vec per reader
+loose-read-limit	5	1	rejected		alloc_limit_bytes=4
+hash-short-stream	6	1	rejected		reader supplied 5 bytes
+hash-long-stream	5	1	accepted-with-surplus		reader supplied 6 bytes; 1 byte remained
