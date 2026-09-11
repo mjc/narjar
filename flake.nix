@@ -267,6 +267,7 @@
             env.pkgs.inferno
             env.pkgs.cargo-flamegraph
             env.pkgs.heaptrack
+            env.pkgs.wrk
           ];
         };
       }) systems;

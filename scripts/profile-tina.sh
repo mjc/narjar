@@ -50,7 +50,7 @@ while (($#)); do
   esac
 done
 
-for command in cargo curl heaptrack heaptrack_print inferno-collapse-perf inferno-flamegraph nix nix-store perf setsid; do
+for command in cargo curl heaptrack heaptrack_print inferno-collapse-perf inferno-flamegraph nix nix-store perf setsid wrk; do
   command -v "$command" >/dev/null || {
     echo "missing '$command'; run this inside 'nix develop'" >&2
     exit 1
@@ -101,7 +101,6 @@ READ_NAR_BYTES=""
 SERVER_PID=""
 PERF_PID=""
 HEAPTRACK_PID=""
-WORKLOAD_PIDS=()
 
 cleanup() {
   local status=$?
@@ -115,9 +114,6 @@ cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill -TERM "$SERVER_PID" 2>/dev/null || true
   fi
-  for pid in "${WORKLOAD_PIDS[@]}"; do
-    kill "$pid" 2>/dev/null || true
-  done
   if [[ -n "$HOT_DATA" && "$HOT_DATA" == /dev/shm/narjar-profile-data.* ]]; then
     rm -rf -- "$HOT_DATA"
   fi
@@ -217,7 +213,7 @@ start_server() {
   "$BIN" serve \
     --data-dir "$DATA" \
     --listen "127.0.0.1:$PORT" \
-    --workers 1 \
+    --workers 32 \
     --max-in-flight 64 \
     --max-nar-bytes "$MAX_NAR_BYTES" \
     --min-free-bytes 0 \
@@ -368,37 +364,9 @@ prepare_hot_dataset() {
 }
 
 run_read_workload() {
-  local end=$((SECONDS + PROFILE_SECONDS))
-  local reader
-
-  for _ in {1..4}; do
-    (
-      while ((SECONDS < end)); do
-        curl --fail --silent --show-error --no-compressed \
-          --max-time 15 -H 'Accept-Encoding: identity' "$NAR_ENDPOINT" >/dev/null || true
-      done
-    ) &
-    WORKLOAD_PIDS+=("$!")
-  done
-
-  for _ in {1..8}; do
-    (
-      while ((SECONDS < end)); do
-        curl --fail --silent --show-error --no-compressed \
-          --max-time 5 -H 'Accept-Encoding: identity' -H 'Range: bytes=0-1048575' \
-          "$NAR_ENDPOINT" >/dev/null || true
-        curl --fail --silent --show-error --no-compressed \
-          --max-time 5 -H 'Accept-Encoding: identity' -H 'Range: bytes=-1048576' \
-          "$NAR_ENDPOINT" >/dev/null || true
-      done
-    ) &
-    WORKLOAD_PIDS+=("$!")
-  done
-
-  for reader in "${WORKLOAD_PIDS[@]}"; do
-    wait "$reader" 2>/dev/null || true
-  done
-  WORKLOAD_PIDS=()
+  echo "wrk: one thread, one persistent connection, full NAR body"
+  wrk --threads 1 --connections 1 --duration "${PROFILE_SECONDS}s" --latency \
+    --timeout 15s -H 'Accept-Encoding: identity' "$NAR_ENDPOINT"
 }
 
 if [[ -n "$REUSE_DATA" ]]; then
@@ -443,7 +411,7 @@ perf script -i "$OUTPUT/perf.data" 2> "$OUTPUT/perf-script.log" \
   | tee "$OUTPUT/perf.script" \
   | inferno-collapse-perf \
   | tee "$OUTPUT/perf.folded" \
-  | inferno-flamegraph --title "narjar system-store push" \
+  | inferno-flamegraph --title "narjar hot NAR delivery" \
   > "$OUTPUT/flamegraph.svg"
 
 echo "capturing heaptrack profile with sustained reads"
