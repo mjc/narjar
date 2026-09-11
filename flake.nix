@@ -259,6 +259,7 @@
             env.toolchain
             env.pkgs.git
             env.pkgs.nix
+            env.pkgs.jq
             env.pkgs.direnv
             env.pkgs.nix-direnv
           ]

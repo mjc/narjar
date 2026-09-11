@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf -- "$WORK_DIR"' EXIT
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/nix-corpus collect --spec FILE --manifest FILE [--export-dir DIR] [--build]
+  scripts/nix-corpus validate --manifest FILE [--artifact-root DIR] [--store] [--rebuild]
+
+Collect and validate reproducible corpora of uncompressed Nix NARs.
+Requires nix, nix-store, jq, and standard Unix utilities.
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" > /dev/null || die "required command is not installed: $1"
+}
+
+log_command() {
+  printf '$' >&2
+  printf ' %q' "$@" >&2
+  printf '\n' >&2
+}
+
+run_capture() {
+  log_command "$@"
+  "$@"
+}
+
+sri_file() {
+  run_capture nix hash file --type sha256 --sri "$1"
+}
+
+manifest_issues() {
+  jq -r '
+    def string_list:
+      type == "array" and length > 0 and all(.[]; type == "string");
+    def derivation_list:
+      type == "array" and all(.[]; type == "string");
+    def coverage($entries):
+      ($entries | map(.nar_size) | sort) as $sizes |
+      {
+        entry_count: ($entries | length),
+        logical_bytes: ($entries | map(.nar_size) | add),
+        generations: ($entries | map(.generations[]) | unique | sort),
+        nixpkgs_revisions: ($entries | map(.nixpkgs_revisions[]) | unique | sort),
+        machines: ($entries | map(.machines[]) | unique | sort),
+        families: ($entries | map(.families[]) | unique | sort),
+        size_quantiles: {
+          p50: $sizes[(($sizes | length) - 1) * 50 / 100 | floor],
+          p90: $sizes[(($sizes | length) - 1) * 90 / 100 | floor],
+          p99: $sizes[(($sizes | length) - 1) * 99 / 100 | floor]
+        }
+      };
+    . as $root |
+    def object_entries:
+      [$root.entries[] | select(type == "object")];
+    if .schema_version != 1 then "schema_version must be 1" else empty end,
+    if (.entries | type) != "array" or (.entries | length) == 0 then
+      "entries must be a non-empty list"
+    else
+      (.entries | to_entries[] | select(.value | type != "object") |
+        "entries[\(.key)] must be an object"),
+      (.entries | to_entries[] | select(.value | type == "object") |
+        .key as $index | .value as $entry |
+        (["path", "nar_hash", "nar_size", "artifact_sha256", "targets", "machines", "families", "generations", "nixpkgs_revisions", "flake_refs", "derivations"] - ($entry | keys))[] |
+        "entries[\($index)] missing: \(.)"),
+      (.entries | to_entries[] | select(.value | type == "object") |
+        .key as $index | .value as $entry |
+        if ($entry.path | type != "string" or startswith("/nix/store/") | not) then "entries[\($index)] has invalid path" else empty end,
+        if ($entry.nar_size | type != "number" or . < 0 or floor != .) then "entries[\($index)] has invalid nar_size" else empty end,
+        if ($entry.nar_hash | type != "string" or startswith("sha256-") | not) then "entries[\($index)] has invalid nar_hash" else empty end,
+        if ($entry.artifact_sha256 != null and (($entry.artifact_sha256 | type) != "string" or ($entry.artifact_sha256 | length) != 64)) then "entries[\($index)] has invalid artifact_sha256" else empty end,
+        ("targets", "machines", "families", "generations", "nixpkgs_revisions", "flake_refs") as $field |
+        if ($entry[$field] | string_list | not) then "entries[\($index)] has invalid \($field)" else empty end,
+        if ($entry.derivations | derivation_list | not) then "entries[\($index)] has invalid derivations" else empty end),
+      ([object_entries[] | select(.path | type == "string" and startswith("/nix/store/")) | .path] | group_by(.)[] | select(length > 1) | "duplicate path: \(.[0])"),
+      if (.subsets | type) != "object" then
+        "subsets must be an object"
+      else
+        (.subsets | to_entries[] |
+          .key as $name | .value as $subset |
+          if ($subset | type != "object" or ($subset.entries | type) != "array") then
+            "subset \($name) must contain an entries list"
+          else
+            ($subset.entries - [object_entries[] | .path]) as $missing |
+            if ($missing | length) > 0 then "subset \($name) references unknown paths: \($missing | sort)" else empty end
+          end)
+      end,
+      (object_entries) as $valid_entries |
+      if ($valid_entries | length) > 0 and ($valid_entries | all(.[]; (.generations | string_list) and (.nixpkgs_revisions | string_list) and (.machines | string_list) and (.families | string_list) and (.nar_size | type == "number"))) then
+        (.requirements // {}) as $requirements |
+        if ($requirements | type) == "object" then
+          ($valid_entries | map(.generations[]) | unique) as $generations |
+          ($valid_entries | map(.nixpkgs_revisions[]) | unique) as $revisions |
+          ($valid_entries | map(.families[]) | unique) as $families |
+          if ($requirements.min_generations | type) == "number" and ($generations | length) < $requirements.min_generations then "coverage has \($generations | length) generations, requires \($requirements.min_generations)" else empty end,
+          if ($requirements.min_nixpkgs_revisions | type) == "number" and ($revisions | length) < $requirements.min_nixpkgs_revisions then "coverage has \($revisions | length) nixpkgs revisions, requires \($requirements.min_nixpkgs_revisions)" else empty end,
+          ($requirements.required_families // [])[] as $family |
+          if ($families | index($family)) == null then "coverage is missing family: \($family)" else empty end
+        else empty end,
+        if .coverage != null and .coverage != coverage($valid_entries) then "coverage does not match entries" else empty end
+      else empty end
+    end
+  ' "$1"
+}
+
+artifact_path() {
+  local entry=$1 artifact_root=$2 artifact
+  artifact=$(jq -r '.artifact // empty' <<< "$entry")
+  [[ -n "$artifact" ]] || return 0
+  if [[ -f "$artifact" || -z "$artifact_root" ]]; then
+    printf '%s\n' "$artifact"
+  else
+    printf '%s/%s\n' "$artifact_root" "$(basename -- "$artifact")"
+  fi
+}
+
+validate_artifacts() {
+  local manifest=$1 artifact_root=$2 entry artifact expected_sha expected_size expected_hash actual_sha actual_size actual_hash
+  while IFS= read -r entry; do
+    artifact=$(artifact_path "$entry" "$artifact_root")
+    [[ -n "$artifact" ]] || continue
+    if [[ ! -f "$artifact" ]]; then
+      printf 'missing artifact: %s\n' "$artifact"
+      continue
+    fi
+    expected_sha=$(jq -r '.artifact_sha256 // empty' <<< "$entry")
+    expected_size=$(jq -r '.nar_size' <<< "$entry")
+    expected_hash=$(jq -r '.nar_hash' <<< "$entry")
+    actual_sha=$(sha256sum "$artifact" | cut -d ' ' -f 1)
+    actual_size=$(wc -c < "$artifact" | tr -d '[:space:]')
+    if [[ -n "$expected_sha" && "$actual_sha" != "$expected_sha" ]]; then
+      printf 'artifact hash mismatch: %s\n' "$artifact"
+      continue
+    fi
+    actual_hash=$(sri_file "$artifact")
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+      printf 'NAR hash mismatch: %s\n' "$artifact"
+    fi
+    if [[ "$actual_size" != "$expected_size" ]]; then
+      printf 'artifact size mismatch: %s\n' "$artifact"
+    fi
+  done < <(jq -c '.entries[]? | select(type == "object")' "$manifest")
+}
+
+dump_nar() {
+  local store_path=$1 destination=$2
+  log_command nix-store --dump "$store_path"
+  nix-store --dump "$store_path" > "$destination"
+}
+
+validate_store() {
+  local manifest=$1 entry store_path expected_size expected_hash expected_sha temporary actual_size actual_hash actual_sha
+  while IFS= read -r entry; do
+    store_path=$(jq -r '.path' <<< "$entry")
+    expected_size=$(jq -r '.nar_size' <<< "$entry")
+    expected_hash=$(jq -r '.nar_hash' <<< "$entry")
+    expected_sha=$(jq -r '.artifact_sha256 // empty' <<< "$entry")
+    temporary=$(mktemp "$WORK_DIR/store-nar.XXXXXX")
+    dump_nar "$store_path" "$temporary"
+    actual_size=$(wc -c < "$temporary" | tr -d '[:space:]')
+    actual_hash=$(sri_file "$temporary")
+    actual_sha=$(sha256sum "$temporary" | cut -d ' ' -f 1)
+    if [[ "$actual_size" != "$expected_size" || "$actual_hash" != "$expected_hash" || (-n "$expected_sha" && "$actual_sha" != "$expected_sha") ]]; then
+      printf 'store bytes differ for %s\n' "$store_path"
+    fi
+  done < <(jq -c '.entries[]? | select(type == "object")' "$manifest")
+}
+
+build_command() {
+  local target=$1 flake_ref attribute name reference
+  flake_ref=$(jq -er '.flake_ref | strings' <<< "$target") || die "target has invalid flake_ref"
+  attribute=$(jq -er '.flake_attr | strings' <<< "$target") || die "target has no flake_attr for rebuilding"
+  BUILD_COMMAND=(nix build --no-link --print-out-paths)
+  while IFS=$'\t' read -r name reference; do
+    BUILD_COMMAND+=(--override-input "$name" "$reference")
+  done < <(jq -er '
+    (.input_overrides // {}) as $overrides |
+    if ($overrides | type) != "object" or ($overrides | all(to_entries[]; (.key | type == "string") and (.value | type == "string")) | not) then error("invalid input_overrides") else $overrides end |
+    to_entries | sort_by(.key)[] | [.key, .value] | @tsv
+  ' <<< "$target") || die "target has invalid input_overrides"
+  BUILD_COMMAND+=("$flake_ref#$attribute")
+}
+
+resolve_root() {
+  local target=$1 force_build=$2 root output roots
+  root=$(jq -r '.root // empty' <<< "$target")
+  if [[ "$force_build" == true || -z "$root" ]]; then
+    build_command "$target"
+    output=$(run_capture "${BUILD_COMMAND[@]}")
+    mapfile -t roots < <(printf '%s\n' "$output" | sed '/^$/d')
+    [[ ${#roots[@]} -eq 1 ]] || die "flake target $(jq -r '.id // "<unknown>"' <<< "$target") returned ${#roots[@]} paths"
+    root=${roots[0]}
+  fi
+  realpath "$root"
+}
+
+validate_rebuilds() {
+  local manifest=$1 target expected_root resolved_root target_id
+  while IFS= read -r target; do
+    target_id=$(jq -r '.id // "<unknown>"' <<< "$target")
+    if ! resolved_root=$(resolve_root "$target" true); then
+      printf 'failed to rebuild target: %s\n' "$target_id"
+      continue
+    fi
+    expected_root=$(jq -r '.resolved_root // empty' <<< "$target")
+    if [[ -n "$expected_root" && "$resolved_root" != "$expected_root" ]]; then
+      printf 'rebuilt root differs for %s: %s != %s\n' "$target_id" "$resolved_root" "$expected_root"
+    fi
+  done < <(jq -c '.targets[]? | select(type == "object")' "$manifest")
+}
+
+validate() {
+  local manifest=$1 artifact_root=$2 check_store=$3 rebuild=$4 issues
+  [[ -f "$manifest" ]] || die "manifest does not exist: $manifest"
+  issues="$WORK_DIR/issues.txt"
+  manifest_issues "$manifest" > "$issues"
+  validate_artifacts "$manifest" "$artifact_root" >> "$issues"
+  if [[ "$check_store" == true ]]; then
+    validate_store "$manifest" >> "$issues"
+  fi
+  if [[ "$rebuild" == true ]]; then
+    validate_rebuilds "$manifest" >> "$issues"
+  fi
+  if [[ -s "$issues" ]]; then
+    echo "error: manifest validation failed:" >&2
+    sed 's/^/  /' "$issues" >&2
+    return 1
+  fi
+  printf 'validated %s: %s unique paths\n' "$manifest" "$(jq '.entries | length' "$manifest")"
+}
+
+collect() {
+  local spec= manifest= export_dir= build=false target id root closure metadata paths_json entries targets manifest_tmp
+  while (($#)); do
+    case "$1" in
+      --spec) spec=${2:-}; shift 2 ;;
+      --manifest) manifest=${2:-}; shift 2 ;;
+      --export-dir) export_dir=${2:-}; shift 2 ;;
+      --build) build=true; shift ;;
+      -h|--help) usage; return ;;
+      *) die "unknown collect option: $1" ;;
+    esac
+  done
+  [[ -n "$spec" ]] || die "collect requires --spec"
+  [[ -n "$manifest" ]] || die "collect requires --manifest"
+  [[ -f "$spec" ]] || die "spec does not exist: $spec"
+  jq -e '
+    .schema_version == 1
+    and (.targets | type == "array" and length > 0)
+    and all(.targets[]; type == "object"
+      and (.id | type == "string")
+      and has("generation")
+      and (.nixpkgs_revision | type == "string")
+      and (.flake_ref | type == "string")
+      and (.machine | type == "string")
+      and (.families | type == "array" and length > 0 and all(.[]; type == "string"))
+      and (.subset | type == "string")
+      and ((.root | type == "string") or (.flake_attr | type == "string")))
+    and ([.targets[].id] | unique | length == length)
+  ' "$spec" > /dev/null || die "spec must have schema_version 1 and unique, complete targets"
+  if [[ -n "$export_dir" ]]; then
+    mkdir -p "$export_dir"
+  fi
+
+  entries="$WORK_DIR/entries.jsonl"
+  targets="$WORK_DIR/targets.jsonl"
+  : > "$entries"
+  : > "$targets"
+  local -a target_list=()
+  mapfile -t target_list < <(jq -c '.targets[]' "$spec")
+  for target in "${target_list[@]}"; do
+    id=$(jq -r '.id' <<< "$target")
+    root=$(resolve_root "$target" "$build")
+    jq -c --arg resolved_root "$root" '. + {resolved_root: $resolved_root}' <<< "$target" >> "$targets"
+    closure="$WORK_DIR/closure-${id//[^[:alnum:]]/_}.txt"
+    log_command nix-store --query --requisites "$root"
+    { nix-store --query --requisites "$root"; printf '%s\n' "$root"; } | sort -u > "$closure"
+    metadata="$WORK_DIR/metadata-${id//[^[:alnum:]]/_}.jsonl"
+    : > "$metadata"
+    local -a closure_paths=()
+    mapfile -t closure_paths < "$closure"
+    local start=0 batch_file
+    while ((start < ${#closure_paths[@]})); do
+      local -a batch=("${closure_paths[@]:start:128}")
+      batch_file="$WORK_DIR/path-info-${id//[^[:alnum:]]/_}-${start}.json"
+      log_command nix path-info --json "${batch[@]}"
+      nix path-info --json "${batch[@]}" > "$batch_file"
+      jq -ce '
+        if type == "array" then .[]
+        elif type == "object" and has("path") then .
+        elif type == "object" then to_entries[] | .value + {path: .key}
+        else error("nix path-info returned an invalid record")
+        end |
+        select(.path | type == "string")
+      ' "$batch_file" >> "$metadata"
+      ((start += 128))
+    done
+    paths_json=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$closure")
+    jq -s --argjson target "$target" --argjson paths "$paths_json" '
+      (reduce .[] as $info ({}; .[$info.path] = $info)) as $metadata |
+      $paths[] as $path |
+      ($metadata[$path]) as $info |
+      if $info == null then error("nix path-info omitted closure member: \($path)")
+      elif ($info.narHash | type) != "string" or ($info.narSize | type) != "number" then error("missing narHash/narSize for \($path)")
+      else {
+        path: $path,
+        nar_hash: $info.narHash,
+        nar_size: $info.narSize,
+        artifact_sha256: null,
+        artifact: null,
+        targets: [$target.id],
+        machines: [$target.machine],
+        families: $target.families,
+        generations: [($target.generation | tostring)],
+        nixpkgs_revisions: [$target.nixpkgs_revision],
+        flake_refs: [$target.flake_ref],
+        derivations: (if ($info.deriver | type) == "string" then [$info.deriver] else [] end),
+        subsets: [$target.subset]
+      }
+      end
+    ' "$metadata" >> "$entries"
+  done
+
+  jq -s '
+    sort_by(.path) | group_by(.path) |
+    map(
+      . as $group | $group[0] as $first |
+      reduce $group[] as $entry ($first;
+        .targets = ((.targets + $entry.targets) | unique | sort) |
+        .machines = ((.machines + $entry.machines) | unique | sort) |
+        .families = ((.families + $entry.families) | unique | sort) |
+        .generations = ((.generations + $entry.generations) | unique | sort) |
+        .nixpkgs_revisions = ((.nixpkgs_revisions + $entry.nixpkgs_revisions) | unique | sort) |
+        .flake_refs = ((.flake_refs + $entry.flake_refs) | unique | sort) |
+        .derivations = ((.derivations + $entry.derivations) | unique | sort) |
+        .subsets = ((.subsets + $entry.subsets) | unique | sort)
+      )
+    )
+  ' "$entries" > "$WORK_DIR/entries.json"
+  entries="$WORK_DIR/entries.json"
+
+  if [[ -n "$export_dir" ]]; then
+    local artifacts="$WORK_DIR/artifacts.jsonl" entry path nar_size nar_hash destination temporary actual_size actual_hash actual_sha
+    : > "$artifacts"
+    while IFS= read -r entry; do
+      path=$(jq -r '.path' <<< "$entry")
+      nar_size=$(jq -r '.nar_size' <<< "$entry")
+      nar_hash=$(jq -r '.nar_hash' <<< "$entry")
+      destination="$export_dir/$(basename -- "$path").nar"
+      temporary="$destination.tmp"
+      dump_nar "$path" "$temporary"
+      actual_size=$(wc -c < "$temporary" | tr -d '[:space:]')
+      actual_hash=$(sri_file "$temporary")
+      actual_sha=$(sha256sum "$temporary" | cut -d ' ' -f 1)
+      [[ "$actual_size" == "$nar_size" ]] || die "NAR size changed while exporting $path: $actual_size != $nar_size"
+      [[ "$actual_hash" == "$nar_hash" ]] || die "NAR hash changed while exporting $path"
+      mv -f -- "$temporary" "$destination"
+      jq -n --arg path "$path" --arg artifact "$destination" --arg artifact_sha256 "$actual_sha" \
+        '{path: $path, artifact: $artifact, artifact_sha256: $artifact_sha256}' >> "$artifacts"
+    done < <(jq -c '.[]' "$entries")
+    jq -s '
+      .[0] as $entries |
+      (.[1:] | INDEX(.path)) as $artifacts |
+      $entries | map(. + $artifacts[.path])
+    ' "$entries" "$artifacts" > "$WORK_DIR/entries-with-artifacts.json"
+    entries="$WORK_DIR/entries-with-artifacts.json"
+  fi
+
+  mkdir -p "$(dirname -- "$manifest")"
+  manifest_tmp="$WORK_DIR/manifest.json"
+  jq -n --slurpfile spec "$spec" --slurpfile targets "$targets" --slurpfile entries "$entries" '
+    def coverage($entries):
+      ($entries | map(.nar_size) | sort) as $sizes |
+      {
+        entry_count: ($entries | length),
+        logical_bytes: ($entries | map(.nar_size) | add),
+        generations: ($entries | map(.generations[]) | unique | sort),
+        nixpkgs_revisions: ($entries | map(.nixpkgs_revisions[]) | unique | sort),
+        machines: ($entries | map(.machines[]) | unique | sort),
+        families: ($entries | map(.families[]) | unique | sort),
+        size_quantiles: {
+          p50: $sizes[(($sizes | length) - 1) * 50 / 100 | floor],
+          p90: $sizes[(($sizes | length) - 1) * 90 / 100 | floor],
+          p99: $sizes[(($sizes | length) - 1) * 99 / 100 | floor]
+        }
+      };
+    $spec[0] as $spec |
+    $targets as $targets |
+    $entries[0] as $entries |
+    (reduce $entries[] as $entry ({};
+      reduce $entry.subsets[] as $name (.;
+        .[$name] = {
+          weight: ($spec.subsets[$name].weight // 1),
+          entries: ((.[$name].entries // []) + [$entry.path])
+        }
+      )
+    ) | with_entries(.value.entries |= sort)) as $subsets |
+    {
+      schema_version: 1,
+      corpus_id: ($spec.corpus_id // "narjar-real-nix"),
+      source: ($spec.source // {}),
+      requirements: ($spec.requirements // {}),
+      targets: $targets,
+      coverage: coverage($entries),
+      subsets: $subsets,
+      entries: ($entries | map(del(.subsets)))
+    }
+  ' > "$manifest_tmp"
+  validate "$manifest_tmp" "$export_dir" false false
+  mv -f -- "$manifest_tmp" "$manifest"
+  printf 'wrote %s: %s unique paths\n' "$manifest" "$(jq '. | length' "$entries")"
+}
+
+main() {
+  local command=${1:-}
+  [[ -n "$command" ]] || { usage >&2; exit 2; }
+  shift
+  for tool in nix nix-store jq sha256sum realpath sort; do
+    require_command "$tool"
+  done
+  case "$command" in
+    validate)
+      local manifest= artifact_root= check_store=false rebuild=false
+      while (($#)); do
+        case "$1" in
+          --manifest) manifest=${2:-}; shift 2 ;;
+          --artifact-root) artifact_root=${2:-}; shift 2 ;;
+          --store) check_store=true; shift ;;
+          --rebuild) rebuild=true; shift ;;
+          -h|--help) usage; return ;;
+          *) die "unknown validate option: $1" ;;
+        esac
+      done
+      [[ -n "$manifest" ]] || die "validate requires --manifest"
+      validate "$manifest" "$artifact_root" "$check_store" "$rebuild"
+      ;;
+    collect)
+      collect "$@"
+      ;;
+    -h|--help) usage ;;
+    *) die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"
