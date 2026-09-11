@@ -95,6 +95,11 @@ fn try_dispatch(
     }
 }
 
+fn configure_socket_timeouts(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
+}
+
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     if !fs::symlink_metadata(&config.data_dir)
         .map(|metadata| metadata.is_dir())
@@ -162,7 +167,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
 
     println!(
-        "listening http://{} workers={} max_in_flight={} max_nar_bytes={} min_free_bytes={} shutdown_grace_seconds={}",
+        "listening http://{} workers={} max_in_flight={} max_nar_bytes={} min_free_bytes={} shutdown_grace_seconds={} io_timeout_seconds={}",
         listener
             .local_addr()
             .map_err(|error| Error::runtime(format!("cannot inspect listener: {error}")))?,
@@ -170,7 +175,8 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         config.max_in_flight,
         config.max_nar_bytes,
         config.min_free_bytes,
-        config.shutdown_grace_seconds
+        config.shutdown_grace_seconds,
+        config.io_timeout_seconds
     );
     io::stdout()
         .flush()
@@ -277,6 +283,13 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                     drop(stream);
                     break;
                 }
+                configure_socket_timeouts(
+                    &stream,
+                    Duration::from_secs(config.io_timeout_seconds.get()),
+                )
+                .map_err(|error| {
+                    Error::runtime(format!("cannot configure socket timeouts: {error}"))
+                })?;
                 if let Some(mut stream) = try_dispatch(&sender, &admissions, stream) {
                     let _ = write_status(&mut stream, StatusCode(429));
                 }
@@ -405,11 +418,17 @@ fn path_exists(path: &Path) -> Result<bool, Error> {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::Write,
+        net::TcpListener,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::Arc,
+        thread,
+        time::Duration,
     };
 
-    use super::Admissions;
+    use narjar::http_server::Request;
+
+    use super::{Admissions, configure_socket_timeouts};
 
     #[test]
     fn admission_limit_counts_live_guards() {
@@ -438,5 +457,32 @@ mod tests {
 
         assert!(result.is_err());
         assert!(admissions.try_acquire().is_some());
+    }
+
+    #[test]
+    fn socket_read_times_out_when_request_headers_stop_progressing() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let client = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            stream
+                .write_all(b"GET /healthz HTTP/1.1\r\n")
+                .expect("write partial request");
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let (stream, _) = listener.accept().expect("accept test request");
+        configure_socket_timeouts(&stream, Duration::from_millis(50))
+            .expect("configure socket timeouts");
+        let error = match Request::read(stream) {
+            Ok(_) => panic!("incomplete headers should hit the read deadline"),
+            Err((_, error)) => error,
+        };
+
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        client.join().expect("client should finish");
     }
 }

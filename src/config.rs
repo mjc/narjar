@@ -15,6 +15,7 @@ pub(crate) struct ServeConfig {
     pub(crate) max_nar_bytes: NonZeroU64,
     pub(crate) min_free_bytes: u64,
     pub(crate) shutdown_grace_seconds: NonZeroU64,
+    pub(crate) io_timeout_seconds: NonZeroU64,
 }
 
 #[derive(Args)]
@@ -37,6 +38,12 @@ pub(crate) struct ServeArgs {
         default_value_t = NonZeroU64::new(30).unwrap()
     )]
     shutdown_grace_seconds: NonZeroU64,
+    #[arg(
+        long,
+        env = "NARJAR_IO_TIMEOUT_SECONDS",
+        default_value_t = NonZeroU64::new(30).unwrap()
+    )]
+    io_timeout_seconds: NonZeroU64,
 }
 
 impl From<ServeArgs> for ServeConfig {
@@ -49,6 +56,7 @@ impl From<ServeArgs> for ServeConfig {
             max_nar_bytes: args.max_nar_bytes,
             min_free_bytes: args.min_free_bytes,
             shutdown_grace_seconds: args.shutdown_grace_seconds,
+            io_timeout_seconds: args.io_timeout_seconds,
         }
     }
 }

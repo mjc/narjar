@@ -197,10 +197,14 @@ state, and one fixed buffer. Reads own one file and one fixed buffer. Memory is
 therefore O(workers * buffer-size), independent of NAR size.
 
 Header parsing limits come from Narjar's fixed parser plus route checks. Content-
-Length is required before upload admission. Narjar does not promise an in-
-process socket timeout that its blocking listener cannot enforce. The required reverse
-proxy sets header, request-body progress, and response timeouts; direct private
-use relies on the fixed worker bound. NAR size and minimum free-space checks
+Length is required before upload admission. Each accepted socket uses the
+`--io-timeout-seconds` / `NARJAR_IO_TIMEOUT_SECONDS` limit (30 seconds by
+default) as an idle-progress deadline for request headers, request bodies, and
+response writes. The deadline applies to each blocking read or write, so a
+large transfer may exceed 30 seconds when every interval makes progress. A
+stalled client releases its worker and upload admission when the socket
+operation times out. A reverse proxy may use stricter limits, but direct use
+does not depend on proxy enforcement. NAR size and minimum free-space checks
 happen before and during the stream.
 
 The lock granularity is immutable destination name. Narjar does not create a

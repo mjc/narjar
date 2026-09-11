@@ -23,6 +23,7 @@ const CONFIG_ENV: &[&str] = &[
     "NARJAR_MAX_NAR_BYTES",
     "NARJAR_MIN_FREE_BYTES",
     "NARJAR_SHUTDOWN_GRACE_SECONDS",
+    "NARJAR_IO_TIMEOUT_SECONDS",
 ];
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -758,7 +759,7 @@ fn serve_reports_listener_and_stops_on_sigterm() {
     );
     assert!(
         server.startup_line.ends_with(
-            " workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824 shutdown_grace_seconds=30\n"
+            " workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824 shutdown_grace_seconds=30 io_timeout_seconds=30\n"
         ),
         "startup line omits effective limits: {:?}",
         server.startup_line
@@ -766,6 +767,60 @@ fn serve_reports_listener_and_stops_on_sigterm() {
 
     let (signal, status) = server.stop();
     assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn stalled_request_headers_are_closed_by_the_socket_timeout() {
+    let server =
+        RunningServer::start_with_args("stalled-request-headers", &["--io-timeout-seconds", "1"]);
+    let started = Instant::now();
+    let mut stream = TcpStream::connect(&server.address).expect("connect to narjar");
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\n")
+        .expect("write partial request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("configure client timeout");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("timed-out request should close");
+
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    let (_, status) = server.stop();
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn stalled_upload_body_is_rejected_without_publication() {
+    let server =
+        RunningServer::start_with_args("stalled-upload-body", &["--io-timeout-seconds", "1"]);
+    let path = format!("/nar/{NARJAR_HASH}.nar");
+    let mut stream = server.open_request("PUT", &path, &[("Content-Length", "1")]);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("configure client timeout");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("timed-out upload should receive a response");
+
+    assert!(response.is_empty(), "unexpected response: {:?}", response);
+    assert!(
+        !server
+            .data_dir
+            .join(format!("nar/{NARJAR_HASH}.nar"))
+            .exists()
+    );
+    assert!(
+        !server
+            .data_dir
+            .join(format!("narinfo/{STORE_HASH}.narinfo"))
+            .exists()
+    );
+    let (_, status) = server.stop();
     assert!(status.success(), "narjar should shut down cleanly");
 }
 

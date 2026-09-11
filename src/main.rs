@@ -74,7 +74,7 @@ fn run(cli: Cli) -> Result<(), Error> {
 mod tests {
     use clap::Parser;
 
-    use super::Cli;
+    use super::{Cli, Command};
 
     #[test]
     fn command_schema_rejects_invalid_input() {
@@ -168,6 +168,23 @@ mod tests {
             "0",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn serve_accepts_io_timeout() {
+        let cli = Cli::try_parse_from([
+            "narjar",
+            "serve",
+            "--data-dir",
+            "/cache",
+            "--io-timeout-seconds",
+            "7",
+        ])
+        .expect("serve IO timeout should parse");
+
+        let Command::Serve(_) = cli.command else {
+            panic!("expected serve command");
+        };
     }
 
     #[test]

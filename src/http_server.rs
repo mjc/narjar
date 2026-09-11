@@ -346,7 +346,13 @@ impl Read for BodyReader<'_> {
             return Ok(count);
         }
         let output_length = output.len().min(self.remaining);
-        let count = self.stream.read(&mut output[..output_length])?;
+        let count = match self.stream.read(&mut output[..output_length]) {
+            Ok(count) => count,
+            Err(error) => {
+                *self.complete = false;
+                return Err(error);
+            }
+        };
         if count == 0 {
             *self.complete = false;
         }
