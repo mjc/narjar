@@ -1,0 +1,10 @@
+# fixture	offset	length	kind	source
+root_symlink_x	0	24	literal	nar-magic
+root_symlink_x	24	16	literal	root-open
+root_symlink_x	40	16	literal	type-field
+root_symlink_x	56	16	literal	symlink-kind
+root_symlink_x	72	16	literal	target-field
+root_symlink_x	88	8	literal	target-length
+root_symlink_x	96	1	extent	symlink-target-x
+root_symlink_x	97	7	literal	target-padding
+root_symlink_x	104	16	literal	root-close

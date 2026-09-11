@@ -342,6 +342,10 @@
             ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/semantic-descriptor.sh
             touch $out
           '';
+          virtual-nar-segments = env.pkgs.runCommand "narjar-virtual-nar-segments" { } ''
+            ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/virtual-nar-segments.sh
+            touch $out
+          '';
           runtime-smoke = env.pkgs.runCommand "narjar-runtime-smoke" { } ''
             mkdir data
             ${env.narjar}/bin/narjar init --data-dir "$PWD/data"
@@ -379,6 +383,7 @@
             source-filter
             lock-consistency
             semantic-descriptor
+            virtual-nar-segments
             runtime-smoke
             runtime-closure
             module-evaluation
