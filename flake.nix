@@ -338,6 +338,10 @@
             test -s ${repositorySrc}/flake.lock
             touch $out
           '';
+          semantic-descriptor = env.pkgs.runCommand "narjar-semantic-descriptor" { } ''
+            ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/semantic-descriptor.sh
+            touch $out
+          '';
           runtime-smoke = env.pkgs.runCommand "narjar-runtime-smoke" { } ''
             mkdir data
             ${env.narjar}/bin/narjar init --data-dir "$PWD/data"
@@ -374,6 +378,7 @@
             format
             source-filter
             lock-consistency
+            semantic-descriptor
             runtime-smoke
             runtime-closure
             module-evaluation
