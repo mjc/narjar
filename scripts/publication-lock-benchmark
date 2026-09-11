@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+OUTPUT=
+NARJAR_BIN=
+SLOW_BYTES=1073741824
+SLOW_RATE=67108864
+PUBLISHERS=(1 2 8 32)
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/publication-lock-benchmark --narjar-bin PATH --output DIR [options]
+
+Measure Narjar publication head-of-line blocking with one throttled 1 GiB PUT.
+
+Options:
+  --narjar-bin PATH  Release Narjar binary to measure
+  --output DIR       New directory for samples, logs, and report
+  --slow-bytes N     Slow upload size in bytes (default: 1073741824)
+  --slow-rate N      Slow upload rate in bytes/sec (default: 67108864)
+  --publishers LIST  Comma-separated small PUT counts (default: 1,2,8,32)
+                     Report includes queue latency, throughput, CPU, and RSS
+  -h, --help         Show this help
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --narjar-bin)
+      [[ $# -ge 2 ]] || { echo "missing value for --narjar-bin" >&2; exit 2; }
+      NARJAR_BIN=$2
+      shift 2
+      ;;
+    --output)
+      [[ $# -ge 2 ]] || { echo "missing value for --output" >&2; exit 2; }
+      OUTPUT=$2
+      shift 2
+      ;;
+    --slow-bytes)
+      [[ $# -ge 2 ]] || { echo "missing value for --slow-bytes" >&2; exit 2; }
+      SLOW_BYTES=$2
+      shift 2
+      ;;
+    --slow-rate)
+      [[ $# -ge 2 ]] || { echo "missing value for --slow-rate" >&2; exit 2; }
+      SLOW_RATE=$2
+      shift 2
+      ;;
+    --publishers)
+      [[ $# -ge 2 ]] || { echo "missing value for --publishers" >&2; exit 2; }
+      IFS=',' read -r -a PUBLISHERS <<< "$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+[[ -n "$NARJAR_BIN" && -x "$NARJAR_BIN" ]] || {
+  echo "--narjar-bin must point to an executable release binary" >&2
+  exit 1
+}
+[[ -n "$OUTPUT" ]] || { usage >&2; exit 2; }
+[[ ! -e "$OUTPUT" ]] || { echo "output already exists: $OUTPUT" >&2; exit 1; }
+[[ "$(uname -s)" == Linux ]] || { echo "Linux /proc is required" >&2; exit 1; }
+[[ "$SLOW_BYTES" =~ ^[1-9][0-9]*$ && "$SLOW_RATE" =~ ^[1-9][0-9]*$ ]] || {
+  echo "--slow-bytes and --slow-rate must be positive integers" >&2
+  exit 2
+}
+for publishers in "${PUBLISHERS[@]}"; do
+  [[ "$publishers" =~ ^[1-9][0-9]*$ ]] || {
+    echo "--publishers must contain positive integers" >&2
+    exit 2
+  }
+done
+for command in awk curl date nix stat truncate; do
+  command -v "$command" >/dev/null || {
+    echo "missing '$command'; run inside 'nix develop'" >&2
+    exit 1
+  }
+done
+
+mkdir -p -- "$OUTPUT"
+OUTPUT=$(cd -- "$OUTPUT" && pwd -P)
+COMMAND_LOG=$OUTPUT/commands.txt
+SAMPLES=$OUTPUT/samples.tsv
+SUMMARY=$OUTPUT/summary.tsv
+ENVIRONMENT=$OUTPUT/environment.tsv
+LOG_DIR=$OUTPUT/logs
+METRICS_DIR=$OUTPUT/metrics
+WORK=$(mktemp -d "$OUTPUT/.work.XXXXXX")
+SERVER_PID=
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  rm -rf -- "$WORK"
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+: > "$COMMAND_LOG"
+chmod 600 "$COMMAND_LOG"
+mkdir -p -- "$LOG_DIR" "$METRICS_DIR"
+printf 'publishers\tslow_bytes\tslow_rate\tslow_id\n' > "$ENVIRONMENT"
+printf 'publishers\trequest\telapsed_ms\tstatus\tsize_upload\n' > "$SAMPLES"
+printf 'publishers\tsamples\tp50_ms\tp95_ms\tp99_ms\tmin_ms\tmax_ms\tslow_wall_ms\tslow_mib_s\tsmall_requests_s\tserver_cpu_ms\tserver_peak_rss_kib\tqueue_wait_count\tqueue_wait_sum_ms\tqueue_wait_max_ms\n' > "$SUMMARY"
+
+log_command() {
+  {
+    printf '$'
+    printf ' %q' "$@"
+    printf '\n'
+  } >> "$COMMAND_LOG"
+}
+
+run_logged() {
+  log_command "$@"
+  "$@"
+}
+
+now_ns() { date +%s%N; }
+
+cpu_ticks() {
+  awk -F') ' '{split($2, fields, " "); total += fields[12] + fields[13]}
+    END {print total + 0}' "/proc/$1/task"/*/stat 2>/dev/null
+}
+
+rss_kib() {
+  awk '/^Rss:/{print $2; found=1} END{if (!found) exit 1}' "/proc/$1/smaps_rollup"
+}
+
+metric() {
+  local name=$1 file=$2
+  awk -v name="$name" '$1 == name {print $2; found=1} END {if (!found) print 0}' "$file"
+}
+
+wait_for_server() {
+  local log=$1 port
+  for _ in $(seq 1 300); do
+    port=$(sed -n 's/^listening http:\/\/127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$log" | head -1)
+    if [[ -n "$port" ]] && curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/healthz" >/dev/null; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      cat "$log" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+start_server() {
+  local data=$1 log=$2
+  log_command "$NARJAR_BIN" serve --data-dir "$data" --listen 127.0.0.1:0 --workers 32
+  "$NARJAR_BIN" serve --data-dir "$data" --listen 127.0.0.1:0 --workers 32 > "$log" 2>&1 &
+  SERVER_PID=$!
+  SERVER_PORT=$(wait_for_server "$log")
+  SERVER_URL=http://127.0.0.1:$SERVER_PORT
+}
+
+stop_server() {
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  SERVER_PID=
+}
+
+prepare_auth() {
+  local data=$1 netrc=$2 token
+  run_logged "$NARJAR_BIN" init --data-dir "$data" >/dev/null
+  token=$(run_logged "$NARJAR_BIN" token create --data-dir "$data" --scope write --name publication-lock-benchmark)
+  printf 'machine 127.0.0.1 login narjar password %s\n' "$token" > "$netrc"
+  chmod 600 "$netrc"
+}
+
+SLOW_PAYLOAD=$WORK/slow.nar
+truncate -s "$SLOW_BYTES" "$SLOW_PAYLOAD"
+SLOW_ID=$(run_logged nix hash file --type sha256 --base32 "$SLOW_PAYLOAD")
+SMALL_PAYLOAD=$WORK/small.nar
+printf 'narjar' > "$SMALL_PAYLOAD"
+SMALL_ID=$(run_logged nix hash file --type sha256 --base32 "$SMALL_PAYLOAD")
+
+for publishers in "${PUBLISHERS[@]}"; do
+  data=$WORK/data-$publishers
+  netrc=$WORK/netrc-$publishers
+  server_log=$LOG_DIR/server-$publishers.log
+  metrics_file=$METRICS_DIR/metrics-$publishers.txt
+  result_dir=$WORK/results-$publishers
+  mkdir -p -- "$result_dir"
+  prepare_auth "$data" "$netrc"
+  start_server "$data" "$server_log"
+
+  slow_start=$(now_ns)
+  log_command curl --silent --show-error --limit-rate "$SLOW_RATE" --netrc-file "$netrc" -X PUT \
+    --data-binary "@$SLOW_PAYLOAD" -o /dev/null -w '%{http_code}\t%{time_total}\n' "$SERVER_URL/nar/$SLOW_ID.nar"
+  curl --silent --show-error --limit-rate "$SLOW_RATE" --netrc-file "$netrc" -X PUT \
+    --data-binary "@$SLOW_PAYLOAD" -o /dev/null -w '%{http_code}\t%{time_total}\n' \
+    "$SERVER_URL/nar/$SLOW_ID.nar" > "$result_dir/slow.result" 2> "$result_dir/slow.err" &
+  slow_pid=$!
+
+  ready=0
+  for _ in $(seq 1 300); do
+    curl --silent --show-error --max-time 1 --netrc-file "$netrc" \
+      "$SERVER_URL/metrics" > "$result_dir/metrics-start" || true
+    if [[ "$(metric narjar_uploads_in_flight "$result_dir/metrics-start")" -ge 1 ]]; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "$slow_pid" 2>/dev/null; then
+      cat "$result_dir/slow.err" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+  ((ready == 1)) || { echo "slow upload did not enter publication" >&2; exit 1; }
+
+  before_cpu=$(cpu_ticks "$SERVER_PID")
+  peak_rss=$(rss_kib "$SERVER_PID")
+  small_pids=()
+  for ((index = 0; index < publishers; index++)); do
+    log_command curl --silent --show-error --netrc-file "$netrc" -X PUT --data-binary "@$SMALL_PAYLOAD" \
+      -o /dev/null -w '%{http_code}\t%{time_total}\t%{size_upload}\n' "$SERVER_URL/nar/$SMALL_ID.nar"
+    curl --silent --show-error --netrc-file "$netrc" -X PUT --data-binary "@$SMALL_PAYLOAD" \
+      -o /dev/null -w '%{http_code}\t%{time_total}\t%{size_upload}\n' \
+      "$SERVER_URL/nar/$SMALL_ID.nar" > "$result_dir/small-$index.result" 2> "$result_dir/small-$index.err" &
+    small_pids+=("$!")
+  done
+
+  while kill -0 "$slow_pid" 2>/dev/null; do
+    current_rss=$(rss_kib "$SERVER_PID" 2>/dev/null || printf 0)
+    ((current_rss > peak_rss)) && peak_rss=$current_rss
+    sleep 0.05
+  done
+  wait "$slow_pid" || { cat "$result_dir/slow.err" >&2; exit 1; }
+  IFS=$'\t' read -r slow_status slow_elapsed < "$result_dir/slow.result"
+  [[ "$slow_status" =~ ^2 ]] || {
+    cat "$result_dir/slow.err" >&2
+    echo "slow upload returned HTTP $slow_status" >&2
+    exit 1
+  }
+  for pid in "${small_pids[@]}"; do
+    wait "$pid" || true
+  done
+  slow_end=$(now_ns)
+  after_cpu=$(cpu_ticks "$SERVER_PID")
+  current_rss=$(rss_kib "$SERVER_PID" 2>/dev/null || printf 0)
+  ((current_rss > peak_rss)) && peak_rss=$current_rss
+
+  curl --silent --show-error --netrc-file "$netrc" "$SERVER_URL/metrics" > "$metrics_file"
+  slow_wall_ms=$(awk -v start="$slow_start" -v end="$slow_end" 'BEGIN{printf "%.3f",(end-start)/1000000}')
+  slow_mib_s=$(awk -v bytes="$SLOW_BYTES" -v milliseconds="$slow_wall_ms" 'BEGIN{printf "%.3f",bytes/1048576/(milliseconds/1000)}')
+  server_cpu_ms=$(awk -v before="$before_cpu" -v after="$after_cpu" -v hz="$(getconf CLK_TCK)" 'BEGIN{printf "%.3f",(after-before)*1000/hz}')
+  queue_count=$(metric narjar_publication_queue_wait_seconds_count "$metrics_file")
+  queue_sum=$(awk -v value="$(metric narjar_publication_queue_wait_seconds_sum "$metrics_file")" 'BEGIN{printf "%.3f",value*1000}')
+  queue_max=$(awk -v value="$(metric narjar_publication_queue_wait_seconds_max "$metrics_file")" 'BEGIN{printf "%.3f",value*1000}')
+
+  for ((index = 0; index < publishers; index++)); do
+    IFS=$'\t' read -r status elapsed upload < "$result_dir/small-$index.result"
+    [[ "$status" =~ ^2 ]] || {
+      cat "$result_dir/small-$index.err" >&2
+      echo "small upload $index returned HTTP $status" >&2
+      exit 1
+    }
+    elapsed_ms=$(awk -v seconds="$elapsed" 'BEGIN{printf "%.3f",seconds*1000}')
+    printf '%s\t%s\t%s\t%s\t%s\n' "$publishers" "$index" "$elapsed_ms" "$status" "$upload" >> "$SAMPLES"
+  done
+  awk -F '\t' -v publishers="$publishers" -v slow="$slow_wall_ms" \
+    -v slow_mib_s="$slow_mib_s" -v cpu="$server_cpu_ms" -v rss="$peak_rss" -v queue_count="$queue_count" \
+    -v queue_sum="$queue_sum" -v queue_max="$queue_max" '
+    $1 == publishers {values[++n] = $3}
+    END {
+      for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++)
+        if (values[j] < values[i]) {swap = values[i]; values[i] = values[j]; values[j] = swap}
+      p50 = values[int((n * 0.50) + 0.999)];
+      p95 = values[int((n * 0.95) + 0.999)];
+      p99 = values[int((n * 0.99) + 0.999)];
+      small_requests_s = n / (values[n] / 1000);
+      printf "%s\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\t%s\n",
+        publishers,n,p50,p95,p99,values[1],values[n],slow,slow_mib_s,small_requests_s,cpu,rss,queue_count,queue_sum,queue_max
+    }' "$SAMPLES" >> "$SUMMARY"
+  printf '%s\t%s\t%s\t%s\n' "$publishers" "$SLOW_BYTES" "$SLOW_RATE" "$SLOW_ID" >> "$ENVIRONMENT"
+  stop_server
+done
+
+{
+  printf '# Narjar publication lock contention\n\n'
+  printf 'One throttled %s-byte raw NAR upload at %s bytes/sec was overlapped with independent small PUTs.\n\n' "$SLOW_BYTES" "$SLOW_RATE"
+  printf 'See [commands.txt](./commands.txt), [samples.tsv](./samples.tsv), [summary.tsv](./summary.tsv), and [metrics/](./metrics/).\n\n'
+  printf '```text\n'
+  cat "$SUMMARY"
+  printf '```\n'
+} > "$OUTPUT/report.md"
+
+printf '%s\n' "$OUTPUT"

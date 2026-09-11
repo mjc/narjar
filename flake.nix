@@ -346,6 +346,10 @@
             ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/virtual-nar-segments.sh
             touch $out
           '';
+          publication-lock-benchmark = env.pkgs.runCommand "narjar-publication-lock-benchmark" { } ''
+            ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/publication-lock-benchmark.sh
+            touch $out
+          '';
           runtime-smoke = env.pkgs.runCommand "narjar-runtime-smoke" { } ''
             mkdir data
             ${env.narjar}/bin/narjar init --data-dir "$PWD/data"
@@ -384,6 +388,7 @@
             lock-consistency
             semantic-descriptor
             virtual-nar-segments
+            publication-lock-benchmark
             runtime-smoke
             runtime-closure
             module-evaluation
