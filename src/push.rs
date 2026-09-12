@@ -830,6 +830,80 @@ mod tests {
     }
 
     #[test]
+    fn retries_a_429_during_file_upload() {
+        use std::{
+            fs,
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let payload = tempfile::NamedTempFile::new().expect("create upload test file");
+        fs::write(payload.path(), b"retryable NAR payload").expect("write upload test file");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test listener");
+        let address = listener.local_addr().expect("inspect upload test listener");
+        let server = thread::spawn(move || {
+            for (attempt, status) in [(0, 429), (1, 201)] {
+                let (mut stream, _) = listener.accept().expect("accept upload request");
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let read = stream.read(&mut buffer).expect("read upload request");
+                    assert_ne!(read, 0, "upload request ended before its body");
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let header_end = header_end + 4;
+                    let content_length = request[..header_end]
+                        .split(|&byte| byte == b'\n')
+                        .find_map(|line| {
+                            let separator = line.iter().position(|&byte| byte == b':')?;
+                            let (name, value) = line.split_at(separator);
+                            name.eq_ignore_ascii_case(b"content-length")
+                                .then(|| &value[1..])
+                                .and_then(|value| std::str::from_utf8(value).ok())
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .expect("upload should have a Content-Length");
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+                if attempt == 1 {
+                    assert!(
+                        request.ends_with(b"retryable NAR payload"),
+                        "retry should resend the complete body"
+                    );
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write upload test response");
+            }
+        });
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        assert_eq!(
+            super::put_file(
+                &agent,
+                &format!("http://{address}/nar/test.nar"),
+                payload.path(),
+                None
+            )
+            .expect("upload retry should eventually succeed"),
+            201
+        );
+        server.join().expect("upload retry test server should exit");
+    }
+
+    #[test]
     fn push_defaults_to_one_copy_worker() {
         let matches = Push::augment_args(Command::new("push"))
             .try_get_matches_from([
