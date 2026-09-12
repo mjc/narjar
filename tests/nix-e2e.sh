@@ -425,7 +425,7 @@ gc_base=$(build_path gc-base "$nonce")
 gc_root=$(build_referencing_path "$gc_base" gc-root)
 sign_path "$gc_base"
 sign_path "$gc_root"
-cache_copy_to "$gc_root"
+native_push_to "$gc_root"
 gc_roots="$temp_root/gc-roots"
 printf '%s\n' "$gc_root" > "$gc_roots"
 stop_server
