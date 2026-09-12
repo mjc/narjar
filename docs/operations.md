@@ -101,6 +101,11 @@ serialization. `--netrc-file` is parsed by Narjar and its matching credential
 is sent as HTTP Basic authentication; the file must already have restrictive
 permissions.
 
+The native client transfers store-path NARs and narinfos only. Realisations,
+build logs, `.ls` listings, and other store-daemon metadata are outside this
+client’s upload contract; use the corresponding stock Nix operation when those
+surfaces are required.
+
 delete is offline-only: it refuses while the serve lock is held, removes the
 published narinfo after validation and directory sync, and deliberately leaves
 the NAR object. list-orphans reports NARs unreferenced by any valid narinfo.
