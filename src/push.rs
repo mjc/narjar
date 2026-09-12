@@ -560,7 +560,7 @@ const MAX_ATTEMPTS: usize = 3;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 
 fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 429 | 500 | 502 | 503 | 504)
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 fn retry_after_delay(value: &str) -> Option<Duration> {
@@ -906,7 +906,7 @@ mod tests {
 
     #[test]
     fn retries_only_transient_http_failures() {
-        for status in [429, 500, 502, 503, 504] {
+        for status in [408, 429, 500, 502, 503, 504] {
             assert!(is_retryable_status(status), "HTTP {status} should retry");
         }
         for status in [200, 201, 400, 401, 404, 409, 413, 422] {
