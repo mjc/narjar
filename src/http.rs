@@ -15,7 +15,6 @@ use crate::{
     },
 };
 
-const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 fn header(name: &'static str, value: &'static str) -> Header {
@@ -547,23 +546,27 @@ fn respond_cache_info_put(
     metrics: &Metrics,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
+    let cache_info = match storage.cache_info() {
+        Ok(cache_info) => cache_info,
+        Err(_) => return send_response(guard, request, 500, Response::empty(StatusCode(500)), 0),
+    };
     let mut upload = match UploadRequest::accept(request, guard, metrics) {
         Ok(upload) => upload,
         Err(stream) => return stream,
     };
     let _upload = metrics.upload(upload.length() as u64);
-    if upload.length() != NIX_CACHE_INFO.len() {
+    if upload.length() != cache_info.len() {
         metrics.validation_failure(ValidationClass::Body);
         return upload.respond(guard, 409);
     }
-    let bytes = match upload.read_body(NIX_CACHE_INFO.len()) {
+    let bytes = match upload.read_body(cache_info.len()) {
         Ok(bytes) => bytes,
         Err(status) => {
             metrics.validation_failure(ValidationClass::Body);
             return upload.respond(guard, status);
         }
     };
-    if bytes != NIX_CACHE_INFO {
+    if bytes != cache_info {
         metrics.validation_failure(ValidationClass::Body);
         return upload.respond(guard, 409);
     }
@@ -799,13 +802,18 @@ pub fn respond(
 
     match route {
         ReadRoute::CacheInfo => {
+            let cache_info = match storage.cache_info() {
+                Ok(cache_info) => cache_info,
+                Err(_) => return internal_error(&guard, request),
+            };
+            let cache_info_length = cache_info.len() as u64;
             let response = cache_policy(
-                Response::from_data(NIX_CACHE_INFO.to_vec())
+                Response::from_data(cache_info)
                     .with_header(header("Content-Type", "text/x-nix-cache-info")),
                 private_read,
                 "public, max-age=3600",
             );
-            send_response(&guard, request, 200, response, NIX_CACHE_INFO.len() as u64)
+            send_response(&guard, request, 200, response, cache_info_length)
         }
         ReadRoute::Nar(id, encoding) => {
             respond_nar(request, storage, &id, encoding, &guard, private_read)

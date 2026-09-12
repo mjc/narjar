@@ -1015,6 +1015,23 @@ fn private_cache_info_is_not_shared() {
 }
 
 #[test]
+fn cache_info_reads_the_initialized_priority() {
+    let server = RunningServer::start("custom-cache-priority");
+    fs::write(
+        server.data_dir.join("nix-cache-info"),
+        b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 17\n",
+    )
+    .expect("custom cache-info should be written");
+    let response = String::from_utf8(server.request("GET", "/nix-cache-info"))
+        .expect("response should be UTF-8");
+    let (signal, status) = server.stop();
+
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+    assert!(response.ends_with("\r\n\r\nStoreDir: /nix/store\nWantMassQuery: 0\nPriority: 17\n"));
+}
+
+#[test]
 fn http11_connection_serves_two_sequential_requests() {
     let server = RunningServer::start("http11-keep-alive");
     let mut stream = TcpStream::connect(&server.address).expect("connect to narjar");

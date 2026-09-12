@@ -39,6 +39,7 @@ const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const NIX32_SHA256_LEN: usize = 52;
 const TEMP_ATTEMPTS: u64 = 128;
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
+const MAX_CACHE_INFO_BYTES: u64 = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidObjectId;
@@ -89,6 +90,44 @@ fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObject
     valid_nix32(value, expected_len)
         .then(|| value.to_owned())
         .ok_or(InvalidObjectId)
+}
+
+fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() as u64 > MAX_CACHE_INFO_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "nix-cache-info exceeds configured size limit",
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nix-cache-info is not UTF-8"))?;
+    let mut store_dir = false;
+    let mut mass_query = false;
+    let mut priority = false;
+    for line in text.lines() {
+        let (name, value) = line.split_once(": ").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed nix-cache-info")
+        })?;
+        match name {
+            "StoreDir" if !store_dir && value == "/nix/store" => store_dir = true,
+            "WantMassQuery" if !mass_query && value == "0" => mass_query = true,
+            "Priority" if !priority && value.parse::<u32>().is_ok() => priority = true,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported or duplicate nix-cache-info field",
+                ));
+            }
+        }
+    }
+    if store_dir && mass_query && priority {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "nix-cache-info is missing a required field",
+        ))
+    }
 }
 
 fn valid_nix32(value: &str, expected_len: usize) -> bool {
@@ -542,6 +581,16 @@ impl Storage {
 
     pub fn publish_cache_info(&self, source: impl Read) -> Result<PublishOutcome, StorageError> {
         self.publish(PublishTarget::CacheInfo, source)
+    }
+
+    pub fn cache_info(&self) -> Result<Vec<u8>, StorageError> {
+        let root = self.root_directory()?;
+        let file = open_regular_at(&root, OsStr::new("nix-cache-info"))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_CACHE_INFO_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        validate_cache_info(&bytes)?;
+        Ok(bytes)
     }
 
     pub fn publish_nar(
