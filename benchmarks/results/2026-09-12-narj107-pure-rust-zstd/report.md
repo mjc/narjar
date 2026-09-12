@@ -41,7 +41,8 @@ structured decoder's median was 2.13x `zstd-complete` on the medium input and
   against the small uncompressed source before timing. The medium and large
   timing runs checked the expected decoded byte count on every iteration.
 
-This does not benchmark encoding or the eventual egress path. No dependency
-switch is included in this result; the next implementation step is to trial
-`structured-zstd` in Narjar, bump the declared MSRV to 1.92, and run the full
-compatibility and project gates.
+This does not benchmark encoding or the eventual egress path. Narjar already
+uses `structured-zstd` 0.0.52 with the measured SIMD feature set, so this
+result does not authorize a dependency switch or an MSRV change. The remaining
+work is the full compatibility and project gates plus clean, repeated policy
+measurements on the real corpus.
