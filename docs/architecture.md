@@ -161,8 +161,8 @@ PUT /nar/<file-hash>.nar[.zst|.xz]
   -> validate route and Content-Length <= configured maximum
   -> create DATA/nar/.tmp/nar-<random>.part with create-new
   -> stream body once to a private temporary file
-  -> for `.nar`, hash/count the received bytes
-  -> for `.nar.zst`/`.nar.xz`, stream-decode with the matching reader and hash/count the NAR
+  -> for every encoding, hash/count the received bytes while streaming the upload
+  -> for `.nar.zst`/`.nar.xz`, stream-decode the stored bytes to validate the raw NAR hash/size
   -> reject length/hash/empty mismatch or an oversized decompressed NAR
   -> sync temporary file
   -> rename-no-replace to DATA/nar/<file-hash>.nar[.zst|.xz]
