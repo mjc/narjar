@@ -20,6 +20,7 @@ pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NarEncoding {
     None,
+    Zstd,
     Xz,
 }
 
@@ -27,6 +28,7 @@ impl NarEncoding {
     pub(crate) const fn compression(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::Zstd => "zstd",
             Self::Xz => "xz",
         }
     }
@@ -34,6 +36,7 @@ impl NarEncoding {
     pub(crate) const fn suffix(self) -> &'static str {
         match self {
             Self::None => ".nar",
+            Self::Zstd => ".nar.zst",
             Self::Xz => ".nar.xz",
         }
     }
@@ -230,7 +233,7 @@ impl ParsedNarInfo {
 
         let url = required("URL")?;
         let url_value = url.strip_prefix("nar/").ok_or(NarInfoError)?;
-        let (url_hash, encoding) = [NarEncoding::Xz, NarEncoding::None]
+        let (url_hash, encoding) = [NarEncoding::Zstd, NarEncoding::Xz, NarEncoding::None]
             .into_iter()
             .find_map(|encoding| {
                 url_value

@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::narinfo::{NarEncoding, ValidatedNarInfo};
 use lzma_rust2::XzReader;
+use ruzstd::decoding::StreamingDecoder as RuzstdDecoder;
 
 pub mod gc;
 mod reconcile;
@@ -259,6 +260,59 @@ fn validate_xz(
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
     let mut reader = XzReader::new(HashingReader::new(file), false);
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0u64;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?;
+        if bytes_read > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decompressed NAR exceeds configured size limit",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_nar_hash = hasher.finalize();
+    if expected_nar_hash
+        .is_some_and(|expected_id| !nix32_sha256_matches(&actual_nar_hash, expected_id.as_str()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed NAR hash mismatch",
+        ));
+    }
+    let actual_file_hash = reader.into_inner();
+    if expected_file_hash.is_some_and(|expected_id| !actual_file_hash.matches(expected_id.as_str()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compressed NAR hash mismatch",
+        ));
+    }
+    Ok(bytes_read)
+}
+
+fn validate_zstd(
+    file: &File,
+    expected_nar_hash: Option<&NarObjectId>,
+    expected_file_hash: Option<&NarObjectId>,
+    max_bytes: u64,
+) -> io::Result<u64> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = RuzstdDecoder::new(HashingReader::new(file)).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid zstd NAR: {error}"),
+        )
+    })?;
     let mut hasher = Sha256::new();
     let mut bytes_read = 0u64;
     let mut buffer = [0; 64 * 1024];
@@ -613,6 +667,9 @@ impl Storage {
         let validate = |file: &File| -> Result<(), StorageError> {
             match encoding {
                 NarEncoding::None => Ok(()),
+                NarEncoding::Zstd => validate_zstd(file, None, Some(id), policy.max_bytes)
+                    .map(|_| ())
+                    .map_err(Into::into),
                 NarEncoding::Xz => validate_xz(file, None, Some(id), policy.max_bytes)
                     .map(|_| ())
                     .map_err(Into::into),
@@ -627,7 +684,7 @@ impl Storage {
                 validate,
                 |_| Ok(()),
             ),
-            NarEncoding::Xz => self.publish_with_admission(
+            NarEncoding::Zstd | NarEncoding::Xz => self.publish_with_admission(
                 PublishTarget::Nar(id, encoding),
                 source,
                 admit,
@@ -1621,6 +1678,7 @@ mod tests {
     };
     use crate::narinfo::NarEncoding;
     use lzma_rust2::{XzOptions, XzReader, XzWriter};
+    use ruzstd::encoding::{CompressionLevel, compress};
     use sha2::{Digest, Sha256};
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -1692,6 +1750,33 @@ mod tests {
             super::validate_xz(&file, Some(&nar_hash), Some(&file_hash), raw.len() as u64)
                 .expect("validate XZ NAR"),
             raw.len() as u64
+        );
+    }
+
+    #[test]
+    fn zstd_nars_are_stored_compressed_and_validated_decompressed() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let raw = b"nar bytes";
+        let mut compressed = Vec::new();
+        compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
+        let nar = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(&compressed)))
+            .expect("compressed hash is a valid NAR object id");
+
+        let outcome = storage
+            .publish_nar(
+                &nar,
+                NarEncoding::Zstd,
+                Cursor::new(&compressed),
+                compressed.len() as u64,
+                super::NarUploadPolicy::new(1024, 0),
+            )
+            .expect("publish zstd NAR");
+        assert_eq!(outcome, PublishOutcome::Created);
+        assert_eq!(
+            fs::read(storage.layout().nar_path_encoded(&nar, NarEncoding::Zstd))
+                .expect("read stored zstd NAR"),
+            compressed
         );
     }
 

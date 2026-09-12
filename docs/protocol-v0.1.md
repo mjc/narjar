@@ -22,7 +22,7 @@ under docs/evidence. Third-party implementations are comparison material only.
 | Persistent connections | Optional optimization |
 | Connection close between requests | Required to work |
 | Negative-cache refresh | Required operator behavior; captured |
-| compression=none and xz writes | Required |
+| compression=none, zstd, and xz writes | Required |
 | Other precompressed writes | Explicit non-goal |
 | Chunked request bodies | Explicit non-goal; Content-Length required |
 | Realisations | Explicit v0.1 non-goal unless Linux E2E proves required |
@@ -34,7 +34,7 @@ under docs/evidence. Third-party implementations are comparison material only.
 | --- | ---: | ---: | --- |
 | GET/HEAD /nix-cache-info | 200 text/x-nix-cache-info | 500 if installation is invalid | fixed Content-Length |
 | GET/HEAD /<32-nix32>.narinfo | 200 text/x-nix-narinfo | 404 | immutable after publication |
-| GET/HEAD /nar/<52-nix32>.nar[.xz] | 200 application/x-nix-nar | 404 | Accept-Ranges: bytes; bytes are served as stored |
+| GET/HEAD /nar/<52-nix32>.nar[.zst|.xz] | 200 application/x-nix-nar | 404 | Accept-Ranges: bytes; bytes are served as stored |
 | GET/HEAD /realisations/<id>.doi | none in v0.1 | 404 | route grammar reserved |
 | GET /healthz | 200 text/plain | n/a | public liveness only; no-store |
 | GET /readyz | 200 or 503 text/plain | n/a | read auth when private; no-store |
@@ -68,7 +68,7 @@ explicit migration because clients cache this file for days.
 | Method and route | New | Identical retry | Invalid/conflict |
 | --- | ---: | ---: | --- |
 | PUT /nix-cache-info | 201 | 200 | 409 if bytes differ |
-| PUT /nar/<52-nix32>.nar[.xz] | 201 | 200 | 409 immutable-name conflict |
+| PUT /nar/<52-nix32>.nar[.zst|.xz] | 201 | 200 | 409 immutable-name conflict |
 | PUT /<32-nix32>.narinfo | 201 | 200 | 409 immutable-name conflict |
 | PUT /realisations/<id>.doi | unsupported | unsupported | 405/404 in v0.1 |
 
@@ -124,11 +124,12 @@ Accepted metadata must:
 
 - Be bounded UTF-8 in the line-oriented Nix narinfo format.
 - Contain one StorePath under /nix/store whose hash equals the route.
-- Contain URL nar/<FileHash-nix32>.nar or nar/<NarHash-nix32>.nar.xz.
-- Declare Compression matching the URL suffix (`none` or `xz`).
+- Contain URL nar/<FileHash-nix32>.nar, nar/<FileHash-nix32>.nar.zst, or
+  nar/<NarHash-nix32>.nar.xz.
+- Declare Compression matching the URL suffix (`none`, `zstd`, or `xz`).
 - Include FileHash, FileSize, NarHash, NarSize, References, and at least one Sig.
 - Have FileHash equal NarHash and FileSize equal NarSize for compression=none;
-  for xz, FileHash/FileSize describe the stored compressed object.
+  for zstd and xz, FileHash/FileSize describe the stored compressed object.
 - Match the durable NAR's computed hash and size.
 - Use only canonical store-path/reference grammar.
 - Verify at least one signature against configured trusted public keys.

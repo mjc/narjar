@@ -1,6 +1,7 @@
 use data_encoding::{BASE64, BitOrder, Specification};
 use ed25519_dalek::{Signer, SigningKey};
 use lzma_rust2::{XzOptions, XzWriter};
+use ruzstd::encoding::{CompressionLevel, compress};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -1652,6 +1653,41 @@ fn nar_put_and_get_preserve_xz_bytes() {
         "{wrong_headers:?}"
     );
     assert!(wrong_body.is_empty());
+    assert!(
+        upload_headers.starts_with("HTTP/1.1 201 Created\r\n"),
+        "{upload_headers:?}"
+    );
+    assert!(upload_body.is_empty());
+    let (download_headers, download_body) = response_parts(&downloaded);
+    assert!(
+        download_headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{download_headers:?}"
+    );
+    assert_eq!(download_body, compressed);
+    assert_eq!(stored, compressed);
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn nar_put_and_get_preserve_zstd_bytes() {
+    let server = RunningServer::start("nar-put-zstd");
+    let mut compressed = Vec::new();
+    compress(
+        std::io::Cursor::new(NAR_BYTES),
+        &mut compressed,
+        CompressionLevel::Fastest,
+    );
+
+    let file_hash = nix32_sha256(&compressed);
+    let path = format!("/nar/{file_hash}.nar.zst");
+    let stored_path = server.data_dir.join(format!("nar/{file_hash}.nar.zst"));
+    let uploaded = server.request_with_body("PUT", &path, &[], &compressed);
+    let downloaded = server.request("GET", &path);
+    let stored = fs::read(stored_path).expect("read stored zstd NAR");
+    let (signal, status) = server.stop();
+
+    let (upload_headers, upload_body) = response_parts(&uploaded);
     assert!(
         upload_headers.starts_with("HTTP/1.1 201 Created\r\n"),
         "{upload_headers:?}"

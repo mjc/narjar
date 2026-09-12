@@ -71,7 +71,7 @@ nix run . -- push \
 ```
 
 Use `--refresh` to re-check and re-upload paths already present at the
-destination. `--compression` is explicit and accepts `none` or `xz`; it
+destination. `--compression` is explicit and accepts `none`, `zstd`, or `xz`; it
 defaults to `none`. The server publishes the NAR before its narinfo, and
 consumers only see a path after the metadata is durable.
 

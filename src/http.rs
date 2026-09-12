@@ -253,7 +253,6 @@ enum ReadRoute {
 #[derive(Debug)]
 enum RouteMatch {
     Found(ReadRoute),
-    UnsupportedEncoding,
     Invalid,
     Missing,
 }
@@ -275,11 +274,11 @@ impl ReadRoute {
         }
 
         if let Some(path) = url.strip_prefix("/nar/") {
-            if path
+            if let Some(id) = path
                 .strip_suffix(".nar.zst")
-                .is_some_and(|id| NarObjectId::parse(id).is_ok())
+                .and_then(|id| NarObjectId::parse(id).ok())
             {
-                return RouteMatch::UnsupportedEncoding;
+                return RouteMatch::Found(Self::Nar(id, NarEncoding::Zstd));
             }
             if let Some(id) = path
                 .strip_suffix(NarEncoding::Xz.suffix())
@@ -413,11 +412,6 @@ pub fn prepare_publication(
         RouteMatch::Found(ReadRoute::Nar(id, encoding)) => WriteRoute::Nar(id, encoding),
         RouteMatch::Found(ReadRoute::NarInfo(store)) => WriteRoute::NarInfo(store),
         RouteMatch::Found(ReadRoute::CacheInfo) => WriteRoute::CacheInfo,
-        RouteMatch::UnsupportedEncoding => {
-            let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-            let _ = send_response(&guard, request, 415, Response::empty(StatusCode(415)), 0);
-            return None;
-        }
         RouteMatch::Invalid => {
             let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
             let _ = send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
@@ -764,20 +758,6 @@ pub fn respond(
 
     let route = match ReadRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
-        RouteMatch::UnsupportedEncoding => {
-            let status = if matches!(request.method(), Method::Put) {
-                415
-            } else {
-                400
-            };
-            return send_response(
-                &guard,
-                request,
-                status,
-                Response::empty(StatusCode(status)),
-                0,
-            );
-        }
         RouteMatch::Invalid => {
             return send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
         }
@@ -848,10 +828,16 @@ mod tests {
     }
 
     #[test]
-    fn xz_nar_routes_preserve_the_requested_encoding() {
+    fn encoded_nar_routes_preserve_the_requested_encoding() {
         assert!(matches!(
             ReadRoute::classify("/nar/0000000000000000000000000000000000000000000000000000.nar.xz"),
             RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::Xz))
+        ));
+        assert!(matches!(
+            ReadRoute::classify(
+                "/nar/0000000000000000000000000000000000000000000000000000.nar.zst"
+            ),
+            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::Zstd))
         ));
     }
 }
