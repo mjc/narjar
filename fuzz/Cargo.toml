@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 narjar = { path = ".." }
+tempfile = "3.27.0"
 
 [[bin]]
 name = "nar_decode"
@@ -21,6 +22,34 @@ bench = false
 [[bin]]
 name = "nar_encode"
 path = "fuzz_targets/nar_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_request"
+path = "fuzz_targets/auth_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "narinfo"
+path = "fuzz_targets/narinfo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xz_upload"
+path = "fuzz_targets/xz_upload.rs"
 test = false
 doc = false
 bench = false
