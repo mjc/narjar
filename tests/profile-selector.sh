@@ -7,6 +7,7 @@ trap 'rm -rf -- "$WORK_DIR"' EXIT
 
 ! grep -q "pgrep -f '/tmp/narjar-profile" "$ROOT/scripts/profile.sh"
 grep -q 'ps -eo pid=,args=' "$ROOT/scripts/profile.sh"
+grep -q 'WORKLOAD_PID' "$ROOT/scripts/profile.sh"
 
 printf '%s\n' \
   '[' \

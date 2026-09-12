@@ -96,6 +96,7 @@ READ_NAR_BYTES=""
 SERVER_PID=""
 PERF_PID=""
 HEAPTRACK_PID=""
+WORKLOAD_PID=""
 
 if [[ -x "$BIN" ]]; then
   while read -r pid; do
@@ -109,6 +110,9 @@ fi
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
+  if [[ -n "$WORKLOAD_PID" ]] && kill -0 "$WORKLOAD_PID" 2>/dev/null; then
+    kill -TERM "$WORKLOAD_PID" 2>/dev/null || true
+  fi
   if [[ -n "$PERF_PID" ]] && kill -0 "$PERF_PID" 2>/dev/null; then
     kill -TERM -- "-$PERF_PID" 2>/dev/null || kill -TERM "$PERF_PID" 2>/dev/null || true
   fi
@@ -328,7 +332,16 @@ prepare_hot_dataset() {
 run_read_workload() {
   echo "wrk: one thread, one persistent connection, full NAR body"
   wrk --threads 1 --connections 1 --duration "${PROFILE_SECONDS}s" --latency \
-    --timeout 15s -H 'Accept-Encoding: identity' "$NAR_ENDPOINT"
+    --timeout 15s -H 'Accept-Encoding: identity' "$NAR_ENDPOINT" &
+  WORKLOAD_PID=$!
+  local status
+  if wait "$WORKLOAD_PID"; then
+    status=0
+  else
+    status=$?
+  fi
+  WORKLOAD_PID=""
+  return "$status"
 }
 
 if [[ -n "$REUSE_DATA" ]]; then
