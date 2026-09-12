@@ -67,6 +67,13 @@ inventory before clearing recovery state.
 The current implementation and measurements are documented in
 [`architecture.md`](architecture.md), [`operations.md`](operations.md), and
 [`NARJ-110 publication results`](../benchmarks/results/2026-09-12-narj110-publication/report.md).
+The enhanced harness also records post-load RSS, anonymous allocator memory,
+staging usage, and restart recovery in the
+[`ZFS results`](../benchmarks/results/2026-09-12-narj110-publication-zfs-enhanced/report.md)
+and [`tmpfs results`](../benchmarks/results/2026-09-12-narj110-publication-tmpfs-enhanced/report.md).
+For a measured baseline, run the same command with `--repetitions 15`; each
+repetition uses an independent data directory and is retained in the raw TSV
+outputs.
 
 ## Consequences
 
