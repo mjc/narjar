@@ -266,6 +266,16 @@ fn run_native_push_fixture(
     compression: &str,
     refresh: bool,
 ) -> Output {
+    run_native_push_fixture_with_timeout(fixture, target, compression, refresh, None)
+}
+
+fn run_native_push_fixture_with_timeout(
+    fixture: &NativePushFixture,
+    target: &str,
+    compression: &str,
+    refresh: bool,
+    timeout_seconds: Option<u64>,
+) -> Output {
     let original_path = std::env::var_os("PATH").expect("test PATH should be set");
     let path = format!(
         "{}:{}",
@@ -285,6 +295,10 @@ fn run_native_push_fixture(
             .expect("netrc path should be UTF-8")
             .to_owned(),
     ];
+    if let Some(timeout_seconds) = timeout_seconds {
+        args.push("--timeout-seconds".to_owned());
+        args.push(timeout_seconds.to_string());
+    }
     if refresh {
         args.push("--refresh".to_owned());
     }
@@ -295,6 +309,72 @@ fn run_native_push_fixture(
         .env("NIX_TEST_INVOCATIONS", &fixture.invocation_log)
         .output()
         .expect("narjar push should run")
+}
+
+#[test]
+fn native_push_honors_configured_http_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind native timeout listener");
+    let address = listener
+        .local_addr()
+        .expect("inspect native timeout listener");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept stalled native request");
+        let request = read_http_request(&mut stream);
+        let request = String::from_utf8_lossy(&request);
+        assert!(
+            request.starts_with("GET /") && request.contains(".narinfo"),
+            "first request should be a narinfo lookup"
+        );
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(3));
+            drop(stream);
+        });
+
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept retried native request");
+            let request = read_http_request(&mut stream);
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.starts_with("GET /") && request.contains(".narinfo"),
+                "retries should repeat the narinfo lookup"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 500 Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write timeout retry response");
+        }
+    });
+    let fixture = native_push_fixture();
+    let started = Instant::now();
+    let output = run_native_push_fixture_with_timeout(
+        &fixture,
+        &format!("http://{address}"),
+        "none",
+        false,
+        Some(1),
+    );
+    let elapsed = started.elapsed();
+    server.join().expect("native timeout server should exit");
+
+    assert!(
+        !output.status.success(),
+        "a timed-out push should fail: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "configured timeout should wait for the stalled request: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "configured timeout should avoid the server's full delay: {elapsed:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("narinfo lookup"),
+        "failure should identify the failed lookup: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

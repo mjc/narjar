@@ -74,8 +74,10 @@ Use `--refresh` to re-check and re-upload paths already present at the
 destination. `--compression` is explicit and accepts `none`, `zstd`, or `xz`; it
 defaults to `none`. The client uses fixed-length requests, streams NAR files
 from temporary files, and authenticates with the matching netrc entry. The
-server publishes the NAR before its narinfo, and consumers only see a path
-after the metadata is durable. Nix remains required for closure enumeration,
+native HTTP request timeout defaults to 30 seconds and can be changed with
+`--timeout-seconds` or `NARJAR_PUSH_TIMEOUT_SECONDS`. The server publishes the
+NAR before its narinfo, and consumers only see a path after the metadata is
+durable. Nix remains required for closure enumeration,
 signing, and canonical NAR serialization; the push transfer itself does not
 invoke `nix copy`. Referenced store paths are uploaded in deterministic
 dependency waves; independent paths within a wave use the bounded `--jobs`

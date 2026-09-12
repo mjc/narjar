@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::OnceLock,
@@ -34,6 +34,10 @@ pub(crate) struct Push {
     /// NAR representation requested from the destination cache.
     #[arg(long, value_enum, default_value_t = Compression::None)]
     compression: Compression,
+
+    /// Maximum time allowed for each native HTTP request.
+    #[arg(long, env = "NARJAR_PUSH_TIMEOUT_SECONDS", default_value_t = NonZeroU64::new(30).unwrap())]
+    timeout_seconds: NonZeroU64,
 
     /// Netrc file used for HTTP authentication.
     #[arg(long)]
@@ -210,6 +214,7 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
             let netrc_file = args.netrc_file.clone();
             let refresh = args.refresh;
             let compression = args.compression;
+            let timeout_seconds = args.timeout_seconds;
             let metadata = chunk.to_vec();
             workers.push(thread::spawn(move || {
                 native_copy_paths(
@@ -217,6 +222,7 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
                     netrc_file.as_deref(),
                     refresh,
                     compression,
+                    timeout_seconds,
                     &metadata,
                 )
             }));
@@ -442,6 +448,7 @@ fn native_copy_paths(
     netrc_file: Option<&Path>,
     refresh: bool,
     compression: Compression,
+    timeout_seconds: NonZeroU64,
     metadata: &[PathInfo],
 ) -> Result<(), String> {
     let target = target_with_compression(target, compression);
@@ -451,7 +458,7 @@ fn native_copy_paths(
         .transpose()?;
     let agent: Agent = Agent::config_builder()
         .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(30)))
+        .timeout_global(Some(Duration::from_secs(timeout_seconds.get())))
         .build()
         .into();
 
@@ -1049,6 +1056,23 @@ mod tests {
         let push = Push::from_arg_matches(&matches).expect("push arguments should parse");
 
         assert_eq!(push.jobs.get(), 1);
+    }
+
+    #[test]
+    fn push_accepts_an_http_timeout() {
+        let matches = Push::augment_args(Command::new("push"))
+            .try_get_matches_from([
+                "push",
+                "--to",
+                "https://cache.example",
+                "--timeout-seconds",
+                "7",
+                "/run/current-system",
+            ])
+            .expect("push timeout should parse");
+        let push = Push::from_arg_matches(&matches).expect("push arguments should parse");
+
+        assert_eq!(push.timeout_seconds.get(), 7);
     }
 
     #[test]

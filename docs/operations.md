@@ -67,6 +67,7 @@ narjar stats
 narjar push
   --to STORE_URI
   [--jobs N]
+  [--timeout-seconds N]
   [--netrc-file PATH]
   [--signing-key-file PATH]
   [--refresh]
@@ -92,7 +93,9 @@ first invokes `nix store sign` over the complete closure and refreshes the
 structured metadata before uploading. `--compression` selects the destination
 NAR representation (`none`, `zstd`, or `xz`) and defaults to `none`. Publication
 remains Narjar's existing atomic per-object operation; the client uses
-fixed-length streamed requests and does not invoke `nix copy`. The `nix`
+fixed-length streamed requests and does not invoke `nix copy`. Each native HTTP
+request has a 30-second timeout by default; `--timeout-seconds` or
+`NARJAR_PUSH_TIMEOUT_SECONDS` changes it. The `nix`
 executable remains required for closure enumeration, signing, and canonical NAR
 serialization. `--netrc-file` is parsed by Narjar and its matching credential
 is sent as HTTP Basic authentication; the file must already have restrictive
