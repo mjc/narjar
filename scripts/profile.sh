@@ -80,11 +80,6 @@ BASH_XTRACEFD=3
 PS4='+ ${BASH_SOURCE}:${LINENO}: '
 set -x
 
-while read -r pid; do
-  kill -TERM "$pid" 2>/dev/null || true
-done < <(pgrep -f '/tmp/narjar-profile\.[^ ]*/target/profiling/narjar serve' || true)
-sleep 0.2
-
 TARGET="$OUTPUT/target"
 BIN="$TARGET/profiling/narjar"
 DATA="$OUTPUT/data"
@@ -101,6 +96,15 @@ READ_NAR_BYTES=""
 SERVER_PID=""
 PERF_PID=""
 HEAPTRACK_PID=""
+
+if [[ -x "$BIN" ]]; then
+  while read -r pid; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done < <(
+    ps -eo pid=,args= |
+      awk -v bin="$BIN" '$2 == bin && $3 == "serve" { print $1 }'
+  )
+fi
 
 cleanup() {
   local status=$?

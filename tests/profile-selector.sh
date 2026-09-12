@@ -5,6 +5,9 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf -- "$WORK_DIR"' EXIT
 
+! grep -q "pgrep -f '/tmp/narjar-profile" "$ROOT/scripts/profile.sh"
+grep -q 'ps -eo pid=,args=' "$ROOT/scripts/profile.sh"
+
 printf '%s\n' \
   '[' \
   '  {"path":"/nix/store/store-a","narSize":30},' \
