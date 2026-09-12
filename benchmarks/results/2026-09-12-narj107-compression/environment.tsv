@@ -1,0 +1,12 @@
+field	value
+recorded_date	2026-09-12
+binary	/nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar
+binary_source_revision	not recorded by the run
+pilot_artifact	/home/mjc/narjar-corpora/narjar-real-nix-v1/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0.nar
+pilot_root_nar_bytes	698704
+pilot_closure_paths	7
+large_artifact	/home/mjc/narjar-corpora/narjar-real-nix-v1/cqlx62f919g8xf2f39bmykslpjdh9z0j-rustc-1.97.1.nar
+large_root_nar_bytes	1090707416
+large_closure_paths	12
+filesystem	not recorded by the run
+repetitions	1 per encoding

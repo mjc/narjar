@@ -1,0 +1,18 @@
+ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar init --data-dir /tmp/narj107-real.vK7Aw1/data-none
+ nix-store --generate-binary-cache-key narj107-none /tmp/narj107-real.vK7Aw1/secret-none /tmp/narj107-real.vK7Aw1/public-none
+ cp -- /tmp/narj107-real.vK7Aw1/public-none /tmp/narj107-real.vK7Aw1/data-none/trusted-public-keys
+ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar serve --data-dir /tmp/narj107-real.vK7Aw1/data-none --listen 127.0.0.1:0 --workers 32
+ nix store sign --key-file /tmp/narj107-real.vK7Aw1/secret-none /nix/store/bf6wgamqnl3c91iamlb1branrfcwwy7x-libunistring-1.4.2 /nix/store/6qa00czc79b3nb6ld0mdyacfp2p1k3jx-libidn2-2.3.8 /nix/store/g54b6ghpnn98hfdz4yqw87w10c3hx8bv-xgcc-15.2.0-libgcc /nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61 /nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2 /nix/store/y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2 /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+ nix copy --refresh --option netrc-file /tmp/narj107-real.vK7Aw1/netrc-none --to http://127.0.0.1:41491\?compression=none /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar init --data-dir /tmp/narj107-real.vK7Aw1/data-zstd
+ nix-store --generate-binary-cache-key narj107-zstd /tmp/narj107-real.vK7Aw1/secret-zstd /tmp/narj107-real.vK7Aw1/public-zstd
+ cp -- /tmp/narj107-real.vK7Aw1/public-zstd /tmp/narj107-real.vK7Aw1/data-zstd/trusted-public-keys
+ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar serve --data-dir /tmp/narj107-real.vK7Aw1/data-zstd --listen 127.0.0.1:0 --workers 32
+ nix store sign --key-file /tmp/narj107-real.vK7Aw1/secret-zstd /nix/store/bf6wgamqnl3c91iamlb1branrfcwwy7x-libunistring-1.4.2 /nix/store/6qa00czc79b3nb6ld0mdyacfp2p1k3jx-libidn2-2.3.8 /nix/store/g54b6ghpnn98hfdz4yqw87w10c3hx8bv-xgcc-15.2.0-libgcc /nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61 /nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2 /nix/store/y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2 /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+ nix copy --refresh --option netrc-file /tmp/narj107-real.vK7Aw1/netrc-zstd --to http://127.0.0.1:42745\?compression=zstd /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar init --data-dir /tmp/narj107-real.vK7Aw1/data-xz
+ nix-store --generate-binary-cache-key narj107-xz /tmp/narj107-real.vK7Aw1/secret-xz /tmp/narj107-real.vK7Aw1/public-xz
+ cp -- /tmp/narj107-real.vK7Aw1/public-xz /tmp/narj107-real.vK7Aw1/data-xz/trusted-public-keys
+ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar serve --data-dir /tmp/narj107-real.vK7Aw1/data-xz --listen 127.0.0.1:0 --workers 32
+ nix store sign --key-file /tmp/narj107-real.vK7Aw1/secret-xz /nix/store/bf6wgamqnl3c91iamlb1branrfcwwy7x-libunistring-1.4.2 /nix/store/6qa00czc79b3nb6ld0mdyacfp2p1k3jx-libidn2-2.3.8 /nix/store/g54b6ghpnn98hfdz4yqw87w10c3hx8bv-xgcc-15.2.0-libgcc /nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61 /nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2 /nix/store/y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2 /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+ nix copy --refresh --option netrc-file /tmp/narj107-real.vK7Aw1/netrc-xz --to http://127.0.0.1:45269\?compression=xz /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0

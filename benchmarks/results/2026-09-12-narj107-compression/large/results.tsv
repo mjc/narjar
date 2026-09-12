@@ -1,0 +1,3 @@
+RESULT	none	status=0	wall_ms=25155.463	server_cpu_ticks=419	peak_rss_kib=8008	logical_bytes=1708941784	allocated_bytes=456106496	file_size=1090707416	compression=none
+RESULT	zstd	status=0	wall_ms=41028.421	server_cpu_ticks=1780	peak_rss_kib=16772	logical_bytes=485858121	allocated_bytes=485759488	file_size=326614652	compression=zstd
+RESULT	xz	status=0	wall_ms=831362.828	server_cpu_ticks=4471	peak_rss_kib=16632	logical_bytes=333542988	allocated_bytes=333787136	file_size=225001608	compression=xz

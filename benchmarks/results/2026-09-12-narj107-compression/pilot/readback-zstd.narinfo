@@ -1,0 +1,18 @@
+StorePath: /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+URL: nar/0zvrp56bfgnlx9axshl7r57y9mdmqgdmlywz9k0jsmaapsj4702m.nar.zst
+Compression: zstd
+FileHash: sha256:0zvrp56bfgnlx9axshl7r57y9mdmqgdmlywz9k0jsmaapsj4702m
+FileSize: 305617
+NarHash: sha256:0zplh1il46ia0zr86bzl5wgmbvj2zvik7d5ypywznyqrwc556vd2
+NarSize: 698704
+References: 57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61 61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2 y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2
+Deriver: y24km90ayshr6jpfc2qvjpnv49xdwfgb-libssh-0.12.0.drv
+Sig: cache.nixos.org-1:FhL7LkYeMb806SpHQAqR0obWs1sEyeKTCeLGejc8J42mYixuLEWwG1RAEvvPjuNBbND/zgsZBl7Te9Xa5GllBw==
+Sig: narj107-none:4Ph8mo8OTLCcMz2gpE01ESgQnQeLSGMZnWgvMniM2mOK7lTQzGcY5vO8QzTejLkSIbdB5c/jOlaFgSAKFPYDBQ==
+Sig: narj107-none:6lSGpFcPhmDR6pyVJ8MH75yByHVV3bWWZ5pxcUmfnVnZT1uMFrLvMjNn9iZdkk4PbYoyMmwZsEDlyktuPtrZBA==
+Sig: narj107-none:bCf4XY5U7x/F65RMP4rOYnv2b77qrnGn5ylxSojhX+8o4CVXJcq2rhbfx06LyP2DBKy14zzjCr6eYD9xATVhAw==
+Sig: narj107-none:xqtTA4qzp+ZvmLrrnL7QeCynLjNxu/N61IYXM0p6a5pzEG7/UphnZPaTiGy8up/uNh6ZrG6GZyxaZcr2aZCgCQ==
+Sig: narj107-zstd:DFKumkohfEwnvOO9GonznC41oBzfRDar+mpBZjBr+XHA9gyTBSHAf2hI0FRkgBenO/FpWWvKDRioFlBfpa2uCg==
+Sig: narjar-106-green:eECN0N4zCWb3dWIk0k9g+Xc7yqlIrk6sqouTHq+DZgXXkKzpdaYUBpm/YmSbYADHNLlhveYPRhNlzrvM4QMLDA==
+Sig: narjar-106:rp7oz2kLViz3ziOPu1RIj8up+VpnVthPVlMigSCwQc6wYhS04HMTsqsuOeABAIiYLJOw0AcirlTSX1/i/oDHDQ==
+Sig: narjar-lan:tVlA/s4Gc5AAOScg67VWBy2lqurH/BNbi1YROUVUWpSrF1bxMlbGaZ2kt7NVSg97xRHZVK1MTw+e0lWWc7HmAg==

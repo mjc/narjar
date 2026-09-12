@@ -1,0 +1,2 @@
+READBACK	zstd	copy_status=0	verify_status=0	range_status=206	range_bytes=64	wall_ms=1483.470
+READBACK	xz	copy_status=0	verify_status=0	range_status=206	range_bytes=64	wall_ms=1769.385

@@ -1,0 +1,87 @@
+OUTPUT /tmp/narj107-real.vK7Aw1
+ARTIFACT /home/mjc/narjar-corpora/narjar-real-nix-v1/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0.nar
+STORE_PATH /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+NAR_SIZE 698704
+CLOSURE_PATHS 7
+Using saved setting for 'extra-substituters = https://crane.cachix.org' from ~/.local/share/nix/trusted-settings.json.
+Using saved setting for 'extra-trusted-public-keys = crane.cachix.org-1:8Scfpmn9w+hGdXH/Q9tTLiYAE/2dnJYRJP7kl80GuRk=' from ~/.local/share/nix/trusted-settings.json.
+NARJAR_BIN /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar
++ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar init --data-dir /tmp/narj107-real.vK7Aw1/data-none
++ nix-store --generate-binary-cache-key narj107-none /tmp/narj107-real.vK7Aw1/secret-none /tmp/narj107-real.vK7Aw1/public-none
++ cp -- /tmp/narj107-real.vK7Aw1/public-none /tmp/narj107-real.vK7Aw1/data-none/trusted-public-keys
++ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar serve --data-dir /tmp/narj107-real.vK7Aw1/data-none --listen 127.0.0.1:0 --workers 32
+ENCODING none URL http://127.0.0.1:41491
++ nix store sign --key-file /tmp/narj107-real.vK7Aw1/secret-none /nix/store/bf6wgamqnl3c91iamlb1branrfcwwy7x-libunistring-1.4.2 /nix/store/6qa00czc79b3nb6ld0mdyacfp2p1k3jx-libidn2-2.3.8 /nix/store/g54b6ghpnn98hfdz4yqw87w10c3hx8bv-xgcc-15.2.0-libgcc /nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61 /nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2 /nix/store/y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2 /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+added 7 signatures
++ nix copy --refresh --option netrc-file /tmp/narj107-real.vK7Aw1/netrc-none --to http://127.0.0.1:41491\?compression=none /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+copying 7 paths...
+copying path '/nix/store/g54b6ghpnn98hfdz4yqw87w10c3hx8bv-xgcc-15.2.0-libgcc' to 'http://127.0.0.1:41491'...
+copying path '/nix/store/bf6wgamqnl3c91iamlb1branrfcwwy7x-libunistring-1.4.2' to 'http://127.0.0.1:41491'...
+copying path '/nix/store/6qa00czc79b3nb6ld0mdyacfp2p1k3jx-libidn2-2.3.8' to 'http://127.0.0.1:41491'...
+copying path '/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61' to 'http://127.0.0.1:41491'...
+copying path '/nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2' to 'http://127.0.0.1:41491'...
+copying path '/nix/store/y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2' to 'http://127.0.0.1:41491'...
+copying path '/nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0' to 'http://127.0.0.1:41491'...
+RESULT	none	0	698704	13879296	4636.327	/tmp/narj107-real.vK7Aw1
+RESULT	/home/mjc/narjar-corpora/narjar-real-nix-v1/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0.nar					
+URL: nar/0zplh1il46ia0zr86bzl5wgmbvj2zvik7d5ypywznyqrwc556vd2.nar
+Compression: none
+FileHash: sha256:0zplh1il46ia0zr86bzl5wgmbvj2zvik7d5ypywznyqrwc556vd2
+FileSize: 698704
+NarHash: sha256:0zplh1il46ia0zr86bzl5wgmbvj2zvik7d5ypywznyqrwc556vd2
+NarSize: 698704
+--- server log
+listening http://127.0.0.1:41491 workers=32 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824 shutdown_grace_seconds=30 io_timeout_seconds=30
++ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar init --data-dir /tmp/narj107-real.vK7Aw1/data-zstd
++ nix-store --generate-binary-cache-key narj107-zstd /tmp/narj107-real.vK7Aw1/secret-zstd /tmp/narj107-real.vK7Aw1/public-zstd
++ cp -- /tmp/narj107-real.vK7Aw1/public-zstd /tmp/narj107-real.vK7Aw1/data-zstd/trusted-public-keys
++ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar serve --data-dir /tmp/narj107-real.vK7Aw1/data-zstd --listen 127.0.0.1:0 --workers 32
+ENCODING zstd URL http://127.0.0.1:42745
++ nix store sign --key-file /tmp/narj107-real.vK7Aw1/secret-zstd /nix/store/bf6wgamqnl3c91iamlb1branrfcwwy7x-libunistring-1.4.2 /nix/store/6qa00czc79b3nb6ld0mdyacfp2p1k3jx-libidn2-2.3.8 /nix/store/g54b6ghpnn98hfdz4yqw87w10c3hx8bv-xgcc-15.2.0-libgcc /nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61 /nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2 /nix/store/y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2 /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+added 7 signatures
++ nix copy --refresh --option netrc-file /tmp/narj107-real.vK7Aw1/netrc-zstd --to http://127.0.0.1:42745\?compression=zstd /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+copying 7 paths...
+copying path '/nix/store/g54b6ghpnn98hfdz4yqw87w10c3hx8bv-xgcc-15.2.0-libgcc' to 'http://127.0.0.1:42745'...
+copying path '/nix/store/bf6wgamqnl3c91iamlb1branrfcwwy7x-libunistring-1.4.2' to 'http://127.0.0.1:42745'...
+copying path '/nix/store/6qa00czc79b3nb6ld0mdyacfp2p1k3jx-libidn2-2.3.8' to 'http://127.0.0.1:42745'...
+copying path '/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61' to 'http://127.0.0.1:42745'...
+copying path '/nix/store/y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2' to 'http://127.0.0.1:42745'...
+copying path '/nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2' to 'http://127.0.0.1:42745'...
+copying path '/nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0' to 'http://127.0.0.1:42745'...
+RESULT	zstd	0	698704	1052672	3638.418	/tmp/narj107-real.vK7Aw1
+RESULT	/home/mjc/narjar-corpora/narjar-real-nix-v1/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0.nar					
+URL: nar/0zvrp56bfgnlx9axshl7r57y9mdmqgdmlywz9k0jsmaapsj4702m.nar.zst
+Compression: zstd
+FileHash: sha256:0zvrp56bfgnlx9axshl7r57y9mdmqgdmlywz9k0jsmaapsj4702m
+FileSize: 305617
+NarHash: sha256:0zplh1il46ia0zr86bzl5wgmbvj2zvik7d5ypywznyqrwc556vd2
+NarSize: 698704
+--- server log
+listening http://127.0.0.1:42745 workers=32 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824 shutdown_grace_seconds=30 io_timeout_seconds=30
++ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar init --data-dir /tmp/narj107-real.vK7Aw1/data-xz
++ nix-store --generate-binary-cache-key narj107-xz /tmp/narj107-real.vK7Aw1/secret-xz /tmp/narj107-real.vK7Aw1/public-xz
++ cp -- /tmp/narj107-real.vK7Aw1/public-xz /tmp/narj107-real.vK7Aw1/data-xz/trusted-public-keys
++ /nix/store/p3ckqryifxg9lfki9f7kbr1llggrmxli-narjar-0.1.0/bin/narjar serve --data-dir /tmp/narj107-real.vK7Aw1/data-xz --listen 127.0.0.1:0 --workers 32
+ENCODING xz URL http://127.0.0.1:45269
++ nix store sign --key-file /tmp/narj107-real.vK7Aw1/secret-xz /nix/store/bf6wgamqnl3c91iamlb1branrfcwwy7x-libunistring-1.4.2 /nix/store/6qa00czc79b3nb6ld0mdyacfp2p1k3jx-libidn2-2.3.8 /nix/store/g54b6ghpnn98hfdz4yqw87w10c3hx8bv-xgcc-15.2.0-libgcc /nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61 /nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2 /nix/store/y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2 /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+added 7 signatures
++ nix copy --refresh --option netrc-file /tmp/narj107-real.vK7Aw1/netrc-xz --to http://127.0.0.1:45269\?compression=xz /nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0
+copying 7 paths...
+copying path '/nix/store/g54b6ghpnn98hfdz4yqw87w10c3hx8bv-xgcc-15.2.0-libgcc' to 'http://127.0.0.1:45269'...
+copying path '/nix/store/bf6wgamqnl3c91iamlb1branrfcwwy7x-libunistring-1.4.2' to 'http://127.0.0.1:45269'...
+copying path '/nix/store/6qa00czc79b3nb6ld0mdyacfp2p1k3jx-libidn2-2.3.8' to 'http://127.0.0.1:45269'...
+copying path '/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61' to 'http://127.0.0.1:45269'...
+copying path '/nix/store/y18pnbvfarnilsmgayswvi1khaw9wbsc-openssl-3.6.2' to 'http://127.0.0.1:45269'...
+copying path '/nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2' to 'http://127.0.0.1:45269'...
+copying path '/nix/store/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0' to 'http://127.0.0.1:45269'...
+RESULT	xz	0	698704	10566144	22038.590	/tmp/narj107-real.vK7Aw1
+RESULT	/home/mjc/narjar-corpora/narjar-real-nix-v1/002784hlqqxjqfw6fmr55w6b1y5k33yl-libssh-0.12.0.nar					
+URL: nar/0p0ni099ly5pfhsasr6n7l7z5daczi9nj2infigalwwx7qbi2wkw.nar.xz
+Compression: xz
+FileHash: sha256:0p0ni099ly5pfhsasr6n7l7z5daczi9nj2infigalwwx7qbi2wkw
+FileSize: 237736
+NarHash: sha256:0zplh1il46ia0zr86bzl5wgmbvj2zvik7d5ypywznyqrwc556vd2
+NarSize: 698704
+--- server log
+listening http://127.0.0.1:45269 workers=32 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824 shutdown_grace_seconds=30 io_timeout_seconds=30
+RESULTS /tmp/narj107-real.vK7Aw1/results.tsv
