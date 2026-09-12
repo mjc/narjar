@@ -77,7 +77,9 @@ from temporary files, and authenticates with the matching netrc entry. The
 server publishes the NAR before its narinfo, and consumers only see a path
 after the metadata is durable. Nix remains required for closure enumeration,
 signing, and canonical NAR serialization; the push transfer itself does not
-invoke `nix copy`.
+invoke `nix copy`. Referenced store paths are uploaded in deterministic
+dependency waves; independent paths within a wave use the bounded `--jobs`
+parallelism.
 
 ## Inspect and maintain a cache
 

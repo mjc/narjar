@@ -85,8 +85,9 @@ environment variable, logs, or the hash file.
 
 push is a client-side convenience command for native Rust HTTP uploads. It
 resolves the requested installables with `nix path-info --recursive --json`,
-partitions the resulting closure across bounded workers, and uploads each
-canonical NAR followed by its signed narinfo. With `--signing-key-file`, it
+orders the resulting closure into deterministic dependency waves, and uploads
+each canonical NAR followed by its signed narinfo. Independent paths within a
+wave use the bounded workers. With `--signing-key-file`, it
 first invokes `nix store sign` over the complete closure and refreshes the
 structured metadata before uploading. `--compression` selects the destination
 NAR representation (`none`, `zstd`, or `xz`) and defaults to `none`. Publication

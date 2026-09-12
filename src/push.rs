@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     num::NonZeroUsize,
@@ -195,47 +195,53 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
         sign_paths(key_file, &paths)?;
         metadata = closure_paths(&args.paths)?;
     }
-    let worker_count = args.jobs.get().min(metadata.len());
-    let chunk_size = metadata.len().div_ceil(worker_count);
-    let mut workers = Vec::with_capacity(worker_count);
-
-    for chunk in metadata.chunks(chunk_size) {
-        let target = args.to.clone();
-        let netrc_file = args.netrc_file.clone();
-        let refresh = args.refresh;
-        let compression = args.compression;
-        let metadata = chunk.to_vec();
-        workers.push(thread::spawn(move || {
-            native_copy_paths(
-                &target,
-                netrc_file.as_deref(),
-                refresh,
-                compression,
-                &metadata,
-            )
-        }));
-    }
+    let waves = dependency_waves(metadata)?;
+    let total_paths = waves.iter().map(Vec::len).sum::<usize>();
+    let worker_count = args.jobs.get().min(total_paths);
 
     let mut failures = 0;
-    for worker in workers {
-        match worker.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(message)) => {
-                eprintln!("narjar push: {message}");
-                failures += 1;
+    for wave in waves {
+        let wave_worker_count = args.jobs.get().min(wave.len());
+        let chunk_size = wave.len().div_ceil(wave_worker_count);
+        let mut workers = Vec::with_capacity(wave_worker_count);
+
+        for chunk in wave.chunks(chunk_size) {
+            let target = args.to.clone();
+            let netrc_file = args.netrc_file.clone();
+            let refresh = args.refresh;
+            let compression = args.compression;
+            let metadata = chunk.to_vec();
+            workers.push(thread::spawn(move || {
+                native_copy_paths(
+                    &target,
+                    netrc_file.as_deref(),
+                    refresh,
+                    compression,
+                    &metadata,
+                )
+            }));
+        }
+
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => {
+                    eprintln!("narjar push: {message}");
+                    failures += 1;
+                }
+                Err(_) => {
+                    eprintln!("narjar push: worker panicked");
+                    failures += 1;
+                }
             }
-            Err(_) => {
-                eprintln!("narjar push: worker panicked");
-                failures += 1;
-            }
+        }
+        if failures != 0 {
+            break;
         }
     }
 
     if failures == 0 {
-        println!(
-            "pushed {} paths with {worker_count} workers",
-            metadata.len()
-        );
+        println!("pushed {total_paths} paths with {worker_count} workers");
         Ok(())
     } else {
         Err(Error::runtime(format!("{failures} push workers failed")))
@@ -320,6 +326,84 @@ fn closure_paths(installables: &[String]) -> Result<Vec<PathInfo>, Error> {
     } else {
         Ok(paths)
     }
+}
+
+fn dependency_waves(metadata: Vec<PathInfo>) -> Result<Vec<Vec<PathInfo>>, Error> {
+    let mut by_path = BTreeMap::new();
+    for info in metadata {
+        if by_path.insert(info.path.clone(), info).is_some() {
+            return Err(Error::runtime(
+                "nix path-info returned a duplicate store path",
+            ));
+        }
+    }
+
+    let mut indegree = by_path
+        .keys()
+        .map(|path| (path.clone(), 0usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut dependents = BTreeMap::<String, Vec<String>>::new();
+    for info in by_path.values() {
+        let mut references = info
+            .references
+            .iter()
+            .filter(|reference| by_path.contains_key(*reference))
+            .collect::<Vec<_>>();
+        references.sort_unstable();
+        references.dedup();
+        for reference in references {
+            *indegree
+                .get_mut(&info.path)
+                .expect("every path has an indegree") += 1;
+            dependents
+                .entry(reference.clone())
+                .or_default()
+                .push(info.path.clone());
+        }
+    }
+
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(path, _)| path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut waves = Vec::new();
+    let mut emitted = 0;
+
+    while !ready.is_empty() {
+        let paths = ready.iter().cloned().collect::<Vec<_>>();
+        ready.clear();
+        let mut wave = Vec::with_capacity(paths.len());
+        for path in paths {
+            wave.push(
+                by_path
+                    .remove(&path)
+                    .expect("ready path should have metadata"),
+            );
+            emitted += 1;
+        }
+        for info in &wave {
+            if let Some(children) = dependents.get(&info.path) {
+                for child in children {
+                    let degree = indegree
+                        .get_mut(child)
+                        .expect("dependent path has an indegree");
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.insert(child.clone());
+                    }
+                }
+            }
+        }
+        waves.push(wave);
+    }
+
+    if emitted != indegree.len() {
+        return Err(Error::runtime(
+            "nix path-info returned cyclic store references",
+        ));
+    }
+    Ok(waves)
 }
 
 fn run_path_command(mut command: Command, paths: &[String], name: &str) -> Result<(), String> {
@@ -699,7 +783,8 @@ mod tests {
     use clap::{Args, Command, FromArgMatches};
 
     use super::{
-        Agent, Compression, PathInfo, Push, is_retryable_status, parse_path_info, serialize_narinfo,
+        Agent, Compression, PathInfo, Push, dependency_waves, is_retryable_status, parse_path_info,
+        serialize_narinfo,
     };
 
     #[test]
@@ -916,6 +1001,37 @@ mod tests {
         let push = Push::from_arg_matches(&matches).expect("push arguments should parse");
 
         assert_eq!(push.jobs.get(), 1);
+    }
+
+    #[test]
+    fn dependency_waves_put_references_before_dependents() {
+        let dependency = PathInfo {
+            path: "/nix/store/00000000000000000000000000000000-dependency".to_owned(),
+            ca: None,
+            deriver: None,
+            nar_hash: "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=".to_owned(),
+            nar_size: 289656,
+            references: Vec::new(),
+            signatures: Vec::new(),
+        };
+        let dependent = PathInfo {
+            path: "/nix/store/11111111111111111111111111111111-dependent".to_owned(),
+            references: vec![dependency.path.clone()],
+            ..dependency.clone()
+        };
+
+        let waves = dependency_waves(vec![dependent, dependency]).expect("acyclic closure");
+        let paths = waves
+            .into_iter()
+            .map(|wave| wave.into_iter().map(|info| info.path).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                vec!["/nix/store/00000000000000000000000000000000-dependency".to_owned()],
+                vec!["/nix/store/11111111111111111111111111111111-dependent".to_owned()],
+            ]
+        );
     }
 
     #[test]
