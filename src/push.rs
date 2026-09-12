@@ -488,6 +488,7 @@ fn native_copy_paths(
             &agent,
             &nar_url,
             prepared.file.path(),
+            "application/x-nix-nar",
             authorization.as_deref(),
         )?;
         if !matches!(nar_status, 200 | 201) {
@@ -499,7 +500,13 @@ fn native_copy_paths(
 
         let narinfo =
             serialize_narinfo(info, &prepared.file_hash, prepared.file_size, compression)?;
-        let narinfo_status = put_bytes(&agent, &narinfo_url, &narinfo, authorization.as_deref())?;
+        let narinfo_status = put_bytes(
+            &agent,
+            &narinfo_url,
+            &narinfo,
+            "text/x-nix-narinfo",
+            authorization.as_deref(),
+        )?;
         if !matches!(narinfo_status, 200 | 201) {
             return Err(format!(
                 "narinfo upload for {} returned HTTP {narinfo_status}",
@@ -600,12 +607,13 @@ fn put_file(
     agent: &Agent,
     url: &str,
     path: &Path,
+    content_type: &str,
     authorization: Option<&str>,
 ) -> Result<u16, String> {
     for attempt in 0..MAX_ATTEMPTS {
         let file = File::open(path)
             .map_err(|error| format!("opening NAR for PUT {url} failed: {error}"))?;
-        let mut request = agent.put(url);
+        let mut request = agent.put(url).header("Content-Type", content_type);
         if let Some(authorization) = authorization {
             request = request.header("Authorization", format!("Basic {authorization}"));
         }
@@ -637,10 +645,11 @@ fn put_bytes(
     agent: &Agent,
     url: &str,
     bytes: &[u8],
+    content_type: &str,
     authorization: Option<&str>,
 ) -> Result<u16, String> {
     for attempt in 0..MAX_ATTEMPTS {
-        let mut request = agent.put(url);
+        let mut request = agent.put(url).header("Content-Type", content_type);
         if let Some(authorization) = authorization {
             request = request.header("Authorization", format!("Basic {authorization}"));
         }
@@ -1035,12 +1044,110 @@ mod tests {
                 &agent,
                 &format!("http://{address}/nar/test.nar"),
                 payload.path(),
+                "application/x-nix-nar",
                 None
             )
             .expect("upload retry should eventually succeed"),
             201
         );
         server.join().expect("upload retry test server should exit");
+    }
+
+    #[test]
+    fn uploads_set_protocol_content_types() {
+        use std::{
+            fs,
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        let payload = tempfile::NamedTempFile::new().expect("create content-type test file");
+        fs::write(payload.path(), b"NAR payload").expect("write content-type test file");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind content-type listener");
+        let address = listener
+            .local_addr()
+            .expect("inspect content-type listener");
+        let server = thread::spawn(move || {
+            fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let read = stream.read(&mut buffer).expect("read content-type request");
+                    assert_ne!(read, 0, "content-type request ended before its headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let content_length = request[..header_end]
+                        .split(|&byte| byte == b'\n')
+                        .find_map(|line| {
+                            let separator = line.iter().position(|&byte| byte == b':')?;
+                            let (name, value) = line.split_at(separator);
+                            name.eq_ignore_ascii_case(b"content-length")
+                                .then(|| &value[1..])
+                                .and_then(|value| std::str::from_utf8(value).ok())
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .expect("content-type request should have a Content-Length");
+                    if request.len() >= header_end + 4 + content_length {
+                        return request;
+                    }
+                }
+            }
+
+            for expected_content_type in ["application/x-nix-nar", "text/x-nix-narinfo"] {
+                let (mut stream, _) = listener.accept().expect("accept content-type request");
+                let request = read_request(&mut stream);
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .expect("content-type request should contain headers");
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let expected_header = format!("content-type: {expected_content_type}");
+                assert!(
+                    headers
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case(&expected_header)),
+                    "upload should identify its media type: {headers}"
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write content-type response");
+            }
+        });
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        assert_eq!(
+            super::put_file(
+                &agent,
+                &format!("http://{address}/nar/test.nar"),
+                payload.path(),
+                "application/x-nix-nar",
+                None
+            )
+            .expect("content-type upload should succeed"),
+            201
+        );
+        assert_eq!(
+            super::put_bytes(
+                &agent,
+                &format!("http://{address}/store.narinfo"),
+                b"StorePath: /nix/store/test\n",
+                "text/x-nix-narinfo",
+                None
+            )
+            .expect("narinfo content-type upload should succeed"),
+            201
+        );
+        server.join().expect("content-type server should exit");
     }
 
     #[test]
