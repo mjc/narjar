@@ -285,7 +285,7 @@ impl Metrics {
              # HELP narjar_publications_total Publication attempts.\n# TYPE narjar_publications_total counter\nnarjar_publications_total {}\n\
              # HELP narjar_publication_duration_seconds Publication duration summary.\n# TYPE narjar_publication_duration_seconds summary\nnarjar_publication_duration_seconds_count {}\nnarjar_publication_duration_seconds_sum {}\nnarjar_publication_duration_seconds_max {}\n\
              # HELP narjar_publication_queue_depth Valid PUT requests waiting for the publication worker.\n# TYPE narjar_publication_queue_depth gauge\nnarjar_publication_queue_depth {}\n\
-             # HELP narjar_publication_queue_wait_seconds Queue wait before serialized publication.\n# TYPE narjar_publication_queue_wait_seconds summary\nnarjar_publication_queue_wait_seconds_count {}\nnarjar_publication_queue_wait_seconds_sum {}\nnarjar_publication_queue_wait_seconds_max {}\n\
+             # HELP narjar_publication_queue_wait_seconds Queue wait before publication worker execution.\n# TYPE narjar_publication_queue_wait_seconds summary\nnarjar_publication_queue_wait_seconds_count {}\nnarjar_publication_queue_wait_seconds_sum {}\nnarjar_publication_queue_wait_seconds_max {}\n\
              # HELP narjar_ready Whether the configured destination is ready.\n# TYPE narjar_ready gauge\nnarjar_ready {}\n",
             load(&self.bytes_in), load(&self.bytes_out), load(&self.auth_read_failures),
             load(&self.auth_write_failures), load(&self.validation_body_failures),
