@@ -277,9 +277,9 @@ run cmp "$refresh_path" "$refresh_root$refresh_path"
 scenario 'concurrent identical native uploads'
 concurrent_path=$(build_path concurrent "$nonce")
 sign_path "$concurrent_path"
-cache_copy_to "$concurrent_path" >"$temp_root/concurrent-1.log" 2>&1 &
+native_push_to "$concurrent_path" >"$temp_root/concurrent-1.log" 2>&1 &
 copy_one=$!
-cache_copy_to "$concurrent_path" >"$temp_root/concurrent-2.log" 2>&1 &
+native_push_to "$concurrent_path" >"$temp_root/concurrent-2.log" 2>&1 &
 copy_two=$!
 if ! wait "$copy_one"; then
   cat "$temp_root/concurrent-1.log" >&2
