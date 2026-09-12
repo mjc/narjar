@@ -2406,11 +2406,16 @@ mod tests {
                     .is_err(),
                 "{boundary:?} unexpectedly succeeded"
             );
-            let record = fs::read_dir(directory.path().join(".narjar-transactions"))
-                .expect("read transaction directory")
+            let mut records = fs::read_dir(directory.path().join(".narjar-transactions"))
+                .expect("read transaction directory");
+            let record = records
                 .next()
                 .expect("faulted publication should retain a transaction")
                 .expect("read transaction entry");
+            assert!(
+                records.next().is_none(),
+                "state replacement must not leave an extra transaction record"
+            );
             let contents = fs::read(record.path()).expect("read transaction record");
             let contents = String::from_utf8(contents).expect("transaction record is UTF-8");
             assert!(

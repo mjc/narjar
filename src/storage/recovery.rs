@@ -1,8 +1,8 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::PermissionsExt,
+    io::{self, Read, Write},
+    os::{fd::AsRawFd, unix::ffi::OsStrExt, unix::fs::PermissionsExt},
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
@@ -24,7 +24,7 @@ static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(0);
 pub(super) struct PublicationTransaction {
     directory: File,
     name: OsString,
-    record: File,
+    path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,23 +65,40 @@ impl PublicationState {
 
 impl PublicationTransaction {
     pub(super) fn transition(&mut self, state: PublicationState) -> Result<(), StorageError> {
-        let mut contents = String::new();
-        self.record.seek(SeekFrom::Start(0))?;
-        self.record.read_to_string(&mut contents)?;
-        let path = contents
-            .lines()
-            .find_map(|line| line.strip_prefix("path="))
-            .ok_or_else(|| {
+        let temporary_name = OsString::from(format!(
+            "{}.next-{sequence:016x}",
+            self.name.to_string_lossy(),
+            sequence = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = (|| {
+            let mut replacement = open_at(
+                &self.directory,
+                &temporary_name,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )?;
+            replacement.set_permissions(fs::Permissions::from_mode(0o600))?;
+            let path = self.path.to_str().ok_or_else(|| {
                 io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "publication transaction record has no path",
+                    io::ErrorKind::InvalidInput,
+                    "publication transaction path is not UTF-8",
                 )
             })?;
-        self.record.seek(SeekFrom::Start(0))?;
-        self.record.set_len(0)?;
-        write!(self.record, "state={}\npath={path}\n", state.as_str())?;
-        self.record.sync_all()?;
-        self.directory.sync_all()?;
+            write!(replacement, "state={}\npath={path}\n", state.as_str())?;
+            replacement.sync_all()?;
+            rename_at(
+                &self.directory,
+                &temporary_name,
+                &self.directory,
+                &self.name,
+            )?;
+            self.directory.sync_all()?;
+            Ok::<_, io::Error>(())
+        })();
+        if let Err(error) = result {
+            let _ = unlink_at(&self.directory, &temporary_name);
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -135,7 +152,8 @@ impl RecoveryState {
         &self,
         temporary_path: &Path,
     ) -> Result<PublicationTransaction, StorageError> {
-        let temporary_path = temporary_path.to_str().ok_or_else(|| {
+        let temporary_path = temporary_path.to_owned();
+        let temporary_path_text = temporary_path.to_str().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "publication temporary path is not UTF-8",
@@ -152,13 +170,13 @@ impl RecoveryState {
             ) {
                 Ok(mut record) => {
                     record.set_permissions(fs::Permissions::from_mode(0o600))?;
-                    write!(record, "state=staging\npath={temporary_path}\n")?;
+                    write!(record, "state=staging\npath={temporary_path_text}\n")?;
                     record.sync_all()?;
                     self.transactions.sync_all()?;
                     return Ok(PublicationTransaction {
                         directory: self.transactions.try_clone()?,
                         name,
-                        record,
+                        path: temporary_path,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -323,6 +341,41 @@ impl RecoveryState {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+fn rename_at(
+    from_directory: &File,
+    from_name: &OsStr,
+    to_directory: &File,
+    to_name: &OsStr,
+) -> io::Result<()> {
+    let from_name = std::ffi::CString::new(from_name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "publication transaction name contains a NUL byte",
+        )
+    })?;
+    let to_name = std::ffi::CString::new(to_name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "publication transaction name contains a NUL byte",
+        )
+    })?;
+    // SAFETY: all descriptors and NUL-terminated names are live for the call;
+    // renameat does not retain either pointer.
+    let result = unsafe {
+        libc::renameat(
+            from_directory.as_raw_fd(),
+            from_name.as_ptr(),
+            to_directory.as_raw_fd(),
+            to_name.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
