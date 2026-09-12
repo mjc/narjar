@@ -27,7 +27,7 @@ pub(crate) struct Push {
     #[arg(long, value_parser = non_empty)]
     to: String,
 
-    /// Maximum number of native `nix copy` workers; each worker is internally concurrent.
+    /// Maximum number of native HTTP upload workers.
     #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
     jobs: NonZeroUsize,
 
@@ -35,7 +35,7 @@ pub(crate) struct Push {
     #[arg(long, value_enum, default_value_t = Compression::None)]
     compression: Compression,
 
-    /// Netrc file passed to Nix for HTTP authentication.
+    /// Netrc file used for HTTP authentication.
     #[arg(long)]
     netrc_file: Option<PathBuf>,
 

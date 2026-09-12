@@ -83,17 +83,19 @@ Callers redirect stdout to a mode-0600 secret store. token revoke removes one
 label by atomic file replacement. The secret itself is never in argv, an
 environment variable, logs, or the hash file.
 
-push is a client-side convenience command for native Nix copies. It resolves
-the requested installables once with `nix path-info --recursive`, partitions
-the resulting closure across bounded workers, and invokes native `nix copy`
-for each partition. With `--signing-key-file`, it first invokes `nix store sign`
-over the complete closure so each native copy can publish trusted narinfo
-metadata. `--compression` selects the destination URI's supported NAR
-representation (`none`, `zstd`, or `xz`) and defaults to `none`. Publication remains
-Narjar's existing atomic per-object operation;
-push does not parse NARs or implement a second Nix store protocol. The `nix`
-executable must be in PATH, and `--netrc-file` is passed to Nix as an HTTP
-credential file that must already have restrictive permissions.
+push is a client-side convenience command for native Rust HTTP uploads. It
+resolves the requested installables with `nix path-info --recursive --json`,
+partitions the resulting closure across bounded workers, and uploads each
+canonical NAR followed by its signed narinfo. With `--signing-key-file`, it
+first invokes `nix store sign` over the complete closure and refreshes the
+structured metadata before uploading. `--compression` selects the destination
+NAR representation (`none`, `zstd`, or `xz`) and defaults to `none`. Publication
+remains Narjar's existing atomic per-object operation; the client uses
+fixed-length streamed requests and does not invoke `nix copy`. The `nix`
+executable remains required for closure enumeration, signing, and canonical NAR
+serialization. `--netrc-file` is parsed by Narjar and its matching credential
+is sent as HTTP Basic authentication; the file must already have restrictive
+permissions.
 
 delete is offline-only: it refuses while the serve lock is held, removes the
 published narinfo after validation and directory sync, and deliberately leaves

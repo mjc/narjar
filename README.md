@@ -54,8 +54,8 @@ chmod 600 ./producer.sec
 cp ./producer.pub ./cache/trusted-public-keys
 ```
 
-Create a netrc containing the write token. The `push` command resolves the
-closure, signs it with the supplied key, and invokes native `nix copy` workers:
+Create a netrc containing the write token. The `push` command resolves and signs
+the closure with Nix, then performs the NAR and narinfo HTTP uploads in Rust:
 
 ```sh
 printf 'machine 127.0.0.1 login narjar password %s\n' "$(cat ./write.token)" > ./narjar.netrc
@@ -72,8 +72,12 @@ nix run . -- push \
 
 Use `--refresh` to re-check and re-upload paths already present at the
 destination. `--compression` is explicit and accepts `none`, `zstd`, or `xz`; it
-defaults to `none`. The server publishes the NAR before its narinfo, and
-consumers only see a path after the metadata is durable.
+defaults to `none`. The client uses fixed-length requests, streams NAR files
+from temporary files, and authenticates with the matching netrc entry. The
+server publishes the NAR before its narinfo, and consumers only see a path
+after the metadata is durable. Nix remains required for closure enumeration,
+signing, and canonical NAR serialization; the push transfer itself does not
+invoke `nix copy`.
 
 ## Inspect and maintain a cache
 
