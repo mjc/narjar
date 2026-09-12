@@ -1727,8 +1727,8 @@ mod tests {
     };
     use crate::narinfo::NarEncoding;
     use lzma_rust2::{XzOptions, XzReader, XzWriter};
-    use structured_zstd::encoding::{CompressionLevel, compress};
     use sha2::{Digest, Sha256};
+    use structured_zstd::encoding::{CompressionLevel, compress};
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
     const STORE_HASH: &str = "00000000000000000000000000000000";
@@ -2362,6 +2362,23 @@ mod tests {
                     .next()
                     .is_none(),
                 "{boundary:?} left a temporary file"
+            );
+            assert_eq!(
+                fs::read_dir(directory.path().join(".narjar-transactions"))
+                    .expect("read publication transaction directory")
+                    .count(),
+                1,
+                "{boundary:?} lost its durable recovery record"
+            );
+            storage
+                .finish_recovery(&directory.path().join("trusted-public-keys"))
+                .expect("recover failed publication");
+            assert_eq!(
+                fs::read_dir(directory.path().join(".narjar-transactions"))
+                    .expect("read recovered transaction directory")
+                    .count(),
+                0,
+                "{boundary:?} left its recovery record"
             );
         }
     }
