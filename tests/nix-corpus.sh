@@ -141,6 +141,14 @@ if PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
   exit 1
 fi
 grep -q 'targets\[0\] missing: resolved_root' "$WORK/schema-missing-target-field.err"
+jq '.entries[0].artifact = null' "$WORK/schema-only.json" > "$WORK/schema-missing-artifact-path.json"
+if PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/schema-missing-artifact-path.json" --schema-only \
+  > /dev/null 2> "$WORK/schema-missing-artifact-path.err"; then
+  echo "schema-only validation accepted incomplete artifact metadata" >&2
+  exit 1
+fi
+grep -q 'artifact metadata must be provided together' "$WORK/schema-missing-artifact-path.err"
 if PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
   --manifest "$WORK/schema-only.json" --schema-only --store \
   > /dev/null 2> "$WORK/schema-only-conflict.err"; then

@@ -106,14 +106,16 @@ manifest_issues() {
         "entries[\(.key)] must be an object"),
       (.entries | to_entries[] | select(.value | type == "object") |
         .key as $index | .value as $entry |
-        (["path", "nar_hash", "nar_size", "artifact_sha256", "targets", "machines", "families", "generations", "nixpkgs_revisions", "flake_refs", "derivations"] - ($entry | keys))[] |
+        (["path", "nar_hash", "nar_size", "artifact", "artifact_sha256", "targets", "machines", "families", "generations", "nixpkgs_revisions", "flake_refs", "derivations"] - ($entry | keys))[] |
         "entries[\($index)] missing: \(.)"),
       (.entries | to_entries[] | select(.value | type == "object") |
         .key as $index | .value as $entry |
         if ($entry.path | type != "string" or startswith("/nix/store/") | not) then "entries[\($index)] has invalid path" else empty end,
         if ($entry.nar_size | type != "number" or . < 0 or floor != .) then "entries[\($index)] has invalid nar_size" else empty end,
         if ($entry.nar_hash | type != "string" or startswith("sha256-") | not) then "entries[\($index)] has invalid nar_hash" else empty end,
-        if ($entry.artifact_sha256 != null and (($entry.artifact_sha256 | type) != "string" or ($entry.artifact_sha256 | length) != 64)) then "entries[\($index)] has invalid artifact_sha256" else empty end,
+        if ($entry.artifact != null and (($entry.artifact | type) != "string" or ($entry.artifact | length) == 0)) then "entries[\($index)] has invalid artifact" else empty end,
+        if (($entry.artifact == null) != ($entry.artifact_sha256 == null)) then "entries[\($index)] artifact metadata must be provided together" else empty end,
+        if ($entry.artifact_sha256 != null and (($entry.artifact_sha256 | type) != "string" or (($entry.artifact_sha256 | test("^[0-9a-f]{64}$")) | not))) then "entries[\($index)] has invalid artifact_sha256" else empty end,
         ("targets", "machines", "families", "generations", "nixpkgs_revisions", "flake_refs") as $field |
         if ($entry[$field] | string_list | not) then "entries[\($index)] has invalid \($field)" else empty end,
         if ($entry.derivations | derivation_list | not) then "entries[\($index)] has invalid derivations" else empty end),
