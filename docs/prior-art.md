@@ -12,9 +12,9 @@ atomic storage, ranges, metrics, reconciliation, real-socket conformance tests,
 and a real-Nix signature-gated end-to-end test.
 
 There is still a narrower design worth evaluating: a static, single-tenant,
-filesystem-only cache that stores compression=none and xz uploads byte-for-byte,
-requires client-signed narinfo, holds no signing key, has no database, no
-recompression, no online GC, and no background workers. That profile is a
+filesystem-only cache that stores compression=none, zstd, and xz uploads
+byte-for-byte, requires client-signed narinfo, holds no signing key, has no
+database, no recompression, no online GC, and no background workers. That profile is a
 strict subset between bincache and [Kasha](https://github.com/Zebradil/kasha).
 Narjar should proceed only if the architecture gate accepts those deletions and
 an adversarial comparison shows that adopting bincache or trimming Kasha would
@@ -127,7 +127,7 @@ Narjar differential would be:
 
 - Files are the index; startup validation is a bounded narinfo scan.
 - The server never owns a signing key and never rewrites signatures.
-- compression=none remains compression=none; no CPU-heavy recompression.
+- compression=none remains compression=none; zstd and xz are retained as uploaded; no CPU-heavy recompression.
 - No io_uring-specific runtime path, sharding, redb, rkyv, metrics dependency,
   key rotation, or online deletion in v0.1.
 

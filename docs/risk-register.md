@@ -111,9 +111,9 @@ Evidence: Nix supports many codecs; prior art adds decompression/recompression
 pipelines.
 
 Owner and mitigation: NARJ-29. Reject HTTP Content-Encoding and unsupported
-compressed suffixes; accept only fixed-length `.nar` and `.nar.xz` bodies; cap
-both received and decompressed bytes; stream XZ validation with no NAR semantic
-parser or recompressor.
+compressed suffixes; accept only fixed-length `.nar`, `.nar.zst`, and `.nar.xz`
+bodies; cap both received and decompressed bytes; stream matching validation with
+no NAR semantic parser or recompressor.
 
 Detection and recovery: Per-route byte counters, 413 tests, disk watermark.
 Abort temporary and return admission failure.
@@ -334,8 +334,9 @@ offline. Rejected alternatives: redb and SQLite.
 
 ### D4: Store compression=none byte-for-byte
 
-Accepted provisionally. No decompressor or recompressor; bounded stream hash and
-copy. Rejected alternative: canonical zstd due CPU/dependency complexity.
+Accepted provisionally. Raw, zstd, and XZ uploads are retained byte-for-byte;
+compressed forms are stream-validated without canonical recompression. Rejected
+alternative: server-generated canonical compression.
 
 ### D5: Do not parse NAR semantics
 

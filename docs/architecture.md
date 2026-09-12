@@ -262,7 +262,7 @@ negative cache until --refresh; the server cannot invalidate client caches.
 ## Explicit non-goals
 
 - Native /nix/store serving or a server-side Nix installation.
-- zstd, gzip, chunked-NAR storage, or server recompression.
+- gzip, chunked-NAR storage, or server recompression.
 - Server-side signing or private signing-key custody.
 - Multi-tenancy, quotas, namespaces, UI, database, Redis, S3, mirrors, workers.
 - Online delete or GC, access-time retention, a resident retention worker, or
