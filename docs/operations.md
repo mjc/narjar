@@ -210,8 +210,10 @@ does not depend on proxy enforcement. NAR size and minimum free-space checks
 happen before and during the stream.
 
 Publication workers are bounded by `--workers` and process independent PUTs
-concurrently. Each upload writes a private temporary file and a durable record
-under `.narjar-transactions` before streaming its body. Only the final
+concurrently. Each write reserves its declared body size against available
+staging capacity before it enters the queue. Each upload then writes a private
+temporary file and a durable record under `.narjar-transactions` before
+streaming its body. Only the final
 link/compare and destination-directory sync are serialized for the same
 destination; unrelated destinations do not wait behind a slow body or decoder.
 The queue remains bounded and exposes depth and wait metrics; excess requests
