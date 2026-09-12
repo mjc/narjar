@@ -12,6 +12,8 @@ rg -q 'BENCHMARK_WORKERS=32' "$ROOT/scripts/continuation-benchmark"
 rg -q "size_download}\\\\n'" "$ROOT/scripts/continuation-benchmark"
 rg -q 'method" == HEAD' "$ROOT/scripts/continuation-benchmark"
 rg -q 'set -- "\$@" -I' "$ROOT/scripts/continuation-benchmark"
+awk '/^benchmark_(enospc|startup)$/{print NR ":" $0}' "$ROOT/scripts/continuation-benchmark" |
+  awk 'NR == 1 { first = $0 } NR == 2 { second = $0 } END { exit !(first ~ /benchmark_enospc/ && second ~ /benchmark_startup/) }'
 
 if NARJAR_BIN=/does/not/exist "$ROOT/scripts/continuation-benchmark" \
   --output "$(mktemp -d)/output" >/dev/null 2>&1; then

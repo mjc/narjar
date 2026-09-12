@@ -917,13 +917,13 @@ write_report() {
 resolve_bincache
 select_bincache_port
 for candidate in narjar bincache; do candidate_prepare "$candidate"; done
+benchmark_enospc
 benchmark_startup
 benchmark_io
 benchmark_requests
 benchmark_concurrent_gets
 benchmark_streaming
 benchmark_recovery
-benchmark_enospc
 benchmark_trust
 measure_closures
 write_report
