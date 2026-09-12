@@ -418,7 +418,12 @@ candidate_request() {
   path=$(printf '%s' "$path" | sed 's#^/##')
   url=$CANDIDATE_URL/$path
   set -- curl --silent --show-error --max-time 30 --netrc-file "$root/netrc" \
-    -H 'Accept-Encoding: identity' -X "$method"
+    -H 'Accept-Encoding: identity'
+  if [[ "$method" == HEAD ]]; then
+    set -- "$@" -I
+  else
+    set -- "$@" -X "$method"
+  fi
   [[ -z "$range" ]] || set -- "$@" -H "Range: $range"
   set -- "$@" -o "$body" -w '%{http_code}\t%{time_total}\t%{time_starttransfer}\t%{size_download}\n' "$url"
   log_command "$@"
