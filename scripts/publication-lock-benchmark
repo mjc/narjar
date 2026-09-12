@@ -6,7 +6,7 @@ NARJAR_BIN=
 SLOW_BYTES=1073741824
 SLOW_RATE=67108864
 PUBLISHERS=(1 2 8 32)
-REPETITIONS=1
+REPETITIONS=15
 
 usage() {
   cat <<'EOF'
@@ -20,7 +20,7 @@ Options:
   --slow-bytes N     Slow upload size in bytes (default: 1073741824)
   --slow-rate N      Slow upload rate in bytes/sec (default: 67108864)
   --publishers LIST  Comma-separated small PUT counts (default: 1,2,8,32)
-  --repetitions N     Number of independent runs per publisher count (default: 1)
+  --repetitions N     Number of independent runs per publisher count (default: 15)
                      Report includes queue latency, throughput, CPU, peak and
                      post-load RSS, anonymous allocator memory, staging usage,
                      restart recovery time, and an aggregate summary
