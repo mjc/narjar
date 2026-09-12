@@ -932,9 +932,14 @@ mod tests {
                 let (mut stream, _) = listener.accept().expect("accept retry test request");
                 let mut request = [0; 4096];
                 let _ = stream.read(&mut request).expect("read retry test request");
+                let retry_after = if status == 429 {
+                    "Retry-After: 0\r\n"
+                } else {
+                    ""
+                };
                 write!(
                     stream,
-                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {status} Test\r\n{retry_after}Content-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .expect("write retry test response");
             }
@@ -1001,9 +1006,14 @@ mod tests {
                         "retry should resend the complete body"
                     );
                 }
+                let retry_after = if status == 429 {
+                    "Retry-After: 0\r\n"
+                } else {
+                    ""
+                };
                 write!(
                     stream,
-                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {status} Test\r\n{retry_after}Content-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .expect("write upload test response");
             }
