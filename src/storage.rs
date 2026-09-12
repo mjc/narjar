@@ -227,6 +227,21 @@ struct HashingReader<R> {
     hasher: Sha256,
 }
 
+#[derive(Debug)]
+struct CompressedSourceError(io::Error);
+
+impl fmt::Display for CompressedSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for CompressedSourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 impl<R> HashingReader<R> {
     fn new(inner: R) -> Self {
         Self {
@@ -242,9 +257,36 @@ impl<R> HashingReader<R> {
 
 impl<R: Read> Read for HashingReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(buffer)?;
+        let read = self
+            .inner
+            .read(buffer)
+            .map_err(|error| io::Error::other(CompressedSourceError(error)))?;
         self.hasher.update(&buffer[..read]);
         Ok(read)
+    }
+}
+
+fn compressed_source_error<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a io::Error> {
+    if let Some(source) = error.downcast_ref::<CompressedSourceError>() {
+        return Some(&source.0);
+    }
+    error.source().and_then(compressed_source_error)
+}
+
+fn compressed_read_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        io::Error::new(io::ErrorKind::InvalidData, error)
+    } else if let Some(source) = compressed_source_error(&error) {
+        source.raw_os_error().map_or_else(
+            || io::Error::new(source.kind(), source.to_string()),
+            io::Error::from_raw_os_error,
+        )
+    } else if error.kind() == io::ErrorKind::Other {
+        io::Error::new(io::ErrorKind::InvalidData, error)
+    } else {
+        error
     }
 }
 
@@ -261,7 +303,7 @@ fn validate_xz(
     let mut bytes_read = 0u64;
     let mut buffer = [0; 64 * 1024];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(&mut buffer).map_err(compressed_read_error)?;
         if read == 0 {
             break;
         }
@@ -314,7 +356,7 @@ fn validate_zstd(
     let mut bytes_read = 0u64;
     let mut buffer = [0; 64 * 1024];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(&mut buffer).map_err(compressed_read_error)?;
         if read == 0 {
             break;
         }
@@ -1881,9 +1923,13 @@ mod tests {
                 super::NarUploadPolicy::new(1024, 0),
             );
 
-            assert!(
-                result.is_err(),
-                "truncated {encoding:?} must not be accepted"
+            let StorageError::Io(error) = result.expect_err("truncated frame was accepted") else {
+                panic!("truncated {encoding:?} returned a non-I/O storage error");
+            };
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "truncated {encoding:?} should be classified as invalid input: {error}"
             );
         }
     }

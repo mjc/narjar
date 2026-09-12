@@ -385,6 +385,17 @@ cache_curl --range 0-7 \
   "$server_url/$zstd_nar_url"
 run grep -E '^HTTP/[0-9.]+ 206' "$zstd_range_headers"
 [[ $(wc -c < "$zstd_range_body") -eq 8 ]] || fail "zstd range response was not eight bytes"
+zstd_corrupt_file="$temp_root/zstd-corrupt.nar.zst"
+cache_curl --output "$zstd_corrupt_file" "$server_url/$zstd_nar_url"
+run truncate -s -1 "$zstd_corrupt_file"
+zstd_corrupt_hash=$(nix_cli hash file --type sha256 --base32 "$zstd_corrupt_file")
+zstd_corrupt_url="nar/$zstd_corrupt_hash.nar.zst"
+zstd_corrupt_status=$(run curl --silent --show-error --netrc-file "$netrc" \
+  --request PUT --upload-file "$zstd_corrupt_file" \
+  --output /dev/null --write-out '%{http_code}' "$server_url/$zstd_corrupt_url")
+[[ "$zstd_corrupt_status" == 422 ]] ||
+  fail "truncated zstd upload returned HTTP $zstd_corrupt_status"
+expect_missing "$data_dir/$zstd_corrupt_url"
 run nix_cli store verify --store "local?root=$zstd_root" \
   --sigs-needed 1 \
   --option trusted-public-keys "$trusted_key" \
