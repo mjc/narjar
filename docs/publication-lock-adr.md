@@ -1,16 +1,17 @@
-# ADR: Keep the v0.1 publication lock
+# ADR: Publication serialization and per-publication recovery
 
-- Status: Accepted
-- Date: 2026-09-11
+- Status: Superseded by NARJ-110
+- Original date: 2026-09-11
+- Superseded: 2026-09-12
 - Scope: v0.1 publication and recovery path
 
 ## Context
 
-Narjar currently admits uploads, writes the recovery marker, streams the body,
-publishes the result, and cleans up under one bounded publication worker and
-lock. A throttled large upload therefore delays independent small uploads. The
-lock is also the coordination boundary that makes the single recovery marker
-unambiguous after interruption.
+The original v0.1 design admitted uploads, wrote the recovery marker, streamed
+the body, published the result, and cleaned up under one bounded publication
+worker and global lock. A throttled large upload therefore delayed independent
+small uploads. The lock was also the coordination boundary that made the
+single recovery marker unambiguous after interruption.
 
 ## Evidence
 
@@ -42,28 +43,44 @@ upload returned 2xx, and the command log records the exact upload commands.
 | 8 | 16.292 s | 16.346 s | 16.346 s | 57.548 MiB/s | 7,340 KiB | 9 |
 | 32 | 16.331 s | 16.614 s | 16.643 s | 57.647 MiB/s | 7,908 KiB | 33 |
 
-The small requests wait approximately one slow-upload duration regardless of
-whether there are 1, 2, 8, or 32 publishers. This confirms the expected
+The small requests waited approximately one slow-upload duration regardless of
+whether there were 1, 2, 8, or 32 publishers. This confirmed the expected
 head-of-line blocking rather than a client-side failure.
 
-## Decision
+## Original decision
 
-Keep the global publication serialization for v0.1. The measured latency is a
-real tradeoff, but removing the lock without a replacement recovery protocol
-would make interrupted multi-publication states ambiguous. The existing
-bounded queue and queue-wait metrics remain the operational interface.
+Keep the global publication serialization for v0.1 until a replacement recovery
+protocol exists. The measured latency was a real tradeoff, and removing the
+lock without replacement would have made interrupted multi-publication states
+ambiguous.
+
+## Current decision
+
+NARJ-110 replaced the global lock with one durable transaction record per
+publication. Records are created and synced before body streaming, and are
+removed only after temporary cleanup and the final durable state. Independent
+publications use bounded worker and admission queues. Only final-link comparison
+and the destination-directory sync use a narrow lock for the same destination.
+Startup enumerates every transaction record and validates the published
+inventory before clearing recovery state.
+
+The current implementation and measurements are documented in
+[`architecture.md`](architecture.md), [`operations.md`](operations.md), and
+[`NARJ-110 publication results`](../benchmarks/results/2026-09-12-narj110-publication/report.md).
 
 ## Consequences
 
-- A slow or stalled body can delay unrelated publications.
+- A slow or stalled body no longer holds a process-wide publication lock.
 - Queue depth and queue-wait metrics must remain visible and documented.
-- Future concurrency work must define durable per-transaction recovery before
-  changing admission or marker ownership.
+- Per-destination commit serialization remains necessary for same-target
+  immutable publication races.
+- Recovery records and startup inventory validation are required before clearing
+  the recovery gate.
 - The benchmark is retained as a regression measurement for any redesign.
 
 ## Reconsideration gate
 
-Reopen this decision only with a reviewed state machine for concurrent marker,
-rollback, cleanup, and shutdown interleavings, plus fault-injection coverage
-for each interleaving. Any replacement must preserve atomic destination
- publication and bounded admission.
+Reopen this decision if the transaction protocol, bounded admission, or
+per-destination commit semantics change. Any replacement must preserve atomic
+destination publication, bounded admission, startup recovery, and the
+NAR-before-narinfo visibility invariant.
