@@ -64,6 +64,26 @@ if "$ROOT/scripts/nix-corpus" validate \
 fi
 grep -q 'requirements has invalid min_generations' "$WORK/invalid-requirements.err"
 
+jq '.requirements = {min_generations: null}' \
+  "$WORK/manifest.json" > "$WORK/null-requirements.json"
+if "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/null-requirements.json" --schema-only \
+  > /dev/null 2> "$WORK/null-requirements.err"; then
+  echo "validation accepted null requirements" >&2
+  exit 1
+fi
+grep -q 'requirements has invalid min_generations' "$WORK/null-requirements.err"
+
+jq '.requirements = {required_families: []}' \
+  "$WORK/manifest.json" > "$WORK/empty-families.json"
+if "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/empty-families.json" --schema-only \
+  > /dev/null 2> "$WORK/empty-families.err"; then
+  echo "validation accepted empty required_families" >&2
+  exit 1
+fi
+grep -q 'requirements has invalid required_families' "$WORK/empty-families.err"
+
 MOCK_BIN="$WORK/mock-bin"
 mkdir "$MOCK_BIN"
 export NIX_CORPUS_TEST_LOG="$WORK/nix.log"

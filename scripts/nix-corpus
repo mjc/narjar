@@ -104,17 +104,18 @@ manifest_issues() {
     if (has("requirements") | not) then empty
     elif (.requirements | type) != "object" then
       "requirements must be an object"
-    elif (.requirements.min_generations != null and
+    elif ((.requirements | has("min_generations")) and
       ((.requirements.min_generations | nonnegative_integer) | not)) then
       "requirements has invalid min_generations"
-    elif (.requirements.min_nixpkgs_revisions != null and
+    elif ((.requirements | has("min_nixpkgs_revisions")) and
       ((.requirements.min_nixpkgs_revisions | nonnegative_integer) | not)) then
       "requirements has invalid min_nixpkgs_revisions"
-    elif (.requirements.required_families != null and
+    elif ((.requirements | has("required_families")) and
       (.requirements.required_families | type) != "array") then
       "requirements has invalid required_families"
-    elif (.requirements.required_families != null and
-      any(.requirements.required_families[]; type != "string" or length == 0)) then
+    elif ((.requirements | has("required_families")) and
+      ((.requirements.required_families | length) == 0 or
+        any(.requirements.required_families[]; type != "string" or length == 0))) then
       "requirements has invalid required_families"
     else empty end,
     if (.entries | type) != "array" or (.entries | length) == 0 then
