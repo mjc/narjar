@@ -88,7 +88,8 @@ the requested installables once with `nix path-info --recursive`, partitions
 the resulting closure across bounded workers, and invokes native `nix copy`
 for each partition. With `--signing-key-file`, it first invokes `nix store sign`
 over the complete closure so each native copy can publish trusted narinfo
-metadata. Publication remains Narjar's existing atomic per-object operation;
+metadata. `--compression` selects the destination URI's NAR representation
+(`none`, `zstd`, or `xz`) and defaults to `none`. Publication remains Narjar's existing atomic per-object operation;
 push does not parse NARs or implement a second Nix store protocol. The `nix`
 executable must be in PATH, and `--netrc-file` is passed to Nix as an HTTP
 credential file that must already have restrictive permissions.

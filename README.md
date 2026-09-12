@@ -65,13 +65,15 @@ nix run . -- push \
   --to http://127.0.0.1:5000 \
   --netrc-file ./narjar.netrc \
   --signing-key-file ./producer.sec \
+  --compression none \
   --jobs 8 \
   /nix/store/some-package
 ```
 
 Use `--refresh` to re-check and re-upload paths already present at the
-destination. The server publishes the NAR before its narinfo, and consumers
-only see a path after the metadata is durable.
+destination. `--compression` is explicit and accepts `none`, `zstd`, or `xz`;
+it defaults to `none`. The server publishes the NAR before its narinfo, and
+consumers only see a path after the metadata is durable.
 
 ## Inspect and maintain a cache
 

@@ -20,6 +20,10 @@ pub(crate) struct Push {
     #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
     jobs: NonZeroUsize,
 
+    /// NAR representation requested from the destination cache.
+    #[arg(long, value_enum, default_value_t = Compression::None)]
+    compression: Compression,
+
     /// Netrc file passed to Nix for HTTP authentication.
     #[arg(long)]
     netrc_file: Option<PathBuf>,
@@ -50,6 +54,7 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
         let target = args.to.clone();
         let netrc_file = args.netrc_file.clone();
         let refresh = args.refresh;
+        let target = target_with_compression(&target, args.compression);
         let paths = chunk.to_vec();
         workers.push(thread::spawn(move || {
             copy_paths(&target, netrc_file.as_deref(), refresh, &paths)
@@ -77,6 +82,42 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
     } else {
         Err(Error::runtime(format!("{failures} push workers failed")))
     }
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Compression {
+    None,
+    Zstd,
+    Xz,
+}
+
+impl Compression {
+    const fn query_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Zstd => "zstd",
+            Self::Xz => "xz",
+        }
+    }
+}
+
+fn target_with_compression(target: &str, compression: Compression) -> String {
+    let value = compression.query_value();
+    if let Some(query) = target.split_once('?').map(|(_, query)| query)
+        && query
+            .split('&')
+            .any(|parameter| parameter.starts_with("compression="))
+    {
+        let mut target = target.to_owned();
+        let start = target.find("compression=").expect("compression was found");
+        let end = target[start..]
+            .find('&')
+            .map_or(target.len(), |offset| start + offset);
+        target.replace_range(start..end, &format!("compression={value}"));
+        return target;
+    }
+    let separator = if target.contains('?') { '&' } else { '?' };
+    format!("{target}{separator}compression={value}")
 }
 
 fn sign_paths(key_file: &std::path::Path, paths: &[String]) -> Result<(), Error> {
@@ -197,5 +238,27 @@ mod tests {
         let push = Push::from_arg_matches(&matches).expect("push arguments should parse");
 
         assert_eq!(push.jobs.get(), 1);
+    }
+
+    #[test]
+    fn compression_is_explicitly_added_to_destination_uri() {
+        assert_eq!(
+            super::target_with_compression("https://cache.example", super::Compression::None),
+            "https://cache.example?compression=none"
+        );
+        assert_eq!(
+            super::target_with_compression(
+                "https://cache.example?priority=10",
+                super::Compression::Zstd
+            ),
+            "https://cache.example?priority=10&compression=zstd"
+        );
+        assert_eq!(
+            super::target_with_compression(
+                "https://cache.example?compression=xz&priority=10",
+                super::Compression::None
+            ),
+            "https://cache.example?compression=none&priority=10"
+        );
     }
 }
