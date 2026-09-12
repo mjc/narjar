@@ -13,6 +13,7 @@ help=$(bash "$SCRIPT" --help)
 [[ "$help" == *"--slow-rate"* ]]
 [[ "$help" == *"--publishers"* ]]
 [[ "$help" == *"--repetitions"* ]]
+[[ "$help" == *"aggregate"* ]]
 [[ "$help" == *"throughput"* ]]
 [[ "$help" == *"post-load RSS"* ]]
 [[ "$help" == *"staging usage"* ]]

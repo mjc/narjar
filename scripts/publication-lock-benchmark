@@ -23,7 +23,7 @@ Options:
   --repetitions N     Number of independent runs per publisher count (default: 1)
                      Report includes queue latency, throughput, CPU, peak and
                      post-load RSS, anonymous allocator memory, staging usage,
-                     and restart recovery time
+                     restart recovery time, and an aggregate summary
   -h, --help         Show this help
 EOF
 }
@@ -105,6 +105,7 @@ OUTPUT=$(cd -- "$OUTPUT" && pwd -P)
 COMMAND_LOG=$OUTPUT/commands.txt
 SAMPLES=$OUTPUT/samples.tsv
 SUMMARY=$OUTPUT/summary.tsv
+AGGREGATE=$OUTPUT/aggregate.tsv
 ENVIRONMENT=$OUTPUT/environment.tsv
 LOG_DIR=$OUTPUT/logs
 METRICS_DIR=$OUTPUT/metrics
@@ -129,6 +130,7 @@ mkdir -p -- "$LOG_DIR" "$METRICS_DIR"
 printf 'publishers\trepetition\tslow_bytes\tslow_rate\tslow_id\n' > "$ENVIRONMENT"
 printf 'publishers\trepetition\trequest\telapsed_ms\tstatus\tsize_upload\n' > "$SAMPLES"
 printf 'publishers\trepetition\tsamples\tp50_ms\tp95_ms\tp99_ms\tmin_ms\tmax_ms\tslow_wall_ms\tslow_mib_s\tsmall_requests_s\tserver_cpu_ms\tserver_peak_rss_kib\tserver_post_load_rss_kib\tserver_peak_anonymous_kib\tserver_post_load_anonymous_kib\tserver_peak_heap_rss_kib\tserver_peak_staging_bytes\trecovery_ms\tqueue_wait_count\tqueue_wait_sum_ms\tqueue_wait_max_ms\n' > "$SUMMARY"
+printf 'publishers\trepetitions\trequest_samples\tp50_ms\tp95_ms\tp99_ms\tmin_ms\tmax_ms\tslow_wall_min_ms\tslow_wall_max_ms\tslow_mib_s_min\tslow_mib_s_max\tserver_cpu_ms_max\tserver_peak_rss_max_kib\tserver_post_load_rss_max_kib\tserver_peak_anonymous_max_kib\tserver_post_load_anonymous_max_kib\tserver_peak_heap_rss_max_kib\tserver_peak_staging_max_bytes\trecovery_p50_ms\trecovery_p95_ms\trecovery_p99_ms\n' > "$AGGREGATE"
 
 log_command() {
   {
@@ -370,10 +372,94 @@ for publishers in "${PUBLISHERS[@]}"; do
   done
 done
 
+awk -F '\t' '
+  FILENAME == ARGV[1] {
+    if (FNR == 1) next
+    publisher = $1
+    if (!(publisher in seen)) order[++publishers] = publisher
+    seen[publisher] = 1
+    latency_count[publisher]++
+    latency[publisher, latency_count[publisher]] = $4
+    next
+  }
+  FNR == 1 {next}
+  {
+    publisher = $1
+    repetition_count[publisher]++
+    repetition = repetition_count[publisher]
+    recovery[publisher, repetition] = $19
+    slow_wall = $9
+    slow_mib_s = $10
+    cpu = $12
+    peak_rss = $13
+    post_rss = $14
+    peak_anonymous = $15
+    post_anonymous = $16
+    peak_heap = $17
+    peak_staging = $18
+    if (!(publisher in initialized)) {
+      initialized[publisher] = 1
+      slow_wall_min[publisher] = slow_wall
+      slow_wall_max[publisher] = slow_wall
+      slow_mib_s_min[publisher] = slow_mib_s
+      slow_mib_s_max[publisher] = slow_mib_s
+      max_cpu[publisher] = cpu
+      max_peak_rss[publisher] = peak_rss
+      max_post_rss[publisher] = post_rss
+      max_peak_anonymous[publisher] = peak_anonymous
+      max_post_anonymous[publisher] = post_anonymous
+      max_peak_heap[publisher] = peak_heap
+      max_peak_staging[publisher] = peak_staging
+    } else {
+      if (slow_wall < slow_wall_min[publisher]) slow_wall_min[publisher] = slow_wall
+      if (slow_wall > slow_wall_max[publisher]) slow_wall_max[publisher] = slow_wall
+      if (slow_mib_s < slow_mib_s_min[publisher]) slow_mib_s_min[publisher] = slow_mib_s
+      if (slow_mib_s > slow_mib_s_max[publisher]) slow_mib_s_max[publisher] = slow_mib_s
+      if (cpu > max_cpu[publisher]) max_cpu[publisher] = cpu
+      if (peak_rss > max_peak_rss[publisher]) max_peak_rss[publisher] = peak_rss
+      if (post_rss > max_post_rss[publisher]) max_post_rss[publisher] = post_rss
+      if (peak_anonymous > max_peak_anonymous[publisher]) max_peak_anonymous[publisher] = peak_anonymous
+      if (post_anonymous > max_post_anonymous[publisher]) max_post_anonymous[publisher] = post_anonymous
+      if (peak_heap > max_peak_heap[publisher]) max_peak_heap[publisher] = peak_heap
+      if (peak_staging > max_peak_staging[publisher]) max_peak_staging[publisher] = peak_staging
+    }
+  }
+  END {
+    for (publisher_index = 1; publisher_index <= publishers; publisher_index++) {
+      publisher = order[publisher_index]
+      count = latency_count[publisher]
+      for (i = 1; i <= count; i++) for (j = i + 1; j <= count; j++)
+        if (latency[publisher, j] < latency[publisher, i]) {
+          swap = latency[publisher, i]
+          latency[publisher, i] = latency[publisher, j]
+          latency[publisher, j] = swap
+        }
+      recovery_count = repetition_count[publisher]
+      for (i = 1; i <= recovery_count; i++) for (j = i + 1; j <= recovery_count; j++)
+        if (recovery[publisher, j] < recovery[publisher, i]) {
+          swap = recovery[publisher, i]
+          recovery[publisher, i] = recovery[publisher, j]
+          recovery[publisher, j] = swap
+        }
+      p50 = latency[publisher, int((count * 0.50) + 0.999)]
+      p95 = latency[publisher, int((count * 0.95) + 0.999)]
+      p99 = latency[publisher, int((count * 0.99) + 0.999)]
+      recovery_p50 = recovery[publisher, int((recovery_count * 0.50) + 0.999)]
+      recovery_p95 = recovery[publisher, int((recovery_count * 0.95) + 0.999)]
+      recovery_p99 = recovery[publisher, int((recovery_count * 0.99) + 0.999)]
+      printf "%s\t%d\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.3f\t%.3f\t%.3f\n",
+        publisher,recovery_count,count,p50,p95,p99,latency[publisher,1],latency[publisher,count],
+        slow_wall_min[publisher],slow_wall_max[publisher],slow_mib_s_min[publisher],slow_mib_s_max[publisher],
+        max_cpu[publisher],max_peak_rss[publisher],max_post_rss[publisher],max_peak_anonymous[publisher],
+        max_post_anonymous[publisher],max_peak_heap[publisher],max_peak_staging[publisher],
+        recovery_p50,recovery_p95,recovery_p99
+    }
+  }' "$SAMPLES" "$SUMMARY" >> "$AGGREGATE"
+
 {
   printf '# Narjar publication lock contention\n\n'
   printf 'Each of %s repetitions overlapped one throttled %s-byte raw NAR upload at %s bytes/sec with independent small PUTs.\n\n' "$REPETITIONS" "$SLOW_BYTES" "$SLOW_RATE"
-  printf 'See [commands.txt](./commands.txt), [samples.tsv](./samples.tsv), [summary.tsv](./summary.tsv), and [metrics/](./metrics/).\n\n'
+  printf 'See [commands.txt](./commands.txt), [samples.tsv](./samples.tsv), [summary.tsv](./summary.tsv), [aggregate.tsv](./aggregate.tsv), and [metrics/](./metrics/).\n\n'
   printf '```text\n'
   cat "$SUMMARY"
   printf '```\n'
