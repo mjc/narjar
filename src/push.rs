@@ -87,7 +87,6 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum Compression {
     None,
-    Zstd,
     Xz,
 }
 
@@ -95,7 +94,6 @@ impl Compression {
     const fn query_value(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Zstd => "zstd",
             Self::Xz => "xz",
         }
     }
@@ -249,9 +247,9 @@ mod tests {
         assert_eq!(
             super::target_with_compression(
                 "https://cache.example?priority=10",
-                super::Compression::Zstd
+                super::Compression::Xz
             ),
-            "https://cache.example?priority=10&compression=zstd"
+            "https://cache.example?priority=10&compression=xz"
         );
         assert_eq!(
             super::target_with_compression(
