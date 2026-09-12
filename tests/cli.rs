@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{Shutdown, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     ops::Deref,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
@@ -73,6 +73,37 @@ fn read_http_response(stream: &mut TcpStream) -> Vec<u8> {
             && response.len() >= header_end + content_length
         {
             return response;
+        }
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    loop {
+        let mut buffer = [0; 4096];
+        let count = stream
+            .read(&mut buffer)
+            .expect("request should be readable");
+        assert_ne!(count, 0, "request ended before its declared body");
+        request.extend_from_slice(&buffer[..count]);
+        let Some(header_end) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|offset| offset + 4)
+        else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).expect("request headers UTF-8");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Content-Length")
+                    .then(|| value.trim().parse::<usize>().expect("valid Content-Length"))
+            })
+            .unwrap_or(0);
+        if request.len() >= header_end + content_length {
+            return request;
         }
     }
 }
@@ -174,8 +205,14 @@ fn push_uses_native_transfer_without_nix_copy() {
     }
 }
 
-fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
-    let server = RunningServer::start("native-push-process-boundary");
+struct NativePushFixture {
+    tools: TempDir,
+    invocation_log: PathBuf,
+    netrc: PathBuf,
+    store_path: String,
+}
+
+fn native_push_fixture() -> NativePushFixture {
     let tools = tempfile::tempdir().expect("fake Nix directory should be created");
     let fake_nix = tools.path().join("nix");
     let invocation_log = tools.path().join("nix-invocations");
@@ -215,27 +252,114 @@ fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
     fs::set_permissions(&netrc, fs::Permissions::from_mode(0o600))
         .expect("netrc should be private");
 
+    NativePushFixture {
+        tools,
+        invocation_log,
+        netrc,
+        store_path,
+    }
+}
+
+fn run_native_push_fixture(
+    fixture: &NativePushFixture,
+    target: &str,
+    compression: &str,
+    refresh: bool,
+) -> Output {
     let original_path = std::env::var_os("PATH").expect("test PATH should be set");
     let path = format!(
         "{}:{}",
-        tools.path().display(),
+        fixture.tools.path().display(),
         original_path.to_string_lossy()
     );
-    let output = command()
-        .args([
-            "push",
-            "--to",
-            &format!("http://{}?compression={compression}", server.address),
-            "--compression",
-            compression,
-            "--netrc-file",
-            netrc.to_str().expect("netrc path should be UTF-8"),
-            &store_path,
-        ])
+    let mut args = vec![
+        "push".to_owned(),
+        "--to".to_owned(),
+        target.to_owned(),
+        "--compression".to_owned(),
+        compression.to_owned(),
+        "--netrc-file".to_owned(),
+        fixture
+            .netrc
+            .to_str()
+            .expect("netrc path should be UTF-8")
+            .to_owned(),
+    ];
+    if refresh {
+        args.push("--refresh".to_owned());
+    }
+    args.push(fixture.store_path.clone());
+    command()
+        .args(&args)
         .env("PATH", path)
-        .env("NIX_TEST_INVOCATIONS", &invocation_log)
+        .env("NIX_TEST_INVOCATIONS", &fixture.invocation_log)
         .output()
-        .expect("narjar push should run");
+        .expect("narjar push should run")
+}
+
+#[test]
+fn native_push_retries_a_429_at_the_process_boundary() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind native retry listener");
+    let address = listener
+        .local_addr()
+        .expect("inspect native retry listener");
+    let server = thread::spawn(move || {
+        for (request_number, status) in [(0, 429), (1, 201), (2, 201)] {
+            let (mut stream, _) = listener.accept().expect("accept native retry request");
+            let request = read_http_request(&mut stream);
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request should contain headers")
+                + 4;
+            let body = &request[header_end..];
+            if request_number < 2 {
+                assert_eq!(body, NAR_BYTES, "every NAR retry must resend the body");
+                assert!(
+                    String::from_utf8_lossy(&request).starts_with("PUT /nar/"),
+                    "request {request_number} should upload the NAR"
+                );
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&request).starts_with("PUT /"),
+                    "final request should publish narinfo"
+                );
+                assert!(body.starts_with(b"StorePath: "));
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write native retry response");
+        }
+    });
+    let fixture = native_push_fixture();
+    let output = run_native_push_fixture(&fixture, &format!("http://{address}"), "none", true);
+    server.join().expect("native retry server should exit");
+
+    assert!(
+        output.status.success(),
+        "native push retry failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.invocation_log).expect("Nix invocations should be logged"),
+        format!(
+            "path-info --recursive --json -- {}\nstore dump-path -- {}\n",
+            fixture.store_path, fixture.store_path
+        )
+    );
+}
+
+fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
+    let server = RunningServer::start("native-push-process-boundary");
+    let fixture = native_push_fixture();
+    let output = run_native_push_fixture(
+        &fixture,
+        &format!("http://{}?compression={compression}", server.address),
+        compression,
+        false,
+    );
 
     assert!(
         output.status.success(),
@@ -266,10 +390,14 @@ fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
     assert!(narinfo.contains(&format!("Compression: {compression}\n")));
     assert!(narinfo.contains(&format!("NarSize: {}\n", NAR_BYTES.len())));
 
-    let invocations = fs::read_to_string(invocation_log).expect("Nix invocations should be logged");
+    let invocations =
+        fs::read_to_string(fixture.invocation_log).expect("Nix invocations should be logged");
     assert_eq!(
         invocations,
-        format!("path-info --recursive --json -- {store_path}\nstore dump-path -- {store_path}\n")
+        format!(
+            "path-info --recursive --json -- {}\nstore dump-path -- {}\n",
+            fixture.store_path, fixture.store_path
+        )
     );
     assert!(!invocations.contains(" copy "));
 }
