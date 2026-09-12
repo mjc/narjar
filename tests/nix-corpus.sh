@@ -139,6 +139,15 @@ if PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
 fi
 grep -q 'no resolved_root' "$WORK/missing-resolved-root.err"
 
+jq 'del(.targets)' "$WORK/collected.json" > "$WORK/missing-targets.json"
+if PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/missing-targets.json" --rebuild \
+  > /dev/null 2> "$WORK/missing-targets.err"; then
+  echo "rebuild without targets unexpectedly validated" >&2
+  exit 1
+fi
+grep -q 'no rebuild targets' "$WORK/missing-targets.err"
+
 jq '.entries += [(.entries[0] | .path = "/nix/store/expected-root")] |
   .targets[0].resolved_root = "/nix/store/expected-root" |
   del(.coverage)' \

@@ -219,7 +219,15 @@ path_info() {
 }
 
 validate_rebuilds() {
-  local manifest=$1 target expected_root resolved_root target_id resolved_info expected_hash expected_size
+  local manifest=$1 target expected_root resolved_root target_id resolved_info expected_hash expected_size target_count
+  target_count=$(jq -r 'if (.targets | type) == "array" then (.targets | length) else 0 end' "$manifest") || {
+    printf 'manifest has invalid rebuild targets\n'
+    return
+  }
+  if [[ "$target_count" == 0 ]]; then
+    printf 'manifest has no rebuild targets\n'
+    return
+  fi
   while IFS= read -r target; do
     target_id=$(jq -r '.id // "<unknown>"' <<< "$target")
     expected_root=$(jq -r '.resolved_root // empty' <<< "$target")
