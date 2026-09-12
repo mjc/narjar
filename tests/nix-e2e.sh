@@ -144,6 +144,14 @@ cache_copy_to() {
     "$@"
 }
 
+native_push_to() {
+  run narjar push \
+    --netrc-file "$netrc" \
+    --to "$server_url?compression=none" \
+    --compression none \
+    "$@"
+}
+
 substitute() {
   local destination_root=$1
   local trusted_key=$2
@@ -216,7 +224,7 @@ nix_cli copy --option require-sigs false --to "local?root=$seed_root" "$primary_
 expect_file "$seed_root$primary_path"
 nix_cli store delete --store "local?root=$seed_root" "$primary_path"
 expect_missing "$seed_root$primary_path"
-cache_copy_to "$primary_path"
+native_push_to "$primary_path"
 
 trusted_root="$temp_root/trusted-store"
 substitute "$trusted_root" "$trusted_key" "$primary_path"
