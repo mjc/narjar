@@ -1855,6 +1855,40 @@ mod tests {
     }
 
     #[test]
+    fn compressed_nars_reject_truncated_frames() {
+        let raw = b"nar bytes";
+        let mut xz = Vec::new();
+        let mut xz_writer =
+            XzWriter::new(&mut xz, XzOptions::with_preset(1)).expect("create XZ writer");
+        xz_writer.write_all(raw).expect("compress XZ NAR");
+        xz_writer.finish().expect("finish XZ stream");
+
+        let mut zstd = Vec::new();
+        compress(Cursor::new(raw), &mut zstd, CompressionLevel::Fastest);
+
+        for (encoding, mut compressed) in [(NarEncoding::Xz, xz), (NarEncoding::Zstd, zstd)] {
+            compressed.pop().expect("compressed frame is not empty");
+            let nar = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(&compressed)))
+                .expect("compressed hash is a valid NAR object id");
+            let directory = TestDir::new();
+            let storage = Storage::initialize(directory.path()).expect("initialize storage");
+
+            let result = storage.publish_nar(
+                &nar,
+                encoding,
+                Cursor::new(&compressed),
+                compressed.len() as u64,
+                super::NarUploadPolicy::new(1024, 0),
+            );
+
+            assert!(
+                result.is_err(),
+                "truncated {encoding:?} must not be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn read_side_nar_check_only_requires_the_declared_file_size() {
         let directory = TestDir::new();
         let path = directory.path().join("opaque-nar");
