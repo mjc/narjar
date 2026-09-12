@@ -158,6 +158,15 @@ native_push_with_compression() {
     "$@"
 }
 
+native_push_refresh() {
+  run narjar push \
+    --refresh \
+    --netrc-file "$netrc" \
+    --to "$server_url?compression=none" \
+    --compression none \
+    "$@"
+}
+
 substitute() {
   local destination_root=$1
   local trusted_key=$2
@@ -240,6 +249,12 @@ nix_cli store verify --store "local?root=$trusted_root" \
   --sigs-needed 1 \
   --option trusted-public-keys "$trusted_key" \
   "$primary_path"
+
+scenario 'native duplicate refresh is idempotent'
+native_push_refresh "$primary_path"
+native_refresh_root="$temp_root/native-refresh-store"
+substitute "$native_refresh_root" "$trusted_key" "$primary_path"
+run cmp "$primary_path" "$native_refresh_root$primary_path"
 
 scenario 'untrusted signing key is rejected'
 untrusted_root="$temp_root/untrusted-store"
