@@ -352,6 +352,27 @@ substitute "$default_root" "$trusted_key" "$default_path"
 expect_file "$default_root$default_path"
 run cmp "$default_path" "$default_root$default_path"
 
+scenario 'zstd compression is accepted'
+zstd_path=$(build_path zstd-compression "$nonce")
+sign_path "$zstd_path"
+run nix_cli copy --refresh --option netrc-file "$netrc" \
+  --to "$server_url?compression=zstd" "$zstd_path"
+zstd_root="$temp_root/zstd-store"
+run nix_cli copy --refresh --option netrc-file "$netrc" \
+  --option require-sigs true \
+  --option trusted-public-keys "$trusted_key" \
+  --from "$server_url" \
+  --to "local?root=$zstd_root" "$zstd_path"
+expect_file "$zstd_root$zstd_path"
+run cmp "$zstd_path" "$zstd_root$zstd_path"
+zstd_nar_url=$(nar_url_for "$zstd_path")
+[[ "$zstd_nar_url" == *.nar.zst ]] ||
+  fail "zstd upload did not produce a .nar.zst URL: $zstd_nar_url"
+run nix_cli store verify --store "local?root=$zstd_root" \
+  --sigs-needed 1 \
+  --option trusted-public-keys "$trusted_key" \
+  "$zstd_path"
+
 scenario 'offline GC retains a protected real-Nix closure'
 gc_base=$(build_path gc-base "$nonce")
 gc_root=$(build_referencing_path "$gc_base" gc-root)
