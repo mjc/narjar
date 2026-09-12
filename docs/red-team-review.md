@@ -255,7 +255,7 @@ broader architectural refactor remain separate behaviorally coherent commits.
 
 ## Remaining proof obligations
 
-- NARJ-29: Linux static artifact/ELF proof; current configured Tina builder is
+- NARJ-29: Linux static artifact/ELF proof; the current configured Linux builder is
   unreachable, while direnv and all local/all-system evaluation checks pass.
 - NARJ-17/NARJ-18: real-socket, proxy, stock-Nix, wrong-key, interrupted,
   refusal, and substitution proof.

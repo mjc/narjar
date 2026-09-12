@@ -303,7 +303,7 @@ Nix protocol behavior, trust enforcement, static Linux packaging, or proxy
 deployment.
 
 Evidence: Current Darwin trace succeeds; explicit static Linux build is blocked
-because Tina is unreachable.
+because the configured Linux builder is unreachable.
 
 Owner and mitigation: NARJ-17/NARJ-18/NARJ-29. Real sockets, independent Nix
 store, trusted/untrusted keys, Linux static binary, reverse proxy, and exact

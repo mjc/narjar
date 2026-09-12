@@ -11,7 +11,7 @@ results must not alter this file; a changed constitution gets a new version,
 reason, and review before measurement.
 
 The comparison is the current Narjar binary against a matched raw-NAR cache
-using transparent filesystem compression. Both run on Tina, the same ZFS
+using transparent filesystem compression. Both run on the same Linux builder,
 filesystem, CPU governor, kernel, corpus, proxy, and sample order. HTTP wire
 compression is disabled (`compression=none`, `Accept-Encoding: identity`).
 Each measured scenario has three warmups and 15 repetitions; cold and warm page
