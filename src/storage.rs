@@ -614,8 +614,34 @@ pub struct Storage {
     root: File,
     recovery: RecoveryState,
     publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    staging_reservations: Arc<AtomicU64>,
     temporary_objects: AtomicU64,
     _lock: ProcessLock,
+}
+
+#[derive(Debug)]
+pub struct StagingReservation {
+    reservations: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl StagingReservation {
+    fn empty(reservations: Arc<AtomicU64>) -> Self {
+        Self {
+            reservations,
+            bytes: 0,
+        }
+    }
+}
+
+impl Drop for StagingReservation {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let previous = self.reservations.fetch_sub(self.bytes, Ordering::Release);
+        debug_assert!(previous >= self.bytes);
+    }
 }
 
 impl Storage {
@@ -667,6 +693,7 @@ impl Storage {
             root: root_directory,
             recovery,
             publication_locks: Mutex::new(HashMap::new()),
+            staging_reservations: Arc::new(AtomicU64::new(0)),
             temporary_objects: AtomicU64::new(0),
             _lock: lock,
         };
@@ -692,6 +719,30 @@ impl Storage {
     /// Records that a full inventory scan has completed successfully.
     pub fn finish_recovery(&self, trusted_keys: &Path) -> Result<(), StorageError> {
         self.recovery.finish(trusted_keys)
+    }
+
+    pub fn reserve_staging(
+        &self,
+        bytes: u64,
+        min_free_bytes: u64,
+    ) -> Result<StagingReservation, StorageError> {
+        if bytes == 0 {
+            return Ok(StagingReservation::empty(Arc::clone(
+                &self.staging_reservations,
+            )));
+        }
+        let directory = self.nar_temp_directory()?;
+        let space = filesystem_space(&directory)?;
+        let required_bytes = bytes
+            .checked_add(min_free_bytes)
+            .ok_or(StorageError::InsufficientSpace)?;
+        space.required_capacity(required_bytes)?;
+        reserve_staging_bytes(
+            &self.staging_reservations,
+            space.available_bytes,
+            min_free_bytes,
+            bytes,
+        )
     }
 
     pub fn publish_cache_info(&self, source: impl Read) -> Result<PublishOutcome, StorageError> {
@@ -1258,6 +1309,28 @@ impl FilesystemSpace {
         }
         Ok(())
     }
+}
+
+fn reserve_staging_bytes(
+    reservations: &Arc<AtomicU64>,
+    available_bytes: u64,
+    min_free_bytes: u64,
+    bytes: u64,
+) -> Result<StagingReservation, StorageError> {
+    let capacity = available_bytes
+        .checked_sub(min_free_bytes)
+        .ok_or(StorageError::InsufficientSpace)?;
+    reservations
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+            reserved
+                .checked_add(bytes)
+                .filter(|total| *total <= capacity)
+        })
+        .map(|_| StagingReservation {
+            reservations: Arc::clone(reservations),
+            bytes,
+        })
+        .map_err(|_| StorageError::InsufficientSpace)
 }
 
 fn filesystem_space(directory: &File) -> io::Result<FilesystemSpace> {
@@ -2626,6 +2699,21 @@ mod tests {
             capacity_error_kind(libc::EROFS),
             CapacityErrorKind::ReadOnly
         );
+    }
+
+    #[test]
+    fn staging_reservations_are_bounded_and_released() {
+        let reservations = Arc::new(AtomicU64::new(0));
+        let first = super::reserve_staging_bytes(&reservations, 100, 10, 90)
+            .expect("first reservation should fit");
+        assert!(
+            super::reserve_staging_bytes(&reservations, 100, 10, 1).is_err(),
+            "reservations must not exceed available bytes after the free-space reserve"
+        );
+
+        drop(first);
+        super::reserve_staging_bytes(&reservations, 100, 10, 1)
+            .expect("released staging capacity should be reusable");
     }
 
     struct BrokenReader {

@@ -20,7 +20,7 @@ use narjar::{
     http_server::{Method, Request, StatusCode, write_status},
     inventory::Inventory,
     narinfo::TrustedPublicKeys,
-    storage::{NarUploadPolicy, Storage},
+    storage::{NarUploadPolicy, StagingReservation, Storage, StorageError},
 };
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -70,6 +70,7 @@ struct AcceptedRequest {
 struct QueuedPublication {
     request: PublicationRequest,
     _admission: Admission,
+    _staging: StagingReservation,
     queued_at: Instant,
 }
 
@@ -98,6 +99,14 @@ fn try_dispatch(
 fn configure_socket_timeouts(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))
+}
+
+fn staging_reservation_status(error: &StorageError) -> u16 {
+    match error {
+        StorageError::InsufficientSpace | StorageError::InsufficientInodes => 507,
+        StorageError::Io(error) if error.raw_os_error() == Some(libc::EROFS) => 503,
+        _ => 500,
+    }
 }
 
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
@@ -184,6 +193,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
 
     let min_free_bytes = config.min_free_bytes;
     let upload_policy = NarUploadPolicy::new(config.max_nar_bytes.get(), config.min_free_bytes);
+    let max_nar_bytes = config.max_nar_bytes.get();
     let max_in_flight = config.max_in_flight.get();
     let admissions = Arc::new(Admissions::new(max_in_flight));
     let (sender, receiver) = bounded::<AcceptedRequest>(max_in_flight);
@@ -236,11 +246,24 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                                 else {
                                     break;
                                 };
+                                let staging = storage.reserve_staging(
+                                    request.staging_bytes(max_nar_bytes).unwrap_or(0),
+                                    min_free_bytes,
+                                );
+                                let staging = match staging {
+                                    Ok(staging) => staging,
+                                    Err(error) => {
+                                        request
+                                            .reject(&metrics, staging_reservation_status(&error));
+                                        break;
+                                    }
+                                };
                                 let publication = QueuedPublication {
                                     request,
                                     _admission: admission
                                         .take()
                                         .expect("request admission is present"),
+                                    _staging: staging,
                                     queued_at: Instant::now(),
                                 };
                                 metrics.publication_enqueued();

@@ -369,6 +369,16 @@ impl PublicationRequest {
         );
     }
 
+    pub fn staging_bytes(&self, max_nar_bytes: u64) -> Option<u64> {
+        let length = u64::try_from(self.request.body_length()?).ok()?;
+        match &self.route {
+            WriteRoute::Nar(_, _) if length <= max_nar_bytes => Some(length),
+            WriteRoute::Nar(_, _) => None,
+            WriteRoute::NarInfo(_) => Some(length.min(MAX_NARINFO_BYTES)),
+            WriteRoute::CacheInfo => Some(0),
+        }
+    }
+
     pub fn respond(
         self,
         storage: &Storage,
