@@ -1,0 +1,5 @@
+field	value
+filesystem	tmpfs
+source	tmpfs
+mountpoint	/dev/shm
+options	rw,nosuid,nodev

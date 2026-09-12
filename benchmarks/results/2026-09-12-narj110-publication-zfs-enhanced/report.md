@@ -1,0 +1,22 @@
+# Narjar publication concurrency on the default local filesystem
+
+One throttled 16777216-byte raw NAR upload at 4194304 bytes/sec was overlapped with independent small PUTs.
+
+The data directory and payloads were on ZFS (`zroot/root`). The run used the
+release binary and 1, 2, 8, and 32 small publishers. `server_peak_rss_kib` is
+the largest `/proc/<pid>/smaps_rollup` RSS observed; `server_post_load_rss_kib`
+is the value after all uploads completed. The anonymous fields include glibc
+allocator mappings that are not necessarily reported as the main `[heap]`
+mapping. `server_peak_staging_bytes` is the largest `du -sb` total for the two
+staging directories. `recovery_ms` measures restart through the health check
+after a durable synthetic transaction record was installed.
+
+See [commands.txt](./commands.txt), [samples.tsv](./samples.tsv), [summary.tsv](./summary.tsv), and [metrics/](./metrics/).
+
+```text
+publishers	samples	p50_ms	p95_ms	p99_ms	min_ms	max_ms	slow_wall_ms	slow_mib_s	small_requests_s	server_cpu_ms	server_peak_rss_kib	server_post_load_rss_kib	server_peak_anonymous_kib	server_post_load_anonymous_kib	server_peak_heap_rss_kib	server_peak_staging_bytes	recovery_ms	queue_wait_count	queue_wait_sum_ms	queue_wait_max_ms
+1	1	47.003	47.003	47.003	47.003	47.003	5050.413	3.168	21.275	10.000	12124	12124	9620	9620	92	16777216	112.608	2	0.063	0.035
+2	2	61.653	62.608	62.608	61.653	62.608	5093.690	3.141	31.945	30.000	12200	12200	9668	9668	92	16777216	154.343	3	0.089	0.031
+8	8	60.729	61.391	61.391	60.360	61.391	5104.951	3.134	130.312	20.000	12464	12464	9932	9932	92	16777216	129.670	9	0.472	0.074
+32	32	52.717	64.508	64.857	40.231	64.857	5094.671	3.141	493.393	10.000	13268	13268	10736	10736	92	16777216	171.491	33	7.647	0.332
+```
