@@ -360,6 +360,17 @@ cache_curl --range 0-7 \
   "$server_url/$default_nar_url"
 run grep -E '^HTTP/[0-9.]+ 206' "$default_range_headers"
 [[ $(wc -c < "$default_range_body") -eq 8 ]] || fail "XZ range response was not eight bytes"
+default_corrupt_file="$temp_root/xz-corrupt.nar.xz"
+cache_curl --output "$default_corrupt_file" "$server_url/$default_nar_url"
+run truncate -s -1 "$default_corrupt_file"
+default_corrupt_hash=$(nix_cli hash file --type sha256 --base32 "$default_corrupt_file")
+default_corrupt_url="nar/$default_corrupt_hash.nar.xz"
+default_corrupt_status=$(run curl --silent --show-error --netrc-file "$netrc" \
+  --request PUT --upload-file "$default_corrupt_file" \
+  --output /dev/null --write-out '%{http_code}' "$server_url/$default_corrupt_url")
+[[ "$default_corrupt_status" == 422 ]] ||
+  fail "truncated XZ upload returned HTTP $default_corrupt_status"
+expect_missing "$data_dir/$default_corrupt_url"
 
 scenario 'zstd compression is accepted'
 zstd_path=$(build_path zstd-compression "$nonce")
