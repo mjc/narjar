@@ -2157,12 +2157,19 @@ mod tests {
         let storage = Storage::initialize(directory.path()).expect("initialize storage");
         let trusted_keys = directory.path().join("trusted-public-keys");
         let temporary = directory.path().join(".tmp/cache-info-recovery.part");
+        let nar_temporary = directory.path().join("nar/.tmp/nar-recovery.part");
         fs::write(&trusted_keys, b"").expect("create trusted key file");
         fs::write(&temporary, b"partial publication").expect("create interrupted temporary file");
+        fs::write(&nar_temporary, b"partial NAR publication")
+            .expect("create interrupted NAR temporary file");
         storage
             .recovery
             .begin(Path::new(".tmp/cache-info-recovery.part"))
-            .expect("record interrupted publication");
+            .expect("record interrupted cache-info publication");
+        storage
+            .recovery
+            .begin(Path::new("nar/.tmp/nar-recovery.part"))
+            .expect("record interrupted NAR publication");
 
         assert!(storage.recovery_required().expect("inspect recovery state"));
         storage
@@ -2170,6 +2177,7 @@ mod tests {
             .expect("finish interrupted publication recovery");
 
         assert!(!temporary.exists());
+        assert!(!nar_temporary.exists());
         assert!(
             fs::read_dir(directory.path().join(".narjar-transactions"))
                 .expect("read transaction directory")
