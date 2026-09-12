@@ -1,0 +1,68 @@
+# HELP narjar_http_requests_total HTTP requests by method, route, and status class.
+# TYPE narjar_http_requests_total counter
+narjar_http_requests_total{method="GET",route="healthz",status="2xx"} 1
+narjar_http_requests_total{method="GET",route="metrics",status="2xx"} 11
+narjar_http_requests_total{method="PUT",route="nar",status="2xx"} 2
+# HELP narjar_http_bytes_in_total Accepted upload body bytes.
+# TYPE narjar_http_bytes_in_total counter
+narjar_http_bytes_in_total 1073741830
+# HELP narjar_http_bytes_out_total Served artifact bytes.
+# TYPE narjar_http_bytes_out_total counter
+narjar_http_bytes_out_total 37349
+# HELP narjar_auth_failures_total Authentication failures by permission scope.
+# TYPE narjar_auth_failures_total counter
+narjar_auth_failures_total{scope="read"} 0
+narjar_auth_failures_total{scope="write"} 0
+# HELP narjar_validation_failures_total Rejected request bodies by validation class.
+# TYPE narjar_validation_failures_total counter
+narjar_validation_failures_total{class="body"} 0
+narjar_validation_failures_total{class="nar"} 0
+narjar_validation_failures_total{class="narinfo"} 0
+# HELP narjar_uploads_in_flight Accepted uploads currently being processed.
+# TYPE narjar_uploads_in_flight gauge
+narjar_uploads_in_flight 0
+# HELP narjar_requests_in_flight Requests currently being processed.
+# TYPE narjar_requests_in_flight gauge
+narjar_requests_in_flight 1
+# HELP narjar_temp_objects Temporary objects currently known by reconcile.
+# TYPE narjar_temp_objects gauge
+narjar_temp_objects 0
+# HELP narjar_disk_full_total No-space capacity failures.
+# TYPE narjar_disk_full_total counter
+narjar_disk_full_total 0
+# HELP narjar_capacity_failures_total Capacity failures by reason.
+# TYPE narjar_capacity_failures_total counter
+narjar_capacity_failures_total{reason="no_space"} 0
+narjar_capacity_failures_total{reason="quota"} 0
+narjar_capacity_failures_total{reason="inodes"} 0
+narjar_capacity_failures_total{reason="read_only"} 0
+# HELP narjar_publications_total Publication attempts.
+# TYPE narjar_publications_total counter
+narjar_publications_total 2
+# HELP narjar_publication_duration_seconds Publication duration summary.
+# TYPE narjar_publication_duration_seconds summary
+narjar_publication_duration_seconds_count 2
+narjar_publication_duration_seconds_sum 16.694584
+narjar_publication_duration_seconds_max 16.660921
+# HELP narjar_publication_queue_depth Valid PUT requests waiting for the publication worker.
+# TYPE narjar_publication_queue_depth gauge
+narjar_publication_queue_depth 0
+# HELP narjar_publication_queue_wait_seconds Queue wait before serialized publication.
+# TYPE narjar_publication_queue_wait_seconds summary
+narjar_publication_queue_wait_seconds_count 2
+narjar_publication_queue_wait_seconds_sum 0.000059
+narjar_publication_queue_wait_seconds_max 0.000031
+# HELP narjar_ready Whether the configured destination is ready.
+# TYPE narjar_ready gauge
+narjar_ready 1
+# HELP narjar_storage_capacity_bytes Destination filesystem bytes.
+# TYPE narjar_storage_capacity_bytes gauge
+narjar_storage_capacity_bytes{kind="total"} 312562548736
+narjar_storage_capacity_bytes{kind="available"} 167110770688
+# HELP narjar_storage_capacity_inodes Destination filesystem inodes.
+# TYPE narjar_storage_capacity_inodes gauge
+narjar_storage_capacity_inodes{kind="total"} 328435465
+narjar_storage_capacity_inodes{kind="available"} 326388298
+# HELP narjar_storage_read_only Whether the destination filesystem is read-only.
+# TYPE narjar_storage_read_only gauge
+narjar_storage_read_only 0
