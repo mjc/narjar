@@ -69,7 +69,35 @@ manifest_issues() {
       "targets must be an array"
     else
       (.targets | to_entries[] | select(.value | type != "object") |
-        "targets[\(.key)] must be an object")
+        "targets[\(.key)] must be an object"),
+      (.targets | to_entries[] | select(.value | type == "object") |
+        .key as $index | .value as $target |
+        (["id", "generation", "nixpkgs_revision", "flake_ref", "machine", "families", "subset", "resolved_root"] - ($target | keys))[] |
+        "targets[\($index)] missing: \(.)"),
+      (.targets | to_entries[] | select(.value | type == "object") |
+        .key as $index | .value as $target |
+        if (($target.id | type) != "string" or ($target.id | length) == 0) then
+          "targets[\($index)] has invalid id"
+        elif (
+          (($target.generation | type) == "number" and
+            (($target.generation | floor) != $target.generation or $target.generation < 0)) or
+          (($target.generation | type) == "string" and ($target.generation | length) == 0) or
+          (($target.generation | type) != "number" and ($target.generation | type) != "string")
+        ) then
+          "targets[\($index)] has invalid generation"
+        elif (($target.nixpkgs_revision | type) != "string" or ($target.nixpkgs_revision | length) == 0) then
+          "targets[\($index)] has invalid nixpkgs_revision"
+        elif (($target.flake_ref | type) != "string" or ($target.flake_ref | length) == 0) then
+          "targets[\($index)] has invalid flake_ref"
+        elif (($target.machine | type) != "string" or ($target.machine | length) == 0) then
+          "targets[\($index)] has invalid machine"
+        elif (($target.families | string_list) | not) then
+          "targets[\($index)] has invalid families"
+        elif (($target.subset | type) != "string" or ($target.subset | length) == 0) then
+          "targets[\($index)] has invalid subset"
+        elif (($target.resolved_root | type) != "string" or ($target.resolved_root | startswith("/nix/store/")) | not) then
+          "targets[\($index)] has invalid resolved_root"
+        else empty end)
     end,
     if (.entries | type) != "array" or (.entries | length) == 0 then
       "entries must be a non-empty list"

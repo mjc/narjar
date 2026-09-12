@@ -122,6 +122,9 @@ for command in bash env jq mktemp rm; do
 done
 PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
   --manifest "$WORK/schema-only.json" --schema-only
+jq '.targets[0].generation = "workload-20260901"' "$WORK/collected.json" > "$WORK/schema-string-generation.json"
+PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/schema-string-generation.json" --schema-only
 jq '.targets = ["not-an-object"]' "$WORK/collected.json" > "$WORK/schema-invalid-targets.json"
 if PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
   --manifest "$WORK/schema-invalid-targets.json" --schema-only \
@@ -130,6 +133,14 @@ if PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
   exit 1
 fi
 grep -q 'targets\[0\] must be an object' "$WORK/schema-invalid-targets.err"
+jq '.targets[0] |= del(.resolved_root)' "$WORK/collected.json" > "$WORK/schema-missing-target-field.json"
+if PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/schema-missing-target-field.json" --schema-only \
+  > /dev/null 2> "$WORK/schema-missing-target-field.err"; then
+  echo "schema-only validation accepted an incomplete target" >&2
+  exit 1
+fi
+grep -q 'targets\[0\] missing: resolved_root' "$WORK/schema-missing-target-field.err"
 if PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
   --manifest "$WORK/schema-only.json" --schema-only --store \
   > /dev/null 2> "$WORK/schema-only-conflict.err"; then
