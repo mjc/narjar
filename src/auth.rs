@@ -88,6 +88,10 @@ impl Authorizer {
         };
         bool::from(accepted)
     }
+
+    pub(crate) fn has_private_reads(&self) -> bool {
+        matches!(self.read, ReadPolicy::Private(_))
+    }
 }
 
 fn authorization_token_hash(request: &Request) -> Option<[u8; TOKEN_BYTES]> {

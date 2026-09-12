@@ -993,6 +993,28 @@ fn nix_cache_info_get_and_head_match_contract() {
 }
 
 #[test]
+fn private_cache_info_is_not_shared() {
+    let server = RunningServer::start_with_read_tokens("private-cache-info", TEST_WRITE_TOKEN);
+    let response = String::from_utf8(server.request_with_headers(
+        "GET",
+        "/nix-cache-info",
+        &[("Authorization", TEST_AUTHORIZATION)],
+    ))
+    .expect("response should be UTF-8");
+    let (signal, status) = server.stop();
+
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(
+        response.contains("Cache-Control: private, no-store\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("Vary: Authorization\r\n"), "{response}");
+    assert!(!response.contains("Cache-Control: public"), "{response}");
+}
+
+#[test]
 fn http11_connection_serves_two_sequential_requests() {
     let server = RunningServer::start("http11-keep-alive");
     let mut stream = TcpStream::connect(&server.address).expect("connect to narjar");
