@@ -43,6 +43,14 @@ scripts/nix-corpus validate \
   --manifest benchmarks/corpus-manifest.json --schema-only
 ```
 
+When present, the manifest's `targets` list must contain collected target
+records with an id, generation, pinned nixpkgs revision, flake reference,
+machine, family list, subset, and resolved store root. Numbered generations
+are integers; workload generations may use non-empty descriptive strings.
+Artifact paths and their lowercase hexadecimal SHA-256 values are either both
+present or both null. Schema-only validation checks these fields without
+requiring Nix or opening the artifacts.
+
 `--rebuild` permits a rebuilt root to have a different store path name. It
 compares the rebuilt root's `narHash` and `narSize` with the metadata recorded
 for the target's expected root in the manifest, so historical expected roots
@@ -54,7 +62,8 @@ is intentionally enforced during validation so a partial local store cannot
 silently become the headline corpus.
 
 `tests/nix-corpus.sh` covers the script without a real corpus: it checks a
-valid exported artifact, schema-only validation without opening an artifact,
-rejection of duplicate and unknown subset paths, coverage requirements, sorted
-input overrides, collection into a manifest, and byte-for-byte store rechecks
-through mocked Nix commands.
+valid exported artifact, schema-only validation through a reduced tool path
+without opening an artifact, target and artifact metadata rejection, duplicate
+and unknown subset paths, coverage requirements, sorted input overrides,
+collection into a manifest, and byte-for-byte store rechecks through mocked Nix
+commands.
