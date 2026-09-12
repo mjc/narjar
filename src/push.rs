@@ -396,10 +396,7 @@ fn native_copy_paths(
         let nar_status = put_file(
             &agent,
             &nar_url,
-            prepared
-                .file
-                .reopen()
-                .map_err(|error| format!("cannot reopen NAR for {}: {error}", info.path))?,
+            prepared.file.path(),
             authorization.as_deref(),
         )?;
         if !matches!(nar_status, 200 | 201) {
@@ -461,39 +458,72 @@ fn store_hash_for_path(path: &str) -> Result<&str, String> {
     }
 }
 
+const MAX_ATTEMPTS: usize = 3;
+
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+fn retry_sleep(attempt: usize) {
+    let multiplier = 1u64 << attempt.min(6);
+    thread::sleep(Duration::from_millis(100 * multiplier));
+}
+
 fn request_status(agent: &Agent, url: &str, authorization: Option<&str>) -> Result<u16, String> {
-    let mut request = agent.get(url);
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", format!("Basic {authorization}"));
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut request = agent.get(url);
+        if let Some(authorization) = authorization {
+            request = request.header("Authorization", format!("Basic {authorization}"));
+        }
+        match request.call() {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let mut body = response.into_body().into_reader();
+                io::copy(&mut body, &mut io::sink())
+                    .map_err(|error| format!("reading GET {url} response failed: {error}"))?;
+                if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
+                    retry_sleep(attempt);
+                    continue;
+                }
+                return Ok(status);
+            }
+            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt),
+            Err(error) => return Err(format!("GET {url} failed: {error}")),
+        }
     }
-    let response = request
-        .call()
-        .map_err(|error| format!("GET {url} failed: {error}"))?;
-    let status = response.status().as_u16();
-    let mut body = response.into_body().into_reader();
-    io::copy(&mut body, &mut io::sink())
-        .map_err(|error| format!("reading GET {url} response failed: {error}"))?;
-    Ok(status)
+    unreachable!("retry loop always returns")
 }
 
 fn put_file(
     agent: &Agent,
     url: &str,
-    file: File,
+    path: &Path,
     authorization: Option<&str>,
 ) -> Result<u16, String> {
-    let mut request = agent.put(url);
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", format!("Basic {authorization}"));
+    for attempt in 0..MAX_ATTEMPTS {
+        let file = File::open(path)
+            .map_err(|error| format!("opening NAR for PUT {url} failed: {error}"))?;
+        let mut request = agent.put(url);
+        if let Some(authorization) = authorization {
+            request = request.header("Authorization", format!("Basic {authorization}"));
+        }
+        match request.send(file) {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let mut body = response.into_body().into_reader();
+                io::copy(&mut body, &mut io::sink())
+                    .map_err(|error| format!("reading PUT {url} response failed: {error}"))?;
+                if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
+                    retry_sleep(attempt);
+                    continue;
+                }
+                return Ok(status);
+            }
+            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt),
+            Err(error) => return Err(format!("PUT {url} failed: {error}")),
+        }
     }
-    let response = request
-        .send(file)
-        .map_err(|error| format!("PUT {url} failed: {error}"))?;
-    let status = response.status().as_u16();
-    let mut body = response.into_body().into_reader();
-    io::copy(&mut body, &mut io::sink())
-        .map_err(|error| format!("reading PUT {url} response failed: {error}"))?;
-    Ok(status)
+    unreachable!("retry loop always returns")
 }
 
 fn put_bytes(
@@ -502,18 +532,28 @@ fn put_bytes(
     bytes: &[u8],
     authorization: Option<&str>,
 ) -> Result<u16, String> {
-    let mut request = agent.put(url);
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", format!("Basic {authorization}"));
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut request = agent.put(url);
+        if let Some(authorization) = authorization {
+            request = request.header("Authorization", format!("Basic {authorization}"));
+        }
+        match request.send(bytes) {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let mut body = response.into_body().into_reader();
+                io::copy(&mut body, &mut io::sink())
+                    .map_err(|error| format!("reading PUT {url} response failed: {error}"))?;
+                if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
+                    retry_sleep(attempt);
+                    continue;
+                }
+                return Ok(status);
+            }
+            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt),
+            Err(error) => return Err(format!("PUT {url} failed: {error}")),
+        }
     }
-    let response = request
-        .send(bytes)
-        .map_err(|error| format!("PUT {url} failed: {error}"))?;
-    let status = response.status().as_u16();
-    let mut body = response.into_body().into_reader();
-    io::copy(&mut body, &mut io::sink())
-        .map_err(|error| format!("reading PUT {url} response failed: {error}"))?;
-    Ok(status)
+    unreachable!("retry loop always returns")
 }
 
 fn prepare_nar(info: &PathInfo, compression: Compression) -> Result<PreparedNar, String> {
@@ -658,7 +698,9 @@ fn non_empty(value: &str) -> Result<String, String> {
 mod tests {
     use clap::{Args, Command, FromArgMatches};
 
-    use super::{Compression, PathInfo, Push, parse_path_info, serialize_narinfo};
+    use super::{
+        Agent, Compression, PathInfo, Push, is_retryable_status, parse_path_info, serialize_narinfo,
+    };
 
     #[test]
     fn parses_nix_path_info_metadata() {
@@ -737,6 +779,54 @@ mod tests {
              Deriver: abcdefghijklmnopqrstuvwxyz0123456789.drv\n\
              CA: fixed:sha256:0123456789abcdef\n"
         );
+    }
+
+    #[test]
+    fn retries_only_transient_http_failures() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(status), "HTTP {status} should retry");
+        }
+        for status in [200, 201, 400, 401, 404, 409, 413, 422] {
+            assert!(
+                !is_retryable_status(status),
+                "HTTP {status} should not retry"
+            );
+        }
+    }
+
+    #[test]
+    fn retries_a_429_before_returning_success() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry test listener");
+        let address = listener.local_addr().expect("inspect retry test listener");
+        let server = thread::spawn(move || {
+            for status in [429, 200] {
+                let (mut stream, _) = listener.accept().expect("accept retry test request");
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request).expect("read retry test request");
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write retry test response");
+            }
+        });
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        assert_eq!(
+            super::request_status(&agent, &format!("http://{address}/narinfo"), None)
+                .expect("retry should eventually succeed"),
+            200
+        );
+        server.join().expect("retry test server should exit");
     }
 
     #[test]
