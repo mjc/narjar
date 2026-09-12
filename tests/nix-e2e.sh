@@ -145,10 +145,16 @@ cache_copy_to() {
 }
 
 native_push_to() {
+  native_push_with_compression none "$@"
+}
+
+native_push_with_compression() {
+  local compression=$1
+  shift
   run narjar push \
     --netrc-file "$netrc" \
-    --to "$server_url?compression=none" \
-    --compression none \
+    --to "$server_url?compression=$compression" \
+    --compression "$compression" \
     "$@"
 }
 
@@ -353,8 +359,7 @@ run mv "$temp_root/primary.nar.backup" "$primary_nar_file"
 scenario 'default xz compression is accepted'
 default_path=$(build_path default-compression "$nonce")
 sign_path "$default_path"
-run nix_cli copy --refresh --option netrc-file "$netrc" \
-  --to "$server_url" "$default_path"
+native_push_with_compression xz "$default_path"
 default_root="$temp_root/default-store"
 substitute "$default_root" "$trusted_key" "$default_path"
 expect_file "$default_root$default_path"
@@ -383,8 +388,7 @@ expect_missing "$data_dir/$default_corrupt_url"
 scenario 'zstd compression is accepted'
 zstd_path=$(build_path zstd-compression "$nonce")
 sign_path "$zstd_path"
-run nix_cli copy --refresh --option netrc-file "$netrc" \
-  --to "$server_url?compression=zstd" "$zstd_path"
+native_push_with_compression zstd "$zstd_path"
 zstd_root="$temp_root/zstd-store"
 run nix_cli copy --refresh --option netrc-file "$netrc" \
   --option require-sigs true \
