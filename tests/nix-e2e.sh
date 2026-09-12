@@ -247,7 +247,7 @@ large_file="$temp_root/large-input"
 run dd if=/dev/zero of="$large_file" bs=1048576 count=16 status=none
 ca_path=$(nix_cli store add-file "$large_file")
 sign_path "$ca_path"
-cache_copy_to "$ca_path"
+native_push_to "$ca_path"
 ca_root="$temp_root/ca-store"
 substitute "$ca_root" "$wrong_key" "$ca_path"
 run cmp "$ca_path" "$ca_root$ca_path"
