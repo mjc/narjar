@@ -564,7 +564,7 @@ impl Storage {
         let validate = |file: &File| -> Result<(), StorageError> {
             match encoding {
                 NarEncoding::None => Ok(()),
-                NarEncoding::Xz => validate_xz(file, None, None, policy.max_bytes)
+                NarEncoding::Xz => validate_xz(file, None, Some(id), policy.max_bytes)
                     .map(|_| ())
                     .map_err(Into::into),
             }
@@ -1591,13 +1591,13 @@ mod tests {
         let directory = TestDir::new();
         let storage = Storage::initialize(directory.path()).expect("initialize storage");
         let raw = b"nar bytes";
-        let nar = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(raw)))
-            .expect("hash is a valid NAR object id");
         let mut compressed = Vec::new();
         let mut writer =
             XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
         writer.write_all(raw).expect("compress NAR");
         writer.finish().expect("finish XZ stream");
+        let nar = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(&compressed)))
+            .expect("compressed hash is a valid NAR object id");
 
         let outcome = storage
             .publish_nar(

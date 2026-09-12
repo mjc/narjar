@@ -1596,14 +1596,23 @@ fn nar_put_and_get_preserve_xz_bytes() {
     writer.write_all(NAR_BYTES).expect("compress NAR");
     writer.finish().expect("finish XZ stream");
 
-    let path = format!("/nar/{NARJAR_HASH}.nar.xz");
-    let stored_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar.xz"));
+    let file_hash = nix32_sha256(&compressed);
+    let wrong_path = format!("/nar/{NARJAR_HASH}.nar.xz");
+    let wrong = server.request_with_body("PUT", &wrong_path, &[], &compressed);
+    let path = format!("/nar/{file_hash}.nar.xz");
+    let stored_path = server.data_dir.join(format!("nar/{file_hash}.nar.xz"));
     let uploaded = server.request_with_body("PUT", &path, &[], &compressed);
     let downloaded = server.request("GET", &path);
     let stored = fs::read(stored_path).expect("read stored XZ NAR");
     let (signal, status) = server.stop();
 
     let (upload_headers, upload_body) = response_parts(&uploaded);
+    let (wrong_headers, wrong_body) = response_parts(&wrong);
+    assert!(
+        wrong_headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{wrong_headers:?}"
+    );
+    assert!(wrong_body.is_empty());
     assert!(
         upload_headers.starts_with("HTTP/1.1 201 Created\r\n"),
         "{upload_headers:?}"
@@ -1627,10 +1636,11 @@ fn xz_publications_serialize_at_1_8_and_32_way_concurrency() {
         XzWriter::new(&mut compressed, XzOptions::with_preset(6)).expect("create XZ writer");
     writer.write_all(NAR_BYTES).expect("compress NAR");
     writer.finish().expect("finish XZ stream");
+    let file_hash = nix32_sha256(&compressed);
 
     for concurrency in [1, 8, 32] {
         let server = RunningServer::start_with_workers("xz-publication-lane", 8, &[]);
-        let path = format!("/nar/{NARJAR_HASH}.nar.xz");
+        let path = format!("/nar/{file_hash}.nar.xz");
         let responses = thread::scope(|scope| {
             (0..concurrency)
                 .map(|_| scope.spawn(|| server.request_with_body("PUT", &path, &[], &compressed)))
