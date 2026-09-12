@@ -13,6 +13,10 @@ help=$(bash "$SCRIPT" --help)
 [[ "$help" == *"--slow-rate"* ]]
 [[ "$help" == *"--publishers"* ]]
 [[ "$help" == *"throughput"* ]]
+[[ "$help" == *"post-load RSS"* ]]
+[[ "$help" == *"staging usage"* ]]
+[[ "$help" == *"restart recovery time"* ]]
+[[ "$help" == *"anonymous allocator memory"* ]]
 
 if bash "$SCRIPT" --output "$TEMP_DIR/output" --narjar-bin /does/not/exist >/dev/null 2>&1; then
   echo "expected missing binary failure" >&2

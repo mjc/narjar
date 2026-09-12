@@ -19,7 +19,9 @@ Options:
   --slow-bytes N     Slow upload size in bytes (default: 1073741824)
   --slow-rate N      Slow upload rate in bytes/sec (default: 67108864)
   --publishers LIST  Comma-separated small PUT counts (default: 1,2,8,32)
-                     Report includes queue latency, throughput, CPU, and RSS
+                     Report includes queue latency, throughput, CPU, peak and
+                     post-load RSS, anonymous allocator memory, staging usage,
+                     and restart recovery time
   -h, --help         Show this help
 EOF
 }
@@ -115,7 +117,7 @@ chmod 600 "$COMMAND_LOG"
 mkdir -p -- "$LOG_DIR" "$METRICS_DIR"
 printf 'publishers\tslow_bytes\tslow_rate\tslow_id\n' > "$ENVIRONMENT"
 printf 'publishers\trequest\telapsed_ms\tstatus\tsize_upload\n' > "$SAMPLES"
-printf 'publishers\tsamples\tp50_ms\tp95_ms\tp99_ms\tmin_ms\tmax_ms\tslow_wall_ms\tslow_mib_s\tsmall_requests_s\tserver_cpu_ms\tserver_peak_rss_kib\tqueue_wait_count\tqueue_wait_sum_ms\tqueue_wait_max_ms\n' > "$SUMMARY"
+printf 'publishers\tsamples\tp50_ms\tp95_ms\tp99_ms\tmin_ms\tmax_ms\tslow_wall_ms\tslow_mib_s\tsmall_requests_s\tserver_cpu_ms\tserver_peak_rss_kib\tserver_post_load_rss_kib\tserver_peak_anonymous_kib\tserver_post_load_anonymous_kib\tserver_peak_heap_rss_kib\tserver_peak_staging_bytes\trecovery_ms\tqueue_wait_count\tqueue_wait_sum_ms\tqueue_wait_max_ms\n' > "$SUMMARY"
 
 log_command() {
   {
@@ -139,6 +141,21 @@ cpu_ticks() {
 
 rss_kib() {
   awk '/^Rss:/{print $2; found=1} END{if (!found) exit 1}' "/proc/$1/smaps_rollup"
+}
+
+anonymous_kib() {
+  awk '/^Anonymous:/{print $2; found=1} END{if (!found) exit 1}' "/proc/$1/smaps_rollup"
+}
+
+heap_rss_kib() {
+  awk '
+    /^[0-9a-f]+-[0-9a-f]+/ {heap = ($NF == "[heap]")}
+    heap && /^Rss:/ {total += $2}
+    END {print total + 0}' "/proc/$1/smaps"
+}
+
+staging_bytes() {
+  du -sb -- "$1/nar/.tmp" "$1/.tmp" | awk '{total += $1} END {print total + 0}'
 }
 
 metric() {
@@ -231,6 +248,11 @@ for publishers in "${PUBLISHERS[@]}"; do
 
   before_cpu=$(cpu_ticks "$SERVER_PID")
   peak_rss=$(rss_kib "$SERVER_PID")
+  post_load_rss=$peak_rss
+  peak_anonymous=$(anonymous_kib "$SERVER_PID")
+  post_load_anonymous=$peak_anonymous
+  peak_heap_rss=$(heap_rss_kib "$SERVER_PID")
+  peak_staging=$(staging_bytes "$data")
   small_pids=()
   for ((index = 0; index < publishers; index++)); do
     log_command curl --silent --show-error --netrc-file "$netrc" -X PUT --data-binary "@$SMALL_PAYLOAD" \
@@ -244,6 +266,14 @@ for publishers in "${PUBLISHERS[@]}"; do
   while kill -0 "$slow_pid" 2>/dev/null; do
     current_rss=$(rss_kib "$SERVER_PID" 2>/dev/null || printf 0)
     ((current_rss > peak_rss)) && peak_rss=$current_rss
+    post_load_rss=$current_rss
+    current_anonymous=$(anonymous_kib "$SERVER_PID" 2>/dev/null || printf 0)
+    ((current_anonymous > peak_anonymous)) && peak_anonymous=$current_anonymous
+    post_load_anonymous=$current_anonymous
+    current_heap_rss=$(heap_rss_kib "$SERVER_PID" 2>/dev/null || printf 0)
+    ((current_heap_rss > peak_heap_rss)) && peak_heap_rss=$current_heap_rss
+    current_staging=$(staging_bytes "$data")
+    ((current_staging > peak_staging)) && peak_staging=$current_staging
     sleep 0.05
   done
   wait "$slow_pid" || { cat "$result_dir/slow.err" >&2; exit 1; }
@@ -260,6 +290,14 @@ for publishers in "${PUBLISHERS[@]}"; do
   after_cpu=$(cpu_ticks "$SERVER_PID")
   current_rss=$(rss_kib "$SERVER_PID" 2>/dev/null || printf 0)
   ((current_rss > peak_rss)) && peak_rss=$current_rss
+  post_load_rss=$current_rss
+  current_anonymous=$(anonymous_kib "$SERVER_PID" 2>/dev/null || printf 0)
+  ((current_anonymous > peak_anonymous)) && peak_anonymous=$current_anonymous
+  post_load_anonymous=$current_anonymous
+  current_heap_rss=$(heap_rss_kib "$SERVER_PID" 2>/dev/null || printf 0)
+  ((current_heap_rss > peak_heap_rss)) && peak_heap_rss=$current_heap_rss
+  current_staging=$(staging_bytes "$data")
+  ((current_staging > peak_staging)) && peak_staging=$current_staging
 
   curl --silent --show-error --netrc-file "$netrc" "$SERVER_URL/metrics" > "$metrics_file"
   slow_wall_ms=$(awk -v start="$slow_start" -v end="$slow_end" 'BEGIN{printf "%.3f",(end-start)/1000000}')
@@ -268,6 +306,18 @@ for publishers in "${PUBLISHERS[@]}"; do
   queue_count=$(metric narjar_publication_queue_wait_seconds_count "$metrics_file")
   queue_sum=$(awk -v value="$(metric narjar_publication_queue_wait_seconds_sum "$metrics_file")" 'BEGIN{printf "%.3f",value*1000}')
   queue_max=$(awk -v value="$(metric narjar_publication_queue_wait_seconds_max "$metrics_file")" 'BEGIN{printf "%.3f",value*1000}')
+
+  stop_server
+  recovery_temp="$data/.tmp/recovery-$publishers.part"
+  recovery_record="$data/.narjar-transactions/recovery-$publishers.txn"
+  run_logged truncate -s 1 "$recovery_temp"
+  run_logged sh -c "printf '%s\\n' '.tmp/recovery-$publishers.part' > '$recovery_record'"
+  run_logged chmod 600 "$recovery_record"
+  run_logged sync
+  recovery_start=$(now_ns)
+  start_server "$data" "$server_log"
+  recovery_end=$(now_ns)
+  recovery_ms=$(awk -v start="$recovery_start" -v end="$recovery_end" 'BEGIN{printf "%.3f",(end-start)/1000000}')
 
   for ((index = 0; index < publishers; index++)); do
     IFS=$'\t' read -r status elapsed upload < "$result_dir/small-$index.result"
@@ -280,8 +330,10 @@ for publishers in "${PUBLISHERS[@]}"; do
     printf '%s\t%s\t%s\t%s\t%s\n' "$publishers" "$index" "$elapsed_ms" "$status" "$upload" >> "$SAMPLES"
   done
   awk -F '\t' -v publishers="$publishers" -v slow="$slow_wall_ms" \
-    -v slow_mib_s="$slow_mib_s" -v cpu="$server_cpu_ms" -v rss="$peak_rss" -v queue_count="$queue_count" \
-    -v queue_sum="$queue_sum" -v queue_max="$queue_max" '
+    -v slow_mib_s="$slow_mib_s" -v cpu="$server_cpu_ms" -v rss="$peak_rss" -v post_rss="$post_load_rss" \
+    -v peak_anonymous="$peak_anonymous" -v post_anonymous="$post_load_anonymous" \
+    -v peak_heap="$peak_heap_rss" -v peak_staging="$peak_staging" -v recovery="$recovery_ms" \
+    -v queue_count="$queue_count" -v queue_sum="$queue_sum" -v queue_max="$queue_max" '
     $1 == publishers {values[++n] = $3}
     END {
       for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++)
@@ -290,8 +342,8 @@ for publishers in "${PUBLISHERS[@]}"; do
       p95 = values[int((n * 0.95) + 0.999)];
       p99 = values[int((n * 0.99) + 0.999)];
       small_requests_s = n / (values[n] / 1000);
-      printf "%s\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\t%s\n",
-        publishers,n,p50,p95,p99,values[1],values[n],slow,slow_mib_s,small_requests_s,cpu,rss,queue_count,queue_sum,queue_max
+      printf "%s\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+        publishers,n,p50,p95,p99,values[1],values[n],slow,slow_mib_s,small_requests_s,cpu,rss,post_rss,peak_anonymous,post_anonymous,peak_heap,peak_staging,recovery,queue_count,queue_sum,queue_max
     }' "$SAMPLES" >> "$SUMMARY"
   printf '%s\t%s\t%s\t%s\n' "$publishers" "$SLOW_BYTES" "$SLOW_RATE" "$SLOW_ID" >> "$ENVIRONMENT"
   stop_server
