@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString, OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
@@ -10,17 +11,14 @@ use std::{
         unix::ffi::OsStrExt,
         unix::fs::{OpenOptionsExt, PermissionsExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
     process,
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::SystemTime,
 };
-
-#[cfg(test)]
-use std::path::PathBuf;
 
 use data_encoding::{BitOrder, Encoding, Specification};
 use sha2::{Digest, Sha256};
@@ -38,7 +36,6 @@ use recovery::RecoveryState;
 
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const NIX32_SHA256_LEN: usize = 52;
-const TEMP_ATTEMPTS: u64 = 128;
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_CACHE_INFO_BYTES: u64 = 1024;
 
@@ -568,7 +565,7 @@ pub struct Storage {
     layout: Layout,
     root: File,
     recovery: RecoveryState,
-    publication_lock: Mutex<()>,
+    publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     temporary_objects: AtomicU64,
     _lock: ProcessLock,
 }
@@ -596,6 +593,12 @@ impl Storage {
             "NAR temporary directory",
         )?;
         ensure_directory_at(&root_directory, OsStr::new(".tmp"), "temporary directory")?;
+        let transactions = ensure_directory_at(
+            &root_directory,
+            OsStr::new(".narjar-transactions"),
+            "publication transaction directory",
+        )?;
+        transactions.set_permissions(fs::Permissions::from_mode(0o700))?;
         let realisations_directory = ensure_directory_at(
             &root_directory,
             OsStr::new("realisations"),
@@ -615,7 +618,7 @@ impl Storage {
             layout,
             root: root_directory,
             recovery,
-            publication_lock: Mutex::new(()),
+            publication_locks: Mutex::new(HashMap::new()),
             temporary_objects: AtomicU64::new(0),
             _lock: lock,
         };
@@ -906,16 +909,15 @@ impl Storage {
         validate: impl FnOnce(&File) -> Result<(), StorageError>,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        let _publication = self
-            .publication_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         admit()?;
-        self.recovery.require()?;
         let destination_directory = self.destination_directory(&target)?;
         let destination_name = target.destination_name();
+        let destination_key = self.destination_key(&target, &destination_name);
+        let temp_name = self.next_temp_name(&target);
+        let temporary_path = self.temporary_path(&target, &temp_name);
+        let transaction = self.recovery.begin(&temporary_path)?;
         checkpoint(PublishBoundary::BeforeTempCreate)?;
-        let mut temp = self.create_temp(&target)?;
+        let mut temp = self.create_temp_named(&target, temp_name)?;
         let result = (|| {
             checkpoint(PublishBoundary::AfterTempCreate)?;
             io::copy(&mut source, &mut temp.file)?;
@@ -924,6 +926,10 @@ impl Storage {
             checkpoint(PublishBoundary::AfterTempSync)?;
             validate(&temp.file)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
+            let destination_lock = self.destination_lock(destination_key);
+            let _destination_guard = destination_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             match hard_link_at(
                 &temp.directory,
@@ -964,7 +970,7 @@ impl Storage {
         match result {
             Ok(outcome) => {
                 cleanup?;
-                self.recovery.finish_publication()?;
+                transaction.complete()?;
                 Ok(outcome)
             }
             Err(error) => {
@@ -974,40 +980,52 @@ impl Storage {
         }
     }
 
+    #[cfg(test)]
     fn create_temp(&self, target: &PublishTarget<'_>) -> Result<TemporaryFile, StorageError> {
+        let name = self.next_temp_name(target);
+        self.create_temp_named(target, name)
+    }
+
+    fn next_temp_name(&self, target: &PublishTarget<'_>) -> OsString {
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        OsString::from(format!(
+            "{}-{}-{sequence:016x}.part",
+            target.temp_prefix(),
+            process::id()
+        ))
+    }
+
+    fn temporary_path(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
+        match target {
+            PublishTarget::Nar(_, _) => PathBuf::from("nar/.tmp").join(name),
+            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => {
+                PathBuf::from(".tmp").join(name)
+            }
+        }
+    }
+
+    fn create_temp_named(
+        &self,
+        target: &PublishTarget<'_>,
+        name: OsString,
+    ) -> Result<TemporaryFile, StorageError> {
         let directory = match target {
             PublishTarget::Nar(_, _) => self.nar_temp_directory()?,
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.temp_directory()?,
         };
-        let prefix = target.temp_prefix();
-        for _ in 0..TEMP_ATTEMPTS {
-            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-            let name = OsString::from(format!("{prefix}-{}-{sequence:016x}.part", process::id()));
-            match open_at(
-                &directory,
-                &name,
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            ) {
-                Ok(file) => {
-                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-                    self.temporary_objects.fetch_add(1, Ordering::Relaxed);
-                    return Ok(TemporaryFile {
-                        name,
-                        directory,
-                        file,
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "cannot allocate unique temporary file",
-        )
-        .into())
+        let file = open_at(
+            &directory,
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        self.temporary_objects.fetch_add(1, Ordering::Relaxed);
+        Ok(TemporaryFile {
+            name,
+            directory,
+            file,
+        })
     }
 
     fn remove_temp(&self, temp: &TemporaryFile) -> Result<(), StorageError> {
@@ -1050,6 +1068,27 @@ impl Storage {
             PublishTarget::Nar(_, _) => self.nar_directory(),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.root_directory(),
         }
+    }
+
+    fn destination_key(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
+        match target {
+            PublishTarget::Nar(_, _) => PathBuf::from("nar").join(name),
+            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => PathBuf::from(name),
+        }
+    }
+
+    fn destination_lock(&self, key: PathBuf) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .publication_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 }
 
@@ -2113,6 +2152,34 @@ mod tests {
     }
 
     #[test]
+    fn recovery_cleans_incomplete_publication_transactions() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let trusted_keys = directory.path().join("trusted-public-keys");
+        let temporary = directory.path().join(".tmp/cache-info-recovery.part");
+        fs::write(&trusted_keys, b"").expect("create trusted key file");
+        fs::write(&temporary, b"partial publication").expect("create interrupted temporary file");
+        storage
+            .recovery
+            .begin(Path::new(".tmp/cache-info-recovery.part"))
+            .expect("record interrupted publication");
+
+        assert!(storage.recovery_required().expect("inspect recovery state"));
+        storage
+            .finish_recovery(&trusted_keys)
+            .expect("finish interrupted publication recovery");
+
+        assert!(!temporary.exists());
+        assert!(
+            fs::read_dir(directory.path().join(".narjar-transactions"))
+                .expect("read transaction directory")
+                .next()
+                .is_none()
+        );
+        assert!(!storage.recovery_required().expect("inspect clean state"));
+    }
+
+    #[test]
     fn publication_is_immutable_idempotent_and_pair_gated() {
         let directory = TestDir::new();
         let storage = Storage::initialize(directory.path()).expect("initialize storage");
@@ -2414,6 +2481,89 @@ mod tests {
             buffer[..3].copy_from_slice(b"nar");
             Ok(3)
         }
+    }
+
+    struct BlockingReader {
+        started: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<()>,
+        returned_bytes: bool,
+    }
+
+    impl Read for BlockingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.returned_bytes {
+                return Ok(0);
+            }
+
+            self.started
+                .take()
+                .expect("blocking reader only starts once")
+                .send(())
+                .expect("signal blocked publication");
+            self.release.recv().expect("release blocked publication");
+            buffer[..3].copy_from_slice(b"nar");
+            self.returned_bytes = true;
+            Ok(3)
+        }
+    }
+
+    #[test]
+    fn independent_publications_do_not_wait_for_another_body() {
+        let directory = TestDir::new();
+        let storage = Arc::new(Storage::initialize(directory.path()).expect("initialize storage"));
+        let first = NarObjectId::parse(NAR_ID).expect("valid first NAR object id");
+        let second = NarObjectId::parse(&"1".repeat(52)).expect("valid second NAR object id");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let publisher = {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || {
+                storage.publish_with(
+                    PublishTarget::Nar(&first, NarEncoding::None),
+                    BlockingReader {
+                        started: Some(started_tx),
+                        release: release_rx,
+                        returned_bytes: false,
+                    },
+                    |_| Ok(()),
+                )
+            })
+        };
+
+        started_rx.recv().expect("wait for first publication body");
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let contender = {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || {
+                let outcome = storage.publish_nar_unchecked(&second, Cursor::new(b"nar"));
+                outcome_tx
+                    .send(outcome)
+                    .expect("send second publication outcome");
+            })
+        };
+
+        let early_outcome = outcome_rx.recv_timeout(Duration::from_millis(500)).ok();
+        release_tx.send(()).expect("release first publication");
+        assert_eq!(
+            publisher
+                .join()
+                .expect("join first publication")
+                .expect("publish first NAR"),
+            PublishOutcome::Created
+        );
+        contender.join().expect("join second publication");
+        assert!(
+            early_outcome.is_some(),
+            "second publication waited for the first body to finish"
+        );
+        assert_eq!(
+            early_outcome
+                .or_else(|| outcome_rx.recv().ok())
+                .expect("second publication outcome")
+                .expect("publish second NAR"),
+            PublishOutcome::Created
+        );
     }
 
     #[test]

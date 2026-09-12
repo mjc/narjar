@@ -274,7 +274,7 @@ fn classify_root_entry(
     let is_directory = entry_is_directory_at(directory, name)?;
     let is_regular = entry_is_regular_at(directory, name)?;
     Ok(match name.to_str() {
-        Some("nar" | ".tmp" | "realisations" | "auth") => {
+        Some("nar" | ".tmp" | ".narjar-transactions" | "realisations" | "auth") => {
             (!is_directory).then_some(ReconcileClass::UnexpectedType)
         }
         Some(

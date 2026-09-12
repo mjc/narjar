@@ -79,6 +79,7 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
 const INIT_ROOT_ENTRIES: &[&str] = &[
     ".narjar-clean",
     ".narjar-recovery",
+    ".narjar-transactions",
     ".tmp",
     "auth",
     "nar",
