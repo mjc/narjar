@@ -136,6 +136,17 @@ fn signed_xz_narinfo(file_hash: &str, nar_hash: &str, nar_size: u64, file_size: 
     )
 }
 
+fn signed_zstd_narinfo(file_hash: &str, nar_hash: &str, nar_size: u64, file_size: u64) -> String {
+    let store_path = format!("/nix/store/{STORE_HASH}-narjar");
+    let fingerprint = format!("1;{store_path};sha256:{nar_hash};{nar_size};");
+    let signature = SigningKey::from_bytes(&[7; 32]).sign(fingerprint.as_bytes());
+
+    format!(
+        "StorePath: {store_path}\nURL: nar/{file_hash}.nar.zst\nCompression: zstd\nFileHash: sha256:{file_hash}\nFileSize: {file_size}\nNarHash: sha256:{nar_hash}\nNarSize: {nar_size}\nReferences: \nSig: narjar-test:{}\n",
+        BASE64.encode(&signature.to_bytes())
+    )
+}
+
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_narjar"));
     for variable in CONFIG_ENV {
@@ -1842,6 +1853,62 @@ fn xz_narinfo_gates_and_serves_the_compressed_pair() {
             "{response:?}"
         );
     }
+    let (_, nar_body) = response_parts(&nar_get);
+    assert_eq!(nar_body, compressed);
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn zstd_narinfo_gates_and_serves_the_compressed_pair() {
+    let server = RunningServer::start("narinfo-zstd");
+    let mut compressed = Vec::new();
+    compress(
+        std::io::Cursor::new(NAR_BYTES),
+        &mut compressed,
+        CompressionLevel::Fastest,
+    );
+    let file_hash = nix32_sha256(&compressed);
+    let narinfo = signed_zstd_narinfo(
+        &file_hash,
+        NARJAR_HASH,
+        NAR_BYTES.len() as u64,
+        compressed.len() as u64,
+    );
+
+    let wrong_path = format!("/nar/{NARJAR_HASH}.nar.zst");
+    let wrong = server.request_with_body("PUT", &wrong_path, &[], &compressed);
+    let nar_path = format!("/nar/{file_hash}.nar.zst");
+    let uploaded = server.request_with_body("PUT", &nar_path, &[], &compressed);
+    let published = server.request_with_body(
+        "PUT",
+        &format!("/{STORE_HASH}.narinfo"),
+        &[],
+        narinfo.as_bytes(),
+    );
+    let narinfo_get = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
+    let nar_get = server.request("GET", &nar_path);
+    let (signal, status) = server.stop();
+
+    let (wrong_headers, wrong_body) = response_parts(&wrong);
+    assert!(
+        wrong_headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{wrong_headers:?}"
+    );
+    assert!(wrong_body.is_empty());
+    for (name, response) in [
+        ("uploaded", &uploaded),
+        ("published", &published),
+        ("narinfo_get", &narinfo_get),
+        ("nar_get", &nar_get),
+    ] {
+        assert!(
+            String::from_utf8_lossy(response).starts_with("HTTP/1.1 2"),
+            "{name}: {response:?}"
+        );
+    }
+    let (_, narinfo_body) = response_parts(&narinfo_get);
+    assert_eq!(narinfo_body, narinfo.as_bytes());
     let (_, nar_body) = response_parts(&nar_get);
     assert_eq!(nar_body, compressed);
     assert!(signal.success(), "SIGTERM should be sent");

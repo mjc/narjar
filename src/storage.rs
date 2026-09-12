@@ -396,8 +396,12 @@ pub(crate) fn nar_file_matches(
     if file.metadata()?.len() != file_size {
         return Ok(false);
     }
-    Ok(validate_xz(file, Some(nar_hash), Some(file_hash), nar_size)
-        .is_ok_and(|size| size == nar_size))
+    let validation = match encoding {
+        NarEncoding::Zstd => validate_zstd(file, Some(nar_hash), Some(file_hash), nar_size),
+        NarEncoding::Xz => validate_xz(file, Some(nar_hash), Some(file_hash), nar_size),
+        NarEncoding::None => unreachable!("raw NARs return above"),
+    };
+    Ok(validation.is_ok_and(|size| size == nar_size))
 }
 
 pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Result<bool> {
