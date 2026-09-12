@@ -543,14 +543,20 @@ fn store_hash_for_path(path: &str) -> Result<&str, String> {
 }
 
 const MAX_ATTEMPTS: usize = 3;
+const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
-fn retry_sleep(attempt: usize) {
+fn retry_after_delay(value: &str) -> Option<Duration> {
+    let seconds = value.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds.min(MAX_RETRY_AFTER_SECONDS)))
+}
+
+fn retry_sleep(attempt: usize, retry_after: Option<Duration>) {
     let multiplier = 1u64 << attempt.min(6);
-    thread::sleep(Duration::from_millis(100 * multiplier));
+    thread::sleep(retry_after.unwrap_or_else(|| Duration::from_millis(100 * multiplier)));
 }
 
 fn request_status(agent: &Agent, url: &str, authorization: Option<&str>) -> Result<u16, String> {
@@ -562,16 +568,21 @@ fn request_status(agent: &Agent, url: &str, authorization: Option<&str>) -> Resu
         match request.call() {
             Ok(response) => {
                 let status = response.status().as_u16();
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(retry_after_delay);
                 let mut body = response.into_body().into_reader();
                 io::copy(&mut body, &mut io::sink())
                     .map_err(|error| format!("reading GET {url} response failed: {error}"))?;
                 if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                    retry_sleep(attempt);
+                    retry_sleep(attempt, retry_after);
                     continue;
                 }
                 return Ok(status);
             }
-            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt),
+            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt, None),
             Err(error) => return Err(format!("GET {url} failed: {error}")),
         }
     }
@@ -594,16 +605,21 @@ fn put_file(
         match request.send(file) {
             Ok(response) => {
                 let status = response.status().as_u16();
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(retry_after_delay);
                 let mut body = response.into_body().into_reader();
                 io::copy(&mut body, &mut io::sink())
                     .map_err(|error| format!("reading PUT {url} response failed: {error}"))?;
                 if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                    retry_sleep(attempt);
+                    retry_sleep(attempt, retry_after);
                     continue;
                 }
                 return Ok(status);
             }
-            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt),
+            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt, None),
             Err(error) => return Err(format!("PUT {url} failed: {error}")),
         }
     }
@@ -624,16 +640,21 @@ fn put_bytes(
         match request.send(bytes) {
             Ok(response) => {
                 let status = response.status().as_u16();
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(retry_after_delay);
                 let mut body = response.into_body().into_reader();
                 io::copy(&mut body, &mut io::sink())
                     .map_err(|error| format!("reading PUT {url} response failed: {error}"))?;
                 if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                    retry_sleep(attempt);
+                    retry_sleep(attempt, retry_after);
                     continue;
                 }
                 return Ok(status);
             }
-            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt),
+            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt, None),
             Err(error) => return Err(format!("PUT {url} failed: {error}")),
         }
     }
@@ -784,8 +805,9 @@ mod tests {
 
     use super::{
         Agent, Compression, PathInfo, Push, dependency_waves, is_retryable_status, parse_path_info,
-        serialize_narinfo,
+        retry_after_delay, serialize_narinfo,
     };
+    use std::time::Duration;
 
     #[test]
     fn parses_nix_path_info_metadata() {
@@ -877,6 +899,22 @@ mod tests {
                 "HTTP {status} should not retry"
             );
         }
+    }
+
+    #[test]
+    fn retry_after_delay_accepts_seconds_and_has_a_bound() {
+        assert_eq!(
+            retry_after_delay("3"),
+            Some(Duration::from_secs(3)),
+            "valid Retry-After seconds should be honored"
+        );
+        assert_eq!(
+            retry_after_delay("3600"),
+            Some(Duration::from_secs(60)),
+            "server-provided delays must remain bounded"
+        );
+        assert_eq!(retry_after_delay("invalid"), None);
+        assert_eq!(retry_after_delay(""), None);
     }
 
     #[test]
