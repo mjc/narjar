@@ -203,8 +203,10 @@ publish with a same-filesystem rename; metadata remains staged under
 Publication workers are bounded by the configured worker count and process
 valid PUTs concurrently. Each write reserves its declared body size against
 available staging capacity before entering the queue. Each publication then
-records its private temporary path under `.narjar-transactions` before
-streaming. Body transfer, validation, and
+records its private temporary path and initial `staging` state under
+`.narjar-transactions` before streaming. The record advances durably through
+`streaming`, `validated`, `linked`, and `published` as those boundaries
+complete. Body transfer, validation, and
 temporary-file sync are independent; only final-link comparison and the
 destination-directory sync use a per-destination commit lock. Queue depth and
 queue-wait summaries remain exposed in metrics. Startup recovery validates the

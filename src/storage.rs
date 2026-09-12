@@ -32,7 +32,7 @@ mod reconcile;
 mod recovery;
 
 pub use reconcile::{ReconcileClass, ReconcileEntry, ReconcileReport};
-use recovery::RecoveryState;
+use recovery::{PublicationState, RecoveryState};
 
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const NIX32_SHA256_LEN: usize = 52;
@@ -1014,9 +1014,10 @@ impl Storage {
         let destination_key = self.destination_key(&target, &destination_name);
         let temp_name = self.next_temp_name(&target);
         let temporary_path = self.temporary_path(&target, &temp_name);
-        let transaction = self.recovery.begin(&temporary_path)?;
+        let mut transaction = self.recovery.begin(&temporary_path)?;
         checkpoint(PublishBoundary::BeforeTempCreate)?;
         let mut temp = self.create_temp_named(&target, temp_name)?;
+        transaction.transition(PublicationState::Streaming)?;
         let mut durable = false;
         let result = (|| {
             checkpoint(PublishBoundary::AfterTempCreate)?;
@@ -1025,6 +1026,7 @@ impl Storage {
             temp.file.sync_all()?;
             checkpoint(PublishBoundary::AfterTempSync)?;
             validate(&temp.file)?;
+            transaction.transition(PublicationState::Validated)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
             let destination_lock = self.destination_lock(destination_key);
             let _destination_guard = destination_lock
@@ -1038,6 +1040,7 @@ impl Storage {
                 &destination_name,
             ) {
                 Ok(()) => {
+                    transaction.transition(PublicationState::Linked)?;
                     if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
                         rollback_link_at(&destination_directory, &destination_name)?;
                         return Err(error);
@@ -1047,6 +1050,7 @@ impl Storage {
                         return Err(error.into());
                     }
                     durable = true;
+                    transaction.transition(PublicationState::Published)?;
                     checkpoint(PublishBoundary::AfterParentSync)?;
                     Ok(PublishOutcome::Created)
                 }
@@ -1057,6 +1061,7 @@ impl Storage {
                         &destination_directory,
                         &destination_name,
                     )? {
+                        transaction.transition(PublicationState::Published)?;
                         Ok(PublishOutcome::Identical)
                     } else {
                         Err(StorageError::Conflict)
@@ -2382,6 +2387,40 @@ mod tests {
     }
 
     #[test]
+    fn recovery_records_publish_state_before_each_fault_boundary() {
+        for (boundary, expected_state) in [
+            (PublishBoundary::BeforeTempCreate, "staging"),
+            (PublishBoundary::AfterTempCreate, "streaming"),
+            (PublishBoundary::AfterStream, "streaming"),
+            (PublishBoundary::AfterTempSync, "streaming"),
+            (PublishBoundary::BeforeFinalLink, "validated"),
+            (PublishBoundary::BeforeParentSync, "linked"),
+        ] {
+            let directory = TestDir::new();
+            let storage = Storage::initialize(directory.path()).expect("initialize storage");
+            let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+
+            assert!(
+                storage
+                    .publish_nar_fault(&nar, Cursor::new(b"nar bytes"), boundary)
+                    .is_err(),
+                "{boundary:?} unexpectedly succeeded"
+            );
+            let record = fs::read_dir(directory.path().join(".narjar-transactions"))
+                .expect("read transaction directory")
+                .next()
+                .expect("faulted publication should retain a transaction")
+                .expect("read transaction entry");
+            let contents = fs::read(record.path()).expect("read transaction record");
+            let contents = String::from_utf8(contents).expect("transaction record is UTF-8");
+            assert!(
+                contents.starts_with(&format!("state={expected_state}\npath=")),
+                "{boundary:?} recorded unexpected state: {contents:?}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_publication_transaction_blocks_recovery() {
         let directory = TestDir::new();
         let storage = Storage::initialize(directory.path()).expect("initialize storage");
@@ -2397,6 +2436,30 @@ mod tests {
         assert!(storage.recovery_required().expect("inspect recovery state"));
         assert!(storage.finish_recovery(&trusted_keys).is_err());
         assert!(record.exists(), "failed recovery must retain its evidence");
+    }
+
+    #[test]
+    fn unknown_publication_transaction_state_blocks_recovery() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let trusted_keys = directory.path().join("trusted-public-keys");
+        let temporary = directory.path().join(".tmp/unknown-state.part");
+        let record = directory
+            .path()
+            .join(".narjar-transactions/publish-unknown-state.txn");
+        fs::write(&trusted_keys, b"").expect("create trusted key file");
+        fs::write(&temporary, b"temporary").expect("create temporary publication");
+        fs::write(&record, b"state=unknown\npath=.tmp/unknown-state.part\n")
+            .expect("create unknown-state record");
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
+            .expect("make unknown-state record private");
+
+        assert!(storage.finish_recovery(&trusted_keys).is_err());
+        assert!(record.exists(), "unknown state must retain its evidence");
+        assert!(
+            temporary.exists(),
+            "failed recovery must not remove its temp"
+        );
     }
 
     #[test]

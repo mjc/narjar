@@ -224,18 +224,20 @@ Publication workers are bounded by `--workers` and process independent PUTs
 concurrently. Each write reserves its declared body size against available
 staging capacity before it enters the queue. Each upload then writes a private
 temporary file and a durable record under `.narjar-transactions` before
-streaming its body. Only the final
+streaming its body. The record durably advances through `staging`, `streaming`,
+`validated`, `linked`, and `published` states at the corresponding filesystem
+boundaries. Only the final
 link/compare and destination-directory sync are serialized for the same
 destination; unrelated destinations do not wait behind a slow body or decoder.
 The queue remains bounded and exposes depth and wait metrics; excess requests
 receive 429 when admission is full.
 
 If a process stops during publication, the transaction record keeps the
-temporary path recoverable without making the final object visible. Startup
-validates the published inventory, removes recorded temporary state, and only
-then writes the clean marker. Concurrent writers still use private temporary
-files and atomic link-no-replace, so a retry is identical success or a
-deterministic conflict.
+temporary path and durable state recoverable without making an incomplete final
+object visible. Startup validates the published inventory, validates each
+record, removes recorded temporary state, and only then writes the clean
+marker. Concurrent writers still use private temporary files and atomic
+link-no-replace, so a retry is identical success or a deterministic conflict.
 
 ## Durable upload state machine
 

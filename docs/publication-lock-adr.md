@@ -57,12 +57,14 @@ ambiguous.
 ## Current decision
 
 NARJ-110 replaced the global lock with one durable transaction record per
-publication. Records are created and synced before body streaming, and are
-removed only after temporary cleanup and the final durable state. Independent
-publications use bounded worker and admission queues. Only final-link comparison
-and the destination-directory sync use a narrow lock for the same destination.
-Startup enumerates every transaction record and validates the published
-inventory before clearing recovery state.
+publication. Records are created and synced in `staging` before body
+streaming, then advance through `streaming`, `validated`, `linked`, and
+`published`; they are removed only after temporary cleanup and the final
+durable state. Independent publications use bounded worker and admission
+queues. Only final-link comparison and the destination-directory sync use a
+narrow lock for the same destination. Startup enumerates every transaction
+record, validates its state and the published inventory, and only then clears
+recovery state.
 
 The current implementation and measurements are documented in
 [`architecture.md`](architecture.md), [`operations.md`](operations.md), and

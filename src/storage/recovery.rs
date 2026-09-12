@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process,
@@ -24,9 +24,67 @@ static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(0);
 pub(super) struct PublicationTransaction {
     directory: File,
     name: OsString,
+    record: File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PublicationState {
+    Staging,
+    Streaming,
+    Validated,
+    Linked,
+    Published,
+}
+
+impl PublicationState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Streaming => "streaming",
+            Self::Validated => "validated",
+            Self::Linked => "linked",
+            Self::Published => "published",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "staging" => Ok(Self::Staging),
+            "streaming" => Ok(Self::Streaming),
+            "validated" => Ok(Self::Validated),
+            "linked" => Ok(Self::Linked),
+            "published" => Ok(Self::Published),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "publication transaction record has an unknown state",
+            )
+            .into()),
+        }
+    }
 }
 
 impl PublicationTransaction {
+    pub(super) fn transition(&mut self, state: PublicationState) -> Result<(), StorageError> {
+        let mut contents = String::new();
+        self.record.seek(SeekFrom::Start(0))?;
+        self.record.read_to_string(&mut contents)?;
+        let path = contents
+            .lines()
+            .find_map(|line| line.strip_prefix("path="))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "publication transaction record has no path",
+                )
+            })?;
+        self.record.seek(SeekFrom::Start(0))?;
+        self.record.set_len(0)?;
+        write!(self.record, "state={}\npath={path}\n", state.as_str())?;
+        self.record.sync_all()?;
+        self.directory.sync_all()?;
+        Ok(())
+    }
+
     pub(super) fn complete(&self) -> Result<(), StorageError> {
         unlink_at(&self.directory, &self.name)?;
         self.directory.sync_all()?;
@@ -83,25 +141,24 @@ impl RecoveryState {
                 "publication temporary path is not UTF-8",
             )
         })?;
-        let contents = format!("{temporary_path}\n");
-
         for _ in 0..128 {
             let sequence = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed);
             let name = OsString::from(format!("publish-{}-{sequence:016x}.txn", process::id()));
             match open_at(
                 &self.transactions,
                 &name,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o600,
             ) {
                 Ok(mut record) => {
                     record.set_permissions(fs::Permissions::from_mode(0o600))?;
-                    record.write_all(contents.as_bytes())?;
+                    write!(record, "state=staging\npath={temporary_path}\n")?;
                     record.sync_all()?;
                     self.transactions.sync_all()?;
                     return Ok(PublicationTransaction {
                         directory: self.transactions.try_clone()?,
                         name,
+                        record,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -142,8 +199,8 @@ impl RecoveryState {
             record
                 .take(MAX_TRANSACTION_BYTES + 1)
                 .read_to_end(&mut contents)?;
-            let path = parse_transaction_path(&contents)?;
-            self.remove_temporary_path(path)?;
+            let transaction = parse_transaction(&contents)?;
+            self.remove_temporary_path(transaction.path)?;
             unlink_at(&self.transactions, &name)?;
         }
         self.transactions.sync_all()?;
@@ -269,20 +326,61 @@ impl RecoveryState {
     }
 }
 
-fn parse_transaction_path(contents: &[u8]) -> Result<PathBuf, StorageError> {
+struct TransactionRecord {
+    _state: PublicationState,
+    path: PathBuf,
+}
+
+fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError> {
     let contents = contents.strip_suffix(b"\n").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "publication transaction record is not newline terminated",
         )
     })?;
-    let path = std::str::from_utf8(contents).map_err(|_| {
+    let contents = std::str::from_utf8(contents).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "publication transaction record is not UTF-8",
         )
     })?;
-    Ok(PathBuf::from(path))
+    let mut lines = contents.lines();
+    let first = lines.next().unwrap_or_default();
+    if let Some(state) = first.strip_prefix("state=") {
+        let path = lines
+            .next()
+            .and_then(|line| line.strip_prefix("path="))
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "publication transaction record has no path",
+                )
+            })?;
+        if lines.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "publication transaction record has extra fields",
+            )
+            .into());
+        }
+        return Ok(TransactionRecord {
+            _state: PublicationState::parse(state)?,
+            path: PathBuf::from(path),
+        });
+    }
+
+    if first.is_empty() || lines.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "publication transaction record has an invalid legacy path",
+        )
+        .into());
+    }
+    Ok(TransactionRecord {
+        _state: PublicationState::Staging,
+        path: PathBuf::from(first),
+    })
 }
 
 fn trusted_keys_digest(path: &Path) -> Result<[u8; 32], StorageError> {
