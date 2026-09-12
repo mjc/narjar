@@ -122,6 +122,14 @@ for command in bash env jq mktemp rm; do
 done
 PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
   --manifest "$WORK/schema-only.json" --schema-only
+jq '.targets = ["not-an-object"]' "$WORK/collected.json" > "$WORK/schema-invalid-targets.json"
+if PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/schema-invalid-targets.json" --schema-only \
+  > /dev/null 2> "$WORK/schema-invalid-targets.err"; then
+  echo "schema-only validation accepted invalid targets" >&2
+  exit 1
+fi
+grep -q 'targets\[0\] must be an object' "$WORK/schema-invalid-targets.err"
 if PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
   --manifest "$WORK/schema-only.json" --schema-only --store \
   > /dev/null 2> "$WORK/schema-only-conflict.err"; then

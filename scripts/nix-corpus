@@ -64,6 +64,13 @@ manifest_issues() {
     def object_entries:
       [$root.entries[] | select(type == "object")];
     if .schema_version != 1 then "schema_version must be 1" else empty end,
+    if (has("targets") | not) then empty
+    elif (.targets | type) != "array" then
+      "targets must be an array"
+    else
+      (.targets | to_entries[] | select(.value | type != "object") |
+        "targets[\(.key)] must be an object")
+    end,
     if (.entries | type) != "array" or (.entries | length) == 0 then
       "entries must be a non-empty list"
     else
@@ -280,7 +287,9 @@ validate() {
   fi
   if [[ -s "$issues" ]]; then
     echo "error: manifest validation failed:" >&2
-    sed 's/^/  /' "$issues" >&2
+    while IFS= read -r issue; do
+      printf '  %s\n' "$issue" >&2
+    done < "$issues"
     return 1
   fi
   printf 'validated %s: %s unique paths\n' "$manifest" "$(jq '.entries | length' "$manifest")"
