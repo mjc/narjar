@@ -188,22 +188,31 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let admissions = Arc::new(Admissions::new(max_in_flight));
     let (sender, receiver) = bounded::<AcceptedRequest>(max_in_flight);
     let (publication_sender, publication_receiver) = bounded::<QueuedPublication>(max_in_flight);
-    let publication_handle = {
-        let storage = Arc::clone(&storage);
-        let trusted_keys = Arc::clone(&trusted_keys);
-        let metrics = Arc::clone(&metrics);
-        thread::Builder::new()
-            .name("narjar-publication".to_owned())
-            .spawn(move || {
-                while let Ok(publication) = publication_receiver.recv() {
-                    metrics.publication_dequeued(publication.queued_at);
-                    publication
-                        .request
-                        .respond(&storage, &trusted_keys, upload_policy, &metrics);
-                }
-            })
-            .map_err(|error| Error::runtime(format!("cannot start publication worker: {error}")))?
-    };
+    let publication_handles: Vec<_> = (0..config.workers.get())
+        .map(|index| {
+            let publication_receiver = publication_receiver.clone();
+            let storage = Arc::clone(&storage);
+            let trusted_keys = Arc::clone(&trusted_keys);
+            let metrics = Arc::clone(&metrics);
+            thread::Builder::new()
+                .name(format!("narjar-publication-{index}"))
+                .spawn(move || {
+                    while let Ok(publication) = publication_receiver.recv() {
+                        metrics.publication_dequeued(publication.queued_at);
+                        publication.request.respond(
+                            &storage,
+                            &trusted_keys,
+                            upload_policy,
+                            &metrics,
+                        );
+                    }
+                })
+                .map_err(|error| {
+                    Error::runtime(format!("cannot start publication worker: {error}"))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    drop(publication_receiver);
     let handles: Vec<_> = (0..config.workers.get())
         .map(|_| {
             let receiver = receiver.clone();
@@ -316,15 +325,20 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .map_err(|_| Error::runtime("request worker panicked"))?;
     }
     drop(publication_sender);
-    while !publication_handle.is_finished() {
+    while publication_handles
+        .iter()
+        .any(|handle| !handle.is_finished())
+    {
         if Instant::now() >= deadline {
             return Err(Error::runtime("shutdown grace period expired"));
         }
         thread::sleep(Duration::from_millis(10));
     }
-    publication_handle
-        .join()
-        .map_err(|_| Error::runtime("publication worker panicked"))?;
+    for handle in publication_handles {
+        handle
+            .join()
+            .map_err(|_| Error::runtime("publication worker panicked"))?;
+    }
 
     Ok(())
 }

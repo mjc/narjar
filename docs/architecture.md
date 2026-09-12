@@ -200,17 +200,15 @@ limit. NAR staging is under `DATA/nar/.tmp`, so a split NAR destination can
 publish with a same-filesystem rename; metadata remains staged under
 `DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be measured.
 
-Publication is currently globally serialized. A bounded publication worker
-drains valid PUTs in order, and the storage publication mutex remains held from
-admission through request-body streaming, validation, durable link, directory
-sync, cleanup, and recovery bookkeeping. A slow upload therefore creates
-head-of-line blocking for later PUTs, while read workers can continue serving
-GET/HEAD requests. Queue depth and queue-wait summaries are exposed in metrics.
-The design is retained for v0.1 because the single recovery marker and ordered
-commit path make crash recovery straightforward; the matched contention
-measurement and decision are recorded in
-[`publication-lock-adr.md`](publication-lock-adr.md). Splitting preparation
-from the short durable commit section requires a separate recovery-state design.
+Publication workers are bounded by the configured worker count and process
+valid PUTs concurrently. Each publication records its private temporary path
+under `.narjar-transactions` before streaming. Body transfer, validation, and
+temporary-file sync are independent; only final-link comparison and the
+destination-directory sync use a per-destination commit lock. Queue depth and
+queue-wait summaries remain exposed in metrics. Startup recovery validates the
+published inventory before removing transaction-recorded temporary files and
+rewriting the clean marker. The earlier serialized design and its measurement
+remain historical context in [`publication-lock-adr.md`](publication-lock-adr.md).
 
 ## Publication and crash semantics
 

@@ -209,20 +209,20 @@ operation times out. A reverse proxy may use stricter limits, but direct use
 does not depend on proxy enforcement. NAR size and minimum free-space checks
 happen before and during the stream.
 
-Publication is globally serialized by one bounded publication worker and the
-storage publication mutex. The mutex currently covers admission, temporary-file
-creation, the complete request-body stream, validation, durable link, directory
-sync, cleanup, and recovery bookkeeping. Reads continue on the read workers,
-but a later PUT waits behind an earlier slow PUT. The queue is bounded and
-exposes depth and wait metrics; excess requests receive 429 when admission is
-full.
+Publication workers are bounded by `--workers` and process independent PUTs
+concurrently. Each upload writes a private temporary file and a durable record
+under `.narjar-transactions` before streaming its body. Only the final
+link/compare and destination-directory sync are serialized for the same
+destination; unrelated destinations do not wait behind a slow body or decoder.
+The queue remains bounded and exposes depth and wait metrics; excess requests
+receive 429 when admission is full.
 
-This is an intentional v0.1 simplicity tradeoff: a single recovery marker and
-one publication order are easy to reason about across crashes. Concurrent
-writers still use private temporary files and atomic link-no-replace, so a
-retry is identical success or a deterministic conflict. A future narrower
-commit section must preserve those durability and recovery invariants; it is
-not implied by the current per-object atomicity.
+If a process stops during publication, the transaction record keeps the
+temporary path recoverable without making the final object visible. Startup
+validates the published inventory, removes recorded temporary state, and only
+then writes the clean marker. Concurrent writers still use private temporary
+files and atomic link-no-replace, so a retry is identical success or a
+deterministic conflict.
 
 ## Durable upload state machine
 
@@ -265,8 +265,10 @@ publication point.
 | narinfo without NAR | narinfo is quarantinable corruption; normal server returns 404/500 rather than bytes | missing NAR |
 | malformed final filename | unreachable by valid route | unknown/invalid file |
 
-Startup never deletes or publishes. It validates the fixed layout and lock, then
-serves exact files. Reconciliation is deterministic and operator-triggered.
+Startup validates the fixed layout and lock, verifies the published inventory
+when recovery records are present, then removes only those recorded temporary
+objects before serving exact files. Reconciliation remains deterministic and
+operator-triggered for other stale temporary files.
 
 ## Disk-full and I/O failure
 
@@ -323,8 +325,8 @@ For a consistent portable copy:
 
 1. Stop Narjar and wait for the process to exit.
 2. Copy the complete data directory, including `.narjar-clean`,
-   `.narjar-recovery`, `lock`, `nar/`, `.tmp/`, `realisations/`, `nix-cache-info`,
-   `trusted-public-keys`, and `auth/`.
+   `.narjar-recovery`, `.narjar-transactions/`, `lock`, `nar/`, `.tmp/`,
+   `realisations/`, `nix-cache-info`, `trusted-public-keys`, and `auth/`.
 3. Preserve the directory and file permissions; do not expose the copy while
    it contains credentials.
 4. On the destination, run `doctor`, `reconcile --verify-hashes`, and `verify`

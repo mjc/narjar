@@ -1716,7 +1716,7 @@ fn nar_put_and_get_preserve_zstd_bytes() {
 }
 
 #[test]
-fn xz_publications_serialize_at_1_8_and_32_way_concurrency() {
+fn xz_publications_are_idempotent_at_1_8_and_32_way_concurrency() {
     let mut compressed = Vec::new();
     let mut writer =
         XzWriter::new(&mut compressed, XzOptions::with_preset(6)).expect("create XZ writer");
@@ -1759,7 +1759,7 @@ fn xz_publications_serialize_at_1_8_and_32_way_concurrency() {
 }
 
 #[test]
-fn stalled_publication_blocks_following_put_and_reports_queue_wait() {
+fn stalled_publication_does_not_block_an_independent_put() {
     let server = RunningServer::start_with_workers(
         "publication-head-of-line",
         2,
@@ -1780,27 +1780,25 @@ fn stalled_publication_blocks_following_put_and_reports_queue_wait() {
             response
         });
 
-        let mut queued = false;
         for _ in 0..100 {
-            let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
-                .expect("metrics should be UTF-8");
-            if metrics.contains("narjar_publication_queue_depth 1") {
-                queued = true;
+            if completed.load(Ordering::Acquire) {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(queued, "following publication never entered the queue");
-        assert!(!completed.load(Ordering::Acquire));
+        assert!(
+            completed.load(Ordering::Acquire),
+            "following publication remained blocked behind the stalled body"
+        );
 
         stalled
             .write_all(NAR_BYTES)
             .expect("stalled upload body should be writable");
         let first_response = read_http_response(&mut stalled);
-        assert!(first_response.starts_with(b"HTTP/1.1 201 Created\r\n"));
+        assert!(first_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
 
         let second_response = second.join().expect("following upload should not panic");
-        assert!(second_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(second_response.starts_with(b"HTTP/1.1 201 Created\r\n"));
     });
 
     let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
