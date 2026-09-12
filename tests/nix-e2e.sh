@@ -351,6 +351,15 @@ default_root="$temp_root/default-store"
 substitute "$default_root" "$trusted_key" "$default_path"
 expect_file "$default_root$default_path"
 run cmp "$default_path" "$default_root$default_path"
+default_nar_url=$(nar_url_for "$default_path")
+default_range_headers="$temp_root/default-range.headers"
+default_range_body="$temp_root/default-range.body"
+cache_curl --range 0-7 \
+  --dump-header "$default_range_headers" \
+  --output "$default_range_body" \
+  "$server_url/$default_nar_url"
+run grep -E '^HTTP/[0-9.]+ 206' "$default_range_headers"
+[[ $(wc -c < "$default_range_body") -eq 8 ]] || fail "XZ range response was not eight bytes"
 
 scenario 'zstd compression is accepted'
 zstd_path=$(build_path zstd-compression "$nonce")
@@ -368,6 +377,14 @@ run cmp "$zstd_path" "$zstd_root$zstd_path"
 zstd_nar_url=$(nar_url_for "$zstd_path")
 [[ "$zstd_nar_url" == *.nar.zst ]] ||
   fail "zstd upload did not produce a .nar.zst URL: $zstd_nar_url"
+zstd_range_headers="$temp_root/zstd-range.headers"
+zstd_range_body="$temp_root/zstd-range.body"
+cache_curl --range 0-7 \
+  --dump-header "$zstd_range_headers" \
+  --output "$zstd_range_body" \
+  "$server_url/$zstd_nar_url"
+run grep -E '^HTTP/[0-9.]+ 206' "$zstd_range_headers"
+[[ $(wc -c < "$zstd_range_body") -eq 8 ]] || fail "zstd range response was not eight bytes"
 run nix_cli store verify --store "local?root=$zstd_root" \
   --sigs-needed 1 \
   --option trusted-public-keys "$trusted_key" \
