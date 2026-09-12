@@ -34,6 +34,15 @@ scripts/nix-corpus validate \
   --manifest benchmarks/corpus-manifest.json --store --rebuild
 ```
 
+For a fast structural check that does not open or hash exported NAR files, use
+`--schema-only`. It is mutually exclusive with `--artifact-root`, `--store`,
+and `--rebuild`:
+
+```sh
+scripts/nix-corpus validate \
+  --manifest benchmarks/corpus-manifest.json --schema-only
+```
+
 `--rebuild` permits a rebuilt root to have a different store path name. It
 compares the rebuilt root's `narHash` and `narSize` with the metadata recorded
 for the target's expected root in the manifest, so historical expected roots
@@ -45,6 +54,7 @@ is intentionally enforced during validation so a partial local store cannot
 silently become the headline corpus.
 
 `tests/nix-corpus.sh` covers the script without a real corpus: it checks a
-valid exported artifact, rejection of duplicate and unknown subset paths,
-coverage requirements, sorted input overrides, collection into a manifest,
-and byte-for-byte store rechecks through mocked Nix commands.
+valid exported artifact, schema-only validation without opening an artifact,
+rejection of duplicate and unknown subset paths, coverage requirements, sorted
+input overrides, collection into a manifest, and byte-for-byte store rechecks
+through mocked Nix commands.

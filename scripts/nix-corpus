@@ -8,7 +8,7 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/nix-corpus collect --spec FILE --manifest FILE [--export-dir DIR] [--build]
-  scripts/nix-corpus validate --manifest FILE [--artifact-root DIR] [--store] [--rebuild]
+  scripts/nix-corpus validate --manifest FILE [--artifact-root DIR] [--store] [--rebuild] [--schema-only]
 
 Collect and validate reproducible corpora of uncompressed Nix NARs.
 Requires nix, nix-store, jq, and standard Unix utilities.
@@ -249,16 +249,18 @@ validate_rebuilds() {
 }
 
 validate() {
-  local manifest=$1 artifact_root=$2 check_store=$3 rebuild=$4 issues
+  local manifest=$1 artifact_root=$2 check_store=$3 rebuild=$4 schema_only=$5 issues
   [[ -f "$manifest" ]] || die "manifest does not exist: $manifest"
   issues="$WORK_DIR/issues.txt"
   manifest_issues "$manifest" > "$issues"
-  validate_artifacts "$manifest" "$artifact_root" >> "$issues"
-  if [[ "$check_store" == true ]]; then
-    validate_store "$manifest" >> "$issues"
-  fi
-  if [[ "$rebuild" == true ]]; then
-    validate_rebuilds "$manifest" >> "$issues"
+  if [[ "$schema_only" != true ]]; then
+    validate_artifacts "$manifest" "$artifact_root" >> "$issues"
+    if [[ "$check_store" == true ]]; then
+      validate_store "$manifest" >> "$issues"
+    fi
+    if [[ "$rebuild" == true ]]; then
+      validate_rebuilds "$manifest" >> "$issues"
+    fi
   fi
   if [[ -s "$issues" ]]; then
     echo "error: manifest validation failed:" >&2
@@ -462,7 +464,7 @@ collect() {
       entries: ($entries | map(del(.subsets)))
     }
   ' > "$manifest_tmp"
-  validate "$manifest_tmp" "$export_dir" false false
+  validate "$manifest_tmp" "$export_dir" false false false
   mv -f -- "$manifest_tmp" "$manifest"
   printf 'wrote %s: %s unique paths\n' "$manifest" "$(jq '. | length' "$entries")"
 }
@@ -475,20 +477,25 @@ main() {
     require_command "$tool"
   done
   case "$command" in
-    validate)
-      local manifest= artifact_root= check_store=false rebuild=false
+      validate)
+      local manifest= artifact_root= check_store=false rebuild=false schema_only=false
       while (($#)); do
         case "$1" in
           --manifest) manifest=${2:-}; shift 2 ;;
           --artifact-root) artifact_root=${2:-}; shift 2 ;;
           --store) check_store=true; shift ;;
           --rebuild) rebuild=true; shift ;;
+          --schema-only) schema_only=true; shift ;;
           -h|--help) usage; return ;;
           *) die "unknown validate option: $1" ;;
         esac
       done
       [[ -n "$manifest" ]] || die "validate requires --manifest"
-      validate "$manifest" "$artifact_root" "$check_store" "$rebuild"
+      if [[ "$schema_only" == true &&
+        (-n "$artifact_root" || "$check_store" == true || "$rebuild" == true) ]]; then
+        die "--schema-only cannot be combined with artifact or store validation"
+      fi
+      validate "$manifest" "$artifact_root" "$check_store" "$rebuild" "$schema_only"
       ;;
     collect)
       collect "$@"
