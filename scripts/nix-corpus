@@ -473,11 +473,8 @@ main() {
   local command=${1:-}
   [[ -n "$command" ]] || { usage >&2; exit 2; }
   shift
-  for tool in nix nix-store jq sha256sum realpath sort; do
-    require_command "$tool"
-  done
   case "$command" in
-      validate)
+    validate)
       local manifest= artifact_root= check_store=false rebuild=false schema_only=false
       while (($#)); do
         case "$1" in
@@ -495,9 +492,19 @@ main() {
         (-n "$artifact_root" || "$check_store" == true || "$rebuild" == true) ]]; then
         die "--schema-only cannot be combined with artifact or store validation"
       fi
+      if [[ "$schema_only" == true ]]; then
+        require_command jq
+      else
+        for tool in nix nix-store jq sha256sum realpath sort; do
+          require_command "$tool"
+        done
+      fi
       validate "$manifest" "$artifact_root" "$check_store" "$rebuild" "$schema_only"
       ;;
     collect)
+      for tool in nix nix-store jq sha256sum realpath sort; do
+        require_command "$tool"
+      done
       collect "$@"
       ;;
     -h|--help) usage ;;

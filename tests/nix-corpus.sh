@@ -115,6 +115,13 @@ jq '.entries[].artifact = "/no/such/corpus-artifact.nar"' \
   "$WORK/collected.json" > "$WORK/schema-only.json"
 PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
   --manifest "$WORK/schema-only.json" --schema-only
+SCHEMA_BIN="$WORK/schema-bin"
+mkdir "$SCHEMA_BIN"
+for command in bash env jq mktemp rm; do
+  ln -s "$(command -v "$command")" "$SCHEMA_BIN/$command"
+done
+PATH="$SCHEMA_BIN" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/schema-only.json" --schema-only
 if PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
   --manifest "$WORK/schema-only.json" --schema-only --store \
   > /dev/null 2> "$WORK/schema-only-conflict.err"; then
