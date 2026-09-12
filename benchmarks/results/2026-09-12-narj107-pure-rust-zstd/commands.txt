@@ -1,0 +1,15 @@
+# Compressed inputs were made from the local NAR corpus with system zstd 1.5.7:
+zstd -q -T1 -3 -c SOURCE.nar > DATASET.nar.zst
+
+# Each candidate was verified byte-for-byte before timing:
+nix develop -c cargo build --manifest-path /tmp/narjar-zstd-bench.y48wNW/Cargo.toml --release --no-default-features --features CANDIDATE
+taskset -c 0 /tmp/narjar-zstd-bench.y48wNW/target/release/narjar-zstd-bench DATASET.nar.zst ITERATIONS
+
+# The native comparison used this environment for both build and execution:
+RUSTFLAGS='-C target-cpu=native' nix develop -c cargo build --manifest-path /tmp/narjar-zstd-bench.y48wNW/Cargo.toml --release --no-default-features --features CANDIDATE
+taskset -c 0 /tmp/narjar-zstd-bench.y48wNW/target/release/narjar-zstd-bench DATASET.nar.zst ITERATIONS
+
+# Datasets and compressed-input hashes:
+# small  1,130,968 decoded bytes  c8323e0df48c045af2d4b0e90d7db564fa57a86d34810b86e296a7e3c256eadf
+# medium 10,001,912 decoded bytes 3b696cd8390fcc46dca101b62901b6f308b71822e25f6dd43db3343f7a2042c2
+# large  518,199,840 decoded bytes 4bb457313d178be9965c41c0d3afb1e14e7c48cf4ed081309d32ff3475ab609c

@@ -1,0 +1,7 @@
+candidate	version	dataset	iterations	median_mib_s	min_mib_s	max_mib_s	active_kernel
+structured-zstd	0.0.52	medium	3	1284.96	1281.87	1305.07	avx2
+structured-zstd	0.0.52	large	2	703.08	689.39	716.77	avx2
+zstd-complete	0.2.0	medium	3	602.45	411.34	626.51	n/a
+zstd-complete	0.2.0	large	2	314.96	311.09	318.82	n/a
+ruzstd	0.8.2	medium	3	382.57	252.77	506.42	n/a
+ruzstd	0.8.2	large	2	295.62	264.36	326.88	n/a
