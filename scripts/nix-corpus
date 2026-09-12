@@ -45,6 +45,8 @@ manifest_issues() {
       type == "array" and length > 0 and all(.[]; type == "string");
     def derivation_list:
       type == "array" and all(.[]; type == "string");
+    def nonnegative_integer:
+      type == "number" and isfinite and . >= 0 and floor == .;
     def coverage($entries):
       ($entries | map(.nar_size) | sort) as $sizes |
       {
@@ -99,6 +101,22 @@ manifest_issues() {
           "targets[\($index)] has invalid resolved_root"
         else empty end)
     end,
+    if (has("requirements") | not) then empty
+    elif (.requirements | type) != "object" then
+      "requirements must be an object"
+    elif (.requirements.min_generations != null and
+      ((.requirements.min_generations | nonnegative_integer) | not)) then
+      "requirements has invalid min_generations"
+    elif (.requirements.min_nixpkgs_revisions != null and
+      ((.requirements.min_nixpkgs_revisions | nonnegative_integer) | not)) then
+      "requirements has invalid min_nixpkgs_revisions"
+    elif (.requirements.required_families != null and
+      (.requirements.required_families | type) != "array") then
+      "requirements has invalid required_families"
+    elif (.requirements.required_families != null and
+      any(.requirements.required_families[]; type != "string" or length == 0)) then
+      "requirements has invalid required_families"
+    else empty end,
     if (.entries | type) != "array" or (.entries | length) == 0 then
       "entries must be a non-empty list"
     else

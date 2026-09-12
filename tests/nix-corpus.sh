@@ -54,6 +54,16 @@ fi
 grep -q 'generations' "$WORK/coverage.err"
 grep -q 'nixpkgs revisions' "$WORK/coverage.err"
 
+jq '.requirements = {min_generations: "2"}' \
+  "$WORK/manifest.json" > "$WORK/invalid-requirements.json"
+if "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/invalid-requirements.json" --schema-only \
+  > /dev/null 2> "$WORK/invalid-requirements.err"; then
+  echo "validation accepted invalid requirements" >&2
+  exit 1
+fi
+grep -q 'requirements has invalid min_generations' "$WORK/invalid-requirements.err"
+
 MOCK_BIN="$WORK/mock-bin"
 mkdir "$MOCK_BIN"
 export NIX_CORPUS_TEST_LOG="$WORK/nix.log"
