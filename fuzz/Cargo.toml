@@ -53,3 +53,10 @@ path = "fuzz_targets/xz_upload.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "zstd_upload"
+path = "fuzz_targets/zstd_upload.rs"
+test = false
+doc = false
+bench = false

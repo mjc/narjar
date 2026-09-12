@@ -34,7 +34,7 @@ targets. They use disposable loopback sockets and temporary directories, so
 they do not touch a real cache:
 
 ```sh
-for target in http_request auth_request narinfo xz_upload; do
+for target in http_request auth_request narinfo xz_upload zstd_upload; do
   RUSTC="$(rustup which rustc --toolchain nightly)" cargo fuzz run "$target" -- \
     -max_len=1048576 -timeout=5 -rss_limit_mb=256
 done
@@ -42,6 +42,6 @@ done
 
 `http_request` covers request-line, header, body-length, and Range-bearing
 request parsing; `auth_request` adds Basic-auth policy checks; `narinfo`
-exercises untrusted narinfo files and signatures; and `xz_upload` exercises
-bounded compressed-upload handling. Validation errors are expected; a panic,
-hang, or resource-limit breach is not.
+exercises untrusted narinfo files and signatures; and `xz_upload` and
+`zstd_upload` exercise bounded compressed-upload handling. Validation errors
+are expected; a panic, hang, or resource-limit breach is not.

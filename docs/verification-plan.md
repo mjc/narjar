@@ -118,6 +118,7 @@ cargo-fuzz targets are release gates, not normal runtime dependencies:
 - Basic Authorization decoding;
 - Range header;
 - nix-cache-info parser used at startup.
+- Bounded XZ and zstd upload validation.
 
 Seed corpora include raw observed requests, real narinfos, truncated inputs,
 overlong numbers, Unicode confusables, slash encodings, NUL, and duplicate
