@@ -350,14 +350,16 @@ fn dependency_waves(metadata: Vec<PathInfo>) -> Result<Vec<Vec<PathInfo>>, Error
         .collect::<BTreeMap<_, _>>();
     let mut dependents = BTreeMap::<String, Vec<String>>::new();
     for info in by_path.values() {
-        let mut references = info
-            .references
-            .iter()
-            .filter(|reference| by_path.contains_key(*reference))
-            .collect::<Vec<_>>();
+        let mut references = info.references.iter().collect::<Vec<_>>();
         references.sort_unstable();
         references.dedup();
         for reference in references {
+            if !by_path.contains_key(reference) {
+                return Err(Error::runtime(format!(
+                    "{} has missing referenced store path {}",
+                    info.path, reference
+                )));
+            }
             *indegree
                 .get_mut(&info.path)
                 .expect("every path has an indegree") += 1;
@@ -1368,6 +1370,25 @@ mod tests {
                 vec!["/nix/store/00000000000000000000000000000000-dependency".to_owned()],
                 vec!["/nix/store/11111111111111111111111111111111-dependent".to_owned()],
             ]
+        );
+    }
+
+    #[test]
+    fn dependency_waves_reject_missing_references() {
+        let info = PathInfo {
+            path: "/nix/store/11111111111111111111111111111111-dependent".to_owned(),
+            ca: None,
+            deriver: None,
+            nar_hash: "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=".to_owned(),
+            nar_size: 289656,
+            references: vec!["/nix/store/00000000000000000000000000000000-missing".to_owned()],
+            signatures: Vec::new(),
+        };
+
+        let error = dependency_waves(vec![info]).expect_err("missing references must fail");
+        assert!(
+            error.to_string().contains("missing referenced store path"),
+            "unexpected error: {error}"
         );
     }
 
