@@ -14,6 +14,8 @@ lzma-rust2 = { version = "=0.20.1", default-features = false, features = ["std",
 httparse = { version = "=1.10.1", default-features = false, features = ["std"] }
 sha2 = { version = "=0.11.0", default-features = false }
 signal-hook = { version = "=0.4.4", default-features = false }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
 subtle = { version = "=2.6.1", default-features = false }
 tempfile = { version = "=3.27.0", default-features = false }
 structured-zstd = { version = "=0.0.52", default-features = false, features = ["hash", "std", "kernel-sse", "kernel-bmi2", "kernel-avx2", "kernel-neon", "kernel-sve"] }

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::Write,
     num::NonZeroUsize,
     path::PathBuf,
@@ -7,6 +8,7 @@ use std::{
 };
 
 use clap::Args;
+use serde::Deserialize;
 
 use crate::error::Error;
 
@@ -39,6 +41,43 @@ pub(crate) struct Push {
     /// Store paths or installables whose closure should be pushed.
     #[arg(value_name = "INSTALLABLE", required = true, num_args = 1..)]
     paths: Vec<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PathInfo {
+    path: String,
+    deriver: Option<String>,
+    nar_hash: String,
+    nar_size: u64,
+    references: Vec<String>,
+    signatures: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RawPathInfo {
+    deriver: Option<String>,
+    #[serde(rename = "narHash")]
+    nar_hash: String,
+    #[serde(rename = "narSize")]
+    nar_size: u64,
+    references: Vec<String>,
+    signatures: Vec<String>,
+}
+
+fn parse_path_info(bytes: &[u8]) -> Result<Vec<PathInfo>, String> {
+    let entries: BTreeMap<String, RawPathInfo> = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid nix path-info JSON: {error}"))?;
+    Ok(entries
+        .into_iter()
+        .map(|(path, info)| PathInfo {
+            path,
+            deriver: info.deriver,
+            nar_hash: info.nar_hash,
+            nar_size: info.nar_size,
+            references: info.references,
+            signatures: info.signatures,
+        })
+        .collect())
 }
 
 pub(crate) fn run(args: Push) -> Result<(), Error> {
@@ -134,6 +173,7 @@ fn closure_paths(installables: &[String]) -> Result<Vec<String>, Error> {
     let output = Command::new("nix")
         .arg("path-info")
         .arg("--recursive")
+        .arg("--json")
         .arg("--")
         .args(installables)
         .output()
@@ -146,14 +186,11 @@ fn closure_paths(installables: &[String]) -> Result<Vec<String>, Error> {
         )));
     }
 
-    let mut paths: Vec<_> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
+    let paths: Vec<_> = parse_path_info(&output.stdout)
+        .map_err(Error::runtime)?
+        .into_iter()
+        .map(|info| info.path)
         .collect();
-    paths.sort_unstable();
-    paths.dedup();
 
     if paths.is_empty() {
         Err(Error::runtime("nix path-info returned no store paths"))
@@ -223,7 +260,48 @@ fn non_empty(value: &str) -> Result<String, String> {
 mod tests {
     use clap::{Args, Command, FromArgMatches};
 
-    use super::Push;
+    use super::{Push, parse_path_info};
+
+    #[test]
+    fn parses_nix_path_info_metadata() {
+        let metadata = parse_path_info(
+            br#"{
+                "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package": {
+                    "ca": null,
+                    "deriver": "/nix/store/abcdefghijklmnopqrstuvwxyz0123456789.drv",
+                    "narHash": "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=",
+                    "narSize": 289656,
+                    "references": [
+                        "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency"
+                    ],
+                    "signatures": ["cache.example:signature"],
+                    "ultimate": true
+                }
+            }"#,
+        )
+        .expect("valid path-info JSON");
+
+        assert_eq!(metadata.len(), 1);
+        let info = &metadata[0];
+        assert_eq!(
+            info.path,
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package"
+        );
+        assert_eq!(
+            info.nar_hash,
+            "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY="
+        );
+        assert_eq!(info.nar_size, 289656);
+        assert_eq!(
+            info.references,
+            vec!["/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency"]
+        );
+        assert_eq!(info.signatures, vec!["cache.example:signature"]);
+        assert_eq!(
+            info.deriver.as_deref(),
+            Some("/nix/store/abcdefghijklmnopqrstuvwxyz0123456789.drv")
+        );
+    }
 
     #[test]
     fn push_defaults_to_one_copy_worker() {
