@@ -6,6 +6,7 @@ NARJAR_BIN=
 SLOW_BYTES=1073741824
 SLOW_RATE=67108864
 PUBLISHERS=(1 2 8 32)
+REPETITIONS=1
 
 usage() {
   cat <<'EOF'
@@ -19,6 +20,7 @@ Options:
   --slow-bytes N     Slow upload size in bytes (default: 1073741824)
   --slow-rate N      Slow upload rate in bytes/sec (default: 67108864)
   --publishers LIST  Comma-separated small PUT counts (default: 1,2,8,32)
+  --repetitions N     Number of independent runs per publisher count (default: 1)
                      Report includes queue latency, throughput, CPU, peak and
                      post-load RSS, anonymous allocator memory, staging usage,
                      and restart recovery time
@@ -53,6 +55,11 @@ while (($#)); do
       IFS=',' read -r -a PUBLISHERS <<< "$2"
       shift 2
       ;;
+    --repetitions)
+      [[ $# -ge 2 ]] || { echo "missing value for --repetitions" >&2; exit 2; }
+      REPETITIONS=$2
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -74,6 +81,10 @@ done
 [[ "$(uname -s)" == Linux ]] || { echo "Linux /proc is required" >&2; exit 1; }
 [[ "$SLOW_BYTES" =~ ^[1-9][0-9]*$ && "$SLOW_RATE" =~ ^[1-9][0-9]*$ ]] || {
   echo "--slow-bytes and --slow-rate must be positive integers" >&2
+  exit 2
+}
+[[ "$REPETITIONS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "--repetitions must be a positive integer" >&2
   exit 2
 }
 for publishers in "${PUBLISHERS[@]}"; do
@@ -115,9 +126,9 @@ trap cleanup EXIT INT TERM
 : > "$COMMAND_LOG"
 chmod 600 "$COMMAND_LOG"
 mkdir -p -- "$LOG_DIR" "$METRICS_DIR"
-printf 'publishers\tslow_bytes\tslow_rate\tslow_id\n' > "$ENVIRONMENT"
-printf 'publishers\trequest\telapsed_ms\tstatus\tsize_upload\n' > "$SAMPLES"
-printf 'publishers\tsamples\tp50_ms\tp95_ms\tp99_ms\tmin_ms\tmax_ms\tslow_wall_ms\tslow_mib_s\tsmall_requests_s\tserver_cpu_ms\tserver_peak_rss_kib\tserver_post_load_rss_kib\tserver_peak_anonymous_kib\tserver_post_load_anonymous_kib\tserver_peak_heap_rss_kib\tserver_peak_staging_bytes\trecovery_ms\tqueue_wait_count\tqueue_wait_sum_ms\tqueue_wait_max_ms\n' > "$SUMMARY"
+printf 'publishers\trepetition\tslow_bytes\tslow_rate\tslow_id\n' > "$ENVIRONMENT"
+printf 'publishers\trepetition\trequest\telapsed_ms\tstatus\tsize_upload\n' > "$SAMPLES"
+printf 'publishers\trepetition\tsamples\tp50_ms\tp95_ms\tp99_ms\tmin_ms\tmax_ms\tslow_wall_ms\tslow_mib_s\tsmall_requests_s\tserver_cpu_ms\tserver_peak_rss_kib\tserver_post_load_rss_kib\tserver_peak_anonymous_kib\tserver_post_load_anonymous_kib\tserver_peak_heap_rss_kib\tserver_peak_staging_bytes\trecovery_ms\tqueue_wait_count\tqueue_wait_sum_ms\tqueue_wait_max_ms\n' > "$SUMMARY"
 
 log_command() {
   {
@@ -155,7 +166,14 @@ heap_rss_kib() {
 }
 
 staging_bytes() {
-  du -sb -- "$1/nar/.tmp" "$1/.tmp" | awk '{total += $1} END {print total + 0}'
+  local total=0 path bytes
+  for path in "$1/nar/.tmp" "$1/.tmp"; do
+    if [[ -e "$path" ]]; then
+      bytes=$(du -sb -- "$path" | awk '{print $1}')
+      total=$((total + bytes))
+    fi
+  done
+  printf '%s\n' "$total"
 }
 
 metric() {
@@ -213,11 +231,13 @@ printf 'narjar' > "$SMALL_PAYLOAD"
 SMALL_ID=$(run_logged nix hash file --type sha256 --base32 "$SMALL_PAYLOAD")
 
 for publishers in "${PUBLISHERS[@]}"; do
-  data=$WORK/data-$publishers
-  netrc=$WORK/netrc-$publishers
-  server_log=$LOG_DIR/server-$publishers.log
-  metrics_file=$METRICS_DIR/metrics-$publishers.txt
-  result_dir=$WORK/results-$publishers
+  for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
+  printf '# publishers=%s repetition=%s\n' "$publishers" "$repetition" >> "$COMMAND_LOG"
+  data=$WORK/data-$publishers-$repetition
+  netrc=$WORK/netrc-$publishers-$repetition
+  server_log=$LOG_DIR/server-$publishers-$repetition.log
+  metrics_file=$METRICS_DIR/metrics-$publishers-$repetition.txt
+  result_dir=$WORK/results-$publishers-$repetition
   mkdir -p -- "$result_dir"
   prepare_auth "$data" "$netrc"
   start_server "$data" "$server_log"
@@ -327,14 +347,14 @@ for publishers in "${PUBLISHERS[@]}"; do
       exit 1
     }
     elapsed_ms=$(awk -v seconds="$elapsed" 'BEGIN{printf "%.3f",seconds*1000}')
-    printf '%s\t%s\t%s\t%s\t%s\n' "$publishers" "$index" "$elapsed_ms" "$status" "$upload" >> "$SAMPLES"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$publishers" "$repetition" "$index" "$elapsed_ms" "$status" "$upload" >> "$SAMPLES"
   done
-  awk -F '\t' -v publishers="$publishers" -v slow="$slow_wall_ms" \
+  awk -F '\t' -v publishers="$publishers" -v repetition="$repetition" -v slow="$slow_wall_ms" \
     -v slow_mib_s="$slow_mib_s" -v cpu="$server_cpu_ms" -v rss="$peak_rss" -v post_rss="$post_load_rss" \
     -v peak_anonymous="$peak_anonymous" -v post_anonymous="$post_load_anonymous" \
     -v peak_heap="$peak_heap_rss" -v peak_staging="$peak_staging" -v recovery="$recovery_ms" \
     -v queue_count="$queue_count" -v queue_sum="$queue_sum" -v queue_max="$queue_max" '
-    $1 == publishers {values[++n] = $3}
+    $1 == publishers && $2 == repetition {values[++n] = $4}
     END {
       for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++)
         if (values[j] < values[i]) {swap = values[i]; values[i] = values[j]; values[j] = swap}
@@ -342,16 +362,17 @@ for publishers in "${PUBLISHERS[@]}"; do
       p95 = values[int((n * 0.95) + 0.999)];
       p99 = values[int((n * 0.99) + 0.999)];
       small_requests_s = n / (values[n] / 1000);
-      printf "%s\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-        publishers,n,p50,p95,p99,values[1],values[n],slow,slow_mib_s,small_requests_s,cpu,rss,post_rss,peak_anonymous,post_anonymous,peak_heap,peak_staging,recovery,queue_count,queue_sum,queue_max
+      printf "%s\t%s\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+        publishers,repetition,n,p50,p95,p99,values[1],values[n],slow,slow_mib_s,small_requests_s,cpu,rss,post_rss,peak_anonymous,post_anonymous,peak_heap,peak_staging,recovery,queue_count,queue_sum,queue_max
     }' "$SAMPLES" >> "$SUMMARY"
-  printf '%s\t%s\t%s\t%s\n' "$publishers" "$SLOW_BYTES" "$SLOW_RATE" "$SLOW_ID" >> "$ENVIRONMENT"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$publishers" "$repetition" "$SLOW_BYTES" "$SLOW_RATE" "$SLOW_ID" >> "$ENVIRONMENT"
   stop_server
+  done
 done
 
 {
   printf '# Narjar publication lock contention\n\n'
-  printf 'One throttled %s-byte raw NAR upload at %s bytes/sec was overlapped with independent small PUTs.\n\n' "$SLOW_BYTES" "$SLOW_RATE"
+  printf 'Each of %s repetitions overlapped one throttled %s-byte raw NAR upload at %s bytes/sec with independent small PUTs.\n\n' "$REPETITIONS" "$SLOW_BYTES" "$SLOW_RATE"
   printf 'See [commands.txt](./commands.txt), [samples.tsv](./samples.tsv), [summary.tsv](./summary.tsv), and [metrics/](./metrics/).\n\n'
   printf '```text\n'
   cat "$SUMMARY"
