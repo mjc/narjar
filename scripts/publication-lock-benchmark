@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+
 OUTPUT=
 NARJAR_BIN=
 SLOW_BYTES=1073741824
@@ -23,7 +26,8 @@ Options:
   --repetitions N     Number of independent runs per publisher count (default: 15)
                      Report includes queue latency, throughput, CPU, peak and
                      post-load RSS, anonymous allocator memory, staging usage,
-                     restart recovery time, and an aggregate summary
+                     restart recovery time, an aggregate summary, and provenance
+                     in environment.tsv; per-run inputs are in runs.tsv
   -h, --help         Show this help
 EOF
 }
@@ -99,6 +103,12 @@ for command in awk curl date nix stat truncate; do
     exit 1
   }
 done
+for command in sha256sum git hostname findmnt rustc; do
+  command -v "$command" >/dev/null || {
+    echo "missing '$command'; run inside 'nix develop'" >&2
+    exit 1
+  }
+done
 
 mkdir -p -- "$OUTPUT"
 OUTPUT=$(cd -- "$OUTPUT" && pwd -P)
@@ -107,6 +117,7 @@ SAMPLES=$OUTPUT/samples.tsv
 SUMMARY=$OUTPUT/summary.tsv
 AGGREGATE=$OUTPUT/aggregate.tsv
 ENVIRONMENT=$OUTPUT/environment.tsv
+RUNS=$OUTPUT/runs.tsv
 LOG_DIR=$OUTPUT/logs
 METRICS_DIR=$OUTPUT/metrics
 WORK=$(mktemp -d "$OUTPUT/.work.XXXXXX")
@@ -127,7 +138,46 @@ trap cleanup EXIT INT TERM
 : > "$COMMAND_LOG"
 chmod 600 "$COMMAND_LOG"
 mkdir -p -- "$LOG_DIR" "$METRICS_DIR"
-printf 'publishers\trepetition\tslow_bytes\tslow_rate\tslow_id\n' > "$ENVIRONMENT"
+git_commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf unknown)
+binary_sha256=$(sha256sum "$NARJAR_BIN" | awk '{print $1}')
+host=$(hostname 2>/dev/null || printf unknown)
+target=$(uname -m 2>/dev/null || printf unknown)
+kernel=$(uname -sr 2>/dev/null || printf unknown)
+platform=$(uname -srm 2>/dev/null || printf unknown)
+cpu_model=$(awk -F': ' '$1 == "model name" { print $2; exit }' /proc/cpuinfo)
+cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf unknown)
+governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || printf unknown)
+nix_version=$(nix --version 2>&1)
+rust_version=$(rustc --version 2>&1)
+filesystem=$(findmnt -T "$OUTPUT" -no SOURCE,FSTYPE,OPTIONS 2>/dev/null || stat -f -c '%T' "$OUTPUT")
+load_average=$(awk '{print $1}' /proc/loadavg 2>/dev/null || printf unknown)
+{
+  printf 'field\tvalue\n'
+  printf 'recorded_at\t%s\n' "$(date --iso-8601=seconds)"
+  printf 'git_commit\t%s\n' "$git_commit"
+  printf 'narjar_binary\t%s\n' "$NARJAR_BIN"
+  printf 'narjar_binary_sha256\t%s\n' "$binary_sha256"
+  printf 'host\t%s\n' "$host"
+  printf 'target\t%s\n' "$target"
+  printf 'kernel\t%s\n' "$kernel"
+  printf 'platform\t%s\n' "$platform"
+  printf 'cpu_model\t%s\n' "${cpu_model:-unknown}"
+  printf 'cpu_count\t%s\n' "$cpu_count"
+  printf 'cpu_governor\t%s\n' "$governor"
+  printf 'load_average_at_start\t%s\n' "$load_average"
+  printf 'filesystem\t%s\n' "$filesystem"
+  printf 'nix_version\t%s\n' "$nix_version"
+  printf 'rust_version\t%s\n' "$rust_version"
+  printf 'wire_compression\tnone\n'
+  printf 'repetitions\t%s\n' "$REPETITIONS"
+  printf 'publishers\t%s\n' "${PUBLISHERS[*]}"
+  printf 'slow_bytes\t%s\n' "$SLOW_BYTES"
+  printf 'slow_rate\t%s\n' "$SLOW_RATE"
+  printf 'command_log\tcommands.txt\n'
+  printf 'raw_samples\tsamples.tsv\n'
+  printf 'run_inputs\truns.tsv\n'
+} > "$ENVIRONMENT"
+printf 'publishers\trepetition\tslow_bytes\tslow_rate\tslow_id\n' > "$RUNS"
 printf 'publishers\trepetition\trequest\telapsed_ms\tstatus\tsize_upload\n' > "$SAMPLES"
 printf 'publishers\trepetition\tsamples\tp50_ms\tp95_ms\tp99_ms\tmin_ms\tmax_ms\tslow_wall_ms\tslow_mib_s\tsmall_requests_s\tserver_cpu_ms\tserver_peak_rss_kib\tserver_post_load_rss_kib\tserver_peak_anonymous_kib\tserver_post_load_anonymous_kib\tserver_peak_heap_rss_kib\tserver_peak_staging_bytes\trecovery_ms\tqueue_wait_count\tqueue_wait_sum_ms\tqueue_wait_max_ms\n' > "$SUMMARY"
 printf 'publishers\trepetitions\trequest_samples\tp50_ms\tp95_ms\tp99_ms\tmin_ms\tmax_ms\tslow_wall_min_ms\tslow_wall_max_ms\tslow_mib_s_min\tslow_mib_s_max\tserver_cpu_ms_max\tserver_peak_rss_max_kib\tserver_post_load_rss_max_kib\tserver_peak_anonymous_max_kib\tserver_post_load_anonymous_max_kib\tserver_peak_heap_rss_max_kib\tserver_peak_staging_max_bytes\trecovery_p50_ms\trecovery_p95_ms\trecovery_p99_ms\n' > "$AGGREGATE"
@@ -367,7 +417,7 @@ for publishers in "${PUBLISHERS[@]}"; do
       printf "%s\t%s\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
         publishers,repetition,n,p50,p95,p99,values[1],values[n],slow,slow_mib_s,small_requests_s,cpu,rss,post_rss,peak_anonymous,post_anonymous,peak_heap,peak_staging,recovery,queue_count,queue_sum,queue_max
     }' "$SAMPLES" >> "$SUMMARY"
-  printf '%s\t%s\t%s\t%s\t%s\n' "$publishers" "$repetition" "$SLOW_BYTES" "$SLOW_RATE" "$SLOW_ID" >> "$ENVIRONMENT"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$publishers" "$repetition" "$SLOW_BYTES" "$SLOW_RATE" "$SLOW_ID" >> "$RUNS"
   stop_server
   done
 done
@@ -459,7 +509,7 @@ awk -F '\t' '
 {
   printf '# Narjar publication lock contention\n\n'
   printf 'Each of %s repetitions overlapped one throttled %s-byte raw NAR upload at %s bytes/sec with independent small PUTs.\n\n' "$REPETITIONS" "$SLOW_BYTES" "$SLOW_RATE"
-  printf 'See [commands.txt](./commands.txt), [samples.tsv](./samples.tsv), [summary.tsv](./summary.tsv), [aggregate.tsv](./aggregate.tsv), and [metrics/](./metrics/).\n\n'
+  printf 'See [environment.tsv](./environment.tsv), [runs.tsv](./runs.tsv), [commands.txt](./commands.txt), [samples.tsv](./samples.tsv), [summary.tsv](./summary.tsv), [aggregate.tsv](./aggregate.tsv), and [metrics/](./metrics/).\n\n'
   printf '```text\n'
   cat "$SUMMARY"
   printf '```\n'

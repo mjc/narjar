@@ -14,6 +14,8 @@ help=$(bash "$SCRIPT" --help)
 [[ "$help" == *"--publishers"* ]]
 [[ "$help" == *"--repetitions"* ]]
 [[ "$help" == *"default: 15"* ]]
+[[ "$help" == *"provenance"* ]]
+[[ "$help" == *"runs.tsv"* ]]
 [[ "$help" == *"aggregate"* ]]
 [[ "$help" == *"throughput"* ]]
 [[ "$help" == *"post-load RSS"* ]]
