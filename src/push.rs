@@ -557,6 +557,7 @@ fn store_hash_for_path(path: &str) -> Result<&str, String> {
 }
 
 const MAX_ATTEMPTS: usize = 3;
+const MAX_REDIRECTS: usize = 10;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 
 fn is_retryable_status(status: u16) -> bool {
@@ -603,6 +604,93 @@ fn request_status(agent: &Agent, url: &str, authorization: Option<&str>) -> Resu
     unreachable!("retry loop always returns")
 }
 
+fn put_with_redirects<F>(url: &str, mut send: F) -> Result<u16, String>
+where
+    F: FnMut(&str) -> Result<ureq::http::Response<ureq::Body>, String>,
+{
+    let mut upload_url = url.to_owned();
+    'attempts: for attempt in 0..MAX_ATTEMPTS {
+        for redirect in 0..=MAX_REDIRECTS {
+            let response = match send(&upload_url) {
+                Ok(response) => response,
+                Err(_error) if attempt + 1 < MAX_ATTEMPTS => {
+                    retry_sleep(attempt, None);
+                    continue 'attempts;
+                }
+                Err(error) => return Err(error),
+            };
+            let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok())
+                .and_then(retry_after_delay);
+            let location = response
+                .headers()
+                .get("Location")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let mut body = response.into_body().into_reader();
+            io::copy(&mut body, &mut io::sink())
+                .map_err(|error| format!("reading PUT {upload_url} response failed: {error}"))?;
+
+            if matches!(status, 307 | 308) {
+                if redirect == MAX_REDIRECTS {
+                    return Err(format!("PUT {url} followed too many redirects"));
+                }
+                let location = location.ok_or_else(|| {
+                    format!("PUT {upload_url} redirect response had no Location header")
+                })?;
+                upload_url = resolve_upload_redirect(&upload_url, &location)?;
+                continue;
+            }
+
+            if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
+                retry_sleep(attempt, retry_after);
+                continue 'attempts;
+            }
+            return Ok(status);
+        }
+        unreachable!("redirect loop always returns")
+    }
+    unreachable!("retry loop always returns")
+}
+
+fn resolve_upload_redirect(current_url: &str, location: &str) -> Result<String, String> {
+    let current_scheme = http_scheme(current_url)?;
+    let current_authority = split_http_target(current_url)?.1;
+    let location = location.trim();
+    let next_url = if location.starts_with("http://") || location.starts_with("https://") {
+        location.to_owned()
+    } else if location.starts_with('/') && !location.starts_with("//") {
+        format!("{current_scheme}://{current_authority}{location}")
+    } else {
+        return Err(format!(
+            "PUT {current_url} redirect has unsupported Location: {location}"
+        ));
+    };
+    let next_scheme = http_scheme(&next_url)?;
+    let next_authority = split_http_target(&next_url)?.1;
+    let safe_scheme =
+        next_scheme == current_scheme || (current_scheme == "http" && next_scheme == "https");
+    if next_authority != current_authority || !safe_scheme {
+        return Err(format!(
+            "PUT {current_url} redirect leaves the trusted cache authority"
+        ));
+    }
+    Ok(next_url)
+}
+
+fn http_scheme(url: &str) -> Result<&str, String> {
+    if url.starts_with("http://") {
+        Ok("http")
+    } else if url.starts_with("https://") {
+        Ok("https")
+    } else {
+        Err(format!("PUT redirect is not an HTTP URL: {url}"))
+    }
+}
+
 fn put_file(
     agent: &Agent,
     url: &str,
@@ -610,35 +698,22 @@ fn put_file(
     content_type: &str,
     authorization: Option<&str>,
 ) -> Result<u16, String> {
-    for attempt in 0..MAX_ATTEMPTS {
+    put_with_redirects(url, |upload_url| {
         let file = File::open(path)
-            .map_err(|error| format!("opening NAR for PUT {url} failed: {error}"))?;
-        let mut request = agent.put(url).header("Content-Type", content_type);
+            .map_err(|error| format!("opening NAR for PUT {upload_url} failed: {error}"))?;
+        let mut request = agent
+            .put(upload_url)
+            .config()
+            .max_redirects(0)
+            .build()
+            .header("Content-Type", content_type);
         if let Some(authorization) = authorization {
             request = request.header("Authorization", format!("Basic {authorization}"));
         }
-        match request.send(file) {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let retry_after = response
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(retry_after_delay);
-                let mut body = response.into_body().into_reader();
-                io::copy(&mut body, &mut io::sink())
-                    .map_err(|error| format!("reading PUT {url} response failed: {error}"))?;
-                if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                    retry_sleep(attempt, retry_after);
-                    continue;
-                }
-                return Ok(status);
-            }
-            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt, None),
-            Err(error) => return Err(format!("PUT {url} failed: {error}")),
-        }
-    }
-    unreachable!("retry loop always returns")
+        request
+            .send(file)
+            .map_err(|error| format!("PUT {upload_url} failed: {error}"))
+    })
 }
 
 fn put_bytes(
@@ -648,33 +723,20 @@ fn put_bytes(
     content_type: &str,
     authorization: Option<&str>,
 ) -> Result<u16, String> {
-    for attempt in 0..MAX_ATTEMPTS {
-        let mut request = agent.put(url).header("Content-Type", content_type);
+    put_with_redirects(url, |upload_url| {
+        let mut request = agent
+            .put(upload_url)
+            .config()
+            .max_redirects(0)
+            .build()
+            .header("Content-Type", content_type);
         if let Some(authorization) = authorization {
             request = request.header("Authorization", format!("Basic {authorization}"));
         }
-        match request.send(bytes) {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let retry_after = response
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(retry_after_delay);
-                let mut body = response.into_body().into_reader();
-                io::copy(&mut body, &mut io::sink())
-                    .map_err(|error| format!("reading PUT {url} response failed: {error}"))?;
-                if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                    retry_sleep(attempt, retry_after);
-                    continue;
-                }
-                return Ok(status);
-            }
-            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt, None),
-            Err(error) => return Err(format!("PUT {url} failed: {error}")),
-        }
-    }
-    unreachable!("retry loop always returns")
+        request
+            .send(bytes)
+            .map_err(|error| format!("PUT {upload_url} failed: {error}"))
+    })
 }
 
 fn prepare_nar(info: &PathInfo, compression: Compression) -> Result<PreparedNar, String> {
@@ -1051,6 +1113,102 @@ mod tests {
             201
         );
         server.join().expect("upload retry test server should exit");
+    }
+
+    #[test]
+    fn follows_a_307_during_file_upload() {
+        use std::{
+            fs,
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let read = stream.read(&mut buffer).expect("read redirect request");
+                assert_ne!(read, 0, "redirect request ended before its body");
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let content_length = request[..header_end]
+                    .split(|&byte| byte == b'\n')
+                    .find_map(|line| {
+                        let separator = line.iter().position(|&byte| byte == b':')?;
+                        let (name, value) = line.split_at(separator);
+                        name.eq_ignore_ascii_case(b"content-length")
+                            .then(|| &value[1..])
+                            .and_then(|value| std::str::from_utf8(value).ok())
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .expect("redirect request should have a Content-Length");
+                if request.len() >= header_end + 4 + content_length {
+                    return request;
+                }
+            }
+        }
+
+        let payload = tempfile::NamedTempFile::new().expect("create redirect test file");
+        fs::write(payload.path(), b"redirected NAR payload").expect("write redirect test file");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect test listener");
+        let address = listener
+            .local_addr()
+            .expect("inspect redirect test listener");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept initial redirect request");
+            let request = read_request(&mut stream);
+            assert!(
+                String::from_utf8_lossy(&request).starts_with("PUT /nar/test.nar HTTP/1.1"),
+                "initial upload should use the requested path"
+            );
+            assert!(
+                request.ends_with(b"redirected NAR payload"),
+                "initial upload should contain the complete body"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /redirect-target/nar/test.nar\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write redirect response");
+
+            let (mut stream, _) = listener.accept().expect("accept redirected request");
+            let request = read_request(&mut stream);
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .starts_with("PUT /redirect-target/nar/test.nar HTTP/1.1"),
+                "redirected upload should use the Location path"
+            );
+            assert!(
+                request.ends_with(b"redirected NAR payload"),
+                "redirected upload should replay the complete body"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write redirected upload response");
+        });
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        assert_eq!(
+            super::put_file(
+                &agent,
+                &format!("http://{address}/nar/test.nar"),
+                payload.path(),
+                "application/x-nix-nar",
+                None
+            )
+            .expect("redirected upload should succeed"),
+            201
+        );
+        server.join().expect("redirect test server should exit");
     }
 
     #[test]
