@@ -341,7 +341,13 @@ fn validate_zstd(
             "decompressed NAR hash mismatch",
         ));
     }
-    let actual_file_hash = reader.into_inner();
+    let mut actual_file_hash = reader.into_inner();
+    if actual_file_hash.inner.stream_position()? != actual_file_hash.inner.metadata()?.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes after zstd NAR",
+        ));
+    }
     if expected_file_hash.is_some_and(|expected_id| !actual_file_hash.matches(expected_id.as_str()))
     {
         return Err(io::Error::new(
@@ -1778,6 +1784,31 @@ mod tests {
                 .expect("read stored zstd NAR"),
             compressed
         );
+    }
+
+    #[test]
+    fn zstd_validation_rejects_bytes_after_the_frame() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let raw = b"nar bytes";
+        let mut compressed = Vec::new();
+        compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
+        let frame_length = compressed.len();
+        compressed.extend_from_slice(b"trailing bytes");
+        let nar = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(
+            &compressed[..frame_length],
+        )))
+        .expect("compressed frame hash is a valid NAR object id");
+
+        let result = storage.publish_nar(
+            &nar,
+            NarEncoding::Zstd,
+            Cursor::new(&compressed),
+            compressed.len() as u64,
+            super::NarUploadPolicy::new(1024, 0),
+        );
+
+        assert!(result.is_err(), "trailing bytes must not be accepted");
     }
 
     #[test]
