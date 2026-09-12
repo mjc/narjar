@@ -122,6 +122,7 @@
     machine.succeed("test \"$(stat -c %a /var/lib/narjar/auth/write.tokens)\" = 600")
     machine.succeed("systemctl start narjar-gc.service")
     machine.wait_for_unit("narjar.service")
+    machine.wait_for_open_port(5000)
     machine.succeed("curl --fail http://127.0.0.1:5000/healthz")
 
     static.wait_for_unit("narjar.service")
