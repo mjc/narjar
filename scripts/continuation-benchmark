@@ -13,6 +13,7 @@ BINCACHE_BIN=""
 REPETITIONS=15
 WARMUPS=$FROZEN_WARMUPS
 QUICK=0
+BENCHMARK_WORKERS=32
 
 usage() {
   cat <<'EOF'
@@ -79,6 +80,7 @@ NAR_COMPRESSION_narjar=""
 NAR_URL_bincache=""
 NAR_BYTES_bincache=0
 NAR_COMPRESSION_bincache=""
+BINCACHE_PORT=""
 
 cleanup() {
   local status=$?
@@ -150,6 +152,27 @@ resolve_bincache() {
   fi
 }
 
+candidate_listen() {
+  if [[ "$1" == narjar ]]; then
+    printf '%s\n' '127.0.0.1:0'
+    return
+  fi
+  printf '127.0.0.1:%s\n' "$BINCACHE_PORT"
+}
+
+select_bincache_port() {
+  local port=$((30000 + $$ % 10000))
+  for _ in $(seq 1 100); do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      BINCACHE_PORT=$port
+      return
+    fi
+    port=$((port + 1))
+  done
+  echo "could not find a free Bincache benchmark port" >&2
+  return 1
+}
+
 candidate_root() { printf '%s/.candidate-%s' "$WORK" "$1"; }
 candidate_data() { printf '%s/data' "$(candidate_root "$1")"; }
 candidate_bin() {
@@ -186,23 +209,28 @@ candidate_prepare() {
 }
 
 candidate_start() {
-  local candidate=$1 root data log pid port
+  local candidate=$1 root data log pid port listen
   root=$(candidate_root "$candidate")
   data=$(candidate_data "$candidate")
   log=$OUTPUT/logs/$candidate.log
+  listen=$(candidate_listen "$candidate")
   if [[ "$candidate" == narjar ]]; then
-    log_command "$NARJAR_BIN" serve --data-dir "$data" --listen 127.0.0.1:0 --workers 1
-    "$NARJAR_BIN" serve --data-dir "$data" --listen 127.0.0.1:0 --workers 1 > "$log" 2>&1 &
+    log_command "$NARJAR_BIN" serve --data-dir "$data" --listen "$listen" --workers "$BENCHMARK_WORKERS"
+    "$NARJAR_BIN" serve --data-dir "$data" --listen "$listen" --workers "$BENCHMARK_WORKERS" > "$log" 2>&1 &
   else
     log_command "$BINCACHE_BIN" serve --data-dir "$data" --secret-key-file "$root/secret-key" \
-      --push-token-file "$root/push-token" --listen 127.0.0.1:0 --shards 1
+      --push-token-file "$root/push-token" --listen "$listen" --shards 1
     "$BINCACHE_BIN" serve --data-dir "$data" --secret-key-file "$root/secret-key" \
-      --push-token-file "$root/push-token" --listen 127.0.0.1:0 --shards 1 > "$log" 2>&1 &
+      --push-token-file "$root/push-token" --listen "$listen" --shards 1 > "$log" 2>&1 &
   fi
   pid=$!
   SERVER_PIDS="$SERVER_PIDS $pid"
   for _ in $(seq 1 300); do
-    port=$(sed -n 's/^listening http:\/\/127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$log" | head -1)
+    if [[ "$candidate" == narjar ]]; then
+      port=$(sed -n 's/^listening http:\/\/127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$log" | head -1)
+    else
+      port=${listen##*:}
+    fi
     if [[ -n "$port" ]] && curl --silent --show-error --max-time 1 \
       "http://127.0.0.1:$port/nix-cache-info" >/dev/null; then
       CANDIDATE_URL=http://127.0.0.1:$port
@@ -219,11 +247,12 @@ candidate_start() {
 }
 
 candidate_start_limited() {
-  local candidate=$1 limit=$2 root data log pid port limited limited_script
+  local candidate=$1 limit=$2 root data log pid port listen limited limited_script
   root=$(candidate_root "$candidate")
   data=$(candidate_data "$candidate")
   limited=$root/limited-data
   log=$OUTPUT/logs/$candidate-enospc.log
+  listen=$(candidate_listen "$candidate")
   mkdir -p "$limited"
   read -r -d '' limited_script <<'EOF' || true
 set -eu; mount -t tmpfs -o "size=$1M" tmpfs "$2"; cp -a "$3/." "$2/"; shift 3; exec "$@"
@@ -231,26 +260,30 @@ EOF
   if [[ "$candidate" == narjar ]]; then
     log_command unshare -Urm --map-root-user sh -c "$limited_script" \
       benchmark-enospc "$limit" "$limited" "$data" "$NARJAR_BIN" serve \
-      --data-dir "$limited" --listen 127.0.0.1:0 --workers 1
+      --data-dir "$limited" --listen "$listen" --workers "$BENCHMARK_WORKERS"
     unshare -Urm --map-root-user sh -c \
       "$limited_script" \
       benchmark-enospc "$limit" "$limited" "$data" "$NARJAR_BIN" serve \
-      --data-dir "$limited" --listen 127.0.0.1:0 --workers 1 > "$log" 2>&1 &
+      --data-dir "$limited" --listen "$listen" --workers "$BENCHMARK_WORKERS" > "$log" 2>&1 &
   else
     log_command unshare -Urm --map-root-user sh -c "$limited_script" \
       benchmark-enospc "$limit" "$limited" "$data" "$BINCACHE_BIN" serve \
       --data-dir "$limited" --secret-key-file "$root/secret-key" \
-      --push-token-file "$root/push-token" --listen 127.0.0.1:0 --shards 1
+      --push-token-file "$root/push-token" --listen "$listen" --shards 1
     unshare -Urm --map-root-user sh -c \
       "$limited_script" \
       benchmark-enospc "$limit" "$limited" "$data" "$BINCACHE_BIN" serve \
       --data-dir "$limited" --secret-key-file "$root/secret-key" \
-      --push-token-file "$root/push-token" --listen 127.0.0.1:0 --shards 1 > "$log" 2>&1 &
+      --push-token-file "$root/push-token" --listen "$listen" --shards 1 > "$log" 2>&1 &
   fi
   pid=$!
   SERVER_PIDS="$SERVER_PIDS $pid"
   for _ in $(seq 1 300); do
-    port=$(sed -n 's/^listening http:\/\/127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$log" | head -1)
+    if [[ "$candidate" == narjar ]]; then
+      port=$(sed -n 's/^listening http:\/\/127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$log" | head -1)
+    else
+      port=${listen##*:}
+    fi
     if [[ -n "$port" ]] && curl --silent --show-error --max-time 1 \
       "http://127.0.0.1:$port/nix-cache-info" >/dev/null; then
       CANDIDATE_URL=http://127.0.0.1:$port
@@ -387,7 +420,7 @@ candidate_request() {
   set -- curl --silent --show-error --max-time 30 --netrc-file "$root/netrc" \
     -H 'Accept-Encoding: identity' -X "$method"
   [[ -z "$range" ]] || set -- "$@" -H "Range: $range"
-  set -- "$@" -o "$body" -w '%{http_code}\t%{time_total}\t%{time_starttransfer}\t%{size_download}' "$url"
+  set -- "$@" -o "$body" -w '%{http_code}\t%{time_total}\t%{time_starttransfer}\t%{size_download}\n' "$url"
   log_command "$@"
   "$@" > "$meta" 2> "$err" || true
   [[ ! -s "$err" ]] || cat "$err" >> "$COMMAND_LOG"
@@ -498,7 +531,12 @@ benchmark_io() {
 candidate_nar_info() {
   local candidate=$1 store_path=$2
   candidate_request "$candidate" GET "$(basename "$store_path" | cut -d- -f1).narinfo"
-  [[ "$REQUEST_STATUS" == 200 ]] || return 1
+  if [[ "$REQUEST_STATUS" != 200 ]]; then
+    printf 'narinfo request failed candidate=%s status=%s path=%s\n' \
+      "$candidate" "$REQUEST_STATUS" "$store_path" >&2
+    [[ ! -s "$REQUEST_BODY" ]] || cat "$REQUEST_BODY" >&2
+    return 1
+  fi
   printf '%s\t%s\t%s\n' \
     "$(awk -F': ' '$1=="URL"{print $2}' "$REQUEST_BODY")" \
     "$(awk -F': ' '$1=="NarSize"{print $2}' "$REQUEST_BODY")" \
@@ -872,6 +910,7 @@ write_report() {
 }
 
 resolve_bincache
+select_bincache_port
 for candidate in narjar bincache; do candidate_prepare "$candidate"; done
 benchmark_startup
 benchmark_io
