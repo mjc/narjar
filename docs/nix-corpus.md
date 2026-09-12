@@ -43,6 +43,22 @@ scripts/nix-corpus validate \
   --manifest benchmarks/corpus-manifest.json --schema-only
 ```
 
+Pass `--spec` with `--schema-only` to verify that a manifest was collected
+from the current candidate spec. The check compares the corpus id and each
+target's reproducibility identity (including its pinned revision, flake
+reference and attribute, machine, families, subset, and input overrides):
+
+```sh
+scripts/nix-corpus validate \
+  --manifest benchmarks/corpus-manifest.json \
+  --spec benchmarks/corpus-spec.json \
+  --schema-only
+```
+
+The retained historical manifest intentionally does not pass this comparison
+until clean regeneration replaces it; a schema-only pass without `--spec` is
+not evidence that it matches the current candidate.
+
 When present, the manifest's `targets` list must contain collected target
 records with an id, generation, pinned nixpkgs revision, flake reference,
 machine, family list, subset, and resolved store root. Numbered generations

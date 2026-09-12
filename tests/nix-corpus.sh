@@ -111,6 +111,16 @@ PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" collect \
   --spec "$WORK/spec.json" --manifest "$WORK/collected.json" --export-dir "$WORK/export" --build
 jq -e '.entries | length == 1 and .[0].path == "/nix/store/mock-root" and .[0].artifact_sha256 != null' \
   "$WORK/collected.json" > /dev/null
+PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/collected.json" --spec "$WORK/spec.json" --schema-only
+jq '.targets[0].id = "different-target"' "$WORK/spec.json" > "$WORK/mismatched-spec.json"
+if PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/collected.json" --spec "$WORK/mismatched-spec.json" --schema-only \
+  > /dev/null 2> "$WORK/mismatched-spec.err"; then
+  echo "validation accepted a manifest that differs from its spec" >&2
+  exit 1
+fi
+grep -q 'targets do not match spec' "$WORK/mismatched-spec.err"
 jq '.entries[].artifact = "/no/such/corpus-artifact.nar"' \
   "$WORK/collected.json" > "$WORK/schema-only.json"
 PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
