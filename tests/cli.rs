@@ -433,6 +433,83 @@ fn native_push_retries_a_429_at_the_process_boundary() {
 }
 
 #[test]
+fn native_push_follows_a_307_for_the_nar_upload_at_the_process_boundary() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind native redirect listener");
+    let address = listener
+        .local_addr()
+        .expect("inspect native redirect listener");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept initial native upload");
+        let request = read_http_request(&mut stream);
+        let request_text = String::from_utf8_lossy(&request);
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("initial upload should contain headers")
+            + 4;
+        assert!(
+            request_text.starts_with("PUT /nar/"),
+            "initial request should upload the NAR"
+        );
+        assert_eq!(&request[header_end..], NAR_BYTES);
+        write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /redirect-target/nar/upload.nar\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write native redirect response");
+
+        let (mut stream, _) = listener.accept().expect("accept redirected native upload");
+        let request = read_http_request(&mut stream);
+        let request_text = String::from_utf8_lossy(&request);
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("redirected upload should contain headers")
+            + 4;
+        assert!(
+            request_text.starts_with("PUT /redirect-target/nar/upload.nar"),
+            "redirected request should use the Location path"
+        );
+        assert_eq!(&request[header_end..], NAR_BYTES);
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write redirected native upload response");
+
+        let (mut stream, _) = listener.accept().expect("accept native narinfo");
+        let request = read_http_request(&mut stream);
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("narinfo request should contain headers")
+            + 4;
+        assert!(request[header_end..].starts_with(b"StorePath: "));
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write native narinfo response");
+    });
+    let fixture = native_push_fixture();
+    let output = run_native_push_fixture(&fixture, &format!("http://{address}"), "none", true);
+    server.join().expect("native redirect server should exit");
+
+    assert!(
+        output.status.success(),
+        "native redirect push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.invocation_log).expect("Nix invocations should be logged"),
+        format!(
+            "path-info --recursive --json -- {}\nstore dump-path -- {}\n",
+            fixture.store_path, fixture.store_path
+        )
+    );
+}
+
+#[test]
 fn native_push_retries_after_an_interrupted_upload_at_the_process_boundary() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind native interruption listener");
     let address = listener
