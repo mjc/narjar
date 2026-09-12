@@ -111,6 +111,15 @@ PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" collect \
   --spec "$WORK/spec.json" --manifest "$WORK/collected.json" --export-dir "$WORK/export" --build
 jq -e '.entries | length == 1 and .[0].path == "/nix/store/mock-root" and .[0].artifact_sha256 != null' \
   "$WORK/collected.json" > /dev/null
+jq '.targets[0] |= del(.resolved_root)' "$WORK/collected.json" > "$WORK/missing-resolved-root.json"
+if PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \
+  --manifest "$WORK/missing-resolved-root.json" --rebuild \
+  > /dev/null 2> "$WORK/missing-resolved-root.err"; then
+  echo "rebuild without an expected root unexpectedly validated" >&2
+  exit 1
+fi
+grep -q 'no resolved_root' "$WORK/missing-resolved-root.err"
+
 jq '.entries += [(.entries[0] | .path = "/nix/store/expected-root")] |
   .targets[0].resolved_root = "/nix/store/expected-root" |
   del(.coverage)' \

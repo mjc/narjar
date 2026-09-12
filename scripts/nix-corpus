@@ -222,26 +222,28 @@ validate_rebuilds() {
   local manifest=$1 target expected_root resolved_root target_id resolved_info expected_hash expected_size
   while IFS= read -r target; do
     target_id=$(jq -r '.id // "<unknown>"' <<< "$target")
+    expected_root=$(jq -r '.resolved_root // empty' <<< "$target")
+    if [[ -z "$expected_root" ]]; then
+      printf 'target has no resolved_root: %s\n' "$target_id"
+      continue
+    fi
     if ! resolved_root=$(resolve_root "$target" true); then
       printf 'failed to rebuild target: %s\n' "$target_id"
       continue
     fi
-    expected_root=$(jq -r '.resolved_root // empty' <<< "$target")
-    if [[ -n "$expected_root" ]]; then
-      if ! resolved_info=$(path_info "$resolved_root"); then
-        printf 'failed to read rebuilt metadata: %s\n' "$target_id"
-        continue
-      fi
-      if ! read -r expected_hash expected_size < <(jq -er --arg root "$expected_root" '
-        .entries[]? | select(.path == $root) | [.nar_hash, (.nar_size | tostring)] | @tsv
-      ' "$manifest"); then
-        printf 'manifest has no metadata for expected root: %s\n' "$target_id"
-        continue
-      fi
-      if [[ "$(jq -r '.narHash' <<< "$resolved_info")" != "$expected_hash" ||
-        "$(jq -r '.narSize' <<< "$resolved_info")" != "$expected_size" ]]; then
-        printf 'rebuilt content differs for %s: %s != %s\n' "$target_id" "$resolved_root" "$expected_root"
-      fi
+    if ! resolved_info=$(path_info "$resolved_root"); then
+      printf 'failed to read rebuilt metadata: %s\n' "$target_id"
+      continue
+    fi
+    if ! read -r expected_hash expected_size < <(jq -er --arg root "$expected_root" '
+      .entries[]? | select(.path == $root) | [.nar_hash, (.nar_size | tostring)] | @tsv
+    ' "$manifest"); then
+      printf 'manifest has no metadata for expected root: %s\n' "$target_id"
+      continue
+    fi
+    if [[ "$(jq -r '.narHash' <<< "$resolved_info")" != "$expected_hash" ||
+      "$(jq -r '.narSize' <<< "$resolved_info")" != "$expected_size" ]]; then
+      printf 'rebuilt content differs for %s: %s != %s\n' "$target_id" "$resolved_root" "$expected_root"
     fi
   done < <(jq -c '.targets[]? | select(type == "object")' "$manifest")
 }
