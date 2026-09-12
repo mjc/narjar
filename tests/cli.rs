@@ -169,6 +169,12 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
 
 #[test]
 fn push_uses_native_transfer_without_nix_copy() {
+    for (compression, suffix) in [("none", ".nar"), ("zstd", ".nar.zst"), ("xz", ".nar.xz")] {
+        assert_native_push_process_boundary(compression, suffix);
+    }
+}
+
+fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
     let server = RunningServer::start("native-push-process-boundary");
     let tools = tempfile::tempdir().expect("fake Nix directory should be created");
     let fake_nix = tools.path().join("nix");
@@ -219,7 +225,9 @@ fn push_uses_native_transfer_without_nix_copy() {
         .args([
             "push",
             "--to",
-            &format!("http://{}?compression=none", server.address),
+            &format!("http://{}?compression={compression}", server.address),
+            "--compression",
+            compression,
             "--netrc-file",
             netrc.to_str().expect("netrc path should be UTF-8"),
             &store_path,
@@ -238,14 +246,24 @@ fn push_uses_native_transfer_without_nix_copy() {
         String::from_utf8_lossy(&output.stdout),
         "pushed 1 paths with 1 workers\n"
     );
-    assert_eq!(
-        fs::read(server.data_dir.join(format!("nar/{nar_hash}.nar")))
-            .expect("native NAR should be published"),
-        NAR_BYTES
-    );
     let narinfo = fs::read_to_string(server.data_dir.join(format!("{STORE_HASH}.narinfo")))
         .expect("native narinfo should be published");
-    assert!(narinfo.contains("Compression: none\n"));
+    let url = narinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("URL: nar/"))
+        .expect("native narinfo should contain a NAR URL");
+    assert!(
+        url.ends_with(suffix),
+        "NAR URL {url:?} should use requested suffix {suffix:?} for {compression}"
+    );
+    let published_nar = fs::read(server.data_dir.join(format!("nar/{url}")))
+        .expect("native NAR should be published");
+    if compression == "none" {
+        assert_eq!(published_nar, NAR_BYTES);
+    } else {
+        assert_ne!(published_nar, NAR_BYTES);
+    }
+    assert!(narinfo.contains(&format!("Compression: {compression}\n")));
     assert!(narinfo.contains(&format!("NarSize: {}\n", NAR_BYTES.len())));
 
     let invocations = fs::read_to_string(invocation_log).expect("Nix invocations should be logged");
