@@ -97,6 +97,16 @@ jq -n '{
     input_overrides: {"z-input": "z-ref", "a-input": "a-ref"}
   }]
 }' > "$WORK/spec.json"
+
+jq '.targets[0].subset = "missing"' "$WORK/spec.json" > "$WORK/unknown-subset-spec.json"
+if PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" collect \
+  --spec "$WORK/unknown-subset-spec.json" --manifest "$WORK/unknown-subset.json" --build \
+  > /dev/null 2> "$WORK/unknown-subset.err"; then
+  echo "unknown corpus subset unexpectedly validated" >&2
+  exit 1
+fi
+grep -q 'unknown subset' "$WORK/unknown-subset.err"
+
 PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" collect \
   --spec "$WORK/spec.json" --manifest "$WORK/collected.json" --export-dir "$WORK/export" --build
 jq -e '.entries | length == 1 and .[0].path == "/nix/store/mock-root" and .[0].artifact_sha256 != null' \

@@ -295,6 +295,23 @@ collect() {
       and ((.root | type == "string") or (.flake_attr | type == "string")))
     and ([.targets[].id] | unique | length == length)
   ' "$spec" > /dev/null || die "spec must have schema_version 1 and unique, complete targets"
+  jq -e '
+    (.subsets | type == "object" and length > 0)
+    and all((.subsets // {}) | to_entries[];
+      .value | type == "object" and
+      (.weight | type == "number" and isfinite and . >= 0))
+  ' "$spec" > /dev/null || die "spec must define non-empty subsets with numeric weights"
+  local missing_subsets
+  missing_subsets=$(jq -r '
+    . as $spec |
+    [$spec.targets[] |
+      .subset as $subset |
+      select(($spec.subsets | has($subset)) | not) |
+      $subset] |
+    unique |
+    join(", ")
+  ' "$spec") || die "spec has invalid subset declarations"
+  [[ -z "$missing_subsets" ]] || die "spec references unknown subset(s): $missing_subsets"
   if [[ -n "$export_dir" ]]; then
     mkdir -p "$export_dir"
   fi
