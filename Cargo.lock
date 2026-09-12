@@ -246,9 +246,9 @@ dependencies = [
  "httparse",
  "libc",
  "lzma-rust2",
- "ruzstd",
  "sha2",
  "signal-hook",
+ "structured-zstd",
  "subtle",
  "tempfile",
 ]
@@ -300,15 +300,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruzstd"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5ff0cc5e135c8870a775d3320910cd9b564ec036b4dc0b8741629020be63f01"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -350,6 +341,15 @@ name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+
+[[package]]
+name = "structured-zstd"
+version = "0.0.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7373485ca5fc5a7f02eec65f8d106b5d8b2c1341f14abebdf8dc7b5a2171d19a"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "subtle"

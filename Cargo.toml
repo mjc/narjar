@@ -2,7 +2,7 @@
 name = "narjar"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.92"
 
 [dependencies]
 clap = { version = "=4.6.6", default-features = false, features = ["derive", "env", "std"] }
@@ -16,7 +16,7 @@ sha2 = { version = "=0.11.0", default-features = false }
 signal-hook = { version = "=0.4.4", default-features = false }
 subtle = { version = "=2.6.1", default-features = false }
 tempfile = { version = "=3.27.0", default-features = false }
-ruzstd = { version = "=0.8.2", default-features = false, features = ["hash", "std"] }
+structured-zstd = { version = "=0.0.52", default-features = false, features = ["hash", "std", "kernel-sse", "kernel-bmi2", "kernel-avx2", "kernel-neon", "kernel-sve"] }
 
 [[bench]]
 name = "micro"

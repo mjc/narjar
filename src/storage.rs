@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::narinfo::{NarEncoding, ValidatedNarInfo};
 use lzma_rust2::XzReader;
-use ruzstd::decoding::StreamingDecoder as RuzstdDecoder;
+use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
 pub mod gc;
 mod reconcile;
@@ -304,7 +304,7 @@ fn validate_zstd(
 ) -> io::Result<u64> {
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
-    let mut reader = RuzstdDecoder::new(HashingReader::new(file)).map_err(|error| {
+    let mut reader = StructuredZstdDecoder::new(HashingReader::new(file)).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid zstd NAR: {error}"),
@@ -1727,7 +1727,7 @@ mod tests {
     };
     use crate::narinfo::NarEncoding;
     use lzma_rust2::{XzOptions, XzReader, XzWriter};
-    use ruzstd::encoding::{CompressionLevel, compress};
+    use structured_zstd::encoding::{CompressionLevel, compress};
     use sha2::{Digest, Sha256};
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";

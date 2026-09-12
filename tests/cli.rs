@@ -1,7 +1,7 @@
 use data_encoding::{BASE64, BitOrder, Specification};
 use ed25519_dalek::{Signer, SigningKey};
 use lzma_rust2::{XzOptions, XzWriter};
-use ruzstd::encoding::{CompressionLevel, compress};
+use structured_zstd::encoding::{CompressionLevel, compress};
 use sha2::{Digest, Sha256};
 use std::{
     fs,

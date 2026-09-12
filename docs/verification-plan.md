@@ -17,7 +17,7 @@ The initial allowed set is deliberately small:
 | signal-hook | Portable SIGINT/SIGTERM flag registration | Rust std exposes no stable signal handler API | Async runtime or control-socket framework |
 | libc | Nonblocking advisory lock on `DATA/lock` | Rust 1.85 has no stable file-lock API | Stale PID files or a larger portability crate |
 | lzma-rust2 | Streaming pure-Rust XZ decode/encode | Rust std has no XZ codec; Nix default binary-cache uploads use `.nar.xz` | liblzma/xz2 add a native C library boundary; sevenzip is a different container |
-| ruzstd | Streaming pure-Rust zstd decode | Rust std has no zstd codec; Nix clients use `.nar.zst` representations | C-backed zstd bindings add a native library boundary; one-shot decoders do not preserve bounded streaming |
+| structured-zstd | Streaming pure-Rust zstd decode/encode with runtime CPU kernels | Rust std has no zstd codec; Nix clients use `.nar.zst` representations | C-backed zstd bindings add a native library boundary; one-shot decoders do not preserve bounded streaming |
 
 Candidate metadata was captured with `cargo info` on 2026-08-31 and 2026-09-11.
 These are review candidates, not loose semver ranges: implementation pins the
@@ -34,10 +34,10 @@ gates.
 | subtle | 2.6.1 | BSD-3-Clause | undeclared; prove on 1.85 | default features off; fixed-size comparison only; pure Rust |
 | signal-hook | 0.4.4 | MIT OR Apache-2.0 | 1.66 | default features off; flag registration only; no iterator/channel or C helper |
 | libc | 0.2.189 | MIT OR Apache-2.0 | 1.65 | default features off; one documented `flock` call; already present through signal-hook |
-| ruzstd | 0.8.2 | MIT | unknown; prove on 1.85 | `hash` and `std` only; streaming pure-Rust decoder; no C zstd library or one-shot whole-input buffer |
+| structured-zstd | 0.0.52 | Apache-2.0 | 1.92 | `hash`, `std`, and runtime SSE/BMI2/AVX2/NEON/SVE kernels; bounded streaming pure-Rust decoder/encoder; no C zstd library or one-shot whole-input buffer |
 
-The project MSRV is Rust 1.85, matching the pinned shell. An undeclared upstream
-MSRV is accepted only after an explicit 1.85 build. Every candidate is
+The project MSRV is Rust 1.92, matching the selected zstd implementation and
+pinned shell. Every candidate is
 permissively licensed and compatible with a musl static build when the rejected
 native/TLS features remain disabled; the Linux static closure check is the
 proof, not this table.
