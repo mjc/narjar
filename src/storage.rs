@@ -960,6 +960,7 @@ impl Storage {
         let transaction = self.recovery.begin(&temporary_path)?;
         checkpoint(PublishBoundary::BeforeTempCreate)?;
         let mut temp = self.create_temp_named(&target, temp_name)?;
+        let mut durable = false;
         let result = (|| {
             checkpoint(PublishBoundary::AfterTempCreate)?;
             io::copy(&mut source, &mut temp.file)?;
@@ -988,6 +989,7 @@ impl Storage {
                         rollback_link_at(&destination_directory, &destination_name)?;
                         return Err(error.into());
                     }
+                    durable = true;
                     checkpoint(PublishBoundary::AfterParentSync)?;
                     Ok(PublishOutcome::Created)
                 }
@@ -1016,7 +1018,12 @@ impl Storage {
                 Ok(outcome)
             }
             Err(error) => {
-                let _ = cleanup;
+                if durable {
+                    cleanup?;
+                    transaction.complete()?;
+                } else {
+                    let _ = cleanup;
+                }
                 Err(error)
             }
         }
@@ -2478,6 +2485,13 @@ mod tests {
                     PublishBoundary::AfterParentSync,
                 )
                 .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(directory.path().join(".narjar-transactions"))
+                .expect("read publication transaction directory")
+                .count(),
+            0,
+            "durable response loss must complete its transaction record"
         );
         assert_eq!(
             storage
