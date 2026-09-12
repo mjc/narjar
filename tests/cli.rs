@@ -7,7 +7,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{Shutdown, TcpStream},
     ops::Deref,
-    os::unix::fs::symlink,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::{
@@ -165,6 +165,95 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
         .envs(environment.iter().copied())
         .output()
         .expect("narjar should run")
+}
+
+#[test]
+fn push_uses_native_transfer_without_nix_copy() {
+    let server = RunningServer::start("native-push-process-boundary");
+    let tools = tempfile::tempdir().expect("fake Nix directory should be created");
+    let fake_nix = tools.path().join("nix");
+    let invocation_log = tools.path().join("nix-invocations");
+    let store_path = format!("/nix/store/{STORE_HASH}-narjar");
+    let nar_hash = nix32_sha256(NAR_BYTES);
+    let nar_hash_sri = format!("sha256-{}", BASE64.encode(&Sha256::digest(NAR_BYTES)));
+    let fingerprint = format!("1;{store_path};sha256:{nar_hash};{};", NAR_BYTES.len());
+    let signature = SigningKey::from_bytes(&[7; 32]).sign(fingerprint.as_bytes());
+    let signature = format!("narjar-test:{}", BASE64.encode(&signature.to_bytes()));
+    let fake_nix_contents = format!(
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' \"$*\" >> \"$NIX_TEST_INVOCATIONS\"\n",
+            "if [ \"$1\" = path-info ]; then\n",
+            "  printf '%s\\n' '{{\"{store_path}\":{{\"ca\":null,\"deriver\":null,\"narHash\":\"{nar_hash_sri}\",\"narSize\":{nar_size},\"references\":[],\"signatures\":[\"{signature}\"]}}}}'\n",
+            "elif [ \"$1\" = store ] && [ \"$2\" = dump-path ]; then\n",
+            "  printf '%s' narjar\n",
+            "else\n",
+            "  printf '%s\\n' \"unexpected nix invocation: $*\" >&2\n",
+            "  exit 1\n",
+            "fi\n"
+        ),
+        store_path = store_path,
+        nar_hash_sri = nar_hash_sri,
+        signature = signature,
+        nar_size = NAR_BYTES.len()
+    );
+    fs::write(&fake_nix, fake_nix_contents).expect("fake Nix should be written");
+    fs::set_permissions(&fake_nix, fs::Permissions::from_mode(0o755))
+        .expect("fake Nix should be executable");
+    let netrc = tools.path().join("netrc");
+    fs::write(
+        &netrc,
+        "machine 127.0.0.1 login narjar password test-write-token\n",
+    )
+    .expect("netrc should be written");
+    fs::set_permissions(&netrc, fs::Permissions::from_mode(0o600))
+        .expect("netrc should be private");
+
+    let original_path = std::env::var_os("PATH").expect("test PATH should be set");
+    let path = format!(
+        "{}:{}",
+        tools.path().display(),
+        original_path.to_string_lossy()
+    );
+    let output = command()
+        .args([
+            "push",
+            "--to",
+            &format!("http://{}?compression=none", server.address),
+            "--netrc-file",
+            netrc.to_str().expect("netrc path should be UTF-8"),
+            &store_path,
+        ])
+        .env("PATH", path)
+        .env("NIX_TEST_INVOCATIONS", &invocation_log)
+        .output()
+        .expect("narjar push should run");
+
+    assert!(
+        output.status.success(),
+        "native push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "pushed 1 paths with 1 workers\n"
+    );
+    assert_eq!(
+        fs::read(server.data_dir.join(format!("nar/{nar_hash}.nar")))
+            .expect("native NAR should be published"),
+        NAR_BYTES
+    );
+    let narinfo = fs::read_to_string(server.data_dir.join(format!("{STORE_HASH}.narinfo")))
+        .expect("native narinfo should be published");
+    assert!(narinfo.contains("Compression: none\n"));
+    assert!(narinfo.contains(&format!("NarSize: {}\n", NAR_BYTES.len())));
+
+    let invocations = fs::read_to_string(invocation_log).expect("Nix invocations should be logged");
+    assert_eq!(
+        invocations,
+        format!("path-info --recursive --json -- {store_path}\nstore dump-path -- {store_path}\n")
+    );
+    assert!(!invocations.contains(" copy "));
 }
 
 struct TestDir(TempDir);
