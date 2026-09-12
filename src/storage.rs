@@ -2188,6 +2188,24 @@ mod tests {
     }
 
     #[test]
+    fn malformed_publication_transaction_blocks_recovery() {
+        let directory = TestDir::new();
+        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let trusted_keys = directory.path().join("trusted-public-keys");
+        let record = directory
+            .path()
+            .join(".narjar-transactions/publish-malformed.txn");
+        fs::write(&trusted_keys, b"").expect("create trusted key file");
+        fs::write(&record, b"/outside/recovery.part\n").expect("create malformed record");
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
+            .expect("make malformed record private");
+
+        assert!(storage.recovery_required().expect("inspect recovery state"));
+        assert!(storage.finish_recovery(&trusted_keys).is_err());
+        assert!(record.exists(), "failed recovery must retain its evidence");
+    }
+
+    #[test]
     fn publication_is_immutable_idempotent_and_pair_gated() {
         let directory = TestDir::new();
         let storage = Storage::initialize(directory.path()).expect("initialize storage");
