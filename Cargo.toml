@@ -19,6 +19,7 @@ serde_json = { version = "=1.0.151", default-features = false, features = ["std"
 subtle = { version = "=2.6.1", default-features = false }
 tempfile = { version = "=3.27.0", default-features = false }
 structured-zstd = { version = "=0.0.52", default-features = false, features = ["hash", "std", "kernel-sse", "kernel-bmi2", "kernel-avx2", "kernel-neon", "kernel-sve"] }
+ureq = { version = "=3.4.1", default-features = false, features = ["rustls"] }
 
 [[bench]]
 name = "micro"

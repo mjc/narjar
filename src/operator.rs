@@ -971,7 +971,7 @@ pub(crate) fn stats(options: Stats) -> Result<(), Error> {
     Ok(())
 }
 
-fn netrc_authorization(path: &Path, authority: &str) -> Result<String, Error> {
+pub(crate) fn netrc_authorization(path: &Path, authority: &str) -> Result<String, Error> {
     let text = fs::read_to_string(path).map_err(runtime)?;
     netrc_authorization_from_str(&text, authority)
 }
