@@ -351,6 +351,86 @@ fn native_push_retries_a_429_at_the_process_boundary() {
     );
 }
 
+#[test]
+fn native_push_retries_after_an_interrupted_upload_at_the_process_boundary() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind native interruption listener");
+    let address = listener
+        .local_addr()
+        .expect("inspect native interruption listener");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept interrupted native upload");
+        let mut request = Vec::new();
+        loop {
+            let mut byte = [0; 1];
+            stream
+                .read_exact(&mut byte)
+                .expect("read interrupted upload headers");
+            request.push(byte[0]);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&request).starts_with("PUT /nar/"),
+            "first request should upload the NAR"
+        );
+        let mut partial_body = [0; 1];
+        stream
+            .read_exact(&mut partial_body)
+            .expect("read part of interrupted NAR");
+        stream
+            .shutdown(Shutdown::Both)
+            .expect("close interrupted upload connection");
+
+        let (mut stream, _) = listener.accept().expect("accept retried native upload");
+        let request = read_http_request(&mut stream);
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("retried request should contain headers")
+            + 4;
+        assert_eq!(&request[header_end..], NAR_BYTES);
+        assert!(String::from_utf8_lossy(&request).starts_with("PUT /nar/"));
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write retried upload response");
+
+        let (mut stream, _) = listener.accept().expect("accept native narinfo");
+        let request = read_http_request(&mut stream);
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("narinfo request should contain headers")
+            + 4;
+        assert!(request[header_end..].starts_with(b"StorePath: "));
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write narinfo response");
+    });
+    let fixture = native_push_fixture();
+    let output = run_native_push_fixture(&fixture, &format!("http://{address}"), "none", true);
+    server
+        .join()
+        .expect("native interruption server should exit");
+
+    assert!(
+        output.status.success(),
+        "native push interruption retry failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.invocation_log).expect("Nix invocations should be logged"),
+        format!(
+            "path-info --recursive --json -- {}\nstore dump-path -- {}\n",
+            fixture.store_path, fixture.store_path
+        )
+    );
+}
+
 fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
     let server = RunningServer::start("native-push-process-boundary");
     let fixture = native_push_fixture();
