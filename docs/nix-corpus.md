@@ -75,7 +75,10 @@ do not need to remain in the local store.
 Keep the spec and manifest in version control; keep large NAR exports and
 regeneration roots outside the repository. The manifest's `requirements` block
 is intentionally enforced during validation so a partial local store cannot
-silently become the headline corpus.
+silently become the headline corpus. When present, `min_generations` and
+`min_nixpkgs_revisions` must be finite nonnegative integers, and
+`required_families` must be a non-empty array of non-empty strings; malformed
+or null requirement values fail schema validation.
 
 `tests/nix-corpus.sh` covers the script without a real corpus: it checks a
 valid exported artifact, schema-only validation through a reduced tool path
