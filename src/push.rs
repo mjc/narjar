@@ -354,6 +354,9 @@ fn dependency_waves(metadata: Vec<PathInfo>) -> Result<Vec<Vec<PathInfo>>, Error
         references.sort_unstable();
         references.dedup();
         for reference in references {
+            if reference == &info.path {
+                continue;
+            }
             if !by_path.contains_key(reference) {
                 return Err(Error::runtime(format!(
                     "{} has missing referenced store path {}",
@@ -1371,6 +1374,26 @@ mod tests {
                 vec!["/nix/store/11111111111111111111111111111111-dependent".to_owned()],
             ]
         );
+    }
+
+    #[test]
+    fn dependency_waves_ignore_self_references() {
+        let path = "/nix/store/00000000000000000000000000000000-self-referencing";
+        let info = PathInfo {
+            path: path.to_owned(),
+            ca: None,
+            deriver: None,
+            nar_hash: "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=".to_owned(),
+            nar_size: 289656,
+            references: vec![path.to_owned()],
+            signatures: Vec::new(),
+        };
+
+        let waves =
+            dependency_waves(vec![info]).expect("self references are not dependency cycles");
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].len(), 1);
+        assert_eq!(waves[0][0].path, path);
     }
 
     #[test]
