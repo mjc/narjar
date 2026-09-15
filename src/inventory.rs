@@ -1,18 +1,13 @@
-use std::{collections::HashSet, io, path::Path};
+use std::{collections::HashSet, ffi::OsStr, fs::File, io};
 
 use crate::{
-    narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
+    narinfo::{PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file},
     storage::{
-        NarObjectId, StoreHash, entry_is_regular_at, file_matches, for_each_dir_name,
-        nar_file_matches, open_directory, open_directory_at, open_regular_at, read_dir_names,
+        Directory, NarObjectId, StoreHash, for_each_dir_name,
+        inspection::{NarinfoCandidate, NarinfoName, PayloadEntry, ReferencedPayload},
+        open_directory_at, read_dir_names,
     },
 };
-
-pub use crate::narinfo::MAX_NARINFO_BYTES;
-
-pub fn narinfo_is_valid(trusted: &TrustedPublicKeys, store: &StoreHash, bytes: Vec<u8>) -> bool {
-    trusted.inspect(store, bytes).is_ok()
-}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum InventoryClass {
@@ -51,17 +46,24 @@ impl InventoryClass {
     }
 
     pub const fn invalid_published_pair(self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::MissingNar
-                | Self::MalformedNarInfo
-                | Self::HashOrSizeMismatch
-                | Self::UntrustedSignature
-        )
+            | Self::MalformedNarInfo
+            | Self::HashOrSizeMismatch
+            | Self::UntrustedSignature => true,
+            Self::ValidPair | Self::OrphanNar | Self::InvalidFilename => false,
+        }
     }
 
     pub const fn blocks_serve(self) -> bool {
-        matches!(self, Self::MalformedNarInfo | Self::UntrustedSignature)
+        match self {
+            Self::MalformedNarInfo | Self::UntrustedSignature => true,
+            Self::ValidPair
+            | Self::OrphanNar
+            | Self::MissingNar
+            | Self::HashOrSizeMismatch
+            | Self::InvalidFilename => false,
+        }
     }
 }
 
@@ -99,143 +101,204 @@ pub struct Inventory {
     entries: Vec<InventoryEntry>,
 }
 
-impl Inventory {
-    pub fn can_serve_streaming(root: &Path, trusted: &TrustedPublicKeys) -> io::Result<bool> {
-        let root_directory = open_directory(root)?;
-        let mut can_serve = true;
-        for_each_dir_name(&root_directory, |name| {
-            let Some(name) = name.to_str() else {
-                return Ok(true);
-            };
-            let Some(route) = name.strip_suffix(".narinfo") else {
-                return Ok(true);
-            };
-            let Ok(store) = StoreHash::parse(route) else {
-                return Ok(true);
-            };
-            let name = std::ffi::OsStr::new(name);
-            if !entry_is_regular_at(&root_directory, name)? {
-                can_serve = false;
-                return Ok(false);
-            }
-            match trusted.inspect(
-                &store,
-                read_narinfo_file(open_regular_at(&root_directory, name)?)?,
-            ) {
-                Ok(_) => Ok(true),
-                Err(
-                    PublishedNarInfoError::Malformed | PublishedNarInfoError::UntrustedSignature,
-                ) => {
-                    can_serve = false;
-                    Ok(false)
+#[derive(Clone, Copy, Debug)]
+pub enum VerificationMode {
+    /// Inspect trusted metadata and the referenced payload's existence and size.
+    Availability,
+    /// Also verify encoded and decoded content identities.
+    Content,
+}
+
+#[derive(Default)]
+struct MetadataScan {
+    entries: Vec<InventoryEntry>,
+    references: HashSet<NarObjectId>,
+}
+
+enum MetadataAssessment {
+    Rejected(InventoryEntry),
+    Referenced {
+        entry: InventoryEntry,
+        nar: NarObjectId,
+    },
+}
+
+impl VerificationMode {
+    fn inspect_referenced_payload(
+        self,
+        payload: ReferencedPayload<'_>,
+    ) -> io::Result<InventoryClass> {
+        let matches = match self {
+            Self::Availability => payload.has_expected_size()?,
+            Self::Content => payload.verify_content()?,
+        };
+        Ok(match matches {
+            true => InventoryClass::ValidPair,
+            false => InventoryClass::HashOrSizeMismatch,
+        })
+    }
+}
+
+fn inspect_trusted_narinfo(
+    payloads: &File,
+    store: &StoreHash,
+    metadata: ValidatedNarInfo,
+    verification: VerificationMode,
+) -> io::Result<MetadataAssessment> {
+    let nar = metadata.nar().clone();
+    let class = match ReferencedPayload::open(
+        payloads,
+        metadata.payload_name(),
+        metadata.payload_expectation(),
+    )? {
+        None => InventoryClass::MissingNar,
+        Some(payload) => verification.inspect_referenced_payload(payload)?,
+    };
+    // Trust establishes the reference even when its payload is missing or corrupt.
+    Ok(MetadataAssessment::Referenced {
+        entry: InventoryEntry::new(class, store.as_str()),
+        nar,
+    })
+}
+
+fn validate_narinfo_candidate(
+    root: &File,
+    candidate: &NarinfoCandidate<'_>,
+    trusted: &TrustedPublicKeys,
+) -> io::Result<Result<ValidatedNarInfo, PublishedNarInfoError>> {
+    match candidate.open(root)? {
+        None => Ok(Err(PublishedNarInfoError::Malformed)),
+        Some(file) => Ok(trusted.inspect(candidate.store(), read_narinfo_file(file)?)),
+    }
+}
+
+fn inspect_narinfo_entry(
+    name: NarinfoName<'_>,
+    root: &File,
+    payloads: &File,
+    trusted: &TrustedPublicKeys,
+    verification: VerificationMode,
+) -> io::Result<MetadataAssessment> {
+    match name {
+        NarinfoName::Invalid(name) => Ok(MetadataAssessment::Rejected(InventoryEntry::new(
+            InventoryClass::InvalidFilename,
+            name,
+        ))),
+        NarinfoName::Candidate(candidate) => {
+            match validate_narinfo_candidate(root, &candidate, trusted)? {
+                Ok(metadata) => {
+                    inspect_trusted_narinfo(payloads, candidate.store(), metadata, verification)
                 }
+                Err(error) => Ok(MetadataAssessment::Rejected(InventoryEntry::new(
+                    match error {
+                        PublishedNarInfoError::Malformed => InventoryClass::MalformedNarInfo,
+                        PublishedNarInfoError::UntrustedSignature => {
+                            InventoryClass::UntrustedSignature
+                        }
+                    },
+                    candidate.store().as_str(),
+                ))),
             }
+        }
+    }
+}
+
+impl MetadataScan {
+    fn record(&mut self, assessment: MetadataAssessment) {
+        match assessment {
+            MetadataAssessment::Rejected(entry) => self.entries.push(entry),
+            MetadataAssessment::Referenced { entry, nar } => {
+                self.references.insert(nar);
+                self.entries.push(entry);
+            }
+        }
+    }
+}
+
+fn inspect_narinfo_entries(
+    root: &File,
+    payloads: &File,
+    trusted: &TrustedPublicKeys,
+    verification: VerificationMode,
+) -> io::Result<MetadataScan> {
+    let mut scan = MetadataScan::default();
+    read_dir_names(root)?
+        .iter()
+        .filter_map(|name| NarinfoName::classify(name))
+        .try_for_each(|name| {
+            scan.record(inspect_narinfo_entry(
+                name,
+                root,
+                payloads,
+                trusted,
+                verification,
+            )?);
+            Ok::<(), io::Error>(())
+        })?;
+    Ok(scan)
+}
+
+fn classify_unreferenced_payload(
+    payload: PayloadEntry<'_>,
+    references: &HashSet<NarObjectId>,
+) -> Option<InventoryEntry> {
+    match payload {
+        PayloadEntry::Invalid(name) => {
+            Some(InventoryEntry::new(InventoryClass::InvalidFilename, name))
+        }
+        PayloadEntry::Identified(payload) => match references.contains(&payload.id) {
+            true => None,
+            false => Some(InventoryEntry::new(
+                InventoryClass::OrphanNar,
+                payload.id.as_str(),
+            )),
+        },
+    }
+}
+
+fn inspect_unreferenced_payloads(
+    directory: &File,
+    references: &HashSet<NarObjectId>,
+) -> io::Result<Vec<InventoryEntry>> {
+    let mut entries = Vec::new();
+    read_dir_names(directory)?.iter().try_for_each(|name| {
+        entries.extend(
+            PayloadEntry::identify(directory, name)?
+                .and_then(|payload| classify_unreferenced_payload(payload, references)),
+        );
+        Ok::<(), io::Error>(())
+    })?;
+    Ok(entries)
+}
+
+impl Inventory {
+    pub fn can_serve_streaming(root: &Directory, trusted: &TrustedPublicKeys) -> io::Result<bool> {
+        let root = root.file();
+        let mut can_serve = true;
+        for_each_dir_name(root, |name| {
+            can_serve = match NarinfoName::classify(name) {
+                None | Some(NarinfoName::Invalid(_)) => true,
+                Some(NarinfoName::Candidate(candidate)) => {
+                    validate_narinfo_candidate(root, &candidate, trusted)?.is_ok()
+                }
+            };
+            Ok(can_serve)
         })?;
         Ok(can_serve)
     }
 
-    pub fn scan(root: &Path, trusted: &TrustedPublicKeys, verify_hashes: bool) -> io::Result<Self> {
-        let mut entries = Vec::new();
-        let mut referenced = HashSet::new();
-        let root_directory = open_directory(root)?;
-        let nar_directory = open_directory_at(&root_directory, std::ffi::OsStr::new("nar"))?;
-
-        for name in read_dir_names(&root_directory)? {
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let Some(route) = name.strip_suffix(".narinfo") else {
-                continue;
-            };
-            let Ok(store) = StoreHash::parse(route) else {
-                entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
-                continue;
-            };
-            let name = std::ffi::OsStr::new(name);
-            if !entry_is_regular_at(&root_directory, name)? {
-                entries.push(InventoryEntry::new(InventoryClass::MalformedNarInfo, route));
-                continue;
-            }
-            let validated = match trusted.inspect(
-                &store,
-                read_narinfo_file(open_regular_at(&root_directory, name)?)?,
-            ) {
-                Ok(validated) => validated,
-                Err(PublishedNarInfoError::Malformed) => {
-                    entries.push(InventoryEntry::new(InventoryClass::MalformedNarInfo, route));
-                    continue;
-                }
-                Err(PublishedNarInfoError::UntrustedSignature) => {
-                    entries.push(InventoryEntry::new(
-                        InventoryClass::UntrustedSignature,
-                        route,
-                    ));
-                    continue;
-                }
-            };
-            let nar = validated.nar();
-            referenced.insert(nar.as_str().to_owned());
-            let nar_name = format!("{}{}", nar.as_str(), validated.encoding().suffix());
-            let Some(file) = open_regular_at(&nar_directory, std::ffi::OsStr::new(&nar_name))
-                .map(Some)
-                .or_else(|error| {
-                    if error.kind() == io::ErrorKind::NotFound {
-                        Ok(None)
-                    } else {
-                        Err(error)
-                    }
-                })?
-            else {
-                entries.push(InventoryEntry::new(InventoryClass::MissingNar, route));
-                continue;
-            };
-            let size_matches = file.metadata()?.len() == validated.file_size();
-            let hash_matches = if verify_hashes && size_matches {
-                if validated.encoding() == crate::narinfo::NarEncoding::None {
-                    file_matches(&file, nar.as_str(), validated.nar_size())?
-                } else {
-                    nar_file_matches(
-                        &file,
-                        validated.encoding(),
-                        validated.nar_hash(),
-                        nar,
-                        validated.file_size(),
-                        validated.nar_size(),
-                    )?
-                }
-            } else {
-                true
-            };
-            entries.push(InventoryEntry::new(
-                if size_matches && hash_matches {
-                    InventoryClass::ValidPair
-                } else {
-                    InventoryClass::HashOrSizeMismatch
-                },
-                route,
-            ));
-        }
-
-        for name in read_dir_names(&nar_directory)? {
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let Some(identifier) = name
-                .strip_suffix(".nar.xz")
-                .or_else(|| name.strip_suffix(".nar"))
-            else {
-                entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
-                continue;
-            };
-            if NarObjectId::parse(identifier).is_err()
-                || !entry_is_regular_at(&nar_directory, std::ffi::OsStr::new(name))?
-            {
-                entries.push(InventoryEntry::new(InventoryClass::InvalidFilename, name));
-            } else if !referenced.contains(identifier) {
-                entries.push(InventoryEntry::new(InventoryClass::OrphanNar, identifier));
-            }
-        }
-
+    pub fn scan(
+        root: &Directory,
+        trusted: &TrustedPublicKeys,
+        verification: VerificationMode,
+    ) -> io::Result<Self> {
+        let root = root.file();
+        let nar_directory = open_directory_at(root, OsStr::new("nar"))?;
+        let MetadataScan {
+            mut entries,
+            references,
+        } = inspect_narinfo_entries(root, &nar_directory, trusted, verification)?;
+        entries.extend(inspect_unreferenced_payloads(&nar_directory, &references)?);
         entries.sort();
         Ok(Self { entries })
     }

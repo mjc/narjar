@@ -23,11 +23,14 @@ use std::{
 use data_encoding::{BitOrder, Encoding, Specification};
 use sha2::{Digest, Sha256};
 
-use crate::narinfo::{NarEncoding, ValidatedNarInfo};
+use crate::narinfo::{
+    CompressedEncoding, CompressedNarExpectation, NarEncoding, NarExpectation, ValidatedNarInfo,
+};
 use lzma_rust2::XzReader;
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
 pub mod gc;
+pub(crate) mod inspection;
 mod reconcile;
 mod recovery;
 
@@ -50,7 +53,70 @@ impl fmt::Display for InvalidObjectId {
 
 impl std::error::Error for InvalidObjectId {}
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
+pub struct Directory {
+    file: File,
+    #[cfg(test)]
+    path: PathBuf,
+}
+
+impl Directory {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = open_directory(path).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory | io::ErrorKind::InvalidData => {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("data directory is not a directory: {}", path.display()),
+                )
+            }
+            _ if error.raw_os_error() == Some(libc::ELOOP) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("data directory is not a directory: {}", path.display()),
+            ),
+            _ => error,
+        })?;
+        if file.metadata()?.permissions().mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("data directory has unsafe permissions: {}", path.display()),
+            ));
+        }
+        Ok(Self {
+            file,
+            #[cfg(test)]
+            path: path.to_owned(),
+        })
+    }
+
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+
+    pub fn validate_initialized(&self) -> io::Result<()> {
+        let nar = require_directory_at(&self.file, "nar")?;
+        require_directory_at(&nar, ".tmp")?;
+        require_directory_at(&self.file, ".tmp")?;
+        let realisations = require_directory_at(&self.file, "realisations")?;
+        require_directory_at(&realisations, ".tmp")?;
+        let auth = require_directory_at(&self.file, "auth")?;
+        for name in ["nix-cache-info", "trusted-public-keys"] {
+            require_private_file_at(&self.file, name, true)?;
+        }
+        require_private_file_at(&auth, "write.tokens", true)?;
+        let clean = require_private_file_at(&self.file, ".narjar-clean", false)?;
+        let recovery = require_private_file_at(&self.file, ".narjar-recovery", false)?;
+        if clean || recovery {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "data directory is not initialized",
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NarObjectId(String);
 
 impl NarObjectId {
@@ -415,29 +481,64 @@ pub(crate) fn file_matches(
     Ok(nix32_sha256_matches(&hasher.finalize(), expected_hash))
 }
 
-pub(crate) fn nar_file_matches(
-    file: &File,
-    encoding: NarEncoding,
-    nar_hash: &NarObjectId,
-    file_hash: &NarObjectId,
-    file_size: u64,
-    nar_size: u64,
-) -> io::Result<bool> {
-    if encoding == NarEncoding::None {
-        return Ok(file.metadata()?.len() == nar_size);
+struct VerifiedCompressedNar<'file, 'metadata> {
+    file: &'file File,
+    expectation: CompressedNarExpectation<'metadata>,
+}
+
+fn verify_encoded_compressed_file<'file, 'metadata>(
+    file: &'file File,
+    expectation: CompressedNarExpectation<'metadata>,
+) -> io::Result<Option<VerifiedCompressedNar<'file, 'metadata>>> {
+    if !file_matches(
+        file,
+        expectation.encoded_hash.as_str(),
+        expectation.encoded_size,
+    )? {
+        return Ok(None);
     }
-    if !file_matches(file, file_hash.as_str(), file_size)? {
-        return Ok(false);
-    }
-    if file.metadata()?.len() != file_size {
-        return Ok(false);
-    }
-    let validation = match encoding {
-        NarEncoding::Zstd => validate_zstd(file, Some(nar_hash), Some(file_hash), nar_size),
-        NarEncoding::Xz => validate_xz(file, Some(nar_hash), Some(file_hash), nar_size),
-        NarEncoding::None => unreachable!("raw NARs return above"),
+    Ok(Some(VerifiedCompressedNar { file, expectation }))
+}
+
+fn verify_decoded_compressed_file(verified: VerifiedCompressedNar<'_, '_>) -> io::Result<bool> {
+    let validation = match verified.expectation.encoding {
+        CompressedEncoding::Zstd => validate_zstd(
+            verified.file,
+            Some(verified.expectation.decoded_hash),
+            None,
+            verified.expectation.decoded_size,
+        ),
+        CompressedEncoding::Xz => validate_xz(
+            verified.file,
+            Some(verified.expectation.decoded_hash),
+            None,
+            verified.expectation.decoded_size,
+        ),
     };
-    Ok(validation.is_ok_and(|size| size == nar_size))
+    match validation {
+        Ok(size) => Ok(size == verified.expectation.decoded_size),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn compressed_nar_matches(
+    file: &File,
+    expectation: CompressedNarExpectation<'_>,
+) -> io::Result<bool> {
+    let Some(verified) = verify_encoded_compressed_file(file, expectation)? else {
+        return Ok(false);
+    };
+    verify_decoded_compressed_file(verified)
+}
+
+pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation<'_>) -> io::Result<bool> {
+    match expectation {
+        NarExpectation::Raw { nar_hash, nar_size } => {
+            file_matches(file, nar_hash.as_str(), nar_size)
+        }
+        NarExpectation::Compressed(expectation) => compressed_nar_matches(file, expectation),
+    }
 }
 
 pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Result<bool> {
@@ -636,12 +737,10 @@ impl Drop for StagingReservation {
 }
 
 impl Storage {
-    pub fn initialize(root: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let root_path = root.as_ref().to_owned();
+    pub fn initialize(root: &Directory) -> Result<Self, StorageError> {
         #[cfg(test)]
-        let layout = Layout::new(root_path.clone());
-        ensure_directory(&root_path, "data directory")?;
-        let root_directory = open_directory(&root_path)?;
+        let layout = Layout::new(root.path.clone());
+        let root_directory = root.file.try_clone()?;
         let root_is_empty = directory_is_empty(&root_directory)?;
         let lock = ProcessLock::acquire(open_at(
             &root_directory,
@@ -703,13 +802,13 @@ impl Storage {
         self.recovery.required()
     }
 
-    pub fn recovery_required_for(&self, trusted_keys: &Path) -> Result<bool, StorageError> {
-        self.recovery.required_for(trusted_keys)
+    pub fn recovery_required_for(&self) -> Result<bool, StorageError> {
+        self.recovery.required_for()
     }
 
     /// Records that a full inventory scan has completed successfully.
-    pub fn finish_recovery(&self, trusted_keys: &Path) -> Result<(), StorageError> {
-        self.recovery.finish(trusted_keys)
+    pub fn finish_recovery(&self) -> Result<(), StorageError> {
+        self.recovery.finish()
     }
 
     pub fn reserve_staging(
@@ -825,12 +924,18 @@ impl Storage {
         store: &StoreHash,
         narinfo: ValidatedNarInfo,
     ) -> Result<PublishOutcome, StorageError> {
-        let (nar, encoding, nar_hash, file_size, nar_size, bytes) = narinfo.into_parts();
         let nar_directory = self.nar_directory()?;
-        let nar_name = format!("{}{}", nar.as_str(), encoding.suffix());
+        let expectation = narinfo.payload_expectation();
+        let nar_name = narinfo.payload_name().to_string();
         match open_regular_at(&nar_directory, OsStr::new(&nar_name)) {
             Ok(file) => {
-                if !nar_file_matches(&file, encoding, &nar_hash, &nar, file_size, nar_size)? {
+                let matches = match expectation {
+                    NarExpectation::Raw { nar_size, .. } => nar_file_size_matches(&file, nar_size)?,
+                    NarExpectation::Compressed(expectation) => {
+                        compressed_nar_matches(&file, expectation)?
+                    }
+                };
+                if !matches {
                     return Err(StorageError::NarMismatch);
                 }
             }
@@ -839,7 +944,10 @@ impl Storage {
             }
             Err(error) => return Err(error.into()),
         }
-        self.publish(PublishTarget::NarInfo(store), Cursor::new(bytes))
+        self.publish(
+            PublishTarget::NarInfo(store),
+            Cursor::new(narinfo.into_bytes()),
+        )
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {
@@ -1353,22 +1461,6 @@ fn filesystem_space(directory: &File) -> io::Result<FilesystemSpace> {
     })
 }
 
-fn ensure_directory(path: &Path, name: &str) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && metadata.permissions().mode() & 0o022 == 0 => Ok(()),
-        Ok(metadata) if metadata.is_dir() => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} has unsafe permissions: {}", path.display()),
-        )),
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} is not a directory: {}", path.display()),
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(path),
-        Err(error) => Err(error),
-    }
-}
-
 fn ensure_directory_at(parent: &File, name: &OsStr, label: &str) -> io::Result<File> {
     match open_directory_at(parent, name) {
         Ok(directory) => validate_directory(&directory, label),
@@ -1405,7 +1497,28 @@ fn validate_directory(directory: &File, name: &str) -> io::Result<File> {
     directory.try_clone()
 }
 
-pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
+fn require_directory_at(parent: &File, name: &str) -> io::Result<File> {
+    let directory = open_directory_at(parent, OsStr::new(name))
+        .map_err(|error| io::Error::new(error.kind(), format!("{name} is unavailable: {error}")))?;
+    validate_directory(&directory, name)
+}
+
+fn require_private_file_at(parent: &File, name: &str, required: bool) -> io::Result<bool> {
+    match open_regular_at(parent, OsStr::new(name)) {
+        Ok(file) if file.metadata()?.permissions().mode() & 0o777 == 0o600 => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} must have 0600 permissions"),
+        )),
+        Err(error) if !required && error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("{name} is unavailable: {error}"),
+        )),
+    }
+}
+
+fn open_directory(path: &Path) -> io::Result<File> {
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -1433,20 +1546,6 @@ pub(crate) fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File>
         ));
     }
     Ok(directory)
-}
-
-pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    Ok(file)
 }
 
 pub(crate) fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File> {
@@ -1845,9 +1944,9 @@ mod tests {
     };
 
     use super::{
-        CapacityErrorKind, FilesystemSpace, Layout, NarObjectId, PublishBoundary, PublishOutcome,
-        PublishTarget, ReconcileClass, Storage, StorageError, StoreHash, capacity_error_kind,
-        remove_temp, sync_dir,
+        CapacityErrorKind, Directory, FilesystemSpace, Layout, NarObjectId, PublishBoundary,
+        PublishOutcome, PublishTarget, ReconcileClass, Storage, StorageError, StoreHash,
+        capacity_error_kind, remove_temp, sync_dir,
     };
     use crate::narinfo::NarEncoding;
     use lzma_rust2::{XzOptions, XzReader, XzWriter};
@@ -1856,6 +1955,10 @@ mod tests {
 
     const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
     const STORE_HASH: &str = "00000000000000000000000000000000";
+
+    fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
+        Storage::initialize(&Directory::open(path)?)
+    }
 
     #[test]
     fn nix32_sha256_matches_borrowed_hashes() {
@@ -1890,7 +1993,7 @@ mod tests {
     #[test]
     fn xz_nars_are_stored_compressed_and_validated_decompressed() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let raw = b"nar bytes";
         let mut compressed = Vec::new();
         let mut writer =
@@ -1953,9 +2056,59 @@ mod tests {
     }
 
     #[test]
+    fn compressed_matching_still_checks_both_hashes_and_sizes() {
+        let raw = b"nar bytes";
+        let mut xz = Vec::new();
+        let mut writer = XzWriter::new(&mut xz, XzOptions::with_preset(1)).unwrap();
+        writer.write_all(raw).unwrap();
+        writer.finish().unwrap();
+        let mut zstd = Vec::new();
+        compress(Cursor::new(raw), &mut zstd, CompressionLevel::Fastest);
+        let nar_hash = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(raw))).unwrap();
+        let wrong_hash = NarObjectId::parse(&"0".repeat(52)).unwrap();
+
+        for (encoding, compressed) in [(NarEncoding::Xz, xz), (NarEncoding::Zstd, zstd)] {
+            let directory = TestDir::new();
+            let path = directory.path().join("compressed-nar");
+            fs::write(&path, &compressed).unwrap();
+            let file_hash =
+                NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(&compressed))).unwrap();
+            let file_size = compressed.len() as u64;
+            let nar_size = raw.len() as u64;
+            let matches = |encoded_hash, decoded_hash, encoded_size, decoded_size| {
+                let expectation = super::CompressedNarExpectation {
+                    encoding: match encoding {
+                        NarEncoding::Xz => super::CompressedEncoding::Xz,
+                        NarEncoding::Zstd => super::CompressedEncoding::Zstd,
+                        NarEncoding::None => {
+                            unreachable!("test only supplies compressed encodings")
+                        }
+                    },
+                    encoded_hash,
+                    encoded_size,
+                    decoded_hash,
+                    decoded_size,
+                };
+                let file = fs::File::open(&path).unwrap();
+                let Some(verified) =
+                    super::verify_encoded_compressed_file(&file, expectation).unwrap()
+                else {
+                    return false;
+                };
+                super::verify_decoded_compressed_file(verified).unwrap()
+            };
+            assert!(matches(&file_hash, &nar_hash, file_size, nar_size));
+            assert!(!matches(&wrong_hash, &nar_hash, file_size, nar_size));
+            assert!(!matches(&file_hash, &wrong_hash, file_size, nar_size));
+            assert!(!matches(&file_hash, &nar_hash, file_size + 1, nar_size));
+            assert!(!matches(&file_hash, &nar_hash, file_size, nar_size + 1));
+        }
+    }
+
+    #[test]
     fn zstd_nars_are_stored_compressed_and_validated_decompressed() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let raw = b"nar bytes";
         let mut compressed = Vec::new();
         compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
@@ -1982,7 +2135,7 @@ mod tests {
     #[test]
     fn zstd_validation_rejects_bytes_after_the_frame() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let raw = b"nar bytes";
         let mut compressed = Vec::new();
         compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
@@ -2007,7 +2160,7 @@ mod tests {
     #[test]
     fn xz_validation_rejects_bytes_after_the_stream() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let raw = b"nar bytes";
         let mut compressed = Vec::new();
         let mut writer =
@@ -2049,7 +2202,7 @@ mod tests {
             let nar = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(&compressed)))
                 .expect("compressed hash is a valid NAR object id");
             let directory = TestDir::new();
-            let storage = Storage::initialize(directory.path()).expect("initialize storage");
+            let storage = initialize_storage(directory.path()).expect("initialize storage");
 
             let result = storage.publish_nar(
                 &nar,
@@ -2134,7 +2287,7 @@ mod tests {
     #[test]
     fn initialization_creates_only_the_fixed_layout() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
 
         assert!(directory.path().join("nar").is_dir());
         assert!(directory.path().join("nar/.tmp").is_dir());
@@ -2152,7 +2305,7 @@ mod tests {
         fs::create_dir(&target).expect("create symlink target");
         symlink(&target, &link).expect("create data directory symlink");
 
-        let error = Storage::initialize(&link).expect_err("symlinked data must be rejected");
+        let error = initialize_storage(&link).expect_err("symlinked data must be rejected");
         assert!(error.to_string().contains("data directory"));
         assert!(!target.join("nar").exists());
         assert!(!target.join(".tmp").exists());
@@ -2162,7 +2315,7 @@ mod tests {
     #[test]
     fn initialization_rejects_a_symlinked_lock() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         drop(storage);
 
         let target = directory.path().join("lock-target");
@@ -2171,7 +2324,7 @@ mod tests {
         fs::remove_file(&lock).expect("remove original lock");
         symlink(&target, &lock).expect("create lock symlink");
 
-        let error = Storage::initialize(directory.path()).expect_err("symlinked lock must fail");
+        let error = initialize_storage(directory.path()).expect_err("symlinked lock must fail");
         assert!(error.to_string().contains("lock"));
     }
 
@@ -2183,7 +2336,7 @@ mod tests {
         fs::set_permissions(&nar, fs::Permissions::from_mode(0o777))
             .expect("make NAR directory writable");
 
-        let error = Storage::initialize(directory.path())
+        let error = initialize_storage(directory.path())
             .expect_err("writable storage directory must be rejected");
         assert!(error.to_string().contains("nar directory"));
     }
@@ -2191,7 +2344,7 @@ mod tests {
     #[test]
     fn temporary_publication_files_are_private() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let temporary = storage
             .create_temp(&PublishTarget::CacheInfo)
             .expect("create temporary publication file");
@@ -2213,7 +2366,7 @@ mod tests {
     #[test]
     fn nar_publication_uses_a_destination_local_temporary_directory() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
 
         let temporary = storage
@@ -2248,7 +2401,7 @@ mod tests {
     #[test]
     fn publication_rejects_a_symlinked_temporary_directory() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let temporary = storage.layout.nar_temp_dir();
         let real_temporary = directory.path().join("nar-tmp-real");
         let target = directory.path().join("external");
@@ -2274,7 +2427,7 @@ mod tests {
     #[test]
     fn publication_rejects_a_symlinked_destination_directory() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
         let nar_dir = storage.layout.nar_dir();
         let real_nar_dir = directory.path().join("nar-real");
@@ -2299,7 +2452,7 @@ mod tests {
     #[test]
     fn reconciliation_rejects_a_symlinked_nar_directory() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let storage = initialize_storage(directory.path()).expect("storage should initialize");
         let nar_dir = storage.layout.nar_dir();
         let real_nar_dir = directory.path().join("nar-real");
         let external = directory.path().join("external");
@@ -2325,7 +2478,7 @@ mod tests {
     #[test]
     fn delete_rejects_a_symlinked_narinfo() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let storage = initialize_storage(directory.path()).expect("storage should initialize");
         let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
         let target = directory.path().join("external-narinfo");
         let link = directory.path().join(format!("{STORE_HASH}.narinfo"));
@@ -2343,7 +2496,7 @@ mod tests {
     #[test]
     fn recovery_marker_distinguishes_clean_and_interrupted_publication() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
 
         assert!(
@@ -2370,7 +2523,7 @@ mod tests {
     #[test]
     fn recovery_cleans_incomplete_publication_transactions() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let trusted_keys = directory.path().join("trusted-public-keys");
         let temporary = directory.path().join(".tmp/cache-info-recovery.part");
         let nar_temporary = directory.path().join("nar/.tmp/nar-recovery.part");
@@ -2389,7 +2542,7 @@ mod tests {
 
         assert!(storage.recovery_required().expect("inspect recovery state"));
         storage
-            .finish_recovery(&trusted_keys)
+            .finish_recovery()
             .expect("finish interrupted publication recovery");
 
         assert!(!temporary.exists());
@@ -2414,7 +2567,7 @@ mod tests {
             (PublishBoundary::BeforeParentSync, "linked"),
         ] {
             let directory = TestDir::new();
-            let storage = Storage::initialize(directory.path()).expect("initialize storage");
+            let storage = initialize_storage(directory.path()).expect("initialize storage");
             let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
 
             assert!(
@@ -2445,7 +2598,7 @@ mod tests {
     #[test]
     fn malformed_publication_transaction_blocks_recovery() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let trusted_keys = directory.path().join("trusted-public-keys");
         let record = directory
             .path()
@@ -2456,14 +2609,14 @@ mod tests {
             .expect("make malformed record private");
 
         assert!(storage.recovery_required().expect("inspect recovery state"));
-        assert!(storage.finish_recovery(&trusted_keys).is_err());
+        assert!(storage.finish_recovery().is_err());
         assert!(record.exists(), "failed recovery must retain its evidence");
     }
 
     #[test]
     fn unknown_publication_transaction_state_blocks_recovery() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let trusted_keys = directory.path().join("trusted-public-keys");
         let temporary = directory.path().join(".tmp/unknown-state.part");
         let record = directory
@@ -2476,7 +2629,7 @@ mod tests {
         fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
             .expect("make unknown-state record private");
 
-        assert!(storage.finish_recovery(&trusted_keys).is_err());
+        assert!(storage.finish_recovery().is_err());
         assert!(record.exists(), "unknown state must retain its evidence");
         assert!(
             temporary.exists(),
@@ -2487,7 +2640,7 @@ mod tests {
     #[test]
     fn publication_is_immutable_idempotent_and_pair_gated() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
         let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
 
@@ -2556,7 +2709,7 @@ mod tests {
     #[test]
     fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
         let directory = TestDir::new();
-        let storage = Arc::new(Storage::initialize(directory.path()).expect("initialize storage"));
+        let storage = Arc::new(initialize_storage(directory.path()).expect("initialize storage"));
         let (linked_tx, linked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
 
@@ -2622,7 +2775,7 @@ mod tests {
             PublishBoundary::BeforeParentSync,
         ] {
             let directory = TestDir::new();
-            let storage = Storage::initialize(directory.path()).expect("initialize storage");
+            let storage = initialize_storage(directory.path()).expect("initialize storage");
             let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
 
             assert!(
@@ -2650,7 +2803,7 @@ mod tests {
                 "{boundary:?} lost its durable recovery record"
             );
             storage
-                .finish_recovery(&directory.path().join("trusted-public-keys"))
+                .finish_recovery()
                 .expect("recover failed publication");
             assert_eq!(
                 fs::read_dir(directory.path().join(".narjar-transactions"))
@@ -2665,7 +2818,7 @@ mod tests {
     #[test]
     fn response_loss_after_parent_sync_is_visible_and_idempotent() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
         let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
 
@@ -2721,7 +2874,7 @@ mod tests {
     fn stream_resource_failures_leave_no_false_publication_state() {
         for raw_error in [libc::EIO, libc::ENOSPC] {
             let directory = TestDir::new();
-            let storage = Storage::initialize(directory.path()).expect("initialize storage");
+            let storage = initialize_storage(directory.path()).expect("initialize storage");
             let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
 
             let error = storage
@@ -2854,7 +3007,7 @@ mod tests {
     #[test]
     fn independent_publications_do_not_wait_for_another_body() {
         let directory = TestDir::new();
-        let storage = Arc::new(Storage::initialize(directory.path()).expect("initialize storage"));
+        let storage = Arc::new(initialize_storage(directory.path()).expect("initialize storage"));
         let first = NarObjectId::parse(NAR_ID).expect("valid first NAR object id");
         let second = NarObjectId::parse(&"1".repeat(52)).expect("valid second NAR object id");
         let (started_tx, started_rx) = mpsc::channel();
@@ -2913,26 +3066,26 @@ mod tests {
     #[test]
     fn process_lock_is_exclusive_and_released_on_drop() {
         let directory = TestDir::new();
-        let first = Storage::initialize(directory.path()).expect("acquire first process lock");
+        let first = initialize_storage(directory.path()).expect("acquire first process lock");
 
         assert!(directory.path().join("lock").is_file());
         assert!(matches!(
-            Storage::initialize(directory.path()),
+            initialize_storage(directory.path()),
             Err(StorageError::Locked)
         ));
 
         drop(first);
-        Storage::initialize(directory.path()).expect("reacquire released process lock");
+        initialize_storage(directory.path()).expect("reacquire released process lock");
     }
 
     #[test]
     fn process_lock_release_does_not_depend_on_storage_directory_handles() {
         let directory = TestDir::new();
-        let first = Storage::initialize(directory.path()).expect("acquire first process lock");
+        let first = initialize_storage(directory.path()).expect("acquire first process lock");
         let lingering_directory_handle = first.root.try_clone().expect("clone directory handle");
 
         drop(first);
-        Storage::initialize(directory.path())
+        initialize_storage(directory.path())
             .expect("reacquire without waiting for directory handles");
 
         drop(lingering_directory_handle);
@@ -2941,24 +3094,24 @@ mod tests {
     #[test]
     fn process_lock_survives_lockfile_replacement() {
         let directory = TestDir::new();
-        let first = Storage::initialize(directory.path()).expect("acquire first process lock");
+        let first = initialize_storage(directory.path()).expect("acquire first process lock");
         let lock = directory.path().join("lock");
         fs::remove_file(&lock).expect("remove lock pathname");
         fs::write(&lock, b"replacement").expect("replace lock pathname");
 
         assert!(matches!(
-            Storage::initialize(directory.path()),
+            initialize_storage(directory.path()),
             Err(StorageError::Locked)
         ));
 
         drop(first);
-        Storage::initialize(directory.path()).expect("reacquire after lease release");
+        initialize_storage(directory.path()).expect("reacquire after lease release");
     }
 
     #[test]
     fn process_lock_replacement_blocks_a_child_process() {
         let directory = TestDir::new();
-        let first = Storage::initialize(directory.path()).expect("acquire first process lock");
+        let first = initialize_storage(directory.path()).expect("acquire first process lock");
         let lock = directory.path().join("lock");
         fs::remove_file(&lock).expect("remove lock pathname");
         fs::write(&lock, b"replacement").expect("replace lock pathname");
@@ -2975,7 +3128,7 @@ mod tests {
         assert!(status.success(), "child process should observe the lease");
 
         drop(first);
-        Storage::initialize(directory.path()).expect("reacquire after lease release");
+        initialize_storage(directory.path()).expect("reacquire after lease release");
     }
 
     #[test]
@@ -2984,7 +3137,7 @@ mod tests {
             return;
         };
         assert!(matches!(
-            Storage::initialize(Path::new(&path)),
+            initialize_storage(Path::new(&path)),
             Err(StorageError::Locked)
         ));
     }
@@ -2992,7 +3145,7 @@ mod tests {
     #[test]
     fn reconciliation_is_deterministic_bounded_and_reports_manual_changes() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         fs::write(directory.path().join("manual"), b"manual").expect("write manual file");
         fs::write(directory.path().join("nar/not-valid.nar"), b"bad").expect("write malformed NAR");
         fs::write(directory.path().join(".tmp/nar-manual.part"), b"temp")
@@ -3032,7 +3185,7 @@ mod tests {
     #[test]
     fn cleanup_removes_only_reported_stale_temps() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let stale_path = directory.path().join(".tmp/nar-stale.part");
         fs::write(&stale_path, b"temp").expect("write stale temp");
 
@@ -3078,7 +3231,7 @@ mod tests {
     #[test]
     fn cleanup_does_not_remove_a_replaced_stale_temp() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let path = directory.path().join(".tmp/nar-replaced.part");
         fs::write(&path, b"original").expect("write stale temp");
 
@@ -3107,7 +3260,7 @@ mod tests {
     #[test]
     fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
         let directory = TestDir::new();
-        let storage = Storage::initialize(directory.path()).expect("initialize storage");
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
         let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
         let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
         storage

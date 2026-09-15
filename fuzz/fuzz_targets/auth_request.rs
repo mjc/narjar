@@ -7,6 +7,7 @@ use std::thread;
 use libfuzzer_sys::fuzz_target;
 use narjar::auth::{Authorizer, Permission};
 use narjar::http_server::Request;
+use narjar::storage::Directory;
 use tempfile::tempdir;
 
 fn exercise(input: &[u8]) {
@@ -14,7 +15,8 @@ fn exercise(input: &[u8]) {
     let auth = directory.path().join("auth");
     std::fs::create_dir(&auth).expect("auth directory");
     std::fs::write(auth.join("write.tokens"), input).expect("write fuzz token file");
-    let Ok(authorizer) = Authorizer::load(directory.path()) else {
+    let root = Directory::open(directory.path()).expect("open auth directory");
+    let Ok(authorizer) = Authorizer::load(&root) else {
         return;
     };
 

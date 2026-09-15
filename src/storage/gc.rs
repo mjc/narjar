@@ -10,7 +10,8 @@ use std::{
 use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
     storage::{
-        NarObjectId, Storage, StorageError, StoreHash, open_regular_at, read_dir_names, unlink_at,
+        Directory, NarObjectId, Storage, StorageError, StoreHash, open_regular_at, read_dir_names,
+        unlink_at,
     },
 };
 
@@ -88,10 +89,9 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         return Err(invalid("--target-bytes cannot exceed --max-bytes"));
     }
 
-    let storage = Storage::initialize(&options.data_dir)?;
-    let trusted_keys_path = options.data_dir.join("trusted-public-keys");
-    let trusted =
-        TrustedPublicKeys::load(&trusted_keys_path).map_err(|error| invalid(error.to_string()))?;
+    let root = Directory::open(&options.data_dir)?;
+    let storage = Storage::initialize(&root)?;
+    let trusted = TrustedPublicKeys::load(&root).map_err(|error| invalid(error.to_string()))?;
     let mut entries = scan(&storage, &trusted)?;
     let protection = protect(&mut entries, options.protected_roots.as_deref())?;
     let orphans = scan_orphans(&storage, &entries)?;
@@ -139,7 +139,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         let remaining_entries = scan(&storage, &trusted)?;
         let remaining_orphans = scan_orphans(&storage, &remaining_entries)?;
         after_bytes = total_bytes(&remaining_entries) + orphan_bytes(&remaining_orphans);
-        storage.recovery.finish(&trusted_keys_path)?;
+        storage.recovery.finish()?;
         deleted
     };
     let evicted_bytes = before_bytes.saturating_sub(after_bytes);
@@ -675,7 +675,7 @@ fn invalid(message: impl Into<String>) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::open_directory;
+    use crate::storage::Directory;
     use std::{
         fs,
         os::unix::fs::symlink,
@@ -693,6 +693,10 @@ mod tests {
     struct Policy {
         target_bytes: u64,
         min_age: Duration,
+    }
+
+    fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
+        Storage::initialize(&Directory::open(path)?)
     }
 
     fn select_candidates(
@@ -779,7 +783,9 @@ mod tests {
 
         assert_eq!(
             temporary_inventory_directory(
-                &open_directory(&temporary).expect("open temporary directory"),
+                Directory::open(&temporary)
+                    .expect("open temporary directory")
+                    .file(),
             )
             .expect("scan temporary directory"),
             (0, 0)
@@ -795,13 +801,13 @@ mod tests {
         fs::write(target.join("escaped"), vec![0; 17]).expect("external file should be written");
         symlink(&target, &temporary).expect("temporary directory symlink should be created");
 
-        assert!(open_directory(&temporary).is_err());
+        assert!(Directory::open(&temporary).is_err());
     }
 
     #[test]
     fn orphan_scan_rejects_a_symlinked_nar_directory() {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
-        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let storage = initialize_storage(directory.path()).expect("storage should initialize");
         let nar_dir = storage.layout.nar_dir();
         let real_nar_dir = directory.path().join("nar-real");
         let external = directory.path().join("external");
@@ -822,7 +828,7 @@ mod tests {
 
     fn pair_fixture() -> (tempfile::TempDir, Storage, Entry) {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
-        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let storage = initialize_storage(directory.path()).expect("storage should initialize");
         let store = StoreHash::parse(TEST_STORE_HASH).expect("store hash should parse");
         let nar = NarObjectId::parse(TEST_NAR_ID).expect("NAR id should parse");
         let narinfo_name = OsString::from(format!("{TEST_STORE_HASH}.narinfo"));
@@ -890,7 +896,7 @@ mod tests {
                     .expect("recovery state should be readable")
             );
             drop(storage);
-            let reopened = Storage::initialize(directory.path()).expect("storage should reopen");
+            let reopened = initialize_storage(directory.path()).expect("storage should reopen");
             assert!(
                 reopened
                     .recovery_required()
@@ -902,7 +908,7 @@ mod tests {
     #[test]
     fn orphan_cleanup_failure_preserves_orphan() {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
-        let storage = Storage::initialize(directory.path()).expect("storage should initialize");
+        let storage = initialize_storage(directory.path()).expect("storage should initialize");
         let nar = NarObjectId::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl")
             .expect("NAR id should parse");
         let path = storage.layout.nar_path(&nar);

@@ -3056,6 +3056,301 @@ fn init_and_key_generate_create_secure_operator_material() {
 }
 
 #[test]
+fn inventory_scan_recognizes_formats_and_keeps_trusted_references() {
+    use narjar::{
+        inventory::{Inventory, InventoryClass as Class, VerificationMode as Mode},
+        narinfo::TrustedPublicKeys,
+        storage::Directory,
+    };
+    let mut xz = Vec::new();
+    let mut writer = XzWriter::new(&mut xz, XzOptions::with_preset(1)).unwrap();
+    writer.write_all(NAR_BYTES).unwrap();
+    writer.finish().unwrap();
+    let mut zstd = Vec::new();
+    compress(
+        std::io::Cursor::new(NAR_BYTES),
+        &mut zstd,
+        CompressionLevel::Fastest,
+    );
+
+    for (suffix, bytes) in [
+        (".nar", NAR_BYTES.to_vec()),
+        (".nar.xz", xz),
+        (".nar.zst", zstd),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path();
+        fs::create_dir(root.join("nar")).unwrap();
+        let key_path = root.join("trusted-public-keys");
+        fs::write(
+            &key_path,
+            format!(
+                "narjar-test:{}\n",
+                BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+            ),
+        )
+        .unwrap();
+        let root_directory = Directory::open(root).unwrap();
+        let trusted = TrustedPublicKeys::load(&root_directory).unwrap();
+        let hash = nix32_sha256(&bytes);
+        let metadata = match suffix {
+            ".nar" => signed_narinfo(&hash, NAR_BYTES.len() as u64),
+            ".nar.xz" => signed_xz_narinfo(
+                &hash,
+                NARJAR_HASH,
+                NAR_BYTES.len() as u64,
+                bytes.len() as u64,
+            ),
+            ".nar.zst" => signed_zstd_narinfo(
+                &hash,
+                NARJAR_HASH,
+                NAR_BYTES.len() as u64,
+                bytes.len() as u64,
+            ),
+            _ => unreachable!(),
+        };
+        let payload = root.join(format!("nar/{hash}{suffix}"));
+        let narinfo = root.join(format!("{STORE_HASH}.narinfo"));
+        fs::write(&payload, &bytes).unwrap();
+        fs::write(&narinfo, &metadata).unwrap();
+        let scan = |mode| {
+            Inventory::scan(&root_directory, &trusted, mode)
+                .unwrap()
+                .entries()
+                .iter()
+                .map(|entry| (entry.class(), entry.identifier().to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let assert_metadata_trusted = |expected| {
+            assert_eq!(
+                Inventory::can_serve_streaming(&root_directory, &trusted).unwrap(),
+                expected
+            );
+        };
+        assert_metadata_trusted(true);
+        assert_eq!(
+            scan(Mode::Content),
+            [(Class::ValidPair, STORE_HASH.into())],
+            "{suffix}"
+        );
+
+        fs::write(&payload, vec![0; bytes.len()]).unwrap();
+        assert_metadata_trusted(true);
+        assert_eq!(
+            scan(Mode::Availability),
+            [(Class::ValidPair, STORE_HASH.into())]
+        );
+        assert_eq!(
+            scan(Mode::Content),
+            [(Class::HashOrSizeMismatch, STORE_HASH.into())]
+        );
+        fs::write(&payload, b"x").unwrap();
+        assert_eq!(
+            scan(Mode::Availability),
+            [(Class::HashOrSizeMismatch, STORE_HASH.into())]
+        );
+        fs::remove_file(&payload).unwrap();
+        assert_metadata_trusted(true);
+        assert_eq!(
+            scan(Mode::Content),
+            [(Class::MissingNar, STORE_HASH.into())]
+        );
+
+        // References remain object-ID based even when the requested encoding is absent.
+        let alternate_suffix = if suffix == ".nar" { ".nar.xz" } else { ".nar" };
+        let alternate = root.join(format!("nar/{hash}{alternate_suffix}"));
+        fs::write(&alternate, &bytes).unwrap();
+        assert_eq!(
+            scan(Mode::Content),
+            [(Class::MissingNar, STORE_HASH.into())]
+        );
+        fs::remove_file(alternate).unwrap();
+
+        fs::write(&payload, &bytes).unwrap();
+        fs::write(
+            &narinfo,
+            metadata.replace("Sig: narjar-test:", "Sig: unknown:"),
+        )
+        .unwrap();
+        assert_metadata_trusted(false);
+        assert_eq!(
+            scan(Mode::Content),
+            [
+                (Class::OrphanNar, hash.clone()),
+                (Class::UntrustedSignature, STORE_HASH.into()),
+            ]
+        );
+        fs::write(&narinfo, b"malformed\n").unwrap();
+        assert_metadata_trusted(false);
+        assert_eq!(
+            scan(Mode::Content),
+            [
+                (Class::OrphanNar, hash.clone()),
+                (Class::MalformedNarInfo, STORE_HASH.into()),
+            ]
+        );
+        fs::remove_file(&narinfo).unwrap();
+        assert_metadata_trusted(true);
+        assert_eq!(scan(Mode::Content), [(Class::OrphanNar, hash)]);
+    }
+}
+
+#[test]
+fn metadata_readiness_ignores_unrelated_names_without_opening_payload_directory() {
+    use narjar::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
+    let directory = TempDir::new().unwrap();
+    let root = directory.path();
+    let trusted = TrustedPublicKeys::default();
+    fs::write(root.join("unrelated"), b"ignored").unwrap();
+    fs::write(root.join("bad.narinfo"), b"ignored").unwrap();
+    // Readiness neither requires nor opens a payload directory.
+    fs::write(root.join("nar"), b"not a directory").unwrap();
+    let root_directory = Directory::open(root).unwrap();
+    assert!(Inventory::can_serve_streaming(&root_directory, &trusted).unwrap());
+
+    let metadata = root.join(format!("{STORE_HASH}.narinfo"));
+    fs::create_dir(&metadata).unwrap();
+    assert!(!Inventory::can_serve_streaming(&root_directory, &trusted).unwrap());
+    fs::remove_dir(&metadata).unwrap();
+    symlink(root.join("unrelated"), &metadata).unwrap();
+    assert!(!Inventory::can_serve_streaming(&root_directory, &trusted).unwrap());
+}
+
+#[test]
+fn inventory_and_trust_keep_using_the_directory_opened_by_run() {
+    use narjar::{
+        inventory::{Inventory, InventoryClass, VerificationMode},
+        narinfo::TrustedPublicKeys,
+        storage::Directory,
+    };
+    let directory = TempDir::new().unwrap();
+    let root = directory.path().join("cache");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join("nar")).unwrap();
+    fs::write(
+        root.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .unwrap();
+    fs::write(root.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES).unwrap();
+    fs::write(
+        root.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .unwrap();
+
+    let opened_root = Directory::open(&root).unwrap();
+    fs::rename(&root, directory.path().join("moved-cache")).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join("nar")).unwrap();
+    fs::write(root.join("trusted-public-keys"), []).unwrap();
+
+    let trusted = TrustedPublicKeys::load(&opened_root).unwrap();
+    let inventory = Inventory::scan(&opened_root, &trusted, VerificationMode::Content).unwrap();
+    assert_eq!(inventory.entries().len(), 1);
+    assert_eq!(inventory.entries()[0].class(), InventoryClass::ValidPair);
+}
+
+#[test]
+fn inventory_scan_classifies_names_and_files_before_inspection() {
+    use narjar::{
+        inventory::{Inventory, InventoryClass as Class, VerificationMode},
+        narinfo::TrustedPublicKeys,
+        storage::Directory,
+    };
+    let directory = TempDir::new().unwrap();
+    let root = directory.path();
+    fs::create_dir(root.join("nar")).unwrap();
+    fs::write(root.join("unrelated"), b"ignored").unwrap();
+    fs::write(root.join("bad.narinfo"), b"invalid name").unwrap();
+    fs::create_dir(root.join(format!("{STORE_HASH}.narinfo"))).unwrap();
+    let symlink_store = "1".repeat(32);
+    symlink(
+        root.join("unrelated"),
+        root.join(format!("{symlink_store}.narinfo")),
+    )
+    .unwrap();
+    let malformed_store = "2".repeat(32);
+    fs::write(
+        root.join(format!("{malformed_store}.narinfo")),
+        b"malformed",
+    )
+    .unwrap();
+    fs::write(root.join("nar/bad.nar"), []).unwrap();
+    let unreadable_orphan = root.join(format!("nar/{NARJAR_HASH}.nar.xz"));
+    fs::write(&unreadable_orphan, b"discovery does not read contents").unwrap();
+    fs::set_permissions(&unreadable_orphan, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::write(root.join(format!("nar/{NAR_ID}.unknown")), []).unwrap();
+    fs::create_dir(root.join(format!("nar/{NAR_ID}.nar"))).unwrap();
+    symlink(
+        root.join("unrelated"),
+        root.join(format!("nar/{NAR_ID}.nar.zst")),
+    )
+    .unwrap();
+    let inventory = Inventory::scan(
+        &Directory::open(root).unwrap(),
+        &TrustedPublicKeys::default(),
+        VerificationMode::Content,
+    )
+    .unwrap();
+    let actual = inventory
+        .entries()
+        .iter()
+        .map(|entry| (entry.class(), entry.identifier().to_owned()))
+        .collect::<Vec<_>>();
+    let mut expected = vec![
+        (Class::OrphanNar, NARJAR_HASH.into()),
+        (Class::MalformedNarInfo, STORE_HASH.into()),
+        (Class::MalformedNarInfo, symlink_store),
+        (Class::MalformedNarInfo, malformed_store),
+        (Class::InvalidFilename, "bad.narinfo".into()),
+        (Class::InvalidFilename, "bad.nar".into()),
+        (Class::InvalidFilename, format!("{NAR_ID}.unknown")),
+        (Class::InvalidFilename, format!("{NAR_ID}.nar")),
+        (Class::InvalidFilename, format!("{NAR_ID}.nar.zst")),
+    ];
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn inventory_scan_propagates_payload_open_errors() {
+    use narjar::{
+        inventory::{Inventory, VerificationMode},
+        narinfo::TrustedPublicKeys,
+        storage::Directory,
+    };
+    let directory = TempDir::new().unwrap();
+    let root = directory.path();
+    fs::create_dir(root.join("nar")).unwrap();
+    let key_path = root.join("trusted-public-keys");
+    fs::write(
+        &key_path,
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .unwrap();
+    let root_directory = Directory::open(root).unwrap();
+    let trusted = TrustedPublicKeys::load(&root_directory).unwrap();
+    fs::write(
+        root.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .unwrap();
+    let payload = root.join(format!("nar/{NARJAR_HASH}.nar"));
+    symlink(&payload, &payload).unwrap();
+    for mode in [VerificationMode::Availability, VerificationMode::Content] {
+        let error = Inventory::scan(&root_directory, &trusted, mode).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+    }
+}
+
+#[test]
 fn reconcile_and_verify_classify_operator_findings() {
     let data_dir = init_data_dir("operator-verify");
     fs::write(

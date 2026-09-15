@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::{ffi::OsStr, fs::File, io};
 
 use crate::{
     http_server::Request,
+    storage::{Directory, open_directory_at, open_regular_at},
     token_file::{Error as TokenFileError, TokenFile},
 };
 use data_encoding::BASE64;
@@ -20,8 +21,12 @@ pub enum Permission {
 struct TokenHashes(TokenFile);
 
 impl TokenHashes {
-    fn load(path: &Path) -> Result<Option<Self>, TokenFileError> {
-        Ok(TokenFile::load(path)?.map(Self))
+    fn load(directory: &File, name: &str) -> Result<Option<Self>, TokenFileError> {
+        match open_regular_at(directory, OsStr::new(name)) {
+            Ok(file) => TokenFile::read(file).map(Self).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn matches(&self, actual: &[u8; TOKEN_BYTES]) -> Choice {
@@ -40,8 +45,8 @@ enum ReadPolicy {
 }
 
 impl ReadPolicy {
-    fn load(path: &Path) -> Result<Self, TokenFileError> {
-        Ok(match TokenHashes::load(path)? {
+    fn load(directory: &File) -> Result<Self, TokenFileError> {
+        Ok(match TokenHashes::load(directory, "read.tokens")? {
             Some(tokens) => Self::Private(tokens),
             None => Self::Public,
         })
@@ -66,11 +71,11 @@ pub struct Authorizer {
 }
 
 impl Authorizer {
-    pub fn load(root: &Path) -> Result<Self, TokenFileError> {
-        let auth = root.join("auth");
+    pub fn load(root: &Directory) -> Result<Self, TokenFileError> {
+        let auth = open_directory_at(root.file(), OsStr::new("auth"))?;
         Ok(Self {
-            read: ReadPolicy::load(&auth.join("read.tokens"))?,
-            write: TokenHashes::load(&auth.join("write.tokens"))?.unwrap_or_default(),
+            read: ReadPolicy::load(&auth)?,
+            write: TokenHashes::load(&auth, "write.tokens")?.unwrap_or_default(),
         })
     }
 
@@ -152,7 +157,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
             .expect("set insecure test permissions");
 
-        let result = Authorizer::load(&root);
+        let result = Authorizer::load(&Directory::open(&root).expect("open test root"));
         fs::remove_dir_all(root).expect("remove test data directory");
 
         assert!(result.is_err(), "insecure token file should be rejected");

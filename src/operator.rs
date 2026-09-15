@@ -17,10 +17,10 @@ use clap::{Args, Subcommand};
 use data_encoding::BASE64;
 use ed25519_dalek::SigningKey;
 use narjar::{
-    inventory::{Inventory, InventoryClass, MAX_NARINFO_BYTES, narinfo_is_valid},
-    narinfo::TrustedPublicKeys,
+    inventory::{Inventory, InventoryClass, VerificationMode},
+    narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
-        ReconcileClass, Storage, StoreHash,
+        Directory, ReconcileClass, Storage, StoreHash,
         gc::{self, GcOptions},
     },
 };
@@ -53,7 +53,8 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
 
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(runtime)?;
     create_recovery_marker(&root)?;
-    let storage = Storage::initialize(&root).map_err(runtime)?;
+    let directory = Directory::open(&root).map_err(runtime)?;
+    let storage = Storage::initialize(&directory).map_err(runtime)?;
     for directory in ["nar", ".tmp", "realisations"] {
         ensure_directory(&root.join(directory), 0o700)?;
     }
@@ -69,9 +70,7 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
     if private_read || path_exists(&root.join("auth/read.tokens"))? {
         create_file(&root.join("auth/read.tokens"), b"", 0o600, true)?;
     }
-    storage
-        .finish_recovery(&root.join("trusted-public-keys"))
-        .map_err(runtime)?;
+    storage.finish_recovery().map_err(runtime)?;
     drop(storage);
     Ok(())
 }
@@ -355,7 +354,10 @@ enum ReportMode {
 
 impl ReportMode {
     const fn scans_content(self) -> bool {
-        matches!(self, Self::Verify)
+        match self {
+            Self::Verify => true,
+            Self::Reconcile | Self::Orphans => false,
+        }
     }
 
     const fn only_orphans(self) -> bool {
@@ -364,9 +366,16 @@ impl ReportMode {
 }
 
 fn report(root: PathBuf, mode: ReportMode, verify_hashes: bool, json: bool) -> Result<(), Error> {
-    let trusted = TrustedPublicKeys::load(&root.join("trusted-public-keys")).map_err(runtime)?;
-    let inventory =
-        Inventory::scan(&root, &trusted, mode.scans_content() || verify_hashes).map_err(runtime)?;
+    let root = Directory::open(&root).map_err(runtime)?;
+    let trusted = TrustedPublicKeys::load(&root).map_err(runtime)?;
+    let verification = match mode {
+        ReportMode::Verify => VerificationMode::Content,
+        ReportMode::Reconcile | ReportMode::Orphans => match verify_hashes {
+            true => VerificationMode::Content,
+            false => VerificationMode::Availability,
+        },
+    };
+    let inventory = Inventory::scan(&root, &trusted, verification).map_err(runtime)?;
 
     for finding in inventory
         .entries()
@@ -422,6 +431,7 @@ fn structural_scan(
     let stale_before = SystemTime::now()
         .checked_sub(Duration::from_secs(min_age_seconds))
         .ok_or_else(|| Error::usage("minimum age is out of range"))?;
+    let root = Directory::open(&root).map_err(runtime)?;
     let storage = Storage::initialize(&root).map_err(runtime)?;
     let report = storage.reconcile(limit, stale_before).map_err(runtime)?;
 
@@ -585,8 +595,9 @@ pub(crate) fn delete(options: Delete) -> Result<(), Error> {
         json,
     } = options;
     let store = StoreHash::parse(&route).map_err(|_| Error::usage("--store-hash is invalid"))?;
+    let root = Directory::open(&root).map_err(runtime)?;
     let storage = Storage::initialize(&root).map_err(runtime)?;
-    let trusted = TrustedPublicKeys::load(&root.join("trusted-public-keys")).map_err(runtime)?;
+    let trusted = TrustedPublicKeys::load(&root).map_err(runtime)?;
     let file = storage
         .open_narinfo(&store)
         .map_err(runtime)?
@@ -595,7 +606,7 @@ pub(crate) fn delete(options: Delete) -> Result<(), Error> {
     file.take(MAX_NARINFO_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(runtime)?;
-    if !narinfo_is_valid(&trusted, &store, bytes) {
+    if trusted.validate(&store, bytes).is_err() {
         return Err(Error::runtime("narinfo is malformed or untrusted"));
     }
     storage.delete_narinfo(&store).map_err(runtime)?;

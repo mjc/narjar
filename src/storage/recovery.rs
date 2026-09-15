@@ -133,18 +133,18 @@ impl RecoveryState {
             || !self.transaction_names()?.is_empty())
     }
 
-    pub(super) fn required_for(&self, trusted_keys: &Path) -> Result<bool, StorageError> {
+    pub(super) fn required_for(&self) -> Result<bool, StorageError> {
         if self.required()? {
             return Ok(true);
         }
 
-        let digest = trusted_keys_digest(trusted_keys)?;
+        let digest = trusted_keys_digest(&self.root)?;
         Ok(self.clean_marker()? != digest.as_slice())
     }
 
-    pub(super) fn finish(&self, trusted_keys: &Path) -> Result<(), StorageError> {
+    pub(super) fn finish(&self) -> Result<(), StorageError> {
         self.clear_transactions()?;
-        self.write_clean_marker(trusted_keys_digest(trusted_keys)?.as_slice())?;
+        self.write_clean_marker(trusted_keys_digest(&self.root)?.as_slice())?;
         self.clear_recovery_marker()
     }
 
@@ -436,10 +436,13 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
     })
 }
 
-fn trusted_keys_digest(path: &Path) -> Result<[u8; 32], StorageError> {
-    let contents = match fs::read(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+fn trusted_keys_digest(root: &File) -> Result<[u8; 32], StorageError> {
+    let mut contents = Vec::new();
+    match open_regular_at(root, OsStr::new("trusted-public-keys")) {
+        Ok(mut file) => {
+            file.read_to_end(&mut contents)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     };
     Ok(Sha256::digest(contents).into())

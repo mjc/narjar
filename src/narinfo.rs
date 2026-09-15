@@ -1,18 +1,15 @@
 use std::{
     collections::BTreeMap,
+    ffi::OsStr,
     fmt,
     io::{self, Read},
     os::unix::fs::MetadataExt,
-    path::Path,
 };
 
 use data_encoding::BASE64;
 use ed25519_dalek::{Signature, VerifyingKey};
 
-use crate::storage::{
-    NarObjectId, StoreHash, entry_is_regular_at, open_directory, open_regular, open_regular_at,
-    read_dir_names,
-};
+use crate::storage::{Directory, NarObjectId, StoreHash, inspection::NarFileName, open_regular_at};
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
@@ -52,8 +49,8 @@ pub(crate) fn read_narinfo_file(file: impl Read) -> io::Result<Vec<u8>> {
 pub struct TrustedPublicKeys(BTreeMap<String, VerifyingKey>);
 
 impl TrustedPublicKeys {
-    pub fn load(path: &Path) -> Result<Self, TrustError> {
-        let mut file = match open_regular(path) {
+    pub fn load(directory: &Directory) -> Result<Self, TrustError> {
+        let mut file = match open_regular_at(directory.file(), OsStr::new("trusted-public-keys")) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(error.into()),
@@ -109,33 +106,12 @@ impl TrustedPublicKeys {
         Ok(ValidatedNarInfo(narinfo))
     }
 
-    pub(crate) fn validate(
+    pub fn validate(
         &self,
         route: &StoreHash,
         bytes: Vec<u8>,
     ) -> Result<ValidatedNarInfo, NarInfoError> {
         self.inspect(route, bytes).map_err(|_| NarInfoError)
-    }
-
-    pub fn validate_published(&self, root: &Path) -> Result<(), TrustError> {
-        let root_directory = open_directory(root)?;
-        for name in read_dir_names(&root_directory)? {
-            let Some(route) = name.to_str().and_then(|name| name.strip_suffix(".narinfo")) else {
-                continue;
-            };
-            let Ok(route) = StoreHash::parse(route) else {
-                continue;
-            };
-            if !entry_is_regular_at(&root_directory, &name)? {
-                return Err(TrustError::UntrustedPublishedNarInfo);
-            }
-
-            let bytes = read_narinfo_file(open_regular_at(&root_directory, &name)?)?;
-            if self.validate(&route, bytes).is_err() {
-                return Err(TrustError::UntrustedPublishedNarInfo);
-            }
-        }
-        Ok(())
     }
 
     fn verifies(&self, fingerprint: &[u8], signatures: &[NamedSignature]) -> bool {
@@ -181,9 +157,8 @@ impl NamedSignature {
 struct ParsedNarInfo {
     store_path: String,
     references: String,
-    nar: NarObjectId,
+    payload: NarFileName,
     nar_hash: NarObjectId,
-    encoding: NarEncoding,
     file_size: u64,
     nar_size: u64,
     fingerprint: String,
@@ -233,15 +208,8 @@ impl ParsedNarInfo {
 
         let url = required("URL")?;
         let url_value = url.strip_prefix("nar/").ok_or(NarInfoError)?;
-        let (url_hash, encoding) = [NarEncoding::Zstd, NarEncoding::Xz, NarEncoding::None]
-            .into_iter()
-            .find_map(|encoding| {
-                url_value
-                    .strip_suffix(encoding.suffix())
-                    .map(|hash| (hash, encoding))
-            })
-            .ok_or(NarInfoError)?;
-        let nar = NarObjectId::parse(url_hash).map_err(|_| NarInfoError)?;
+        let payload = NarFileName::parse(url_value).map_err(|_| NarInfoError)?;
+        let NarFileName { id: nar, encoding } = &payload;
         if required("Compression")? != encoding.compression() {
             return Err(NarInfoError);
         }
@@ -257,7 +225,7 @@ impl ParsedNarInfo {
             .strip_prefix("sha256:")
             .and_then(|value| NarObjectId::parse(value).ok())
             .ok_or(NarInfoError)?;
-        if encoding == NarEncoding::None && nar_hash != nar {
+        if *encoding == NarEncoding::None && nar_hash != *nar {
             return Err(NarInfoError);
         }
 
@@ -267,7 +235,7 @@ impl ParsedNarInfo {
         let nar_size = required("NarSize")?
             .parse::<u64>()
             .map_err(|_| NarInfoError)?;
-        if nar_size == 0 || (encoding == NarEncoding::None && file_size != nar_size) {
+        if nar_size == 0 || (*encoding == NarEncoding::None && file_size != nar_size) {
             return Err(NarInfoError);
         }
 
@@ -293,9 +261,8 @@ impl ParsedNarInfo {
         Ok(Self {
             store_path: store_path.to_owned(),
             references,
-            nar,
+            payload,
             nar_hash,
-            encoding,
             file_size,
             nar_size,
             fingerprint,
@@ -308,6 +275,39 @@ impl ParsedNarInfo {
 #[derive(Debug)]
 pub struct ValidatedNarInfo(ParsedNarInfo);
 
+#[derive(Clone, Copy)]
+pub(crate) enum CompressedEncoding {
+    Xz,
+    Zstd,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CompressedNarExpectation<'a> {
+    pub(crate) encoding: CompressedEncoding,
+    pub(crate) encoded_hash: &'a NarObjectId,
+    pub(crate) encoded_size: u64,
+    pub(crate) decoded_hash: &'a NarObjectId,
+    pub(crate) decoded_size: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NarExpectation<'a> {
+    Raw {
+        nar_hash: &'a NarObjectId,
+        nar_size: u64,
+    },
+    Compressed(CompressedNarExpectation<'a>),
+}
+
+impl NarExpectation<'_> {
+    pub(crate) const fn encoded_size(self) -> u64 {
+        match self {
+            Self::Raw { nar_size, .. } => nar_size,
+            Self::Compressed(expectation) => expectation.encoded_size,
+        }
+    }
+}
+
 impl ValidatedNarInfo {
     pub(crate) fn store_path(&self) -> &str {
         &self.0.store_path
@@ -318,39 +318,43 @@ impl ValidatedNarInfo {
     }
 
     pub(crate) fn nar(&self) -> &NarObjectId {
-        &self.0.nar
+        &self.0.payload.id
     }
 
-    pub(crate) fn nar_hash(&self) -> &NarObjectId {
-        &self.0.nar_hash
+    pub(crate) fn payload_name(&self) -> &NarFileName {
+        &self.0.payload
     }
 
     pub(crate) const fn encoding(&self) -> NarEncoding {
-        self.0.encoding
+        self.0.payload.encoding
     }
 
     pub(crate) const fn file_size(&self) -> u64 {
         self.0.file_size
     }
 
-    pub(crate) const fn nar_size(&self) -> u64 {
-        self.0.nar_size
+    pub(crate) fn payload_expectation(&self) -> NarExpectation<'_> {
+        let compressed = |encoding| {
+            NarExpectation::Compressed(CompressedNarExpectation {
+                encoding,
+                encoded_hash: self.nar(),
+                encoded_size: self.0.file_size,
+                decoded_hash: &self.0.nar_hash,
+                decoded_size: self.0.nar_size,
+            })
+        };
+        match self.encoding() {
+            NarEncoding::None => NarExpectation::Raw {
+                nar_hash: self.nar(),
+                nar_size: self.0.nar_size,
+            },
+            NarEncoding::Zstd => compressed(CompressedEncoding::Zstd),
+            NarEncoding::Xz => compressed(CompressedEncoding::Xz),
+        }
     }
 
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.0.bytes
-    }
-
-    pub(crate) fn into_parts(self) -> (NarObjectId, NarEncoding, NarObjectId, u64, u64, Vec<u8>) {
-        let parsed = self.0;
-        (
-            parsed.nar,
-            parsed.encoding,
-            parsed.nar_hash,
-            parsed.file_size,
-            parsed.nar_size,
-            parsed.bytes,
-        )
     }
 }
 
@@ -450,7 +454,6 @@ impl std::error::Error for NarInfoError {}
 #[derive(Debug)]
 pub enum TrustError {
     InvalidTrustFile,
-    UntrustedPublishedNarInfo,
     Io(io::Error),
 }
 
@@ -464,9 +467,6 @@ impl fmt::Display for TrustError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidTrustFile => formatter.write_str("invalid trusted public key file"),
-            Self::UntrustedPublishedNarInfo => {
-                formatter.write_str("published narinfo is not trusted")
-            }
             Self::Io(error) => error.fmt(formatter),
         }
     }
@@ -476,7 +476,6 @@ impl std::error::Error for TrustError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidTrustFile => None,
-            Self::UntrustedPublishedNarInfo => None,
             Self::Io(error) => Some(error),
         }
     }
@@ -485,6 +484,14 @@ impl std::error::Error for TrustError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_read_errors_are_not_reported_as_malformed_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(directory.path().join("write-only")).unwrap();
+        let error = read_narinfo_file(file).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
 
     const STORE_HASH: &str = "00000000000000000000000000000000";
     const NAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
