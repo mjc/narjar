@@ -292,16 +292,19 @@ fn target_with_compression(target: &str, compression: Compression) -> String {
             let mut replaced = false;
             let mut parameters = query
                 .split('&')
-                .map(|parameter| {
-                    if !replaced
-                        && parameter
-                            .split_once('=')
-                            .is_some_and(|(name, _)| name == "compression")
+                .filter_map(|parameter| {
+                    if parameter
+                        .split_once('=')
+                        .is_some_and(|(name, _)| name == "compression")
                     {
-                        replaced = true;
-                        format!("compression={value}")
+                        if replaced {
+                            None
+                        } else {
+                            replaced = true;
+                            Some(format!("compression={value}"))
+                        }
                     } else {
-                        parameter.to_owned()
+                        Some(parameter.to_owned())
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1472,6 +1475,17 @@ mod tests {
                 super::Compression::Zstd,
             ),
             "https://cache.example?priority=10&compression=zstd#cache"
+        );
+    }
+
+    #[test]
+    fn compression_query_replacement_removes_duplicate_values() {
+        assert_eq!(
+            super::target_with_compression(
+                "https://cache.example?compression=xz&priority=10&compression=zstd#cache",
+                super::Compression::None,
+            ),
+            "https://cache.example?compression=none&priority=10#cache"
         );
     }
 }
