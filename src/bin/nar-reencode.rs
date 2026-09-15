@@ -22,7 +22,7 @@ impl<W: Write> EventSink for Reencoder<W> {
             DecodeEvent::Symlink { target } => self.encoder.push(EncodeEvent::Symlink(&target)),
             DecodeEvent::EndDirectory => self.encoder.push(EncodeEvent::EndDirectory),
         };
-        result.map_err(|error| io::Error::other(error.to_string()))
+        result.map_err(io::Error::other)
     }
 }
 
@@ -43,4 +43,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         encoded.raw_size, encoded.entries, encoded.files, encoded.symlinks
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use narjar::nar_encode::EncodeError;
+
+    use super::*;
+
+    #[test]
+    fn reencoder_preserves_encode_error_source() {
+        let encoder = Encoder::new(Vec::new()).expect("create encoder");
+        let mut reencoder = Reencoder { encoder };
+
+        let error = reencoder
+            .event(DecodeEvent::EndFile)
+            .expect_err("an end event without a file should fail");
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<EncodeError>());
+
+        assert!(source.is_some(), "sink error should retain EncodeError");
+    }
 }
