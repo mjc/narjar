@@ -138,7 +138,10 @@ fi
 grep -q 'unknown subset' "$WORK/unknown-subset.err"
 
 PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" collect \
-  --spec "$WORK/spec.json" --manifest "$WORK/collected.json" --export-dir "$WORK/export" --build
+  --spec "$WORK/spec.json" --manifest "$WORK/collected.json" --export-dir "$WORK/export" --build \
+  --log "$WORK/collect.log"
+grep -Fq '$ nix build --no-link --print-out-paths --override-input a-input a-ref --override-input z-input z-ref flake#nixosConfigurations.generation' "$WORK/collect.log"
+grep -Fq '$ nix-store --query --requisites /nix/store/mock-root' "$WORK/collect.log"
 jq -e '.entries | length == 1 and .[0].path == "/nix/store/mock-root" and .[0].artifact_sha256 != null' \
   "$WORK/collected.json" > /dev/null
 PATH="$MOCK_BIN:$PATH" "$ROOT/scripts/nix-corpus" validate \

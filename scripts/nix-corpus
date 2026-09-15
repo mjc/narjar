@@ -3,12 +3,13 @@ set -Eeuo pipefail
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf -- "$WORK_DIR"' EXIT
+LOG_FILE=
 
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/nix-corpus collect --spec FILE --manifest FILE [--export-dir DIR] [--build]
-  scripts/nix-corpus validate --manifest FILE [--spec FILE] [--artifact-root DIR] [--store] [--rebuild] [--schema-only]
+  scripts/nix-corpus collect --spec FILE --manifest FILE [--export-dir DIR] [--build] [--log FILE]
+  scripts/nix-corpus validate --manifest FILE [--spec FILE] [--artifact-root DIR] [--store] [--rebuild] [--schema-only] [--log FILE]
 
 Collect and validate reproducible corpora of uncompressed Nix NARs.
 Requires nix, nix-store, jq, and standard Unix utilities.
@@ -25,9 +26,23 @@ require_command() {
 }
 
 log_command() {
-  printf '$' >&2
-  printf ' %q' "$@" >&2
-  printf '\n' >&2
+  if [[ -n "$LOG_FILE" ]]; then
+    {
+      printf '$'
+      printf ' %q' "$@"
+      printf '\n'
+    } | tee -a "$LOG_FILE" >&2
+  else
+    printf '$' >&2
+    printf ' %q' "$@" >&2
+    printf '\n' >&2
+  fi
+}
+
+set_log_file() {
+  [[ -n "$LOG_FILE" ]] || return 0
+  mkdir -p "$(dirname -- "$LOG_FILE")"
+  : > "$LOG_FILE"
 }
 
 run_capture() {
@@ -386,6 +401,7 @@ collect() {
       --manifest) manifest=${2:-}; shift 2 ;;
       --export-dir) export_dir=${2:-}; shift 2 ;;
       --build) build=true; shift ;;
+      --log) LOG_FILE=${2:-}; shift 2 ;;
       -h|--help) usage; return ;;
       *) die "unknown collect option: $1" ;;
     esac
@@ -393,6 +409,7 @@ collect() {
   [[ -n "$spec" ]] || die "collect requires --spec"
   [[ -n "$manifest" ]] || die "collect requires --manifest"
   [[ -f "$spec" ]] || die "spec does not exist: $spec"
+  set_log_file
   jq -e '
     .schema_version == 1
     and (.targets | type == "array" and length > 0)
@@ -592,11 +609,13 @@ main() {
           --store) check_store=true; shift ;;
           --rebuild) rebuild=true; shift ;;
           --schema-only) schema_only=true; shift ;;
+          --log) LOG_FILE=${2:-}; shift 2 ;;
           -h|--help) usage; return ;;
           *) die "unknown validate option: $1" ;;
         esac
       done
       [[ -n "$manifest" ]] || die "validate requires --manifest"
+      set_log_file
       if [[ -n "$spec" && ! -f "$spec" ]]; then
         die "spec does not exist: $spec"
       fi
