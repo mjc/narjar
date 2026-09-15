@@ -33,7 +33,7 @@ TLS reverse proxy
   v
 Narjar process
   |
-  | same-filesystem temporary + fsync + rename
+  | same-filesystem temporary + fsync + no-replace hard link
   v
 flat cache directory
 
@@ -165,7 +165,7 @@ PUT /nar/<file-hash>.nar[.zst|.xz]
   -> for `.nar.zst`/`.nar.xz`, stream-decode the stored bytes to validate the raw NAR hash/size
   -> reject length/hash/empty mismatch or an oversized decompressed NAR
   -> sync temporary file
-  -> rename-no-replace to DATA/nar/<file-hash>.nar[.zst|.xz]
+  -> no-replace hard link to DATA/nar/<file-hash>.nar[.zst|.xz]
   -> sync DATA/nar
   -> 201 for newly durable object, 200 for identical existing object
 
@@ -181,7 +181,7 @@ PUT /<store-hash>.narinfo
   -> verify at least one signature from trusted-public-keys
   -> write canonical original bytes to DATA/.tmp with create-new
   -> sync temporary file
-  -> rename-no-replace to DATA/<store-hash>.narinfo
+  -> no-replace hard link to DATA/<store-hash>.narinfo
   -> sync DATA
   -> 201 only after durable publication
 ~~~
@@ -197,8 +197,9 @@ without adding authenticity.
 Narjar does not recompress. The upload and stored object remain identical; XZ is
 decoded only while validating the raw hash and configured decompressed-size
 limit. NAR staging is under `DATA/nar/.tmp`, so a split NAR destination can
-publish with a same-filesystem rename; metadata remains staged under
-`DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be measured.
+publish with a same-filesystem no-replace hard link; metadata remains staged
+under `DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be
+measured.
 
 Publication workers are bounded by the configured worker count and process
 valid PUTs concurrently. Each write reserves its declared body size against
@@ -216,7 +217,8 @@ remain historical context in [`publication-lock-adr.md`](publication-lock-adr.md
 
 ## Publication and crash semantics
 
-The narinfo rename is the visibility point. A crash can leave:
+The narinfo no-replace hard link and parent-directory sync are the visibility
+point. A crash can leave:
 
 - A file under any `.tmp` directory: never reader-visible; reconcile may delete
   it after an age threshold.
@@ -229,11 +231,11 @@ published. A successful narinfo PUT means the validated pair is durable and
 reader-visible. Narjar does not return 201 before the relevant file and parent
 directory syncs complete.
 
-Concurrent identical PUTs converge. The first rename wins; losers compare the
+Concurrent identical PUTs converge. The first hard link wins; losers compare the
 published file's size and hash and return idempotent success only when
 identical. A conflicting immutable name returns 409 and never overwrites.
 
-Disk-full, sync, rename, parse, signature, hash, size, and connection failures
+Disk-full, sync, link, parse, signature, hash, size, and connection failures
 leave no published narinfo. Cleanup failure is logged and delegated to
 reconcile.
 
