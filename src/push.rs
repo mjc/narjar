@@ -281,21 +281,41 @@ impl Compression {
 
 fn target_with_compression(target: &str, compression: Compression) -> String {
     let value = compression.query_value();
-    if let Some(query) = target.split_once('?').map(|(_, query)| query)
-        && query
-            .split('&')
-            .any(|parameter| parameter.starts_with("compression="))
-    {
-        let mut target = target.to_owned();
-        let start = target.find("compression=").expect("compression was found");
-        let end = target[start..]
-            .find('&')
-            .map_or(target.len(), |offset| start + offset);
-        target.replace_range(start..end, &format!("compression={value}"));
-        return target;
+    let (target_without_fragment, fragment) = target
+        .split_once('#')
+        .map_or((target, None), |(target, fragment)| {
+            (target, Some(fragment))
+        });
+    let mut output = match target_without_fragment.split_once('?') {
+        None => format!("{target_without_fragment}?compression={value}"),
+        Some((base, query)) => {
+            let mut replaced = false;
+            let mut parameters = query
+                .split('&')
+                .map(|parameter| {
+                    if !replaced
+                        && parameter
+                            .split_once('=')
+                            .is_some_and(|(name, _)| name == "compression")
+                    {
+                        replaced = true;
+                        format!("compression={value}")
+                    } else {
+                        parameter.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !replaced {
+                parameters.push(format!("compression={value}"));
+            }
+            format!("{base}?{}", parameters.join("&"))
+        }
+    };
+    if let Some(fragment) = fragment {
+        output.push('#');
+        output.push_str(fragment);
     }
-    let separator = if target.contains('?') { '&' } else { '?' };
-    format!("{target}{separator}compression={value}")
+    output
 }
 
 fn sign_paths(key_file: &std::path::Path, paths: &[String]) -> Result<(), Error> {
@@ -1434,6 +1454,17 @@ mod tests {
                 super::Compression::None
             ),
             "https://cache.example?compression=none&priority=10"
+        );
+    }
+
+    #[test]
+    fn compression_query_replacement_does_not_touch_the_path() {
+        assert_eq!(
+            super::target_with_compression(
+                "https://cache.example/compression=path?priority=10&compression=xz",
+                super::Compression::None,
+            ),
+            "https://cache.example/compression=path?priority=10&compression=none"
         );
     }
 }
