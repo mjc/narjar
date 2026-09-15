@@ -1466,5 +1466,12 @@ mod tests {
             ),
             "https://cache.example/compression=path?priority=10&compression=none"
         );
+        assert_eq!(
+            super::target_with_compression(
+                "https://cache.example?priority=10#cache",
+                super::Compression::Zstd,
+            ),
+            "https://cache.example?priority=10&compression=zstd#cache"
+        );
     }
 }
