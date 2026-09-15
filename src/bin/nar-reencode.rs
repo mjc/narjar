@@ -1,15 +1,17 @@
 use std::io::{self, Write};
 
 use narjar::nar::{Decoder, Event as DecodeEvent, EventSink};
-use narjar::nar_encode::{Encoder, Event as EncodeEvent};
+use narjar::nar_encode::{EncodeError, Encoder, Event as EncodeEvent};
 
 struct Reencoder<W> {
     encoder: Encoder<W>,
 }
 
 impl<W: Write> EventSink for Reencoder<W> {
-    fn event(&mut self, event: DecodeEvent<'_>) -> io::Result<()> {
-        let result = match event {
+    type Error = EncodeError;
+
+    fn event(&mut self, event: DecodeEvent<'_>) -> Result<(), Self::Error> {
+        match event {
             DecodeEvent::BeginDirectory { .. } => self.encoder.push(EncodeEvent::BeginDirectory),
             DecodeEvent::Entry { name } => self.encoder.push(EncodeEvent::Entry(&name)),
             DecodeEvent::BeginFile {
@@ -21,8 +23,7 @@ impl<W: Write> EventSink for Reencoder<W> {
             DecodeEvent::EndFile => self.encoder.push(EncodeEvent::EndFile),
             DecodeEvent::Symlink { target } => self.encoder.push(EncodeEvent::Symlink(&target)),
             DecodeEvent::EndDirectory => self.encoder.push(EncodeEvent::EndDirectory),
-        };
-        result.map_err(io::Error::other)
+        }
     }
 }
 
@@ -47,22 +48,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use narjar::nar_encode::EncodeError;
-
     use super::*;
 
     #[test]
-    fn reencoder_preserves_encode_error_source() {
+    fn reencoder_returns_concrete_encode_error() {
         let encoder = Encoder::new(Vec::new()).expect("create encoder");
         let mut reencoder = Reencoder { encoder };
 
         let error = reencoder
             .event(DecodeEvent::EndFile)
             .expect_err("an end event without a file should fail");
-        let source = error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<EncodeError>());
-
-        assert!(source.is_some(), "sink error should retain EncodeError");
+        assert!(matches!(
+            error,
+            EncodeError::Invalid("file end outside a regular node")
+        ));
     }
 }

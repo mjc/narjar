@@ -46,6 +46,8 @@ struct Sink {
 }
 
 impl EventSink for Sink {
+    type Error = io::Error;
+
     fn event(&mut self, event: DecodeEvent<'_>) -> io::Result<()> {
         match event {
             DecodeEvent::Entry { name } => self.names.push(name),

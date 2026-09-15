@@ -43,10 +43,14 @@ impl Default for Limits {
     }
 }
 
+/// An error encountered while decoding a NAR or delivering one of its events.
+///
+/// `E` is the error type chosen by the event sink. Input and structural errors
+/// remain represented by the decoder's own variants.
 #[derive(Debug)]
-pub enum DecodeError {
+pub enum DecodeError<E = io::Error> {
     Io(io::Error),
-    Sink(io::Error),
+    Sink(E),
     Invalid(String),
     NonCanonical(&'static str),
     LimitExceeded {
@@ -56,7 +60,7 @@ pub enum DecodeError {
     },
 }
 
-impl fmt::Display for DecodeError {
+impl<E: fmt::Display> fmt::Display for DecodeError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "NAR input: {error}"),
@@ -72,7 +76,15 @@ impl fmt::Display for DecodeError {
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl<E: std::error::Error + 'static> std::error::Error for DecodeError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Sink(error) => Some(error),
+            Self::Invalid(_) | Self::NonCanonical(_) | Self::LimitExceeded { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Event<'a> {
@@ -96,14 +108,20 @@ pub enum Event<'a> {
 }
 
 pub trait EventSink {
-    fn event(&mut self, event: Event<'_>) -> io::Result<()>;
+    /// The error returned when delivering an event fails.
+    type Error: std::error::Error + 'static;
+
+    fn event(&mut self, event: Event<'_>) -> Result<(), Self::Error>;
 }
 
-impl<F> EventSink for F
+impl<F, E> EventSink for F
 where
-    F: for<'a> FnMut(Event<'a>) -> io::Result<()>,
+    F: for<'a> FnMut(Event<'a>) -> Result<(), E>,
+    E: std::error::Error + 'static,
 {
-    fn event(&mut self, event: Event<'_>) -> io::Result<()> {
+    type Error = E;
+
+    fn event(&mut self, event: Event<'_>) -> Result<(), Self::Error> {
         self(event)
     }
 }
@@ -141,7 +159,10 @@ impl<R: Read> Decoder<R> {
         }
     }
 
-    pub fn decode<S: EventSink>(&mut self, sink: &mut S) -> Result<DecodeSummary, DecodeError> {
+    pub fn decode<S: EventSink>(
+        &mut self,
+        sink: &mut S,
+    ) -> Result<DecodeSummary, DecodeError<S::Error>> {
         self.expect(b"nix-archive-1")?;
         let mut counters = Counters::default();
         let root = self.decode_node(0, sink, &mut counters)?;
@@ -171,7 +192,7 @@ impl<R: Read> Decoder<R> {
         depth: usize,
         sink: &mut S,
         counters: &mut Counters,
-    ) -> Result<RootKind, DecodeError> {
+    ) -> Result<RootKind, DecodeError<S::Error>> {
         self.bump_work()?;
         if depth > self.limits.max_depth {
             return Err(DecodeError::LimitExceeded {
@@ -287,7 +308,11 @@ impl<R: Read> Decoder<R> {
         }
     }
 
-    fn read_file<S: EventSink>(&mut self, size: u64, sink: &mut S) -> Result<(), DecodeError> {
+    fn read_file<S: EventSink>(
+        &mut self,
+        size: u64,
+        sink: &mut S,
+    ) -> Result<(), DecodeError<S::Error>> {
         let mut remaining = size;
         let mut buffer = [0_u8; CHUNK_SIZE];
         while remaining != 0 {
@@ -300,13 +325,13 @@ impl<R: Read> Decoder<R> {
         self.read_padding(size)
     }
 
-    fn read_u64(&mut self) -> Result<u64, DecodeError> {
+    fn read_u64<E>(&mut self) -> Result<u64, DecodeError<E>> {
         let mut bytes = [0_u8; 8];
         self.read_raw(&mut bytes)?;
         Ok(u64::from_le_bytes(bytes))
     }
 
-    fn read_string(&mut self, max: u64) -> Result<Vec<u8>, DecodeError> {
+    fn read_string<E>(&mut self, max: u64) -> Result<Vec<u8>, DecodeError<E>> {
         let length = self.read_u64()?;
         if length > max {
             return Err(DecodeError::LimitExceeded {
@@ -323,7 +348,7 @@ impl<R: Read> Decoder<R> {
         Ok(value)
     }
 
-    fn read_padding(&mut self, length: u64) -> Result<(), DecodeError> {
+    fn read_padding<E>(&mut self, length: u64) -> Result<(), DecodeError<E>> {
         let padding = (8 - length % 8) % 8;
         if padding == 0 {
             return Ok(());
@@ -336,7 +361,7 @@ impl<R: Read> Decoder<R> {
         Ok(())
     }
 
-    fn expect(&mut self, expected: &[u8]) -> Result<(), DecodeError> {
+    fn expect<E>(&mut self, expected: &[u8]) -> Result<(), DecodeError<E>> {
         let actual = self.read_string(TOKEN_LIMIT)?;
         if actual == expected {
             Ok(())
@@ -349,7 +374,7 @@ impl<R: Read> Decoder<R> {
         }
     }
 
-    fn validate_name(&self, name: &[u8]) -> Result<(), DecodeError> {
+    fn validate_name<E>(&self, name: &[u8]) -> Result<(), DecodeError<E>> {
         if name.is_empty()
             || name == b"."
             || name == b".."
@@ -361,7 +386,7 @@ impl<R: Read> Decoder<R> {
         Ok(())
     }
 
-    fn bump_work(&mut self) -> Result<(), DecodeError> {
+    fn bump_work<E>(&mut self) -> Result<(), DecodeError<E>> {
         self.work = self.work.saturating_add(1);
         if self.work > self.limits.max_work {
             return Err(DecodeError::LimitExceeded {
@@ -373,7 +398,7 @@ impl<R: Read> Decoder<R> {
         Ok(())
     }
 
-    fn read_raw(&mut self, buffer: &mut [u8]) -> Result<(), DecodeError> {
+    fn read_raw<E>(&mut self, buffer: &mut [u8]) -> Result<(), DecodeError<E>> {
         let requested = buffer.len() as u64;
         let Some(next) = self.raw_bytes.checked_add(requested) else {
             return Err(DecodeError::LimitExceeded {
