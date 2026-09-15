@@ -292,6 +292,7 @@ fn target_with_compression(target: &str, compression: Compression) -> String {
             let mut replaced = false;
             let mut parameters = query
                 .split('&')
+                .filter(|parameter| !parameter.is_empty())
                 .filter_map(|parameter| {
                     let name = parameter
                         .split_once('=')
@@ -1497,6 +1498,14 @@ mod tests {
                 super::Compression::Zstd,
             ),
             "https://cache.example?compression=zstd&priority=10"
+        );
+    }
+
+    #[test]
+    fn compression_query_replacement_normalizes_an_empty_query() {
+        assert_eq!(
+            super::target_with_compression("https://cache.example?", super::Compression::Xz),
+            "https://cache.example?compression=xz"
         );
     }
 }
