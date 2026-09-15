@@ -151,6 +151,8 @@ impl Scanner<'_> {
 }
 
 impl EventSink for Scanner<'_> {
+    type Error = io::Error;
+
     fn event(&mut self, event: Event<'_>) -> io::Result<()> {
         match event {
             Event::BeginDirectory { depth } => {

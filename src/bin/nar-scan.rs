@@ -21,6 +21,8 @@ struct FileObject {
 }
 
 impl<W: Write> EventSink for Scanner<'_, W> {
+    type Error = io::Error;
+
     fn event(&mut self, event: Event<'_>) -> io::Result<()> {
         match event {
             Event::BeginFile {

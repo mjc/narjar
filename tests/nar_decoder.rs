@@ -1,7 +1,9 @@
+use std::convert::Infallible;
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use narjar::nar::{DecodeError, Decoder, Event, EventSink, Limits, RootKind};
+use narjar::nar_encode::EncodeError;
 use sha2::{Digest, Sha256};
 
 fn string(value: &[u8]) -> Vec<u8> {
@@ -74,6 +76,8 @@ struct Events {
 }
 
 impl EventSink for Events {
+    type Error = io::Error;
+
     fn event(&mut self, event: Event<'_>) -> io::Result<()> {
         match event {
             Event::BeginDirectory { depth: 0 } => self.root = Some(RootKind::Directory),
@@ -83,6 +87,56 @@ impl EventSink for Events {
             _ => {}
         }
         Ok(())
+    }
+}
+
+struct EncodeFailure;
+
+impl EventSink for EncodeFailure {
+    type Error = EncodeError;
+
+    fn event(&mut self, _event: Event<'_>) -> Result<(), Self::Error> {
+        Err(EncodeError::Invalid("test encoder failure"))
+    }
+}
+
+struct IoFailure;
+
+impl EventSink for IoFailure {
+    type Error = io::Error;
+
+    fn event(&mut self, _event: Event<'_>) -> Result<(), Self::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "test sink failure",
+        ))
+    }
+}
+
+struct NeverFailure;
+
+impl EventSink for NeverFailure {
+    type Error = Infallible;
+
+    fn event(&mut self, _event: Event<'_>) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+struct LateFailure {
+    events: usize,
+}
+
+impl EventSink for LateFailure {
+    type Error = EncodeError;
+
+    fn event(&mut self, event: Event<'_>) -> Result<(), Self::Error> {
+        self.events += 1;
+        if matches!(event, Event::FileChunk(_)) {
+            Err(EncodeError::Invalid("late sink failure"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -126,6 +180,105 @@ fn decodes_chunked_directory_without_materializing_file_contents() {
     assert_eq!(events.names, vec![b"a".to_vec(), b"link".to_vec()]);
     assert_eq!(events.file_chunks.concat(), b"hello");
     assert_eq!(events.symlinks, vec![b"../target".to_vec()]);
+}
+
+#[test]
+fn decoder_preserves_each_event_sink_error_type() {
+    let data = archive(regular(b"hello", false));
+
+    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let error = decoder
+        .decode(&mut EncodeFailure)
+        .expect_err("the encoder sink should fail");
+    assert!(matches!(
+        &error,
+        DecodeError::Sink(EncodeError::Invalid("test encoder failure"))
+    ));
+    assert!(
+        std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<EncodeError>())
+            .is_some(),
+        "the encoder error should remain the source"
+    );
+
+    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let error = decoder
+        .decode(&mut IoFailure)
+        .expect_err("the I/O sink should fail");
+    assert!(matches!(
+        &error,
+        DecodeError::Sink(error) if error.kind() == io::ErrorKind::BrokenPipe
+    ));
+    assert!(
+        std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .is_some(),
+        "the I/O error should remain the source"
+    );
+
+    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
+    assert!(result.is_ok(), "the never sink cannot fail");
+}
+
+#[test]
+fn closure_sinks_use_their_declared_error_types() {
+    let data = archive(regular(b"hello", false));
+
+    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let mut encode_sink = |_: Event<'_>| Err::<(), _>(EncodeError::Invalid("closure failure"));
+    let error = decoder
+        .decode(&mut encode_sink)
+        .expect_err("the encoding closure should fail");
+    assert!(matches!(
+        error,
+        DecodeError::Sink(EncodeError::Invalid("closure failure"))
+    ));
+
+    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let mut infallible_sink = |_: Event<'_>| Ok::<(), Infallible>(());
+    let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut infallible_sink);
+    assert!(result.is_ok(), "the infallible closure cannot fail");
+}
+
+#[test]
+fn infallible_sink_does_not_hide_decoder_errors() {
+    let data = archive(regular(b"hello", false));
+
+    let mut truncated = data.clone();
+    truncated.pop();
+    let mut decoder = Decoder::new(io::Cursor::new(truncated));
+    let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
+    assert!(matches!(result, Err(DecodeError::Io(_))));
+
+    let invalid = archive(node(b"unknown", Vec::new()));
+    let mut decoder = Decoder::new(io::Cursor::new(invalid));
+    let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
+    assert!(matches!(result, Err(DecodeError::Invalid(_))));
+
+    let limits = Limits {
+        max_total_bytes: (data.len() - 1) as u64,
+        ..Limits::default()
+    };
+    let mut decoder = Decoder::with_limits(io::Cursor::new(data), limits);
+    let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
+    assert!(matches!(result, Err(DecodeError::LimitExceeded { .. })));
+}
+
+#[test]
+fn sink_failure_after_progress_stops_event_delivery() {
+    let data = archive(regular(b"hello", false));
+    let mut decoder = Decoder::new(io::Cursor::new(data));
+    let mut sink = LateFailure { events: 0 };
+    let error = decoder
+        .decode(&mut sink)
+        .expect_err("the later sink event should fail");
+
+    assert!(matches!(
+        error,
+        DecodeError::Sink(EncodeError::Invalid("late sink failure"))
+    ));
+    assert_eq!(sink.events, 2, "no event should follow the failed chunk");
 }
 
 #[test]
