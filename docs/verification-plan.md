@@ -36,7 +36,7 @@ gates.
 | libc | 0.2.189 | MIT OR Apache-2.0 | 1.65 | default features off; one documented `flock` call; already present through signal-hook |
 | structured-zstd | 0.0.52 | Apache-2.0 | 1.92 | `hash`, `std`, and runtime SSE/BMI2/AVX2/NEON/SVE kernels; bounded streaming pure-Rust decoder/encoder; no C zstd library or one-shot whole-input buffer |
 
-The project MSRV is Rust 1.92, matching the selected zstd implementation and
+The project MSRV is Rust 1.98, matching the pinned development toolchain and
 pinned shell. Every candidate is
 permissively licensed and compatible with a musl static build when the rejected
 native/TLS features remain disabled; the Linux static closure check is the

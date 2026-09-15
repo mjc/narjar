@@ -29,6 +29,25 @@ struct HeaderRange {
     value: Range<usize>,
 }
 
+#[derive(Clone, Debug)]
+struct RequestTargetRange(Range<usize>);
+
+impl RequestTargetRange {
+    fn empty() -> Self {
+        Self(0..0)
+    }
+
+    fn from_subslice(buffer: &[u8], target: &[u8]) -> Option<Self> {
+        buffer
+            .subslice_range(target)
+            .map(|range| Self(range.into()))
+    }
+
+    fn as_range(&self) -> Range<usize> {
+        self.0.clone()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct HeaderField<'a>(&'a str);
 
@@ -80,7 +99,7 @@ pub struct Request {
     header_end: usize,
     body_prefix_len: usize,
     method: Method,
-    url: Range<usize>,
+    url: RequestTargetRange,
     header_ranges: [HeaderRange; MAX_HEADERS],
     header_count: usize,
     body_length: Option<usize>,
@@ -96,7 +115,7 @@ impl Request {
             header_end: 0,
             body_prefix_len: 0,
             method: Method::Other,
-            url: 0..0,
+            url: RequestTargetRange::empty(),
             header_ranges: std::array::from_fn(|_| HeaderRange {
                 name: 0..0,
                 value: 0..0,
@@ -110,7 +129,7 @@ impl Request {
         let mut received = 0;
         let header_end = loop {
             if let Some(end) = request.buffer[..received]
-                .windows(4)
+                .array_windows::<4>()
                 .position(|window| window == b"\r\n\r\n")
             {
                 break end + 4;
@@ -146,7 +165,7 @@ impl Request {
         }
 
         let Some(request_line_end) = request.buffer[..header_end - 2]
-            .windows(2)
+            .array_windows::<2>()
             .position(|window| window == b"\r\n")
         else {
             return Err((request.stream, invalid_data("missing request line")));
@@ -175,8 +194,8 @@ impl Request {
         if !version.starts_with(b"HTTP/") {
             return Err((request.stream, invalid_data("malformed HTTP version")));
         }
-        let target_start = target.as_ptr() as usize - request.buffer.as_ptr() as usize;
-        request.url = target_start..target_start + target.len();
+        request.url = RequestTargetRange::from_subslice(&request.buffer[..received], target)
+            .expect("request target is a subslice of the request buffer");
         request.method = match method {
             b"GET" => Method::Get,
             b"HEAD" => Method::Head,
@@ -190,7 +209,7 @@ impl Request {
                 break;
             }
             let line_end = request.buffer[line_start..header_end - 2]
-                .windows(2)
+                .array_windows::<2>()
                 .position(|window| window == b"\r\n")
                 .map(|offset| line_start + offset)
                 .ok_or_else(|| invalid_data("unterminated header"));
@@ -270,7 +289,7 @@ impl Request {
     }
 
     pub fn url(&self) -> &str {
-        std::str::from_utf8(&self.buffer[self.url.clone()]).expect("validated request target")
+        std::str::from_utf8(&self.buffer[self.url.as_range()]).expect("validated request target")
     }
 
     pub fn headers(&self) -> Headers<'_> {
@@ -636,6 +655,27 @@ mod tests {
         let mut body = Vec::new();
         std::io::Read::read_to_end(&mut request.as_reader(), &mut body).expect("read body");
         assert_eq!(body, b"body");
+        sender.join().expect("sender should finish");
+    }
+
+    #[test]
+    fn parses_a_request_fragmented_at_every_byte() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let sender = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            for byte in b"GET /nar/example.nar HTTP/1.1\r\nConnection: close\r\n\r\n" {
+                stream
+                    .write_all(std::slice::from_ref(byte))
+                    .expect("write request byte");
+            }
+        });
+        let (stream, _) = listener.accept().expect("accept test request");
+        let request = Request::read(stream).expect("parse fragmented request");
+
+        assert_eq!(request.method(), Method::Get);
+        assert_eq!(request.url(), "/nar/example.nar");
+        assert!(request.body_complete());
         sender.join().expect("sender should finish");
     }
 
