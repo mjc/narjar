@@ -293,10 +293,10 @@ fn target_with_compression(target: &str, compression: Compression) -> String {
             let mut parameters = query
                 .split('&')
                 .filter_map(|parameter| {
-                    if parameter
+                    let name = parameter
                         .split_once('=')
-                        .is_some_and(|(name, _)| name == "compression")
-                    {
+                        .map_or(parameter, |(name, _)| name);
+                    if name == "compression" {
                         if replaced {
                             None
                         } else {
@@ -1486,6 +1486,17 @@ mod tests {
                 super::Compression::None,
             ),
             "https://cache.example?compression=none&priority=10#cache"
+        );
+    }
+
+    #[test]
+    fn compression_query_replacement_removes_bare_duplicate_values() {
+        assert_eq!(
+            super::target_with_compression(
+                "https://cache.example?compression&priority=10&compression=xz",
+                super::Compression::Zstd,
+            ),
+            "https://cache.example?compression=zstd&priority=10"
         );
     }
 }
