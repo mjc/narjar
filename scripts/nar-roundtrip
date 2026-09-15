@@ -37,7 +37,7 @@ done
 [[ -n "$OUTPUT" ]] || die "--output is required"
 [[ -d "$NAR_ROOT" ]] || die "artifact root does not exist: $NAR_ROOT"
 [[ -x "$REENCODER" ]] || die "reencoder is not executable: $REENCODER"
-command -v jq > /dev/null || die "jq is required; run inside nix develop"
+command -v jq > /dev/null || die "jq is required; run inside devenv shell"
 command -v cmp > /dev/null || die "cmp is required"
 command -v find > /dev/null || die "find is required"
 command -v sha256sum > /dev/null || die "sha256sum is required"

@@ -56,8 +56,8 @@ done
 [[ -n "$OUTPUT" ]] || die "--output is required"
 [[ -f "$MANIFEST" ]] || die "manifest does not exist: $MANIFEST"
 [[ ! -e "$OUTPUT" ]] || die "output already exists: $OUTPUT"
-command -v jq > /dev/null || die "jq is required; run inside nix develop"
-command -v rustc > /dev/null || die "rustc is required; run inside nix develop"
+command -v jq > /dev/null || die "jq is required; run inside devenv shell"
+command -v rustc > /dev/null || die "rustc is required; run inside devenv shell"
 
 mkdir -p "$OUTPUT"
 COMMAND_LOG="$OUTPUT/commands.txt"

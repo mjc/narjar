@@ -27,7 +27,7 @@
     }:
     let
       lib = nixpkgs.lib;
-      rustVersion = "1.98.1";
+      rustVersion = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
       supportedSystems = [
         "aarch64-darwin"
         "x86_64-linux"
@@ -55,6 +55,7 @@
             extensions = [
               "rust-src"
               "rust-analyzer-preview"
+              "clippy-preview"
             ];
           }
           // lib.optionalAttrs (targets != [ ]) { inherit targets; }
@@ -257,27 +258,6 @@
           };
         };
 
-      devShells = lib.mapAttrs (_system: env: {
-        default = env.pkgs.mkShell {
-          packages = [
-            env.toolchain
-            env.pkgs.git
-            env.pkgs.nix
-            env.pkgs.jq
-            env.pkgs.direnv
-            env.pkgs.nix-direnv
-          ]
-          ++ lib.optionals (env.pkgs.stdenv.hostPlatform.system == "x86_64-linux") [
-            env.pkgs.perf
-            env.pkgs.inferno
-            env.pkgs.cargo-flamegraph
-            env.pkgs.heaptrack
-            env.pkgs.wrk
-            env.pkgs.vmtouch
-          ];
-        };
-      }) systems;
-
       apps = lib.mapAttrs (_system: env: {
         default = {
           type = "app";
@@ -325,7 +305,12 @@
             test -f ${repositorySrc}/src/main.rs
             test -f ${repositorySrc}/flake.nix
             test -f ${repositorySrc}/flake.lock
+            test -f ${repositorySrc}/AGENTS.md
             test -f ${repositorySrc}/.envrc
+            test -f ${repositorySrc}/devenv.nix
+            test -f ${repositorySrc}/devenv.yaml
+            test -f ${repositorySrc}/devenv.lock
+            test -f ${repositorySrc}/rust-toolchain.toml
             test -f ${repositorySrc}/README.md
             test -f ${env.src}/tests/fixtures/nix-2.31.5-http-v0.1.tsv
             test ! -e ${repositorySrc}/target
@@ -336,6 +321,7 @@
           lock-consistency = env.pkgs.runCommand "narjar-lock-consistency" { } ''
             test -s ${env.src}/Cargo.lock
             test -s ${repositorySrc}/flake.lock
+            test -s ${repositorySrc}/devenv.lock
             touch $out
           '';
           semantic-descriptor = env.pkgs.runCommand "narjar-semantic-descriptor" { } ''

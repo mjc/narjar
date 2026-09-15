@@ -128,7 +128,7 @@ done
 [[ -n "$OUTPUT" ]] || die "--output is required"
 [[ -x "$SCANNER" ]] || die "scanner is not executable: $SCANNER"
 [[ -d /proc ]] || die "Linux /proc is required"
-command -v jq > /dev/null || die "jq is required; run inside nix develop"
+command -v jq > /dev/null || die "jq is required; run inside devenv shell"
 if ((${#SIZES[@]} == 0)); then
   SIZES=(1048576 1073741824 21474836480)
 fi

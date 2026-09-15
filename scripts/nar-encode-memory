@@ -88,7 +88,7 @@ done
 
 [[ -n "$OUTPUT" ]] || die "--output is required"
 [[ -x "$ENCODER" ]] || die "encoder is not executable: $ENCODER"
-command -v jq > /dev/null || die "jq is required; run inside nix develop"
+command -v jq > /dev/null || die "jq is required; run inside devenv shell"
 command -v awk > /dev/null || die "awk is required"
 command -v date > /dev/null || die "date is required"
 if ((${#SIZES[@]} == 0)); then

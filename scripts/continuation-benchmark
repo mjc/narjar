@@ -59,7 +59,7 @@ if (( ! QUICK && WARMUPS != FROZEN_WARMUPS )); then
 fi
 for command in awk curl date findmnt jq nix nix-store stat vmtouch; do
   command -v "$command" >/dev/null || {
-    echo "missing '$command'; run inside 'nix develop'" >&2
+    echo "missing '$command'; run inside 'devenv shell'" >&2
     exit 1
   }
 done

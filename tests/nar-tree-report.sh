@@ -11,7 +11,7 @@ REPORTER=$ROOT/target/debug/nar-tree-report
   exit 1
 }
 command -v nix-store >/dev/null || {
-  printf 'nix-store is required; run inside nix develop\n' >&2
+  printf 'nix-store is required; run inside devenv shell\n' >&2
   exit 1
 }
 

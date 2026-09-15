@@ -16,7 +16,7 @@ die() {
 [[ $# -eq 1 ]] || { usage >&2; exit 2; }
 RECORD=$1
 [[ -f "$RECORD" ]] || die "record does not exist: $RECORD"
-command -v jq > /dev/null || die "jq is required; run inside nix develop"
+command -v jq > /dev/null || die "jq is required; run inside devenv shell"
 
 MISSING=$(jq -nr \
   --slurpfile constitution "$CONSTITUTION" \

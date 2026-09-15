@@ -99,13 +99,13 @@ for publishers in "${PUBLISHERS[@]}"; do
 done
 for command in awk curl date nix stat truncate; do
   command -v "$command" >/dev/null || {
-    echo "missing '$command'; run inside 'nix develop'" >&2
+    echo "missing '$command'; run inside 'devenv shell'" >&2
     exit 1
   }
 done
 for command in sha256sum git hostname findmnt rustc; do
   command -v "$command" >/dev/null || {
-    echo "missing '$command'; run inside 'nix develop'" >&2
+    echo "missing '$command'; run inside 'devenv shell'" >&2
     exit 1
   }
 done

@@ -1,5 +1,6 @@
 .direnv/
 /target/
+.devenv/
 result
 result-*
 fuzz/target/

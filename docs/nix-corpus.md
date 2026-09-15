@@ -3,7 +3,7 @@
 `nix-corpus` is the single collection and validation command for
 the real-Nix corpus. It exports uncompressed NAR streams and records both the
 Nix `narHash`/`narSize` and a SHA-256 of the exact exported bytes.
-It is a self-contained Bash script: `nix develop` provides its only
+It is a self-contained Bash script: `devenv shell` provides its only
 non-core utility, `jq`; it has no Python, Cargo, or Rust-crate dependency.
 The harness prints every external command to stderr, so regeneration logs
 preserve the exact build, closure, and byte-export commands.

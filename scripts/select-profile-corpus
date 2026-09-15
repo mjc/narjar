@@ -37,7 +37,7 @@ done
   exit 2
 }
 command -v jq >/dev/null || {
-  echo "jq is required; run inside 'nix develop'" >&2
+  echo "jq is required; run inside 'devenv shell'" >&2
   exit 1
 }
 

@@ -26,7 +26,7 @@ It was run from commit `5fbd212c6474a0b3d67ec846a1d7eb616ce5def0` with the
 release Nix binary:
 
 ```text
-nix develop -c bash scripts/publication-lock-benchmark \
+devenv shell -- bash scripts/publication-lock-benchmark \
   --narjar-bin /nix/store/7iydfr0xlpvq73yqgpwl323kiik3x28b-narjar-0.1.0/bin/narjar \
   --output benchmarks/results/2026-09-11-narj70-publication-lock
 ```
