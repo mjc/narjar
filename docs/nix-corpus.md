@@ -5,9 +5,9 @@ the real-Nix corpus. It exports uncompressed NAR streams and records both the
 Nix `narHash`/`narSize` and a SHA-256 of the exact exported bytes.
 It is a self-contained Bash script: `devenv shell` provides its only
 non-core utility, `jq`; it has no Python, Cargo, or Rust-crate dependency.
-The harness prints every external command to stderr. Pass `--log FILE` to
-also persist the exact shell-escaped build, closure, and byte-export commands
-without relying on manual stderr redirection.
+The harness prints every Nix and `nix-store` operation to stderr. Pass `--log
+FILE` to also persist the exact shell-escaped build, closure, and byte-export
+commands without relying on manual stderr redirection.
 
 Start from `benchmarks/corpus-spec.example.json`, replace the pinned commits,
 flake attributes, and (when already materialized) generation roots, and add one
