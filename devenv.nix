@@ -14,6 +14,7 @@ in
     nix
     jq
     curl
+    cargo-nextest
     shellcheck
     cargo-fuzz
     # cargo-fuzz requires nightly-only compiler flags. Keep this snapshot
@@ -25,7 +26,6 @@ in
     util-linux
     perf
     inferno
-    cargo-flamegraph
     heaptrack
     wrk
     vmtouch
@@ -36,8 +36,12 @@ in
   tasks."check:fmt".exec = "cargo fmt --all -- --check";
   tasks."check:clippy".exec = "cargo clippy --all-targets --all-features";
   tasks."check:test".exec = "cargo test --locked";
+  tasks."check:nextest".exec = "cargo nextest run --locked";
   tasks."check:shell".exec = "shellcheck -S error $(find scripts tests -maxdepth 1 -type f -perm -u+x -print)";
   tasks."check:flake".exec = "nix flake check -L --no-update-lock-file";
+
+  tasks."fuzz:list".exec = "cargo fuzz list";
+  tasks."fuzz:build".exec = "RUSTC=\"$NARJAR_FUZZ_RUSTC\" cargo fuzz build nar_decode";
 
   processes.narjar.exec = ''
     data_dir="$DEVENV_STATE/narjar-data"
