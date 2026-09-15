@@ -204,6 +204,14 @@ publish with a same-filesystem no-replace hard link; metadata remains staged
 under `DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be
 measured.
 
+Upload validation is the content-integrity boundary. After an immutable NAR has
+passed encoded and decoded hash/size validation, narinfo publication and
+ordinary NAR availability checks inspect only the regular file and its encoded
+size; they do not read, decompress, or rehash the payload again. Full-content
+verification is explicit operator work through `verify` or
+`reconcile --verify-hashes`, which is where same-size out-of-band mutation is
+detected.
+
 Publication workers are bounded by the configured worker count and process
 valid PUTs concurrently. Each write reserves its declared body size against
 available staging capacity before entering the queue. Each publication then

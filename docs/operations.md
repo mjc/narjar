@@ -288,6 +288,13 @@ when recovery records are present, then removes only those recorded temporary
 objects before serving exact files. Reconciliation remains deterministic and
 operator-triggered for other stale temporary files.
 
+Upload validation is the content-integrity boundary. Once an immutable NAR has
+passed encoded and decoded hash/size validation, narinfo publication and normal
+availability checks only inspect that the regular file exists with the declared
+encoded size. They do not reread, decompress, or rehash the payload. Use
+`narjar verify` or `narjar reconcile --verify-hashes` for an explicit full
+content scan, including detection of same-size out-of-band mutation.
+
 ## Disk-full and I/O failure
 
 Before accepting a NAR, Narjar checks the receiving `DATA/nar/.tmp`
