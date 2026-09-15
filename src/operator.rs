@@ -3,7 +3,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     mem::MaybeUninit,
-    net::TcpStream,
     num::NonZeroUsize,
     os::{
         fd::AsRawFd,
@@ -24,8 +23,9 @@ use narjar::{
         gc::{self, GcOptions},
     },
 };
+use ureq::Agent;
 
-use crate::error::Error;
+use crate::{error::Error, http_url::HttpUrl};
 
 #[derive(Args)]
 pub(crate) struct Init {
@@ -929,7 +929,7 @@ fn print_doctor(report: &DoctorReport) {
 #[derive(Args)]
 pub(crate) struct Stats {
     #[arg(long)]
-    url: String,
+    url: HttpUrl,
     #[arg(long)]
     netrc_file: Option<PathBuf>,
     #[arg(long)]
@@ -937,43 +937,32 @@ pub(crate) struct Stats {
 }
 
 pub(crate) fn stats(options: Stats) -> Result<(), Error> {
-    let authority = options
-        .url
-        .strip_prefix("http://")
-        .and_then(|url| url.split('/').next())
-        .filter(|authority| !authority.is_empty())
-        .ok_or_else(|| Error::usage("--url must be an http:// URL"))?;
     let authorization = options
         .netrc_file
         .as_deref()
-        .map(|path| netrc_authorization(path, authority))
+        .map(|path| netrc_authorization(path, options.url.host()))
         .transpose()?;
-
-    let mut stream = TcpStream::connect(authority).map_err(runtime)?;
-    write!(
-        stream,
-        "GET /metrics HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n"
-    )
-    .map_err(runtime)?;
+    let metrics_url = options.url.endpoint(&["metrics"]);
+    let agent: Agent = Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut request = agent
+        .get(metrics_url.as_str())
+        .config()
+        .max_redirects(0)
+        .build();
     if let Some(authorization) = authorization {
-        write!(stream, "Authorization: Basic {authorization}\r\n").map_err(runtime)?;
+        request = request.header("Authorization", format!("Basic {authorization}"));
     }
-    write!(stream, "\r\n").map_err(runtime)?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).map_err(runtime)?;
-    let split = response
-        .windows(4)
-        .position(|bytes| bytes == b"\r\n\r\n")
-        .ok_or_else(|| Error::runtime("stats endpoint returned an invalid HTTP response"))?;
-    let headers = String::from_utf8_lossy(&response[..split]);
-    if !headers.starts_with("HTTP/1.1 200") {
+    let mut response = request.call().map_err(runtime)?;
+    if response.status() != 200 {
         return Err(Error::runtime(format!(
-            "stats endpoint failed: {}",
-            headers.lines().next().unwrap_or("unknown status")
+            "stats endpoint failed: HTTP {}",
+            response.status()
         )));
     }
-    let body = String::from_utf8(response[split + 4..].to_vec())
-        .map_err(|_| Error::runtime("stats endpoint returned non-UTF-8 metrics"))?;
+    let body = response.body_mut().read_to_string().map_err(runtime)?;
     if options.json {
         println!("{{\"metrics\":\"{}\"}}", json_escape(&body));
     } else {
@@ -982,21 +971,12 @@ pub(crate) fn stats(options: Stats) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn netrc_authorization(path: &Path, authority: &str) -> Result<String, Error> {
+pub(crate) fn netrc_authorization(path: &Path, host: &str) -> Result<String, Error> {
     let text = fs::read_to_string(path).map_err(runtime)?;
-    netrc_authorization_from_str(&text, authority)
+    netrc_authorization_from_str(&text, host)
 }
 
-fn netrc_authorization_from_str(text: &str, authority: &str) -> Result<String, Error> {
-    let host = match authority
-        .strip_prefix('[')
-        .and_then(|authority| authority.split_once(']'))
-    {
-        Some((host, _)) => host,
-        None => authority
-            .split_once(':')
-            .map_or(authority, |(host, _)| host),
-    };
+fn netrc_authorization_from_str(text: &str, host: &str) -> Result<String, Error> {
     let words: Vec<_> = text.split_whitespace().collect();
     let machine = words
         .windows(2)
@@ -1107,7 +1087,7 @@ mod tests {
             "machine cache.example login cache-user
 machine other.example password other-secret
 ",
-            "cache.example:5000",
+            "cache.example",
         )
         .expect_err("the matching machine has no password");
 
@@ -1115,11 +1095,11 @@ machine other.example password other-secret
     }
 
     #[test]
-    fn netrc_matches_a_bracketed_ipv6_authority() {
+    fn netrc_matches_an_ipv6_host() {
         let authorization = netrc_authorization_from_str(
             "machine ::1 login cache-user password cache-secret
 ",
-            "[::1]:5000",
+            "::1",
         )
         .expect("IPv6 machine should match");
 

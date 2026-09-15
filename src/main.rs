@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod http_url;
 mod operator;
 mod push;
 mod server;
@@ -129,6 +130,8 @@ mod tests {
                 "not-an-address",
             ]
             .as_slice(),
+            ["push", "--to", "file:///tmp/cache", "/run/current-system"].as_slice(),
+            ["stats", "--url", "https://user:secret@cache.example"].as_slice(),
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("narjar").chain(args.iter().copied())).is_err()

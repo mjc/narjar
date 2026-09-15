@@ -19,13 +19,13 @@ use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 use tempfile::NamedTempFile;
 use ureq::Agent;
 
-use crate::{error::Error, operator::netrc_authorization};
+use crate::{error::Error, http_url::HttpUrl, operator::netrc_authorization};
 
 #[derive(Debug, Args)]
 pub(crate) struct Push {
     /// Destination binary cache store URI.
-    #[arg(long, value_parser = non_empty)]
-    to: String,
+    #[arg(long)]
+    to: HttpUrl,
 
     /// Maximum number of native HTTP upload workers.
     #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
@@ -279,49 +279,6 @@ impl Compression {
     }
 }
 
-fn target_with_compression(target: &str, compression: Compression) -> String {
-    let value = compression.query_value();
-    let (target_without_fragment, fragment) = target
-        .split_once('#')
-        .map_or((target, None), |(target, fragment)| {
-            (target, Some(fragment))
-        });
-    let mut output = match target_without_fragment.split_once('?') {
-        None => format!("{target_without_fragment}?compression={value}"),
-        Some((base, query)) => {
-            let mut replaced = false;
-            let mut parameters = query
-                .split('&')
-                .filter(|parameter| !parameter.is_empty())
-                .filter_map(|parameter| {
-                    let name = parameter
-                        .split_once('=')
-                        .map_or(parameter, |(name, _)| name);
-                    if name == "compression" {
-                        if replaced {
-                            None
-                        } else {
-                            replaced = true;
-                            Some(format!("compression={value}"))
-                        }
-                    } else {
-                        Some(parameter.to_owned())
-                    }
-                })
-                .collect::<Vec<_>>();
-            if !replaced {
-                parameters.push(format!("compression={value}"));
-            }
-            format!("{base}?{}", parameters.join("&"))
-        }
-    };
-    if let Some(fragment) = fragment {
-        output.push('#');
-        output.push_str(fragment);
-    }
-    output
-}
-
 fn sign_paths(key_file: &std::path::Path, paths: &[String]) -> Result<(), Error> {
     let mut command = Command::new("nix");
     command
@@ -473,17 +430,15 @@ struct PreparedNar {
 }
 
 fn native_copy_paths(
-    target: &str,
+    target: &HttpUrl,
     netrc_file: Option<&Path>,
     refresh: bool,
     compression: Compression,
     timeout_seconds: NonZeroU64,
     metadata: &[PathInfo],
 ) -> Result<(), String> {
-    let target = target_with_compression(target, compression);
-    let (base_url, authority) = split_http_target(&target)?;
     let authorization = netrc_file
-        .map(|path| netrc_authorization(path, &authority).map_err(|error| error.to_string()))
+        .map(|path| netrc_authorization(path, target.host()).map_err(|error| error.to_string()))
         .transpose()?;
     let agent: Agent = Agent::config_builder()
         .http_status_as_error(false)
@@ -493,7 +448,8 @@ fn native_copy_paths(
 
     for info in metadata {
         let store_hash = store_hash_for_path(&info.path)?;
-        let narinfo_url = format!("{base_url}/{store_hash}.narinfo");
+        let narinfo_name = format!("{store_hash}.narinfo");
+        let narinfo_url = target.endpoint(&[&narinfo_name]);
         if !refresh {
             match request_status(&agent, &narinfo_url, authorization.as_deref())? {
                 200 => continue,
@@ -508,11 +464,8 @@ fn native_copy_paths(
         }
 
         let prepared = prepare_nar(info, compression)?;
-        let nar_url = format!(
-            "{base_url}/nar/{}{}",
-            prepared.file_hash,
-            compression.suffix()
-        );
+        let nar_name = format!("{}{}", prepared.file_hash, compression.suffix());
+        let nar_url = target.endpoint(&["nar", &nar_name]);
         let nar_status = put_file(
             &agent,
             &nar_url,
@@ -544,27 +497,6 @@ fn native_copy_paths(
         }
     }
     Ok(())
-}
-
-fn split_http_target(target: &str) -> Result<(String, String), String> {
-    let rest = target
-        .strip_prefix("http://")
-        .or_else(|| target.strip_prefix("https://"))
-        .ok_or_else(|| "--to must be an http:// or https:// URL".to_owned())?;
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|authority| !authority.is_empty())
-        .ok_or_else(|| "--to must include a host".to_owned())?;
-    let base = target
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(target)
-        .trim_end_matches('/');
-    if base.is_empty() {
-        return Err("--to must include a host".to_owned());
-    }
-    Ok((base.to_owned(), authority.to_owned()))
 }
 
 fn store_hash_for_path(path: &str) -> Result<&str, String> {
@@ -603,9 +535,13 @@ fn retry_sleep(attempt: usize, retry_after: Option<Duration>) {
     thread::sleep(retry_after.unwrap_or_else(|| Duration::from_millis(100 * multiplier)));
 }
 
-fn request_status(agent: &Agent, url: &str, authorization: Option<&str>) -> Result<u16, String> {
+fn request_status(
+    agent: &Agent,
+    url: &HttpUrl,
+    authorization: Option<&str>,
+) -> Result<u16, String> {
     for attempt in 0..MAX_ATTEMPTS {
-        let mut request = agent.get(url);
+        let mut request = agent.get(url.as_str());
         if let Some(authorization) = authorization {
             request = request.header("Authorization", format!("Basic {authorization}"));
         }
@@ -633,11 +569,11 @@ fn request_status(agent: &Agent, url: &str, authorization: Option<&str>) -> Resu
     unreachable!("retry loop always returns")
 }
 
-fn put_with_redirects<F>(url: &str, mut send: F) -> Result<u16, String>
+fn put_with_redirects<F>(url: &HttpUrl, mut send: F) -> Result<u16, String>
 where
-    F: FnMut(&str) -> Result<ureq::http::Response<ureq::Body>, String>,
+    F: FnMut(&HttpUrl) -> Result<ureq::http::Response<ureq::Body>, String>,
 {
-    let mut upload_url = url.to_owned();
+    let mut upload_url = url.clone();
     'attempts: for attempt in 0..MAX_ATTEMPTS {
         for redirect in 0..=MAX_REDIRECTS {
             let response = match send(&upload_url) {
@@ -670,7 +606,7 @@ where
                 let location = location.ok_or_else(|| {
                     format!("PUT {upload_url} redirect response had no Location header")
                 })?;
-                upload_url = resolve_upload_redirect(&upload_url, &location)?;
+                upload_url = upload_url.resolve_trusted_redirect(&location)?;
                 continue;
             }
 
@@ -685,44 +621,9 @@ where
     unreachable!("retry loop always returns")
 }
 
-fn resolve_upload_redirect(current_url: &str, location: &str) -> Result<String, String> {
-    let current_scheme = http_scheme(current_url)?;
-    let current_authority = split_http_target(current_url)?.1;
-    let location = location.trim();
-    let next_url = if location.starts_with("http://") || location.starts_with("https://") {
-        location.to_owned()
-    } else if location.starts_with('/') && !location.starts_with("//") {
-        format!("{current_scheme}://{current_authority}{location}")
-    } else {
-        return Err(format!(
-            "PUT {current_url} redirect has unsupported Location: {location}"
-        ));
-    };
-    let next_scheme = http_scheme(&next_url)?;
-    let next_authority = split_http_target(&next_url)?.1;
-    let safe_scheme =
-        next_scheme == current_scheme || (current_scheme == "http" && next_scheme == "https");
-    if next_authority != current_authority || !safe_scheme {
-        return Err(format!(
-            "PUT {current_url} redirect leaves the trusted cache authority"
-        ));
-    }
-    Ok(next_url)
-}
-
-fn http_scheme(url: &str) -> Result<&str, String> {
-    if url.starts_with("http://") {
-        Ok("http")
-    } else if url.starts_with("https://") {
-        Ok("https")
-    } else {
-        Err(format!("PUT redirect is not an HTTP URL: {url}"))
-    }
-}
-
 fn put_file(
     agent: &Agent,
-    url: &str,
+    url: &HttpUrl,
     path: &Path,
     content_type: &str,
     authorization: Option<&str>,
@@ -731,7 +632,7 @@ fn put_file(
         let file = File::open(path)
             .map_err(|error| format!("opening NAR for PUT {upload_url} failed: {error}"))?;
         let mut request = agent
-            .put(upload_url)
+            .put(upload_url.as_str())
             .config()
             .max_redirects(0)
             .build()
@@ -747,14 +648,14 @@ fn put_file(
 
 fn put_bytes(
     agent: &Agent,
-    url: &str,
+    url: &HttpUrl,
     bytes: &[u8],
     content_type: &str,
     authorization: Option<&str>,
 ) -> Result<u16, String> {
     put_with_redirects(url, |upload_url| {
         let mut request = agent
-            .put(upload_url)
+            .put(upload_url.as_str())
             .config()
             .max_redirects(0)
             .build()
@@ -900,12 +801,6 @@ fn format_command_failure(command: &str, stderr: &[u8]) -> String {
     }
 }
 
-fn non_empty(value: &str) -> Result<String, String> {
-    (!value.is_empty())
-        .then(|| value.to_owned())
-        .ok_or_else(|| "must not be empty".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use clap::{Args, Command, FromArgMatches};
@@ -914,6 +809,11 @@ mod tests {
         Agent, Compression, PathInfo, Push, dependency_waves, is_retryable_status, parse_path_info,
         retry_after_delay, serialize_narinfo,
     };
+    use crate::http_url::HttpUrl;
+
+    fn http_url(value: impl AsRef<str>) -> HttpUrl {
+        value.as_ref().parse().expect("test HTTP URL should parse")
+    }
     use std::time::Duration;
 
     #[test]
@@ -1057,7 +957,7 @@ mod tests {
             .into();
 
         assert_eq!(
-            super::request_status(&agent, &format!("http://{address}/narinfo"), None)
+            super::request_status(&agent, &http_url(format!("http://{address}/narinfo")), None)
                 .expect("retry should eventually succeed"),
             200
         );
@@ -1133,7 +1033,7 @@ mod tests {
         assert_eq!(
             super::put_file(
                 &agent,
-                &format!("http://{address}/nar/test.nar"),
+                &http_url(format!("http://{address}/nar/test.nar")),
                 payload.path(),
                 "application/x-nix-nar",
                 None
@@ -1229,7 +1129,7 @@ mod tests {
         assert_eq!(
             super::put_file(
                 &agent,
-                &format!("http://{address}/nar/test.nar"),
+                &http_url(format!("http://{address}/nar/test.nar")),
                 payload.path(),
                 "application/x-nix-nar",
                 None
@@ -1315,7 +1215,7 @@ mod tests {
         assert_eq!(
             super::put_file(
                 &agent,
-                &format!("http://{address}/nar/test.nar"),
+                &http_url(format!("http://{address}/nar/test.nar")),
                 payload.path(),
                 "application/x-nix-nar",
                 None
@@ -1326,7 +1226,7 @@ mod tests {
         assert_eq!(
             super::put_bytes(
                 &agent,
-                &format!("http://{address}/store.narinfo"),
+                &http_url(format!("http://{address}/store.narinfo")),
                 b"StorePath: /nix/store/test\n",
                 "text/x-nix-narinfo",
                 None
@@ -1436,76 +1336,6 @@ mod tests {
         assert!(
             error.to_string().contains("missing referenced store path"),
             "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn compression_is_explicitly_added_to_destination_uri() {
-        assert_eq!(
-            super::target_with_compression("https://cache.example", super::Compression::None),
-            "https://cache.example?compression=none"
-        );
-        assert_eq!(
-            super::target_with_compression(
-                "https://cache.example?priority=10",
-                super::Compression::Zstd
-            ),
-            "https://cache.example?priority=10&compression=zstd"
-        );
-        assert_eq!(
-            super::target_with_compression(
-                "https://cache.example?compression=xz&priority=10",
-                super::Compression::None
-            ),
-            "https://cache.example?compression=none&priority=10"
-        );
-    }
-
-    #[test]
-    fn compression_query_replacement_does_not_touch_the_path() {
-        assert_eq!(
-            super::target_with_compression(
-                "https://cache.example/compression=path?priority=10&compression=xz",
-                super::Compression::None,
-            ),
-            "https://cache.example/compression=path?priority=10&compression=none"
-        );
-        assert_eq!(
-            super::target_with_compression(
-                "https://cache.example?priority=10#cache",
-                super::Compression::Zstd,
-            ),
-            "https://cache.example?priority=10&compression=zstd#cache"
-        );
-    }
-
-    #[test]
-    fn compression_query_replacement_removes_duplicate_values() {
-        assert_eq!(
-            super::target_with_compression(
-                "https://cache.example?compression=xz&priority=10&compression=zstd#cache",
-                super::Compression::None,
-            ),
-            "https://cache.example?compression=none&priority=10#cache"
-        );
-    }
-
-    #[test]
-    fn compression_query_replacement_removes_bare_duplicate_values() {
-        assert_eq!(
-            super::target_with_compression(
-                "https://cache.example?compression&priority=10&compression=xz",
-                super::Compression::Zstd,
-            ),
-            "https://cache.example?compression=zstd&priority=10"
-        );
-    }
-
-    #[test]
-    fn compression_query_replacement_normalizes_an_empty_query() {
-        assert_eq!(
-            super::target_with_compression("https://cache.example?", super::Compression::Xz),
-            "https://cache.example?compression=xz"
         );
     }
 }
