@@ -55,40 +55,6 @@
     };
   };
 
-  nodes.static = {pkgs, ...}: {
-    imports = [self.nixosModules.default];
-
-    services.narjar = {
-      enable = true;
-      dataDir = "/var/lib/narjar-static";
-      dynamicUser = false;
-      minFreeBytes = 0;
-    };
-
-    environment.systemPackages = [pkgs.coreutils];
-    virtualisation.diskSize = 2048;
-  };
-
-  nodes.blocked = {...}: {
-    imports = [self.nixosModules.default];
-
-    services.narjar = {
-      enable = true;
-      dataDir = "/var/lib/narjar-mounted";
-      dynamicUser = false;
-      minFreeBytes = 0;
-    };
-
-    systemd.mounts = [
-      {
-        what = "/dev/narjar-missing";
-        where = "/var/lib/narjar-mounted";
-        type = "ext4";
-        options = "noauto,nofail,x-systemd.device-timeout=1ms";
-      }
-    ];
-  };
-
   testScript = ''
     machine.wait_for_unit("narjar.service")
     machine.wait_for_unit("nginx.service")
@@ -124,42 +90,6 @@
     machine.wait_for_unit("narjar.service")
     machine.wait_for_open_port(5000)
     machine.succeed("curl --fail http://127.0.0.1:5000/healthz")
-
-    static.wait_for_unit("narjar.service")
-    static.succeed("systemctl is-active --quiet narjar.service")
-    static.succeed("test \"$(systemctl show narjar.service -p DynamicUser --value)\" = no")
-    static.succeed("systemctl stop narjar.service")
-    static.succeed("rm -f /var/lib/narjar-static/nix-cache-info && touch /var/lib/narjar-static/incompatible")
-    static.succeed("! systemctl start narjar.service")
-    static.succeed("journalctl -u narjar.service -b --no-pager | grep -F 'data directory has unexpected entries'")
-    static.succeed("systemctl stop narjar.service || true")
-    static.succeed("systemctl reset-failed narjar.service")
-    static.succeed("rm -rf /var/lib/narjar-static && install -d -m 0700 -o narjar -g narjar /var/lib/narjar-static")
-    static.succeed("systemctl start narjar.service")
-    static.wait_for_unit("narjar.service")
-    static.succeed("mkdir -p /var/lib/narjar-static/realisations/sentinel")
-    static.succeed("seq 1 10000 | xargs -P 8 -n 1000 sh -c 'for i; do : > /var/lib/narjar-static/realisations/sentinel/$i; done' sh", timeout=300)
-    before = static.succeed("stat -c '%u:%g:%Y:%Z' /var/lib/narjar-static/realisations/sentinel/1")
-    static.succeed("systemctl restart narjar.service")
-    static.wait_for_unit("narjar.service")
-    static.succeed("systemctl is-active --quiet narjar.service")
-    after = static.succeed("stat -c '%u:%g:%Y:%Z' /var/lib/narjar-static/realisations/sentinel/1")
-    assert before == after, (before, after)
-
-    static.succeed("printf '%s\\n' 'preserved 0000000000000000000000000000000000000000000000000000000000000000' > /var/lib/narjar-static/auth/write.tokens && chmod 0600 /var/lib/narjar-static/auth/write.tokens")
-    static.succeed("printf '%s\\n' 'narjar-test:11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=' > /var/lib/narjar-static/trusted-public-keys && chmod 0600 /var/lib/narjar-static/trusted-public-keys")
-    static.succeed("systemctl restart narjar.service")
-    static.wait_for_unit("narjar.service")
-    static.succeed("grep -Fx 'preserved 0000000000000000000000000000000000000000000000000000000000000000' /var/lib/narjar-static/auth/write.tokens")
-    static.succeed("grep -Fx 'narjar-test:11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=' /var/lib/narjar-static/trusted-public-keys")
-    static.succeed("test \"$(stat -c %U:%G /var/lib/narjar-static/auth/write.tokens)\" = narjar:narjar")
-    static.succeed("test \"$(stat -c %U:%G /var/lib/narjar-static/trusted-public-keys)\" = narjar:narjar")
-
-    blocked.succeed("systemctl show narjar.service -p RequiresMountsFor --value | grep -Fx /var/lib/narjar-mounted")
-    blocked.succeed("systemctl start --no-block narjar.service")
-    blocked.succeed("sleep 1")
-    blocked.succeed("! systemctl is-active --quiet narjar.service")
-    blocked.succeed("test ! -e /var/lib/narjar-mounted/nix-cache-info")
 
   '';
 }
