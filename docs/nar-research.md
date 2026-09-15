@@ -79,6 +79,23 @@ symlink payload bytes are intentionally excluded. The NARJ-82 full-corpus
 result is retained at
 [`benchmarks/results/2026-09-11-narj82-tree-sharing/report.md`](../benchmarks/results/2026-09-11-narj82-tree-sharing/report.md).
 
+## Reproducible corpus evidence
+
+Collect or validate the NAR corpus with `scripts/nix-corpus`. Pass `--log` to
+retain every Nix command, including its exact store paths and input overrides:
+
+```sh
+scripts/nix-corpus collect \
+  --spec benchmarks/corpus-spec.json \
+  --manifest /tmp/corpus-manifest.json \
+  --export-dir /tmp/corpus-nars \
+  --build \
+  --log /tmp/corpus-collect.commands
+```
+
+The log is plain shell-escaped command text suitable for attaching to the
+manifest and raw-artifact evidence.
+
 ## Exact reuse report
 
 Run the corpus report after building `nar-scan`:
