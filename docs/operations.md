@@ -380,6 +380,82 @@ Executable backup/restore coverage is the
 it copies a cache into a new DATA directory, runs reconciliation, verification,
 and doctor, then starts the restored service before accepting readiness.
 
+### Optional ZFS snapshot and replication workflow
+
+ZFS operations stay outside Narjar. Substitute an explicitly verified dataset
+name for `pool/narjar-data`; never infer a production target from a mountpoint
+or copy these commands onto an unrelated pool.
+
+First confirm the DATA dataset, mountpoint, and policy before taking a snapshot:
+
+~~~sh
+dataset=pool/narjar-data
+pool=${dataset%%/*}
+test "$(zfs get -H -o value mountpoint "$dataset")" = /var/lib/narjar
+zfs get -H -o property,value \
+  mountpoint,compression,atime,sync,dedup,quota,refquota,refreservation \
+  "$dataset"
+~~~
+
+For a single DATA dataset, stopping Narjar and taking one snapshot gives a
+point-in-time application boundary. If DATA is split across child datasets,
+stop the service and use one recursive snapshot boundary; independent
+snapshots are not an atomic multi-dataset backup.
+
+~~~sh
+snapshot="narjar-$(date +%Y%m%d-%H%M%S)"
+systemctl stop narjar.service
+zfs snapshot -r "$dataset@$snapshot"
+zfs hold -r narjar:backup "$dataset@$snapshot"
+narjar verify --data-dir /var/lib/narjar
+systemctl start narjar.service
+~~~
+
+Record the dry-run stream size before sending. Send to a new, offline receive
+target and run `doctor`, `reconcile --verify-hashes`, and `verify` there before
+using it. An incremental stream requires that the destination retain the base
+snapshot; use `-R` for a recursive dataset tree.
+
+~~~sh
+target=backup/narjar-restore
+zfs send -nP -R "$dataset@$snapshot"
+zfs send -R "$dataset@$snapshot" | zfs receive -u "$target"
+
+base=narjar-previous
+next=narjar-next
+zfs snapshot -r "$dataset@$next"
+zfs send -nP -R -i "$dataset@$base" "$dataset@$next"
+zfs send -R -i "$dataset@$base" "$dataset@$next" | zfs receive -u "$target"
+~~~
+
+If a send or receive fails, keep the receive target offline and treat it as an
+incomplete restore; do not route Narjar to it. A successful ZFS receive proves
+that the stream was accepted by ZFS, not that Narjar's published pairs are
+complete. Restore validation remains an application-level `doctor`,
+`reconcile --verify-hashes`, `verify`, and fresh-client substitution sequence.
+
+Run a pool scrub separately from Narjar verification and retain the final pool
+status output. Scrub checks and, where configured, repairs ZFS block checksums;
+it does not validate narinfo signatures or NAR hashes.
+
+~~~sh
+zpool scrub "$pool"
+zpool status -v "$pool"
+zfs get -H -o property,value \
+  used,referenced,logicalused,logicalreferenced,compressratio,quota,refquota,refreservation \
+  "$dataset"
+~~~
+
+Report logical GC bytes, dataset referenced/logical bytes, compression ratio,
+and snapshot-held bytes separately. A quota or reservation alert is a capacity
+condition, not evidence that GC can reclaim the reported physical space. Release
+the backup hold only after the external retention policy has made that snapshot
+disposable.
+
+~~~sh
+zfs release -r narjar:backup "$dataset@$snapshot"
+~~~
+
 ## Deletion and retention GC
 
 `delete` supports offline logical deletion of one store hash:
