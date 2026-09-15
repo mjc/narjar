@@ -1,9 +1,6 @@
 use std::{
-    fs,
     io::{self, Write},
     net::{TcpListener, TcpStream},
-    os::unix::fs::PermissionsExt,
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -20,7 +17,7 @@ use narjar::{
     http_server::{Method, Request, StatusCode, write_status},
     inventory::Inventory,
     narinfo::TrustedPublicKeys,
-    storage::{NarUploadPolicy, StagingReservation, Storage, StorageError},
+    storage::{Directory, NarUploadPolicy, StagingReservation, Storage, StorageError},
 };
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -110,35 +107,31 @@ fn staging_reservation_status(error: &StorageError) -> u16 {
 }
 
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
-    if !fs::symlink_metadata(&config.data_dir)
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false)
-    {
-        return Err(Error::runtime(format!(
-            "data directory is not a directory: {}",
+    let root_directory =
+        Directory::open(&config.data_dir).map_err(|error| Error::runtime(error.to_string()))?;
+    root_directory.validate_initialized().map_err(|error| {
+        Error::runtime(format!(
+            "data directory is not initialized at {}: {error}",
             config.data_dir.display()
-        )));
-    }
-    require_initialized_data(&config.data_dir)?;
-
-    let storage = Arc::new(Storage::initialize(&config.data_dir).map_err(|error| {
+        ))
+    })?;
+    let storage = Arc::new(Storage::initialize(&root_directory).map_err(|error| {
         Error::runtime(format!(
             "cannot initialize data directory {}: {error}",
             config.data_dir.display()
         ))
     })?);
     let authorizer =
-        Arc::new(Authorizer::load(&config.data_dir).map_err(|error| {
+        Arc::new(Authorizer::load(&root_directory).map_err(|error| {
             Error::runtime(format!("cannot load authorization policy: {error}"))
         })?);
-    let trusted_keys_path = config.data_dir.join("trusted-public-keys");
-    let trusted_keys = TrustedPublicKeys::load(&trusted_keys_path)
+    let trusted_keys = TrustedPublicKeys::load(&root_directory)
         .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
     if storage
-        .recovery_required_for(&trusted_keys_path)
+        .recovery_required_for()
         .map_err(|error| Error::runtime(format!("cannot inspect cache recovery state: {error}")))?
     {
-        if !Inventory::can_serve_streaming(&config.data_dir, &trusted_keys)
+        if !Inventory::can_serve_streaming(&root_directory, &trusted_keys)
             .map_err(|error| Error::runtime(format!("cannot validate cache: {error}")))?
         {
             return Err(Error::runtime(
@@ -146,7 +139,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             ));
         }
         storage
-            .finish_recovery(&trusted_keys_path)
+            .finish_recovery()
             .map_err(|error| Error::runtime(format!("cannot complete cache recovery: {error}")))?;
     }
     let trusted_keys = Arc::new(trusted_keys);
@@ -364,92 +357,6 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-fn require_initialized_data(root: &Path) -> Result<(), Error> {
-    require_directory(root, "data directory")?;
-    for directory in [
-        "nar",
-        "nar/.tmp",
-        ".tmp",
-        "realisations",
-        "realisations/.tmp",
-        "auth",
-    ] {
-        require_directory(&root.join(directory), directory)?;
-    }
-    for file in ["nix-cache-info", "trusted-public-keys", "auth/write.tokens"] {
-        require_private_file(&root.join(file), file)?;
-    }
-
-    let clean = root.join(".narjar-clean");
-    let recovery = root.join(".narjar-recovery");
-    let clean_present = path_exists(&clean)?;
-    let recovery_present = path_exists(&recovery)?;
-    if clean_present {
-        require_private_file(&clean, ".narjar-clean")?;
-    }
-    if recovery_present {
-        require_private_file(&recovery, ".narjar-recovery")?;
-    }
-    if !clean_present && !recovery_present {
-        return Err(Error::runtime(
-            "data directory is not initialized; run `narjar init --data-dir ...`",
-        ));
-    }
-    Ok(())
-}
-
-fn require_directory(path: &Path, name: &str) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        Error::runtime(format!(
-            "{name} is unavailable at {}: {error}",
-            path.display()
-        ))
-    })?;
-    if !metadata.file_type().is_dir() {
-        return Err(Error::runtime(format!(
-            "{name} is not a directory: {}",
-            path.display()
-        )));
-    }
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(Error::runtime(format!(
-            "{name} has unsafe permissions: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn require_private_file(path: &Path, name: &str) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        Error::runtime(format!(
-            "{name} is unavailable at {}: {error}",
-            path.display()
-        ))
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(Error::runtime(format!(
-            "{name} is not a regular file: {}",
-            path.display()
-        )));
-    }
-    if metadata.permissions().mode() & 0o777 != 0o600 {
-        return Err(Error::runtime(format!(
-            "{name} must have 0600 permissions: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn path_exists(path: &Path) -> Result<bool, Error> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(Error::runtime(error.to_string())),
-    }
 }
 
 #[cfg(test)]

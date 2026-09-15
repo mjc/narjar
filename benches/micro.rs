@@ -10,9 +10,9 @@ use std::{
 
 use narjar::{
     http_server::Request,
-    inventory::Inventory,
+    inventory::{Inventory, VerificationMode},
     narinfo::TrustedPublicKeys,
-    storage::{NarObjectId, Storage},
+    storage::{Directory, NarObjectId, Storage},
 };
 
 const OBJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -35,7 +35,9 @@ fn run(name: &str, iterations: usize, mut operation: impl FnMut()) {
 }
 
 fn initialized_storage(root: &Path) -> Storage {
-    Storage::initialize(root).expect("initialize storage")
+    fs::create_dir_all(root).expect("create storage directory");
+    Storage::initialize(&Directory::open(root).expect("open storage directory"))
+        .expect("initialize storage")
 }
 
 fn bench_request_parse() {
@@ -107,10 +109,15 @@ fn bench_inventory() {
             .expect("write inventory NAR");
     }
     drop(storage);
+    let root = Directory::open(directory.path()).expect("open inventory root");
 
     run("inventory scan (256 NARs)", 20, || {
-        let inventory = Inventory::scan(directory.path(), &TrustedPublicKeys::default(), false)
-            .expect("scan inventory");
+        let inventory = Inventory::scan(
+            &root,
+            &TrustedPublicKeys::default(),
+            VerificationMode::Availability,
+        )
+        .expect("scan inventory");
         black_box(inventory.entries());
     });
 }

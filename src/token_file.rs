@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fmt,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
@@ -22,7 +22,7 @@ struct Record {
 
 impl TokenFile {
     pub fn load(path: &Path) -> Result<Option<Self>, Error> {
-        let mut file = match OpenOptions::new()
+        let file = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
@@ -31,6 +31,10 @@ impl TokenFile {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        Self::read(file).map(Some)
+    }
+
+    pub(crate) fn read(mut file: File) -> Result<Self, Error> {
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
             return Err(Error::InsecurePermissions);
@@ -59,7 +63,7 @@ impl TokenFile {
                 digest,
             });
         }
-        Ok(Some(Self(records)))
+        Ok(Self(records))
     }
 
     pub fn hashes(&self) -> impl Iterator<Item = &[u8; TOKEN_BYTES]> {
