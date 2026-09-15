@@ -2591,7 +2591,7 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
     assert!(startup_line.is_empty(), "{startup_line:?}");
     assert!(!status.success());
     assert!(
-        stderr.contains("published narinfo is not trusted"),
+        stderr.contains("published inventory contains an invalid narinfo/NAR pair"),
         "{stderr:?}"
     );
 }
@@ -3773,10 +3773,91 @@ fn dirty_start_rejects_a_malformed_published_narinfo() {
     ]);
     assert!(!output.status.success(), "dirty start must fail closed");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("published narinfo is not trusted"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("published inventory contains an invalid narinfo/NAR pair"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        data_dir.join(".narjar-recovery").exists(),
+        "failed recovery must retain its marker"
+    );
+}
+
+#[test]
+fn dirty_start_rejects_a_published_narinfo_without_its_nar() {
+    let data_dir = init_data_dir("dirty-start-missing-nar");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::remove_file(data_dir.join(".narjar-clean")).expect("clean marker should be removed");
+    let recovery = data_dir.join(".narjar-recovery");
+    fs::write(&recovery, b"").expect("recovery marker should be created");
+    fs::set_permissions(
+        &recovery,
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("recovery marker should be private");
+    fs::write(
+        data_dir.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("signed narinfo should be written");
+
+    let output = run(&[
+        "serve",
+        "--data-dir",
+        data_dir.to_str().expect("temporary path should be UTF-8"),
+        "--listen",
+        "127.0.0.1:0",
+    ]);
+    assert!(!output.status.success(), "dirty start must fail closed");
+    assert!(
+        data_dir.join(".narjar-recovery").exists(),
+        "failed recovery must retain its marker"
+    );
+}
+
+#[test]
+fn dirty_start_rejects_a_published_narinfo_with_the_wrong_nar_size() {
+    let data_dir = init_data_dir("dirty-start-wrong-nar-size");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("NAR should be written");
+    fs::write(
+        data_dir.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64 + 1),
+    )
+    .expect("signed narinfo should be written");
+    fs::remove_file(data_dir.join(".narjar-clean")).expect("clean marker should be removed");
+    let recovery = data_dir.join(".narjar-recovery");
+    fs::write(&recovery, b"").expect("recovery marker should be created");
+    fs::set_permissions(
+        &recovery,
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("recovery marker should be private");
+
+    let output = run(&[
+        "serve",
+        "--data-dir",
+        data_dir.to_str().expect("temporary path should be UTF-8"),
+        "--listen",
+        "127.0.0.1:0",
+    ]);
+    assert!(!output.status.success(), "dirty start must fail closed");
     assert!(
         data_dir.join(".narjar-recovery").exists(),
         "failed recovery must retain its marker"
