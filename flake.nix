@@ -55,6 +55,7 @@
             extensions = [
               "rust-src"
               "rust-analyzer-preview"
+              "clippy-preview"
             ];
           }
           // lib.optionalAttrs (targets != [ ]) { inherit targets; }
