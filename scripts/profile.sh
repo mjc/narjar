@@ -31,7 +31,7 @@ Options:
   -h, --help         Show this help
 
 Run from the development shell, for example:
-  nix develop --command scripts/profile.sh --size-gib 20
+  devenv shell -- scripts/profile.sh --size-gib 20
 EOF
 }
 
@@ -52,7 +52,7 @@ done
 
 for command in cargo curl heaptrack heaptrack_print inferno-collapse-perf inferno-flamegraph nix nix-store perf setsid wrk; do
   command -v "$command" >/dev/null || {
-    echo "missing '$command'; run this inside 'nix develop'" >&2
+    echo "missing '$command'; run this inside 'devenv shell'" >&2
     exit 1
   }
 done

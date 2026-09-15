@@ -27,7 +27,7 @@ allocator profile.
 The reproducible probe commands were:
 
 ```sh
-nix develop /home/mjc/projects/narjar -c env RUSTC_WRAPPER= cargo build --release
+devenv shell -- env RUSTC_WRAPPER= cargo build --release
 GIX_PROBE_LARGE_SIZE=1073741824 target/release/narjar-gix-probe
 GIX_PROBE_STREAM_READERS=32 target/release/narjar-gix-probe
 ```

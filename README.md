@@ -178,5 +178,6 @@ devenv shell -- scripts/parse_perfdata \
 - `scripts/` — profiling and profile-analysis tools
 - `docs/` — protocol, architecture, operations, verification, and risk notes
 
-Keep changes reproducible: use the flake toolchain, keep `Cargo.lock` and
-`flake.lock` committed, and sign commits with GPG.
+Keep changes reproducible: use the pinned development toolchain, keep
+`Cargo.lock`, `flake.lock`, and `devenv.lock` committed, and sign commits with
+GPG.
