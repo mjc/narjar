@@ -236,7 +236,10 @@ If a process stops during publication, the transaction record keeps the
 temporary path and durable state recoverable without making an incomplete final
 object visible. Startup validates the published inventory, validates each
 record, removes recorded temporary state, and only then writes the clean
-marker. Concurrent writers still use private temporary files and atomic
+marker. During that recovery check, every trusted narinfo must have a regular
+referenced NAR whose encoded size matches the metadata; startup does not rehash
+the payload because upload validation already established its content hash.
+Concurrent writers still use private temporary files and atomic
 link-no-replace, so a retry is identical success or a deterministic conflict.
 
 ## Durable upload state machine
