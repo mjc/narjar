@@ -5,8 +5,9 @@ the real-Nix corpus. It exports uncompressed NAR streams and records both the
 Nix `narHash`/`narSize` and a SHA-256 of the exact exported bytes.
 It is a self-contained Bash script: `devenv shell` provides its only
 non-core utility, `jq`; it has no Python, Cargo, or Rust-crate dependency.
-The harness prints every external command to stderr, so regeneration logs
-preserve the exact build, closure, and byte-export commands.
+The harness prints every external command to stderr. Pass `--log FILE` to
+also persist the exact shell-escaped build, closure, and byte-export commands
+without relying on manual stderr redirection.
 
 Start from `benchmarks/corpus-spec.example.json`, replace the pinned commits,
 flake attributes, and (when already materialized) generation roots, and add one
@@ -22,7 +23,8 @@ scripts/nix-corpus collect \
   --spec benchmarks/corpus-spec.json \
   --manifest benchmarks/corpus-manifest.json \
   --export-dir /path/to/uncompressed-nars \
-  --build
+  --build \
+  --log /path/to/corpus-collect.commands
 
 scripts/nix-corpus validate \
   --manifest benchmarks/corpus-manifest.json \
@@ -84,5 +86,5 @@ or null requirement values fail schema validation.
 valid exported artifact, schema-only validation through a reduced tool path
 without opening an artifact, target and artifact metadata rejection, duplicate
 and unknown subset paths, coverage requirements, sorted input overrides,
-collection into a manifest, and byte-for-byte store rechecks through mocked Nix
-commands.
+collection into a manifest, command-log persistence, and byte-for-byte store
+rechecks through mocked Nix commands.
