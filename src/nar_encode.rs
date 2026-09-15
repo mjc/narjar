@@ -43,7 +43,14 @@ impl fmt::Display for EncodeError {
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl std::error::Error for EncodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Invalid(_) | Self::NonCanonical(_) | Self::LimitExceeded { .. } => None,
+        }
+    }
+}
 
 /// Representation-neutral events accepted by [`Encoder`].
 pub enum Event<'a> {

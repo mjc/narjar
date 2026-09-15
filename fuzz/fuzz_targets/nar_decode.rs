@@ -1,6 +1,6 @@
 #![no_main]
 
-use std::io;
+use std::convert::Infallible;
 
 use libfuzzer_sys::fuzz_target;
 use narjar::nar::{Decoder, Event, EventSink, Limits};
@@ -8,7 +8,9 @@ use narjar::nar::{Decoder, Event, EventSink, Limits};
 struct Sink;
 
 impl EventSink for Sink {
-    fn event(&mut self, _event: Event<'_>) -> io::Result<()> {
+    type Error = Infallible;
+
+    fn event(&mut self, _event: Event<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
 }

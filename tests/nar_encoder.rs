@@ -221,3 +221,20 @@ fn handles_faulting_writers_and_invariant_chunking() {
         Err(EncodeError::Io(_))
     ));
 }
+
+#[test]
+fn encode_error_exposes_the_writer_error_as_its_source() {
+    let mut encoder = Encoder::new(FailingWriter { remaining: 64 }).expect("header");
+    let error = encoder
+        .push(Event::BeginFile {
+            executable: false,
+            size: 0,
+        })
+        .expect_err("the writer should fail");
+
+    assert!(matches!(error, EncodeError::Io(_)));
+    let source = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<io::Error>())
+        .expect("the writer error should be exposed as the source");
+    assert_eq!(source.kind(), io::ErrorKind::BrokenPipe);
+}

@@ -123,6 +123,23 @@ impl EventSink for NeverFailure {
     }
 }
 
+struct LateFailure {
+    events: usize,
+}
+
+impl EventSink for LateFailure {
+    type Error = EncodeError;
+
+    fn event(&mut self, event: Event<'_>) -> Result<(), Self::Error> {
+        self.events += 1;
+        if matches!(event, Event::FileChunk(_)) {
+            Err(EncodeError::Invalid("late sink failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl Read for Chunked<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.offset == self.data.len() {
@@ -202,6 +219,66 @@ fn decoder_preserves_each_event_sink_error_type() {
     let mut decoder = Decoder::new(io::Cursor::new(&data));
     let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
     assert!(result.is_ok(), "the never sink cannot fail");
+}
+
+#[test]
+fn closure_sinks_use_their_declared_error_types() {
+    let data = archive(regular(b"hello", false));
+
+    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let mut encode_sink = |_: Event<'_>| Err::<(), _>(EncodeError::Invalid("closure failure"));
+    let error = decoder
+        .decode(&mut encode_sink)
+        .expect_err("the encoding closure should fail");
+    assert!(matches!(
+        error,
+        DecodeError::Sink(EncodeError::Invalid("closure failure"))
+    ));
+
+    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let mut infallible_sink = |_: Event<'_>| Ok::<(), Infallible>(());
+    let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut infallible_sink);
+    assert!(result.is_ok(), "the infallible closure cannot fail");
+}
+
+#[test]
+fn infallible_sink_does_not_hide_decoder_errors() {
+    let data = archive(regular(b"hello", false));
+
+    let mut truncated = data.clone();
+    truncated.pop();
+    let mut decoder = Decoder::new(io::Cursor::new(truncated));
+    let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
+    assert!(matches!(result, Err(DecodeError::Io(_))));
+
+    let invalid = archive(node(b"unknown", Vec::new()));
+    let mut decoder = Decoder::new(io::Cursor::new(invalid));
+    let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
+    assert!(matches!(result, Err(DecodeError::Invalid(_))));
+
+    let limits = Limits {
+        max_total_bytes: (data.len() - 1) as u64,
+        ..Limits::default()
+    };
+    let mut decoder = Decoder::with_limits(io::Cursor::new(data), limits);
+    let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
+    assert!(matches!(result, Err(DecodeError::LimitExceeded { .. })));
+}
+
+#[test]
+fn sink_failure_after_progress_stops_event_delivery() {
+    let data = archive(regular(b"hello", false));
+    let mut decoder = Decoder::new(io::Cursor::new(data));
+    let mut sink = LateFailure { events: 0 };
+    let error = decoder
+        .decode(&mut sink)
+        .expect_err("the later sink event should fail");
+
+    assert!(matches!(
+        error,
+        DecodeError::Sink(EncodeError::Invalid("late sink failure"))
+    ));
+    assert_eq!(sink.events, 2, "no event should follow the failed chunk");
 }
 
 #[test]
