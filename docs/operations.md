@@ -346,6 +346,11 @@ serving process is stopped and the DATA lease is released. A live `rsync` is
 convergent synchronization, not a point-in-time backup: it may capture a NAR
 and its narinfo at different moments.
 
+For a live convergent copy when downtime is not available, exclude all `.tmp`
+directories and run `verify` on the destination before using it. This is not a
+substitute for the stopped-service procedure when a strict point-in-time
+boundary is required.
+
 For a consistent portable copy:
 
 1. Stop Narjar and wait for the process to exit.
@@ -618,33 +623,3 @@ podman run --rm --read-only \
 The archive sets only the standard image entrypoint, command, user, port,
 working directory, and volume metadata. TLS, credentials, and bind mounts remain
 orchestrator concerns; Narjar does not inspect a Docker-specific environment.
-
-## Backup and restore
-
-Because published files are immutable, a live backup can exclude every `.tmp`
-directory and then verify the copy. Stop the service or snapshot the filesystem after
-flushing when a strict point-in-time boundary is required:
-
-~~~sh
-backup="/srv/backup/narjar-$(date +%F)"
-install -d -m 0700 "$backup"
-rsync -a --exclude='/.tmp/' /var/lib/narjar/ "$backup/"
-nix run . -- verify --data-dir "$backup"
-~~~
-
-Restore into a new mode-0700 directory, restore token hashes and trusted public
-keys through the secret manager, verify, and only then point the service at the
-restored directory:
-
-~~~sh
-restore=/var/lib/narjar-restore
-install -d -m 0700 "$restore"
-rsync -a --exclude='/.tmp/' "$backup/" "$restore/"
-nix run . -- verify --data-dir "$restore"
-~~~
-
-The [`restored_cache_verifies_before_serving`](../tests/cli.rs) integration test
-exercises this copy, verification, and serving sequence. Missing-NAR findings
-require reupload or narinfo quarantine before readiness. A backup contains no
-producer private key or plaintext token, but token hashes and trust policy
-remain security-sensitive.

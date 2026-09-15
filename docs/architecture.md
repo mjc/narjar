@@ -1,7 +1,7 @@
 # Narjar v0.1 architecture and trust decisions
 
-Status: design-gate draft for NARJ-4 through NARJ-12. No implementation is
-authorized by this document until NARJ-20 approves it.
+Status: accepted v0.1 architecture; implementation and operational follow-up
+remain subject to the evidence gates recorded below.
 
 ## Decision
 
@@ -287,12 +287,18 @@ negative cache until --refresh; the server cannot invalidate client caches.
 - Multiple HTTP ranges or conditional mutation.
 - Availability guarantees across multiple processes or hosts.
 
-## Open blockers before NARJ-20
+## Open follow-up evidence gates
 
-- Decide whether client-signature verification can use a small audited Nix
-  fingerprint implementation or requires importing a larger parser crate.
-- Freeze realisation support as required or explicit v0.1 non-goal from a real
-  client trace.
-- Demonstrate proxy limits with request buffering disabled.
-- Produce matched Narjar-versus-bincache startup, idle RSS, upload CPU, and
-  stored-size estimates before choosing greenfield implementation.
+The v0.1 flat-storage decision is accepted; these items qualify the remaining
+deployment and architecture claims rather than reopening the serving contract:
+
+- Complete the clean-host real-Nix and cross-host evidence for the native push
+  path (NARJ-111/NARJ-112), including any current static Linux packaging gap.
+- Complete the filesystem/ZFS profile and operator drill (NARJ-67 through
+  NARJ-73) before making filesystem-specific performance, space, or recovery
+  claims.
+- Keep the per-publication recovery measurements in NARJ-110 as evidence for
+  concurrency and memory claims; the implementation does not depend on those
+  measurements to preserve its correctness invariants.
+- Keep the semantic-storage investigation (NARJ-74) separate; it remains the
+  gate for any parsed-NAR or content-addressed replacement.
