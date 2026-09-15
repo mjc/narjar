@@ -304,6 +304,7 @@
             test -f ${repositorySrc}/src/main.rs
             test -f ${repositorySrc}/flake.nix
             test -f ${repositorySrc}/flake.lock
+            test -f ${repositorySrc}/AGENTS.md
             test -f ${repositorySrc}/.envrc
             test -f ${repositorySrc}/devenv.nix
             test -f ${repositorySrc}/devenv.yaml
