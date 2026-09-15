@@ -116,11 +116,12 @@ credential handling, see [the backup and restore runbook](docs/operations.md#bac
 
 ## Build and test
 
-Nix supplies the pinned Rust toolchain, vendored Cargo dependencies, and native
-tools used by the project:
+devenv supplies the pinned Rust toolchain and native development tools. Nix
+continues to supply vendored Cargo dependencies and the reproducible build and
+test outputs:
 
 ```sh
-nix develop
+devenv shell
 cargo fmt --all -- --check
 cargo test --locked
 nix flake check -L --no-update-lock-file
@@ -151,7 +152,7 @@ the filesystem is not the read bottleneck. Use `--hot-nar-max-gib` to change
 that tmpfs NAR ceiling:
 
 ```sh
-nix develop --command scripts/profile.sh --size-gib 20 --seconds 60
+devenv shell -- scripts/profile.sh --size-gib 20 --seconds 60
 ```
 
 The script prints an output directory such as `/tmp/narjar-profile.XXXXXX`.
@@ -163,9 +164,9 @@ workload uses `compression=none` and sends `Accept-Encoding: identity`.
 The copied analysis helpers can summarize the results without opening a GUI:
 
 ```sh
-nix develop --command scripts/parse_flamegraph \
+devenv shell -- scripts/parse_flamegraph \
   /tmp/narjar-profile.XXXXXX/flamegraph.svg summary
-nix develop --command scripts/parse_perfdata \
+devenv shell -- scripts/parse_perfdata \
   /tmp/narjar-profile.XXXXXX/perf.data --max-stack 128
 ```
 
