@@ -363,6 +363,11 @@ the recovery marker, trust material, and credentials according to that same
 policy. A corrupt or incomplete copy must remain offline: `doctor`,
 `reconcile`, or `verify` must pass before readiness is considered meaningful.
 
+Executable backup/restore coverage is the
+[`restored_cache_verifies_before_serving`](../tests/cli.rs) integration test;
+it copies a cache into a new DATA directory, runs reconciliation, verification,
+and doctor, then starts the restored service before accepting readiness.
+
 ## Deletion and retention GC
 
 `delete` supports offline logical deletion of one store hash:
@@ -435,6 +440,10 @@ Required series:
   reports its read-only flag. These are O(1) descriptor queries and omit the
   series when the destination probe fails.
 - narjar_ready 0/1
+
+The [`health_readiness_metrics_and_stats_follow_the_operator_contract`](../tests/cli.rs)
+integration test exercises the metric output and readiness transitions; the
+metric implementation is in [`src/metrics.rs`](../src/metrics.rs).
 
 Labels are fixed enums; no request IDs, paths, token names, or hashes become
 metric labels.
@@ -627,8 +636,8 @@ rsync -a --exclude='/.tmp/' "$backup/" "$restore/"
 nix run . -- verify --data-dir "$restore"
 ~~~
 
-The `restored_cache_verifies_before_serving` integration test exercises this
-copy, verification, and serving sequence. Missing-NAR findings require reupload
-or narinfo quarantine before readiness. A backup contains no producer private
-key or plaintext token, but token hashes and trust policy remain
-security-sensitive.
+The [`restored_cache_verifies_before_serving`](../tests/cli.rs) integration test
+exercises this copy, verification, and serving sequence. Missing-NAR findings
+require reupload or narinfo quarantine before readiness. A backup contains no
+producer private key or plaintext token, but token hashes and trust policy
+remain security-sensitive.
