@@ -135,7 +135,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .map_err(|error| Error::runtime(format!("cannot validate cache: {error}")))?
         {
             return Err(Error::runtime(
-                "cannot activate trusted public keys: published narinfo is not trusted",
+                "cannot recover cache before serving: published inventory contains an invalid narinfo/NAR pair",
             ));
         }
         storage

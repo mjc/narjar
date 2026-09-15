@@ -2591,7 +2591,7 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
     assert!(startup_line.is_empty(), "{startup_line:?}");
     assert!(!status.success());
     assert!(
-        stderr.contains("published narinfo is not trusted"),
+        stderr.contains("published inventory contains an invalid narinfo/NAR pair"),
         "{stderr:?}"
     );
 }
@@ -3773,7 +3773,8 @@ fn dirty_start_rejects_a_malformed_published_narinfo() {
     ]);
     assert!(!output.status.success(), "dirty start must fail closed");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("published narinfo is not trusted"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("published inventory contains an invalid narinfo/NAR pair"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
