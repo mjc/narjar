@@ -3,11 +3,12 @@
 This is deliberately a separate fuzz crate. It exercises the research decoder
 without adding fuzzing dependencies to the Narjar production package.
 
-Install `cargo-fuzz`, then run:
+Enter `devenv shell`; it provides `cargo-fuzz` and the pinned nightly compiler
+path in `NARJAR_FUZZ_RUSTC`. Then run:
 
 ```sh
 cd fuzz
-RUSTC="$(rustup which rustc --toolchain nightly)" cargo fuzz run nar_decode -- \
+RUSTC="$NARJAR_FUZZ_RUSTC" cargo fuzz run nar_decode -- \
   -max_len=1048576 \
   -timeout=5 \
   -rss_limit_mb=256
@@ -17,7 +18,7 @@ The encoder state-machine target uses the same bounded limits while mutating
 directory/file/symlink events:
 
 ```sh
-RUSTC="$(rustup which rustc --toolchain nightly)" cargo fuzz run nar_encode -- \
+RUSTC="$NARJAR_FUZZ_RUSTC" cargo fuzz run nar_encode -- \
   -max_len=65536 \
   -timeout=5 \
   -rss_limit_mb=256
@@ -35,7 +36,7 @@ they do not touch a real cache:
 
 ```sh
 for target in http_request auth_request narinfo cache_info xz_upload zstd_upload; do
-  RUSTC="$(rustup which rustc --toolchain nightly)" cargo fuzz run "$target" -- \
+  RUSTC="$NARJAR_FUZZ_RUSTC" cargo fuzz run "$target" -- \
     -max_len=1048576 -timeout=5 -rss_limit_mb=256
 done
 ```
