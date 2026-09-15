@@ -536,6 +536,29 @@ metric implementation is in [`src/metrics.rs`](../src/metrics.rs).
 Labels are fixed enums; no request IDs, paths, token names, or hashes become
 metric labels.
 
+## Filesystem support boundary
+
+Narjar's required filesystem contract is limited to regular files and
+directories, no-follow path checks, file and directory sync, same-filesystem
+no-replace hard links, unlink, enumeration, and an exclusive local lease. The
+service does not detect or configure a filesystem-specific backend.
+
+| Environment | Current classification | Meaning |
+| --- | --- | --- |
+| Linux ext4 root in the NixOS VM check | exercised portable lane | The default module test covers the ordinary `/var/lib/narjar` path and service ordering. |
+| XFS, btrfs, ZFS, and Darwin APFS | unverified host-specific behavior | Do not turn successful unit tests or a deployment anecdote into a support guarantee. |
+| tmpfs | non-persistent fixture only | Useful for tests; it is not a durable cache or a backup target. |
+| bind-mounted DATA | depends on the mounted underlying filesystem | Validate the mounted DATA path and its ownership; the container/image filesystem is not the storage contract. |
+| overlay, NFS, SMB, and FUSE | unsupported or unverified | Do not use them for a claimed production deployment without a conformance result for link, lock, sync, and transaction-recovery semantics. |
+
+For a Narjar-only ZFS dataset, the conservative provisional posture is
+`sync=standard`, checksums enabled, `dedup=off`, `atime=off`, the default record
+size and cache topology, and no special vdev or SLOG requirement. `compression=lz4`
+is the conservative candidate; any zstd level, non-default recordsize, ARC
+policy, deduplication, or other tuning is optional and unapproved until the
+corresponding measured evidence exists. `sync=disabled` is a durability
+violation warning, not a performance recommendation.
+
 ## Graceful shutdown
 
 SIGINT/SIGTERM set a shutdown flag, stop admitting new requests, and wait up to
