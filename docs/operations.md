@@ -551,14 +551,15 @@ dependency. Narjar never mounts or creates the dataset.
 The NixOS VM check performs state initialization and HTTP requests under those
 restrictions, and verifies the credential and state modes.
 
-The separate `filesystem-conformance` NixOS check exercises a real empty
-block device formatted as ext4 and a tmpfs DATA mount. It verifies initial
-layout creation, restart/reopen across an unmount/remount, and HTTP service.
-The existing NixOS module check separately verifies refusal when a declared
-DATA mount is unavailable. XFS, btrfs, ZFS, overlay, bind-mount variants,
-quota/inode exhaustion, read-only remounts, and Darwin APFS remain unverified
-until host-specific lanes provide those fixtures; they must not be advertised
-as covered by the portable check.
+The `nixos-module` NixOS VM check exercises the service with its default
+`/var/lib/narjar` DATA path on the VM's ext4 root. It verifies initialization,
+credential/state modes, restart, HTTP health/readiness, and the systemd
+hardening contract. The separate module-evaluation check covers valid and
+invalid `dataDir` declarations. There is currently no dedicated block-device,
+tmpfs, unmount/remount, or cross-filesystem conformance lane. XFS, btrfs, ZFS,
+overlay, bind-mount variants, quota/inode exhaustion, read-only remounts, and
+Darwin APFS remain unverified until host-specific lanes provide those fixtures;
+they must not be advertised as covered by the portable checks.
 
 `GET /healthz` is the liveness endpoint. `GET /readyz` is the readiness
 endpoint and requires a read token when private-read mode is enabled. Socket

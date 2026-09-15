@@ -47,6 +47,9 @@ TLS reverse proxy -> Narjar -> immutable files
 Narjar knows Nix binary-cache metadata and NAR hashes. It does not know how to
 build, realise, register, mount, or garbage-collect a native Nix store.
 
+The required DATA filesystem capabilities and rejected filesystem integrations
+are recorded in the [portable filesystem capability ADR](filesystem-capability-adr.md).
+
 ## Chosen trust model: client-signed ingestion
 
 A producer must sign the store path before upload. Narjar accepts configured
