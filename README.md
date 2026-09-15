@@ -127,6 +127,28 @@ cargo test --locked
 nix flake check -L --no-update-lock-file
 ```
 
+The same checks are available as devenv tasks:
+
+```sh
+devenv tasks run check:fmt
+devenv tasks run check:clippy
+devenv tasks run check:test
+devenv tasks run check:nextest
+devenv tasks run check:shell
+devenv tasks run check:flake
+```
+
+The fuzz helpers use the pinned nightly compiler:
+
+```sh
+devenv tasks run fuzz:list           # list available fuzz targets
+devenv tasks run fuzz:build          # build nar_decode with the pinned nightly
+```
+
+Start a loopback development server with a disposable cache using
+`devenv processes up narjar`. It listens on `127.0.0.1:5000` and stores its
+data under `.devenv/state`.
+
 Useful flake outputs on supported systems:
 
 ```sh
