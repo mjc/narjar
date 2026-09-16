@@ -1558,28 +1558,14 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
     assert!(!storage.delete_narinfo(&store).expect("repeat delete"));
 }
 
-static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
-
-struct TestDir(PathBuf);
+struct TestDir(tempfile::TempDir);
 
 impl TestDir {
     fn new() -> Self {
-        let path = env::temp_dir().join(format!(
-            "narjar-storage-test-{}-{}",
-            process::id(),
-            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).expect("create test directory");
-        Self(path)
+        Self(tempfile::tempdir().expect("create test directory"))
     }
 
     fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).expect("remove test directory");
+        self.0.path()
     }
 }
