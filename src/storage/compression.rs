@@ -796,20 +796,13 @@ pub(super) fn compressed_nar_matches(
 pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation) -> io::Result<bool> {
     match expectation {
         NarExpectation::Raw(identity) => raw_nar_file_matches(file, identity),
-        NarExpectation::Compressed(expectation) => compressed_nar_file_matches(file, expectation),
+        NarExpectation::Compressed(expectation) => compressed_nar_matches(file, expectation),
     }
 }
 
 fn raw_nar_file_matches(file: &File, identity: NarIdentity) -> io::Result<bool> {
     let expected_hash = identity.hash().to_string();
     file_matches(file, &expected_hash, identity.size().get())
-}
-
-fn compressed_nar_file_matches(
-    file: &File,
-    expectation: CompressedNarExpectation,
-) -> io::Result<bool> {
-    compressed_nar_matches(file, expectation)
 }
 
 pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Result<bool> {
