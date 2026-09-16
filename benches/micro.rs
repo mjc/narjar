@@ -122,8 +122,75 @@ fn bench_inventory() {
     });
 }
 
+fn find_header_end_rescanning(input: &[u8], chunk_size: usize) -> Option<usize> {
+    let mut received = 0;
+    for chunk in input.chunks(chunk_size) {
+        received += chunk.len();
+        if let Some(offset) = input[..received]
+            .array_windows::<4>()
+            .position(|window| window == b"\r\n\r\n")
+        {
+            return Some(offset + 4);
+        }
+    }
+    None
+}
+
+fn find_header_end_incrementally(input: &[u8], chunk_size: usize) -> Option<usize> {
+    let mut received = 0;
+    let mut scanned_until: usize = 0;
+    for chunk in input.chunks(chunk_size) {
+        received += chunk.len();
+        let search_start = scanned_until.saturating_sub(3);
+        if let Some(offset) = input[search_start..received]
+            .array_windows::<4>()
+            .position(|window| window == b"\r\n\r\n")
+        {
+            return Some(search_start + offset + 4);
+        }
+        scanned_until = received;
+    }
+    None
+}
+
+fn assert_header_scan_equivalence() {
+    for prefix_len in 0..=4096 {
+        let mut input = vec![b'x'; prefix_len];
+        input.extend_from_slice(b"\r\n\r\n");
+        let expected = Some(prefix_len + 4);
+        assert_eq!(find_header_end_rescanning(&input, 64), expected);
+        assert_eq!(find_header_end_incrementally(&input, 64), expected);
+    }
+
+    let without_terminator = vec![b'x'; 4096];
+    assert_eq!(find_header_end_rescanning(&without_terminator, 64), None);
+    assert_eq!(find_header_end_incrementally(&without_terminator, 64), None);
+}
+
+fn bench_header_scanning() {
+    const ITERATIONS: usize = 100;
+    let mut input = vec![b'x'; 4096];
+    input.extend_from_slice(b"\r\n\r\n");
+
+    for (chunk_size, rescan_name, incremental_name) in [
+        (1, "header rescan (1 B)", "header incremental (1 B)"),
+        (4, "header rescan (4 B)", "header incremental (4 B)"),
+        (64, "header rescan (64 B)", "header incremental (64 B)"),
+        (1024, "header rescan (1 KiB)", "header incremental (1 KiB)"),
+    ] {
+        run(rescan_name, ITERATIONS, || {
+            black_box(find_header_end_rescanning(&input, chunk_size));
+        });
+        run(incremental_name, ITERATIONS, || {
+            black_box(find_header_end_incrementally(&input, chunk_size));
+        });
+    }
+}
+
 fn main() {
     println!("narjar microbenchmarks (custom std::time harness)");
+    assert_header_scan_equivalence();
+    bench_header_scanning();
     bench_request_parse();
     bench_storage();
     bench_startup();

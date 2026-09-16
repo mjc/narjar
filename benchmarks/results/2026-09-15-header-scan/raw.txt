@@ -1,0 +1,53 @@
+Command: devenv shell -- cargo bench --locked --bench micro 2>&1 | rg 'header (rescan|incremental)'
+Iterations: 100 per row
+Input: 4096 bytes of non-terminator data followed by CRLFCRLF
+
+Sample 1
+header rescan (1 B)           100 iterations    4453725.1 ns/op
+header incremental (1 B)      100 iterations       9133.0 ns/op
+header rescan (4 B)           100 iterations    1077784.8 ns/op
+header incremental (4 B)      100 iterations       4818.6 ns/op
+header rescan (64 B)          100 iterations      75608.5 ns/op
+header incremental (64 B)      100 iterations       2384.3 ns/op
+header rescan (1 KiB)          100 iterations       8285.7 ns/op
+header incremental (1 KiB)     100 iterations       2010.8 ns/op
+
+Sample 2
+header rescan (1 B)           100 iterations    4322580.1 ns/op
+header incremental (1 B)      100 iterations       6214.1 ns/op
+header rescan (4 B)           100 iterations     954210.0 ns/op
+header incremental (4 B)      100 iterations       2345.9 ns/op
+header rescan (64 B)          100 iterations      54570.4 ns/op
+header incremental (64 B)      100 iterations       2148.5 ns/op
+header rescan (1 KiB)         100 iterations       5854.3 ns/op
+header incremental (1 KiB)      100 iterations        985.2 ns/op
+
+Sample 3
+header rescan (1 B)           100 iterations    4118656.0 ns/op
+header incremental (1 B)      100 iterations       5653.0 ns/op
+header rescan (4 B)           100 iterations    1056768.8 ns/op
+header incremental (4 B)      100 iterations       2310.8 ns/op
+header rescan (64 B)          100 iterations      53494.3 ns/op
+header incremental (64 B)      100 iterations       1266.6 ns/op
+header rescan (1 KiB)          100 iterations       5607.3 ns/op
+header incremental (1 KiB)     100 iterations        963.6 ns/op
+
+Sample 4
+header rescan (1 B)           100 iterations    4472481.2 ns/op
+header incremental (1 B)      100 iterations       8284.8 ns/op
+header rescan (4 B)           100 iterations    1135926.4 ns/op
+header incremental (4 B)      100 iterations       2340.2 ns/op
+header rescan (64 B)          100 iterations      53912.8 ns/op
+header incremental (64 B)      100 iterations       1266.8 ns/op
+header rescan (1 KiB)          100 iterations       5584.6 ns/op
+header incremental (1 KiB)      100 iterations        961.2 ns/op
+
+Sample 5
+header rescan (1 B)           100 iterations    4204837.5 ns/op
+header incremental (1 B)      100 iterations      10243.1 ns/op
+header rescan (4 B)           100 iterations    1089436.0 ns/op
+header incremental (4 B)      100 iterations       3646.2 ns/op
+header rescan (64 B)          100 iterations      62565.5 ns/op
+header incremental (64 B)      100 iterations       2136.8 ns/op
+header rescan (1 KiB)          100 iterations       6405.6 ns/op
+header incremental (1 KiB)      100 iterations       2054.2 ns/op
