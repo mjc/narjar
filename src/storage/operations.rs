@@ -15,11 +15,12 @@ use std::{
 };
 
 use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation, ValidatedNarInfo};
+use crate::object::FileHash;
 
 use super::{
     compression::{
-        CheckedUploadReader, ValidationEvidence, nar_encoding, nar_file_size_matches,
-        validate_compressed_nar, validate_xz, validate_zstd, validation_file_name,
+        CheckedUploadReader, IngestionReceipt, ingestion_receipt_file_name, nar_file_size_matches,
+        normalize_upload,
     },
     directory::Directory,
     fs::{
@@ -34,7 +35,7 @@ use super::{
         PublishedPair, StagingReservation, StorageError, TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
-    recovery::{PublicationState, RecoveryState},
+    recovery::{PublicationState, PublicationTransaction, RecoveryState},
     state::Storage,
 };
 
@@ -43,7 +44,8 @@ use super::publication::{Layout, injected_fault};
 
 const MAX_CACHE_INFO_BYTES: u64 = 1024;
 pub(super) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
-pub(super) const MAX_VALIDATION_EVIDENCE_BYTES: u64 = 256;
+pub(super) const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
+pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
 
 fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
     if bytes.len() as u64 > MAX_CACHE_INFO_BYTES {
@@ -124,6 +126,11 @@ impl Storage {
             &root_directory,
             OsStr::new(VALIDATION_DIRECTORY),
             "validation evidence directory",
+        )?;
+        ensure_directory_at(
+            &root_directory,
+            OsStr::new(INGESTION_RECEIPT_DIRECTORY),
+            "compressed ingestion receipt directory",
         )?;
 
         root_directory.sync_all()?;
@@ -219,48 +226,78 @@ impl Storage {
             let directory = self.nar_temp_directory()?;
             filesystem_space(&directory)?.required_capacity(required_bytes)
         };
-        let validate = |file: &File| -> Result<Option<ValidationEvidence>, StorageError> {
-            match encoding {
-                NarEncoding::None => Ok(None),
-                NarEncoding::Zstd => validate_zstd(file, None, None, policy.max_bytes)
-                    .map(|decoded| {
-                        Some(ValidationEvidence::from_decoded(
-                            encoding,
-                            id.clone(),
-                            expected_length,
-                            decoded,
-                        ))
-                    })
-                    .map_err(Into::into),
-                NarEncoding::Xz => validate_xz(file, None, None, policy.max_bytes)
-                    .map(|decoded| {
-                        Some(ValidationEvidence::from_decoded(
-                            encoding,
-                            id.clone(),
-                            expected_length,
-                            decoded,
-                        ))
-                    })
-                    .map_err(Into::into),
+        match encoding {
+            NarEncoding::None => {
+                let file_hash = FileHash::parse(id.as_str())
+                    .expect("validated upload path is a SHA-256 file hash");
+                self.publish_with_admission(
+                    PublishTarget::Nar(id, encoding),
+                    CheckedUploadReader::new(source, &file_hash, expected_length),
+                    admit,
+                    |_| Ok(()),
+                )
+            }
+            NarEncoding::Zstd | NarEncoding::Xz => {
+                self.publish_normalized_nar(id, encoding, source, expected_length, policy, admit)
+            }
+        }
+    }
+
+    fn publish_normalized_nar(
+        &self,
+        encoded_id: &NarObjectId,
+        encoding: NarEncoding,
+        source: impl Read,
+        encoded_size: u64,
+        policy: NarUploadPolicy,
+        admit: impl FnOnce() -> Result<(), StorageError>,
+    ) -> Result<PublishOutcome, StorageError> {
+        let encoded_hash = FileHash::parse(encoded_id.as_str())
+            .expect("validated upload path is a SHA-256 file hash");
+        admit()?;
+        let staging_target = PublishTarget::Nar(encoded_id, encoding);
+        let temp_name = self.next_temp_name(&staging_target);
+        let temporary_path = self.temporary_path(&staging_target, &temp_name);
+        let mut transaction = self.recovery.begin(&temporary_path)?;
+        let mut temp = self.create_temp_named(&staging_target, temp_name)?;
+        transaction.transition(PublicationState::Streaming)?;
+
+        let decoded = (|| {
+            let decoded = normalize_upload(
+                source,
+                encoding,
+                &encoded_hash,
+                encoded_size,
+                &mut temp.file,
+                policy.max_bytes,
+            )?;
+            temp.file.sync_all()?;
+            transaction.transition(PublicationState::Validated)?;
+            Ok::<_, StorageError>(decoded)
+        })();
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                let _ = self.remove_temp(&temp);
+                return Err(error);
             }
         };
 
-        match encoding {
-            NarEncoding::None => self.publish_with_admission(
-                PublishTarget::Nar(id, encoding),
-                CheckedUploadReader::new(source, &id.0, expected_length),
-                admit,
-                validate,
-                |_| Ok(()),
-            ),
-            NarEncoding::Zstd | NarEncoding::Xz => self.publish_with_admission(
-                PublishTarget::Nar(id, encoding),
-                CheckedUploadReader::new(source, &id.0, expected_length),
-                admit,
-                validate,
-                |_| Ok(()),
-            ),
-        }
+        let raw_id = NarObjectId::parse(&decoded.hash.to_string())
+            .expect("binary SHA-256 Nix hash formats as a valid object ID");
+        let outcome = self.commit_temporary(
+            PublishTarget::Nar(&raw_id, NarEncoding::None),
+            temp,
+            transaction,
+            |_| Ok(()),
+        )?;
+        self.publish_ingestion_receipt(IngestionReceipt::from_decoded(
+            encoding,
+            encoded_hash,
+            encoded_size,
+            decoded,
+        ))?;
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -291,80 +328,38 @@ impl Storage {
         store: &StoreHash,
         narinfo: ValidatedNarInfo,
     ) -> Result<PublishOutcome, StorageError> {
-        let nar_directory = self.nar_directory()?;
         let expectation = narinfo.payload_expectation();
-        let nar_name = narinfo.payload_name().to_string();
-        match open_regular_at(&nar_directory, OsStr::new(&nar_name)) {
-            Ok(file) => {
-                let matches = match expectation {
-                    NarExpectation::Raw { nar_size, .. } => nar_file_size_matches(&file, nar_size)?,
-                    NarExpectation::Compressed(expectation) => {
-                        self.compressed_nar_matches_with_evidence(&file, expectation)?
-                    }
-                };
-                if !matches {
+        let nar_hash = match expectation {
+            NarExpectation::Raw { nar_hash, .. } => *nar_hash,
+            NarExpectation::Compressed(expectation) => {
+                let Some(receipt) = self.read_ingestion_receipt(expectation)? else {
                     return Err(StorageError::NarMismatch);
-                }
+                };
+                receipt.decoded_hash()
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(StorageError::MissingNar);
-            }
-            Err(error) => return Err(error.into()),
+        };
+        let raw_id = NarObjectId::parse(&nar_hash.to_string())
+            .expect("binary SHA-256 Nix hash formats as a valid object ID");
+        let Some(file) = self.open_nar(&raw_id)? else {
+            return Err(StorageError::MissingNar);
+        };
+        let expected_size = match expectation {
+            NarExpectation::Raw { nar_size, .. } => nar_size,
+            NarExpectation::Compressed(expectation) => expectation.decoded_size,
+        };
+        if !nar_file_size_matches(&file, expected_size)? {
+            return Err(StorageError::NarMismatch);
         }
         self.publish(
             PublishTarget::NarInfo(store),
-            Cursor::new(narinfo.into_bytes()),
+            Cursor::new(narinfo.into_raw_bytes()),
         )
     }
 
-    pub(super) fn compressed_nar_matches_with_evidence(
-        &self,
-        file: &File,
-        expectation: CompressedNarExpectation<'_>,
-    ) -> Result<bool, StorageError> {
-        if let Some(evidence) = self.read_validation_evidence(expectation)? {
-            return Ok(evidence.matches(expectation));
-        }
-
-        let Some(decoded) = validate_compressed_nar(file, expectation)? else {
-            return Ok(false);
-        };
-        self.publish_validation_evidence(ValidationEvidence::from_decoded(
-            nar_encoding(expectation.encoding),
-            expectation.encoded_hash.clone(),
-            expectation.encoded_size,
-            decoded,
-        ))?;
-        Ok(true)
-    }
-
-    pub(super) fn read_validation_evidence(
-        &self,
-        expectation: CompressedNarExpectation<'_>,
-    ) -> Result<Option<ValidationEvidence>, StorageError> {
-        let directory = self.validation_directory()?;
-        let name = validation_file_name(expectation);
-        let file = match open_regular_at(&directory, &name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let mut bytes = Vec::new();
-        file.take(MAX_VALIDATION_EVIDENCE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_VALIDATION_EVIDENCE_BYTES {
-            return Ok(None);
-        }
-        if let Some(evidence) =
-            ValidationEvidence::parse(&bytes).filter(|evidence| evidence.matches(expectation))
-        {
-            return Ok(Some(evidence));
-        }
-        Ok(None)
-    }
-
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {
-        let Some(file) = self.open_nar_encoded(narinfo.nar(), narinfo.encoding())? else {
+        let nar_directory = self.nar_directory()?;
+        let payload_name = narinfo.payload_name().to_string();
+        let Some(file) = open_optional_at(&nar_directory, OsStr::new(&payload_name))? else {
             return Ok(false);
         };
         nar_file_size_matches(&file, narinfo.file_size()).map_err(Into::into)
@@ -509,7 +504,7 @@ impl Storage {
         source: impl Read,
         checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish_with_admission(target, source, || Ok(()), |_| Ok(None), checkpoint)
+        self.publish_with_admission(target, source, || Ok(()), checkpoint)
     }
 
     pub(super) fn publish_with_admission(
@@ -517,32 +512,65 @@ impl Storage {
         target: PublishTarget<'_>,
         mut source: impl Read,
         admit: impl FnOnce() -> Result<(), StorageError>,
-        validate: impl FnOnce(&File) -> Result<Option<ValidationEvidence>, StorageError>,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
         admit()?;
+        let temp_name = self.next_temp_name(&target);
+        let temporary_path = self.temporary_path(&target, &temp_name);
+        let mut transaction = Some(self.recovery.begin(&temporary_path)?);
+        checkpoint(PublishBoundary::BeforeTempCreate)?;
+        let mut temp = Some(self.create_temp_named(&target, temp_name)?);
+        transaction
+            .as_mut()
+            .expect("publication transaction exists")
+            .transition(PublicationState::Streaming)?;
+        let staging = (|| {
+            checkpoint(PublishBoundary::AfterTempCreate)?;
+            io::copy(
+                &mut source,
+                &mut temp.as_mut().expect("temporary file exists").file,
+            )?;
+            checkpoint(PublishBoundary::AfterStream)?;
+            temp.as_ref()
+                .expect("temporary file exists")
+                .file
+                .sync_all()?;
+            checkpoint(PublishBoundary::AfterTempSync)?;
+            transaction
+                .as_mut()
+                .expect("publication transaction exists")
+                .transition(PublicationState::Validated)
+        })();
+
+        if let Err(error) = staging {
+            if let Some(temp) = temp {
+                let _ = self.remove_temp(&temp);
+            }
+            return Err(error);
+        }
+
+        self.commit_temporary(
+            target,
+            temp.take().expect("temporary file exists"),
+            transaction.take().expect("publication transaction exists"),
+            checkpoint,
+        )
+    }
+
+    fn commit_temporary(
+        &self,
+        target: PublishTarget<'_>,
+        temp: TemporaryFile,
+        mut transaction: PublicationTransaction,
+        mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+    ) -> Result<PublishOutcome, StorageError> {
         let destination_directory = self.destination_directory(&target)?;
         let destination_name = target.destination_name();
         let destination_key = self.destination_key(&target, &destination_name);
         let replace_destination = target.replaces_destination();
-        let temp_name = self.next_temp_name(&target);
-        let temporary_path = self.temporary_path(&target, &temp_name);
-        let mut transaction = self.recovery.begin(&temporary_path)?;
-        checkpoint(PublishBoundary::BeforeTempCreate)?;
-        let mut temp = self.create_temp_named(&target, temp_name)?;
-        transaction.transition(PublicationState::Streaming)?;
         let mut durable = false;
         let mut temp_moved = false;
         let result = (|| {
-            checkpoint(PublishBoundary::AfterTempCreate)?;
-            io::copy(&mut source, &mut temp.file)?;
-            checkpoint(PublishBoundary::AfterStream)?;
-            temp.file.sync_all()?;
-            checkpoint(PublishBoundary::AfterTempSync)?;
-            if let Some(evidence) = validate(&temp.file)? {
-                self.publish_validation_evidence(evidence)?;
-            }
-            transaction.transition(PublicationState::Validated)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
             let mut finalize_publication = |publish_result: io::Result<()>| match publish_result {
                 Ok(()) => {
@@ -652,9 +680,9 @@ impl Storage {
     pub(super) fn temporary_path(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
         match target {
             PublishTarget::Nar(_, _) => PathBuf::from("nar/.tmp").join(name),
-            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) | PublishTarget::Validation(_) => {
-                PathBuf::from(".tmp").join(name)
-            }
+            PublishTarget::CacheInfo
+            | PublishTarget::NarInfo(_)
+            | PublishTarget::IngestionReceipt(_) => PathBuf::from(".tmp").join(name),
         }
     }
 
@@ -665,9 +693,9 @@ impl Storage {
     ) -> Result<TemporaryFile, StorageError> {
         let directory = match target {
             PublishTarget::Nar(_, _) => self.nar_temp_directory()?,
-            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) | PublishTarget::Validation(_) => {
-                self.temp_directory()?
-            }
+            PublishTarget::CacheInfo
+            | PublishTarget::NarInfo(_)
+            | PublishTarget::IngestionReceipt(_) => self.temp_directory()?,
         };
         let file = open_at(
             &directory,
@@ -726,7 +754,7 @@ impl Storage {
         match target {
             PublishTarget::Nar(_, _) => self.nar_directory(),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.root_directory(),
-            PublishTarget::Validation(_) => self.validation_directory(),
+            PublishTarget::IngestionReceipt(_) => self.ingestion_receipt_directory(),
         }
     }
 
@@ -734,13 +762,54 @@ impl Storage {
         match target {
             PublishTarget::Nar(_, _) => PathBuf::from("nar").join(name),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => PathBuf::from(name),
-            PublishTarget::Validation(_) => PathBuf::from(VALIDATION_DIRECTORY).join(name),
+            PublishTarget::IngestionReceipt(_) => {
+                PathBuf::from(INGESTION_RECEIPT_DIRECTORY).join(name)
+            }
         }
     }
 
     pub(super) fn validation_directory(&self) -> Result<File, StorageError> {
         let root = self.root_directory()?;
         Ok(open_directory_at(&root, OsStr::new(VALIDATION_DIRECTORY))?)
+    }
+
+    pub(super) fn ingestion_receipt_directory(&self) -> Result<File, StorageError> {
+        let root = self.root_directory()?;
+        Ok(open_directory_at(
+            &root,
+            OsStr::new(INGESTION_RECEIPT_DIRECTORY),
+        )?)
+    }
+
+    pub(super) fn publish_ingestion_receipt(
+        &self,
+        receipt: IngestionReceipt,
+    ) -> Result<PublishOutcome, StorageError> {
+        let bytes = receipt.bytes();
+        self.publish(
+            PublishTarget::IngestionReceipt(&receipt),
+            Cursor::new(bytes),
+        )
+    }
+
+    pub(super) fn read_ingestion_receipt(
+        &self,
+        expectation: CompressedNarExpectation<'_>,
+    ) -> Result<Option<IngestionReceipt>, StorageError> {
+        let directory = self.ingestion_receipt_directory()?;
+        let name = ingestion_receipt_file_name(expectation);
+        let file = match open_regular_at(&directory, &name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_INGESTION_RECEIPT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_INGESTION_RECEIPT_BYTES {
+            return Ok(None);
+        }
+        Ok(IngestionReceipt::parse(&bytes).filter(|receipt| receipt.matches(expectation)))
     }
 
     pub(super) fn remove_orphan_validation_evidence(&self) -> Result<(), StorageError> {
@@ -780,14 +849,6 @@ impl Storage {
             validation.sync_all()?;
         }
         Ok(())
-    }
-
-    pub(super) fn publish_validation_evidence(
-        &self,
-        evidence: ValidationEvidence,
-    ) -> Result<PublishOutcome, StorageError> {
-        let bytes = evidence.bytes();
-        self.publish(PublishTarget::Validation(&evidence), Cursor::new(bytes))
     }
 
     pub(super) fn destination_lock(&self, key: PathBuf) -> Arc<Mutex<()>> {

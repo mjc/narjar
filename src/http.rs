@@ -372,7 +372,10 @@ impl PublicationRequest {
     pub fn staging_bytes(&self, max_nar_bytes: u64) -> Option<u64> {
         let length = u64::try_from(self.request.body_length()?).ok()?;
         match &self.route {
-            WriteRoute::Nar(_, _) if length <= max_nar_bytes => Some(length),
+            WriteRoute::Nar(_, NarEncoding::None) if length <= max_nar_bytes => Some(length),
+            WriteRoute::Nar(_, NarEncoding::Zstd | NarEncoding::Xz) if length <= max_nar_bytes => {
+                Some(max_nar_bytes)
+            }
             WriteRoute::Nar(_, _) => None,
             WriteRoute::NarInfo(_) => Some(length.min(MAX_NARINFO_BYTES)),
             WriteRoute::CacheInfo => Some(0),

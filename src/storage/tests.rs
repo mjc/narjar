@@ -14,19 +14,19 @@ use std::{
 };
 
 use super::compression::{
-    CheckedUploadReader, DecodedValidation, nar_file_size_matches, validate_xz,
+    CheckedUploadReader, DecodedValidation, nar_file_size_matches, normalize_upload, validate_xz,
     verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
 use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes, sync_dir};
 use super::ids::{nix32_sha256, nix32_sha256_matches};
-use super::operations::{MAX_VALIDATION_EVIDENCE_BYTES, VALIDATION_DIRECTORY};
 use super::publication::{Layout, PublishBoundary, PublishTarget};
 use super::{
     CapacityErrorKind, Directory, NarObjectId, PublishOutcome, ReconcileClass, Storage,
     StorageError, StoreHash, capacity_error_kind,
 };
 use crate::narinfo::{CompressedEncoding, CompressedNarExpectation, NarEncoding};
-use lzma_rust2::{XzOptions, XzReader, XzWriter};
+use crate::object::{FileHash, NarHash};
+use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::encoding::{CompressionLevel, compress};
 
@@ -49,7 +49,8 @@ fn nix32_sha256_matches_borrowed_hashes() {
 #[test]
 fn upload_reader_checks_encoded_hash_and_length() {
     let bytes = b"encoded NAR bytes";
-    let expected = nix32_sha256(&Sha256::digest(bytes));
+    let expected =
+        FileHash::parse(&nix32_sha256(&Sha256::digest(bytes))).expect("file hash is valid");
     let mut reader = CheckedUploadReader::new(Cursor::new(bytes), &expected, bytes.len() as u64);
     let mut received = Vec::new();
 
@@ -58,7 +59,8 @@ fn upload_reader_checks_encoded_hash_and_length() {
         .expect("matching upload should be readable");
     assert_eq!(received, bytes);
 
-    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), NAR_ID, bytes.len() as u64);
+    let wrong_hash = FileHash::parse(NAR_ID).expect("file hash is valid");
+    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), &wrong_hash, bytes.len() as u64);
     let error = reader
         .read_to_end(&mut Vec::new())
         .expect_err("wrong encoded hash should be rejected");
@@ -66,7 +68,26 @@ fn upload_reader_checks_encoded_hash_and_length() {
 }
 
 #[test]
-fn xz_nars_are_stored_compressed_and_validated_decompressed() {
+fn normalized_compressed_source_errors_remain_io_errors() {
+    for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
+        let directory = TestDir::new();
+        let destination = directory.path().join("raw.nar");
+        let mut destination = fs::File::create(destination).expect("create raw staging file");
+        let error = normalize_upload(
+            BrokenReader::new(libc::EIO),
+            encoding,
+            &FileHash::parse(NAR_ID).expect("file hash is valid"),
+            3,
+            &mut destination,
+            u64::MAX,
+        )
+        .expect_err("source failure must not become invalid content");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{encoding:?}");
+    }
+}
+
+#[test]
+fn xz_uploads_are_normalized_to_the_raw_nar() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
     let raw = b"nar bytes";
@@ -75,12 +96,15 @@ fn xz_nars_are_stored_compressed_and_validated_decompressed() {
         XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
     writer.write_all(raw).expect("compress NAR");
     writer.finish().expect("finish XZ stream");
-    let nar = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed)))
-        .expect("compressed hash is a valid NAR object id");
+    let encoded = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed)))
+        .expect("compressed hash is a valid file object id");
+    let raw =
+        NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).expect("raw hash is a valid NAR hash");
+    let raw_id = NarObjectId::parse(&raw.to_string()).expect("raw hash is a valid object id");
 
     let outcome = storage
         .publish_nar(
-            &nar,
+            &encoded,
             NarEncoding::Xz,
             Cursor::new(&compressed),
             compressed.len() as u64,
@@ -89,24 +113,15 @@ fn xz_nars_are_stored_compressed_and_validated_decompressed() {
         .expect("publish XZ NAR");
     assert_eq!(outcome, PublishOutcome::Created);
     assert_eq!(
-        fs::read(storage.layout().nar_path_encoded(&nar, NarEncoding::Xz))
-            .expect("read stored XZ NAR"),
-        compressed
+        fs::read(storage.layout().nar_path(&raw_id)).expect("read stored raw NAR"),
+        b"nar bytes"
     );
-    let evidence = directory.path().join(VALIDATION_DIRECTORY).join(format!(
-        "{}{}.validation",
-        nar.as_str(),
-        NarEncoding::Xz.suffix()
-    ));
-    let evidence = fs::read_to_string(evidence).expect("read XZ validation evidence");
-    assert!(evidence.contains("encoding=xz"));
-    assert!(evidence.contains("decoded-size=9"));
-
-    let mut decoded = Vec::new();
-    XzReader::new(Cursor::new(compressed), false)
-        .read_to_end(&mut decoded)
-        .expect("decode stored XZ NAR");
-    assert_eq!(decoded, raw);
+    assert!(
+        !directory
+            .path()
+            .join(format!("{}.nar.xz", encoded.as_str()))
+            .exists()
+    );
 }
 
 #[test]
@@ -121,16 +136,15 @@ fn xz_validation_checks_compressed_and_decompressed_hashes_together() {
     writer.finish().expect("finish XZ stream");
     fs::write(&path, &compressed).expect("write XZ NAR");
     let file = fs::File::open(path).expect("open XZ NAR");
-    let nar_hash =
-        NarObjectId::parse(&nix32_sha256(&Sha256::digest(raw))).expect("NAR hash is valid");
-    let file_hash = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed)))
-        .expect("file hash is valid");
+    let nar_hash = NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).expect("NAR hash is valid");
+    let file_hash =
+        FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).expect("file hash is valid");
 
     assert_eq!(
         validate_xz(&file, Some(&nar_hash), Some(&file_hash), raw.len() as u64)
             .expect("validate XZ NAR"),
         DecodedValidation {
-            hash: nar_hash.clone(),
+            hash: nar_hash,
             size: raw.len() as u64,
         }
     );
@@ -153,14 +167,15 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
     writer.finish().unwrap();
     let mut zstd = Vec::new();
     compress(Cursor::new(raw), &mut zstd, CompressionLevel::Fastest);
-    let nar_hash = NarObjectId::parse(&nix32_sha256(&Sha256::digest(raw))).unwrap();
-    let wrong_hash = NarObjectId::parse(&"0".repeat(52)).unwrap();
+    let nar_hash = NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).unwrap();
+    let wrong_file_hash = FileHash::parse(&"0".repeat(52)).unwrap();
+    let wrong_nar_hash = NarHash::parse(&"0".repeat(52)).unwrap();
 
     for (encoding, compressed) in [(NarEncoding::Xz, xz), (NarEncoding::Zstd, zstd)] {
         let directory = TestDir::new();
         let path = directory.path().join("compressed-nar");
         fs::write(&path, &compressed).unwrap();
-        let file_hash = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed))).unwrap();
+        let file_hash = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).unwrap();
         let file_size = compressed.len() as u64;
         let nar_size = raw.len() as u64;
         let matches = |encoded_hash, decoded_hash, encoded_size, decoded_size| {
@@ -184,26 +199,29 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
             verify_decoded_compressed_file(verified).unwrap().is_some()
         };
         assert!(matches(&file_hash, &nar_hash, file_size, nar_size));
-        assert!(!matches(&wrong_hash, &nar_hash, file_size, nar_size));
-        assert!(!matches(&file_hash, &wrong_hash, file_size, nar_size));
+        assert!(!matches(&wrong_file_hash, &nar_hash, file_size, nar_size));
+        assert!(!matches(&file_hash, &wrong_nar_hash, file_size, nar_size));
         assert!(!matches(&file_hash, &nar_hash, file_size + 1, nar_size));
         assert!(!matches(&file_hash, &nar_hash, file_size, nar_size + 1));
     }
 }
 
 #[test]
-fn zstd_nars_are_stored_compressed_and_validated_decompressed() {
+fn zstd_uploads_are_normalized_to_the_raw_nar() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
     let raw = b"nar bytes";
     let mut compressed = Vec::new();
     compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
-    let nar = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed)))
-        .expect("compressed hash is a valid NAR object id");
+    let encoded = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed)))
+        .expect("compressed hash is a valid file object id");
+    let raw_hash =
+        NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).expect("raw hash is a valid NAR hash");
+    let raw_id = NarObjectId::parse(&raw_hash.to_string()).expect("raw hash is a valid object id");
 
     let outcome = storage
         .publish_nar(
-            &nar,
+            &encoded,
             NarEncoding::Zstd,
             Cursor::new(&compressed),
             compressed.len() as u64,
@@ -212,99 +230,67 @@ fn zstd_nars_are_stored_compressed_and_validated_decompressed() {
         .expect("publish zstd NAR");
     assert_eq!(outcome, PublishOutcome::Created);
     assert_eq!(
-        fs::read(storage.layout().nar_path_encoded(&nar, NarEncoding::Zstd))
-            .expect("read stored zstd NAR"),
-        compressed
+        fs::read(storage.layout().nar_path(&raw_id)).expect("read stored raw NAR"),
+        b"nar bytes"
     );
-    let evidence = directory.path().join(VALIDATION_DIRECTORY).join(format!(
-        "{}{}.validation",
-        nar.as_str(),
-        NarEncoding::Zstd.suffix()
-    ));
-    let evidence = fs::read_to_string(evidence).expect("read zstd validation evidence");
-    assert!(evidence.contains("encoding=zstd"));
-    assert!(evidence.contains("decoded-size=9"));
+    assert!(
+        !directory
+            .path()
+            .join(format!("{}.nar.zst", encoded.as_str()))
+            .exists()
+    );
 }
 
 #[test]
-fn compressed_publication_reuses_and_repairs_validation_evidence() {
+fn compressed_uploads_converge_on_one_raw_object() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
     let raw = b"nar bytes";
     let mut compressed = Vec::new();
     compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
-    let encoded_hash = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed)))
-        .expect("compressed hash is valid");
-    let decoded_hash =
-        NarObjectId::parse(&nix32_sha256(&Sha256::digest(raw))).expect("decoded hash is valid");
-    storage
+    let mut xz = Vec::new();
+    let mut writer = XzWriter::new(&mut xz, XzOptions::with_preset(1)).unwrap();
+    writer.write_all(raw).unwrap();
+    writer.finish().unwrap();
+    let xz_id = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&xz))).unwrap();
+    let zstd_id = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed))).unwrap();
+    let raw_hash = NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).unwrap();
+    let raw_id = NarObjectId::parse(&raw_hash.to_string()).unwrap();
+
+    let xz_result = storage
         .publish_nar(
-            &encoded_hash,
+            &xz_id,
+            NarEncoding::Xz,
+            Cursor::new(&xz),
+            xz.len() as u64,
+            super::NarUploadPolicy::new(1024, 0),
+        )
+        .expect("publish XZ NAR");
+    let zstd_result = storage
+        .publish_nar(
+            &zstd_id,
             NarEncoding::Zstd,
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
         )
-        .expect("publish zstd NAR");
-    drop(storage);
+        .expect("publish Zstd NAR");
 
-    let storage = initialize_storage(directory.path()).expect("restart storage");
-    let expectation = CompressedNarExpectation {
-        encoding: CompressedEncoding::Zstd,
-        encoded_hash: &encoded_hash,
-        encoded_size: compressed.len() as u64,
-        decoded_hash: &decoded_hash,
-        decoded_size: raw.len() as u64,
-    };
-    let file = storage
-        .open_nar_encoded(&encoded_hash, NarEncoding::Zstd)
-        .expect("open encoded NAR")
-        .expect("encoded NAR exists");
+    assert_eq!(xz_result, PublishOutcome::Created);
+    assert_eq!(zstd_result, PublishOutcome::Identical);
+    assert_eq!(fs::read(storage.layout().nar_path(&raw_id)).unwrap(), raw);
     assert!(
-        storage
-            .compressed_nar_matches_with_evidence(&file, expectation)
-            .expect("reuse validation evidence")
-    );
-
-    let evidence_path = directory.path().join(VALIDATION_DIRECTORY).join(format!(
-        "{}{}.validation",
-        encoded_hash.as_str(),
-        NarEncoding::Zstd.suffix()
-    ));
-    fs::write(&evidence_path, b"version=2\n").expect("change evidence version");
-    assert!(
-        storage
-            .compressed_nar_matches_with_evidence(&file, expectation)
-            .expect("replace incompatible validation evidence")
-    );
-    fs::write(&evidence_path, b"not evidence\n").expect("corrupt validation evidence");
-    assert!(
-        storage
-            .compressed_nar_matches_with_evidence(&file, expectation)
-            .expect("repair validation evidence")
+        !storage
+            .layout()
+            .nar_path_encoded(&xz_id, NarEncoding::Xz)
+            .exists()
     );
     assert!(
-        fs::read_to_string(&evidence_path)
-            .expect("read repaired validation evidence")
-            .starts_with("version=1\n")
+        !storage
+            .layout()
+            .nar_path_encoded(&zstd_id, NarEncoding::Zstd)
+            .exists()
     );
-
-    let oversized = format!(
-        "version=1\nencoding=zstd\nencoded-hash={}\nencoded-size={:0>250}\ndecoded-hash={}\ndecoded-size={}\n",
-        encoded_hash.as_str(),
-        compressed.len(),
-        decoded_hash.as_str(),
-        raw.len(),
-    );
-    fs::write(&evidence_path, oversized).expect("write oversized validation evidence");
-    assert!(
-        storage
-            .compressed_nar_matches_with_evidence(&file, expectation)
-            .expect("repair oversized validation evidence")
-    );
-    let repaired = fs::read(&evidence_path).expect("read repaired oversized evidence");
-    assert!(repaired.starts_with(b"version=1\n"));
-    assert!(repaired.len() <= MAX_VALIDATION_EVIDENCE_BYTES as usize);
 }
 
 #[test]

@@ -145,7 +145,8 @@ fn inspect_trusted_narinfo(
     metadata: ValidatedNarInfo,
     verification: VerificationMode,
 ) -> io::Result<MetadataAssessment> {
-    let nar = metadata.nar().clone();
+    let nar = NarObjectId::parse(&metadata.payload_name().file_hash.to_string())
+        .expect("validated payload name has a SHA-256 file hash");
     let class = match ReferencedPayload::open(
         payloads,
         metadata.payload_name(),
@@ -246,13 +247,17 @@ fn classify_unreferenced_payload(
         PayloadEntry::Invalid(name) => {
             Some(InventoryEntry::new(InventoryClass::InvalidFilename, name))
         }
-        PayloadEntry::Identified(payload) => match references.contains(&payload.id) {
-            true => None,
-            false => Some(InventoryEntry::new(
-                InventoryClass::OrphanNar,
-                payload.id.as_str(),
-            )),
-        },
+        PayloadEntry::Identified(payload) => {
+            let object_id = NarObjectId::parse(&payload.file_hash.to_string())
+                .expect("validated payload name has a SHA-256 file hash");
+            match references.contains(&object_id) {
+                true => None,
+                false => Some(InventoryEntry::new(
+                    InventoryClass::OrphanNar,
+                    object_id.as_str(),
+                )),
+            }
+        }
     }
 }
 

@@ -2182,7 +2182,7 @@ fn nar_put_streams_hash_checks_and_retries_immutably() {
 }
 
 #[test]
-fn nar_put_and_get_preserve_xz_bytes() {
+fn nar_put_normalizes_xz_to_raw_bytes() {
     let server = RunningServer::start("nar-put-xz");
     let mut compressed = Vec::new();
     let mut writer =
@@ -2194,10 +2194,10 @@ fn nar_put_and_get_preserve_xz_bytes() {
     let wrong_path = format!("/nar/{NARJAR_HASH}.nar.xz");
     let wrong = server.request_with_body("PUT", &wrong_path, &[], &compressed);
     let path = format!("/nar/{file_hash}.nar.xz");
-    let stored_path = server.data_dir.join(format!("nar/{file_hash}.nar.xz"));
     let uploaded = server.request_with_body("PUT", &path, &[], &compressed);
-    let downloaded = server.request("GET", &path);
-    let stored = fs::read(stored_path).expect("read stored XZ NAR");
+    let downloaded = server.request("GET", &format!("/nar/{NARJAR_HASH}.nar"));
+    let stored = fs::read(server.data_dir.join(format!("nar/{NARJAR_HASH}.nar")))
+        .expect("read stored raw NAR");
     let (signal, status) = server.stop();
 
     let (upload_headers, upload_body) = response_parts(&uploaded);
@@ -2217,14 +2217,14 @@ fn nar_put_and_get_preserve_xz_bytes() {
         download_headers.starts_with("HTTP/1.1 200 OK\r\n"),
         "{download_headers:?}"
     );
-    assert_eq!(download_body, compressed);
-    assert_eq!(stored, compressed);
+    assert_eq!(download_body, NAR_BYTES);
+    assert_eq!(stored, NAR_BYTES);
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
 
 #[test]
-fn nar_put_and_get_preserve_zstd_bytes() {
+fn nar_put_normalizes_zstd_to_raw_bytes() {
     let server = RunningServer::start("nar-put-zstd");
     let mut compressed = Vec::new();
     compress(
@@ -2235,10 +2235,10 @@ fn nar_put_and_get_preserve_zstd_bytes() {
 
     let file_hash = nix32_sha256(&compressed);
     let path = format!("/nar/{file_hash}.nar.zst");
-    let stored_path = server.data_dir.join(format!("nar/{file_hash}.nar.zst"));
     let uploaded = server.request_with_body("PUT", &path, &[], &compressed);
-    let downloaded = server.request("GET", &path);
-    let stored = fs::read(stored_path).expect("read stored zstd NAR");
+    let downloaded = server.request("GET", &format!("/nar/{NARJAR_HASH}.nar"));
+    let stored = fs::read(server.data_dir.join(format!("nar/{NARJAR_HASH}.nar")))
+        .expect("read stored raw NAR");
     let (signal, status) = server.stop();
 
     let (upload_headers, upload_body) = response_parts(&uploaded);
@@ -2252,8 +2252,8 @@ fn nar_put_and_get_preserve_zstd_bytes() {
         download_headers.starts_with("HTTP/1.1 200 OK\r\n"),
         "{download_headers:?}"
     );
-    assert_eq!(download_body, compressed);
-    assert_eq!(stored, compressed);
+    assert_eq!(download_body, NAR_BYTES);
+    assert_eq!(stored, NAR_BYTES);
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
@@ -2361,7 +2361,7 @@ fn stalled_publication_does_not_block_an_independent_put() {
 }
 
 #[test]
-fn xz_narinfo_gates_and_serves_the_compressed_pair() {
+fn xz_narinfo_is_published_as_the_canonical_raw_pair() {
     let server = RunningServer::start("narinfo-xz");
     let mut compressed = Vec::new();
     let mut writer =
@@ -2385,7 +2385,7 @@ fn xz_narinfo_gates_and_serves_the_compressed_pair() {
         narinfo.as_bytes(),
     );
     let narinfo_get = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
-    let nar_get = server.request("GET", &nar_path);
+    let nar_get = server.request("GET", &format!("/nar/{NARJAR_HASH}.nar"));
     let (signal, status) = server.stop();
 
     for response in [&uploaded, &published, &narinfo_get, &nar_get] {
@@ -2394,14 +2394,19 @@ fn xz_narinfo_gates_and_serves_the_compressed_pair() {
             "{response:?}"
         );
     }
+    let (_, narinfo_body) = response_parts(&narinfo_get);
+    assert_eq!(
+        narinfo_body,
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64).as_bytes()
+    );
     let (_, nar_body) = response_parts(&nar_get);
-    assert_eq!(nar_body, compressed);
+    assert_eq!(nar_body, NAR_BYTES);
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
 
 #[test]
-fn zstd_narinfo_gates_and_serves_the_compressed_pair() {
+fn zstd_narinfo_is_published_as_the_canonical_raw_pair() {
     let server = RunningServer::start("narinfo-zstd");
     let mut compressed = Vec::new();
     compress(
@@ -2428,7 +2433,7 @@ fn zstd_narinfo_gates_and_serves_the_compressed_pair() {
         narinfo.as_bytes(),
     );
     let narinfo_get = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
-    let nar_get = server.request("GET", &nar_path);
+    let nar_get = server.request("GET", &format!("/nar/{NARJAR_HASH}.nar"));
     let (signal, status) = server.stop();
 
     let (wrong_headers, wrong_body) = response_parts(&wrong);
@@ -2449,9 +2454,12 @@ fn zstd_narinfo_gates_and_serves_the_compressed_pair() {
         );
     }
     let (_, narinfo_body) = response_parts(&narinfo_get);
-    assert_eq!(narinfo_body, narinfo.as_bytes());
+    assert_eq!(
+        narinfo_body,
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64).as_bytes()
+    );
     let (_, nar_body) = response_parts(&nar_get);
-    assert_eq!(nar_body, compressed);
+    assert_eq!(nar_body, NAR_BYTES);
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }

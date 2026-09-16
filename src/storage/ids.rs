@@ -1,21 +1,10 @@
-use std::fmt;
-
 use data_encoding::{BitOrder, Encoding, Specification};
 use sha2::{Digest, Sha256};
 
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const NIX32_SHA256_LEN: usize = 52;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InvalidObjectId;
-
-impl fmt::Display for InvalidObjectId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("invalid Nix base-32 object identifier")
-    }
-}
-
-impl std::error::Error for InvalidObjectId {}
+pub use crate::object::InvalidObjectId;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NarObjectId(pub(super) String);
@@ -23,10 +12,6 @@ pub struct NarObjectId(pub(super) String);
 impl NarObjectId {
     pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
         parse_nix32(value, 52).map(Self)
-    }
-
-    pub(crate) fn validate(value: &str) -> Result<(), InvalidObjectId> {
-        valid_nix32(value, 52).then_some(()).ok_or(InvalidObjectId)
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -73,6 +58,7 @@ fn nix32_encoding() -> &'static Encoding {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn nix32_sha256(digest: &[u8]) -> String {
     let encoding = nix32_encoding();
     let mut encoded = vec![0; encoding.encode_len(digest.len())];

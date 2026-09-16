@@ -1,8 +1,9 @@
 //! Read-only discovery and payload inspection; inventory reporting belongs to the caller.
 
 use super::compression::{nar_file_matches, nar_file_size_matches};
-use super::{InvalidObjectId, NarObjectId, StoreHash, entry_is_regular_at, open_regular_at};
+use super::{InvalidObjectId, StoreHash, entry_is_regular_at, open_regular_at};
 use crate::narinfo::{NarEncoding, NarExpectation};
+use crate::object::FileHash;
 use std::{ffi::OsStr, fmt, fs::File, io};
 
 pub(crate) enum NarinfoName<'a> {
@@ -46,7 +47,7 @@ impl NarinfoCandidate<'_> {
 
 #[derive(Debug)]
 pub(crate) struct NarFileName {
-    pub(crate) id: NarObjectId,
+    pub(crate) file_hash: FileHash,
     pub(crate) encoding: NarEncoding,
 }
 
@@ -55,8 +56,12 @@ impl NarFileName {
         [NarEncoding::Zstd, NarEncoding::Xz, NarEncoding::None]
             .into_iter()
             .find_map(|encoding| {
-                name.strip_suffix(encoding.suffix())
-                    .map(|hash| NarObjectId::parse(hash).map(|id| Self { id, encoding }))
+                name.strip_suffix(encoding.suffix()).map(|hash| {
+                    FileHash::parse(hash).map(|file_hash| Self {
+                        file_hash,
+                        encoding,
+                    })
+                })
             })
             .ok_or(InvalidObjectId)?
     }
@@ -64,7 +69,7 @@ impl NarFileName {
 
 impl fmt::Display for NarFileName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}{}", self.id.as_str(), self.encoding.suffix())
+        write!(formatter, "{}{}", self.file_hash, self.encoding.suffix())
     }
 }
 

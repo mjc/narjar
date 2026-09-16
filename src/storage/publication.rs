@@ -10,7 +10,7 @@ use std::{
 use std::path::PathBuf;
 
 use super::{
-    compression::ValidationEvidence,
+    compression::IngestionReceipt,
     fs::{lock_exclusive, open_at},
     ids::{NarObjectId, StoreHash},
 };
@@ -58,7 +58,7 @@ pub(super) enum PublishTarget<'a> {
     CacheInfo,
     Nar(&'a NarObjectId, NarEncoding),
     NarInfo(&'a StoreHash),
-    Validation(&'a ValidationEvidence),
+    IngestionReceipt(&'a IngestionReceipt),
 }
 
 impl PublishTarget<'_> {
@@ -69,7 +69,7 @@ impl PublishTarget<'_> {
                 OsString::from(format!("{}{}", id.as_str(), encoding.suffix()))
             }
             Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
-            Self::Validation(evidence) => evidence.file_name(),
+            Self::IngestionReceipt(evidence) => evidence.file_name(),
         }
     }
 
@@ -78,13 +78,13 @@ impl PublishTarget<'_> {
             Self::CacheInfo => "cache-info",
             Self::Nar(_, _) => "nar",
             Self::NarInfo(_) => "narinfo",
-            Self::Validation(_) => "validation",
+            Self::IngestionReceipt(_) => "receipt",
         }
     }
 
     pub(super) fn replaces_destination(&self) -> bool {
         match self {
-            Self::Validation(_) => true,
+            Self::IngestionReceipt(_) => true,
             Self::CacheInfo | Self::Nar(_, _) | Self::NarInfo(_) => false,
         }
     }

@@ -216,11 +216,7 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
                     invalid(format!("untrusted narinfo: {name_str}"))
                 }
             })?;
-        let nar_name = OsString::from(format!(
-            "{}{}",
-            validated.nar().as_str(),
-            validated.encoding().suffix()
-        ));
+        let nar_name = OsString::from(validated.payload_name().to_string());
         let nar_metadata = open_regular_at(&nar_directory, &nar_name)
             .and_then(|file| file.metadata())
             .map_err(|error| match error.kind() {
