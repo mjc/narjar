@@ -10,8 +10,8 @@ use crate::{
     metrics::{Metrics, RequestGuard, RequestMethod, RequestRoute, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, NarEncoding, TrustedPublicKeys},
     storage::{
-        CapacityErrorKind, NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError,
-        StoreHash, capacity_error_kind,
+        CapacityErrorKind, NarObjectId, NarUploadPolicy, PublishOutcome, StagingReservation,
+        Storage, StorageError, StoreHash, capacity_error_kind,
     },
 };
 
@@ -374,7 +374,7 @@ impl PublicationRequest {
         match &self.route {
             WriteRoute::Nar(_, NarEncoding::None) if length <= max_nar_bytes => Some(length),
             WriteRoute::Nar(_, NarEncoding::Zstd | NarEncoding::Xz) if length <= max_nar_bytes => {
-                Some(max_nar_bytes)
+                Some(length)
             }
             WriteRoute::Nar(_, _) => None,
             WriteRoute::NarInfo(_) => Some(length.min(MAX_NARINFO_BYTES)),
@@ -388,22 +388,30 @@ impl PublicationRequest {
         trusted: &TrustedPublicKeys,
         policy: NarUploadPolicy,
         metrics: &Metrics,
+        staging: StagingReservation,
     ) {
         let guard = metrics.request(RequestMethod::Put, request_route(self.request.url()));
         let _ = match self.route {
             WriteRoute::Nar(id, encoding) => respond_nar_put(
                 self.request,
-                storage,
-                &id,
-                encoding,
-                policy,
-                metrics,
-                &guard,
+                NarPutContext {
+                    storage,
+                    id: &id,
+                    encoding,
+                    policy,
+                    metrics,
+                    guard: &guard,
+                    staging,
+                },
             ),
             WriteRoute::NarInfo(store) => {
+                drop(staging);
                 respond_narinfo_put(self.request, storage, &store, trusted, metrics, &guard)
             }
-            WriteRoute::CacheInfo => respond_cache_info_put(self.request, storage, metrics, &guard),
+            WriteRoute::CacheInfo => {
+                drop(staging);
+                respond_cache_info_put(self.request, storage, metrics, &guard)
+            }
         };
     }
 }
@@ -594,15 +602,26 @@ fn respond_cache_info_put(
     upload.respond(guard, status)
 }
 
-fn respond_nar_put(
-    request: Request,
-    storage: &Storage,
-    id: &NarObjectId,
+struct NarPutContext<'storage, 'request> {
+    storage: &'storage Storage,
+    id: &'storage NarObjectId,
     encoding: NarEncoding,
     policy: NarUploadPolicy,
-    metrics: &Metrics,
-    guard: &RequestGuard<'_>,
-) -> Option<TcpStream> {
+    metrics: &'storage Metrics,
+    guard: &'request RequestGuard<'storage>,
+    staging: StagingReservation,
+}
+
+fn respond_nar_put(request: Request, context: NarPutContext<'_, '_>) -> Option<TcpStream> {
+    let NarPutContext {
+        storage,
+        id,
+        encoding,
+        policy,
+        metrics,
+        guard,
+        staging,
+    } = context;
     let mut upload = match UploadRequest::accept(request, guard, metrics) {
         Ok(upload) => upload,
         Err(stream) => return stream,
@@ -610,7 +629,14 @@ fn respond_nar_put(
     let length = upload.length();
     let _upload = metrics.upload(length as u64);
     let started = Instant::now();
-    let result = storage.publish_nar(id, encoding, upload.reader(), length as u64, policy);
+    let result = storage.publish_nar_with_staging(
+        id,
+        encoding,
+        upload.reader(),
+        length as u64,
+        policy,
+        staging,
+    );
     metrics.publication(started.elapsed());
     if !upload.body_complete() {
         metrics.validation_failure(ValidationClass::Nar);
@@ -694,7 +720,6 @@ pub fn respond(
     storage: &Storage,
     authorizer: &Authorizer,
     trusted: &TrustedPublicKeys,
-    policy: NarUploadPolicy,
     metrics: &Metrics,
     min_free_bytes: u64,
 ) -> Option<TcpStream> {
@@ -776,18 +801,6 @@ pub fn respond(
         }
         RouteMatch::Missing => return not_found(&guard, request),
     };
-
-    if matches!(request.method(), Method::Put) {
-        return match route {
-            ReadRoute::Nar(id, encoding) => {
-                respond_nar_put(request, storage, &id, encoding, policy, metrics, &guard)
-            }
-            ReadRoute::NarInfo(store) => {
-                respond_narinfo_put(request, storage, &store, trusted, metrics, &guard)
-            }
-            ReadRoute::CacheInfo => respond_cache_info_put(request, storage, metrics, &guard),
-        };
-    }
 
     if !matches!(request.method(), Method::Get | Method::Head) {
         return method_not_allowed(&guard, request, "GET, HEAD, PUT");

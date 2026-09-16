@@ -172,6 +172,10 @@ impl NarUploadPolicy {
             min_free_bytes,
         }
     }
+
+    pub const fn min_free_bytes(self) -> u64 {
+        self.min_free_bytes
+    }
 }
 
 #[derive(Debug)]
@@ -186,6 +190,42 @@ impl StagingReservation {
             reservations,
             bytes: 0,
         }
+    }
+
+    pub(super) fn grow_to(
+        &mut self,
+        available_bytes: u64,
+        min_free_bytes: u64,
+        required_bytes: u64,
+    ) -> Result<(), StorageError> {
+        let additional = required_bytes.saturating_sub(self.bytes);
+        if additional == 0 {
+            return Ok(());
+        }
+        let new_bytes = self
+            .bytes
+            .checked_add(additional)
+            .ok_or(StorageError::InsufficientSpace)?;
+        let capacity = available_bytes
+            .checked_sub(min_free_bytes)
+            .ok_or(StorageError::InsufficientSpace)?;
+        self.reservations
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |reserved| {
+                    reserved
+                        .checked_add(additional)
+                        .filter(|total| *total <= capacity)
+                },
+            )
+            .map_err(|_| StorageError::InsufficientSpace)?;
+        self.bytes = new_bytes;
+        Ok(())
+    }
+
+    pub(super) const fn reserved_bytes(&self) -> u64 {
+        self.bytes
     }
 }
 

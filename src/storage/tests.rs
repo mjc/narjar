@@ -14,8 +14,9 @@ use std::{
 };
 
 use super::compression::{
-    CheckedUploadReader, DecodedValidation, nar_file_size_matches, normalize_upload, validate_xz,
+    CheckedUploadReader, DecodedValidation, nar_file_size_matches, validate_xz,
     verify_decoded_compressed_file, verify_encoded_compressed_file,
+    write_uploaded_representation_as_raw_nar,
 };
 use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes, sync_dir};
 use super::ids::{nix32_sha256, nix32_sha256_matches};
@@ -79,13 +80,15 @@ fn normalized_compressed_source_errors_remain_io_errors() {
         let directory = TestDir::new();
         let destination = directory.path().join("raw.nar");
         let mut destination = fs::File::create(destination).expect("create raw staging file");
-        let error = normalize_upload(
+        let error = write_uploaded_representation_as_raw_nar(
             BrokenReader::new(libc::EIO),
             encoding,
-            &FileHash::parse(NAR_ID).expect("file hash is valid"),
-            3,
+            super::compression::EncodedUploadExpectation {
+                expected_file_hash: &FileHash::parse(NAR_ID).expect("file hash is valid"),
+                expected_file_size: 3,
+                max_nar_size: u64::MAX,
+            },
             &mut destination,
-            u64::MAX,
         )
         .expect_err("source failure must not become invalid content");
         assert_eq!(error.raw_os_error(), Some(libc::EIO), "{encoding:?}");

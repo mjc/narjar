@@ -15,9 +15,14 @@ use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 use crate::narinfo::{CompressedEncoding, CompressedNarExpectation, NarEncoding, NarExpectation};
 use crate::object::{FileHash, NarHash};
 
-use super::ids::nix32_sha256_matches;
+use super::{
+    fs::filesystem_space,
+    ids::nix32_sha256_matches,
+    publication::{StagingReservation, StorageError},
+};
 
 const INGESTION_RECEIPT_VERSION: u8 = 1;
+const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) struct CheckedUploadReader<'a, R, State = Receiving> {
     inner: R,
@@ -87,6 +92,12 @@ impl<'a, R> CheckedUploadReader<'a, R, Receiving> {
     }
 }
 
+impl<R> CheckedUploadReader<'_, R, Complete> {
+    fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
 impl<R: Read> Read for CheckedUploadReader<'_, R, Receiving> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.done {
@@ -114,15 +125,77 @@ impl<R: Read> Read for CheckedUploadReader<'_, R, Receiving> {
     }
 }
 
-struct HashingWriter<'a> {
-    inner: &'a mut File,
+pub(super) struct RawStagingWriter<'a> {
+    file: &'a mut File,
+    reservation: &'a mut StagingReservation,
+    min_free_bytes: u64,
+    bytes_written: u64,
+}
+
+impl<'a> RawStagingWriter<'a> {
+    pub(super) fn new(
+        file: &'a mut File,
+        reservation: &'a mut StagingReservation,
+        min_free_bytes: u64,
+    ) -> Self {
+        Self {
+            file,
+            reservation,
+            min_free_bytes,
+            bytes_written: 0,
+        }
+    }
+
+    fn reserve_before_write(&mut self, next_size: u64) -> io::Result<()> {
+        let required_bytes = next_size
+            .div_ceil(RAW_STAGING_GROWTH_BYTES)
+            .saturating_mul(RAW_STAGING_GROWTH_BYTES);
+        if required_bytes <= self.reservation.reserved_bytes() {
+            return Ok(());
+        }
+        let available_bytes = filesystem_space(self.file)?.available_bytes;
+        self.reservation
+            .grow_to(available_bytes, self.min_free_bytes, required_bytes)
+            .map_err(storage_capacity_error)
+    }
+}
+
+impl Write for RawStagingWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next_size = self
+            .bytes_written
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?;
+        self.reserve_before_write(next_size)?;
+        let written = self.file.write(buffer)?;
+        self.bytes_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn storage_capacity_error(error: StorageError) -> io::Error {
+    match error {
+        StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
+            io::Error::from_raw_os_error(libc::ENOSPC)
+        }
+        StorageError::Io(error) => error,
+        error => io::Error::other(error),
+    }
+}
+
+struct HashingWriter<'a, W: Write + ?Sized> {
+    inner: &'a mut W,
     hasher: Sha256,
     bytes_written: u64,
     max_bytes: u64,
 }
 
-impl<'a> HashingWriter<'a> {
-    fn new(inner: &'a mut File, max_bytes: u64) -> Self {
+impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
+    fn new(inner: &'a mut W, max_bytes: u64) -> Self {
         Self {
             inner,
             hasher: Sha256::new(),
@@ -139,7 +212,7 @@ impl<'a> HashingWriter<'a> {
     }
 }
 
-impl Write for HashingWriter<'_> {
+impl<W: Write + ?Sized> Write for HashingWriter<'_, W> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let next_size = self
             .bytes_written
@@ -162,100 +235,110 @@ impl Write for HashingWriter<'_> {
     }
 }
 
-pub(super) fn normalize_upload(
+pub(super) fn write_uploaded_representation_as_raw_nar<W: Write>(
     source: impl Read,
     encoding: NarEncoding,
-    expected_file_hash: &FileHash,
-    expected_file_size: u64,
-    destination: &mut File,
-    max_nar_size: u64,
+    expectation: EncodedUploadExpectation<'_>,
+    destination: &mut W,
 ) -> io::Result<DecodedValidation> {
     match encoding {
-        NarEncoding::None => normalize_raw_upload(
-            source,
-            expected_file_hash,
-            expected_file_size,
-            destination,
-            max_nar_size,
-        ),
-        NarEncoding::Xz => normalize_xz_upload(
-            source,
-            expected_file_hash,
-            expected_file_size,
-            destination,
-            max_nar_size,
-        ),
-        NarEncoding::Zstd => normalize_zstd_upload(
-            source,
-            expected_file_hash,
-            expected_file_size,
-            destination,
-            max_nar_size,
-        ),
+        NarEncoding::None => copy_raw_upload_to_raw_staging(source, expectation, destination),
+        NarEncoding::Xz => decode_xz_upload_to_raw_staging(source, expectation, destination),
+        NarEncoding::Zstd => decode_zstd_upload_to_raw_staging(source, expectation, destination),
     }
 }
 
-fn normalize_raw_upload(
+pub(super) fn finish_checked_upload<R: Read>(input: CheckedUploadReader<'_, R>) -> io::Result<()> {
+    input.finish().map(|_| ())
+}
+
+fn copy_raw_upload_to_raw_staging<W: Write>(
     source: impl Read,
-    expected_file_hash: &FileHash,
-    expected_file_size: u64,
-    destination: &mut File,
-    max_nar_size: u64,
+    expectation: EncodedUploadExpectation<'_>,
+    destination: &mut W,
 ) -> io::Result<DecodedValidation> {
-    let mut input = CheckedUploadReader::new(source, expected_file_hash, expected_file_size);
-    let mut output = HashingWriter::new(destination, max_nar_size);
+    let mut input = CheckedUploadReader::new(
+        source,
+        expectation.expected_file_hash,
+        expectation.expected_file_size,
+    );
+    let mut output = HashingWriter::new(destination, expectation.max_nar_size);
     io::copy(&mut input, &mut output)?;
     let _complete = input.finish()?;
     let decoded = output.finish();
-    if decoded.size != expected_file_size || !expected_file_hash.matches_nar_hash(decoded.hash) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "raw NAR hash or size mismatch",
-        ));
-    }
-    Ok(decoded)
+    validate_raw_upload_identity(decoded, expectation)
 }
 
-fn normalize_xz_upload(
+fn decode_xz_upload_to_raw_staging<W: Write>(
     source: impl Read,
-    expected_file_hash: &FileHash,
-    expected_file_size: u64,
-    destination: &mut File,
-    max_nar_size: u64,
+    expectation: EncodedUploadExpectation<'_>,
+    destination: &mut W,
 ) -> io::Result<DecodedValidation> {
-    let input = CheckedUploadReader::new(source, expected_file_hash, expected_file_size);
+    let input = CheckedUploadReader::new(
+        source,
+        expectation.expected_file_hash,
+        expectation.expected_file_size,
+    );
     let source_error = Rc::new(RefCell::new(None));
     let mut decoder = XzReader::new(
         CompressedSourceReader::new(input, Rc::clone(&source_error)),
         false,
     );
-    let decoded = copy_decoded_bytes_to_raw_staging(&mut decoder, destination, max_nar_size)
-        .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
-    finish_encoded_upload_after_decoding(decoder.into_inner().inner, &source_error)?;
+    let decoded =
+        copy_decoded_bytes_to_raw_staging(&mut decoder, destination, expectation.max_nar_size)
+            .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
+    finish_encoded_upload_after_decoding(decoder.into_inner().into_inner(), &source_error)?;
     Ok(decoded)
 }
 
-fn normalize_zstd_upload(
+fn decode_zstd_upload_to_raw_staging<W: Write>(
     source: impl Read,
-    expected_file_hash: &FileHash,
-    expected_file_size: u64,
-    destination: &mut File,
-    max_nar_size: u64,
+    expectation: EncodedUploadExpectation<'_>,
+    destination: &mut W,
 ) -> io::Result<DecodedValidation> {
-    let input = CheckedUploadReader::new(source, expected_file_hash, expected_file_size);
+    let input = CheckedUploadReader::new(
+        source,
+        expectation.expected_file_hash,
+        expectation.expected_file_size,
+    );
     let source_error = Rc::new(RefCell::new(None));
     let mut decoder =
         StructuredZstdDecoder::new(CompressedSourceReader::new(input, Rc::clone(&source_error)))
             .map_err(|error| take_source_error(&source_error, compressed_decoder_error(error)))?;
-    let decoded = copy_decoded_bytes_to_raw_staging(&mut decoder, destination, max_nar_size)
-        .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
-    finish_encoded_upload_after_decoding(decoder.into_inner().inner, &source_error)?;
+    let decoded =
+        copy_decoded_bytes_to_raw_staging(&mut decoder, destination, expectation.max_nar_size)
+            .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
+    finish_encoded_upload_after_decoding(decoder.into_inner().into_inner(), &source_error)?;
     Ok(decoded)
 }
 
-fn copy_decoded_bytes_to_raw_staging<R: Read>(
+#[derive(Clone, Copy)]
+pub(super) struct EncodedUploadExpectation<'a> {
+    pub(super) expected_file_hash: &'a FileHash,
+    pub(super) expected_file_size: u64,
+    pub(super) max_nar_size: u64,
+}
+
+fn validate_raw_upload_identity(
+    decoded: DecodedValidation,
+    expectation: EncodedUploadExpectation<'_>,
+) -> io::Result<DecodedValidation> {
+    if decoded.size == expectation.expected_file_size
+        && expectation
+            .expected_file_hash
+            .matches_nar_hash(decoded.hash)
+    {
+        return Ok(decoded);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "raw NAR hash or size mismatch",
+    ))
+}
+
+fn copy_decoded_bytes_to_raw_staging<R: Read, W: Write>(
     decoder: &mut R,
-    destination: &mut File,
+    destination: &mut W,
     max_nar_size: u64,
 ) -> io::Result<DecodedValidation> {
     let mut output = HashingWriter::new(destination, max_nar_size);
@@ -269,7 +352,7 @@ fn finish_encoded_upload_after_decoding<R: Read>(
 ) -> io::Result<()> {
     input
         .finish()
-        .map(|_| ())
+        .map(|complete| drop(complete.into_inner()))
         .map_err(|error| take_source_error(source_error, compressed_read_error(error)))
 }
 
@@ -286,6 +369,10 @@ struct CompressedSourceReader<R> {
 impl<R> CompressedSourceReader<R> {
     fn new(inner: R, error: Rc<RefCell<Option<io::Error>>>) -> Self {
         Self { inner, error }
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
     }
 }
 

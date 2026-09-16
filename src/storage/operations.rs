@@ -19,8 +19,9 @@ use crate::object::FileHash;
 
 use super::{
     compression::{
-        CheckedUploadReader, IngestionReceipt, ingestion_receipt_file_name, nar_file_size_matches,
-        normalize_upload,
+        CheckedUploadReader, EncodedUploadExpectation, IngestionReceipt, RawStagingWriter,
+        finish_checked_upload, ingestion_receipt_file_name, nar_file_size_matches,
+        write_uploaded_representation_as_raw_nar,
     },
     directory::Directory,
     fs::{
@@ -46,6 +47,19 @@ const MAX_CACHE_INFO_BYTES: u64 = 1024;
 pub(super) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
 pub(super) const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
 pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
+
+struct CompletedRawNarStaging {
+    temporary: TemporaryFile,
+    transaction: PublicationTransaction,
+    receipt: IngestionReceipt,
+}
+
+impl CompletedRawNarStaging {
+    fn raw_nar_object_id(&self) -> NarObjectId {
+        NarObjectId::parse(&self.receipt.decoded_hash().to_string())
+            .expect("binary SHA-256 Nix hash formats as a valid object ID")
+    }
+}
 
 fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
     if bytes.len() as u64 > MAX_CACHE_INFO_BYTES {
@@ -221,83 +235,194 @@ impl Storage {
             return Err(StorageError::UploadTooLarge);
         }
 
-        let required_bytes = expected_length.saturating_add(policy.min_free_bytes);
-        let admit = || {
-            let directory = self.nar_temp_directory()?;
-            filesystem_space(&directory)?.required_capacity(required_bytes)
-        };
+        let staging = self.reserve_staging(expected_length, policy.min_free_bytes)?;
+        self.publish_nar_with_staging(id, encoding, source, expected_length, policy, staging)
+    }
+
+    pub fn publish_nar_with_staging(
+        &self,
+        id: &NarObjectId,
+        encoding: NarEncoding,
+        source: impl Read,
+        expected_length: u64,
+        policy: NarUploadPolicy,
+        mut staging: StagingReservation,
+    ) -> Result<PublishOutcome, StorageError> {
+        if expected_length > policy.max_bytes {
+            return Err(StorageError::UploadTooLarge);
+        }
+
         match encoding {
-            NarEncoding::None => {
-                let file_hash = FileHash::parse(id.as_str())
-                    .expect("validated upload path is a SHA-256 file hash");
-                self.publish_with_admission(
-                    PublishTarget::Nar(id, encoding),
-                    CheckedUploadReader::new(source, &file_hash, expected_length),
-                    admit,
-                    |_| Ok(()),
-                )
+            NarEncoding::None => self.publish_raw_nar_upload(id, source, expected_length),
+            NarEncoding::Xz => {
+                self.publish_xz_nar_upload(id, source, expected_length, policy, &mut staging)
             }
-            NarEncoding::Zstd | NarEncoding::Xz => {
-                self.publish_normalized_nar(id, encoding, source, expected_length, policy, admit)
+            NarEncoding::Zstd => {
+                self.publish_zstd_nar_upload(id, source, expected_length, policy, &mut staging)
             }
         }
     }
 
-    fn publish_normalized_nar(
+    fn publish_raw_nar_upload(
+        &self,
+        id: &NarObjectId,
+        source: impl Read,
+        expected_length: u64,
+    ) -> Result<PublishOutcome, StorageError> {
+        let file_hash =
+            FileHash::parse(id.as_str()).expect("validated upload path is a SHA-256 file hash");
+        self.publish_with_admission(
+            PublishTarget::Nar(id, NarEncoding::None),
+            CheckedUploadReader::new(source, &file_hash, expected_length),
+            || Ok(()),
+            |_| Ok(()),
+            |input| finish_checked_upload(input).map_err(StorageError::from),
+        )
+    }
+
+    fn publish_xz_nar_upload(
+        &self,
+        id: &NarObjectId,
+        source: impl Read,
+        expected_length: u64,
+        policy: NarUploadPolicy,
+        staging: &mut StagingReservation,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.publish_compressed_nar_upload_as_raw(
+            id,
+            NarEncoding::Xz,
+            source,
+            expected_length,
+            policy,
+            staging,
+        )
+    }
+
+    fn publish_zstd_nar_upload(
+        &self,
+        id: &NarObjectId,
+        source: impl Read,
+        expected_length: u64,
+        policy: NarUploadPolicy,
+        staging: &mut StagingReservation,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.publish_compressed_nar_upload_as_raw(
+            id,
+            NarEncoding::Zstd,
+            source,
+            expected_length,
+            policy,
+            staging,
+        )
+    }
+
+    fn publish_compressed_nar_upload_as_raw(
         &self,
         encoded_id: &NarObjectId,
         encoding: NarEncoding,
         source: impl Read,
         encoded_size: u64,
         policy: NarUploadPolicy,
-        admit: impl FnOnce() -> Result<(), StorageError>,
+        staging: &mut StagingReservation,
     ) -> Result<PublishOutcome, StorageError> {
+        let staging = self.stage_compressed_upload_as_raw_nar(
+            encoded_id,
+            encoding,
+            source,
+            encoded_size,
+            policy,
+            staging,
+        )?;
+        let raw_id = staging.raw_nar_object_id();
+        let CompletedRawNarStaging {
+            temporary,
+            transaction,
+            receipt,
+        } = staging;
+
+        let outcome = self.commit_temporary(
+            PublishTarget::Nar(&raw_id, NarEncoding::None),
+            temporary,
+            transaction,
+            |_| Ok(()),
+        )?;
+        self.publish_ingestion_receipt(receipt)?;
+        Ok(outcome)
+    }
+
+    fn stage_compressed_upload_as_raw_nar(
+        &self,
+        encoded_id: &NarObjectId,
+        encoding: NarEncoding,
+        source: impl Read,
+        encoded_size: u64,
+        policy: NarUploadPolicy,
+        staging: &mut StagingReservation,
+    ) -> Result<CompletedRawNarStaging, StorageError> {
         let encoded_hash = FileHash::parse(encoded_id.as_str())
             .expect("validated upload path is a SHA-256 file hash");
-        admit()?;
         let staging_target = PublishTarget::Nar(encoded_id, encoding);
         let temp_name = self.next_temp_name(&staging_target);
         let temporary_path = self.temporary_path(&staging_target, &temp_name);
         let mut transaction = self.recovery.begin(&temporary_path)?;
         let mut temp = self.create_temp_named(&staging_target, temp_name)?;
-        transaction.transition(PublicationState::Streaming)?;
 
-        let decoded = (|| {
-            let decoded = normalize_upload(
-                source,
-                encoding,
-                &encoded_hash,
-                encoded_size,
-                &mut temp.file,
-                policy.max_bytes,
-            )?;
-            temp.file.sync_all()?;
-            transaction.transition(PublicationState::Validated)?;
-            Ok::<_, StorageError>(decoded)
-        })();
-        let decoded = match decoded {
-            Ok(decoded) => decoded,
+        let expectation = EncodedUploadExpectation {
+            expected_file_hash: &encoded_hash,
+            expected_file_size: encoded_size,
+            max_nar_size: policy.max_bytes,
+        };
+        let receipt = match Self::write_and_validate_compressed_upload(
+            source,
+            encoding,
+            expectation,
+            policy.min_free_bytes,
+            staging,
+            &mut temp,
+            &mut transaction,
+        ) {
+            Ok(receipt) => receipt,
             Err(error) => {
                 let _ = self.remove_temp(&temp);
                 return Err(error);
             }
         };
 
-        let raw_id = NarObjectId::parse(&decoded.hash.to_string())
-            .expect("binary SHA-256 Nix hash formats as a valid object ID");
-        let outcome = self.commit_temporary(
-            PublishTarget::Nar(&raw_id, NarEncoding::None),
-            temp,
+        Ok(CompletedRawNarStaging {
+            temporary: temp,
             transaction,
-            |_| Ok(()),
-        )?;
-        self.publish_ingestion_receipt(IngestionReceipt::from_decoded(
+            receipt,
+        })
+    }
+
+    fn write_and_validate_compressed_upload(
+        source: impl Read,
+        encoding: NarEncoding,
+        expectation: EncodedUploadExpectation<'_>,
+        min_free_bytes: u64,
+        staging: &mut StagingReservation,
+        temporary: &mut TemporaryFile,
+        transaction: &mut PublicationTransaction,
+    ) -> Result<IngestionReceipt, StorageError> {
+        transaction.transition(PublicationState::Streaming)?;
+        let decoded = {
+            let mut destination =
+                RawStagingWriter::new(&mut temporary.file, staging, min_free_bytes);
+            write_uploaded_representation_as_raw_nar(
+                source,
+                encoding,
+                expectation,
+                &mut destination,
+            )?
+        };
+        temporary.file.sync_all()?;
+        transaction.transition(PublicationState::Validated)?;
+        Ok(IngestionReceipt::from_decoded(
             encoding,
-            encoded_hash,
-            encoded_size,
+            *expectation.expected_file_hash,
+            expectation.expected_file_size,
             decoded,
-        ))?;
-        Ok(outcome)
+        ))
     }
 
     #[cfg(test)]
@@ -504,15 +629,16 @@ impl Storage {
         source: impl Read,
         checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish_with_admission(target, source, || Ok(()), checkpoint)
+        self.publish_with_admission(target, source, || Ok(()), checkpoint, |_| Ok(()))
     }
 
-    pub(super) fn publish_with_admission(
+    pub(super) fn publish_with_admission<R: Read>(
         &self,
         target: PublishTarget<'_>,
-        mut source: impl Read,
+        mut source: R,
         admit: impl FnOnce() -> Result<(), StorageError>,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+        finish_source: impl FnOnce(R) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
         admit()?;
         let temp_name = self.next_temp_name(&target);
@@ -530,6 +656,7 @@ impl Storage {
                 &mut source,
                 &mut temp.as_mut().expect("temporary file exists").file,
             )?;
+            finish_source(source)?;
             checkpoint(PublishBoundary::AfterStream)?;
             temp.as_ref()
                 .expect("temporary file exists")
