@@ -18,43 +18,43 @@ use crate::narinfo::NarEncoding;
 
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct Layout {
+pub(super) struct Layout {
     root: PathBuf,
 }
 
 #[cfg(test)]
 impl Layout {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub(super) fn new(root: PathBuf) -> Self {
         Self { root }
     }
 
-    pub(crate) fn nar_dir(&self) -> PathBuf {
+    pub(super) fn nar_dir(&self) -> PathBuf {
         self.root.join("nar")
     }
 
-    pub(crate) fn nar_path(&self, id: &NarObjectId) -> PathBuf {
+    pub(super) fn nar_path(&self, id: &NarObjectId) -> PathBuf {
         self.nar_dir().join(format!("{}.nar", id.0))
     }
 
-    pub(crate) fn nar_path_encoded(&self, id: &NarObjectId, encoding: NarEncoding) -> PathBuf {
+    pub(super) fn nar_path_encoded(&self, id: &NarObjectId, encoding: NarEncoding) -> PathBuf {
         self.nar_dir()
             .join(format!("{}{}", id.0, encoding.suffix()))
     }
 
-    pub(crate) fn nar_temp_dir(&self) -> PathBuf {
+    pub(super) fn nar_temp_dir(&self) -> PathBuf {
         self.nar_dir().join(".tmp")
     }
 
-    pub(crate) fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
+    pub(super) fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
         self.root.join(format!("{}.narinfo", hash.0))
     }
 
-    pub(crate) fn temp_dir(&self) -> PathBuf {
+    pub(super) fn temp_dir(&self) -> PathBuf {
         self.root.join(".tmp")
     }
 }
 
-pub(crate) enum PublishTarget<'a> {
+pub(super) enum PublishTarget<'a> {
     CacheInfo,
     Nar(&'a NarObjectId, NarEncoding),
     NarInfo(&'a StoreHash),
@@ -62,7 +62,7 @@ pub(crate) enum PublishTarget<'a> {
 }
 
 impl PublishTarget<'_> {
-    pub(crate) fn destination_name(&self) -> OsString {
+    pub(super) fn destination_name(&self) -> OsString {
         match self {
             Self::CacheInfo => OsString::from("nix-cache-info"),
             Self::Nar(id, encoding) => {
@@ -73,7 +73,7 @@ impl PublishTarget<'_> {
         }
     }
 
-    pub(crate) fn temp_prefix(&self) -> &'static str {
+    pub(super) fn temp_prefix(&self) -> &'static str {
         match self {
             Self::CacheInfo => "cache-info",
             Self::Nar(_, _) => "nar",
@@ -82,7 +82,7 @@ impl PublishTarget<'_> {
         }
     }
 
-    pub(crate) fn replaces_destination(&self) -> bool {
+    pub(super) fn replaces_destination(&self) -> bool {
         match self {
             Self::Validation(_) => true,
             Self::CacheInfo | Self::Nar(_, _) | Self::NarInfo(_) => false,
@@ -91,14 +91,14 @@ impl PublishTarget<'_> {
 }
 
 #[derive(Debug)]
-pub(crate) struct TemporaryFile {
-    pub(crate) name: OsString,
-    pub(crate) directory: File,
-    pub(crate) file: File,
+pub(super) struct TemporaryFile {
+    pub(super) name: OsString,
+    pub(super) directory: File,
+    pub(super) file: File,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PublishBoundary {
+pub(super) enum PublishBoundary {
     BeforeTempCreate,
     AfterTempCreate,
     AfterStream,
@@ -109,7 +109,7 @@ pub(crate) enum PublishBoundary {
 }
 
 #[cfg(test)]
-pub(crate) fn injected_fault(
+pub(super) fn injected_fault(
     boundary: PublishBoundary,
     fault: PublishBoundary,
 ) -> Result<(), StorageError> {
@@ -126,17 +126,17 @@ pub(crate) fn injected_fault(
 /// relies on local-filesystem `flock` semantics for directory file
 /// descriptions; distributed filesystems are outside the supported guarantee.
 #[derive(Debug)]
-pub(crate) struct ProcessLock {
+pub(super) struct ProcessLock {
     _file: File,
 }
 
 impl ProcessLock {
-    pub(crate) fn acquire(parent: File) -> Result<Self, StorageError> {
+    pub(super) fn acquire(parent: File) -> Result<Self, StorageError> {
         lock_exclusive(&parent)?;
         Ok(Self { _file: parent })
     }
 
-    pub(crate) fn validate_lock_file(root: &File) -> Result<(), StorageError> {
+    pub(super) fn validate_lock_file(root: &File) -> Result<(), StorageError> {
         let file = open_at(
             root,
             OsStr::new("lock"),
@@ -263,4 +263,4 @@ impl std::error::Error for StorageError {
     }
 }
 
-pub(crate) static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+pub(super) static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);

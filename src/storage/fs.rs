@@ -22,7 +22,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::{StagingReservation, StorageError, TemporaryFile};
+use super::publication::TemporaryFile;
+use super::{StagingReservation, StorageError};
 
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 

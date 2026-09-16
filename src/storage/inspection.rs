@@ -1,9 +1,7 @@
 //! Read-only discovery and payload inspection; inventory reporting belongs to the caller.
 
-use super::{
-    InvalidObjectId, NarObjectId, StoreHash, entry_is_regular_at, nar_file_matches,
-    nar_file_size_matches, open_regular_at,
-};
+use super::compression::{nar_file_matches, nar_file_size_matches};
+use super::{InvalidObjectId, NarObjectId, StoreHash, entry_is_regular_at, open_regular_at};
 use crate::narinfo::{NarEncoding, NarExpectation};
 use std::{ffi::OsStr, fmt, fs::File, io};
 

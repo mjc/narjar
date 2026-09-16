@@ -6,8 +6,8 @@ use std::{
 };
 
 #[cfg(test)]
-use super::Layout;
-use super::ProcessLock;
+use super::publication::Layout;
+use super::publication::ProcessLock;
 use super::recovery::RecoveryState;
 
 #[derive(Debug)]

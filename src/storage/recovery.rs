@@ -10,9 +10,9 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+use super::fs::{open_at, unlink_at};
 use super::{
-    StorageError, entry_is_regular_at, open_at, open_directory_at, open_regular_at, read_dir_names,
-    unlink_at,
+    StorageError, entry_is_regular_at, open_directory_at, open_regular_at, read_dir_names,
 };
 
 const TRANSACTION_DIRECTORY: &str = ".narjar-transactions";

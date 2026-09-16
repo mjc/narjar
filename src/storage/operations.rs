@@ -1,8 +1,49 @@
-use super::*;
+use std::{
+    collections::HashMap,
+    ffi::{OsStr, OsString},
+    fs::{File, Permissions},
+    io::{self, Cursor, Read},
+    num::NonZeroUsize,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    process,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::SystemTime,
+};
+
+use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation, ValidatedNarInfo};
+
+use super::{
+    compression::{
+        CheckedUploadReader, ValidationEvidence, nar_encoding, nar_file_size_matches,
+        validate_compressed_nar, validate_xz, validate_zstd, validation_file_name,
+    },
+    directory::Directory,
+    fs::{
+        StorageCapacity, directory_is_empty, ensure_directory_at, entry_is_regular_at,
+        files_equal_at, filesystem_space, hard_link_at, open_at, open_directory_at,
+        open_optional_at, open_regular_at, read_dir_names, remove_temp, rename_at,
+        reserve_staging_bytes, rollback_link_at, unlink_at,
+    },
+    ids::{NarObjectId, StoreHash},
+    publication::{
+        NEXT_TEMP, NarUploadPolicy, ProcessLock, PublishBoundary, PublishOutcome, PublishTarget,
+        PublishedPair, StagingReservation, StorageError, TemporaryFile,
+    },
+    reconcile::{self, ReconcileEntry, ReconcileReport},
+    recovery::{PublicationState, RecoveryState},
+    state::Storage,
+};
+
+#[cfg(test)]
+use super::publication::{Layout, injected_fault};
 
 const MAX_CACHE_INFO_BYTES: u64 = 1024;
-pub(crate) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
-pub(crate) const MAX_VALIDATION_EVIDENCE_BYTES: u64 = 256;
+pub(super) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
+pub(super) const MAX_VALIDATION_EVIDENCE_BYTES: u64 = 256;
 
 fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
     if bytes.len() as u64 > MAX_CACHE_INFO_BYTES {
