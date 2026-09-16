@@ -2465,6 +2465,157 @@ fn zstd_narinfo_is_published_as_the_canonical_raw_pair() {
 }
 
 #[test]
+fn compressed_ingestion_receipts_survive_restart_before_narinfo_publication() {
+    for compression in ["xz", "zstd"] {
+        let server = RunningServer::start(&format!("receipt-restart-{compression}"));
+        let (compressed, narinfo, suffix) = compressed_upload_fixture(compression);
+        let encoded_hash = nix32_sha256(&compressed);
+        let uploaded = server.request_with_body(
+            "PUT",
+            &format!("/nar/{encoded_hash}{suffix}"),
+            &[],
+            &compressed,
+        );
+        assert!(
+            response_parts(&uploaded)
+                .0
+                .starts_with("HTTP/1.1 201 Created\r\n"),
+            "{compression} upload should be accepted: {uploaded:?}"
+        );
+
+        let (data_dir, signal, status) = server.stop_preserving();
+        assert!(signal.success(), "{compression} server should stop cleanly");
+        assert!(status.success(), "{compression} server should stop cleanly");
+
+        let restarted = RunningServer::start_in(data_dir, &[]);
+        let published = restarted.request_with_body(
+            "PUT",
+            &format!("/{STORE_HASH}.narinfo"),
+            &[],
+            narinfo.as_bytes(),
+        );
+        assert!(
+            response_parts(&published)
+                .0
+                .starts_with("HTTP/1.1 201 Created\r\n"),
+            "{compression} narinfo should use the durable receipt: {published:?}"
+        );
+        let served = restarted.request("GET", &format!("/nar/{NARJAR_HASH}.nar"));
+        assert_eq!(response_parts(&served).1, NAR_BYTES);
+        let (signal, status) = restarted.stop();
+        assert!(signal.success(), "{compression} server should stop cleanly");
+        assert!(status.success(), "{compression} server should stop cleanly");
+    }
+}
+
+#[test]
+fn compressed_publication_rejects_a_receipt_for_a_different_nar_identity() {
+    let different_nar = b"different-nar";
+    let different_hash = nix32_sha256(different_nar);
+    for compression in ["xz", "zstd"] {
+        let server = RunningServer::start(&format!("receipt-mismatch-{compression}"));
+        let (compressed, _, suffix) = compressed_upload_fixture(compression);
+        let encoded_hash = nix32_sha256(&compressed);
+        let mismatched_narinfo = signed_compressed_narinfo(
+            compression,
+            &encoded_hash,
+            &different_hash,
+            different_nar.len() as u64,
+            compressed.len() as u64,
+        );
+
+        let uploaded = server.request_with_body(
+            "PUT",
+            &format!("/nar/{encoded_hash}{suffix}"),
+            &[],
+            &compressed,
+        );
+        assert!(
+            response_parts(&uploaded)
+                .0
+                .starts_with("HTTP/1.1 201 Created\r\n")
+        );
+        let rejected = server.request_with_body(
+            "PUT",
+            &format!("/{STORE_HASH}.narinfo"),
+            &[],
+            mismatched_narinfo.as_bytes(),
+        );
+        assert!(
+            response_parts(&rejected)
+                .0
+                .starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+            "{compression} metadata must remain bound to the decoded NAR: {rejected:?}"
+        );
+        assert!(
+            !server
+                .data_dir
+                .join(format!("{STORE_HASH}.narinfo"))
+                .exists()
+        );
+        let (signal, status) = server.stop();
+        assert!(signal.success(), "{compression} server should stop cleanly");
+        assert!(status.success(), "{compression} server should stop cleanly");
+    }
+}
+
+fn compressed_upload_fixture(compression: &str) -> (Vec<u8>, String, &'static str) {
+    let mut compressed = Vec::new();
+    let narinfo = match compression {
+        "xz" => {
+            let mut writer =
+                XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ");
+            writer.write_all(NAR_BYTES).expect("compress NAR");
+            writer.finish().expect("finish XZ");
+            let encoded_hash = nix32_sha256(&compressed);
+            signed_compressed_narinfo(
+                compression,
+                &encoded_hash,
+                NARJAR_HASH,
+                NAR_BYTES.len() as u64,
+                compressed.len() as u64,
+            )
+        }
+        "zstd" => {
+            compress(
+                std::io::Cursor::new(NAR_BYTES),
+                &mut compressed,
+                CompressionLevel::Fastest,
+            );
+            let encoded_hash = nix32_sha256(&compressed);
+            signed_compressed_narinfo(
+                compression,
+                &encoded_hash,
+                NARJAR_HASH,
+                NAR_BYTES.len() as u64,
+                compressed.len() as u64,
+            )
+        }
+        _ => panic!("unsupported test compression: {compression}"),
+    };
+    let suffix = match compression {
+        "xz" => ".nar.xz",
+        "zstd" => ".nar.zst",
+        _ => unreachable!(),
+    };
+    (compressed, narinfo, suffix)
+}
+
+fn signed_compressed_narinfo(
+    compression: &str,
+    encoded_hash: &str,
+    nar_hash: &str,
+    nar_size: u64,
+    encoded_size: u64,
+) -> String {
+    match compression {
+        "xz" => signed_xz_narinfo(encoded_hash, nar_hash, nar_size, encoded_size),
+        "zstd" => signed_zstd_narinfo(encoded_hash, nar_hash, nar_size, encoded_size),
+        _ => panic!("unsupported test compression: {compression}"),
+    }
+}
+
+#[test]
 fn narinfo_put_rejects_unsigned_metadata_without_publication() {
     let server = RunningServer::start("narinfo-put-unsigned");
     let nar_path = format!("/nar/{NARJAR_HASH}.nar");
