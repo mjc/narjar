@@ -127,13 +127,16 @@ impl Request {
         };
 
         let mut received = 0;
+        let mut scanned_until: usize = 0;
         let header_end = loop {
-            if let Some(end) = request.buffer[..received]
+            let search_start = scanned_until.saturating_sub(3);
+            if let Some(end) = request.buffer[search_start..received]
                 .array_windows::<4>()
                 .position(|window| window == b"\r\n\r\n")
             {
-                break end + 4;
+                break search_start + end + 4;
             }
+            scanned_until = received;
             if received == request.buffer.len() {
                 return Err((
                     request.stream,
