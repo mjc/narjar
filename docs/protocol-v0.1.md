@@ -116,7 +116,8 @@ does depend on NAR-before-narinfo for native v0.1 ingestion. A narinfo PUT whose
 NAR is absent fails with 422 and never creates a visible path.
 
 The NAR object may be durable but unreachable. The store path becomes visible
-only when its validated narinfo rename and directory sync complete.
+only when its validated narinfo no-replace hard link and directory sync
+complete.
 
 ## Narinfo requirements
 

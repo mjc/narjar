@@ -1,6 +1,7 @@
 # Narjar v0.1 operations and resilience contract
 
-Status: design-gate draft for NARJ-11, NARJ-13, and NARJ-14.
+Status: accepted v0.1 operations contract; remaining deployment evidence is
+tracked in the risk register and open Lific work.
 
 ## CLI
 
@@ -20,6 +21,8 @@ narjar serve
   [--max-in-flight 64]
   [--max-nar-bytes 17179869184]
   [--min-free-bytes 1073741824]
+  [--shutdown-grace-seconds 30]
+  [--io-timeout-seconds 30]
 
 narjar token create
   --data-dir PATH
@@ -34,6 +37,15 @@ narjar token revoke
 narjar reconcile
   --data-dir PATH
   [--verify-hashes]
+  [--json]
+  [--structural]
+  [--limit N]
+  [--min-age-seconds N]
+
+narjar cleanup
+  --data-dir PATH
+  [--min-age-seconds N]
+  [--limit N]
   [--json]
 
 narjar verify
@@ -57,7 +69,17 @@ narjar gc
 
 narjar list-orphans
   --data-dir PATH
+  [--verify-hashes]
   [--json]
+
+narjar doctor
+  --data-dir PATH
+  [--json]
+
+narjar key generate
+  --name LABEL
+  --secret-key-file PATH
+  --public-key-file PATH
 
 narjar stats
   --url HTTP_URL
@@ -67,6 +89,7 @@ narjar stats
 narjar push
   --to STORE_URI
   [--jobs N]
+  [--compression none|zstd|xz]
   [--timeout-seconds N]
   [--netrc-file PATH]
   [--signing-key-file PATH]
@@ -98,8 +121,10 @@ request has a 30-second timeout by default; `--timeout-seconds` or
 `NARJAR_PUSH_TIMEOUT_SECONDS` changes it. The `nix`
 executable remains required for closure enumeration, signing, and canonical NAR
 serialization. `--netrc-file` is parsed by Narjar and its matching credential
-is sent as HTTP Basic authentication; the file must already have restrictive
-permissions.
+is sent as HTTP Basic authentication only when the target URL uses HTTPS. Plain
+HTTP requests never receive an Authorization header, and an HTTP-to-HTTPS
+redirect does not upgrade credentials; use an HTTPS target from the start. The
+file must already have restrictive permissions.
 
 The native client transfers store-path NARs and narinfos only. Realisations,
 build logs, `.ls` listings, and other store-daemon metadata are outside this
@@ -157,6 +182,8 @@ NARJAR_MAX_IN_FLIGHT
 NARJAR_MAX_NAR_BYTES
 NARJAR_MIN_FREE_BYTES
 NARJAR_SHUTDOWN_GRACE_SECONDS
+NARJAR_IO_TIMEOUT_SECONDS
+NARJAR_PUSH_TIMEOUT_SECONDS
 ~~~
 
 The compiled defaults bind to loopback, use 8 workers, admit at most 64
@@ -205,9 +232,9 @@ serve creates a fixed worker set and a bounded queue. max-in-flight limits
 requests that have begun processing; excess requests receive 429 when possible
 or remain outside Narjar in the proxy accept queue.
 
-Each admitted upload owns at most one temporary file, one descriptor, one hash
-state, and one fixed buffer. Reads own one file and one fixed buffer. Memory is
-therefore O(workers * buffer-size), independent of NAR size.
+Each admitted upload owns at most one temporary file, one descriptor, bounded
+hash state, and one fixed buffer. Reads own one file and one fixed buffer. Memory
+is therefore O(workers * buffer-size), independent of NAR size.
 
 Header parsing limits come from Narjar's fixed parser plus route checks. Content-
 Length is required before upload admission. Each accepted socket uses the
@@ -288,6 +315,13 @@ when recovery records are present, then removes only those recorded temporary
 objects before serving exact files. Reconciliation remains deterministic and
 operator-triggered for other stale temporary files.
 
+Upload validation is the first content-integrity boundary. Raw narinfo
+publication and normal availability checks inspect only that the regular file
+exists with the declared encoded size. Compressed narinfo publication currently
+revalidates the encoded and decoded hashes before publication. Use `narjar
+verify` or `narjar reconcile --verify-hashes` for an explicit full content scan,
+including detection of same-size out-of-band mutation.
+
 ## Disk-full and I/O failure
 
 Before accepting a NAR, Narjar checks the receiving `DATA/nar/.tmp`
@@ -339,6 +373,11 @@ serving process is stopped and the DATA lease is released. A live `rsync` is
 convergent synchronization, not a point-in-time backup: it may capture a NAR
 and its narinfo at different moments.
 
+For a live convergent copy when downtime is not available, exclude all `.tmp`
+directories and run `verify` on the destination before using it. This is not a
+substitute for the stopped-service procedure when a strict point-in-time
+boundary is required.
+
 For a consistent portable copy:
 
 1. Stop Narjar and wait for the process to exit.
@@ -347,8 +386,8 @@ For a consistent portable copy:
    `realisations/`, `nix-cache-info`, `trusted-public-keys`, and `auth/`.
 3. Preserve the directory and file permissions; do not expose the copy while
    it contains credentials.
-4. On the destination, run `doctor`, `reconcile --verify-hashes`, and `verify`
-   before starting Narjar.
+4. On the destination, require `doctor` to exit successfully, then run
+   `reconcile --verify-hashes` and `verify` before starting Narjar.
 5. Start Narjar and require `GET /readyz` to return `200` before routing
    consumers to it.
 
@@ -362,6 +401,109 @@ Filesystem snapshots are an external alternative, but the snapshot must include
 the recovery marker, trust material, and credentials according to that same
 policy. A corrupt or incomplete copy must remain offline: `doctor`,
 `reconcile`, or `verify` must pass before readiness is considered meaningful.
+
+Executable backup/restore coverage is the
+[`restored_cache_verifies_before_serving`](../tests/cli.rs) integration test;
+it copies a cache into a new DATA directory, runs reconciliation, verification,
+and doctor, then starts the restored service before accepting readiness.
+
+### Optional ZFS snapshot and replication workflow
+
+ZFS operations stay outside Narjar. Substitute an explicitly verified dataset
+name for `pool/narjar-data`; never infer a production target from a mountpoint
+or copy these commands onto an unrelated pool.
+
+First confirm the DATA dataset, mountpoint, and policy before taking a snapshot:
+
+~~~sh
+dataset=pool/narjar-data
+pool=${dataset%%/*}
+test "$(zfs get -H -o value mountpoint "$dataset")" = /var/lib/narjar
+zfs get -H -o property,value \
+  mountpoint,compression,atime,sync,dedup,quota,refquota,refreservation \
+  "$dataset"
+~~~
+
+For a single DATA dataset, stopping Narjar and taking one snapshot gives a
+point-in-time application boundary. If DATA is split across child datasets,
+stop the service and use one recursive snapshot boundary; independent
+snapshots are not an atomic multi-dataset backup.
+
+~~~sh
+snapshot="narjar-$(date +%Y%m%d-%H%M%S)"
+set -euo pipefail
+restarted=0
+restart_narjar() {
+  if [ "$restarted" -eq 0 ]; then
+    systemctl start narjar.service
+  fi
+}
+trap restart_narjar EXIT
+systemctl stop narjar.service
+zfs snapshot -r "$dataset@$snapshot"
+zfs hold -r narjar:backup "$dataset@$snapshot"
+narjar verify --data-dir /var/lib/narjar
+systemctl start narjar.service
+restarted=1
+trap - EXIT
+~~~
+
+Record the dry-run stream size before sending. Send to a new, offline receive
+target and run `doctor`, `reconcile --verify-hashes`, and `verify` there before
+using it. An incremental stream requires that the destination retain the base
+snapshot; use `-R` for a recursive dataset tree.
+
+~~~sh
+set -euo pipefail
+target=backup/narjar-restore
+zfs send -nP -R "$dataset@$snapshot"
+zfs send -R "$dataset@$snapshot" | zfs receive -u "$target"
+
+zfs mount "$target"
+restore_data_dir="$(zfs get -H -o value mountpoint "$target")"
+narjar doctor --data-dir "$restore_data_dir"
+narjar reconcile --data-dir "$restore_data_dir" --verify-hashes
+narjar verify --data-dir "$restore_data_dir"
+zfs unmount "$target"
+
+base=narjar-previous
+next=narjar-next
+zfs snapshot -r "$dataset@$next"
+zfs send -nP -R -i "$dataset@$base" "$dataset@$next"
+zfs send -R -i "$dataset@$base" "$dataset@$next" | zfs receive -u "$target"
+~~~
+
+If a send or receive fails, keep the receive target offline and treat it as an
+incomplete restore; do not route Narjar to it. A successful ZFS receive proves
+that the stream was accepted by ZFS, not that Narjar's published pairs are
+complete. Restore validation remains an application-level `doctor`,
+`reconcile --verify-hashes`, `verify`, and fresh-client substitution sequence.
+
+Run a pool scrub separately from Narjar verification and retain the final pool
+status output. Scrub checks and, where configured, repairs ZFS block checksums;
+it does not validate narinfo signatures or NAR hashes.
+
+~~~sh
+set -euo pipefail
+zpool scrub "$pool"
+while zpool status "$pool" | grep -q "scan: scrub in progress"; do
+  sleep 5
+done
+zpool status -v "$pool"
+zfs get -H -o property,value \
+  used,usedbysnapshots,referenced,logicalused,logicalreferenced,compressratio,quota,refquota,refreservation \
+  "$dataset"
+~~~
+
+Report logical GC bytes, dataset referenced/logical bytes, compression ratio,
+and snapshot-held bytes separately. A quota or reservation alert is a capacity
+condition, not evidence that GC can reclaim the reported physical space. Release
+the backup hold only after the external retention policy has made that snapshot
+disposable.
+
+~~~sh
+zfs release -r narjar:backup "$dataset@$snapshot"
+~~~
 
 ## Deletion and retention GC
 
@@ -436,8 +578,35 @@ Required series:
   series when the destination probe fails.
 - narjar_ready 0/1
 
+The [`health_readiness_metrics_and_stats_follow_the_operator_contract`](../tests/cli.rs)
+integration test exercises the metric output and readiness transitions; the
+metric implementation is in [`src/metrics.rs`](../src/metrics.rs).
+
 Labels are fixed enums; no request IDs, paths, token names, or hashes become
 metric labels.
+
+## Filesystem support boundary
+
+Narjar's required filesystem contract is limited to regular files and
+directories, no-follow path checks, file and directory sync, same-filesystem
+no-replace hard links, unlink, enumeration, and an exclusive local lease. The
+service does not detect or configure a filesystem-specific backend.
+
+| Environment | Current classification | Meaning |
+| --- | --- | --- |
+| Linux ext4 root in the NixOS VM check | exercised portable lane | The default module test covers the ordinary `/var/lib/narjar` path and service ordering. |
+| XFS, btrfs, ZFS, and Darwin APFS | unverified host-specific behavior | Do not turn successful unit tests or a deployment anecdote into a support guarantee. |
+| tmpfs | non-persistent fixture only | Useful for tests; it is not a durable cache or a backup target. |
+| bind-mounted DATA | depends on the mounted underlying filesystem | Validate the mounted DATA path and its ownership; the container/image filesystem is not the storage contract. |
+| overlay, NFS, SMB, and FUSE | unsupported or unverified | Do not use them for a claimed production deployment without a conformance result for link, lock, sync, and transaction-recovery semantics. |
+
+For a Narjar-only ZFS dataset, the conservative provisional posture is
+`sync=standard`, checksums enabled, `dedup=off`, `atime=off`, the default record
+size and cache topology, and no special vdev or SLOG requirement. `compression=lz4`
+is the conservative candidate; any zstd level, non-default recordsize, ARC
+policy, deduplication, or other tuning is optional and unapproved until the
+corresponding measured evidence exists. `sync=disabled` is a durability
+violation warning, not a performance recommendation.
 
 ## Graceful shutdown
 
@@ -551,14 +720,15 @@ dependency. Narjar never mounts or creates the dataset.
 The NixOS VM check performs state initialization and HTTP requests under those
 restrictions, and verifies the credential and state modes.
 
-The separate `filesystem-conformance` NixOS check exercises a real empty
-block device formatted as ext4 and a tmpfs DATA mount. It verifies initial
-layout creation, restart/reopen across an unmount/remount, and HTTP service.
-The existing NixOS module check separately verifies refusal when a declared
-DATA mount is unavailable. XFS, btrfs, ZFS, overlay, bind-mount variants,
-quota/inode exhaustion, read-only remounts, and Darwin APFS remain unverified
-until host-specific lanes provide those fixtures; they must not be advertised
-as covered by the portable check.
+The `nixos-module` NixOS VM check exercises the service with its default
+`/var/lib/narjar` DATA path on the VM's ext4 root. It verifies initialization,
+credential/state modes, restart, HTTP health/readiness, and the systemd
+hardening contract. The separate module-evaluation check covers valid and
+invalid `dataDir` declarations. There is currently no dedicated block-device,
+tmpfs, unmount/remount, or cross-filesystem conformance lane. XFS, btrfs, ZFS,
+overlay, bind-mount variants, quota/inode exhaustion, read-only remounts, and
+Darwin APFS remain unverified until host-specific lanes provide those fixtures;
+they must not be advertised as covered by the portable checks.
 
 `GET /healthz` is the liveness endpoint. `GET /readyz` is the readiness
 endpoint and requires a read token when private-read mode is enabled. Socket
@@ -601,33 +771,3 @@ podman run --rm --read-only \
 The archive sets only the standard image entrypoint, command, user, port,
 working directory, and volume metadata. TLS, credentials, and bind mounts remain
 orchestrator concerns; Narjar does not inspect a Docker-specific environment.
-
-## Backup and restore
-
-Because published files are immutable, a live backup can exclude every `.tmp`
-directory and then verify the copy. Stop the service or snapshot the filesystem after
-flushing when a strict point-in-time boundary is required:
-
-~~~sh
-backup="/srv/backup/narjar-$(date +%F)"
-install -d -m 0700 "$backup"
-rsync -a --exclude='/.tmp/' /var/lib/narjar/ "$backup/"
-nix run . -- verify --data-dir "$backup"
-~~~
-
-Restore into a new mode-0700 directory, restore token hashes and trusted public
-keys through the secret manager, verify, and only then point the service at the
-restored directory:
-
-~~~sh
-restore=/var/lib/narjar-restore
-install -d -m 0700 "$restore"
-rsync -a --exclude='/.tmp/' "$backup/" "$restore/"
-nix run . -- verify --data-dir "$restore"
-~~~
-
-The `restored_cache_verifies_before_serving` integration test exercises this
-copy, verification, and serving sequence. Missing-NAR findings require reupload
-or narinfo quarantine before readiness. A backup contains no producer private
-key or plaintext token, but token hashes and trust policy remain
-security-sensitive.

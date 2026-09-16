@@ -1,7 +1,8 @@
 # Narjar v0.1 risk register and decision log
 
-Status: NARJ-28 draft for NARJ-20 review. Likelihood and impact are Low,
-Medium, High, or Critical. Owner is the Lific issue that must supply proof.
+Status: accepted v0.1 risk register; remaining evidence gates are tracked in
+Lific. Likelihood and impact are Low, Medium, High, or Critical. Owner is the
+Lific issue that must supply proof.
 
 ## R1: Undocumented HTTP write behavior
 
@@ -39,8 +40,9 @@ differential is not material.
 Detection and recovery: Dependency/LOC growth or new DB/signing/recompression
 scope reopens the decision. Stop implementation and upstream the delta.
 
-Residual/disposition/proof: High, architecture gate blocker. NARJ-20 must choose
-adopt, extract, or greenfield based on NARJ-19 evidence.
+Residual/disposition/proof: High continuation risk. NARJ-19 remains the matched
+measurement gate for whether the greenfield implementation delivers a material
+benefit over existing products.
 
 ## R3: Native-store and flat-cache confusion
 
@@ -151,13 +153,15 @@ Evidence: Rename atomicity does not imply power-loss durability; directory sync
 is required.
 
 Owner and mitigation: NARJ-9/NARJ-11. Same-filesystem temporaries, file sync,
-no-replace publication, parent-directory sync, NAR before narinfo.
+no-replace hard-link publication, parent-directory sync, NAR before narinfo.
 
-Detection and recovery: Fault injection at every write/sync/rename step;
+Detection and recovery: Fault injection at every write/sync/link step;
 restart state matrix; reconcile stale temporaries/orphans.
 
-Residual/disposition/proof: High release blocker until NARJ-16 fault tests pass
-on Linux filesystem targets.
+Residual/disposition/proof: Medium. In-process fault coverage passes, but there
+is no dedicated Linux filesystem-conformance lane and broader filesystem and
+power-loss claims remain outside the current evidence; they are tracked by
+NARJ-68/NARJ-69.
 
 ## R9: Traversal and route ambiguity
 
@@ -296,14 +300,16 @@ snapshot/compression space; monitor destination capacity separately.
 
 ## R16: Real-Nix and Linux proof gaps
 
-Likelihood: High until tests exist. Impact: Critical.
+Likelihood: Medium for a new deployment. Impact: Critical.
 
 Statement and invariant: Handler tests or flake evaluation cannot prove stock
 Nix protocol behavior, trust enforcement, static Linux packaging, or proxy
 deployment.
 
-Evidence: Current Darwin trace succeeds; explicit static Linux build is blocked
-because the configured Linux builder is unreachable.
+Evidence: The repository has protocol/CLI coverage and recorded real-Nix
+client-path evidence, but the current native transfer and static Linux release
+claims still require the clean-host/cross-host evidence tracked by NARJ-111 and
+NARJ-112.
 
 Owner and mitigation: NARJ-17/NARJ-18/NARJ-29. Real sockets, independent Nix
 store, trusted/untrusted keys, Linux static binary, reverse proxy, and exact
@@ -312,8 +318,10 @@ trace assertions.
 Detection and recovery: These are release gates, not warnings. Keep
 implementation tickets incomplete until proof is attached.
 
-Residual/disposition/proof: Critical blocker. No v0.1 approval without all
-three tickets passing.
+Residual/disposition/proof: High for release and cross-host claims. The flat
+storage implementation remains the accepted v0.1 contract; do not advertise a
+new native-transfer or static-Linux deployment as fully proven until those
+remaining gates pass.
 
 ## Decision log
 
@@ -357,7 +365,8 @@ reconciliation remain required.
 
 ### D8: Greenfield implementation is conditional
 
-Conditionally choose Narjar's greenfield thin vertical slice because its
-approved profile removes the database, recompression, server signing key,
-background workers, and startup index. NARJ-19 matched comparison decides
-whether implementation may continue past that slice or must adopt bincache.
+Narjar's greenfield thin vertical slice is accepted for the current v0.1
+implementation because its approved profile removes the database,
+recompression, server signing key, background workers, and startup index.
+NARJ-19 defines the measurement discipline; the separate NARJ-74 research
+program still gates any semantic-storage replacement.

@@ -3494,6 +3494,11 @@ fn reconcile_and_verify_classify_operator_findings() {
 #[test]
 fn structural_reconcile_reports_temp_age_and_shape() {
     let data_dir = init_data_dir("operator-structural-reconcile");
+    fs::write(
+        data_dir.join(format!("nar/{NAR_ID}.nar.zst")),
+        b"compressed NAR",
+    )
+    .expect("zstd NAR should be written");
     fs::write(data_dir.join(".tmp/nar-young.part"), b"temporary")
         .expect("temporary file should be written");
     fs::write(data_dir.join(".tmp/cache-info-young.part"), b"temporary")
@@ -3547,6 +3552,23 @@ fn structural_reconcile_reports_temp_age_and_shape() {
     assert!(report.contains(
         "{\"class\":\"unexpected_type\",\"path\":\".tmp/nar-directory.part\",\"action\":\"inspect\"}"
     ));
+    assert!(report.contains(&format!(
+        "{{\"class\":\"nar_object\",\"path\":\"nar/{NAR_ID}.nar.zst\",\"action\":\"inspect\"}}"
+    )));
+}
+
+#[test]
+fn doctor_returns_failure_for_invalid_layout() {
+    let data_dir = init_data_dir("operator-doctor-failure");
+    fs::remove_file(data_dir.join("trusted-public-keys"))
+        .expect("required trust file should be removed");
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+
+    let output = run(&["doctor", "--data-dir", path, "--json"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"severity\":\"error\""));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("doctor found errors"));
 }
 
 #[test]
@@ -4268,6 +4290,11 @@ fn gc_reclaims_old_orphan_nars() {
         .expect("temporary entry should be written");
     fs::write(data_dir.join(format!("nar/{NAR_ID}.nar")), b"orphan")
         .expect("orphan NAR should be written");
+    fs::write(
+        data_dir.join(format!("nar/{NARJAR_HASH}.nar.zst")),
+        b"zstd orphan",
+    )
+    .expect("zstd orphan NAR should be written");
 
     let path = data_dir.to_str().expect("temporary path should be UTF-8");
     let output = run(&[
@@ -4288,9 +4315,9 @@ fn gc_reclaims_old_orphan_nars() {
     );
     assert!(!data_dir.join(format!("nar/{NAR_ID}.nar")).exists());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"deleted_orphans\":1"));
+    assert!(stdout.contains("\"deleted_orphans\":2"));
     assert!(stdout.contains("\"temporary\":1"));
-    assert!(stdout.contains("\"orphaned_bytes\":6"));
+    assert!(stdout.contains("\"orphaned_bytes\":17"));
     assert!(stdout.contains("\"temporary_bytes\":4"));
 }
 

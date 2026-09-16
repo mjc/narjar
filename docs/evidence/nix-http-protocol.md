@@ -141,8 +141,9 @@ later full-body retry idempotently:
   garbage, not a readable cache entry.
 - Incoming bodies must stream to a same-filesystem temporary file. Never buffer
   a NAR in memory.
-- Verify length/hash and durability before rename; then publish narinfo by
-  temporary-file write, sync, and atomic rename.
+- Verify length/hash and durability before publication; Narjar uses a
+  temporary-file write, sync, and no-replace hard link for both the NAR and
+  narinfo final objects.
 - Existing identical objects are idempotent success. Conflicting attempts must
   not overwrite published content.
 - GET and HEAD share metadata and status behavior; HEAD sends no body.

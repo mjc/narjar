@@ -1,7 +1,7 @@
 # Narjar v0.1 architecture and trust decisions
 
-Status: design-gate draft for NARJ-4 through NARJ-12. No implementation is
-authorized by this document until NARJ-20 approves it.
+Status: accepted v0.1 architecture; implementation and operational follow-up
+remain subject to the evidence gates recorded below.
 
 ## Decision
 
@@ -33,7 +33,7 @@ TLS reverse proxy
   v
 Narjar process
   |
-  | same-filesystem temporary + fsync + rename
+  | same-filesystem temporary + fsync + no-replace hard link
   v
 flat cache directory
 
@@ -46,6 +46,9 @@ TLS reverse proxy -> Narjar -> immutable files
 
 Narjar knows Nix binary-cache metadata and NAR hashes. It does not know how to
 build, realise, register, mount, or garbage-collect a native Nix store.
+
+The required DATA filesystem capabilities and rejected filesystem integrations
+are recorded in the [portable filesystem capability ADR](filesystem-capability-adr.md).
 
 ## Chosen trust model: client-signed ingestion
 
@@ -129,9 +132,11 @@ access. Paths are constructed from validated identifiers, never joined from a
 raw request path.
 
 No startup index or full scan is needed to serve: an exact route maps to an
-exact file. Startup creates required directories, validates ownership/modes,
-acquires the process lock, validates nix-cache-info, and removes no data.
-Offline reconcile and GC perform the potentially unbounded scans.
+exact file. Startup creates required directories, validates required entries
+and modes, acquires the process lock, and removes no data. `nix-cache-info` is
+validated when it is read or published; offline inventory commands validate it
+as part of their own work. Offline reconcile and GC perform the potentially
+unbounded scans.
 
 ## Offline retention and GC
 
@@ -165,7 +170,7 @@ PUT /nar/<file-hash>.nar[.zst|.xz]
   -> for `.nar.zst`/`.nar.xz`, stream-decode the stored bytes to validate the raw NAR hash/size
   -> reject length/hash/empty mismatch or an oversized decompressed NAR
   -> sync temporary file
-  -> rename-no-replace to DATA/nar/<file-hash>.nar[.zst|.xz]
+  -> no-replace hard link to DATA/nar/<file-hash>.nar[.zst|.xz]
   -> sync DATA/nar
   -> 201 for newly durable object, 200 for identical existing object
 
@@ -181,7 +186,7 @@ PUT /<store-hash>.narinfo
   -> verify at least one signature from trusted-public-keys
   -> write canonical original bytes to DATA/.tmp with create-new
   -> sync temporary file
-  -> rename-no-replace to DATA/<store-hash>.narinfo
+  -> no-replace hard link to DATA/<store-hash>.narinfo
   -> sync DATA
   -> 201 only after durable publication
 ~~~
@@ -197,8 +202,16 @@ without adding authenticity.
 Narjar does not recompress. The upload and stored object remain identical; XZ is
 decoded only while validating the raw hash and configured decompressed-size
 limit. NAR staging is under `DATA/nar/.tmp`, so a split NAR destination can
-publish with a same-filesystem rename; metadata remains staged under
-`DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be measured.
+publish with a same-filesystem no-replace hard link; metadata remains staged
+under `DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be
+measured.
+
+Upload validation is the first content-integrity boundary. Raw narinfo
+publication and ordinary NAR availability checks inspect only that the regular
+file exists with the declared encoded size. Compressed narinfo publication
+revalidates the encoded and decoded hashes before publication. Full-content
+verification is explicit operator work through `verify` or
+`reconcile --verify-hashes`, which detects same-size out-of-band mutation.
 
 Publication workers are bounded by the configured worker count and process
 valid PUTs concurrently. Each write reserves its declared body size against
@@ -216,7 +229,8 @@ remain historical context in [`publication-lock-adr.md`](publication-lock-adr.md
 
 ## Publication and crash semantics
 
-The narinfo rename is the visibility point. A crash can leave:
+The narinfo no-replace hard link and parent-directory sync are the visibility
+point. A crash can leave:
 
 - A file under any `.tmp` directory: never reader-visible; reconcile may delete
   it after an age threshold.
@@ -229,11 +243,11 @@ published. A successful narinfo PUT means the validated pair is durable and
 reader-visible. Narjar does not return 201 before the relevant file and parent
 directory syncs complete.
 
-Concurrent identical PUTs converge. The first rename wins; losers compare the
+Concurrent identical PUTs converge. The first hard link wins; losers compare the
 published file's size and hash and return idempotent success only when
 identical. A conflicting immutable name returns 409 and never overwrites.
 
-Disk-full, sync, rename, parse, signature, hash, size, and connection failures
+Disk-full, sync, link, parse, signature, hash, size, and connection failures
 leave no published narinfo. Cleanup failure is logged and delegated to
 reconcile.
 
@@ -274,12 +288,18 @@ negative cache until --refresh; the server cannot invalidate client caches.
 - Multiple HTTP ranges or conditional mutation.
 - Availability guarantees across multiple processes or hosts.
 
-## Open blockers before NARJ-20
+## Open follow-up evidence gates
 
-- Decide whether client-signature verification can use a small audited Nix
-  fingerprint implementation or requires importing a larger parser crate.
-- Freeze realisation support as required or explicit v0.1 non-goal from a real
-  client trace.
-- Demonstrate proxy limits with request buffering disabled.
-- Produce matched Narjar-versus-bincache startup, idle RSS, upload CPU, and
-  stored-size estimates before choosing greenfield implementation.
+The v0.1 flat-storage decision is accepted; these items qualify the remaining
+deployment and architecture claims rather than reopening the serving contract:
+
+- Complete the clean-host real-Nix and cross-host evidence for the native push
+  path (NARJ-111/NARJ-112), including any current static Linux packaging gap.
+- Complete the filesystem/ZFS profile and operator drill (NARJ-67 through
+  NARJ-73) before making filesystem-specific performance, space, or recovery
+  claims.
+- Keep the per-publication recovery measurements in NARJ-110 as evidence for
+  concurrency and memory claims; the implementation does not depend on those
+  measurements to preserve its correctness invariants.
+- Keep the semantic-storage investigation (NARJ-74) separate; it remains the
+  gate for any parsed-NAR or content-addressed replacement.

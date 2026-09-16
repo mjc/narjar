@@ -265,6 +265,7 @@ fn scan_orphans(storage: &Storage, entries: &[Entry]) -> Result<Vec<Orphan>, Sto
         };
         let identifier = name_str
             .strip_suffix(".nar.xz")
+            .or_else(|| name_str.strip_suffix(".nar.zst"))
             .or_else(|| name_str.strip_suffix(".nar"));
         let Some(identifier) = identifier else {
             continue;
