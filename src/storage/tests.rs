@@ -14,9 +14,8 @@ use std::{
 };
 
 use super::compression::{
-    CheckedUploadReader, DecodedValidation, nar_file_size_matches, validate_xz,
-    verify_decoded_compressed_file, verify_encoded_compressed_file,
-    write_uploaded_representation_as_raw_nar,
+    CheckedUploadReader, DecodedValidation, nar_file_size_matches, verify_decoded_compressed_file,
+    verify_encoded_compressed_file, write_uploaded_representation_as_raw_nar,
 };
 use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes, sync_dir};
 use super::ids::nix32_sha256;
@@ -26,9 +25,7 @@ use super::{
     StorageError, StoreHash, capacity_error_kind,
 };
 use crate::narinfo::{CompressedNarExpectation, NarEncoding};
-use crate::object::{
-    EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize, Sha256DigestExpectation,
-};
+use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::encoding::{CompressionLevel, compress};
@@ -38,22 +35,6 @@ const STORE_HASH: &str = "00000000000000000000000000000000";
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
     Storage::initialize(&Directory::open(path)?)
-}
-
-#[test]
-fn typed_sha256_hashes_match_borrowed_digests() {
-    let digest = Sha256::digest(b"nar bytes");
-    let hash = nix32_sha256(&digest);
-    let nar_hash = NarHash::parse(&hash).expect("NAR hash is valid");
-    let file_hash = FileHash::parse(&hash).expect("file hash is valid");
-
-    assert!(nar_hash.matches_digest(&digest));
-    assert!(file_hash.matches_digest(&digest));
-    assert!(
-        !NarHash::parse(NAR_ID)
-            .expect("NAR hash is valid")
-            .matches_digest(&digest)
-    );
 }
 
 #[test]
@@ -194,7 +175,7 @@ fn xz_uploads_are_normalized_to_the_raw_nar() {
 }
 
 #[test]
-fn xz_validation_checks_compressed_and_decompressed_hashes_together() {
+fn encoded_verification_precedes_xz_nar_identity_verification() {
     let directory = TestDir::new();
     let path = directory.path().join("nar.xz");
     let raw = b"nar bytes";
@@ -209,17 +190,22 @@ fn xz_validation_checks_compressed_and_decompressed_hashes_together() {
     let file_hash =
         FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).expect("file hash is valid");
 
+    let expectation = CompressedNarExpectation {
+        encoded: EncodedIdentity::new(
+            NarEncoding::Xz,
+            file_hash,
+            EncodedSize::new(compressed.len() as u64),
+        ),
+        decoded: NarIdentity::new(nar_hash, NarSize::new(raw.len() as u64)),
+    };
+    let verified = verify_encoded_compressed_file(&file, expectation)
+        .expect("verify encoded XZ NAR")
+        .expect("encoded XZ NAR matches");
+
     assert_eq!(
-        validate_xz(&file, Some(&nar_hash), Some(&file_hash), raw.len() as u64)
-            .expect("validate XZ NAR"),
-        DecodedValidation {
-            hash: nar_hash,
-            size: NarSize::new(raw.len() as u64),
-        }
-    );
-    assert_eq!(
-        validate_xz(&file, Some(&nar_hash), None, raw.len() as u64)
-            .expect("validate already-hashed XZ NAR"),
+        verify_decoded_compressed_file(verified)
+            .expect("verify decoded XZ NAR")
+            .expect("decoded XZ NAR matches"),
         DecodedValidation {
             hash: nar_hash,
             size: NarSize::new(raw.len() as u64),

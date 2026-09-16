@@ -12,9 +12,7 @@ use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
 use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation};
-use crate::object::{
-    EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize, Sha256DigestExpectation,
-};
+use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
 
 use super::{
     fs::filesystem_space,
@@ -24,56 +22,12 @@ use super::{
 const INGESTION_RECEIPT_VERSION: u8 = 1;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
-struct Sha256Hasher {
-    hasher: Option<Sha256>,
-}
-
-impl Sha256Hasher {
-    fn new() -> Self {
-        Self {
-            hasher: Some(Sha256::new()),
-        }
-    }
-
-    fn new_if(enabled: bool) -> Self {
-        Self {
-            hasher: enabled.then(Sha256::new),
-        }
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        if let Some(hasher) = &mut self.hasher {
-            hasher.update(bytes);
-        }
-    }
-
-    fn matches_expected_digest<H: Sha256DigestExpectation>(&self, expected: &H) -> bool {
-        self.hasher
-            .as_ref()
-            .is_some_and(|hasher| expected.matches_digest(&hasher.clone().finalize()))
-    }
-
-    fn matches_optional_expected_digest<H: Sha256DigestExpectation>(
-        &self,
-        expected: Option<&H>,
-    ) -> bool {
-        expected.is_none_or(|expected| self.matches_expected_digest(expected))
-    }
-
-    fn finalize_digest(self) -> [u8; 32] {
-        self.hasher
-            .expect("a disabled SHA-256 hasher cannot be finished")
-            .finalize()
-            .into()
-    }
-}
-
 pub(super) struct CheckedUploadReader<'a, R> {
     inner: R,
     expected_hash: &'a FileHash,
     expected_length: u64,
     bytes_read: u64,
-    hasher: Sha256Hasher,
+    hasher: Sha256,
     upload_end_validated: bool,
 }
 
@@ -88,15 +42,14 @@ impl<'a, R> CheckedUploadReader<'a, R> {
             expected_hash,
             expected_length,
             bytes_read: 0,
-            hasher: Sha256Hasher::new(),
+            hasher: Sha256::new(),
             upload_end_validated: false,
         }
     }
 
     fn validate_observed_upload_hash_and_length(&self) -> io::Result<()> {
-        if self.bytes_read != self.expected_length
-            || !self.hasher.matches_expected_digest(self.expected_hash)
-        {
+        let actual_hash = FileHash::from_digest(self.hasher.clone().finalize().into());
+        if self.bytes_read != self.expected_length || actual_hash != *self.expected_hash {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "NAR hash or size mismatch",
@@ -237,7 +190,7 @@ fn storage_capacity_error(error: StorageError) -> io::Error {
 
 struct HashingWriter<'a, W: Write + ?Sized> {
     inner: &'a mut W,
-    hasher: Sha256Hasher,
+    hasher: Sha256,
     bytes_written: u64,
     max_bytes: u64,
 }
@@ -246,7 +199,7 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
     fn new(inner: &'a mut W, max_bytes: u64) -> Self {
         Self {
             inner,
-            hasher: Sha256Hasher::new(),
+            hasher: Sha256::new(),
             bytes_written: 0,
             max_bytes,
         }
@@ -254,7 +207,7 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
 
     fn finish(self) -> DecodedValidation {
         DecodedValidation {
-            hash: NarHash::from_digest(self.hasher.finalize_digest()),
+            hash: NarHash::from_digest(self.hasher.finalize().into()),
             size: NarSize::new(self.bytes_written),
         }
     }
@@ -329,12 +282,14 @@ fn decode_xz_upload_to_raw_staging<W: Write>(
     );
     let source_error = Rc::new(RefCell::new(None));
     let mut decoder = XzReader::new(
-        CompressedSourceReader::new(input, Rc::clone(&source_error)),
+        UploadCompressedSourceReader::new(input, Rc::clone(&source_error)),
         false,
     );
     let decoded =
         copy_decoded_bytes_to_raw_staging(&mut decoder, destination, expectation.max_nar_size)
-            .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
+            .map_err(|error| {
+                take_upload_source_error(&source_error, compressed_read_error(error))
+            })?;
     finish_encoded_upload_after_decoding(decoder.into_inner().into_inner(), &source_error)?;
     Ok(decoded)
 }
@@ -350,12 +305,16 @@ fn decode_zstd_upload_to_raw_staging<W: Write>(
         expectation.expected_file_size.get(),
     );
     let source_error = Rc::new(RefCell::new(None));
-    let mut decoder =
-        StructuredZstdDecoder::new(CompressedSourceReader::new(input, Rc::clone(&source_error)))
-            .map_err(|error| take_source_error(&source_error, compressed_decoder_error(error)))?;
+    let mut decoder = StructuredZstdDecoder::new(UploadCompressedSourceReader::new(
+        input,
+        Rc::clone(&source_error),
+    ))
+    .map_err(|error| take_upload_source_error(&source_error, compressed_decoder_error(error)))?;
     let decoded =
         copy_decoded_bytes_to_raw_staging(&mut decoder, destination, expectation.max_nar_size)
-            .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
+            .map_err(|error| {
+                take_upload_source_error(&source_error, compressed_read_error(error))
+            })?;
     finish_encoded_upload_after_decoding(decoder.into_inner().into_inner(), &source_error)?;
     Ok(decoded)
 }
@@ -401,22 +360,34 @@ fn finish_encoded_upload_after_decoding<R: Read>(
     input
         .finish()
         .map(|complete| drop(complete.into_inner()))
-        .map_err(|error| take_source_error(source_error, compressed_read_error(error)))
+        .map_err(|error| take_upload_source_error(source_error, compressed_read_error(error)))
 }
 
-struct HashingReader<R> {
+struct StoredCompressedSourceReader<R> {
     inner: R,
-    hasher: Sha256Hasher,
 }
 
-struct CompressedSourceReader<R> {
+impl<R> StoredCompressedSourceReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner }
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+struct UploadCompressedSourceReader<R> {
     inner: R,
-    error: Rc<RefCell<Option<io::Error>>>,
+    source_error: Rc<RefCell<Option<io::Error>>>,
 }
 
-impl<R> CompressedSourceReader<R> {
-    fn new(inner: R, error: Rc<RefCell<Option<io::Error>>>) -> Self {
-        Self { inner, error }
+impl<R> UploadCompressedSourceReader<R> {
+    fn new(inner: R, source_error: Rc<RefCell<Option<io::Error>>>) -> Self {
+        Self {
+            inner,
+            source_error,
+        }
     }
 
     fn into_inner(self) -> R {
@@ -548,31 +519,19 @@ impl std::error::Error for CompressedSourceError {
     }
 }
 
-impl<R> HashingReader<R> {
-    fn new(inner: R, enabled: bool) -> Self {
-        Self {
-            inner,
-            hasher: Sha256Hasher::new_if(enabled),
-        }
-    }
-}
-
-impl<R: Read> Read for HashingReader<R> {
+impl<R: Read> Read for StoredCompressedSourceReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let read = self
-            .inner
+        self.inner
             .read(buffer)
-            .map_err(|error| io::Error::other(CompressedSourceError(error)))?;
-        self.hasher.update(&buffer[..read]);
-        Ok(read)
+            .map_err(|error| io::Error::other(CompressedSourceError(error)))
     }
 }
 
-impl<R: Read> Read for CompressedSourceReader<R> {
+impl<R: Read> Read for UploadCompressedSourceReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buffer).map_err(|error| {
-            *self.error.borrow_mut() = Some(error);
-            io::Error::other("compressed source read failed")
+            *self.source_error.borrow_mut() = Some(error);
+            io::Error::other("compressed upload source read failed")
         })
     }
 }
@@ -614,16 +573,15 @@ fn compressed_decoder_error<E: std::error::Error + 'static>(error: E) -> io::Err
     )
 }
 
-fn take_source_error(source_error: &RefCell<Option<io::Error>>, fallback: io::Error) -> io::Error {
+fn take_upload_source_error(
+    source_error: &RefCell<Option<io::Error>>,
+    fallback: io::Error,
+) -> io::Error {
     source_error.borrow_mut().take().unwrap_or(fallback)
 }
 
-fn validate_decoded<R: Read>(
-    reader: &mut R,
-    expected_nar_hash: Option<&NarHash>,
-    max_bytes: u64,
-) -> io::Result<DecodedValidation> {
-    let mut hasher = Sha256Hasher::new();
+fn measure_decoded_nar<R: Read>(reader: &mut R, max_bytes: u64) -> io::Result<DecodedValidation> {
+    let mut hasher = Sha256::new();
     let mut bytes_read = 0u64;
     let mut buffer = [0; 64 * 1024];
     loop {
@@ -642,98 +600,16 @@ fn validate_decoded<R: Read>(
         }
         hasher.update(&buffer[..read]);
     }
-    let actual_nar_hash = NarHash::from_digest(hasher.finalize_digest());
-    if expected_nar_hash.is_some_and(|expected_id| actual_nar_hash != *expected_id) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "decompressed NAR hash mismatch",
-        ));
-    }
     Ok(DecodedValidation {
-        hash: actual_nar_hash,
+        hash: NarHash::from_digest(hasher.finalize().into()),
         size: NarSize::new(bytes_read),
     })
 }
 
-pub(super) fn validate_xz(
-    file: &File,
-    expected_nar_hash: Option<&NarHash>,
-    expected_file_hash: Option<&FileHash>,
-    max_bytes: u64,
-) -> io::Result<DecodedValidation> {
+fn sha256_file(file: &File) -> io::Result<[u8; 32]> {
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
-    let mut reader = XzReader::new(
-        HashingReader::new(file, expected_file_hash.is_some()),
-        false,
-    );
-    let decoded = validate_decoded(&mut reader, expected_nar_hash, max_bytes)?;
-    let mut actual_file_hash = reader.into_inner();
-    if actual_file_hash.inner.stream_position()? != actual_file_hash.inner.metadata()?.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "trailing bytes after XZ NAR",
-        ));
-    }
-    if !actual_file_hash
-        .hasher
-        .matches_optional_expected_digest(expected_file_hash)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "compressed NAR hash mismatch",
-        ));
-    }
-    Ok(decoded)
-}
-
-pub(super) fn validate_zstd(
-    file: &File,
-    expected_nar_hash: Option<&NarHash>,
-    expected_file_hash: Option<&FileHash>,
-    max_bytes: u64,
-) -> io::Result<DecodedValidation> {
-    let mut file = file.try_clone()?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut reader =
-        StructuredZstdDecoder::new(HashingReader::new(file, expected_file_hash.is_some()))
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid zstd NAR: {error}"),
-                )
-            })?;
-    let decoded = validate_decoded(&mut reader, expected_nar_hash, max_bytes)?;
-    let mut actual_file_hash = reader.into_inner();
-    if actual_file_hash.inner.stream_position()? != actual_file_hash.inner.metadata()?.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "trailing bytes after zstd NAR",
-        ));
-    }
-    if !actual_file_hash
-        .hasher
-        .matches_optional_expected_digest(expected_file_hash)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "compressed NAR hash mismatch",
-        ));
-    }
-    Ok(decoded)
-}
-
-pub(super) fn file_matches<H: Sha256DigestExpectation>(
-    file: &File,
-    expected_hash: &H,
-    expected_size: u64,
-) -> io::Result<bool> {
-    if file.metadata()?.len() != expected_size {
-        return Ok(false);
-    }
-    let mut file = file.try_clone()?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut hasher = Sha256Hasher::new();
+    let mut hasher = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
@@ -742,7 +618,14 @@ pub(super) fn file_matches<H: Sha256DigestExpectation>(
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.matches_expected_digest(expected_hash))
+    Ok(hasher.finalize().into())
+}
+
+fn encoded_file_matches(file: &File, identity: EncodedIdentity) -> io::Result<bool> {
+    if file.metadata()?.len() != identity.size().get() {
+        return Ok(false);
+    }
+    Ok(FileHash::from_digest(sha256_file(file)?) == identity.hash())
 }
 
 pub(super) struct VerifiedCompressedNar<'file> {
@@ -754,11 +637,7 @@ pub(super) fn verify_encoded_compressed_file<'file>(
     file: &'file File,
     expectation: CompressedNarExpectation,
 ) -> io::Result<Option<VerifiedCompressedNar<'file>>> {
-    if !file_matches(
-        file,
-        &expectation.encoded.hash(),
-        expectation.encoded.size().get(),
-    )? {
+    if !encoded_file_matches(file, expectation.encoded)? {
         return Ok(None);
     }
     Ok(Some(VerifiedCompressedNar { file, expectation }))
@@ -767,55 +646,79 @@ pub(super) fn verify_encoded_compressed_file<'file>(
 pub(super) fn verify_decoded_compressed_file(
     verified: VerifiedCompressedNar<'_>,
 ) -> io::Result<Option<DecodedValidation>> {
-    let decoded = decode_compressed_payload_for_nar_identity(&verified)?;
-    Ok(decoded.and_then(|decoded| {
-        decoded_nar_with_expected_size(decoded, verified.expectation.decoded.size())
-    }))
-}
-
-fn decode_compressed_payload_for_nar_identity(
-    verified: &VerifiedCompressedNar<'_>,
-) -> io::Result<Option<DecodedValidation>> {
-    match validate_compressed_payload_for_nar_identity(verified) {
-        Ok(decoded) => Ok(Some(decoded)),
+    match decode_verified_compressed_payload(&verified) {
+        Ok(decoded) => Ok(decoded_nar_matches_expected_identity(
+            decoded,
+            verified.expectation.decoded,
+        )),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-fn validate_compressed_payload_for_nar_identity(
+fn decode_verified_compressed_payload(
     verified: &VerifiedCompressedNar<'_>,
 ) -> io::Result<DecodedValidation> {
     match verified.expectation.encoded.encoding() {
-        NarEncoding::Zstd => {
-            validate_zstd_payload_against_nar_identity(verified.file, verified.expectation.decoded)
-        }
-        NarEncoding::Xz => {
-            validate_xz_payload_against_nar_identity(verified.file, verified.expectation.decoded)
-        }
+        NarEncoding::Zstd => decode_verified_zstd_payload(verified),
+        NarEncoding::Xz => decode_verified_xz_payload(verified),
         NarEncoding::Raw => unreachable!("raw uploads do not use compressed verification"),
     }
 }
 
-fn decoded_nar_with_expected_size(
+fn decoded_nar_matches_expected_identity(
     decoded: DecodedValidation,
-    expected_size: NarSize,
+    expected: NarIdentity,
 ) -> Option<DecodedValidation> {
-    (decoded.size == expected_size).then_some(decoded)
+    (decoded.hash == expected.hash() && decoded.size == expected.size()).then_some(decoded)
 }
 
-fn validate_xz_payload_against_nar_identity(
-    file: &File,
-    identity: NarIdentity,
+fn decode_verified_xz_payload(
+    verified: &VerifiedCompressedNar<'_>,
 ) -> io::Result<DecodedValidation> {
-    validate_xz(file, Some(&identity.hash()), None, identity.size().get())
+    let input = rewound_compressed_file(verified.file)?;
+    let mut decoder = XzReader::new(StoredCompressedSourceReader::new(input), false);
+    let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded.size().get())?;
+    ensure_decoder_consumed_complete_compressed_file(
+        &mut decoder.into_inner().into_inner(),
+        NarEncoding::Xz,
+    )?;
+    Ok(decoded)
 }
 
-fn validate_zstd_payload_against_nar_identity(
-    file: &File,
-    identity: NarIdentity,
+fn decode_verified_zstd_payload(
+    verified: &VerifiedCompressedNar<'_>,
 ) -> io::Result<DecodedValidation> {
-    validate_zstd(file, Some(&identity.hash()), None, identity.size().get())
+    let input = rewound_compressed_file(verified.file)?;
+    let mut decoder = StructuredZstdDecoder::new(StoredCompressedSourceReader::new(input))
+        .map_err(compressed_decoder_error)?;
+    let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded.size().get())?;
+    ensure_decoder_consumed_complete_compressed_file(
+        &mut decoder.into_inner().into_inner(),
+        NarEncoding::Zstd,
+    )?;
+    Ok(decoded)
+}
+
+fn rewound_compressed_file(file: &File) -> io::Result<File> {
+    let mut input = file.try_clone()?;
+    input.seek(SeekFrom::Start(0))?;
+    Ok(input)
+}
+
+fn ensure_decoder_consumed_complete_compressed_file(
+    file: &mut File,
+    encoding: NarEncoding,
+) -> io::Result<()> {
+    if file.stream_position()? == file.metadata()?.len() {
+        return Ok(());
+    }
+    let message = match encoding {
+        NarEncoding::Xz => "trailing bytes after XZ NAR",
+        NarEncoding::Zstd => "trailing bytes after zstd NAR",
+        NarEncoding::Raw => unreachable!("raw NARs do not use a compressed decoder"),
+    };
+    Err(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
 pub(super) fn validate_compressed_nar(
@@ -843,7 +746,10 @@ pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation) -> io::
 }
 
 fn raw_nar_file_matches(file: &File, identity: NarIdentity) -> io::Result<bool> {
-    file_matches(file, &identity.hash(), identity.size().get())
+    if file.metadata()?.len() != identity.size().get() {
+        return Ok(false);
+    }
+    Ok(NarHash::from_digest(sha256_file(file)?) == identity.hash())
 }
 
 pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Result<bool> {

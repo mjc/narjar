@@ -38,29 +38,17 @@ impl fmt::Display for NarHash {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileHash([u8; 32]);
 
-pub(crate) trait Sha256DigestExpectation {
-    fn matches_digest(&self, digest: &[u8]) -> bool;
-}
-
-impl Sha256DigestExpectation for NarHash {
-    fn matches_digest(&self, digest: &[u8]) -> bool {
-        self.0.as_slice() == digest
-    }
-}
-
 impl FileHash {
     pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
         decode_sha256(value).map(Self)
     }
 
+    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
     pub(crate) fn matches_nar_hash(self, hash: NarHash) -> bool {
         self.0 == hash.0
-    }
-}
-
-impl Sha256DigestExpectation for FileHash {
-    fn matches_digest(&self, digest: &[u8]) -> bool {
-        self.0.as_slice() == digest
     }
 }
 
