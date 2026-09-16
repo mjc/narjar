@@ -10,7 +10,7 @@ use data_encoding::BASE64;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 pub use crate::object::WireEncoding as NarEncoding;
-use crate::object::{EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
+use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
 use crate::storage::{Directory, StoreHash, inspection::NarFileName, open_regular_at};
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
@@ -256,35 +256,23 @@ impl ParsedNarInfo {
 #[derive(Debug)]
 pub struct ValidatedNarInfo(ParsedNarInfo);
 
-#[derive(Clone, Copy)]
-pub(crate) enum CompressedEncoding {
-    Xz,
-    Zstd,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompressedNarExpectation {
+    pub(crate) encoded: EncodedIdentity,
+    pub(crate) decoded: NarIdentity,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct CompressedNarExpectation<'a> {
-    pub(crate) encoding: CompressedEncoding,
-    pub(crate) encoded_hash: &'a FileHash,
-    pub(crate) encoded_size: EncodedSize,
-    pub(crate) decoded_hash: &'a NarHash,
-    pub(crate) decoded_size: NarSize,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NarExpectation {
+    Raw(NarIdentity),
+    Compressed(CompressedNarExpectation),
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum NarExpectation<'a> {
-    Raw {
-        nar_hash: &'a NarHash,
-        nar_size: NarSize,
-    },
-    Compressed(CompressedNarExpectation<'a>),
-}
-
-impl NarExpectation<'_> {
+impl NarExpectation {
     pub(crate) const fn encoded_size(self) -> EncodedSize {
         match self {
-            Self::Raw { nar_size, .. } => EncodedSize::new(nar_size.get()),
-            Self::Compressed(expectation) => expectation.encoded_size,
+            Self::Raw(identity) => EncodedSize::new(identity.size().get()),
+            Self::Compressed(expectation) => expectation.encoded.size(),
         }
     }
 }
@@ -296,10 +284,6 @@ impl ValidatedNarInfo {
 
     pub(crate) fn references(&self) -> &str {
         &self.0.references
-    }
-
-    pub(crate) fn nar(&self) -> &NarHash {
-        &self.0.identity.hash
     }
 
     pub(crate) fn payload_name(&self) -> &NarFileName {
@@ -314,23 +298,17 @@ impl ValidatedNarInfo {
         self.0.file_size
     }
 
-    pub(crate) fn payload_expectation(&self) -> NarExpectation<'_> {
-        let compressed = |encoding| {
+    pub(crate) fn payload_expectation(&self) -> NarExpectation {
+        let compressed = |encoding: NarEncoding| {
             NarExpectation::Compressed(CompressedNarExpectation {
-                encoding,
-                encoded_hash: &self.0.payload.file_hash,
-                encoded_size: self.0.file_size,
-                decoded_hash: &self.0.identity.hash,
-                decoded_size: self.0.identity.size(),
+                encoded: EncodedIdentity::new(encoding, self.0.payload.file_hash, self.0.file_size),
+                decoded: self.0.identity,
             })
         };
         match self.encoding() {
-            NarEncoding::Raw => NarExpectation::Raw {
-                nar_hash: self.nar(),
-                nar_size: self.0.identity.size(),
-            },
-            NarEncoding::Zstd => compressed(CompressedEncoding::Zstd),
-            NarEncoding::Xz => compressed(CompressedEncoding::Xz),
+            NarEncoding::Raw => NarExpectation::Raw(self.0.identity),
+            NarEncoding::Zstd => compressed(NarEncoding::Zstd),
+            NarEncoding::Xz => compressed(NarEncoding::Xz),
         }
     }
 

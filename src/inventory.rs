@@ -124,10 +124,7 @@ enum MetadataAssessment {
 }
 
 impl VerificationMode {
-    fn inspect_referenced_payload(
-        self,
-        payload: ReferencedPayload<'_>,
-    ) -> io::Result<InventoryClass> {
+    fn inspect_referenced_payload(self, payload: ReferencedPayload) -> io::Result<InventoryClass> {
         let matches = match self {
             Self::Availability => payload.has_expected_size()?,
             Self::Content => payload.verify_content()?,

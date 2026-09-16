@@ -12,8 +12,8 @@ use lzma_rust2::XzReader;
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
-use crate::narinfo::{CompressedEncoding, CompressedNarExpectation, NarEncoding, NarExpectation};
-use crate::object::{EncodedSize, FileHash, NarHash, NarSize};
+use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation};
+use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
 
 use super::{
     fs::filesystem_space,
@@ -384,11 +384,8 @@ pub(super) struct DecodedValidation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct IngestionReceipt {
-    encoding: NarEncoding,
-    encoded_hash: FileHash,
-    encoded_size: EncodedSize,
-    decoded_hash: NarHash,
-    decoded_size: NarSize,
+    encoded: EncodedIdentity,
+    decoded: NarIdentity,
 }
 
 impl IngestionReceipt {
@@ -399,30 +396,31 @@ impl IngestionReceipt {
         decoded: DecodedValidation,
     ) -> Self {
         Self {
-            encoding,
-            encoded_hash,
-            encoded_size,
-            decoded_hash: decoded.hash,
-            decoded_size: decoded.size,
+            encoded: EncodedIdentity::new(
+                encoding,
+                encoded_hash,
+                EncodedSize::new(encoded_size.get()),
+            ),
+            decoded: NarIdentity::new(decoded.hash, decoded.size),
         }
     }
 
     pub(super) fn file_name(&self) -> OsString {
         OsString::from(format!(
             "{}{}.validation",
-            self.encoded_hash,
-            self.encoding.suffix()
+            self.encoded.hash(),
+            self.encoded.encoding().suffix()
         ))
     }
 
     pub(super) fn bytes(&self) -> Vec<u8> {
         format!(
             "version={INGESTION_RECEIPT_VERSION}\nencoding={}\nencoded-hash={}\nencoded-size={}\ndecoded-hash={}\ndecoded-size={}\n",
-            self.encoding.compression(),
-            self.encoded_hash,
-            self.encoded_size,
-            self.decoded_hash,
-            self.decoded_size,
+            self.encoded.encoding().compression(),
+            self.encoded.hash(),
+            self.encoded.size(),
+            self.decoded.hash(),
+            self.decoded.size(),
         )
         .into_bytes()
     }
@@ -464,41 +462,26 @@ impl IngestionReceipt {
                 _ => return None,
             }
         }
-        let evidence = Self {
-            encoding: encoding?,
-            encoded_hash: encoded_hash?,
-            encoded_size: encoded_size?,
-            decoded_hash: decoded_hash?,
-            decoded_size: decoded_size?,
-        };
+        let encoded = EncodedIdentity::new(encoding?, encoded_hash?, encoded_size?);
+        let decoded = NarIdentity::new(decoded_hash?, decoded_size?);
+        let evidence = Self { encoded, decoded };
         (version? == INGESTION_RECEIPT_VERSION).then_some(evidence)
     }
 
-    pub(super) fn matches(&self, expectation: CompressedNarExpectation<'_>) -> bool {
-        self.encoding == nar_encoding(expectation.encoding)
-            && self.encoded_hash == *expectation.encoded_hash
-            && self.encoded_size == expectation.encoded_size
-            && self.decoded_hash == *expectation.decoded_hash
-            && self.decoded_size == expectation.decoded_size
+    pub(super) fn matches(&self, expectation: CompressedNarExpectation) -> bool {
+        self.encoded == expectation.encoded && self.decoded == expectation.decoded
     }
 
-    pub(super) fn decoded_hash(&self) -> NarHash {
-        self.decoded_hash
+    pub(super) fn decoded_identity(&self) -> NarIdentity {
+        self.decoded
     }
 }
 
-pub(super) fn nar_encoding(encoding: CompressedEncoding) -> NarEncoding {
-    match encoding {
-        CompressedEncoding::Zstd => NarEncoding::Zstd,
-        CompressedEncoding::Xz => NarEncoding::Xz,
-    }
-}
-
-pub(super) fn ingestion_receipt_file_name(expectation: CompressedNarExpectation<'_>) -> OsString {
+pub(super) fn ingestion_receipt_file_name(expectation: CompressedNarExpectation) -> OsString {
     OsString::from(format!(
         "{}{}.validation",
-        expectation.encoded_hash,
-        nar_encoding(expectation.encoding).suffix()
+        expectation.encoded.hash(),
+        expectation.encoded.encoding().suffix()
     ))
 }
 
@@ -720,19 +703,19 @@ pub(super) fn file_matches(
     Ok(nix32_sha256_matches(&hasher.finalize(), expected_hash))
 }
 
-pub(super) struct VerifiedCompressedNar<'file, 'metadata> {
+pub(super) struct VerifiedCompressedNar<'file> {
     file: &'file File,
-    expectation: CompressedNarExpectation<'metadata>,
+    expectation: CompressedNarExpectation,
 }
 
-pub(super) fn verify_encoded_compressed_file<'file, 'metadata>(
+pub(super) fn verify_encoded_compressed_file<'file>(
     file: &'file File,
-    expectation: CompressedNarExpectation<'metadata>,
-) -> io::Result<Option<VerifiedCompressedNar<'file, 'metadata>>> {
+    expectation: CompressedNarExpectation,
+) -> io::Result<Option<VerifiedCompressedNar<'file>>> {
     if !file_matches(
         file,
-        &expectation.encoded_hash.to_string(),
-        expectation.encoded_size.get(),
+        &expectation.encoded.hash().to_string(),
+        expectation.encoded.size().get(),
     )? {
         return Ok(None);
     }
@@ -740,24 +723,25 @@ pub(super) fn verify_encoded_compressed_file<'file, 'metadata>(
 }
 
 pub(super) fn verify_decoded_compressed_file(
-    verified: VerifiedCompressedNar<'_, '_>,
+    verified: VerifiedCompressedNar<'_>,
 ) -> io::Result<Option<DecodedValidation>> {
-    let validation = match verified.expectation.encoding {
-        CompressedEncoding::Zstd => validate_zstd(
+    let validation = match verified.expectation.encoded.encoding() {
+        NarEncoding::Zstd => validate_zstd(
             verified.file,
-            Some(verified.expectation.decoded_hash),
+            Some(&verified.expectation.decoded.hash()),
             None,
-            verified.expectation.decoded_size.get(),
+            verified.expectation.decoded.size().get(),
         ),
-        CompressedEncoding::Xz => validate_xz(
+        NarEncoding::Xz => validate_xz(
             verified.file,
-            Some(verified.expectation.decoded_hash),
+            Some(&verified.expectation.decoded.hash()),
             None,
-            verified.expectation.decoded_size.get(),
+            verified.expectation.decoded.size().get(),
         ),
+        NarEncoding::Raw => unreachable!("raw uploads do not use compressed verification"),
     };
     match validation {
-        Ok(decoded) if decoded.size == verified.expectation.decoded_size => Ok(Some(decoded)),
+        Ok(decoded) if decoded.size == verified.expectation.decoded.size() => Ok(Some(decoded)),
         Ok(_) => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
         Err(error) => Err(error),
@@ -766,7 +750,7 @@ pub(super) fn verify_decoded_compressed_file(
 
 pub(super) fn validate_compressed_nar(
     file: &File,
-    expectation: CompressedNarExpectation<'_>,
+    expectation: CompressedNarExpectation,
 ) -> io::Result<Option<DecodedValidation>> {
     let Some(verified) = verify_encoded_compressed_file(file, expectation)? else {
         return Ok(None);
@@ -776,16 +760,16 @@ pub(super) fn validate_compressed_nar(
 
 pub(super) fn compressed_nar_matches(
     file: &File,
-    expectation: CompressedNarExpectation<'_>,
+    expectation: CompressedNarExpectation,
 ) -> io::Result<bool> {
     Ok(validate_compressed_nar(file, expectation)?.is_some())
 }
 
-pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation<'_>) -> io::Result<bool> {
+pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation) -> io::Result<bool> {
     match expectation {
-        NarExpectation::Raw { nar_hash, nar_size } => {
-            let expected_hash = nar_hash.to_string();
-            file_matches(file, &expected_hash, nar_size.get())
+        NarExpectation::Raw(identity) => {
+            let expected_hash = identity.hash().to_string();
+            file_matches(file, &expected_hash, identity.size().get())
         }
         NarExpectation::Compressed(expectation) => compressed_nar_matches(file, expectation),
     }

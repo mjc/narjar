@@ -56,7 +56,7 @@ struct CompletedRawNarStaging {
 
 impl CompletedRawNarStaging {
     fn raw_nar_object_id(&self) -> NarObjectId {
-        NarObjectId::parse(&self.receipt.decoded_hash().to_string())
+        NarObjectId::parse(&self.receipt.decoded_identity().hash().to_string())
             .expect("binary SHA-256 Nix hash formats as a valid object ID")
     }
 }
@@ -454,25 +454,21 @@ impl Storage {
         narinfo: ValidatedNarInfo,
     ) -> Result<PublishOutcome, StorageError> {
         let expectation = narinfo.payload_expectation();
-        let nar_hash = match expectation {
-            NarExpectation::Raw { nar_hash, .. } => *nar_hash,
+        let raw_identity = match expectation {
+            NarExpectation::Raw(identity) => identity,
             NarExpectation::Compressed(expectation) => {
                 let Some(receipt) = self.read_ingestion_receipt(expectation)? else {
                     return Err(StorageError::NarMismatch);
                 };
-                receipt.decoded_hash()
+                receipt.decoded_identity()
             }
         };
-        let raw_id = NarObjectId::parse(&nar_hash.to_string())
+        let raw_id = NarObjectId::parse(&raw_identity.hash().to_string())
             .expect("binary SHA-256 Nix hash formats as a valid object ID");
         let Some(file) = self.open_nar(&raw_id)? else {
             return Err(StorageError::MissingNar);
         };
-        let expected_size = match expectation {
-            NarExpectation::Raw { nar_size, .. } => nar_size.get(),
-            NarExpectation::Compressed(expectation) => expectation.decoded_size.get(),
-        };
-        if !nar_file_size_matches(&file, expected_size)? {
+        if !nar_file_size_matches(&file, raw_identity.size().get())? {
             return Err(StorageError::NarMismatch);
         }
         self.publish(
@@ -921,7 +917,7 @@ impl Storage {
 
     pub(super) fn read_ingestion_receipt(
         &self,
-        expectation: CompressedNarExpectation<'_>,
+        expectation: CompressedNarExpectation,
     ) -> Result<Option<IngestionReceipt>, StorageError> {
         let directory = self.ingestion_receipt_directory()?;
         let name = ingestion_receipt_file_name(expectation);

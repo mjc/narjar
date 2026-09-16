@@ -93,16 +93,16 @@ impl<'a> PayloadEntry<'a> {
     }
 }
 
-pub(crate) struct ReferencedPayload<'a> {
+pub(crate) struct ReferencedPayload {
     file: File,
-    expectation: NarExpectation<'a>,
+    expectation: NarExpectation,
 }
 
-impl<'a> ReferencedPayload<'a> {
+impl ReferencedPayload {
     pub(crate) fn open(
         directory: &File,
         name: &NarFileName,
-        expectation: NarExpectation<'a>,
+        expectation: NarExpectation,
     ) -> io::Result<Option<Self>> {
         match open_regular_at(directory, OsStr::new(&name.to_string())) {
             Ok(file) => Ok(Some(Self { file, expectation })),

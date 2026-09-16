@@ -59,6 +59,35 @@ impl fmt::Display for FileHash {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct EncodedIdentity {
+    encoding: WireEncoding,
+    hash: FileHash,
+    size: EncodedSize,
+}
+
+impl EncodedIdentity {
+    pub(crate) const fn new(encoding: WireEncoding, hash: FileHash, size: EncodedSize) -> Self {
+        Self {
+            encoding,
+            hash,
+            size,
+        }
+    }
+
+    pub(crate) const fn encoding(self) -> WireEncoding {
+        self.encoding
+    }
+
+    pub(crate) const fn hash(self) -> FileHash {
+        self.hash
+    }
+
+    pub(crate) const fn size(self) -> EncodedSize {
+        self.size
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct NarSize(u64);
 
 impl NarSize {

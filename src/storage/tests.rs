@@ -25,8 +25,8 @@ use super::{
     CapacityErrorKind, Directory, NarObjectId, PublishOutcome, ReconcileClass, Storage,
     StorageError, StoreHash, capacity_error_kind,
 };
-use crate::narinfo::{CompressedEncoding, CompressedNarExpectation, NarEncoding};
-use crate::object::{EncodedSize, FileHash, NarHash, NarSize};
+use crate::narinfo::{CompressedNarExpectation, NarEncoding};
+use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::encoding::{CompressionLevel, compress};
@@ -187,19 +187,23 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
         let file_hash = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).unwrap();
         let file_size = EncodedSize::new(compressed.len() as u64);
         let nar_size = NarSize::new(raw.len() as u64);
-        let matches = |encoded_hash, decoded_hash, encoded_size, decoded_size| {
+        let matches = |encoded_hash: &FileHash,
+                       decoded_hash: &NarHash,
+                       encoded_size: EncodedSize,
+                       decoded_size: NarSize| {
             let expectation = CompressedNarExpectation {
-                encoding: match encoding {
-                    NarEncoding::Xz => CompressedEncoding::Xz,
-                    NarEncoding::Zstd => CompressedEncoding::Zstd,
-                    NarEncoding::Raw => {
-                        unreachable!("test only supplies compressed encodings")
-                    }
-                },
-                encoded_hash,
-                encoded_size,
-                decoded_hash,
-                decoded_size,
+                encoded: EncodedIdentity::new(
+                    match encoding {
+                        NarEncoding::Xz => NarEncoding::Xz,
+                        NarEncoding::Zstd => NarEncoding::Zstd,
+                        NarEncoding::Raw => {
+                            unreachable!("test only supplies compressed encodings")
+                        }
+                    },
+                    *encoded_hash,
+                    encoded_size,
+                ),
+                decoded: NarIdentity::new(*decoded_hash, decoded_size),
             };
             let file = fs::File::open(&path).unwrap();
             let Some(verified) = verify_encoded_compressed_file(&file, expectation).unwrap() else {
