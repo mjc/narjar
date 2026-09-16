@@ -142,6 +142,7 @@ pub struct Decoder<R> {
     digest: Sha256,
     raw_bytes: u64,
     work: u64,
+    file_buffer: [u8; CHUNK_SIZE],
 }
 
 impl<R: Read> Decoder<R> {
@@ -156,6 +157,7 @@ impl<R: Read> Decoder<R> {
             digest: Sha256::new(),
             raw_bytes: 0,
             work: 0,
+            file_buffer: [0; CHUNK_SIZE],
         }
     }
 
@@ -313,16 +315,36 @@ impl<R: Read> Decoder<R> {
         size: u64,
         sink: &mut S,
     ) -> Result<(), DecodeError<S::Error>> {
-        let mut remaining = size;
-        let mut buffer = [0_u8; CHUNK_SIZE];
-        while remaining != 0 {
-            let length = remaining.min(buffer.len() as u64) as usize;
-            self.read_raw(&mut buffer[..length])?;
-            sink.event(Event::FileChunk(&buffer[..length]))
-                .map_err(DecodeError::Sink)?;
-            remaining -= length as u64;
-        }
+        (0..size.div_ceil(CHUNK_SIZE as u64)).try_for_each(|chunk| {
+            let offset = chunk * CHUNK_SIZE as u64;
+            let length = (size - offset).min(CHUNK_SIZE as u64) as usize;
+            self.read_file_chunk(length, sink)
+        })?;
         self.read_padding(size)
+    }
+
+    fn read_file_chunk<S: EventSink>(
+        &mut self,
+        length: usize,
+        sink: &mut S,
+    ) -> Result<(), DecodeError<S::Error>> {
+        let Self {
+            reader,
+            limits,
+            digest,
+            raw_bytes,
+            file_buffer,
+            ..
+        } = self;
+        read_raw_bytes(
+            reader,
+            digest,
+            raw_bytes,
+            limits,
+            &mut file_buffer[..length],
+        )?;
+        sink.event(Event::FileChunk(&file_buffer[..length]))
+            .map_err(DecodeError::Sink)
     }
 
     fn read_u64<E>(&mut self) -> Result<u64, DecodeError<E>> {
@@ -399,39 +421,54 @@ impl<R: Read> Decoder<R> {
     }
 
     fn read_raw<E>(&mut self, buffer: &mut [u8]) -> Result<(), DecodeError<E>> {
-        let requested = buffer.len() as u64;
-        let Some(next) = self.raw_bytes.checked_add(requested) else {
-            return Err(DecodeError::LimitExceeded {
-                what: "raw size",
-                limit: self.limits.max_total_bytes,
-                actual: u64::MAX,
-            });
-        };
-        if next > self.limits.max_total_bytes {
-            return Err(DecodeError::LimitExceeded {
-                what: "raw size",
-                limit: self.limits.max_total_bytes,
-                actual: next,
-            });
-        }
-        let mut offset = 0;
-        while offset < buffer.len() {
-            let read = self
-                .reader
-                .read(&mut buffer[offset..])
-                .map_err(DecodeError::Io)?;
-            if read == 0 {
-                return Err(DecodeError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected end of NAR",
-                )));
-            }
-            self.digest.update(&buffer[offset..offset + read]);
-            self.raw_bytes += read as u64;
-            offset += read;
-        }
-        Ok(())
+        read_raw_bytes(
+            &mut self.reader,
+            &mut self.digest,
+            &mut self.raw_bytes,
+            &self.limits,
+            buffer,
+        )
     }
+}
+
+fn read_raw_bytes<R: Read, E>(
+    reader: &mut R,
+    digest: &mut Sha256,
+    raw_bytes: &mut u64,
+    limits: &Limits,
+    buffer: &mut [u8],
+) -> Result<(), DecodeError<E>> {
+    let requested = buffer.len() as u64;
+    let Some(next) = raw_bytes.checked_add(requested) else {
+        return Err(DecodeError::LimitExceeded {
+            what: "raw size",
+            limit: limits.max_total_bytes,
+            actual: u64::MAX,
+        });
+    };
+    if next > limits.max_total_bytes {
+        return Err(DecodeError::LimitExceeded {
+            what: "raw size",
+            limit: limits.max_total_bytes,
+            actual: next,
+        });
+    }
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let read = reader
+            .read(&mut buffer[offset..])
+            .map_err(DecodeError::Io)?;
+        if read == 0 {
+            return Err(DecodeError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected end of NAR",
+            )));
+        }
+        digest.update(&buffer[offset..offset + read]);
+        *raw_bytes += read as u64;
+        offset += read;
+    }
+    Ok(())
 }
 
 #[derive(Default)]

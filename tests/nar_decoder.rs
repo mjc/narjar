@@ -123,6 +123,22 @@ impl EventSink for NeverFailure {
     }
 }
 
+#[derive(Default)]
+struct ChunkLengths {
+    lengths: Vec<usize>,
+}
+
+impl EventSink for ChunkLengths {
+    type Error = Infallible;
+
+    fn event(&mut self, event: Event<'_>) -> Result<(), Self::Error> {
+        if let Event::FileChunk(chunk) = event {
+            self.lengths.push(chunk.len());
+        }
+        Ok(())
+    }
+}
+
 struct LateFailure {
     events: usize,
 }
@@ -180,6 +196,28 @@ fn decodes_chunked_directory_without_materializing_file_contents() {
     assert_eq!(events.names, vec![b"a".to_vec(), b"link".to_vec()]);
     assert_eq!(events.file_chunks.concat(), b"hello");
     assert_eq!(events.symlinks, vec![b"../target".to_vec()]);
+}
+
+#[test]
+fn reuses_one_bounded_chunk_shape_across_small_and_large_files() {
+    let first = vec![b'a'; 64 * 1024 + 3];
+    let second = vec![b'b'; 65];
+    let data = archive(directory([
+        (b"first".as_slice(), regular(&first, false)),
+        (b"second".as_slice(), regular(&second, false)),
+    ]));
+    let mut decoder = Decoder::new(io::Cursor::new(data));
+    let mut chunks = ChunkLengths::default();
+
+    decoder
+        .decode(&mut chunks)
+        .expect("mixed-size files are valid NAR input");
+
+    assert_eq!(
+        chunks.lengths,
+        vec![64 * 1024, 3, 65],
+        "each file is streamed through the one bounded decoder chunk"
+    );
 }
 
 #[test]

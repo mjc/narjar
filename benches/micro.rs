@@ -1,7 +1,7 @@
 use std::{
     fs,
     hint::black_box,
-    io::Write,
+    io::{Cursor, Write},
     net::{TcpListener, TcpStream},
     path::Path,
     thread,
@@ -11,6 +11,8 @@ use std::{
 use narjar::{
     http_server::Request,
     inventory::{Inventory, VerificationMode},
+    nar::{Decoder, Event},
+    nar_encode::{self, Encoder},
     narinfo::TrustedPublicKeys,
     storage::{Directory, NarObjectId, Storage},
 };
@@ -242,10 +244,64 @@ fn bench_header_scanning() {
     }
 }
 
+fn encoded_decoder_fixture(file_count: usize, file_size: usize) -> Vec<u8> {
+    let mut archive = Vec::new();
+    let mut encoder = Encoder::new(&mut archive).expect("create decoder fixture encoder");
+    encoder
+        .push(nar_encode::Event::BeginDirectory)
+        .expect("open decoder fixture directory");
+    let chunk = vec![b'x'; 64 * 1024];
+    for index in 0..file_count {
+        let name = format!("file-{index:04}");
+        encoder
+            .push(nar_encode::Event::Entry(name.as_bytes()))
+            .expect("write decoder fixture entry");
+        encoder
+            .push(nar_encode::Event::BeginFile {
+                executable: false,
+                size: file_size as u64,
+            })
+            .expect("open decoder fixture file");
+        (0..file_size.div_ceil(chunk.len()))
+            .try_for_each(|part| {
+                let offset = part * chunk.len();
+                let length = (file_size - offset).min(chunk.len());
+                encoder.push(nar_encode::Event::FileChunk(&chunk[..length]))
+            })
+            .expect("write decoder fixture contents");
+        encoder
+            .push(nar_encode::Event::EndFile)
+            .expect("close decoder fixture file");
+    }
+    encoder
+        .push(nar_encode::Event::EndDirectory)
+        .expect("close decoder fixture directory");
+    encoder.finish().expect("finish decoder fixture");
+    archive
+}
+
+fn decode_benchmark_fixture(input: &[u8]) {
+    let mut decoder = Decoder::new(Cursor::new(input));
+    let mut sink = |_: Event<'_>| Ok::<(), std::io::Error>(());
+    black_box(decoder.decode(&mut sink).expect("decode benchmark fixture"));
+}
+
+fn bench_nar_decoder() {
+    let many_small_files = encoded_decoder_fixture(2_048, 32);
+    let large_file = encoded_decoder_fixture(1, 16 * 1024 * 1024);
+    run("NAR decode many small", 100, || {
+        decode_benchmark_fixture(&many_small_files);
+    });
+    run("NAR decode large payload", 10, || {
+        decode_benchmark_fixture(&large_file);
+    });
+}
+
 fn main() {
     println!("narjar microbenchmarks (custom std::time harness)");
     assert_header_scan_equivalence();
     bench_header_scanning();
+    bench_nar_decoder();
     bench_request_parse();
     bench_storage();
     bench_startup();
