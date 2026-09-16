@@ -438,8 +438,9 @@ fn native_copy_paths(
     metadata: &[PathInfo],
 ) -> Result<(), String> {
     let authorization = netrc_file
-        .map(|path| netrc_authorization(path, target.host()).map_err(|error| error.to_string()))
-        .transpose()?;
+        .map(|path| netrc_authorization(path, target).map_err(|error| error.to_string()))
+        .transpose()?
+        .flatten();
     let agent: Agent = Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(timeout_seconds.get())))

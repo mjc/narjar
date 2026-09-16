@@ -80,6 +80,10 @@ impl HttpUrl {
         self.0.as_str()
     }
 
+    pub(crate) fn is_https(&self) -> bool {
+        self.0.scheme().as_str() == "https"
+    }
+
     fn try_from_uri(uri: Uri<String>) -> Result<Self, String> {
         let uri = uri.normalize();
         match uri.scheme().as_str() {

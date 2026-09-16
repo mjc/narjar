@@ -940,8 +940,9 @@ pub(crate) fn stats(options: Stats) -> Result<(), Error> {
     let authorization = options
         .netrc_file
         .as_deref()
-        .map(|path| netrc_authorization(path, options.url.host()))
-        .transpose()?;
+        .map(|path| netrc_authorization(path, &options.url))
+        .transpose()?
+        .flatten();
     let metrics_url = options.url.endpoint(&["metrics"]);
     let agent: Agent = Agent::config_builder()
         .http_status_as_error(false)
@@ -971,9 +972,13 @@ pub(crate) fn stats(options: Stats) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn netrc_authorization(path: &Path, host: &str) -> Result<String, Error> {
+pub(crate) fn netrc_authorization(path: &Path, url: &HttpUrl) -> Result<Option<String>, Error> {
+    if !url.is_https() {
+        return Ok(None);
+    }
+
     let text = fs::read_to_string(path).map_err(runtime)?;
-    netrc_authorization_from_str(&text, host)
+    netrc_authorization_from_str(&text, url.host()).map(Some)
 }
 
 fn netrc_authorization_from_str(text: &str, host: &str) -> Result<String, Error> {
@@ -1104,6 +1109,28 @@ machine other.example password other-secret
         .expect("IPv6 machine should match");
 
         assert_eq!(authorization, BASE64.encode(b"cache-user:cache-secret"));
+    }
+
+    #[test]
+    fn netrc_credentials_are_not_available_to_plain_http() {
+        let file = tempfile::NamedTempFile::new().expect("temporary netrc should be created");
+        fs::write(
+            file.path(),
+            "machine cache.example login cache-user password cache-secret\n",
+        )
+        .expect("temporary netrc should be written");
+        let http: HttpUrl = "http://cache.example"
+            .parse()
+            .expect("HTTP URL should parse");
+        let https: HttpUrl = "https://cache.example"
+            .parse()
+            .expect("HTTPS URL should parse");
+
+        assert_eq!(netrc_authorization(file.path(), &http).unwrap(), None);
+        assert_eq!(
+            netrc_authorization(file.path(), &https).unwrap(),
+            Some(BASE64.encode(b"cache-user:cache-secret"))
+        );
     }
 
     #[test]

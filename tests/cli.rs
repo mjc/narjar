@@ -109,6 +109,27 @@ fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
     }
 }
 
+fn http_request_body_start(request: &[u8]) -> usize {
+    request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("request should contain headers")
+        + 4
+}
+
+fn assert_http_request_has_no_authorization(request: &[u8]) {
+    let header_end = http_request_body_start(request);
+    assert!(
+        !String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .any(|line| {
+                line.split_once(':')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            }),
+        "plain HTTP request must not contain an Authorization header"
+    );
+}
+
 fn signed_narinfo_for(store_hash: &str, nar_hash: &str, nar_size: u64) -> String {
     signed_narinfo_for_with_references(store_hash, nar_hash, nar_size, &[])
 }
@@ -590,14 +611,82 @@ fn native_push_retries_after_an_interrupted_upload_at_the_process_boundary() {
 }
 
 fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
-    let server = RunningServer::start("native-push-process-boundary");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind native push listener");
+    let address = listener.local_addr().expect("inspect native push listener");
+    let expected_compression = compression.to_owned();
+    let expected_suffix = suffix.to_owned();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept narinfo lookup");
+        let request = read_http_request(&mut stream);
+        assert!(
+            String::from_utf8_lossy(&request)
+                .starts_with("GET /00000000000000000000000000000000.narinfo"),
+            "first request should look up the narinfo"
+        );
+        assert_http_request_has_no_authorization(&request);
+        write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write missing narinfo response");
+
+        let (mut stream, _) = listener.accept().expect("accept NAR upload");
+        let request = read_http_request(&mut stream);
+        let header_end = http_request_body_start(&request);
+        assert!(
+            String::from_utf8_lossy(&request).starts_with("PUT /nar/"),
+            "second request should upload the NAR"
+        );
+        assert_http_request_has_no_authorization(&request);
+        assert!(
+            !request[header_end..].is_empty(),
+            "NAR upload should have a body"
+        );
+        if expected_compression == "none" {
+            assert_eq!(&request[header_end..], NAR_BYTES);
+        } else {
+            assert_ne!(&request[header_end..], NAR_BYTES);
+        }
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write NAR upload response");
+
+        let (mut stream, _) = listener.accept().expect("accept narinfo upload");
+        let request = read_http_request(&mut stream);
+        let header_end = http_request_body_start(&request);
+        assert!(
+            String::from_utf8_lossy(&request)
+                .starts_with("PUT /00000000000000000000000000000000.narinfo"),
+            "third request should publish the narinfo"
+        );
+        assert_http_request_has_no_authorization(&request);
+        let narinfo = String::from_utf8_lossy(&request[header_end..]);
+        let url = narinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("URL: nar/"))
+            .expect("narinfo should contain a NAR URL");
+        assert!(
+            url.ends_with(&expected_suffix),
+            "NAR URL should use {expected_suffix:?}"
+        );
+        assert!(narinfo.contains(&format!("Compression: {expected_compression}\n")));
+        assert!(narinfo.contains(&format!("NarSize: {}\n", NAR_BYTES.len())));
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write narinfo response");
+    });
     let fixture = native_push_fixture();
     let output = run_native_push_fixture(
         &fixture,
-        &format!("http://{}?compression={compression}", server.address),
+        &format!("http://{address}?compression={compression}"),
         compression,
         false,
     );
+    server.join().expect("native push server should exit");
 
     assert!(
         output.status.success(),
@@ -608,25 +697,6 @@ fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
         String::from_utf8_lossy(&output.stdout),
         "pushed 1 paths with 1 workers\n"
     );
-    let narinfo = fs::read_to_string(server.data_dir.join(format!("{STORE_HASH}.narinfo")))
-        .expect("native narinfo should be published");
-    let url = narinfo
-        .lines()
-        .find_map(|line| line.strip_prefix("URL: nar/"))
-        .expect("native narinfo should contain a NAR URL");
-    assert!(
-        url.ends_with(suffix),
-        "NAR URL {url:?} should use requested suffix {suffix:?} for {compression}"
-    );
-    let published_nar = fs::read(server.data_dir.join(format!("nar/{url}")))
-        .expect("native NAR should be published");
-    if compression == "none" {
-        assert_eq!(published_nar, NAR_BYTES);
-    } else {
-        assert_ne!(published_nar, NAR_BYTES);
-    }
-    assert!(narinfo.contains(&format!("Compression: {compression}\n")));
-    assert!(narinfo.contains(&format!("NarSize: {}\n", NAR_BYTES.len())));
 
     let invocations =
         fs::read_to_string(fixture.invocation_log).expect("Nix invocations should be logged");
