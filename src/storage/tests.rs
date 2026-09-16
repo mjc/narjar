@@ -1129,6 +1129,28 @@ fn staging_reservations_are_bounded_and_released() {
         .expect("released staging capacity should be reusable");
 }
 
+#[test]
+fn staging_reservation_growth_is_atomic_and_monotonic() {
+    let reservations = Arc::new(AtomicU64::new(0));
+    let mut reservation = super::publication::StagingReservation::empty(reservations.clone());
+
+    reservation
+        .grow_to(100, 10, 64)
+        .expect("first growth should fit");
+    assert_eq!(reservation.reserved_bytes(), 64);
+    assert_eq!(reservations.load(Ordering::Relaxed), 64);
+
+    reservation
+        .grow_to(100, 10, 32)
+        .expect("smaller growth should be a no-op");
+    assert_eq!(reservation.reserved_bytes(), 64);
+    assert_eq!(reservations.load(Ordering::Relaxed), 64);
+
+    assert!(reservation.grow_to(70, 10, 100).is_err());
+    assert_eq!(reservation.reserved_bytes(), 64);
+    assert_eq!(reservations.load(Ordering::Relaxed), 64);
+}
+
 struct BrokenReader {
     raw_error: i32,
     returned_prefix: bool,
