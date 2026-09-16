@@ -64,6 +64,7 @@ chmod 600 ./narjar.netrc
 nix run . -- push \
   --to http://127.0.0.1:5000 \
   --netrc-file ./narjar.netrc \
+  --insecure-http \
   --signing-key-file ./producer.sec \
   --compression none \
   --jobs 8 \
@@ -72,9 +73,11 @@ nix run . -- push \
 
 Use `--refresh` to re-check and re-upload paths already present at the
 destination. `--compression` is explicit and accepts `none`, `zstd`, or `xz`; it
-defaults to `none`. The client uses fixed-length requests, streams NAR files
-from temporary files, and authenticates with the matching netrc entry. The
-native HTTP request timeout defaults to 30 seconds and can be changed with
+defaults to `none`. Netrc credentials are sent only over HTTPS by default;
+`--insecure-http` is an explicit opt-in for the loopback HTTP example above.
+The client uses fixed-length requests, streams NAR files from temporary files,
+and authenticates with the matching netrc entry. The native HTTP request
+timeout defaults to 30 seconds and can be changed with
 `--timeout-seconds` or `NARJAR_PUSH_TIMEOUT_SECONDS`. The server publishes the
 NAR before its narinfo, and consumers only see a path after the metadata is
 durable. Nix remains required for closure enumeration,

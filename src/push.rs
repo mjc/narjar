@@ -43,6 +43,10 @@ pub(crate) struct Push {
     #[arg(long)]
     netrc_file: Option<PathBuf>,
 
+    /// Permit sending netrc credentials over plain HTTP.
+    #[arg(long)]
+    insecure_http: bool,
+
     /// Secret key file used to sign the local store paths before copying.
     #[arg(long)]
     signing_key_file: Option<PathBuf>,
@@ -212,6 +216,7 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
         for chunk in wave.chunks(chunk_size) {
             let target = args.to.clone();
             let netrc_file = args.netrc_file.clone();
+            let insecure_http = args.insecure_http;
             let refresh = args.refresh;
             let compression = args.compression;
             let timeout_seconds = args.timeout_seconds;
@@ -220,6 +225,7 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
                 native_copy_paths(
                     &target,
                     netrc_file.as_deref(),
+                    insecure_http,
                     refresh,
                     compression,
                     timeout_seconds,
@@ -432,13 +438,16 @@ struct PreparedNar {
 fn native_copy_paths(
     target: &HttpUrl,
     netrc_file: Option<&Path>,
+    insecure_http: bool,
     refresh: bool,
     compression: Compression,
     timeout_seconds: NonZeroU64,
     metadata: &[PathInfo],
 ) -> Result<(), String> {
     let authorization = netrc_file
-        .map(|path| netrc_authorization(path, target).map_err(|error| error.to_string()))
+        .map(|path| {
+            netrc_authorization(path, target, insecure_http).map_err(|error| error.to_string())
+        })
         .transpose()?
         .flatten();
     let agent: Agent = Agent::config_builder()
