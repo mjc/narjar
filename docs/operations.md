@@ -1,6 +1,7 @@
 # Narjar v0.1 operations and resilience contract
 
-Status: design-gate draft for NARJ-11, NARJ-13, and NARJ-14.
+Status: accepted v0.1 operations contract; remaining deployment evidence is
+tracked in the risk register and open Lific work.
 
 ## CLI
 
@@ -20,6 +21,8 @@ narjar serve
   [--max-in-flight 64]
   [--max-nar-bytes 17179869184]
   [--min-free-bytes 1073741824]
+  [--shutdown-grace-seconds 30]
+  [--io-timeout-seconds 30]
 
 narjar token create
   --data-dir PATH
@@ -34,6 +37,15 @@ narjar token revoke
 narjar reconcile
   --data-dir PATH
   [--verify-hashes]
+  [--json]
+  [--structural]
+  [--limit N]
+  [--min-age-seconds N]
+
+narjar cleanup
+  --data-dir PATH
+  [--min-age-seconds N]
+  [--limit N]
   [--json]
 
 narjar verify
@@ -57,7 +69,17 @@ narjar gc
 
 narjar list-orphans
   --data-dir PATH
+  [--verify-hashes]
   [--json]
+
+narjar doctor
+  --data-dir PATH
+  [--json]
+
+narjar key generate
+  --name LABEL
+  --secret-key-file PATH
+  --public-key-file PATH
 
 narjar stats
   --url HTTP_URL
@@ -67,6 +89,7 @@ narjar stats
 narjar push
   --to STORE_URI
   [--jobs N]
+  [--compression none|zstd|xz]
   [--timeout-seconds N]
   [--netrc-file PATH]
   [--signing-key-file PATH]
@@ -98,8 +121,10 @@ request has a 30-second timeout by default; `--timeout-seconds` or
 `NARJAR_PUSH_TIMEOUT_SECONDS` changes it. The `nix`
 executable remains required for closure enumeration, signing, and canonical NAR
 serialization. `--netrc-file` is parsed by Narjar and its matching credential
-is sent as HTTP Basic authentication; the file must already have restrictive
-permissions.
+is sent as HTTP Basic authentication only when the target URL uses HTTPS. Plain
+HTTP requests never receive an Authorization header, and an HTTP-to-HTTPS
+redirect does not upgrade credentials; use an HTTPS target from the start. The
+file must already have restrictive permissions.
 
 The native client transfers store-path NARs and narinfos only. Realisations,
 build logs, `.ls` listings, and other store-daemon metadata are outside this
@@ -157,6 +182,8 @@ NARJAR_MAX_IN_FLIGHT
 NARJAR_MAX_NAR_BYTES
 NARJAR_MIN_FREE_BYTES
 NARJAR_SHUTDOWN_GRACE_SECONDS
+NARJAR_IO_TIMEOUT_SECONDS
+NARJAR_PUSH_TIMEOUT_SECONDS
 ~~~
 
 The compiled defaults bind to loopback, use 8 workers, admit at most 64
@@ -205,9 +232,9 @@ serve creates a fixed worker set and a bounded queue. max-in-flight limits
 requests that have begun processing; excess requests receive 429 when possible
 or remain outside Narjar in the proxy accept queue.
 
-Each admitted upload owns at most one temporary file, one descriptor, one hash
-state, and one fixed buffer. Reads own one file and one fixed buffer. Memory is
-therefore O(workers * buffer-size), independent of NAR size.
+Each admitted upload owns at most one temporary file, one descriptor, bounded
+hash state, and one fixed buffer. Reads own one file and one fixed buffer. Memory
+is therefore O(workers * buffer-size), independent of NAR size.
 
 Header parsing limits come from Narjar's fixed parser plus route checks. Content-
 Length is required before upload admission. Each accepted socket uses the
@@ -288,12 +315,12 @@ when recovery records are present, then removes only those recorded temporary
 objects before serving exact files. Reconciliation remains deterministic and
 operator-triggered for other stale temporary files.
 
-Upload validation is the content-integrity boundary. Once an immutable NAR has
-passed encoded and decoded hash/size validation, narinfo publication and normal
-availability checks only inspect that the regular file exists with the declared
-encoded size. They do not reread, decompress, or rehash the payload. Use
-`narjar verify` or `narjar reconcile --verify-hashes` for an explicit full
-content scan, including detection of same-size out-of-band mutation.
+Upload validation is the first content-integrity boundary. Raw narinfo
+publication and normal availability checks inspect only that the regular file
+exists with the declared encoded size. Compressed narinfo publication currently
+revalidates the encoded and decoded hashes before publication. Use `narjar
+verify` or `narjar reconcile --verify-hashes` for an explicit full content scan,
+including detection of same-size out-of-band mutation.
 
 ## Disk-full and I/O failure
 
@@ -359,8 +386,8 @@ For a consistent portable copy:
    `realisations/`, `nix-cache-info`, `trusted-public-keys`, and `auth/`.
 3. Preserve the directory and file permissions; do not expose the copy while
    it contains credentials.
-4. On the destination, run `doctor`, `reconcile --verify-hashes`, and `verify`
-   before starting Narjar.
+4. On the destination, require `doctor` to exit successfully, then run
+   `reconcile --verify-hashes` and `verify` before starting Narjar.
 5. Start Narjar and require `GET /readyz` to return `200` before routing
    consumers to it.
 
@@ -404,11 +431,21 @@ snapshots are not an atomic multi-dataset backup.
 
 ~~~sh
 snapshot="narjar-$(date +%Y%m%d-%H%M%S)"
+set -euo pipefail
+restarted=0
+restart_narjar() {
+  if [ "$restarted" -eq 0 ]; then
+    systemctl start narjar.service
+  fi
+}
+trap restart_narjar EXIT
 systemctl stop narjar.service
 zfs snapshot -r "$dataset@$snapshot"
 zfs hold -r narjar:backup "$dataset@$snapshot"
 narjar verify --data-dir /var/lib/narjar
 systemctl start narjar.service
+restarted=1
+trap - EXIT
 ~~~
 
 Record the dry-run stream size before sending. Send to a new, offline receive
@@ -417,9 +454,17 @@ using it. An incremental stream requires that the destination retain the base
 snapshot; use `-R` for a recursive dataset tree.
 
 ~~~sh
+set -euo pipefail
 target=backup/narjar-restore
 zfs send -nP -R "$dataset@$snapshot"
 zfs send -R "$dataset@$snapshot" | zfs receive -u "$target"
+
+zfs mount "$target"
+restore_data_dir="$(zfs get -H -o value mountpoint "$target")"
+narjar doctor --data-dir "$restore_data_dir"
+narjar reconcile --data-dir "$restore_data_dir" --verify-hashes
+narjar verify --data-dir "$restore_data_dir"
+zfs unmount "$target"
 
 base=narjar-previous
 next=narjar-next
@@ -439,10 +484,14 @@ status output. Scrub checks and, where configured, repairs ZFS block checksums;
 it does not validate narinfo signatures or NAR hashes.
 
 ~~~sh
+set -euo pipefail
 zpool scrub "$pool"
+while zpool status "$pool" | grep -q "scan: scrub in progress"; do
+  sleep 5
+done
 zpool status -v "$pool"
 zfs get -H -o property,value \
-  used,referenced,logicalused,logicalreferenced,compressratio,quota,refquota,refreservation \
+  used,usedbysnapshots,referenced,logicalused,logicalreferenced,compressratio,quota,refquota,refreservation \
   "$dataset"
 ~~~
 

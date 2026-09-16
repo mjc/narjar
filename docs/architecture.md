@@ -132,9 +132,11 @@ access. Paths are constructed from validated identifiers, never joined from a
 raw request path.
 
 No startup index or full scan is needed to serve: an exact route maps to an
-exact file. Startup creates required directories, validates ownership/modes,
-acquires the process lock, validates nix-cache-info, and removes no data.
-Offline reconcile and GC perform the potentially unbounded scans.
+exact file. Startup creates required directories, validates required entries
+and modes, acquires the process lock, and removes no data. `nix-cache-info` is
+validated when it is read or published; offline inventory commands validate it
+as part of their own work. Offline reconcile and GC perform the potentially
+unbounded scans.
 
 ## Offline retention and GC
 
@@ -204,13 +206,12 @@ publish with a same-filesystem no-replace hard link; metadata remains staged
 under `DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be
 measured.
 
-Upload validation is the content-integrity boundary. After an immutable NAR has
-passed encoded and decoded hash/size validation, narinfo publication and
-ordinary NAR availability checks inspect only the regular file and its encoded
-size; they do not read, decompress, or rehash the payload again. Full-content
+Upload validation is the first content-integrity boundary. Raw narinfo
+publication and ordinary NAR availability checks inspect only that the regular
+file exists with the declared encoded size. Compressed narinfo publication
+revalidates the encoded and decoded hashes before publication. Full-content
 verification is explicit operator work through `verify` or
-`reconcile --verify-hashes`, which is where same-size out-of-band mutation is
-detected.
+`reconcile --verify-hashes`, which detects same-size out-of-band mutation.
 
 Publication workers are bounded by the configured worker count and process
 valid PUTs concurrently. Each write reserves its declared body size against

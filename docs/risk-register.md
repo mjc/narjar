@@ -1,7 +1,8 @@
 # Narjar v0.1 risk register and decision log
 
-Status: NARJ-28 draft for NARJ-20 review. Likelihood and impact are Low,
-Medium, High, or Critical. Owner is the Lific issue that must supply proof.
+Status: accepted v0.1 risk register; remaining evidence gates are tracked in
+Lific. Likelihood and impact are Low, Medium, High, or Critical. Owner is the
+Lific issue that must supply proof.
 
 ## R1: Undocumented HTTP write behavior
 
@@ -39,8 +40,9 @@ differential is not material.
 Detection and recovery: Dependency/LOC growth or new DB/signing/recompression
 scope reopens the decision. Stop implementation and upstream the delta.
 
-Residual/disposition/proof: High, architecture gate blocker. NARJ-20 must choose
-adopt, extract, or greenfield based on NARJ-19 evidence.
+Residual/disposition/proof: High continuation risk. NARJ-19 remains the matched
+measurement gate for whether the greenfield implementation delivers a material
+benefit over existing products.
 
 ## R3: Native-store and flat-cache confusion
 
@@ -156,9 +158,10 @@ no-replace hard-link publication, parent-directory sync, NAR before narinfo.
 Detection and recovery: Fault injection at every write/sync/link step;
 restart state matrix; reconcile stale temporaries/orphans.
 
-Residual/disposition/proof: Medium. In-process fault coverage and the required
-Linux conformance lane pass; broader filesystem and power-loss claims remain
-outside the current evidence and are tracked by NARJ-68/NARJ-69.
+Residual/disposition/proof: Medium. In-process fault coverage passes, but there
+is no dedicated Linux filesystem-conformance lane and broader filesystem and
+power-loss claims remain outside the current evidence; they are tracked by
+NARJ-68/NARJ-69.
 
 ## R9: Traversal and route ambiguity
 
