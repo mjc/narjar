@@ -52,18 +52,24 @@ fn upload_reader_checks_encoded_hash_and_length() {
     let expected =
         FileHash::parse(&nix32_sha256(&Sha256::digest(bytes))).expect("file hash is valid");
     let mut reader = CheckedUploadReader::new(Cursor::new(bytes), &expected, bytes.len() as u64);
-    let mut received = Vec::new();
-
+    let mut received = [0; 17];
     reader
-        .read_to_end(&mut received)
+        .read_exact(&mut received)
         .expect("matching upload should be readable");
-    assert_eq!(received, bytes);
+    assert_eq!(&received, bytes);
+    reader
+        .finish()
+        .expect("matching upload should complete successfully");
 
     let wrong_hash = FileHash::parse(NAR_ID).expect("file hash is valid");
     let mut reader = CheckedUploadReader::new(Cursor::new(bytes), &wrong_hash, bytes.len() as u64);
-    let error = reader
-        .read_to_end(&mut Vec::new())
-        .expect_err("wrong encoded hash should be rejected");
+    reader
+        .read_exact(&mut [0; 17])
+        .expect("reading the upload body should succeed before completion");
+    let error = match reader.finish() {
+        Ok(_) => panic!("wrong encoded hash should be rejected"),
+        Err(error) => error,
+    };
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 

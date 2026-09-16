@@ -46,6 +46,10 @@ impl FileHash {
     pub(crate) fn matches_digest(self, digest: &[u8]) -> bool {
         self.0.as_slice() == digest
     }
+
+    pub(crate) fn matches_nar_hash(self, hash: NarHash) -> bool {
+        self.0 == hash.0
+    }
 }
 
 impl fmt::Display for FileHash {

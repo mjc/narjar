@@ -4,6 +4,7 @@ use std::{
     fmt,
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
+    marker::PhantomData,
     rc::Rc,
 };
 
@@ -18,16 +19,20 @@ use super::ids::nix32_sha256_matches;
 
 const INGESTION_RECEIPT_VERSION: u8 = 1;
 
-pub(super) struct CheckedUploadReader<'a, R> {
+pub(super) struct CheckedUploadReader<'a, R, State = Receiving> {
     inner: R,
     expected_hash: &'a FileHash,
     expected_length: u64,
     bytes_read: u64,
     hasher: Sha256,
     done: bool,
+    state: PhantomData<State>,
 }
 
-impl<'a, R> CheckedUploadReader<'a, R> {
+pub(super) struct Receiving;
+pub(super) struct Complete;
+
+impl<'a, R> CheckedUploadReader<'a, R, Receiving> {
     pub(super) fn new(inner: R, expected_hash: &'a FileHash, expected_length: u64) -> Self {
         Self {
             inner,
@@ -36,25 +41,11 @@ impl<'a, R> CheckedUploadReader<'a, R> {
             bytes_read: 0,
             hasher: Sha256::new(),
             done: false,
+            state: PhantomData,
         }
     }
 
-    pub(super) fn finish(&mut self) -> io::Result<()>
-    where
-        R: Read,
-    {
-        if self.done {
-            return Ok(());
-        }
-
-        let mut buffer = [0; 64 * 1024];
-        let read = self.inner.read(&mut buffer)?;
-        if read != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "encoded upload has trailing bytes",
-            ));
-        }
+    fn validate_complete_upload(&self) -> io::Result<()> {
         if self.bytes_read != self.expected_length
             || !self
                 .expected_hash
@@ -65,28 +56,45 @@ impl<'a, R> CheckedUploadReader<'a, R> {
                 "NAR hash or size mismatch",
             ));
         }
-        self.done = true;
         Ok(())
+    }
+
+    pub(super) fn finish(mut self) -> io::Result<CheckedUploadReader<'a, R, Complete>>
+    where
+        R: Read,
+    {
+        if !self.done {
+            let mut buffer = [0; 64 * 1024];
+            let read = self.inner.read(&mut buffer)?;
+            if read != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "encoded upload has trailing bytes",
+                ));
+            }
+            self.done = true;
+        }
+        self.validate_complete_upload()?;
+        Ok(CheckedUploadReader {
+            inner: self.inner,
+            expected_hash: self.expected_hash,
+            expected_length: self.expected_length,
+            bytes_read: self.bytes_read,
+            hasher: self.hasher,
+            done: true,
+            state: PhantomData,
+        })
     }
 }
 
-impl<R: Read> Read for CheckedUploadReader<'_, R> {
+impl<R: Read> Read for CheckedUploadReader<'_, R, Receiving> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.done {
             return Ok(0);
         }
-
         let read = self.inner.read(buffer)?;
         if read == 0 {
-            let digest = self.hasher.clone().finalize();
-            if self.bytes_read != self.expected_length
-                || !self.expected_hash.matches_digest(&digest)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "NAR hash or size mismatch",
-                ));
-            }
+            self.validate_complete_upload()?;
             self.done = true;
             return Ok(0);
         }
@@ -162,56 +170,107 @@ pub(super) fn normalize_upload(
     destination: &mut File,
     max_nar_size: u64,
 ) -> io::Result<DecodedValidation> {
-    let input = CheckedUploadReader::new(source, expected_file_hash, expected_file_size);
     match encoding {
-        NarEncoding::None => {
-            let mut input = input;
-            let mut output = HashingWriter::new(destination, max_nar_size);
-            io::copy(&mut input, &mut output)?;
-            input.finish()?;
-            let decoded = output.finish();
-            if decoded.size != expected_file_size
-                || decoded.hash.to_string() != expected_file_hash.to_string()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "raw NAR hash or size mismatch",
-                ));
-            }
-            Ok(decoded)
-        }
-        NarEncoding::Xz => {
-            let source_error = Rc::new(RefCell::new(None));
-            let mut decoder = XzReader::new(
-                CompressedSourceReader::new(input, Rc::clone(&source_error)),
-                false,
-            );
-            let mut output = HashingWriter::new(destination, max_nar_size);
-            io::copy(&mut decoder, &mut output)
-                .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
-            let mut input = decoder.into_inner().inner;
-            input
-                .finish()
-                .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
-            Ok(output.finish())
-        }
-        NarEncoding::Zstd => {
-            let source_error = Rc::new(RefCell::new(None));
-            let mut decoder = StructuredZstdDecoder::new(CompressedSourceReader::new(
-                input,
-                Rc::clone(&source_error),
-            ))
-            .map_err(|error| take_source_error(&source_error, compressed_decoder_error(error)))?;
-            let mut output = HashingWriter::new(destination, max_nar_size);
-            io::copy(&mut decoder, &mut output)
-                .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
-            let mut input = decoder.into_inner().inner;
-            input
-                .finish()
-                .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
-            Ok(output.finish())
-        }
+        NarEncoding::None => normalize_raw_upload(
+            source,
+            expected_file_hash,
+            expected_file_size,
+            destination,
+            max_nar_size,
+        ),
+        NarEncoding::Xz => normalize_xz_upload(
+            source,
+            expected_file_hash,
+            expected_file_size,
+            destination,
+            max_nar_size,
+        ),
+        NarEncoding::Zstd => normalize_zstd_upload(
+            source,
+            expected_file_hash,
+            expected_file_size,
+            destination,
+            max_nar_size,
+        ),
     }
+}
+
+fn normalize_raw_upload(
+    source: impl Read,
+    expected_file_hash: &FileHash,
+    expected_file_size: u64,
+    destination: &mut File,
+    max_nar_size: u64,
+) -> io::Result<DecodedValidation> {
+    let mut input = CheckedUploadReader::new(source, expected_file_hash, expected_file_size);
+    let mut output = HashingWriter::new(destination, max_nar_size);
+    io::copy(&mut input, &mut output)?;
+    let _complete = input.finish()?;
+    let decoded = output.finish();
+    if decoded.size != expected_file_size || !expected_file_hash.matches_nar_hash(decoded.hash) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raw NAR hash or size mismatch",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn normalize_xz_upload(
+    source: impl Read,
+    expected_file_hash: &FileHash,
+    expected_file_size: u64,
+    destination: &mut File,
+    max_nar_size: u64,
+) -> io::Result<DecodedValidation> {
+    let input = CheckedUploadReader::new(source, expected_file_hash, expected_file_size);
+    let source_error = Rc::new(RefCell::new(None));
+    let mut decoder = XzReader::new(
+        CompressedSourceReader::new(input, Rc::clone(&source_error)),
+        false,
+    );
+    let decoded = copy_decoded_bytes_to_raw_staging(&mut decoder, destination, max_nar_size)
+        .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
+    finish_encoded_upload_after_decoding(decoder.into_inner().inner, &source_error)?;
+    Ok(decoded)
+}
+
+fn normalize_zstd_upload(
+    source: impl Read,
+    expected_file_hash: &FileHash,
+    expected_file_size: u64,
+    destination: &mut File,
+    max_nar_size: u64,
+) -> io::Result<DecodedValidation> {
+    let input = CheckedUploadReader::new(source, expected_file_hash, expected_file_size);
+    let source_error = Rc::new(RefCell::new(None));
+    let mut decoder =
+        StructuredZstdDecoder::new(CompressedSourceReader::new(input, Rc::clone(&source_error)))
+            .map_err(|error| take_source_error(&source_error, compressed_decoder_error(error)))?;
+    let decoded = copy_decoded_bytes_to_raw_staging(&mut decoder, destination, max_nar_size)
+        .map_err(|error| take_source_error(&source_error, compressed_read_error(error)))?;
+    finish_encoded_upload_after_decoding(decoder.into_inner().inner, &source_error)?;
+    Ok(decoded)
+}
+
+fn copy_decoded_bytes_to_raw_staging<R: Read>(
+    decoder: &mut R,
+    destination: &mut File,
+    max_nar_size: u64,
+) -> io::Result<DecodedValidation> {
+    let mut output = HashingWriter::new(destination, max_nar_size);
+    io::copy(decoder, &mut output)?;
+    Ok(output.finish())
+}
+
+fn finish_encoded_upload_after_decoding<R: Read>(
+    input: CheckedUploadReader<'_, R>,
+    source_error: &RefCell<Option<io::Error>>,
+) -> io::Result<()> {
+    input
+        .finish()
+        .map(|_| ())
+        .map_err(|error| take_source_error(source_error, compressed_read_error(error)))
 }
 
 struct HashingReader<R> {
