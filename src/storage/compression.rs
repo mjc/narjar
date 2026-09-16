@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
 use crate::narinfo::{CompressedNarExpectation, NarEncoding, ValidatedPayload};
-use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
+use crate::object::{
+    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize,
+};
 
 use super::{
     fs::filesystem_space,
@@ -409,14 +411,14 @@ pub(super) struct IngestionReceipt {
 
 impl IngestionReceipt {
     pub(super) fn from_decoded(
-        encoding: NarEncoding,
+        codec: CompressionCodec,
         encoded_hash: FileHash,
         encoded_size: EncodedSize,
         decoded: DecodedValidation,
     ) -> Self {
         Self {
             encoded: EncodedIdentity::new(
-                encoding,
+                codec,
                 encoded_hash,
                 EncodedSize::new(encoded_size.get()),
             ),
@@ -428,14 +430,14 @@ impl IngestionReceipt {
         OsString::from(format!(
             "{}{}.validation",
             self.encoded.hash(),
-            self.encoded.encoding().suffix()
+            self.encoded.codec().suffix()
         ))
     }
 
     pub(super) fn bytes(&self) -> Vec<u8> {
         format!(
             "version={INGESTION_RECEIPT_VERSION}\nencoding={}\nencoded-hash={}\nencoded-size={}\ndecoded-hash={}\ndecoded-size={}\n",
-            self.encoded.encoding().compression(),
+            self.encoded.codec().compression(),
             self.encoded.hash(),
             self.encoded.size(),
             self.decoded.hash(),
@@ -481,7 +483,12 @@ impl IngestionReceipt {
                 _ => return None,
             }
         }
-        let encoded = EncodedIdentity::new(encoding?, encoded_hash?, encoded_size?);
+        let codec = match encoding? {
+            NarEncoding::Zstd => CompressionCodec::Zstd,
+            NarEncoding::Xz => CompressionCodec::Xz,
+            NarEncoding::Raw => return None,
+        };
+        let encoded = EncodedIdentity::new(codec, encoded_hash?, encoded_size?);
         let decoded = NarIdentity::new(decoded_hash?, decoded_size?);
         let evidence = Self { encoded, decoded };
         (version? == INGESTION_RECEIPT_VERSION).then_some(evidence)
@@ -500,7 +507,7 @@ pub(super) fn ingestion_receipt_file_name(expectation: CompressedNarExpectation)
     OsString::from(format!(
         "{}{}.validation",
         expectation.encoded.hash(),
-        expectation.encoded.encoding().suffix()
+        expectation.encoded.codec().suffix()
     ))
 }
 
@@ -659,10 +666,9 @@ pub(super) fn verify_decoded_compressed_file(
 fn decode_verified_compressed_payload(
     verified: &VerifiedCompressedNar<'_>,
 ) -> io::Result<DecodedValidation> {
-    match verified.expectation.encoded.encoding() {
-        NarEncoding::Zstd => decode_verified_zstd_payload(verified),
-        NarEncoding::Xz => decode_verified_xz_payload(verified),
-        NarEncoding::Raw => unreachable!("raw uploads do not use compressed verification"),
+    match verified.expectation.encoded.codec() {
+        CompressionCodec::Zstd => decode_verified_zstd_payload(verified),
+        CompressionCodec::Xz => decode_verified_xz_payload(verified),
     }
 }
 
@@ -681,7 +687,7 @@ fn decode_verified_xz_payload(
     let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded.size().get())?;
     ensure_decoder_consumed_complete_compressed_file(
         &mut decoder.into_inner().into_inner(),
-        NarEncoding::Xz,
+        CompressionCodec::Xz,
     )?;
     Ok(decoded)
 }
@@ -695,7 +701,7 @@ fn decode_verified_zstd_payload(
     let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded.size().get())?;
     ensure_decoder_consumed_complete_compressed_file(
         &mut decoder.into_inner().into_inner(),
-        NarEncoding::Zstd,
+        CompressionCodec::Zstd,
     )?;
     Ok(decoded)
 }
@@ -708,15 +714,14 @@ fn rewound_compressed_file(file: &File) -> io::Result<File> {
 
 fn ensure_decoder_consumed_complete_compressed_file(
     file: &mut File,
-    encoding: NarEncoding,
+    codec: CompressionCodec,
 ) -> io::Result<()> {
     if file.stream_position()? == file.metadata()?.len() {
         return Ok(());
     }
-    let message = match encoding {
-        NarEncoding::Xz => "trailing bytes after XZ NAR",
-        NarEncoding::Zstd => "trailing bytes after zstd NAR",
-        NarEncoding::Raw => unreachable!("raw NARs do not use a compressed decoder"),
+    let message = match codec {
+        CompressionCodec::Xz => "trailing bytes after XZ NAR",
+        CompressionCodec::Zstd => "trailing bytes after zstd NAR",
     };
     Err(io::Error::new(io::ErrorKind::InvalidData, message))
 }

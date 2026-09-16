@@ -9,9 +9,11 @@ use std::{
 use data_encoding::BASE64;
 use ed25519_dalek::{Signature, VerifyingKey};
 
-use crate::object::NarFileName;
 pub use crate::object::WireEncoding as NarEncoding;
-use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
+use crate::object::{
+    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
+    NarSize,
+};
 use crate::storage::{Directory, StoreHash, open_regular_at};
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
@@ -192,26 +194,20 @@ impl ParsedNarInfo {
             .strip_prefix("sha256:")
             .ok_or(NarInfoError)?;
         let file_hash = FileHash::parse(declared_file_hash).map_err(|_| NarInfoError)?;
-        if file_hash != payload.file_hash() {
-            return Err(NarInfoError);
-        }
         let nar_hash = required("NarHash")?
             .strip_prefix("sha256:")
             .and_then(|value| NarHash::parse(value).ok())
             .ok_or(NarInfoError)?;
-        if payload.encoding() == NarEncoding::Raw && !file_hash.matches_nar_hash(nar_hash) {
-            return Err(NarInfoError);
-        }
-
-        let file_size = required("FileSize")?
-            .parse::<u64>()
-            .map_err(|_| NarInfoError)?;
-        let nar_size = required("NarSize")?
-            .parse::<u64>()
-            .map_err(|_| NarInfoError)?;
-        if nar_size == 0 || (payload.encoding() == NarEncoding::Raw && file_size != nar_size) {
-            return Err(NarInfoError);
-        }
+        let file_size = EncodedSize::new(
+            required("FileSize")?
+                .parse::<u64>()
+                .map_err(|_| NarInfoError)?,
+        );
+        let nar_size = NarSize::new(
+            required("NarSize")?
+                .parse::<u64>()
+                .map_err(|_| NarInfoError)?,
+        );
 
         if field("Deriver").is_some_and(|deriver| {
             deriver != "unknown-deriver" && validate_store_basename(deriver).is_err()
@@ -223,8 +219,8 @@ impl ParsedNarInfo {
         }
 
         let references = parse_references(required("References")?)?;
-        let identity = NarIdentity::new(nar_hash, NarSize::new(nar_size));
-        let payload = validated_payload(payload, file_size, identity);
+        let identity = NarIdentity::new(nar_hash, nar_size);
+        let payload = ValidatedPayload::from_narinfo(payload, file_hash, file_size, identity)?;
         let fingerprint = build_fingerprint(
             store_path,
             &identity.hash(),
@@ -259,6 +255,20 @@ pub(crate) struct CompressedNarExpectation {
     pub(crate) decoded: NarIdentity,
 }
 
+impl CompressedNarExpectation {
+    pub(crate) const fn new(
+        codec: CompressionCodec,
+        encoded_hash: FileHash,
+        encoded_size: EncodedSize,
+        decoded: NarIdentity,
+    ) -> Self {
+        Self {
+            encoded: EncodedIdentity::new(codec, encoded_hash, encoded_size),
+            decoded,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ValidatedPayload {
     Raw(NarIdentity),
@@ -266,6 +276,35 @@ pub(crate) enum ValidatedPayload {
 }
 
 impl ValidatedPayload {
+    fn from_narinfo(
+        file_name: NarFileName,
+        file_hash: FileHash,
+        file_size: EncodedSize,
+        identity: NarIdentity,
+    ) -> Result<Self, NarInfoError> {
+        if file_name.file_hash() != file_hash || identity.size().get() == 0 {
+            return Err(NarInfoError);
+        }
+
+        match file_name.encoding() {
+            NarEncoding::Raw if !file_hash.matches_nar_hash(identity.hash()) => Err(NarInfoError),
+            NarEncoding::Raw if file_size.get() != identity.size().get() => Err(NarInfoError),
+            NarEncoding::Raw => Ok(Self::Raw(identity)),
+            NarEncoding::Zstd => Ok(Self::Compressed(CompressedNarExpectation::new(
+                CompressionCodec::Zstd,
+                file_hash,
+                file_size,
+                identity,
+            ))),
+            NarEncoding::Xz => Ok(Self::Compressed(CompressedNarExpectation::new(
+                CompressionCodec::Xz,
+                file_hash,
+                file_size,
+                identity,
+            ))),
+        }
+    }
+
     pub(crate) const fn decoded_identity(self) -> NarIdentity {
         match self {
             Self::Raw(identity) => identity,
@@ -283,29 +322,10 @@ impl ValidatedPayload {
     pub(crate) const fn payload_name(self) -> NarFileName {
         match self {
             Self::Raw(identity) => NarFileName::raw(identity.hash()),
-            Self::Compressed(expectation) => {
-                NarFileName::new(expectation.encoded.hash(), expectation.encoded.encoding())
-            }
-        }
-    }
-}
-
-fn validated_payload(
-    file_name: NarFileName,
-    file_size: u64,
-    identity: NarIdentity,
-) -> ValidatedPayload {
-    match file_name.encoding() {
-        NarEncoding::Raw => ValidatedPayload::Raw(identity),
-        NarEncoding::Zstd | NarEncoding::Xz => {
-            ValidatedPayload::Compressed(CompressedNarExpectation {
-                encoded: EncodedIdentity::new(
-                    file_name.encoding(),
-                    file_name.file_hash(),
-                    EncodedSize::new(file_size),
-                ),
-                decoded: identity,
-            })
+            Self::Compressed(expectation) => NarFileName::new(
+                expectation.encoded.hash(),
+                expectation.encoded.codec().wire_encoding(),
+            ),
         }
     }
 }
@@ -335,8 +355,10 @@ impl ValidatedNarInfo {
         self.0.bytes
     }
 
-    pub(crate) fn into_raw_narinfo(self) -> RawNarInfo {
-        let identity = self.0.payload.decoded_identity();
+    pub(crate) fn bind_raw(self, identity: NarIdentity) -> Result<RawNarInfo, NarInfoError> {
+        if self.0.payload.decoded_identity() != identity {
+            return Err(NarInfoError);
+        }
         let text = std::str::from_utf8(&self.0.bytes).expect("validated narinfo is UTF-8");
         let raw_url = format!("nar/{}{}", identity.hash(), NarEncoding::Raw.suffix());
         let raw_file_hash = format!("sha256:{}", identity.hash());
@@ -360,20 +382,15 @@ impl ValidatedNarInfo {
             .collect::<Vec<_>>()
             .join("\n")
             .into_bytes();
-        RawNarInfo { identity, bytes }
+        Ok(RawNarInfo { bytes })
     }
 }
 
 pub(crate) struct RawNarInfo {
-    identity: NarIdentity,
     bytes: Vec<u8>,
 }
 
 impl RawNarInfo {
-    pub(crate) const fn identity(&self) -> NarIdentity {
-        self.identity
-    }
-
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }

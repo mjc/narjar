@@ -331,24 +331,18 @@ struct UploadRequest {
 }
 
 pub struct PublicationRequest {
-    request: Request,
+    upload: UploadRequest,
     route: CacheRoute,
 }
 
 impl PublicationRequest {
     pub fn reject(self, metrics: &Metrics, status: u16) {
-        let guard = metrics.request(RequestMethod::Put, request_route(self.request.url()));
-        let _ = send_response(
-            &guard,
-            self.request,
-            status,
-            Response::empty(StatusCode(status)),
-            0,
-        );
+        let guard = metrics.request(RequestMethod::Put, request_route(self.upload.request.url()));
+        let _ = self.upload.respond(&guard, status);
     }
 
     pub fn staging_bytes(&self, max_nar_bytes: u64) -> Option<u64> {
-        let length = u64::try_from(self.request.body_length()?).ok()?;
+        let length = u64::try_from(self.upload.length()).ok()?;
         match &self.route {
             CacheRoute::Nar(_) if length <= max_nar_bytes => Some(length),
             CacheRoute::Nar(_) => None,
@@ -365,10 +359,11 @@ impl PublicationRequest {
         metrics: &Metrics,
         staging: StagingReservation,
     ) {
-        let guard = metrics.request(RequestMethod::Put, request_route(self.request.url()));
-        let _ = match self.route {
+        let guard = metrics.request(RequestMethod::Put, request_route(self.upload.request.url()));
+        let Self { upload, route } = self;
+        let _ = match route {
             CacheRoute::Nar(name) => respond_nar_put(
-                self.request,
+                upload,
                 NarPutContext {
                     storage,
                     name,
@@ -380,11 +375,11 @@ impl PublicationRequest {
             ),
             CacheRoute::NarInfo(store) => {
                 drop(staging);
-                respond_narinfo_put(self.request, storage, &store, trusted, metrics, &guard)
+                respond_narinfo_put(upload, storage, &store, trusted, metrics, &guard)
             }
             CacheRoute::CacheInfo => {
                 drop(staging);
-                respond_cache_info_put(self.request, storage, metrics, &guard)
+                respond_cache_info_put(upload, storage, metrics, &guard)
             }
         };
     }
@@ -417,54 +412,39 @@ pub fn prepare_publication(
         }
     };
 
-    if has_header(&request, "Transfer-Encoding") {
-        metrics.validation_failure(ValidationClass::Body);
-        let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-        let _ = send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
-        return None;
-    }
-    if has_header(&request, "Content-Encoding") {
-        metrics.validation_failure(ValidationClass::Body);
-        let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-        let _ = send_response(&guard, request, 415, Response::empty(StatusCode(415)), 0);
-        return None;
-    }
-    if request.body_length().is_none() {
-        metrics.validation_failure(ValidationClass::Body);
-        let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-        let _ = send_response(&guard, request, 411, Response::empty(StatusCode(411)), 0);
-        return None;
-    }
+    let length = match UploadRequest::validate_headers_and_length(&request) {
+        Ok(length) => length,
+        Err(status) => {
+            metrics.validation_failure(ValidationClass::Body);
+            let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
+            let _ = send_response(
+                &guard,
+                request,
+                status,
+                Response::empty(StatusCode(status)),
+                0,
+            );
+            return None;
+        }
+    };
+    let upload = UploadRequest::from_validated_request(request, length);
 
-    Some(PublicationRequest { request, route })
+    Some(PublicationRequest { upload, route })
 }
 
 impl UploadRequest {
-    fn accept(
-        request: Request,
-        guard: &RequestGuard<'_>,
-        metrics: &Metrics,
-    ) -> Result<Self, Option<TcpStream>> {
-        let length = if has_header(&request, "Transfer-Encoding") {
-            Err(400)
-        } else if has_header(&request, "Content-Encoding") {
-            Err(415)
-        } else {
-            request.body_length().ok_or(411)
-        };
-        match length {
-            Ok(length) => Ok(Self { request, length }),
-            Err(status) => {
-                metrics.validation_failure(ValidationClass::Body);
-                Err(send_response(
-                    guard,
-                    request,
-                    status,
-                    Response::empty(StatusCode(status)),
-                    0,
-                ))
-            }
+    fn validate_headers_and_length(request: &Request) -> Result<usize, u16> {
+        if has_header(request, "Transfer-Encoding") {
+            return Err(400);
         }
+        if has_header(request, "Content-Encoding") {
+            return Err(415);
+        }
+        request.body_length().ok_or(411)
+    }
+
+    fn from_validated_request(request: Request, length: usize) -> Self {
+        Self { request, length }
     }
 
     const fn length(&self) -> usize {
@@ -528,18 +508,14 @@ fn record_capacity_error(metrics: &Metrics, error: &StorageError) {
 }
 
 fn respond_cache_info_put(
-    request: Request,
+    mut upload: UploadRequest,
     storage: &Storage,
     metrics: &Metrics,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
     let cache_info = match storage.cache_info() {
         Ok(cache_info) => cache_info,
-        Err(_) => return send_response(guard, request, 500, Response::empty(StatusCode(500)), 0),
-    };
-    let mut upload = match UploadRequest::accept(request, guard, metrics) {
-        Ok(upload) => upload,
-        Err(stream) => return stream,
+        Err(_) => return upload.respond(guard, 500),
     };
     let _upload = metrics.upload(upload.length() as u64);
     if upload.length() != cache_info.len() {
@@ -583,7 +559,7 @@ struct NarPutContext<'storage, 'request> {
     staging: StagingReservation,
 }
 
-fn respond_nar_put(request: Request, context: NarPutContext<'_, '_>) -> Option<TcpStream> {
+fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) -> Option<TcpStream> {
     let NarPutContext {
         storage,
         name,
@@ -592,10 +568,6 @@ fn respond_nar_put(request: Request, context: NarPutContext<'_, '_>) -> Option<T
         guard,
         staging,
     } = context;
-    let mut upload = match UploadRequest::accept(request, guard, metrics) {
-        Ok(upload) => upload,
-        Err(stream) => return stream,
-    };
     let length = upload.length();
     let _upload = metrics.upload(length as u64);
     let started = Instant::now();
@@ -625,17 +597,13 @@ fn respond_nar_put(request: Request, context: NarPutContext<'_, '_>) -> Option<T
 }
 
 fn respond_narinfo_put(
-    request: Request,
+    mut upload: UploadRequest,
     storage: &Storage,
     store: &StoreHash,
     trusted: &TrustedPublicKeys,
     metrics: &Metrics,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
-    let mut upload = match UploadRequest::accept(request, guard, metrics) {
-        Ok(upload) => upload,
-        Err(stream) => return stream,
-    };
     let _upload = metrics.upload(upload.length() as u64);
     let bytes = match upload.read_body(MAX_NARINFO_BYTES as usize) {
         Ok(bytes) => bytes,

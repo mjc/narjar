@@ -143,11 +143,10 @@ fn inspect_trusted_narinfo(
     verification: VerificationMode,
 ) -> io::Result<MetadataAssessment> {
     let nar = metadata.payload_name().file_hash();
-    let class =
-        match ReferencedPayload::open(payloads, &metadata.payload_name(), metadata.payload())? {
-            None => InventoryClass::MissingNar,
-            Some(payload) => verification.inspect_referenced_payload(payload)?,
-        };
+    let class = match ReferencedPayload::open(payloads, metadata.payload())? {
+        None => InventoryClass::MissingNar,
+        Some(payload) => verification.inspect_referenced_payload(payload)?,
+    };
     // Trust establishes the reference even when its payload is missing or corrupt.
     Ok(MetadataAssessment::Referenced {
         entry: InventoryEntry::new(class, store.as_str()),

@@ -64,22 +64,18 @@ impl fmt::Display for FileHash {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct EncodedIdentity {
-    encoding: WireEncoding,
+    codec: CompressionCodec,
     hash: FileHash,
     size: EncodedSize,
 }
 
 impl EncodedIdentity {
-    pub(crate) const fn new(encoding: WireEncoding, hash: FileHash, size: EncodedSize) -> Self {
-        Self {
-            encoding,
-            hash,
-            size,
-        }
+    pub(crate) const fn new(codec: CompressionCodec, hash: FileHash, size: EncodedSize) -> Self {
+        Self { codec, hash, size }
     }
 
-    pub(crate) const fn encoding(self) -> WireEncoding {
-        self.encoding
+    pub(crate) const fn codec(self) -> CompressionCodec {
+        self.codec
     }
 
     pub(crate) const fn hash(self) -> FileHash {
@@ -219,6 +215,29 @@ pub enum WireEncoding {
     Raw,
     Zstd,
     Xz,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum CompressionCodec {
+    Zstd,
+    Xz,
+}
+
+impl CompressionCodec {
+    pub(crate) const fn wire_encoding(self) -> WireEncoding {
+        match self {
+            Self::Zstd => WireEncoding::Zstd,
+            Self::Xz => WireEncoding::Xz,
+        }
+    }
+
+    pub(crate) const fn compression(self) -> &'static str {
+        self.wire_encoding().compression()
+    }
+
+    pub(crate) const fn suffix(self) -> &'static str {
+        self.wire_encoding().suffix()
+    }
 }
 
 impl WireEncoding {

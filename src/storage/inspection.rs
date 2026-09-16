@@ -71,11 +71,8 @@ pub(crate) struct ReferencedPayload {
 }
 
 impl ReferencedPayload {
-    pub(crate) fn open(
-        directory: &File,
-        name: &NarFileName,
-        payload: ValidatedPayload,
-    ) -> io::Result<Option<Self>> {
+    pub(crate) fn open(directory: &File, payload: ValidatedPayload) -> io::Result<Option<Self>> {
+        let name = payload.payload_name();
         match open_regular_at(directory, &name.os_string()) {
             Ok(file) => Ok(Some(Self { file, payload })),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
