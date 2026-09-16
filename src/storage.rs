@@ -41,6 +41,9 @@ const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const NIX32_SHA256_LEN: usize = 52;
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_CACHE_INFO_BYTES: u64 = 1024;
+const VALIDATION_DIRECTORY: &str = ".narjar-validation";
+const VALIDATION_EVIDENCE_VERSION: u8 = 1;
+const MAX_VALIDATION_EVIDENCE_BYTES: u64 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidObjectId;
@@ -210,7 +213,6 @@ fn nix32_encoding() -> &'static Encoding {
     })
 }
 
-#[cfg(test)]
 fn nix32_sha256(digest: &[u8]) -> String {
     let encoding = nix32_encoding();
     let mut encoded = vec![0; encoding.encode_len(digest.len())];
@@ -293,6 +295,128 @@ struct HashingReader<R> {
     hasher: Option<Sha256>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct DecodedValidation {
+    hash: NarObjectId,
+    size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidationEvidence {
+    encoding: NarEncoding,
+    encoded_hash: NarObjectId,
+    encoded_size: u64,
+    decoded_hash: NarObjectId,
+    decoded_size: u64,
+}
+
+impl ValidationEvidence {
+    fn from_decoded(
+        encoding: NarEncoding,
+        encoded_hash: NarObjectId,
+        encoded_size: u64,
+        decoded: DecodedValidation,
+    ) -> Self {
+        Self {
+            encoding,
+            encoded_hash,
+            encoded_size,
+            decoded_hash: decoded.hash,
+            decoded_size: decoded.size,
+        }
+    }
+
+    fn file_name(&self) -> OsString {
+        OsString::from(format!(
+            "{}{}.validation",
+            self.encoded_hash.as_str(),
+            self.encoding.suffix()
+        ))
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        format!(
+            "version={VALIDATION_EVIDENCE_VERSION}\nencoding={}\nencoded-hash={}\nencoded-size={}\ndecoded-hash={}\ndecoded-size={}\n",
+            self.encoding.compression(),
+            self.encoded_hash.as_str(),
+            self.encoded_size,
+            self.decoded_hash.as_str(),
+            self.decoded_size,
+        )
+        .into_bytes()
+    }
+
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        if !text.ends_with('\n') {
+            return None;
+        }
+        let mut version: Option<u8> = None;
+        let mut encoding = None;
+        let mut encoded_hash = None;
+        let mut encoded_size = None;
+        let mut decoded_hash = None;
+        let mut decoded_size = None;
+        for line in text.lines() {
+            let (name, value) = line.split_once('=')?;
+            match name {
+                "version" if version.is_none() => version = Some(value.parse().ok()?),
+                "encoding" if encoding.is_none() => {
+                    encoding = Some(match value {
+                        "zstd" => NarEncoding::Zstd,
+                        "xz" => NarEncoding::Xz,
+                        _ => return None,
+                    })
+                }
+                "encoded-hash" if encoded_hash.is_none() => {
+                    encoded_hash = Some(NarObjectId::parse(value).ok()?)
+                }
+                "encoded-size" if encoded_size.is_none() => {
+                    encoded_size = Some(value.parse().ok()?)
+                }
+                "decoded-hash" if decoded_hash.is_none() => {
+                    decoded_hash = Some(NarObjectId::parse(value).ok()?)
+                }
+                "decoded-size" if decoded_size.is_none() => {
+                    decoded_size = Some(value.parse().ok()?)
+                }
+                _ => return None,
+            }
+        }
+        let evidence = Self {
+            encoding: encoding?,
+            encoded_hash: encoded_hash?,
+            encoded_size: encoded_size?,
+            decoded_hash: decoded_hash?,
+            decoded_size: decoded_size?,
+        };
+        (version? == VALIDATION_EVIDENCE_VERSION).then_some(evidence)
+    }
+
+    fn matches(&self, expectation: CompressedNarExpectation<'_>) -> bool {
+        self.encoding == nar_encoding(expectation.encoding)
+            && self.encoded_hash == *expectation.encoded_hash
+            && self.encoded_size == expectation.encoded_size
+            && self.decoded_hash == *expectation.decoded_hash
+            && self.decoded_size == expectation.decoded_size
+    }
+}
+
+fn nar_encoding(encoding: CompressedEncoding) -> NarEncoding {
+    match encoding {
+        CompressedEncoding::Zstd => NarEncoding::Zstd,
+        CompressedEncoding::Xz => NarEncoding::Xz,
+    }
+}
+
+fn validation_file_name(expectation: CompressedNarExpectation<'_>) -> OsString {
+    OsString::from(format!(
+        "{}{}.validation",
+        expectation.encoded_hash.as_str(),
+        nar_encoding(expectation.encoding).suffix()
+    ))
+}
+
 #[derive(Debug)]
 struct CompressedSourceError(io::Error);
 
@@ -366,7 +490,7 @@ fn validate_decoded<R: Read>(
     reader: &mut R,
     expected_nar_hash: Option<&NarObjectId>,
     max_bytes: u64,
-) -> io::Result<u64> {
+) -> io::Result<DecodedValidation> {
     let mut hasher = Sha256::new();
     let mut bytes_read = 0u64;
     let mut buffer = [0; 64 * 1024];
@@ -386,16 +510,18 @@ fn validate_decoded<R: Read>(
         }
         hasher.update(&buffer[..read]);
     }
-    let actual_nar_hash = hasher.finalize();
-    if expected_nar_hash
-        .is_some_and(|expected_id| !nix32_sha256_matches(&actual_nar_hash, expected_id.as_str()))
-    {
+    let actual_nar_hash = NarObjectId::parse(&nix32_sha256(&hasher.finalize()))
+        .expect("SHA-256 Nix32 encoding is always a valid NAR object ID");
+    if expected_nar_hash.is_some_and(|expected_id| actual_nar_hash != *expected_id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "decompressed NAR hash mismatch",
         ));
     }
-    Ok(bytes_read)
+    Ok(DecodedValidation {
+        hash: actual_nar_hash,
+        size: bytes_read,
+    })
 }
 
 fn validate_xz(
@@ -403,14 +529,14 @@ fn validate_xz(
     expected_nar_hash: Option<&NarObjectId>,
     expected_file_hash: Option<&NarObjectId>,
     max_bytes: u64,
-) -> io::Result<u64> {
+) -> io::Result<DecodedValidation> {
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
     let mut reader = XzReader::new(
         HashingReader::new(file, expected_file_hash.is_some()),
         false,
     );
-    let bytes_read = validate_decoded(&mut reader, expected_nar_hash, max_bytes)?;
+    let decoded = validate_decoded(&mut reader, expected_nar_hash, max_bytes)?;
     let mut actual_file_hash = reader.into_inner();
     if actual_file_hash.inner.stream_position()? != actual_file_hash.inner.metadata()?.len() {
         return Err(io::Error::new(
@@ -424,7 +550,7 @@ fn validate_xz(
             "compressed NAR hash mismatch",
         ));
     }
-    Ok(bytes_read)
+    Ok(decoded)
 }
 
 fn validate_zstd(
@@ -432,7 +558,7 @@ fn validate_zstd(
     expected_nar_hash: Option<&NarObjectId>,
     expected_file_hash: Option<&NarObjectId>,
     max_bytes: u64,
-) -> io::Result<u64> {
+) -> io::Result<DecodedValidation> {
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
     let mut reader =
@@ -443,7 +569,7 @@ fn validate_zstd(
                     format!("invalid zstd NAR: {error}"),
                 )
             })?;
-    let bytes_read = validate_decoded(&mut reader, expected_nar_hash, max_bytes)?;
+    let decoded = validate_decoded(&mut reader, expected_nar_hash, max_bytes)?;
     let mut actual_file_hash = reader.into_inner();
     if actual_file_hash.inner.stream_position()? != actual_file_hash.inner.metadata()?.len() {
         return Err(io::Error::new(
@@ -457,7 +583,7 @@ fn validate_zstd(
             "compressed NAR hash mismatch",
         ));
     }
-    Ok(bytes_read)
+    Ok(decoded)
 }
 
 pub(crate) fn file_matches(
@@ -469,6 +595,7 @@ pub(crate) fn file_matches(
         return Ok(false);
     }
     let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     loop {
@@ -500,7 +627,9 @@ fn verify_encoded_compressed_file<'file, 'metadata>(
     Ok(Some(VerifiedCompressedNar { file, expectation }))
 }
 
-fn verify_decoded_compressed_file(verified: VerifiedCompressedNar<'_, '_>) -> io::Result<bool> {
+fn verify_decoded_compressed_file(
+    verified: VerifiedCompressedNar<'_, '_>,
+) -> io::Result<Option<DecodedValidation>> {
     let validation = match verified.expectation.encoding {
         CompressedEncoding::Zstd => validate_zstd(
             verified.file,
@@ -516,20 +645,28 @@ fn verify_decoded_compressed_file(verified: VerifiedCompressedNar<'_, '_>) -> io
         ),
     };
     match validation {
-        Ok(size) => Ok(size == verified.expectation.decoded_size),
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(false),
+        Ok(decoded) if decoded.size == verified.expectation.decoded_size => Ok(Some(decoded)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn validate_compressed_nar(
+    file: &File,
+    expectation: CompressedNarExpectation<'_>,
+) -> io::Result<Option<DecodedValidation>> {
+    let Some(verified) = verify_encoded_compressed_file(file, expectation)? else {
+        return Ok(None);
+    };
+    verify_decoded_compressed_file(verified)
 }
 
 fn compressed_nar_matches(
     file: &File,
     expectation: CompressedNarExpectation<'_>,
 ) -> io::Result<bool> {
-    let Some(verified) = verify_encoded_compressed_file(file, expectation)? else {
-        return Ok(false);
-    };
-    verify_decoded_compressed_file(verified)
+    Ok(validate_compressed_nar(file, expectation)?.is_some())
 }
 
 pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation<'_>) -> io::Result<bool> {
@@ -596,6 +733,7 @@ enum PublishTarget<'a> {
     CacheInfo,
     Nar(&'a NarObjectId, NarEncoding),
     NarInfo(&'a StoreHash),
+    Validation(&'a ValidationEvidence),
 }
 
 impl PublishTarget<'_> {
@@ -606,6 +744,7 @@ impl PublishTarget<'_> {
                 OsString::from(format!("{}{}", id.as_str(), encoding.suffix()))
             }
             Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
+            Self::Validation(evidence) => evidence.file_name(),
         }
     }
 
@@ -614,6 +753,7 @@ impl PublishTarget<'_> {
             Self::CacheInfo => "cache-info",
             Self::Nar(_, _) => "nar",
             Self::NarInfo(_) => "narinfo",
+            Self::Validation(_) => "validation",
         }
     }
 }
@@ -773,6 +913,11 @@ impl Storage {
             OsStr::new(".tmp"),
             "realisation temporary directory",
         )?;
+        ensure_directory_at(
+            &root_directory,
+            OsStr::new(VALIDATION_DIRECTORY),
+            "validation evidence directory",
+        )?;
 
         root_directory.sync_all()?;
 
@@ -808,6 +953,7 @@ impl Storage {
 
     /// Records that a full inventory scan has completed successfully.
     pub fn finish_recovery(&self) -> Result<(), StorageError> {
+        self.remove_orphan_validation_evidence()?;
         self.recovery.finish()
     }
 
@@ -866,14 +1012,28 @@ impl Storage {
             let directory = self.nar_temp_directory()?;
             filesystem_space(&directory)?.required_capacity(required_bytes)
         };
-        let validate = |file: &File| -> Result<(), StorageError> {
+        let validate = |file: &File| -> Result<Option<ValidationEvidence>, StorageError> {
             match encoding {
-                NarEncoding::None => Ok(()),
+                NarEncoding::None => Ok(None),
                 NarEncoding::Zstd => validate_zstd(file, None, None, policy.max_bytes)
-                    .map(|_| ())
+                    .map(|decoded| {
+                        Some(ValidationEvidence::from_decoded(
+                            encoding,
+                            id.clone(),
+                            expected_length,
+                            decoded,
+                        ))
+                    })
                     .map_err(Into::into),
                 NarEncoding::Xz => validate_xz(file, None, None, policy.max_bytes)
-                    .map(|_| ())
+                    .map(|decoded| {
+                        Some(ValidationEvidence::from_decoded(
+                            encoding,
+                            id.clone(),
+                            expected_length,
+                            decoded,
+                        ))
+                    })
                     .map_err(Into::into),
             }
         };
@@ -932,7 +1092,7 @@ impl Storage {
                 let matches = match expectation {
                     NarExpectation::Raw { nar_size, .. } => nar_file_size_matches(&file, nar_size)?,
                     NarExpectation::Compressed(expectation) => {
-                        compressed_nar_matches(&file, expectation)?
+                        self.compressed_nar_matches_with_evidence(&file, expectation)?
                     }
                 };
                 if !matches {
@@ -948,6 +1108,51 @@ impl Storage {
             PublishTarget::NarInfo(store),
             Cursor::new(narinfo.into_bytes()),
         )
+    }
+
+    fn compressed_nar_matches_with_evidence(
+        &self,
+        file: &File,
+        expectation: CompressedNarExpectation<'_>,
+    ) -> Result<bool, StorageError> {
+        if let Some(evidence) = self.read_validation_evidence(expectation)? {
+            return Ok(evidence.matches(expectation));
+        }
+
+        let Some(decoded) = validate_compressed_nar(file, expectation)? else {
+            return Ok(false);
+        };
+        self.publish_validation_evidence(ValidationEvidence::from_decoded(
+            nar_encoding(expectation.encoding),
+            expectation.encoded_hash.clone(),
+            expectation.encoded_size,
+            decoded,
+        ))?;
+        Ok(true)
+    }
+
+    fn read_validation_evidence(
+        &self,
+        expectation: CompressedNarExpectation<'_>,
+    ) -> Result<Option<ValidationEvidence>, StorageError> {
+        let directory = self.validation_directory()?;
+        let name = validation_file_name(expectation);
+        let file = match open_regular_at(&directory, &name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_VALIDATION_EVIDENCE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if let Some(evidence) =
+            ValidationEvidence::parse(&bytes).filter(|evidence| evidence.matches(expectation))
+        {
+            return Ok(Some(evidence));
+        }
+        unlink_at(&directory, &name)?;
+        directory.sync_all()?;
+        Ok(None)
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {
@@ -1096,7 +1301,7 @@ impl Storage {
         source: impl Read,
         checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish_with_admission(target, source, || Ok(()), |_| Ok(()), checkpoint)
+        self.publish_with_admission(target, source, || Ok(()), |_| Ok(None), checkpoint)
     }
 
     fn publish_with_admission(
@@ -1104,7 +1309,7 @@ impl Storage {
         target: PublishTarget<'_>,
         mut source: impl Read,
         admit: impl FnOnce() -> Result<(), StorageError>,
-        validate: impl FnOnce(&File) -> Result<(), StorageError>,
+        validate: impl FnOnce(&File) -> Result<Option<ValidationEvidence>, StorageError>,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
         admit()?;
@@ -1124,7 +1329,9 @@ impl Storage {
             checkpoint(PublishBoundary::AfterStream)?;
             temp.file.sync_all()?;
             checkpoint(PublishBoundary::AfterTempSync)?;
-            validate(&temp.file)?;
+            if let Some(evidence) = validate(&temp.file)? {
+                self.publish_validation_evidence(evidence)?;
+            }
             transaction.transition(PublicationState::Validated)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
             let destination_lock = self.destination_lock(destination_key);
@@ -1208,7 +1415,7 @@ impl Storage {
     fn temporary_path(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
         match target {
             PublishTarget::Nar(_, _) => PathBuf::from("nar/.tmp").join(name),
-            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => {
+            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) | PublishTarget::Validation(_) => {
                 PathBuf::from(".tmp").join(name)
             }
         }
@@ -1221,7 +1428,9 @@ impl Storage {
     ) -> Result<TemporaryFile, StorageError> {
         let directory = match target {
             PublishTarget::Nar(_, _) => self.nar_temp_directory()?,
-            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.temp_directory()?,
+            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) | PublishTarget::Validation(_) => {
+                self.temp_directory()?
+            }
         };
         let file = open_at(
             &directory,
@@ -1277,6 +1486,7 @@ impl Storage {
         match target {
             PublishTarget::Nar(_, _) => self.nar_directory(),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.root_directory(),
+            PublishTarget::Validation(_) => self.validation_directory(),
         }
     }
 
@@ -1284,7 +1494,83 @@ impl Storage {
         match target {
             PublishTarget::Nar(_, _) => PathBuf::from("nar").join(name),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => PathBuf::from(name),
+            PublishTarget::Validation(_) => PathBuf::from(VALIDATION_DIRECTORY).join(name),
         }
+    }
+
+    fn validation_directory(&self) -> Result<File, StorageError> {
+        let root = self.root_directory()?;
+        Ok(open_directory_at(&root, OsStr::new(VALIDATION_DIRECTORY))?)
+    }
+
+    pub(crate) fn remove_validation_evidence_for_nar(
+        &self,
+        nar_name: &OsStr,
+    ) -> Result<(), StorageError> {
+        let Some(name) = nar_name.to_str() else {
+            return Ok(());
+        };
+        let Some(_) = name
+            .strip_suffix(".nar.xz")
+            .or_else(|| name.strip_suffix(".nar.zst"))
+        else {
+            return Ok(());
+        };
+        let evidence_name = OsString::from(format!("{name}.validation"));
+        let directory = self.validation_directory()?;
+        match unlink_at(&directory, &evidence_name) {
+            Ok(()) => directory.sync_all()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    fn remove_orphan_validation_evidence(&self) -> Result<(), StorageError> {
+        let validation = self.validation_directory()?;
+        let nar = self.nar_directory()?;
+        let mut removed = false;
+        for name in read_dir_names(&validation)? {
+            let Some(evidence_name) = name.to_str() else {
+                continue;
+            };
+            let Some(nar_name) = evidence_name.strip_suffix(".validation") else {
+                continue;
+            };
+            if !nar_name.ends_with(".nar.xz") && !nar_name.ends_with(".nar.zst") {
+                continue;
+            }
+            if NarObjectId::parse(
+                nar_name
+                    .strip_suffix(".nar.xz")
+                    .or_else(|| nar_name.strip_suffix(".nar.zst"))
+                    .unwrap_or_default(),
+            )
+            .is_err()
+            {
+                continue;
+            }
+            match entry_is_regular_at(&nar, OsStr::new(nar_name)) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            unlink_at(&validation, &name)?;
+            removed = true;
+        }
+        if removed {
+            validation.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn publish_validation_evidence(
+        &self,
+        evidence: ValidationEvidence,
+    ) -> Result<PublishOutcome, StorageError> {
+        let bytes = evidence.bytes();
+        self.publish(PublishTarget::Validation(&evidence), Cursor::new(bytes))
     }
 
     fn destination_lock(&self, key: PathBuf) -> Arc<Mutex<()>> {
@@ -2018,6 +2304,17 @@ mod tests {
                 .expect("read stored XZ NAR"),
             compressed
         );
+        let evidence = directory
+            .path()
+            .join(super::VALIDATION_DIRECTORY)
+            .join(format!(
+                "{}{}.validation",
+                nar.as_str(),
+                NarEncoding::Xz.suffix()
+            ));
+        let evidence = fs::read_to_string(evidence).expect("read XZ validation evidence");
+        assert!(evidence.contains("encoding=xz"));
+        assert!(evidence.contains("decoded-size=9"));
 
         let mut decoded = Vec::new();
         XzReader::new(Cursor::new(compressed), false)
@@ -2046,12 +2343,18 @@ mod tests {
         assert_eq!(
             super::validate_xz(&file, Some(&nar_hash), Some(&file_hash), raw.len() as u64)
                 .expect("validate XZ NAR"),
-            raw.len() as u64
+            super::DecodedValidation {
+                hash: nar_hash.clone(),
+                size: raw.len() as u64,
+            }
         );
         assert_eq!(
             super::validate_xz(&file, Some(&nar_hash), None, raw.len() as u64)
                 .expect("validate already-hashed XZ NAR"),
-            raw.len() as u64
+            super::DecodedValidation {
+                hash: nar_hash,
+                size: raw.len() as u64,
+            }
         );
     }
 
@@ -2095,7 +2398,9 @@ mod tests {
                 else {
                     return false;
                 };
-                super::verify_decoded_compressed_file(verified).unwrap()
+                super::verify_decoded_compressed_file(verified)
+                    .unwrap()
+                    .is_some()
             };
             assert!(matches(&file_hash, &nar_hash, file_size, nar_size));
             assert!(!matches(&wrong_hash, &nar_hash, file_size, nar_size));
@@ -2129,6 +2434,84 @@ mod tests {
             fs::read(storage.layout().nar_path_encoded(&nar, NarEncoding::Zstd))
                 .expect("read stored zstd NAR"),
             compressed
+        );
+        let evidence = directory
+            .path()
+            .join(super::VALIDATION_DIRECTORY)
+            .join(format!(
+                "{}{}.validation",
+                nar.as_str(),
+                NarEncoding::Zstd.suffix()
+            ));
+        let evidence = fs::read_to_string(evidence).expect("read zstd validation evidence");
+        assert!(evidence.contains("encoding=zstd"));
+        assert!(evidence.contains("decoded-size=9"));
+    }
+
+    #[test]
+    fn compressed_publication_reuses_and_repairs_validation_evidence() {
+        let directory = TestDir::new();
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
+        let raw = b"nar bytes";
+        let mut compressed = Vec::new();
+        compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
+        let encoded_hash = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(&compressed)))
+            .expect("compressed hash is valid");
+        let decoded_hash = NarObjectId::parse(&super::nix32_sha256(&Sha256::digest(raw)))
+            .expect("decoded hash is valid");
+        storage
+            .publish_nar(
+                &encoded_hash,
+                NarEncoding::Zstd,
+                Cursor::new(&compressed),
+                compressed.len() as u64,
+                super::NarUploadPolicy::new(1024, 0),
+            )
+            .expect("publish zstd NAR");
+        drop(storage);
+
+        let storage = initialize_storage(directory.path()).expect("restart storage");
+        let expectation = super::CompressedNarExpectation {
+            encoding: super::CompressedEncoding::Zstd,
+            encoded_hash: &encoded_hash,
+            encoded_size: compressed.len() as u64,
+            decoded_hash: &decoded_hash,
+            decoded_size: raw.len() as u64,
+        };
+        let file = storage
+            .open_nar_encoded(&encoded_hash, NarEncoding::Zstd)
+            .expect("open encoded NAR")
+            .expect("encoded NAR exists");
+        assert!(
+            storage
+                .compressed_nar_matches_with_evidence(&file, expectation)
+                .expect("reuse validation evidence")
+        );
+
+        let evidence_path = directory
+            .path()
+            .join(super::VALIDATION_DIRECTORY)
+            .join(format!(
+                "{}{}.validation",
+                encoded_hash.as_str(),
+                NarEncoding::Zstd.suffix()
+            ));
+        fs::write(&evidence_path, b"version=2\n").expect("change evidence version");
+        assert!(
+            storage
+                .compressed_nar_matches_with_evidence(&file, expectation)
+                .expect("replace incompatible validation evidence")
+        );
+        fs::write(&evidence_path, b"not evidence\n").expect("corrupt validation evidence");
+        assert!(
+            storage
+                .compressed_nar_matches_with_evidence(&file, expectation)
+                .expect("repair validation evidence")
+        );
+        assert!(
+            fs::read_to_string(evidence_path)
+                .expect("read repaired validation evidence")
+                .starts_with("version=1\n")
         );
     }
 

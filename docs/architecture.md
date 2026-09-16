@@ -121,6 +121,9 @@ DATA/
   auth/
     read.tokens                         mode 0600, hashed records
     write.tokens                        mode 0600, hashed records
+  .narjar-validation/
+    <encoded-hash>.nar.zst.validation   durable decoded identity evidence
+    <encoded-hash>.nar.xz.validation
   trusted-public-keys                   mode 0600
   lock                                  single-writer process lock
 ~~~
@@ -209,9 +212,11 @@ measured.
 Upload validation is the first content-integrity boundary. Raw narinfo
 publication and ordinary NAR availability checks inspect only that the regular
 file exists with the declared encoded size. Compressed narinfo publication
-revalidates the encoded and decoded hashes before publication. Full-content
-verification is explicit operator work through `verify` or
-`reconcile --verify-hashes`, which detects same-size out-of-band mutation.
+reuses durable evidence keyed by encoding, encoded hash, and encoded size; a
+missing, malformed, stale, or incompatible record triggers full encoded and
+decoded verification before publication. Full-content verification is explicit
+operator work through `verify` or `reconcile --verify-hashes`, which detects
+same-size out-of-band mutation.
 
 Publication workers are bounded by the configured worker count and process
 valid PUTs concurrently. Each write reserves its declared body size against

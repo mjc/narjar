@@ -139,7 +139,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         let remaining_entries = scan(&storage, &trusted)?;
         let remaining_orphans = scan_orphans(&storage, &remaining_entries)?;
         after_bytes = total_bytes(&remaining_entries) + orphan_bytes(&remaining_orphans);
-        storage.recovery.finish()?;
+        storage.finish_recovery()?;
         deleted
     };
     let evicted_bytes = before_bytes.saturating_sub(after_bytes);
@@ -638,6 +638,7 @@ fn apply_with_failure(
             unlink_at(&nar_directory, &entry.nar_name)?;
             fail_if(failure, FailurePoint::AfterNarDeleteBeforeSync)?;
             nar_directory.sync_all()?;
+            storage.remove_validation_evidence_for_nar(&entry.nar_name)?;
             deleted_nars += 1;
         }
     }
