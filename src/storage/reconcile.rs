@@ -303,6 +303,7 @@ fn valid_nar_filename(name: &OsStr) -> bool {
     name.to_str()
         .and_then(|name| {
             name.strip_suffix(".nar.xz")
+                .or_else(|| name.strip_suffix(".nar.zst"))
                 .or_else(|| name.strip_suffix(".nar"))
         })
         .is_some_and(|hash| parse_nix32(hash, 52).is_ok())

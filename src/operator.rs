@@ -647,6 +647,13 @@ impl DoctorSeverity {
             Self::Unavailable => "unavailable",
         }
     }
+
+    const fn is_failure(self) -> bool {
+        match self {
+            Self::Ok | Self::Warning => false,
+            Self::Error | Self::Unavailable => true,
+        }
+    }
 }
 
 struct DoctorPath {
@@ -680,6 +687,14 @@ struct DoctorReport {
     lease_detail: String,
 }
 
+impl DoctorReport {
+    fn has_failures(&self) -> bool {
+        self.mount.is_failure()
+            || self.lease.is_failure()
+            || self.paths.iter().any(|path| path.severity.is_failure())
+    }
+}
+
 const DOCTOR_DIRECTORIES: &[&str] = &[
     "",
     "nar",
@@ -698,10 +713,14 @@ const DOCTOR_FILES: &[&str] = &[
 
 pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
     let report = inspect_doctor(&options.data_dir)?;
+    let failed = report.has_failures();
     if options.json {
         println!("{}", doctor_json(&report));
     } else {
         print_doctor(&report);
+    }
+    if failed {
+        return Err(Error::runtime("doctor found errors"));
     }
     Ok(())
 }
