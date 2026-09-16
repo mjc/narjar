@@ -20,8 +20,6 @@ in
     # cargo-fuzz requires nightly-only compiler flags. Keep this snapshot
     # separate from the stable toolchain used for normal builds.
     fuzzToolchain
-    direnv
-    nix-direnv
   ] ++ lib.optionals stdenv.isLinux [
     util-linux
     perf

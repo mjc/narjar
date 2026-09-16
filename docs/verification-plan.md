@@ -249,14 +249,13 @@ If that gate fails, stop greenfield work and adopt/contribute upstream.
 
 ## Commands
 
-The repository shell is entered through direnv or Nix:
+The repository shell is entered through devenv:
 
 ~~~sh
-direnv allow
-direnv exec . cargo nextest run
-direnv exec . cargo clippy --all-targets --all-features -- -D warnings
-direnv exec . cargo fmt --all --check
-direnv exec . nix flake check --all-systems --accept-flake-config
+devenv shell -- cargo nextest run
+devenv shell -- cargo clippy --all-targets --all-features -- -D warnings
+devenv shell -- cargo fmt --all --check
+devenv shell -- nix flake check --all-systems --accept-flake-config
 ~~~
 
 Linux static artifact proof additionally builds packages.x86_64-linux.narjar-static
