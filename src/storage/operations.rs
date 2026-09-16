@@ -14,8 +14,8 @@ use std::{
     time::SystemTime,
 };
 
-use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation, ValidatedNarInfo};
-use crate::object::{FileHash, NarIdentity};
+use crate::narinfo::{CompressedNarExpectation, NarEncoding, ValidatedNarInfo, ValidatedPayload};
+use crate::object::{FileHash, NarFileName, NarHash, NarIdentity};
 
 use super::{
     compression::{
@@ -30,7 +30,7 @@ use super::{
         open_optional_at, open_regular_at, read_dir_names, remove_temp, rename_at,
         reserve_staging_bytes, rollback_link_at, unlink_at,
     },
-    ids::{NarObjectId, StoreHash},
+    ids::StoreHash,
     publication::{
         NEXT_TEMP, NarUploadPolicy, ProcessLock, PublishBoundary, PublishOutcome, PublishTarget,
         PublishedPair, StagingReservation, StorageError, TemporaryFile,
@@ -55,9 +55,8 @@ struct CompletedRawNarStaging {
 }
 
 impl CompletedRawNarStaging {
-    fn raw_nar_object_id(&self) -> NarObjectId {
-        NarObjectId::parse(&self.receipt.decoded_identity().hash().to_string())
-            .expect("binary SHA-256 Nix hash formats as a valid object ID")
+    fn raw_nar_identity(&self) -> NarIdentity {
+        self.receipt.decoded_identity()
     }
 }
 
@@ -225,8 +224,7 @@ impl Storage {
 
     pub fn publish_nar(
         &self,
-        id: &NarObjectId,
-        encoding: NarEncoding,
+        name: NarFileName,
         source: impl Read,
         expected_length: u64,
         policy: NarUploadPolicy,
@@ -236,13 +234,12 @@ impl Storage {
         }
 
         let staging = self.reserve_staging(expected_length, policy.min_free_bytes)?;
-        self.publish_nar_with_staging(id, encoding, source, expected_length, policy, staging)
+        self.publish_nar_with_staging(name, source, expected_length, policy, staging)
     }
 
     pub fn publish_nar_with_staging(
         &self,
-        id: &NarObjectId,
-        encoding: NarEncoding,
+        name: NarFileName,
         source: impl Read,
         expected_length: u64,
         policy: NarUploadPolicy,
@@ -252,27 +249,27 @@ impl Storage {
             return Err(StorageError::UploadTooLarge);
         }
 
-        match encoding {
-            NarEncoding::Raw => self.publish_raw_nar_upload(id, source, expected_length),
-            NarEncoding::Xz => {
-                self.publish_xz_nar_upload(id, source, expected_length, policy, &mut staging)
-            }
-            NarEncoding::Zstd => {
-                self.publish_zstd_nar_upload(id, source, expected_length, policy, &mut staging)
-            }
+        match name.encoding() {
+            NarEncoding::Raw => self.publish_raw_nar_upload(name, source, expected_length),
+            NarEncoding::Xz | NarEncoding::Zstd => self.publish_compressed_nar_upload_as_raw(
+                name,
+                source,
+                expected_length,
+                policy,
+                &mut staging,
+            ),
         }
     }
 
     fn publish_raw_nar_upload(
         &self,
-        id: &NarObjectId,
+        name: NarFileName,
         source: impl Read,
         expected_length: u64,
     ) -> Result<PublishOutcome, StorageError> {
-        let file_hash =
-            FileHash::parse(id.as_str()).expect("validated upload path is a SHA-256 file hash");
+        let file_hash = name.file_hash();
         self.publish_with_admission(
-            PublishTarget::Nar(id, NarEncoding::Raw),
+            PublishTarget::Nar(name),
             CheckedUploadReader::new(source, &file_hash, expected_length),
             || Ok(()),
             |_| Ok(()),
@@ -280,60 +277,22 @@ impl Storage {
         )
     }
 
-    fn publish_xz_nar_upload(
-        &self,
-        id: &NarObjectId,
-        source: impl Read,
-        expected_length: u64,
-        policy: NarUploadPolicy,
-        staging: &mut StagingReservation,
-    ) -> Result<PublishOutcome, StorageError> {
-        self.publish_compressed_nar_upload_as_raw(
-            id,
-            NarEncoding::Xz,
-            source,
-            expected_length,
-            policy,
-            staging,
-        )
-    }
-
-    fn publish_zstd_nar_upload(
-        &self,
-        id: &NarObjectId,
-        source: impl Read,
-        expected_length: u64,
-        policy: NarUploadPolicy,
-        staging: &mut StagingReservation,
-    ) -> Result<PublishOutcome, StorageError> {
-        self.publish_compressed_nar_upload_as_raw(
-            id,
-            NarEncoding::Zstd,
-            source,
-            expected_length,
-            policy,
-            staging,
-        )
-    }
-
     fn publish_compressed_nar_upload_as_raw(
         &self,
-        encoded_id: &NarObjectId,
-        encoding: NarEncoding,
+        encoded_name: NarFileName,
         source: impl Read,
         encoded_size: u64,
         policy: NarUploadPolicy,
         staging: &mut StagingReservation,
     ) -> Result<PublishOutcome, StorageError> {
         let staging = self.stage_compressed_upload_as_raw_nar(
-            encoded_id,
-            encoding,
+            encoded_name,
             source,
             encoded_size,
             policy,
             staging,
         )?;
-        let raw_id = staging.raw_nar_object_id();
+        let raw_identity = staging.raw_nar_identity();
         let CompletedRawNarStaging {
             temporary,
             transaction,
@@ -341,7 +300,7 @@ impl Storage {
         } = staging;
 
         let outcome = self.commit_temporary(
-            PublishTarget::Nar(&raw_id, NarEncoding::Raw),
+            PublishTarget::Nar(NarFileName::raw(raw_identity.hash())),
             temporary,
             transaction,
             |_| Ok(()),
@@ -352,29 +311,26 @@ impl Storage {
 
     fn stage_compressed_upload_as_raw_nar(
         &self,
-        encoded_id: &NarObjectId,
-        encoding: NarEncoding,
+        encoded_name: NarFileName,
         source: impl Read,
         encoded_size: u64,
         policy: NarUploadPolicy,
         staging: &mut StagingReservation,
     ) -> Result<CompletedRawNarStaging, StorageError> {
-        let encoded_hash = FileHash::parse(encoded_id.as_str())
-            .expect("validated upload path is a SHA-256 file hash");
-        let staging_target = PublishTarget::Nar(encoded_id, encoding);
+        let staging_target = PublishTarget::Nar(encoded_name);
         let temp_name = self.next_temp_name(&staging_target);
         let temporary_path = self.temporary_path(&staging_target, &temp_name);
         let mut transaction = self.recovery.begin(&temporary_path)?;
         let mut temp = self.create_temp_named(&staging_target, temp_name)?;
 
         let expectation = EncodedUploadExpectation {
-            expected_file_hash: &encoded_hash,
+            expected_file_hash: &encoded_name.file_hash(),
             expected_file_size: encoded_size.into(),
             max_nar_size: policy.max_bytes,
         };
         let receipt = match Self::write_and_validate_compressed_upload(
             source,
-            encoding,
+            encoded_name.encoding(),
             expectation,
             policy.min_free_bytes,
             staging,
@@ -428,21 +384,21 @@ impl Storage {
     #[cfg(test)]
     pub(super) fn publish_nar_unchecked(
         &self,
-        id: &NarObjectId,
+        hash: &NarHash,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish(PublishTarget::Nar(id, NarEncoding::Raw), source)
+        self.publish(PublishTarget::Nar(NarFileName::raw(*hash)), source)
     }
 
     #[cfg(test)]
     pub(super) fn publish_nar_fault(
         &self,
-        id: &NarObjectId,
+        hash: &NarHash,
         source: impl Read,
         fault: PublishBoundary,
     ) -> Result<PublishOutcome, StorageError> {
         self.publish_with(
-            PublishTarget::Nar(id, NarEncoding::Raw),
+            PublishTarget::Nar(NarFileName::raw(*hash)),
             source,
             |boundary| injected_fault(boundary, fault),
         )
@@ -453,10 +409,13 @@ impl Storage {
         store: &StoreHash,
         narinfo: ValidatedNarInfo,
     ) -> Result<PublishOutcome, StorageError> {
-        let raw_identity = self.resolve_raw_identity_for_narinfo(narinfo.payload_expectation())?;
-        let raw_id = NarObjectId::parse(&raw_identity.hash().to_string())
-            .expect("binary SHA-256 Nix hash formats as a valid object ID");
-        let Some(file) = self.open_nar(&raw_id)? else {
+        let expected = narinfo.payload();
+        let raw_narinfo = narinfo.into_raw_narinfo();
+        let raw_identity = self.resolve_raw_identity_for_narinfo(expected)?;
+        if raw_identity != raw_narinfo.identity() {
+            return Err(StorageError::NarMismatch);
+        }
+        let Some(file) = self.open_nar(raw_identity.hash())? else {
             return Err(StorageError::MissingNar);
         };
         if !nar_file_size_matches(&file, raw_identity.size().get())? {
@@ -464,17 +423,17 @@ impl Storage {
         }
         self.publish(
             PublishTarget::NarInfo(store),
-            Cursor::new(narinfo.into_raw_bytes()),
+            Cursor::new(raw_narinfo.into_bytes()),
         )
     }
 
     fn resolve_raw_identity_for_narinfo(
         &self,
-        expectation: NarExpectation,
+        expectation: ValidatedPayload,
     ) -> Result<NarIdentity, StorageError> {
         match expectation {
-            NarExpectation::Raw(identity) => Ok(identity),
-            NarExpectation::Compressed(expectation) => {
+            ValidatedPayload::Raw(identity) => Ok(identity),
+            ValidatedPayload::Compressed(expectation) => {
                 self.resolve_raw_identity_from_ingestion_receipt(expectation)
             }
         }
@@ -492,8 +451,8 @@ impl Storage {
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {
         let nar_directory = self.nar_directory()?;
-        let payload_name = narinfo.payload_name().to_string();
-        let Some(file) = open_optional_at(&nar_directory, OsStr::new(&payload_name))? else {
+        let payload_name = narinfo.payload_name();
+        let Some(file) = open_optional_at(&nar_directory, &payload_name.os_string())? else {
             return Ok(false);
         };
         nar_file_size_matches(&file, narinfo.file_size().get()).map_err(Into::into)
@@ -503,10 +462,10 @@ impl Storage {
     pub(super) fn publish_narinfo_unchecked(
         &self,
         store: &StoreHash,
-        nar: &NarObjectId,
+        nar: NarHash,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
-        self.ensure_nar(nar)?;
+        self.ensure_nar(&nar)?;
         self.publish(PublishTarget::NarInfo(store), source)
     }
 
@@ -514,39 +473,34 @@ impl Storage {
     pub(super) fn publish_narinfo_fault(
         &self,
         store: &StoreHash,
-        nar: &NarObjectId,
+        nar: NarHash,
         source: impl Read,
         fault: PublishBoundary,
     ) -> Result<PublishOutcome, StorageError> {
-        self.ensure_nar(nar)?;
+        self.ensure_nar(&nar)?;
         self.publish_with(PublishTarget::NarInfo(store), source, |boundary| {
             injected_fault(boundary, fault)
         })
     }
 
     #[cfg(test)]
-    pub(super) fn ensure_nar(&self, nar: &NarObjectId) -> Result<(), StorageError> {
+    pub(super) fn ensure_nar(&self, nar: &NarHash) -> Result<(), StorageError> {
         let nar_directory = self.nar_directory()?;
-        let nar_name = format!("{}.nar", nar.as_str());
-        match open_regular_at(&nar_directory, OsStr::new(&nar_name)) {
+        let nar_name = NarFileName::raw(*nar);
+        match open_regular_at(&nar_directory, &nar_name.os_string()) {
             Ok(_) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StorageError::MissingNar),
             Err(error) => Err(error.into()),
         }
     }
 
-    pub fn open_nar(&self, nar: &NarObjectId) -> Result<Option<File>, StorageError> {
-        self.open_nar_encoded(nar, NarEncoding::Raw)
+    pub fn open_nar(&self, nar: NarHash) -> Result<Option<File>, StorageError> {
+        self.open_nar_encoded(NarFileName::raw(nar))
     }
 
-    pub fn open_nar_encoded(
-        &self,
-        nar: &NarObjectId,
-        encoding: NarEncoding,
-    ) -> Result<Option<File>, StorageError> {
+    pub fn open_nar_encoded(&self, name: NarFileName) -> Result<Option<File>, StorageError> {
         let directory = self.nar_directory()?;
-        let name = format!("{}{}", nar.as_str(), encoding.suffix());
-        open_optional_at(&directory, OsStr::new(&name))
+        open_optional_at(&directory, &name.os_string())
     }
 
     pub fn open_narinfo(&self, store: &StoreHash) -> Result<Option<File>, StorageError> {
@@ -558,7 +512,7 @@ impl Storage {
     pub fn open_pair(
         &self,
         store: &StoreHash,
-        nar: &NarObjectId,
+        nar: NarHash,
     ) -> Result<Option<PublishedPair>, StorageError> {
         let Some(narinfo) = self.open_narinfo(store)? else {
             return Ok(None);
@@ -815,7 +769,7 @@ impl Storage {
 
     pub(super) fn temporary_path(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
         match target {
-            PublishTarget::Nar(_, _) => PathBuf::from("nar/.tmp").join(name),
+            PublishTarget::Nar(_) => PathBuf::from("nar/.tmp").join(name),
             PublishTarget::CacheInfo
             | PublishTarget::NarInfo(_)
             | PublishTarget::IngestionReceipt(_) => PathBuf::from(".tmp").join(name),
@@ -828,7 +782,7 @@ impl Storage {
         name: OsString,
     ) -> Result<TemporaryFile, StorageError> {
         let directory = match target {
-            PublishTarget::Nar(_, _) => self.nar_temp_directory()?,
+            PublishTarget::Nar(_) => self.nar_temp_directory()?,
             PublishTarget::CacheInfo
             | PublishTarget::NarInfo(_)
             | PublishTarget::IngestionReceipt(_) => self.temp_directory()?,
@@ -888,7 +842,7 @@ impl Storage {
         target: &PublishTarget<'_>,
     ) -> Result<File, StorageError> {
         match target {
-            PublishTarget::Nar(_, _) => self.nar_directory(),
+            PublishTarget::Nar(_) => self.nar_directory(),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.root_directory(),
             PublishTarget::IngestionReceipt(_) => self.ingestion_receipt_directory(),
         }
@@ -896,7 +850,7 @@ impl Storage {
 
     pub(super) fn destination_key(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
         match target {
-            PublishTarget::Nar(_, _) => PathBuf::from("nar").join(name),
+            PublishTarget::Nar(_) => PathBuf::from("nar").join(name),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => PathBuf::from(name),
             PublishTarget::IngestionReceipt(_) => {
                 PathBuf::from(INGESTION_RECEIPT_DIRECTORY).join(name)
@@ -962,7 +916,7 @@ impl Storage {
             if !nar_name.ends_with(".nar.xz") && !nar_name.ends_with(".nar.zst") {
                 continue;
             }
-            if NarObjectId::parse(
+            if FileHash::parse(
                 nar_name
                     .strip_suffix(".nar.xz")
                     .or_else(|| nar_name.strip_suffix(".nar.zst"))

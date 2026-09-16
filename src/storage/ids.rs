@@ -5,19 +5,6 @@ const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 
 pub use crate::object::InvalidObjectId;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct NarObjectId(pub(super) String);
-
-impl NarObjectId {
-    pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
-        parse_nix32(value, 52).map(Self)
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 #[derive(Debug, Eq, PartialEq)]
 pub struct StoreHash(pub(super) String);
 

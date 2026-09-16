@@ -21,11 +21,13 @@ use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes, sync_dir};
 use super::ids::nix32_sha256;
 use super::publication::{Layout, PublishBoundary, PublishTarget};
 use super::{
-    CapacityErrorKind, Directory, NarObjectId, PublishOutcome, ReconcileClass, Storage,
-    StorageError, StoreHash, capacity_error_kind,
+    CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageError, StoreHash,
+    capacity_error_kind,
 };
 use crate::narinfo::{CompressedNarExpectation, NarEncoding};
-use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
+use crate::object::{
+    EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize,
+};
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::encoding::{CompressionLevel, compress};
@@ -146,16 +148,14 @@ fn xz_uploads_are_normalized_to_the_raw_nar() {
         XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
     writer.write_all(raw).expect("compress NAR");
     writer.finish().expect("finish XZ stream");
-    let encoded = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed)))
-        .expect("compressed hash is a valid file object id");
+    let encoded = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed)))
+        .expect("compressed hash is a valid file hash");
     let raw =
         NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).expect("raw hash is a valid NAR hash");
-    let raw_id = NarObjectId::parse(&raw.to_string()).expect("raw hash is a valid object id");
 
     let outcome = storage
         .publish_nar(
-            &encoded,
-            NarEncoding::Xz,
+            NarFileName::new(encoded, NarEncoding::Xz),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -163,15 +163,10 @@ fn xz_uploads_are_normalized_to_the_raw_nar() {
         .expect("publish XZ NAR");
     assert_eq!(outcome, PublishOutcome::Created);
     assert_eq!(
-        fs::read(storage.layout().nar_path(&raw_id)).expect("read stored raw NAR"),
+        fs::read(storage.layout().nar_path(raw)).expect("read stored raw NAR"),
         b"nar bytes"
     );
-    assert!(
-        !directory
-            .path()
-            .join(format!("{}.nar.xz", encoded.as_str()))
-            .exists()
-    );
+    assert!(!directory.path().join(format!("{encoded}.nar.xz")).exists());
 }
 
 #[test]
@@ -282,16 +277,14 @@ fn zstd_uploads_are_normalized_to_the_raw_nar() {
     let raw = b"nar bytes";
     let mut compressed = Vec::new();
     compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
-    let encoded = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed)))
-        .expect("compressed hash is a valid file object id");
+    let encoded = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed)))
+        .expect("compressed hash is a valid file hash");
     let raw_hash =
         NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).expect("raw hash is a valid NAR hash");
-    let raw_id = NarObjectId::parse(&raw_hash.to_string()).expect("raw hash is a valid object id");
 
     let outcome = storage
         .publish_nar(
-            &encoded,
-            NarEncoding::Zstd,
+            NarFileName::new(encoded, NarEncoding::Zstd),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -299,15 +292,10 @@ fn zstd_uploads_are_normalized_to_the_raw_nar() {
         .expect("publish zstd NAR");
     assert_eq!(outcome, PublishOutcome::Created);
     assert_eq!(
-        fs::read(storage.layout().nar_path(&raw_id)).expect("read stored raw NAR"),
+        fs::read(storage.layout().nar_path(raw_hash)).expect("read stored raw NAR"),
         b"nar bytes"
     );
-    assert!(
-        !directory
-            .path()
-            .join(format!("{}.nar.zst", encoded.as_str()))
-            .exists()
-    );
+    assert!(!directory.path().join(format!("{encoded}.nar.zst")).exists());
 }
 
 #[test]
@@ -321,15 +309,13 @@ fn compressed_uploads_converge_on_one_raw_object() {
     let mut writer = XzWriter::new(&mut xz, XzOptions::with_preset(1)).unwrap();
     writer.write_all(raw).unwrap();
     writer.finish().unwrap();
-    let xz_id = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&xz))).unwrap();
-    let zstd_id = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed))).unwrap();
+    let xz_id = FileHash::parse(&nix32_sha256(&Sha256::digest(&xz))).unwrap();
+    let zstd_id = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).unwrap();
     let raw_hash = NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).unwrap();
-    let raw_id = NarObjectId::parse(&raw_hash.to_string()).unwrap();
 
     let xz_result = storage
         .publish_nar(
-            &xz_id,
-            NarEncoding::Xz,
+            NarFileName::new(xz_id, NarEncoding::Xz),
             Cursor::new(&xz),
             xz.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -337,8 +323,7 @@ fn compressed_uploads_converge_on_one_raw_object() {
         .expect("publish XZ NAR");
     let zstd_result = storage
         .publish_nar(
-            &zstd_id,
-            NarEncoding::Zstd,
+            NarFileName::new(zstd_id, NarEncoding::Zstd),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -347,17 +332,17 @@ fn compressed_uploads_converge_on_one_raw_object() {
 
     assert_eq!(xz_result, PublishOutcome::Created);
     assert_eq!(zstd_result, PublishOutcome::Identical);
-    assert_eq!(fs::read(storage.layout().nar_path(&raw_id)).unwrap(), raw);
+    assert_eq!(fs::read(storage.layout().nar_path(raw_hash)).unwrap(), raw);
     assert!(
         !storage
             .layout()
-            .nar_path_encoded(&xz_id, NarEncoding::Xz)
+            .nar_path_encoded(NarFileName::new(xz_id, NarEncoding::Xz))
             .exists()
     );
     assert!(
         !storage
             .layout()
-            .nar_path_encoded(&zstd_id, NarEncoding::Zstd)
+            .nar_path_encoded(NarFileName::new(zstd_id, NarEncoding::Zstd))
             .exists()
     );
 }
@@ -371,12 +356,11 @@ fn zstd_validation_rejects_bytes_after_the_frame() {
     compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
     let frame_length = compressed.len();
     compressed.extend_from_slice(b"trailing bytes");
-    let nar = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed[..frame_length])))
-        .expect("compressed frame hash is a valid NAR object id");
+    let nar = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed[..frame_length])))
+        .expect("compressed frame hash is a valid file hash");
 
     let result = storage.publish_nar(
-        &nar,
-        NarEncoding::Zstd,
+        NarFileName::new(nar, NarEncoding::Zstd),
         Cursor::new(&compressed),
         compressed.len() as u64,
         super::NarUploadPolicy::new(1024, 0),
@@ -397,12 +381,11 @@ fn xz_validation_rejects_bytes_after_the_stream() {
     writer.finish().expect("finish XZ stream");
     let frame_length = compressed.len();
     compressed.extend_from_slice(b"trailing bytes");
-    let nar = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed[..frame_length])))
-        .expect("compressed frame hash is a valid NAR object id");
+    let nar = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed[..frame_length])))
+        .expect("compressed frame hash is a valid file hash");
 
     let result = storage.publish_nar(
-        &nar,
-        NarEncoding::Xz,
+        NarFileName::new(nar, NarEncoding::Xz),
         Cursor::new(&compressed),
         compressed.len() as u64,
         super::NarUploadPolicy::new(1024, 0),
@@ -425,14 +408,13 @@ fn compressed_nars_reject_truncated_frames() {
 
     for (encoding, mut compressed) in [(NarEncoding::Xz, xz), (NarEncoding::Zstd, zstd)] {
         compressed.pop().expect("compressed frame is not empty");
-        let nar = NarObjectId::parse(&nix32_sha256(&Sha256::digest(&compressed)))
-            .expect("compressed hash is a valid NAR object id");
+        let nar = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed)))
+            .expect("compressed hash is a valid file hash");
         let directory = TestDir::new();
         let storage = initialize_storage(directory.path()).expect("initialize storage");
 
         let result = storage.publish_nar(
-            &nar,
-            encoding,
+            NarFileName::new(nar, encoding),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -465,11 +447,11 @@ fn read_side_nar_check_only_requires_the_declared_file_size() {
 #[test]
 fn validated_ids_map_to_exact_layout_paths() {
     let layout = Layout::new(PathBuf::from("/cache"));
-    let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
 
     assert_eq!(
-        layout.nar_path(&nar),
+        layout.nar_path(nar),
         PathBuf::from(format!("/cache/nar/{NAR_ID}.nar"))
     );
     assert_eq!(
@@ -503,8 +485,8 @@ fn ids_reject_wrong_length_and_non_nix32_bytes() {
         "../0000000000000000000000000000000000000000000000000",
     ] {
         assert!(
-            NarObjectId::parse(value).is_err(),
-            "accepted invalid NAR object id: {value:?}"
+            FileHash::parse(value).is_err(),
+            "accepted invalid NAR file hash: {value:?}"
         );
     }
 }
@@ -592,10 +574,10 @@ fn temporary_publication_files_are_private() {
 fn nar_publication_uses_a_destination_local_temporary_directory() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
-    let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
     let temporary = storage
-        .create_temp(&PublishTarget::Nar(&nar, NarEncoding::Raw))
+        .create_temp(&PublishTarget::Nar(NarFileName::raw(nar)))
         .expect("create NAR temporary publication file");
     assert_eq!(
         fs::read_dir(storage.layout().temp_dir())
@@ -634,13 +616,13 @@ fn publication_rejects_a_symlinked_temporary_directory() {
     fs::create_dir(&target).expect("create external directory");
     symlink(&target, &temporary).expect("create temporary directory symlink");
 
-    let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     assert!(
         storage
             .publish_nar_unchecked(&nar, Cursor::new(b"must not escape"))
             .is_err()
     );
-    assert!(!storage.layout.nar_path(&nar).exists());
+    assert!(!storage.layout.nar_path(nar).exists());
     assert!(
         fs::read_dir(&target)
             .expect("read external directory")
@@ -653,7 +635,7 @@ fn publication_rejects_a_symlinked_temporary_directory() {
 fn publication_rejects_a_symlinked_destination_directory() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
-    let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let nar_dir = storage.layout.nar_dir();
     let real_nar_dir = directory.path().join("nar-real");
     let external = directory.path().join("external");
@@ -722,7 +704,7 @@ fn delete_rejects_a_symlinked_narinfo() {
 fn recovery_marker_distinguishes_clean_and_interrupted_publication() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
-    let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
     assert!(
         !storage
@@ -793,7 +775,7 @@ fn recovery_records_publish_state_before_each_fault_boundary() {
     ] {
         let directory = TestDir::new();
         let storage = initialize_storage(directory.path()).expect("initialize storage");
-        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+        let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
         assert!(
             storage
@@ -866,7 +848,7 @@ fn unknown_publication_transaction_state_blocks_recovery() {
 fn publication_is_immutable_idempotent_and_pair_gated() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
-    let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
 
     assert_eq!(
@@ -887,7 +869,7 @@ fn publication_is_immutable_idempotent_and_pair_gated() {
     ));
     assert!(
         storage
-            .open_pair(&store, &nar)
+            .open_pair(&store, nar)
             .expect("check incomplete pair")
             .is_none(),
         "an orphan NAR must not make a store path visible"
@@ -895,23 +877,23 @@ fn publication_is_immutable_idempotent_and_pair_gated() {
 
     assert_eq!(
         storage
-            .publish_narinfo_unchecked(&store, &nar, Cursor::new(b"narinfo bytes"))
+            .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
             .expect("publish narinfo"),
         PublishOutcome::Created
     );
     assert_eq!(
         storage
-            .publish_narinfo_unchecked(&store, &nar, Cursor::new(b"narinfo bytes"))
+            .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
             .expect("retry identical narinfo"),
         PublishOutcome::Identical
     );
     assert!(matches!(
-        storage.publish_narinfo_unchecked(&store, &nar, Cursor::new(b"different")),
+        storage.publish_narinfo_unchecked(&store, nar, Cursor::new(b"different")),
         Err(StorageError::Conflict)
     ));
 
     let mut pair = storage
-        .open_pair(&store, &nar)
+        .open_pair(&store, nar)
         .expect("open durable pair")
         .expect("pair should be visible");
     let mut nar_bytes = Vec::new();
@@ -941,9 +923,9 @@ fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
     let winner = {
         let storage = Arc::clone(&storage);
         std::thread::spawn(move || {
-            let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+            let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
             storage.publish_with(
-                PublishTarget::Nar(&nar, NarEncoding::Raw),
+                PublishTarget::Nar(NarFileName::raw(nar)),
                 Cursor::new(b"nar bytes"),
                 |boundary| {
                     if boundary == PublishBoundary::BeforeParentSync {
@@ -963,7 +945,7 @@ fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
     let contender = {
         let storage = Arc::clone(&storage);
         std::thread::spawn(move || {
-            let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+            let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
             started_tx.send(()).expect("signal contender start");
             let outcome = storage.publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"));
             outcome_tx.send(outcome).expect("send contender outcome");
@@ -985,8 +967,8 @@ fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
         PublishOutcome::Created
     );
 
-    let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
-    assert!(storage.layout().nar_path(&nar).exists());
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
+    assert!(storage.layout().nar_path(nar).exists());
 }
 
 #[test]
@@ -1001,7 +983,7 @@ fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
     ] {
         let directory = TestDir::new();
         let storage = initialize_storage(directory.path()).expect("initialize storage");
-        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+        let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
         assert!(
             storage
@@ -1010,7 +992,7 @@ fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
             "{boundary:?} unexpectedly succeeded"
         );
         assert!(
-            !storage.layout().nar_path(&nar).exists(),
+            !storage.layout().nar_path(nar).exists(),
             "{boundary:?} left a final NAR"
         );
         assert!(
@@ -1044,7 +1026,7 @@ fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
 fn response_loss_after_parent_sync_is_visible_and_idempotent() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
-    let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
 
     assert!(
@@ -1074,7 +1056,7 @@ fn response_loss_after_parent_sync_is_visible_and_idempotent() {
         storage
             .publish_narinfo_fault(
                 &store,
-                &nar,
+                nar,
                 Cursor::new(b"narinfo bytes"),
                 PublishBoundary::AfterParentSync,
             )
@@ -1082,14 +1064,14 @@ fn response_loss_after_parent_sync_is_visible_and_idempotent() {
     );
     assert!(
         storage
-            .open_pair(&store, &nar)
+            .open_pair(&store, nar)
             .expect("open durable pair")
             .is_some(),
         "a parent-synced pair must remain visible after response loss"
     );
     assert_eq!(
         storage
-            .publish_narinfo_unchecked(&store, &nar, Cursor::new(b"narinfo bytes"))
+            .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
             .expect("retry durable narinfo"),
         PublishOutcome::Identical
     );
@@ -1100,7 +1082,7 @@ fn stream_resource_failures_leave_no_false_publication_state() {
     for raw_error in [libc::EIO, libc::ENOSPC] {
         let directory = TestDir::new();
         let storage = initialize_storage(directory.path()).expect("initialize storage");
-        let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+        let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
         let error = storage
             .publish_nar_unchecked(&nar, BrokenReader::new(raw_error))
@@ -1109,7 +1091,7 @@ fn stream_resource_failures_leave_no_false_publication_state() {
             panic!("stream failure returned a non-I/O error");
         };
         assert_eq!(error.raw_os_error(), Some(raw_error));
-        assert!(!storage.layout().nar_path(&nar).exists());
+        assert!(!storage.layout().nar_path(nar).exists());
         assert!(
             fs::read_dir(storage.layout().temp_dir())
                 .expect("read temp directory")
@@ -1255,8 +1237,8 @@ impl Read for BlockingReader {
 fn independent_publications_do_not_wait_for_another_body() {
     let directory = TestDir::new();
     let storage = Arc::new(initialize_storage(directory.path()).expect("initialize storage"));
-    let first = NarObjectId::parse(NAR_ID).expect("valid first NAR object id");
-    let second = NarObjectId::parse(&"1".repeat(52)).expect("valid second NAR object id");
+    let first = NarHash::parse(NAR_ID).expect("valid first NAR hash");
+    let second = NarHash::parse(&"1".repeat(52)).expect("valid second NAR hash");
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
 
@@ -1264,7 +1246,7 @@ fn independent_publications_do_not_wait_for_another_body() {
         let storage = Arc::clone(&storage);
         std::thread::spawn(move || {
             storage.publish_with(
-                PublishTarget::Nar(&first, NarEncoding::Raw),
+                PublishTarget::Nar(NarFileName::raw(first)),
                 BlockingReader {
                     started: Some(started_tx),
                     release: release_rx,
@@ -1524,23 +1506,23 @@ fn cleanup_does_not_remove_a_replaced_stale_temp() {
 fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
-    let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
     storage
         .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
         .expect("publish NAR");
     storage
-        .publish_narinfo_unchecked(&store, &nar, Cursor::new(b"narinfo bytes"))
+        .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
         .expect("publish narinfo");
 
     assert!(storage.delete_narinfo(&store).expect("delete narinfo"));
     assert!(
         storage
-            .open_pair(&store, &nar)
+            .open_pair(&store, nar)
             .expect("open deleted pair")
             .is_none()
     );
-    assert!(storage.layout().nar_path(&nar).is_file());
+    assert!(storage.layout().nar_path(nar).is_file());
     assert!(!storage.delete_narinfo(&store).expect("repeat delete"));
 }
 

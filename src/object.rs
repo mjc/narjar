@@ -1,4 +1,4 @@
-use std::{fmt, sync::OnceLock};
+use std::{ffi::OsString, fmt, sync::OnceLock};
 
 use data_encoding::{BitOrder, Encoding, Specification};
 
@@ -49,6 +49,10 @@ impl FileHash {
 
     pub(crate) fn matches_nar_hash(self, hash: NarHash) -> bool {
         self.0 == hash.0
+    }
+
+    pub(crate) const fn from_nar_hash(hash: NarHash) -> Self {
+        Self(hash.0)
     }
 }
 
@@ -154,6 +158,59 @@ impl NarIdentity {
 
     pub(crate) const fn size(self) -> NarSize {
         self.size
+    }
+}
+
+/// The immutable filename and wire representation of a NAR payload.
+///
+/// A raw filename still begins as a `FileHash` at the HTTP boundary. Its
+/// equality with the logical `NarHash` is established while validating the
+/// upload or narinfo, rather than assumed from its suffix.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NarFileName {
+    file_hash: FileHash,
+    encoding: WireEncoding,
+}
+
+impl NarFileName {
+    pub const fn new(file_hash: FileHash, encoding: WireEncoding) -> Self {
+        Self {
+            file_hash,
+            encoding,
+        }
+    }
+
+    pub fn parse(name: &str) -> Result<Self, InvalidObjectId> {
+        [WireEncoding::Zstd, WireEncoding::Xz, WireEncoding::Raw]
+            .into_iter()
+            .find_map(|encoding| {
+                name.strip_suffix(encoding.suffix()).map(|hash| {
+                    FileHash::parse(hash).map(|file_hash| Self::new(file_hash, encoding))
+                })
+            })
+            .ok_or(InvalidObjectId)?
+    }
+
+    pub(crate) const fn raw(hash: NarHash) -> Self {
+        Self::new(FileHash::from_nar_hash(hash), WireEncoding::Raw)
+    }
+
+    pub const fn file_hash(self) -> FileHash {
+        self.file_hash
+    }
+
+    pub const fn encoding(self) -> WireEncoding {
+        self.encoding
+    }
+
+    pub(crate) fn os_string(self) -> OsString {
+        OsString::from(self.to_string())
+    }
+}
+
+impl fmt::Display for NarFileName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}{}", self.file_hash, self.encoding.suffix())
     }
 }
 

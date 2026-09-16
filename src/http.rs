@@ -8,10 +8,11 @@ use crate::{
     auth::{Authorizer, Permission},
     http_server::{Method, Request, Response, ResponseHeader as Header, StatusCode, static_header},
     metrics::{Metrics, RequestGuard, RequestMethod, RequestRoute, ValidationClass},
-    narinfo::{MAX_NARINFO_BYTES, NarEncoding, TrustedPublicKeys},
+    narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
+    object::NarFileName,
     storage::{
-        CapacityErrorKind, NarObjectId, NarUploadPolicy, PublishOutcome, StagingReservation,
-        Storage, StorageError, StoreHash, capacity_error_kind,
+        CapacityErrorKind, NarUploadPolicy, PublishOutcome, StagingReservation, Storage,
+        StorageError, StoreHash, capacity_error_kind,
     },
 };
 
@@ -192,12 +193,11 @@ fn requested_range(request: &Request, length: u64) -> RequestedRange {
 fn respond_nar(
     request: Request,
     storage: &Storage,
-    nar: &NarObjectId,
-    encoding: NarEncoding,
+    name: NarFileName,
     guard: &RequestGuard<'_>,
     private_read: bool,
 ) -> Option<TcpStream> {
-    let file = match storage.open_nar_encoded(nar, encoding) {
+    let file = match storage.open_nar_encoded(name) {
         Ok(Some(file)) => file,
         Ok(None) => return not_found(guard, request),
         Err(_) => return internal_error(guard, request),
@@ -244,20 +244,20 @@ fn respond_nar(
 }
 
 #[derive(Debug)]
-enum ReadRoute {
+enum CacheRoute {
     CacheInfo,
-    Nar(NarObjectId, NarEncoding),
+    Nar(NarFileName),
     NarInfo(StoreHash),
 }
 
 #[derive(Debug)]
 enum RouteMatch {
-    Found(ReadRoute),
+    Found(CacheRoute),
     Invalid,
     Missing,
 }
 
-impl ReadRoute {
+impl CacheRoute {
     fn classify(url: &str) -> RouteMatch {
         if url.starts_with("//") || url.contains(['\\', '?', '#']) {
             return RouteMatch::Invalid;
@@ -274,24 +274,9 @@ impl ReadRoute {
         }
 
         if let Some(path) = url.strip_prefix("/nar/") {
-            if let Some(id) = path
-                .strip_suffix(".nar.zst")
-                .and_then(|id| NarObjectId::parse(id).ok())
-            {
-                return RouteMatch::Found(Self::Nar(id, NarEncoding::Zstd));
-            }
-            if let Some(id) = path
-                .strip_suffix(NarEncoding::Xz.suffix())
-                .and_then(|id| NarObjectId::parse(id).ok())
-            {
-                return RouteMatch::Found(Self::Nar(id, NarEncoding::Xz));
-            }
-            return match path
-                .strip_suffix(NarEncoding::Raw.suffix())
-                .and_then(|id| NarObjectId::parse(id).ok())
-            {
-                Some(id) => RouteMatch::Found(Self::Nar(id, NarEncoding::Raw)),
-                None => RouteMatch::Invalid,
+            return match NarFileName::parse(path) {
+                Ok(name) => RouteMatch::Found(Self::Nar(name)),
+                Err(_) => RouteMatch::Invalid,
             };
         }
         if url == "/nar" || url.starts_with("/nix-cache-info/") {
@@ -345,16 +330,9 @@ struct UploadRequest {
     length: usize,
 }
 
-#[derive(Debug)]
-enum WriteRoute {
-    CacheInfo,
-    Nar(NarObjectId, NarEncoding),
-    NarInfo(StoreHash),
-}
-
 pub struct PublicationRequest {
     request: Request,
-    route: WriteRoute,
+    route: CacheRoute,
 }
 
 impl PublicationRequest {
@@ -372,13 +350,10 @@ impl PublicationRequest {
     pub fn staging_bytes(&self, max_nar_bytes: u64) -> Option<u64> {
         let length = u64::try_from(self.request.body_length()?).ok()?;
         match &self.route {
-            WriteRoute::Nar(_, NarEncoding::Raw) if length <= max_nar_bytes => Some(length),
-            WriteRoute::Nar(_, NarEncoding::Zstd | NarEncoding::Xz) if length <= max_nar_bytes => {
-                Some(length)
-            }
-            WriteRoute::Nar(_, _) => None,
-            WriteRoute::NarInfo(_) => Some(length.min(MAX_NARINFO_BYTES)),
-            WriteRoute::CacheInfo => Some(0),
+            CacheRoute::Nar(_) if length <= max_nar_bytes => Some(length),
+            CacheRoute::Nar(_) => None,
+            CacheRoute::NarInfo(_) => Some(length.min(MAX_NARINFO_BYTES)),
+            CacheRoute::CacheInfo => Some(0),
         }
     }
 
@@ -392,23 +367,22 @@ impl PublicationRequest {
     ) {
         let guard = metrics.request(RequestMethod::Put, request_route(self.request.url()));
         let _ = match self.route {
-            WriteRoute::Nar(id, encoding) => respond_nar_put(
+            CacheRoute::Nar(name) => respond_nar_put(
                 self.request,
                 NarPutContext {
                     storage,
-                    id: &id,
-                    encoding,
+                    name,
                     policy,
                     metrics,
                     guard: &guard,
                     staging,
                 },
             ),
-            WriteRoute::NarInfo(store) => {
+            CacheRoute::NarInfo(store) => {
                 drop(staging);
                 respond_narinfo_put(self.request, storage, &store, trusted, metrics, &guard)
             }
-            WriteRoute::CacheInfo => {
+            CacheRoute::CacheInfo => {
                 drop(staging);
                 respond_cache_info_put(self.request, storage, metrics, &guard)
             }
@@ -429,10 +403,8 @@ pub fn prepare_publication(
         return None;
     }
 
-    let route = match ReadRoute::classify(request.url()) {
-        RouteMatch::Found(ReadRoute::Nar(id, encoding)) => WriteRoute::Nar(id, encoding),
-        RouteMatch::Found(ReadRoute::NarInfo(store)) => WriteRoute::NarInfo(store),
-        RouteMatch::Found(ReadRoute::CacheInfo) => WriteRoute::CacheInfo,
+    let route = match CacheRoute::classify(request.url()) {
+        RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
             let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
             let _ = send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
@@ -604,8 +576,7 @@ fn respond_cache_info_put(
 
 struct NarPutContext<'storage, 'request> {
     storage: &'storage Storage,
-    id: &'storage NarObjectId,
-    encoding: NarEncoding,
+    name: NarFileName,
     policy: NarUploadPolicy,
     metrics: &'storage Metrics,
     guard: &'request RequestGuard<'storage>,
@@ -615,8 +586,7 @@ struct NarPutContext<'storage, 'request> {
 fn respond_nar_put(request: Request, context: NarPutContext<'_, '_>) -> Option<TcpStream> {
     let NarPutContext {
         storage,
-        id,
-        encoding,
+        name,
         policy,
         metrics,
         guard,
@@ -629,14 +599,8 @@ fn respond_nar_put(request: Request, context: NarPutContext<'_, '_>) -> Option<T
     let length = upload.length();
     let _upload = metrics.upload(length as u64);
     let started = Instant::now();
-    let result = storage.publish_nar_with_staging(
-        id,
-        encoding,
-        upload.reader(),
-        length as u64,
-        policy,
-        staging,
-    );
+    let result =
+        storage.publish_nar_with_staging(name, upload.reader(), length as u64, policy, staging);
     metrics.publication(started.elapsed());
     if !upload.body_complete() {
         metrics.validation_failure(ValidationClass::Nar);
@@ -794,7 +758,7 @@ pub fn respond(
     }
     let private_read = authorizer.has_private_reads();
 
-    let route = match ReadRoute::classify(request.url()) {
+    let route = match CacheRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
             return send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
@@ -807,7 +771,7 @@ pub fn respond(
     }
 
     match route {
-        ReadRoute::CacheInfo => {
+        CacheRoute::CacheInfo => {
             let cache_info = match storage.cache_info() {
                 Ok(cache_info) => cache_info,
                 Err(_) => return internal_error(&guard, request),
@@ -821,10 +785,8 @@ pub fn respond(
             );
             send_response(&guard, request, 200, response, cache_info_length)
         }
-        ReadRoute::Nar(id, encoding) => {
-            respond_nar(request, storage, &id, encoding, &guard, private_read)
-        }
-        ReadRoute::NarInfo(store) => {
+        CacheRoute::Nar(name) => respond_nar(request, storage, name, &guard, private_read),
+        CacheRoute::NarInfo(store) => {
             respond_narinfo(request, storage, &store, trusted, &guard, private_read)
         }
     }
@@ -832,38 +794,38 @@ pub fn respond(
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadRoute, RouteMatch};
+    use super::{CacheRoute, RouteMatch};
     use crate::narinfo::NarEncoding;
 
     #[test]
     fn legacy_main_prefix_maps_to_cache_routes() {
         assert!(matches!(
-            ReadRoute::classify("/main/nix-cache-info"),
-            RouteMatch::Found(ReadRoute::CacheInfo)
+            CacheRoute::classify("/main/nix-cache-info"),
+            RouteMatch::Found(CacheRoute::CacheInfo)
         ));
         assert!(matches!(
-            ReadRoute::classify("/main/00000000000000000000000000000000.narinfo"),
-            RouteMatch::Found(ReadRoute::NarInfo(_))
+            CacheRoute::classify("/main/00000000000000000000000000000000.narinfo"),
+            RouteMatch::Found(CacheRoute::NarInfo(_))
         ));
         assert!(matches!(
-            ReadRoute::classify(
+            CacheRoute::classify(
                 "/main/nar/0000000000000000000000000000000000000000000000000000.nar"
             ),
-            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::Raw))
+            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == NarEncoding::Raw
         ));
     }
 
     #[test]
     fn encoded_nar_routes_preserve_the_requested_encoding() {
         assert!(matches!(
-            ReadRoute::classify("/nar/0000000000000000000000000000000000000000000000000000.nar.xz"),
-            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::Xz))
+            CacheRoute::classify("/nar/0000000000000000000000000000000000000000000000000000.nar.xz"),
+            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == NarEncoding::Xz
         ));
         assert!(matches!(
-            ReadRoute::classify(
+            CacheRoute::classify(
                 "/nar/0000000000000000000000000000000000000000000000000000.nar.zst"
             ),
-            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::Zstd))
+            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == NarEncoding::Zstd
         ));
     }
 }

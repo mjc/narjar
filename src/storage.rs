@@ -16,9 +16,11 @@ pub(crate) use fs::{
     open_regular_at, read_dir_names,
 };
 
-pub use crate::object::{EncodedSize, FileHash, NarHash, NarIdentity, NarSize, WireEncoding};
+pub use crate::object::{
+    EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize, WireEncoding,
+};
 pub use directory::Directory;
-pub use ids::{InvalidObjectId, NarObjectId, StoreHash};
+pub use ids::{InvalidObjectId, StoreHash};
 pub use publication::{
     NarUploadPolicy, PublishOutcome, PublishedPair, StagingReservation, StorageError,
 };

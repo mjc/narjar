@@ -14,7 +14,7 @@ use narjar::{
     nar::{Decoder, Event},
     nar_encode::{self, Encoder},
     narinfo::TrustedPublicKeys,
-    storage::{Directory, NarObjectId, Storage},
+    storage::{Directory, NarHash, Storage},
 };
 
 const OBJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -69,9 +69,9 @@ fn bench_request_parse() {
 fn bench_storage() {
     let directory = tempfile::tempdir().expect("storage benchmark directory");
     let storage = initialized_storage(directory.path());
-    let id = NarObjectId::parse(OBJECT_ID).expect("benchmark object id");
-    let missing_id = NarObjectId::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        .expect("missing object id");
+    let id = NarHash::parse(OBJECT_ID).expect("benchmark NAR hash");
+    let missing_id = NarHash::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .expect("missing NAR hash");
     fs::write(
         directory
             .path()
@@ -82,10 +82,10 @@ fn bench_storage() {
     .expect("write benchmark NAR");
 
     run("open existing NAR", 10_000, || {
-        black_box(storage.open_nar(&id).expect("open NAR"));
+        black_box(storage.open_nar(id).expect("open NAR"));
     });
     run("open missing NAR", 10_000, || {
-        black_box(storage.open_nar(&missing_id).expect("open missing NAR"));
+        black_box(storage.open_nar(missing_id).expect("open missing NAR"));
     });
 }
 

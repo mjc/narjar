@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use super::{
     compression::IngestionReceipt,
     fs::{lock_exclusive, open_at},
-    ids::{NarObjectId, StoreHash},
+    ids::StoreHash,
 };
-use crate::narinfo::NarEncoding;
+use crate::object::NarFileName;
 
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
@@ -32,13 +32,12 @@ impl Layout {
         self.root.join("nar")
     }
 
-    pub(super) fn nar_path(&self, id: &NarObjectId) -> PathBuf {
-        self.nar_dir().join(format!("{}.nar", id.0))
+    pub(super) fn nar_path(&self, hash: crate::object::NarHash) -> PathBuf {
+        self.nar_dir().join(NarFileName::raw(hash).to_string())
     }
 
-    pub(super) fn nar_path_encoded(&self, id: &NarObjectId, encoding: NarEncoding) -> PathBuf {
-        self.nar_dir()
-            .join(format!("{}{}", id.0, encoding.suffix()))
+    pub(super) fn nar_path_encoded(&self, name: NarFileName) -> PathBuf {
+        self.nar_dir().join(name.to_string())
     }
 
     pub(super) fn nar_temp_dir(&self) -> PathBuf {
@@ -56,7 +55,7 @@ impl Layout {
 
 pub(super) enum PublishTarget<'a> {
     CacheInfo,
-    Nar(&'a NarObjectId, NarEncoding),
+    Nar(NarFileName),
     NarInfo(&'a StoreHash),
     IngestionReceipt(&'a IngestionReceipt),
 }
@@ -65,9 +64,7 @@ impl PublishTarget<'_> {
     pub(super) fn destination_name(&self) -> OsString {
         match self {
             Self::CacheInfo => OsString::from("nix-cache-info"),
-            Self::Nar(id, encoding) => {
-                OsString::from(format!("{}{}", id.as_str(), encoding.suffix()))
-            }
+            Self::Nar(name) => name.os_string(),
             Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
             Self::IngestionReceipt(evidence) => evidence.file_name(),
         }
@@ -76,7 +73,7 @@ impl PublishTarget<'_> {
     pub(super) fn temp_prefix(&self) -> &'static str {
         match self {
             Self::CacheInfo => "cache-info",
-            Self::Nar(_, _) => "nar",
+            Self::Nar(_) => "nar",
             Self::NarInfo(_) => "narinfo",
             Self::IngestionReceipt(_) => "receipt",
         }
@@ -85,7 +82,7 @@ impl PublishTarget<'_> {
     pub(super) fn replaces_destination(&self) -> bool {
         match self {
             Self::IngestionReceipt(_) => true,
-            Self::CacheInfo | Self::Nar(_, _) | Self::NarInfo(_) => false,
+            Self::CacheInfo | Self::Nar(_) | Self::NarInfo(_) => false,
         }
     }
 }

@@ -11,7 +11,7 @@ use lzma_rust2::XzReader;
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
-use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation};
+use crate::narinfo::{CompressedNarExpectation, NarEncoding, ValidatedPayload};
 use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
 
 use super::{
@@ -738,10 +738,10 @@ pub(super) fn compressed_nar_matches(
     Ok(validate_compressed_nar(file, expectation)?.is_some())
 }
 
-pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation) -> io::Result<bool> {
-    match expectation {
-        NarExpectation::Raw(identity) => raw_nar_file_matches(file, identity),
-        NarExpectation::Compressed(expectation) => compressed_nar_matches(file, expectation),
+pub(crate) fn nar_file_matches(file: &File, payload: ValidatedPayload) -> io::Result<bool> {
+    match payload {
+        ValidatedPayload::Raw(identity) => raw_nar_file_matches(file, identity),
+        ValidatedPayload::Compressed(expectation) => compressed_nar_matches(file, expectation),
     }
 }
 

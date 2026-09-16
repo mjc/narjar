@@ -370,6 +370,7 @@ dependencies = [
  "httparse",
  "libc",
  "lzma-rust2",
+ "memchr",
  "serde",
  "serde_json",
  "sha2",
