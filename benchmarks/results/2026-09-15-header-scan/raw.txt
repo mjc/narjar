@@ -1,0 +1,54 @@
+Command: devenv shell -- cargo bench --locked --bench micro
+Benchmark: `header (scalar|memmem)` rows only
+Profile: Cargo bench (optimized release profile)
+Iterations: 100000 timed iterations per row after 10 warmup iterations
+
+Sample 1
+header scalar (Nix GET)    100000 iterations        189.8 ns/op
+header memmem (Nix GET)    100000 iterations         61.1 ns/op
+header scalar (Nix HEAD NAR)   100000 iterations        158.4 ns/op
+header memmem (Nix HEAD NAR)   100000 iterations         52.3 ns/op
+header scalar (Nix auth GET)   100000 iterations        145.9 ns/op
+header memmem (Nix auth GET)   100000 iterations         41.9 ns/op
+header scalar (Nix NAR PUT (16 KiB read cap))   100000 iterations        226.5 ns/op
+header memmem (Nix NAR PUT (16 KiB read cap))   100000 iterations         46.6 ns/op
+
+Sample 2
+header scalar (Nix GET)    100000 iterations         95.2 ns/op
+header memmem (Nix GET)    100000 iterations         48.9 ns/op
+header scalar (Nix HEAD NAR)   100000 iterations        120.0 ns/op
+header memmem (Nix HEAD NAR)   100000 iterations         65.2 ns/op
+header scalar (Nix auth GET)   100000 iterations        174.5 ns/op
+header memmem (Nix auth GET)   100000 iterations         78.3 ns/op
+header scalar (Nix NAR PUT (16 KiB read cap))   100000 iterations        266.1 ns/op
+header memmem (Nix NAR PUT (16 KiB read cap))   100000 iterations         78.3 ns/op
+
+Sample 3
+header scalar (Nix GET)    100000 iterations        129.0 ns/op
+header memmem (Nix GET)    100000 iterations         42.5 ns/op
+header scalar (Nix HEAD NAR)   100000 iterations        126.2 ns/op
+header memmem (Nix HEAD NAR)   100000 iterations         42.8 ns/op
+header scalar (Nix auth GET)   100000 iterations        102.7 ns/op
+header memmem (Nix auth GET)   100000 iterations         50.6 ns/op
+header scalar (Nix NAR PUT (16 KiB read cap))   100000 iterations        169.6 ns/op
+header memmem (Nix NAR PUT (16 KiB read cap))   100000 iterations         47.7 ns/op
+
+Sample 4
+header scalar (Nix GET)    100000 iterations        138.8 ns/op
+header memmem (Nix GET)    100000 iterations         55.8 ns/op
+header scalar (Nix HEAD NAR)   100000 iterations        117.2 ns/op
+header memmem (Nix HEAD NAR)   100000 iterations         48.5 ns/op
+header scalar (Nix auth GET)   100000 iterations        105.0 ns/op
+header memmem (Nix auth GET)   100000 iterations         40.4 ns/op
+header scalar (Nix NAR PUT (16 KiB read cap))   100000 iterations        145.5 ns/op
+header memmem (Nix NAR PUT (16 KiB read cap))   100000 iterations         46.6 ns/op
+
+Sample 5
+header scalar (Nix GET)    100000 iterations         90.3 ns/op
+header memmem (Nix GET)    100000 iterations         62.0 ns/op
+header scalar (Nix HEAD NAR)   100000 iterations        138.8 ns/op
+header memmem (Nix HEAD NAR)   100000 iterations         43.5 ns/op
+header scalar (Nix auth GET)   100000 iterations        132.2 ns/op
+header memmem (Nix auth GET)   100000 iterations         45.8 ns/op
+header scalar (Nix NAR PUT (16 KiB read cap))   100000 iterations        327.4 ns/op
+header memmem (Nix NAR PUT (16 KiB read cap))   100000 iterations         71.3 ns/op

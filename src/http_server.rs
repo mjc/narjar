@@ -15,6 +15,11 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
 const RESPONSE_HEADERS: usize = 8;
 
+#[inline]
+fn find_header_delimiter(scanned: &[u8]) -> Option<usize> {
+    memchr::memmem::find(scanned, b"\r\n\r\n")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Method {
     Get,
@@ -29,14 +34,75 @@ struct HeaderRange {
     value: Range<usize>,
 }
 
+impl HeaderRange {
+    fn empty() -> Self {
+        Self {
+            name: 0..0,
+            value: 0..0,
+        }
+    }
+
+    fn from_httparse(buffer: &[u8], header: &httparse::Header<'_>) -> io::Result<Self> {
+        let name = buffer
+            .subslice_range(header.name.as_bytes())
+            .ok_or_else(|| invalid_data("request header name is outside the request"))?;
+        let value = buffer
+            .subslice_range(header.value)
+            .ok_or_else(|| invalid_data("request header value is outside the request"))?;
+        std::str::from_utf8(header.value)
+            .map_err(|_| invalid_data("request header is not UTF-8"))?;
+        Ok(Self {
+            name: name.into(),
+            value: value.into(),
+        })
+    }
+
+    fn name<'a>(&self, buffer: &'a [u8]) -> &'a str {
+        let name = buffer
+            .get(self.name.clone())
+            .expect("validated header range");
+        std::str::from_utf8(name).expect("validated header name")
+    }
+
+    fn value<'a>(&self, buffer: &'a [u8]) -> &'a str {
+        let value = buffer
+            .get(self.value.clone())
+            .expect("validated header range");
+        std::str::from_utf8(value).expect("validated header value")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HeaderRanges {
+    ranges: [HeaderRange; MAX_HEADERS],
+    len: usize,
+}
+
+impl HeaderRanges {
+    fn from_httparse(buffer: &[u8], headers: &[httparse::Header<'_>]) -> io::Result<Self> {
+        if headers.len() > MAX_HEADERS {
+            return Err(invalid_data("too many request headers"));
+        }
+        let mut ranges = Self {
+            ranges: std::array::from_fn(|_| HeaderRange::empty()),
+            len: 0,
+        };
+        for (range, header) in ranges.ranges.iter_mut().zip(headers) {
+            *range = HeaderRange::from_httparse(buffer, header)?;
+        }
+        ranges.len = headers.len();
+        Ok(ranges)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &HeaderRange> {
+        self.ranges.iter().take(self.len)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RequestTargetRange(Range<usize>);
 
 impl RequestTargetRange {
-    fn empty() -> Self {
-        Self(0..0)
-    }
-
     fn from_subslice(buffer: &[u8], target: &[u8]) -> Option<Self> {
         buffer
             .subslice_range(target)
@@ -78,210 +144,198 @@ pub struct Headers<'a> {
 
 impl<'a> Headers<'a> {
     pub fn iter(self) -> impl Iterator<Item = RequestHeader<'a>> {
-        self.request.header_ranges[..self.request.header_count]
-            .iter()
-            .map(|header| RequestHeader {
-                field: HeaderField(
-                    std::str::from_utf8(&self.request.buffer[header.name.clone()])
-                        .expect("validated header name"),
-                ),
-                value: HeaderValue(
-                    std::str::from_utf8(&self.request.buffer[header.value.clone()])
-                        .expect("validated header value"),
-                ),
-            })
+        self.request.headers.iter().map(|header| RequestHeader {
+            field: HeaderField(header.name(&self.request.buffer)),
+            value: HeaderValue(header.value(&self.request.buffer)),
+        })
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeaderBoundary {
+    end: usize,
+    received: usize,
+}
+
+impl HeaderBoundary {
+    fn detected(end: usize, received: usize) -> Self {
+        Self { end, received }
+    }
+
+    fn end(self) -> usize {
+        self.end
+    }
+
+    fn body_prefix(self) -> Range<usize> {
+        self.end..self.received
+    }
+}
+
+struct BufferedHead {
+    stream: TcpStream,
+    buffer: [u8; MAX_HEADER_BYTES],
+    received: usize,
+    boundary: HeaderBoundary,
+}
+
+struct ParsedHead {
+    method: Method,
+    url: RequestTargetRange,
+    headers: HeaderRanges,
+    body_length: Option<usize>,
+    keep_alive: bool,
 }
 
 pub struct Request {
     stream: TcpStream,
     buffer: [u8; MAX_HEADER_BYTES],
-    header_end: usize,
-    body_prefix_len: usize,
+    body_prefix: Range<usize>,
     method: Method,
     url: RequestTargetRange,
-    header_ranges: [HeaderRange; MAX_HEADERS],
-    header_count: usize,
+    headers: HeaderRanges,
     body_length: Option<usize>,
     body_complete: bool,
     keep_alive: bool,
 }
 
-impl Request {
-    pub fn read(stream: TcpStream) -> Result<Self, (TcpStream, io::Error)> {
-        let mut request = Self {
-            stream,
-            buffer: [0; MAX_HEADER_BYTES],
-            header_end: 0,
-            body_prefix_len: 0,
-            method: Method::Other,
-            url: RequestTargetRange::empty(),
-            header_ranges: std::array::from_fn(|_| HeaderRange {
-                name: 0..0,
-                value: 0..0,
-            }),
-            header_count: 0,
-            body_length: None,
-            body_complete: true,
-            keep_alive: false,
-        };
-
+impl BufferedHead {
+    fn read(mut stream: TcpStream) -> Result<Self, (TcpStream, io::Error)> {
+        let mut buffer = [0; MAX_HEADER_BYTES];
         let mut received = 0;
-        let header_end = loop {
-            if let Some(end) = request.buffer[..received]
-                .array_windows::<4>()
-                .position(|window| window == b"\r\n\r\n")
-            {
-                break end + 4;
+        let mut scanned_until: usize = 0;
+
+        loop {
+            let search_start = scanned_until.saturating_sub(3);
+            let scanned = buffer
+                .get(search_start..received)
+                .expect("scanner bounds are within the header buffer");
+            if let Some(offset) = find_header_delimiter(scanned) {
+                let boundary = HeaderBoundary::detected(search_start + offset + 4, received);
+                return Ok(Self {
+                    stream,
+                    buffer,
+                    received,
+                    boundary,
+                });
             }
-            if received == request.buffer.len() {
-                return Err((
-                    request.stream,
-                    invalid_data("request headers exceed 16 KiB"),
-                ));
+            scanned_until = received;
+            if received == buffer.len() {
+                return Err((stream, invalid_data("request headers exceed 16 KiB")));
             }
-            let read = match request.stream.read(&mut request.buffer[received..]) {
-                Ok(read) if read != 0 => read,
-                Ok(_) if received == 0 => {
-                    return Err((
-                        request.stream,
-                        io::Error::from(io::ErrorKind::UnexpectedEof),
-                    ));
+            let unread = buffer
+                .get_mut(received..)
+                .expect("received bytes fit the header buffer");
+            let read = match stream.read(unread) {
+                Ok(0) if received == 0 => {
+                    return Err((stream, io::Error::from(io::ErrorKind::UnexpectedEof)));
                 }
-                Ok(_) => return Err((request.stream, invalid_data("request ended early"))),
-                Err(error) => return Err((request.stream, error)),
+                Ok(0) => return Err((stream, invalid_data("request ended early"))),
+                Ok(read) => read,
+                Err(error) => return Err((stream, error)),
             };
             received += read;
-        };
+        }
+    }
 
+    fn bytes(&self) -> &[u8] {
+        self.buffer
+            .get(..self.received)
+            .expect("received bytes fit the header buffer")
+    }
+
+    fn into_request(self) -> Result<Request, (TcpStream, io::Error)> {
+        let parsed = match ParsedHead::parse(&self) {
+            Ok(parsed) => parsed,
+            Err(error) => return Err((self.stream, error)),
+        };
+        Ok(Request {
+            stream: self.stream,
+            buffer: self.buffer,
+            body_prefix: self.boundary.body_prefix(),
+            method: parsed.method,
+            url: parsed.url,
+            headers: parsed.headers,
+            body_length: parsed.body_length,
+            body_complete: true,
+            keep_alive: parsed.keep_alive,
+        })
+    }
+}
+
+impl ParsedHead {
+    fn parse(buffered: &BufferedHead) -> io::Result<Self> {
         let mut parsed_headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
         let mut parsed = httparse::Request::new(&mut parsed_headers);
-        match parsed.parse(&request.buffer[..received]) {
-            Ok(httparse::Status::Complete(_)) => {}
-            Ok(httparse::Status::Partial) => {
-                return Err((request.stream, invalid_data("incomplete HTTP request")));
-            }
-            Err(_) => return Err((request.stream, invalid_data("malformed HTTP request"))),
+        let parsed_end = match parsed.parse(buffered.bytes()) {
+            Ok(httparse::Status::Complete(end)) => end,
+            Ok(httparse::Status::Partial) => return Err(invalid_data("incomplete HTTP request")),
+            Err(_) => return Err(invalid_data("malformed HTTP request")),
+        };
+        if parsed_end != buffered.boundary.end() {
+            return Err(invalid_data("HTTP parser disagrees with header boundary"));
         }
 
-        let Some(request_line_end) = request.buffer[..header_end - 2]
-            .array_windows::<2>()
-            .position(|window| window == b"\r\n")
-        else {
-            return Err((request.stream, invalid_data("missing request line")));
+        let (method, target, version) = match (parsed.method, parsed.path, parsed.version) {
+            (Some(method), Some(target), Some(version)) => (method, target, version),
+            _ => return Err(invalid_data("incomplete HTTP request")),
         };
-        let line = &request.buffer[..request_line_end];
-        let mut fields = line.split(|byte| *byte == b' ' || *byte == b'\t');
-        let method = fields
-            .next()
-            .filter(|field| !field.is_empty())
-            .ok_or_else(|| invalid_data("missing HTTP method"));
-        let target = fields
-            .next()
-            .filter(|field| !field.is_empty())
-            .ok_or_else(|| invalid_data("missing request target"));
-        let version = fields
-            .next()
-            .filter(|field| !field.is_empty())
-            .ok_or_else(|| invalid_data("missing HTTP version"));
-        if fields.next().is_some() {
-            return Err((request.stream, invalid_data("extra request-line fields")));
-        }
-        let (method, target, version) = match (method, target, version) {
-            (Ok(method), Ok(target), Ok(version)) => (method, target, version),
-            _ => return Err((request.stream, invalid_data("malformed request line"))),
-        };
-        if !version.starts_with(b"HTTP/") {
-            return Err((request.stream, invalid_data("malformed HTTP version")));
-        }
-        request.url = RequestTargetRange::from_subslice(&request.buffer[..received], target)
-            .expect("request target is a subslice of the request buffer");
-        request.method = match method {
-            b"GET" => Method::Get,
-            b"HEAD" => Method::Head,
-            b"PUT" => Method::Put,
-            _ => Method::Other,
-        };
+        let url = RequestTargetRange::from_subslice(buffered.bytes(), target.as_bytes())
+            .ok_or_else(|| invalid_data("request target is outside the request"))?;
+        let headers = HeaderRanges::from_httparse(buffered.bytes(), parsed.headers)?;
+        let body_length = request_content_length(buffered.bytes(), &headers)?;
+        let keep_alive = request_keeps_connection_alive(version, buffered.bytes(), &headers);
 
-        let mut line_start = request_line_end + 2;
-        while line_start + 2 <= header_end {
-            if &request.buffer[line_start..line_start + 2] == b"\r\n" {
-                break;
-            }
-            let line_end = request.buffer[line_start..header_end - 2]
-                .array_windows::<2>()
-                .position(|window| window == b"\r\n")
-                .map(|offset| line_start + offset)
-                .ok_or_else(|| invalid_data("unterminated header"));
-            let line_end = match line_end {
-                Ok(line_end) => line_end,
-                Err(error) => return Err((request.stream, error)),
-            };
-            let colon = request.buffer[line_start..line_end]
-                .iter()
-                .position(|byte| *byte == b':')
-                .map(|offset| line_start + offset);
-            let Some(colon) = colon else {
-                return Err((request.stream, invalid_data("header has no colon")));
-            };
-            if request.header_count == MAX_HEADERS {
-                return Err((request.stream, invalid_data("too many request headers")));
-            }
-            let value_start = request.buffer[colon + 1..line_end]
-                .iter()
-                .position(|byte| !matches!(byte, b' ' | b'\t'))
-                .map_or(line_end, |offset| colon + 1 + offset);
-            let value_end = request.buffer[value_start..line_end]
-                .iter()
-                .rposition(|byte| !matches!(byte, b' ' | b'\t'))
-                .map_or(value_start, |offset| value_start + offset + 1);
-            request.header_ranges[request.header_count] = HeaderRange {
-                name: line_start..colon,
-                value: value_start..value_end,
-            };
-            if std::str::from_utf8(&request.buffer[line_start..colon]).is_err()
-                || std::str::from_utf8(&request.buffer[value_start..value_end]).is_err()
-            {
-                return Err((request.stream, invalid_data("request header is not UTF-8")));
-            }
-            request.header_count += 1;
-            line_start = line_end + 2;
-        }
+        Ok(Self {
+            method: Method::from_http(method),
+            url,
+            headers,
+            body_length,
+            keep_alive,
+        })
+    }
+}
 
-        let mut content_length = None;
-        let mut content_length_error = None;
-        for header in request.header_ranges[..request.header_count].iter() {
-            let name = std::str::from_utf8(&request.buffer[header.name.clone()])
-                .expect("validated header name");
-            if name.eq_ignore_ascii_case("Content-Length") {
-                if content_length.is_some() {
-                    content_length_error = Some("duplicate Content-Length");
-                    continue;
-                }
-                let value = std::str::from_utf8(&request.buffer[header.value.clone()])
-                    .expect("validated header value");
-                match value.parse::<usize>() {
-                    Ok(length) => content_length = Some(length),
-                    Err(_) => content_length_error = Some("invalid Content-Length"),
-                }
+impl Method {
+    fn from_http(method: &str) -> Self {
+        match method {
+            "GET" => Self::Get,
+            "HEAD" => Self::Head,
+            "PUT" => Self::Put,
+            _ => Self::Other,
+        }
+    }
+}
+
+fn request_content_length(buffer: &[u8], headers: &HeaderRanges) -> io::Result<Option<usize>> {
+    headers
+        .iter()
+        .filter(|header| header.name(buffer).eq_ignore_ascii_case("Content-Length"))
+        .try_fold(None, |found, header| {
+            let length = header
+                .value(buffer)
+                .parse()
+                .map_err(|_| invalid_data("invalid Content-Length"))?;
+            match found {
+                Some(_) => Err(invalid_data("duplicate Content-Length")),
+                None => Ok(Some(length)),
             }
-        }
-        if let Some(error) = content_length_error {
-            return Err((request.stream, invalid_data(error)));
-        }
-        request.keep_alive = version == b"HTTP/1.1"
-            && !request.headers().iter().any(|header| {
-                header.field.equiv("Connection")
-                    && header
-                        .value
-                        .as_str()
-                        .split(',')
-                        .any(|value| value.trim().eq_ignore_ascii_case("close"))
-            });
-        request.header_end = header_end;
-        request.body_prefix_len = received - header_end;
-        request.body_length = content_length;
-        Ok(request)
+        })
+}
+
+fn request_keeps_connection_alive(version: u8, buffer: &[u8], headers: &HeaderRanges) -> bool {
+    version == 1
+        && !headers.iter().any(|header| {
+            header.name(buffer).eq_ignore_ascii_case("Connection")
+                && header
+                    .value(buffer)
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case("close"))
+        })
+}
+
+impl Request {
+    pub fn read(stream: TcpStream) -> Result<Self, (TcpStream, io::Error)> {
+        BufferedHead::read(stream)?.into_request()
     }
 
     pub fn method(&self) -> Method {
@@ -289,7 +343,11 @@ impl Request {
     }
 
     pub fn url(&self) -> &str {
-        std::str::from_utf8(&self.buffer[self.url.as_range()]).expect("validated request target")
+        let target = self
+            .buffer
+            .get(self.url.as_range())
+            .expect("validated request target range");
+        std::str::from_utf8(target).expect("validated request target")
     }
 
     pub fn headers(&self) -> Headers<'_> {
@@ -303,7 +361,10 @@ impl Request {
     pub fn as_reader(&mut self) -> BodyReader<'_> {
         BodyReader {
             stream: &mut self.stream,
-            prefix: &self.buffer[self.header_end..self.header_end + self.body_prefix_len],
+            prefix: self
+                .buffer
+                .get(self.body_prefix.clone())
+                .expect("validated body prefix range"),
             prefix_offset: 0,
             remaining: self.body_length.unwrap_or(0),
             complete: &mut self.body_complete,
@@ -629,7 +690,10 @@ mod tests {
         thread,
     };
 
-    use super::{FORCE_PORTABLE_FILE_COPY, Method, Request, Response, StatusCode};
+    use super::{
+        BufferedHead, FORCE_PORTABLE_FILE_COPY, HeaderBoundary, MAX_HEADER_BYTES, Method,
+        ParsedHead, Request, Response, StatusCode,
+    };
 
     #[test]
     fn parses_headers_without_allocating_header_storage() {
@@ -676,6 +740,33 @@ mod tests {
         assert_eq!(request.method(), Method::Get);
         assert_eq!(request.url(), "/nar/example.nar");
         assert!(request.body_complete());
+        sender.join().expect("sender should finish");
+    }
+
+    #[test]
+    fn parser_requires_the_scanner_header_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let sender = thread::spawn(move || {
+            std::net::TcpStream::connect(address).expect("connect test listener")
+        });
+        let (stream, _) = listener.accept().expect("accept test connection");
+        let bytes = b"GET /healthz HTTP/1.1\r\n\r\n";
+        let mut buffer = [0; MAX_HEADER_BYTES];
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        let buffered = BufferedHead {
+            stream,
+            buffer,
+            received: bytes.len(),
+            boundary: HeaderBoundary::detected(bytes.len() - 1, bytes.len()),
+        };
+
+        let error = match ParsedHead::parse(&buffered) {
+            Ok(_) => panic!("mismatched boundary should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        drop(buffered);
         sender.join().expect("sender should finish");
     }
 
