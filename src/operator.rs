@@ -55,7 +55,7 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
     create_recovery_marker(&root)?;
     let directory = Directory::open(&root).map_err(runtime)?;
     let storage = Storage::initialize(&directory).map_err(runtime)?;
-    for directory in ["nar", ".tmp", "realisations"] {
+    for directory in ["nar", ".tmp", "realisations", ".narjar-validation"] {
         ensure_directory(&root.join(directory), 0o700)?;
     }
     ensure_directory(&root.join("auth"), 0o700)?;
@@ -79,6 +79,7 @@ const INIT_ROOT_ENTRIES: &[&str] = &[
     ".narjar-clean",
     ".narjar-recovery",
     ".narjar-transactions",
+    ".narjar-validation",
     ".tmp",
     "auth",
     "nar",
@@ -703,6 +704,7 @@ const DOCTOR_DIRECTORIES: &[&str] = &[
     "realisations",
     "realisations/.tmp",
     "auth",
+    ".narjar-validation",
 ];
 const DOCTOR_FILES: &[&str] = &[
     "lock",

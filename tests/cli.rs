@@ -3787,6 +3787,7 @@ fn restored_cache_verifies_before_serving() {
         "realisations",
         "realisations/.tmp",
         "auth",
+        ".narjar-validation",
     ] {
         fs::create_dir_all(restored.join(directory)).expect("restore directory should be created");
     }
@@ -4295,6 +4296,13 @@ fn gc_reclaims_old_orphan_nars() {
         b"zstd orphan",
     )
     .expect("zstd orphan NAR should be written");
+    fs::write(
+        data_dir
+            .join(".narjar-validation")
+            .join(format!("{NARJAR_HASH}.nar.zst.validation")),
+        b"stale evidence",
+    )
+    .expect("zstd orphan evidence should be written");
 
     let path = data_dir.to_str().expect("temporary path should be UTF-8");
     let output = run(&[
@@ -4314,6 +4322,12 @@ fn gc_reclaims_old_orphan_nars() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!data_dir.join(format!("nar/{NAR_ID}.nar")).exists());
+    assert!(
+        !data_dir
+            .join(".narjar-validation")
+            .join(format!("{NARJAR_HASH}.nar.zst.validation"))
+            .exists()
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"deleted_orphans\":2"));
     assert!(stdout.contains("\"temporary\":1"));

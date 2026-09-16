@@ -274,9 +274,14 @@ fn classify_root_entry(
     let is_directory = entry_is_directory_at(directory, name)?;
     let is_regular = entry_is_regular_at(directory, name)?;
     Ok(match name.to_str() {
-        Some("nar" | ".tmp" | ".narjar-transactions" | "realisations" | "auth") => {
-            (!is_directory).then_some(ReconcileClass::UnexpectedType)
-        }
+        Some(
+            "nar"
+            | ".tmp"
+            | ".narjar-transactions"
+            | ".narjar-validation"
+            | "realisations"
+            | "auth",
+        ) => (!is_directory).then_some(ReconcileClass::UnexpectedType),
         Some(
             "lock"
             | "nix-cache-info"
@@ -313,10 +318,15 @@ fn valid_temp_filename(name: &OsStr) -> bool {
     let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".part")) else {
         return false;
     };
-    let Some(body) = ["cache-info-", "nar-", "narinfo-", "realisation-"]
-        .into_iter()
-        .find_map(|prefix| stem.strip_prefix(prefix))
-    else {
+    let Some(body) = [
+        "cache-info-",
+        "nar-",
+        "narinfo-",
+        "realisation-",
+        "validation-",
+    ]
+    .into_iter()
+    .find_map(|prefix| stem.strip_prefix(prefix)) else {
         return false;
     };
     !body.is_empty()

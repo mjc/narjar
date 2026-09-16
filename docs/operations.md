@@ -317,10 +317,12 @@ operator-triggered for other stale temporary files.
 
 Upload validation is the first content-integrity boundary. Raw narinfo
 publication and normal availability checks inspect only that the regular file
-exists with the declared encoded size. Compressed narinfo publication currently
-revalidates the encoded and decoded hashes before publication. Use `narjar
-verify` or `narjar reconcile --verify-hashes` for an explicit full content scan,
-including detection of same-size out-of-band mutation.
+exists with the declared encoded size. Compressed upload validation durably
+records the decoded identity in `.narjar-validation/`; compressed narinfo
+publication reuses matching evidence and fully revalidates when it is missing,
+malformed, stale, or incompatible. Use `narjar verify` or `narjar
+reconcile --verify-hashes` for an explicit full content scan, including
+detection of same-size out-of-band mutation.
 
 ## Disk-full and I/O failure
 
@@ -383,7 +385,8 @@ For a consistent portable copy:
 1. Stop Narjar and wait for the process to exit.
 2. Copy the complete data directory, including `.narjar-clean`,
    `.narjar-recovery`, `.narjar-transactions/`, `lock`, `nar/`, `.tmp/`,
-   `realisations/`, `nix-cache-info`, `trusted-public-keys`, and `auth/`.
+   `realisations/`, `.narjar-validation/`, `nix-cache-info`,
+   `trusted-public-keys`, and `auth/`.
 3. Preserve the directory and file permissions; do not expose the copy while
    it contains credentials.
 4. On the destination, require `doctor` to exit successfully, then run
