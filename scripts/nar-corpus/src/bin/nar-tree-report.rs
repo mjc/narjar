@@ -5,7 +5,9 @@ use std::{
     path::Path,
 };
 
-use narjar_corpus::{HashingReader, HashingWriter, hex};
+use narjar_corpus::{
+    HashingReader, HashingWriter, hex, parse_input_list_arguments, usable_input_path,
+};
 use nix_archive::nar::{Event, FileContents, decode_events_reader};
 use sha2::{Digest, Sha256};
 
@@ -40,6 +42,12 @@ struct ScannerStats {
     local_trees: BTreeSet<[u8; 32]>,
 }
 
+struct ScanReport {
+    line: String,
+    tree_count: u64,
+    tree_bytes: u64,
+}
+
 struct Scanner<'a> {
     global_trees: &'a mut BTreeMap<[u8; 32], TreeRecord>,
     directories: Vec<DirectoryFrame>,
@@ -61,7 +69,7 @@ impl Scanner<'_> {
     ) -> Result<(), nix_archive::nar::Error> {
         match event {
             Event::DirectoryStart { name } => {
-                self.stats.entries += u64::from(name.is_some());
+                self.count_named_entry(name);
                 self.stats.max_depth = self.stats.max_depth.max(self.directories.len());
                 self.directories.push(DirectoryFrame {
                     name: name.map(ToOwned::to_owned),
@@ -72,34 +80,57 @@ impl Scanner<'_> {
             Event::Regular {
                 name,
                 executable,
-                mut contents,
-            } => {
-                self.stats.entries += u64::from(name.is_some());
-                let kind = if executable { 2 } else { 1 };
-                let mut digest = HashingWriter::new(io::sink());
-                digest.write_all(SEMANTIC_PREFIX)?;
-                digest.write_all(&[kind])?;
-                digest.write_all(&contents.size().to_le_bytes())?;
-                contents.copy_to(&mut digest)?;
-                let (_, _, digest) = digest.finish();
-                self.add_completed_node(name, kind, digest)?;
-            }
+                contents,
+            } => self.hash_regular_node_and_append_entry(name, executable, contents)?,
             Event::Symlink { name, target } => {
-                self.stats.entries += u64::from(name.is_some());
-                let mut digest = Sha256::new();
-                digest.update(SEMANTIC_PREFIX);
-                digest.update([3]);
-                digest.update((target.len() as u64).to_le_bytes());
-                digest.update(target);
-                let mut oid = [0_u8; 32];
-                oid.copy_from_slice(&digest.finalize());
-                self.add_completed_node(name, 3, oid)?;
+                self.hash_symlink_target_and_append_entry(name, target)?
             }
         }
         Ok(())
     }
 
-    fn add_completed_node(
+    fn hash_regular_node_and_append_entry<R: io::Read + ?Sized>(
+        &mut self,
+        name: Option<&[u8]>,
+        executable: bool,
+        mut contents: FileContents<'_, R>,
+    ) -> Result<(), nix_archive::nar::Error> {
+        self.count_named_entry(name);
+        let kind = if executable { 2 } else { 1 };
+        let mut digest = HashingWriter::new(io::sink());
+        digest.write_all(SEMANTIC_PREFIX)?;
+        digest.write_all(&[kind])?;
+        digest.write_all(&contents.size().to_le_bytes())?;
+        contents.copy_to(&mut digest)?;
+        let (_, summary) = digest.finish();
+        let mut oid = [0_u8; 32];
+        oid.copy_from_slice(&summary.sha256);
+        self.append_completed_entry(name, kind, oid)
+            .map_err(Into::into)
+    }
+
+    fn hash_symlink_target_and_append_entry(
+        &mut self,
+        name: Option<&[u8]>,
+        target: &[u8],
+    ) -> Result<(), nix_archive::nar::Error> {
+        self.count_named_entry(name);
+        let mut digest = Sha256::new();
+        digest.update(SEMANTIC_PREFIX);
+        digest.update([3]);
+        digest.update((target.len() as u64).to_le_bytes());
+        digest.update(target);
+        let mut oid = [0_u8; 32];
+        oid.copy_from_slice(&digest.finalize());
+        self.append_completed_entry(name, 3, oid)
+            .map_err(Into::into)
+    }
+
+    fn count_named_entry(&mut self, name: Option<&[u8]>) {
+        self.stats.entries += u64::from(name.is_some());
+    }
+
+    fn append_completed_entry(
         &mut self,
         name: Option<&[u8]>,
         kind: u8,
@@ -144,21 +175,25 @@ impl Scanner<'_> {
                 "tree OID has inconsistent preimage length",
             ));
         }
-        self.add_completed_node(directory.name.as_deref(), 4, oid)
+        self.append_completed_entry(directory.name.as_deref(), 4, oid)
     }
 
-    fn report(self, path: &str) -> String {
+    fn build_scan_report(self, path: &str) -> ScanReport {
         let repeated = self.stats.tree_count - self.stats.local_trees.len() as u64;
-        format!(
-            "N\t{path}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            self.stats.entries,
-            self.stats.tree_count,
-            self.stats.local_trees.len(),
-            repeated,
-            self.stats.tree_bytes,
-            self.stats.max_depth,
-            self.stats.max_fanout,
-        )
+        ScanReport {
+            line: format!(
+                "N\t{path}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                self.stats.entries,
+                self.stats.tree_count,
+                self.stats.local_trees.len(),
+                repeated,
+                self.stats.tree_bytes,
+                self.stats.max_depth,
+                self.stats.max_fanout,
+            ),
+            tree_count: self.stats.tree_count,
+            tree_bytes: self.stats.tree_bytes,
+        }
     }
 }
 
@@ -189,39 +224,32 @@ fn tree_oid(entries: &[TreeEntry]) -> [u8; 32] {
     oid
 }
 
-fn scan_one(path: &str, global_trees: &mut BTreeMap<[u8; 32], TreeRecord>) -> io::Result<String> {
+fn scan_one(
+    path: &str,
+    global_trees: &mut BTreeMap<[u8; 32], TreeRecord>,
+) -> io::Result<ScanReport> {
     let file = File::open(Path::new(path))?;
     let (mut input, _) = HashingReader::new(BufReader::with_capacity(1024 * 1024, file));
+    scan_reader(&mut input, path, global_trees)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn scan_reader<R: io::Read>(
+    input: &mut HashingReader<R>,
+    path: &str,
+    global_trees: &mut BTreeMap<[u8; 32], TreeRecord>,
+) -> Result<ScanReport, nix_archive::nar::Error> {
     let mut scanner = Scanner::new(global_trees);
-    decode_events_reader(&mut input, |event| scanner.visit(event))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(scanner.report(path))
+    decode_events_reader(input, |event| scanner.visit(event))?;
+    Ok(scanner.build_scan_report(path))
 }
 
 fn main() -> io::Result<()> {
-    let mut args = std::env::args_os().skip(1);
-    let mut input_list = None;
-    let mut output_path = None;
-    while let Some(argument) = args.next() {
-        match argument.to_str() {
-            Some("--input-list") => input_list = args.next(),
-            Some("--output") => output_path = args.next(),
-            Some("--help") => {
-                println!("usage: nar-tree-report --input-list PATH [--output PATH]");
-                return Ok(());
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unknown argument",
-                ));
-            }
-        }
-    }
-    let input_list = input_list
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--input-list is required"))?;
-    let list = File::open(input_list)?;
-    let mut output: Box<dyn Write> = match output_path {
+    let Some(arguments) = parse_input_list_arguments(std::env::args_os().skip(1))? else {
+        return Ok(());
+    };
+    let list = File::open(arguments.input_list)?;
+    let mut output: Box<dyn Write> = match arguments.output_path {
         Some(path) => Box::new(File::create(path)?),
         None => Box::new(io::BufWriter::new(io::stdout().lock())),
     };
@@ -230,27 +258,17 @@ fn main() -> io::Result<()> {
     let mut total_tree_occurrences = 0_u64;
     let mut total_tree_bytes = 0_u64;
 
-    for line in BufReader::new(list).lines() {
-        let path = line?;
-        if path.is_empty() {
-            continue;
-        }
-        if path.contains(['\t', '\n', '\r']) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "input path contains a tab or newline",
-            ));
-        }
-        let report = scan_one(&path, &mut global_trees)?;
-        let fields = report.trim_end().split('\t').collect::<Vec<_>>();
-        total_tree_occurrences += fields[3]
-            .parse::<u64>()
-            .map_err(|_| io::Error::other("invalid tree count"))?;
-        total_tree_bytes += fields[6]
-            .parse::<u64>()
-            .map_err(|_| io::Error::other("invalid tree byte count"))?;
-        output.write_all(report.as_bytes())?;
-    }
+    BufReader::new(list)
+        .lines()
+        .map(|line| line.and_then(usable_input_path))
+        .try_for_each(|path| {
+            path?.map_or(Ok(()), |path| {
+                let report = scan_one(&path, &mut global_trees)?;
+                total_tree_occurrences += report.tree_count;
+                total_tree_bytes += report.tree_bytes;
+                output.write_all(report.line.as_bytes())
+            })
+        })?;
 
     let unique_tree_bytes = global_trees.values().try_fold(0_u64, |total, record| {
         total
@@ -273,4 +291,53 @@ fn main() -> io::Result<()> {
         )?;
     }
     output.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use nix_archive::nar::{NamedNode, Node, encode_tree};
+
+    use super::*;
+
+    #[test]
+    fn tree_report_counts_identical_subtrees_once_for_unique_bytes() {
+        // `a/child` and `b/child` are different paths but identical semantic
+        // subtrees. The report must count three tree occurrences (a, b, root),
+        // while charging only two unique tree preimages.
+        let child_entries = [NamedNode {
+            name: b"child",
+            node: Node::Regular {
+                executable: false,
+                contents: b"x",
+            },
+        }];
+        let child = Node::Directory(&child_entries);
+        let root = [
+            NamedNode {
+                name: b"a",
+                node: child,
+            },
+            NamedNode {
+                name: b"b",
+                node: child,
+            },
+        ];
+        let mut nar = Vec::new();
+        encode_tree(&mut nar, &Node::Directory(&root)).expect("fixture encoding succeeds");
+
+        let (mut input, _) = HashingReader::new(Cursor::new(nar));
+        let mut trees = BTreeMap::new();
+        let report =
+            scan_reader(&mut input, "sample.nar", &mut trees).expect("canonical fixture scans");
+
+        let fields = report.line.trim_end().split('\t').collect::<Vec<_>>();
+        assert_eq!(fields[0], "N");
+        assert_eq!(fields[2], "4", "four named entries are visited");
+        assert_eq!(fields[3], "3", "three directory tree occurrences");
+        assert_eq!(fields[4], "2", "the two identical child trees share bytes");
+        assert_eq!(fields[5], "1", "one occurrence is repeated");
+        assert_eq!(trees.len(), 2);
+    }
 }
