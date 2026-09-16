@@ -1,4 +1,87 @@
-use super::*;
+use std::{
+    collections::HashMap,
+    ffi::{OsStr, OsString},
+    fs::{File, Permissions},
+    io::{self, Cursor, Read},
+    num::NonZeroUsize,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    process,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::SystemTime,
+};
+
+use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation, ValidatedNarInfo};
+
+use super::{
+    compression::{
+        CheckedUploadReader, ValidationEvidence, nar_encoding, nar_file_size_matches,
+        validate_compressed_nar, validate_xz, validate_zstd, validation_file_name,
+    },
+    directory::Directory,
+    fs::{
+        StorageCapacity, directory_is_empty, ensure_directory_at, entry_is_regular_at,
+        files_equal_at, filesystem_space, hard_link_at, open_at, open_directory_at,
+        open_optional_at, open_regular_at, read_dir_names, remove_temp, rename_at,
+        reserve_staging_bytes, rollback_link_at, unlink_at,
+    },
+    ids::{NarObjectId, StoreHash},
+    publication::{
+        NEXT_TEMP, NarUploadPolicy, ProcessLock, PublishBoundary, PublishOutcome, PublishTarget,
+        PublishedPair, StagingReservation, StorageError, TemporaryFile,
+    },
+    reconcile::{self, ReconcileEntry, ReconcileReport},
+    recovery::{PublicationState, RecoveryState},
+    state::Storage,
+};
+
+#[cfg(test)]
+use super::publication::{Layout, injected_fault};
+
+const MAX_CACHE_INFO_BYTES: u64 = 1024;
+pub(super) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
+pub(super) const MAX_VALIDATION_EVIDENCE_BYTES: u64 = 256;
+
+fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() as u64 > MAX_CACHE_INFO_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "nix-cache-info exceeds configured size limit",
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nix-cache-info is not UTF-8"))?;
+    let mut store_dir = false;
+    let mut mass_query = false;
+    let mut priority = false;
+    for line in text.lines() {
+        let (name, value) = line.split_once(": ").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed nix-cache-info")
+        })?;
+        match name {
+            "StoreDir" if !store_dir && value == "/nix/store" => store_dir = true,
+            "WantMassQuery" if !mass_query && value == "0" => mass_query = true,
+            "Priority" if !priority && value.parse::<u32>().is_ok() => priority = true,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported or duplicate nix-cache-info field",
+                ));
+            }
+        }
+    }
+    if store_dir && mass_query && priority {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "nix-cache-info is missing a required field",
+        ))
+    }
+}
 
 impl Storage {
     pub fn initialize(root: &Directory) -> Result<Self, StorageError> {

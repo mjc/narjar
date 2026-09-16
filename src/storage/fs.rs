@@ -22,7 +22,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::{COMPARE_BUFFER_BYTES, StagingReservation, StorageError, TemporaryFile};
+use super::publication::TemporaryFile;
+use super::{StagingReservation, StorageError};
+
+const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 
 pub(crate) fn capacity_error_kind(raw_error: i32) -> CapacityErrorKind {
     match raw_error {

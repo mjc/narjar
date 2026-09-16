@@ -11,7 +11,10 @@ use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
 use crate::narinfo::{CompressedEncoding, CompressedNarExpectation, NarEncoding, NarExpectation};
 
-use super::{NarObjectId, VALIDATION_EVIDENCE_VERSION, nix32_sha256, nix32_sha256_matches};
+use super::NarObjectId;
+use super::ids::{nix32_sha256, nix32_sha256_matches};
+
+const VALIDATION_EVIDENCE_VERSION: u8 = 1;
 
 pub(super) struct CheckedUploadReader<'a, R> {
     inner: R,

@@ -7,9 +7,11 @@ use std::{
     time::SystemTime,
 };
 
+use super::fs::unlink_at;
+use super::ids::parse_nix32;
 use super::{
     Storage, StorageError, entry_identity_at, entry_is_directory_at, entry_is_regular_at,
-    open_regular_at, parse_nix32, read_dir_names, unlink_at,
+    open_regular_at, read_dir_names,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

@@ -7,11 +7,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use super::fs::unlink_at;
 use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
     storage::{
         Directory, NarObjectId, Storage, StorageError, StoreHash, open_regular_at, read_dir_names,
-        unlink_at,
     },
 };
 

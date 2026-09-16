@@ -1,0 +1,266 @@
+use std::{
+    ffi::{OsStr, OsString},
+    fs::File,
+    io,
+    os::unix::fs::PermissionsExt,
+    sync::atomic::AtomicU64,
+};
+
+#[cfg(test)]
+use std::path::PathBuf;
+
+use super::{
+    compression::ValidationEvidence,
+    fs::{lock_exclusive, open_at},
+    ids::{NarObjectId, StoreHash},
+};
+use crate::narinfo::NarEncoding;
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct Layout {
+    root: PathBuf,
+}
+
+#[cfg(test)]
+impl Layout {
+    pub(super) fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub(super) fn nar_dir(&self) -> PathBuf {
+        self.root.join("nar")
+    }
+
+    pub(super) fn nar_path(&self, id: &NarObjectId) -> PathBuf {
+        self.nar_dir().join(format!("{}.nar", id.0))
+    }
+
+    pub(super) fn nar_path_encoded(&self, id: &NarObjectId, encoding: NarEncoding) -> PathBuf {
+        self.nar_dir()
+            .join(format!("{}{}", id.0, encoding.suffix()))
+    }
+
+    pub(super) fn nar_temp_dir(&self) -> PathBuf {
+        self.nar_dir().join(".tmp")
+    }
+
+    pub(super) fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
+        self.root.join(format!("{}.narinfo", hash.0))
+    }
+
+    pub(super) fn temp_dir(&self) -> PathBuf {
+        self.root.join(".tmp")
+    }
+}
+
+pub(super) enum PublishTarget<'a> {
+    CacheInfo,
+    Nar(&'a NarObjectId, NarEncoding),
+    NarInfo(&'a StoreHash),
+    Validation(&'a ValidationEvidence),
+}
+
+impl PublishTarget<'_> {
+    pub(super) fn destination_name(&self) -> OsString {
+        match self {
+            Self::CacheInfo => OsString::from("nix-cache-info"),
+            Self::Nar(id, encoding) => {
+                OsString::from(format!("{}{}", id.as_str(), encoding.suffix()))
+            }
+            Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
+            Self::Validation(evidence) => evidence.file_name(),
+        }
+    }
+
+    pub(super) fn temp_prefix(&self) -> &'static str {
+        match self {
+            Self::CacheInfo => "cache-info",
+            Self::Nar(_, _) => "nar",
+            Self::NarInfo(_) => "narinfo",
+            Self::Validation(_) => "validation",
+        }
+    }
+
+    pub(super) fn replaces_destination(&self) -> bool {
+        match self {
+            Self::Validation(_) => true,
+            Self::CacheInfo | Self::Nar(_, _) | Self::NarInfo(_) => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct TemporaryFile {
+    pub(super) name: OsString,
+    pub(super) directory: File,
+    pub(super) file: File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PublishBoundary {
+    BeforeTempCreate,
+    AfterTempCreate,
+    AfterStream,
+    AfterTempSync,
+    BeforeFinalLink,
+    BeforeParentSync,
+    AfterParentSync,
+}
+
+#[cfg(test)]
+pub(super) fn injected_fault(
+    boundary: PublishBoundary,
+    fault: PublishBoundary,
+) -> Result<(), StorageError> {
+    if boundary == fault {
+        Err(io::Error::other(format!("injected fault at {boundary:?}")).into())
+    } else {
+        Ok(())
+    }
+}
+
+/// The lease is held on the opened DATA directory, not `DATA/lock`.
+///
+/// This keeps replacing the lock pathname from creating a second lease. It
+/// relies on local-filesystem `flock` semantics for directory file
+/// descriptions; distributed filesystems are outside the supported guarantee.
+#[derive(Debug)]
+pub(super) struct ProcessLock {
+    _file: File,
+}
+
+impl ProcessLock {
+    pub(super) fn acquire(parent: File) -> Result<Self, StorageError> {
+        lock_exclusive(&parent)?;
+        Ok(Self { _file: parent })
+    }
+
+    pub(super) fn validate_lock_file(root: &File) -> Result<(), StorageError> {
+        let file = open_at(
+            root,
+            OsStr::new("lock"),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .map_err(|error| io::Error::new(error.kind(), format!("lock: {error}")))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "lock is not a regular file").into(),
+            );
+        }
+        if metadata.permissions().mode() & 0o133 != 0 {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "lock has unsafe permissions").into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NarUploadPolicy {
+    pub(super) max_bytes: u64,
+    pub(super) min_free_bytes: u64,
+}
+
+impl NarUploadPolicy {
+    pub const fn new(max_bytes: u64, min_free_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            min_free_bytes,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct StagingReservation {
+    pub(super) reservations: std::sync::Arc<AtomicU64>,
+    pub(super) bytes: u64,
+}
+
+impl StagingReservation {
+    pub(super) fn empty(reservations: std::sync::Arc<AtomicU64>) -> Self {
+        Self {
+            reservations,
+            bytes: 0,
+        }
+    }
+}
+
+impl Drop for StagingReservation {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let previous = self
+            .reservations
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Release);
+        debug_assert!(previous >= self.bytes);
+    }
+}
+
+#[derive(Debug)]
+pub struct PublishedPair {
+    pub nar: File,
+    pub narinfo: File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublishOutcome {
+    Created,
+    Identical,
+}
+
+#[derive(Debug)]
+pub enum StorageError {
+    Conflict,
+    InsufficientSpace,
+    InsufficientInodes,
+    Locked,
+    MissingNar,
+    NarMismatch,
+    UploadTooLarge,
+    Io(io::Error),
+}
+
+impl From<io::Error> for StorageError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict => formatter.write_str("immutable destination has different contents"),
+            Self::InsufficientSpace => {
+                formatter.write_str("configured free space reserve would be violated")
+            }
+            Self::InsufficientInodes => formatter.write_str("filesystem has no free inodes"),
+            Self::Locked => formatter.write_str("data directory is locked by another process"),
+            Self::MissingNar => formatter.write_str("referenced NAR is not published"),
+            Self::NarMismatch => formatter.write_str("referenced NAR size does not match narinfo"),
+            Self::UploadTooLarge => formatter.write_str("NAR upload exceeds configured size limit"),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Conflict
+            | Self::InsufficientSpace
+            | Self::InsufficientInodes
+            | Self::Locked
+            | Self::MissingNar
+            | Self::NarMismatch
+            | Self::UploadTooLarge => None,
+        }
+    }
+}
+
+pub(super) static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
