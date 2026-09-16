@@ -315,8 +315,7 @@ impl<R: Read> Decoder<R> {
         size: u64,
         sink: &mut S,
     ) -> Result<(), DecodeError<S::Error>> {
-        (0..size.div_ceil(CHUNK_SIZE as u64)).try_for_each(|chunk| {
-            let offset = chunk * CHUNK_SIZE as u64;
+        (0..size).step_by(CHUNK_SIZE).try_for_each(|offset| {
             let length = (size - offset).min(CHUNK_SIZE as u64) as usize;
             self.read_file_chunk(length, sink)
         })?;
@@ -336,7 +335,7 @@ impl<R: Read> Decoder<R> {
             file_buffer,
             ..
         } = self;
-        read_raw_bytes(
+        read_hashed_limited_bytes(
             reader,
             digest,
             raw_bytes,
@@ -421,7 +420,7 @@ impl<R: Read> Decoder<R> {
     }
 
     fn read_raw<E>(&mut self, buffer: &mut [u8]) -> Result<(), DecodeError<E>> {
-        read_raw_bytes(
+        read_hashed_limited_bytes(
             &mut self.reader,
             &mut self.digest,
             &mut self.raw_bytes,
@@ -431,7 +430,7 @@ impl<R: Read> Decoder<R> {
     }
 }
 
-fn read_raw_bytes<R: Read, E>(
+fn read_hashed_limited_bytes<R: Read, E>(
     reader: &mut R,
     digest: &mut Sha256,
     raw_bytes: &mut u64,
