@@ -27,7 +27,7 @@ use super::{
 };
 use crate::narinfo::{CompressedNarExpectation, NarEncoding};
 use crate::object::{
-    EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize, Sha256Digest,
+    EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize, Sha256DigestExpectation,
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
@@ -47,12 +47,12 @@ fn typed_sha256_hashes_match_borrowed_digests() {
     let nar_hash = NarHash::parse(&hash).expect("NAR hash is valid");
     let file_hash = FileHash::parse(&hash).expect("file hash is valid");
 
-    assert!(nar_hash.matches_sha256_digest(&digest));
-    assert!(file_hash.matches_sha256_digest(&digest));
+    assert!(nar_hash.matches_digest(&digest));
+    assert!(file_hash.matches_digest(&digest));
     assert!(
         !NarHash::parse(NAR_ID)
             .expect("NAR hash is valid")
-            .matches_sha256_digest(&digest)
+            .matches_digest(&digest)
     );
 }
 

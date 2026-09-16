@@ -13,7 +13,7 @@ use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
 use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation};
 use crate::object::{
-    EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize, Sha256Digest,
+    EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize, Sha256DigestExpectation,
 };
 
 use super::{
@@ -47,13 +47,13 @@ impl Sha256Hasher {
         }
     }
 
-    fn matches<H: Sha256Digest>(&self, expected: &H) -> bool {
+    fn matches_expected_digest<H: Sha256DigestExpectation>(&self, expected: &H) -> bool {
         self.hasher
             .as_ref()
-            .is_some_and(|hasher| expected.matches_sha256_digest(&hasher.clone().finalize()))
+            .is_some_and(|hasher| expected.matches_digest(&hasher.clone().finalize()))
     }
 
-    fn finish(self) -> [u8; 32] {
+    fn finalize_digest(self) -> [u8; 32] {
         self.hasher
             .expect("a disabled SHA-256 hasher cannot be finished")
             .finalize()
@@ -87,7 +87,9 @@ impl<'a, R> CheckedUploadReader<'a, R> {
     }
 
     fn validate_observed_upload_hash_and_length(&self) -> io::Result<()> {
-        if self.bytes_read != self.expected_length || !self.hasher.matches(self.expected_hash) {
+        if self.bytes_read != self.expected_length
+            || !self.hasher.matches_expected_digest(self.expected_hash)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "NAR hash or size mismatch",
@@ -245,7 +247,7 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
 
     fn finish(self) -> DecodedValidation {
         DecodedValidation {
-            hash: NarHash::from_digest(self.hasher.finish()),
+            hash: NarHash::from_digest(self.hasher.finalize_digest()),
             size: NarSize::new(self.bytes_written),
         }
     }
@@ -547,8 +549,8 @@ impl<R> HashingReader<R> {
         }
     }
 
-    fn matches(self, expected: Option<&FileHash>) -> bool {
-        expected.is_none_or(|expected| self.hasher.matches(expected))
+    fn matches_expected_file_hash(self, expected: Option<&FileHash>) -> bool {
+        expected.is_none_or(|expected| self.hasher.matches_expected_digest(expected))
     }
 }
 
@@ -637,7 +639,7 @@ fn validate_decoded<R: Read>(
         }
         hasher.update(&buffer[..read]);
     }
-    let actual_nar_hash = NarHash::from_digest(hasher.finish());
+    let actual_nar_hash = NarHash::from_digest(hasher.finalize_digest());
     if expected_nar_hash.is_some_and(|expected_id| actual_nar_hash != *expected_id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -670,7 +672,7 @@ pub(super) fn validate_xz(
             "trailing bytes after XZ NAR",
         ));
     }
-    if !actual_file_hash.matches(expected_file_hash) {
+    if !actual_file_hash.matches_expected_file_hash(expected_file_hash) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "compressed NAR hash mismatch",
@@ -703,7 +705,7 @@ pub(super) fn validate_zstd(
             "trailing bytes after zstd NAR",
         ));
     }
-    if !actual_file_hash.matches(expected_file_hash) {
+    if !actual_file_hash.matches_expected_file_hash(expected_file_hash) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "compressed NAR hash mismatch",
@@ -712,7 +714,7 @@ pub(super) fn validate_zstd(
     Ok(decoded)
 }
 
-pub(super) fn file_matches<H: Sha256Digest>(
+pub(super) fn file_matches<H: Sha256DigestExpectation>(
     file: &File,
     expected_hash: &H,
     expected_size: u64,
@@ -731,7 +733,7 @@ pub(super) fn file_matches<H: Sha256Digest>(
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.matches(expected_hash))
+    Ok(hasher.matches_expected_digest(expected_hash))
 }
 
 pub(super) struct VerifiedCompressedNar<'file> {
