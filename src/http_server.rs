@@ -15,6 +15,11 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
 const RESPONSE_HEADERS: usize = 8;
 
+#[inline]
+fn find_header_delimiter(scanned: &[u8]) -> Option<usize> {
+    memchr::memmem::find(scanned, b"\r\n\r\n")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Method {
     Get,
@@ -201,12 +206,10 @@ impl BufferedHead {
 
         loop {
             let search_start = scanned_until.saturating_sub(3);
-            if let Some(offset) = buffer
+            let scanned = buffer
                 .get(search_start..received)
-                .expect("scanner bounds are within the header buffer")
-                .array_windows::<4>()
-                .position(|window| window == b"\r\n\r\n")
-            {
+                .expect("scanner bounds are within the header buffer");
+            if let Some(offset) = find_header_delimiter(scanned) {
                 let boundary = HeaderBoundary::detected(search_start + offset + 4, received);
                 return Ok(Self {
                     stream,
