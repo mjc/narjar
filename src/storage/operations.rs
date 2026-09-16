@@ -369,7 +369,7 @@ impl Storage {
 
         let expectation = EncodedUploadExpectation {
             expected_file_hash: &encoded_hash,
-            expected_file_size: encoded_size,
+            expected_file_size: encoded_size.into(),
             max_nar_size: policy.max_bytes,
         };
         let receipt = match Self::write_and_validate_compressed_upload(
@@ -469,8 +469,8 @@ impl Storage {
             return Err(StorageError::MissingNar);
         };
         let expected_size = match expectation {
-            NarExpectation::Raw { nar_size, .. } => nar_size,
-            NarExpectation::Compressed(expectation) => expectation.decoded_size,
+            NarExpectation::Raw { nar_size, .. } => nar_size.get(),
+            NarExpectation::Compressed(expectation) => expectation.decoded_size.get(),
         };
         if !nar_file_size_matches(&file, expected_size)? {
             return Err(StorageError::NarMismatch);
@@ -487,7 +487,7 @@ impl Storage {
         let Some(file) = open_optional_at(&nar_directory, OsStr::new(&payload_name))? else {
             return Ok(false);
         };
-        nar_file_size_matches(&file, narinfo.file_size()).map_err(Into::into)
+        nar_file_size_matches(&file, narinfo.file_size().get()).map_err(Into::into)
     }
 
     #[cfg(test)]

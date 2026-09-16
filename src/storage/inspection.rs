@@ -112,7 +112,7 @@ impl<'a> ReferencedPayload<'a> {
     }
 
     pub(crate) fn has_expected_size(&self) -> io::Result<bool> {
-        nar_file_size_matches(&self.file, self.expectation.encoded_size())
+        nar_file_size_matches(&self.file, self.expectation.encoded_size().get())
     }
 
     pub(crate) fn verify_content(self) -> io::Result<bool> {

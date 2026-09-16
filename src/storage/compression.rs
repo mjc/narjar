@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
 use crate::narinfo::{CompressedEncoding, CompressedNarExpectation, NarEncoding, NarExpectation};
-use crate::object::{FileHash, NarHash};
+use crate::object::{EncodedSize, FileHash, NarHash, NarSize};
 
 use super::{
     fs::filesystem_space,
@@ -207,7 +207,7 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
     fn finish(self) -> DecodedValidation {
         DecodedValidation {
             hash: NarHash::from_digest(self.hasher.finalize().into()),
-            size: self.bytes_written,
+            size: NarSize::new(self.bytes_written),
         }
     }
 }
@@ -260,7 +260,7 @@ fn copy_raw_upload_to_raw_staging<W: Write>(
     let mut input = CheckedUploadReader::new(
         source,
         expectation.expected_file_hash,
-        expectation.expected_file_size,
+        expectation.expected_file_size.get(),
     );
     let mut output = HashingWriter::new(destination, expectation.max_nar_size);
     io::copy(&mut input, &mut output)?;
@@ -277,7 +277,7 @@ fn decode_xz_upload_to_raw_staging<W: Write>(
     let input = CheckedUploadReader::new(
         source,
         expectation.expected_file_hash,
-        expectation.expected_file_size,
+        expectation.expected_file_size.get(),
     );
     let source_error = Rc::new(RefCell::new(None));
     let mut decoder = XzReader::new(
@@ -299,7 +299,7 @@ fn decode_zstd_upload_to_raw_staging<W: Write>(
     let input = CheckedUploadReader::new(
         source,
         expectation.expected_file_hash,
-        expectation.expected_file_size,
+        expectation.expected_file_size.get(),
     );
     let source_error = Rc::new(RefCell::new(None));
     let mut decoder =
@@ -315,7 +315,7 @@ fn decode_zstd_upload_to_raw_staging<W: Write>(
 #[derive(Clone, Copy)]
 pub(super) struct EncodedUploadExpectation<'a> {
     pub(super) expected_file_hash: &'a FileHash,
-    pub(super) expected_file_size: u64,
+    pub(super) expected_file_size: EncodedSize,
     pub(super) max_nar_size: u64,
 }
 
@@ -323,7 +323,7 @@ fn validate_raw_upload_identity(
     decoded: DecodedValidation,
     expectation: EncodedUploadExpectation<'_>,
 ) -> io::Result<DecodedValidation> {
-    if decoded.size == expectation.expected_file_size
+    if decoded.size.get() == expectation.expected_file_size.get()
         && expectation
             .expected_file_hash
             .matches_nar_hash(decoded.hash)
@@ -379,23 +379,23 @@ impl<R> CompressedSourceReader<R> {
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct DecodedValidation {
     pub(super) hash: NarHash,
-    pub(super) size: u64,
+    pub(super) size: NarSize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct IngestionReceipt {
     encoding: NarEncoding,
     encoded_hash: FileHash,
-    encoded_size: u64,
+    encoded_size: EncodedSize,
     decoded_hash: NarHash,
-    decoded_size: u64,
+    decoded_size: NarSize,
 }
 
 impl IngestionReceipt {
     pub(super) fn from_decoded(
         encoding: NarEncoding,
         encoded_hash: FileHash,
-        encoded_size: u64,
+        encoded_size: EncodedSize,
         decoded: DecodedValidation,
     ) -> Self {
         Self {
@@ -453,13 +453,13 @@ impl IngestionReceipt {
                     encoded_hash = Some(FileHash::parse(value).ok()?)
                 }
                 "encoded-size" if encoded_size.is_none() => {
-                    encoded_size = Some(value.parse().ok()?)
+                    encoded_size = Some(EncodedSize::new(value.parse().ok()?))
                 }
                 "decoded-hash" if decoded_hash.is_none() => {
                     decoded_hash = Some(NarHash::parse(value).ok()?)
                 }
                 "decoded-size" if decoded_size.is_none() => {
-                    decoded_size = Some(value.parse().ok()?)
+                    decoded_size = Some(NarSize::new(value.parse().ok()?))
                 }
                 _ => return None,
             }
@@ -630,7 +630,7 @@ fn validate_decoded<R: Read>(
     }
     Ok(DecodedValidation {
         hash: actual_nar_hash,
-        size: bytes_read,
+        size: NarSize::new(bytes_read),
     })
 }
 
@@ -732,7 +732,7 @@ pub(super) fn verify_encoded_compressed_file<'file, 'metadata>(
     if !file_matches(
         file,
         &expectation.encoded_hash.to_string(),
-        expectation.encoded_size,
+        expectation.encoded_size.get(),
     )? {
         return Ok(None);
     }
@@ -747,13 +747,13 @@ pub(super) fn verify_decoded_compressed_file(
             verified.file,
             Some(verified.expectation.decoded_hash),
             None,
-            verified.expectation.decoded_size,
+            verified.expectation.decoded_size.get(),
         ),
         CompressedEncoding::Xz => validate_xz(
             verified.file,
             Some(verified.expectation.decoded_hash),
             None,
-            verified.expectation.decoded_size,
+            verified.expectation.decoded_size.get(),
         ),
     };
     match validation {
@@ -785,7 +785,7 @@ pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation<'_>) -> 
     match expectation {
         NarExpectation::Raw { nar_hash, nar_size } => {
             let expected_hash = nar_hash.to_string();
-            file_matches(file, &expected_hash, nar_size)
+            file_matches(file, &expected_hash, nar_size.get())
         }
         NarExpectation::Compressed(expectation) => compressed_nar_matches(file, expectation),
     }

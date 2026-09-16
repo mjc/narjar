@@ -26,7 +26,7 @@ use super::{
     StorageError, StoreHash, capacity_error_kind,
 };
 use crate::narinfo::{CompressedEncoding, CompressedNarExpectation, NarEncoding};
-use crate::object::{FileHash, NarHash};
+use crate::object::{EncodedSize, FileHash, NarHash, NarSize};
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::encoding::{CompressionLevel, compress};
@@ -85,7 +85,7 @@ fn normalized_compressed_source_errors_remain_io_errors() {
             encoding,
             super::compression::EncodedUploadExpectation {
                 expected_file_hash: &FileHash::parse(NAR_ID).expect("file hash is valid"),
-                expected_file_size: 3,
+                expected_file_size: EncodedSize::new(3),
                 max_nar_size: u64::MAX,
             },
             &mut destination,
@@ -154,7 +154,7 @@ fn xz_validation_checks_compressed_and_decompressed_hashes_together() {
             .expect("validate XZ NAR"),
         DecodedValidation {
             hash: nar_hash,
-            size: raw.len() as u64,
+            size: NarSize::new(raw.len() as u64),
         }
     );
     assert_eq!(
@@ -162,7 +162,7 @@ fn xz_validation_checks_compressed_and_decompressed_hashes_together() {
             .expect("validate already-hashed XZ NAR"),
         DecodedValidation {
             hash: nar_hash,
-            size: raw.len() as u64,
+            size: NarSize::new(raw.len() as u64),
         }
     );
 }
@@ -185,8 +185,8 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
         let path = directory.path().join("compressed-nar");
         fs::write(&path, &compressed).unwrap();
         let file_hash = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).unwrap();
-        let file_size = compressed.len() as u64;
-        let nar_size = raw.len() as u64;
+        let file_size = EncodedSize::new(compressed.len() as u64);
+        let nar_size = NarSize::new(raw.len() as u64);
         let matches = |encoded_hash, decoded_hash, encoded_size, decoded_size| {
             let expectation = CompressedNarExpectation {
                 encoding: match encoding {
@@ -210,8 +210,18 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
         assert!(matches(&file_hash, &nar_hash, file_size, nar_size));
         assert!(!matches(&wrong_file_hash, &nar_hash, file_size, nar_size));
         assert!(!matches(&file_hash, &wrong_nar_hash, file_size, nar_size));
-        assert!(!matches(&file_hash, &nar_hash, file_size + 1, nar_size));
-        assert!(!matches(&file_hash, &nar_hash, file_size, nar_size + 1));
+        assert!(!matches(
+            &file_hash,
+            &nar_hash,
+            EncodedSize::new(file_size.get() + 1),
+            nar_size
+        ));
+        assert!(!matches(
+            &file_hash,
+            &nar_hash,
+            file_size,
+            NarSize::new(nar_size.get() + 1)
+        ));
     }
 }
 

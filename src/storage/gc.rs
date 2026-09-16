@@ -223,7 +223,7 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
                 io::ErrorKind::NotFound => invalid(format!("missing NAR for narinfo: {name_str}")),
                 _ => error.into(),
             })?;
-        if nar_metadata.len() != validated.file_size() {
+        if nar_metadata.len() != validated.file_size().get() {
             return Err(invalid(format!(
                 "NAR size mismatch for narinfo: {name_str}"
             )));
