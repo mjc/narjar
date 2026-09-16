@@ -253,7 +253,7 @@ impl Storage {
         }
 
         match encoding {
-            NarEncoding::None => self.publish_raw_nar_upload(id, source, expected_length),
+            NarEncoding::Raw => self.publish_raw_nar_upload(id, source, expected_length),
             NarEncoding::Xz => {
                 self.publish_xz_nar_upload(id, source, expected_length, policy, &mut staging)
             }
@@ -272,7 +272,7 @@ impl Storage {
         let file_hash =
             FileHash::parse(id.as_str()).expect("validated upload path is a SHA-256 file hash");
         self.publish_with_admission(
-            PublishTarget::Nar(id, NarEncoding::None),
+            PublishTarget::Nar(id, NarEncoding::Raw),
             CheckedUploadReader::new(source, &file_hash, expected_length),
             || Ok(()),
             |_| Ok(()),
@@ -341,7 +341,7 @@ impl Storage {
         } = staging;
 
         let outcome = self.commit_temporary(
-            PublishTarget::Nar(&raw_id, NarEncoding::None),
+            PublishTarget::Nar(&raw_id, NarEncoding::Raw),
             temporary,
             transaction,
             |_| Ok(()),
@@ -431,7 +431,7 @@ impl Storage {
         id: &NarObjectId,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish(PublishTarget::Nar(id, NarEncoding::None), source)
+        self.publish(PublishTarget::Nar(id, NarEncoding::Raw), source)
     }
 
     #[cfg(test)]
@@ -442,7 +442,7 @@ impl Storage {
         fault: PublishBoundary,
     ) -> Result<PublishOutcome, StorageError> {
         self.publish_with(
-            PublishTarget::Nar(id, NarEncoding::None),
+            PublishTarget::Nar(id, NarEncoding::Raw),
             source,
             |boundary| injected_fault(boundary, fault),
         )
@@ -527,7 +527,7 @@ impl Storage {
     }
 
     pub fn open_nar(&self, nar: &NarObjectId) -> Result<Option<File>, StorageError> {
-        self.open_nar_encoded(nar, NarEncoding::None)
+        self.open_nar_encoded(nar, NarEncoding::Raw)
     }
 
     pub fn open_nar_encoded(

@@ -287,10 +287,10 @@ impl ReadRoute {
                 return RouteMatch::Found(Self::Nar(id, NarEncoding::Xz));
             }
             return match path
-                .strip_suffix(NarEncoding::None.suffix())
+                .strip_suffix(NarEncoding::Raw.suffix())
                 .and_then(|id| NarObjectId::parse(id).ok())
             {
-                Some(id) => RouteMatch::Found(Self::Nar(id, NarEncoding::None)),
+                Some(id) => RouteMatch::Found(Self::Nar(id, NarEncoding::Raw)),
                 None => RouteMatch::Invalid,
             };
         }
@@ -372,7 +372,7 @@ impl PublicationRequest {
     pub fn staging_bytes(&self, max_nar_bytes: u64) -> Option<u64> {
         let length = u64::try_from(self.request.body_length()?).ok()?;
         match &self.route {
-            WriteRoute::Nar(_, NarEncoding::None) if length <= max_nar_bytes => Some(length),
+            WriteRoute::Nar(_, NarEncoding::Raw) if length <= max_nar_bytes => Some(length),
             WriteRoute::Nar(_, NarEncoding::Zstd | NarEncoding::Xz) if length <= max_nar_bytes => {
                 Some(length)
             }
@@ -849,7 +849,7 @@ mod tests {
             ReadRoute::classify(
                 "/main/nar/0000000000000000000000000000000000000000000000000000.nar"
             ),
-            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::None))
+            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::Raw))
         ));
     }
 

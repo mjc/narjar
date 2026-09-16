@@ -130,7 +130,7 @@ impl NarIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum WireEncoding {
-    None,
+    Raw,
     Zstd,
     Xz,
 }
@@ -138,7 +138,7 @@ pub enum WireEncoding {
 impl WireEncoding {
     pub(crate) const fn compression(self) -> &'static str {
         match self {
-            Self::None => "none",
+            Self::Raw => "none",
             Self::Zstd => "zstd",
             Self::Xz => "xz",
         }
@@ -146,7 +146,7 @@ impl WireEncoding {
 
     pub(crate) const fn suffix(self) -> &'static str {
         match self {
-            Self::None => ".nar",
+            Self::Raw => ".nar",
             Self::Zstd => ".nar.zst",
             Self::Xz => ".nar.xz",
         }

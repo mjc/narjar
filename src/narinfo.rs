@@ -201,7 +201,7 @@ impl ParsedNarInfo {
             .strip_prefix("sha256:")
             .and_then(|value| NarHash::parse(value).ok())
             .ok_or(NarInfoError)?;
-        if *encoding == NarEncoding::None && nar_hash.to_string() != file_hash.to_string() {
+        if *encoding == NarEncoding::Raw && nar_hash.to_string() != file_hash.to_string() {
             return Err(NarInfoError);
         }
 
@@ -211,7 +211,7 @@ impl ParsedNarInfo {
         let nar_size = required("NarSize")?
             .parse::<u64>()
             .map_err(|_| NarInfoError)?;
-        if nar_size == 0 || (*encoding == NarEncoding::None && file_size != nar_size) {
+        if nar_size == 0 || (*encoding == NarEncoding::Raw && file_size != nar_size) {
             return Err(NarInfoError);
         }
 
@@ -325,7 +325,7 @@ impl ValidatedNarInfo {
             })
         };
         match self.encoding() {
-            NarEncoding::None => NarExpectation::Raw {
+            NarEncoding::Raw => NarExpectation::Raw {
                 nar_hash: self.nar(),
                 nar_size: self.0.identity.size(),
             },
@@ -340,7 +340,7 @@ impl ValidatedNarInfo {
 
     pub(crate) fn into_raw_bytes(self) -> Vec<u8> {
         let text = std::str::from_utf8(&self.0.bytes).expect("validated narinfo is UTF-8");
-        let raw_url = format!("nar/{}{}", self.0.identity.hash, NarEncoding::None.suffix());
+        let raw_url = format!("nar/{}{}", self.0.identity.hash, NarEncoding::Raw.suffix());
         let raw_file_hash = format!("sha256:{}", self.0.identity.hash);
         text.strip_suffix('\n')
             .expect("validated narinfo ends with a newline")

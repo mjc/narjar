@@ -53,7 +53,7 @@ pub(crate) struct NarFileName {
 
 impl NarFileName {
     pub(crate) fn parse(name: &str) -> Result<Self, InvalidObjectId> {
-        [NarEncoding::Zstd, NarEncoding::Xz, NarEncoding::None]
+        [NarEncoding::Zstd, NarEncoding::Xz, NarEncoding::Raw]
             .into_iter()
             .find_map(|encoding| {
                 name.strip_suffix(encoding.suffix()).map(|hash| {

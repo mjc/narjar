@@ -192,7 +192,7 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
                 encoding: match encoding {
                     NarEncoding::Xz => CompressedEncoding::Xz,
                     NarEncoding::Zstd => CompressedEncoding::Zstd,
-                    NarEncoding::None => {
+                    NarEncoding::Raw => {
                         unreachable!("test only supplies compressed encodings")
                     }
                 },
@@ -545,7 +545,7 @@ fn nar_publication_uses_a_destination_local_temporary_directory() {
     let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
 
     let temporary = storage
-        .create_temp(&PublishTarget::Nar(&nar, NarEncoding::None))
+        .create_temp(&PublishTarget::Nar(&nar, NarEncoding::Raw))
         .expect("create NAR temporary publication file");
     assert_eq!(
         fs::read_dir(storage.layout().temp_dir())
@@ -893,7 +893,7 @@ fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
         std::thread::spawn(move || {
             let nar = NarObjectId::parse(NAR_ID).expect("valid NAR object id");
             storage.publish_with(
-                PublishTarget::Nar(&nar, NarEncoding::None),
+                PublishTarget::Nar(&nar, NarEncoding::Raw),
                 Cursor::new(b"nar bytes"),
                 |boundary| {
                     if boundary == PublishBoundary::BeforeParentSync {
@@ -1192,7 +1192,7 @@ fn independent_publications_do_not_wait_for_another_body() {
         let storage = Arc::clone(&storage);
         std::thread::spawn(move || {
             storage.publish_with(
-                PublishTarget::Nar(&first, NarEncoding::None),
+                PublishTarget::Nar(&first, NarEncoding::Raw),
                 BlockingReader {
                     started: Some(started_tx),
                     release: release_rx,

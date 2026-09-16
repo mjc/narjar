@@ -242,7 +242,7 @@ pub(super) fn write_uploaded_representation_as_raw_nar<W: Write>(
     destination: &mut W,
 ) -> io::Result<DecodedValidation> {
     match encoding {
-        NarEncoding::None => copy_raw_upload_to_raw_staging(source, expectation, destination),
+        NarEncoding::Raw => copy_raw_upload_to_raw_staging(source, expectation, destination),
         NarEncoding::Xz => decode_xz_upload_to_raw_staging(source, expectation, destination),
         NarEncoding::Zstd => decode_zstd_upload_to_raw_staging(source, expectation, destination),
     }
