@@ -4,7 +4,6 @@ use std::{
     fmt,
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
-    marker::PhantomData,
     rc::Rc,
 };
 
@@ -13,49 +12,82 @@ use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 
 use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation};
-use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
+use crate::object::{
+    EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize, Sha256Digest,
+};
 
 use super::{
     fs::filesystem_space,
-    ids::nix32_sha256_matches,
     publication::{StagingReservation, StorageError},
 };
 
 const INGESTION_RECEIPT_VERSION: u8 = 1;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
-pub(super) struct CheckedUploadReader<'a, R, State = Receiving> {
+struct Sha256Hasher {
+    hasher: Option<Sha256>,
+}
+
+impl Sha256Hasher {
+    fn new() -> Self {
+        Self {
+            hasher: Some(Sha256::new()),
+        }
+    }
+
+    fn new_if(enabled: bool) -> Self {
+        Self {
+            hasher: enabled.then(Sha256::new),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        if let Some(hasher) = &mut self.hasher {
+            hasher.update(bytes);
+        }
+    }
+
+    fn matches<H: Sha256Digest>(&self, expected: &H) -> bool {
+        self.hasher
+            .as_ref()
+            .is_some_and(|hasher| expected.matches_sha256_digest(&hasher.clone().finalize()))
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.hasher
+            .expect("a disabled SHA-256 hasher cannot be finished")
+            .finalize()
+            .into()
+    }
+}
+
+pub(super) struct CheckedUploadReader<'a, R> {
     inner: R,
     expected_hash: &'a FileHash,
     expected_length: u64,
     bytes_read: u64,
-    hasher: Sha256,
+    hasher: Sha256Hasher,
     upload_end_validated: bool,
-    state: PhantomData<State>,
 }
 
-pub(super) struct Receiving;
-pub(super) struct Complete;
+pub(super) struct CompleteUpload<R> {
+    inner: R,
+}
 
-impl<'a, R> CheckedUploadReader<'a, R, Receiving> {
+impl<'a, R> CheckedUploadReader<'a, R> {
     pub(super) fn new(inner: R, expected_hash: &'a FileHash, expected_length: u64) -> Self {
         Self {
             inner,
             expected_hash,
             expected_length,
             bytes_read: 0,
-            hasher: Sha256::new(),
+            hasher: Sha256Hasher::new(),
             upload_end_validated: false,
-            state: PhantomData,
         }
     }
 
     fn validate_observed_upload_hash_and_length(&self) -> io::Result<()> {
-        if self.bytes_read != self.expected_length
-            || !self
-                .expected_hash
-                .matches_digest(&self.hasher.clone().finalize())
-        {
+        if self.bytes_read != self.expected_length || !self.hasher.matches(self.expected_hash) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "NAR hash or size mismatch",
@@ -64,13 +96,15 @@ impl<'a, R> CheckedUploadReader<'a, R, Receiving> {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> io::Result<CheckedUploadReader<'a, R, Complete>>
+    pub(super) fn finish(self) -> io::Result<CompleteUpload<R>>
     where
         R: Read,
     {
         let mut receiving = self;
         receiving.ensure_upload_end_was_consumed()?;
-        Ok(receiving.into_complete_state())
+        Ok(CompleteUpload {
+            inner: receiving.inner,
+        })
     }
 
     fn ensure_upload_end_was_consumed(&mut self) -> io::Result<()>
@@ -96,27 +130,15 @@ impl<'a, R> CheckedUploadReader<'a, R, Receiving> {
         self.upload_end_validated = true;
         Ok(())
     }
-
-    fn into_complete_state(self) -> CheckedUploadReader<'a, R, Complete> {
-        CheckedUploadReader {
-            inner: self.inner,
-            expected_hash: self.expected_hash,
-            expected_length: self.expected_length,
-            bytes_read: self.bytes_read,
-            hasher: self.hasher,
-            upload_end_validated: true,
-            state: PhantomData,
-        }
-    }
 }
 
-impl<R> CheckedUploadReader<'_, R, Complete> {
+impl<R> CompleteUpload<R> {
     fn into_inner(self) -> R {
         self.inner
     }
 }
 
-impl<R: Read> Read for CheckedUploadReader<'_, R, Receiving> {
+impl<R: Read> Read for CheckedUploadReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.upload_end_validated {
             return Ok(0);
@@ -206,7 +228,7 @@ fn storage_capacity_error(error: StorageError) -> io::Error {
 
 struct HashingWriter<'a, W: Write + ?Sized> {
     inner: &'a mut W,
-    hasher: Sha256,
+    hasher: Sha256Hasher,
     bytes_written: u64,
     max_bytes: u64,
 }
@@ -215,7 +237,7 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
     fn new(inner: &'a mut W, max_bytes: u64) -> Self {
         Self {
             inner,
-            hasher: Sha256::new(),
+            hasher: Sha256Hasher::new(),
             bytes_written: 0,
             max_bytes,
         }
@@ -223,7 +245,7 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
 
     fn finish(self) -> DecodedValidation {
         DecodedValidation {
-            hash: NarHash::from_digest(self.hasher.finalize().into()),
+            hash: NarHash::from_digest(self.hasher.finish()),
             size: NarSize::new(self.bytes_written),
         }
     }
@@ -375,7 +397,7 @@ fn finish_encoded_upload_after_decoding<R: Read>(
 
 struct HashingReader<R> {
     inner: R,
-    hasher: Option<Sha256>,
+    hasher: Sha256Hasher,
 }
 
 struct CompressedSourceReader<R> {
@@ -521,16 +543,12 @@ impl<R> HashingReader<R> {
     fn new(inner: R, enabled: bool) -> Self {
         Self {
             inner,
-            hasher: enabled.then(Sha256::new),
+            hasher: Sha256Hasher::new_if(enabled),
         }
     }
 
-    fn matches(self, expected: Option<&str>) -> bool {
-        match (self.hasher, expected) {
-            (None, None) => true,
-            (Some(hasher), Some(expected)) => nix32_sha256_matches(&hasher.finalize(), expected),
-            _ => false,
-        }
+    fn matches(self, expected: Option<&FileHash>) -> bool {
+        expected.is_none_or(|expected| self.hasher.matches(expected))
     }
 }
 
@@ -540,9 +558,7 @@ impl<R: Read> Read for HashingReader<R> {
             .inner
             .read(buffer)
             .map_err(|error| io::Error::other(CompressedSourceError(error)))?;
-        if let Some(hasher) = &mut self.hasher {
-            hasher.update(&buffer[..read]);
-        }
+        self.hasher.update(&buffer[..read]);
         Ok(read)
     }
 }
@@ -602,7 +618,7 @@ fn validate_decoded<R: Read>(
     expected_nar_hash: Option<&NarHash>,
     max_bytes: u64,
 ) -> io::Result<DecodedValidation> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha256Hasher::new();
     let mut bytes_read = 0u64;
     let mut buffer = [0; 64 * 1024];
     loop {
@@ -621,7 +637,7 @@ fn validate_decoded<R: Read>(
         }
         hasher.update(&buffer[..read]);
     }
-    let actual_nar_hash = NarHash::from_digest(hasher.finalize().into());
+    let actual_nar_hash = NarHash::from_digest(hasher.finish());
     if expected_nar_hash.is_some_and(|expected_id| actual_nar_hash != *expected_id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -654,8 +670,7 @@ pub(super) fn validate_xz(
             "trailing bytes after XZ NAR",
         ));
     }
-    let expected_file_hash = expected_file_hash.map(ToString::to_string);
-    if !actual_file_hash.matches(expected_file_hash.as_deref()) {
+    if !actual_file_hash.matches(expected_file_hash) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "compressed NAR hash mismatch",
@@ -688,8 +703,7 @@ pub(super) fn validate_zstd(
             "trailing bytes after zstd NAR",
         ));
     }
-    let expected_file_hash = expected_file_hash.map(ToString::to_string);
-    if !actual_file_hash.matches(expected_file_hash.as_deref()) {
+    if !actual_file_hash.matches(expected_file_hash) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "compressed NAR hash mismatch",
@@ -698,9 +712,9 @@ pub(super) fn validate_zstd(
     Ok(decoded)
 }
 
-pub(super) fn file_matches(
+pub(super) fn file_matches<H: Sha256Digest>(
     file: &File,
-    expected_hash: &str,
+    expected_hash: &H,
     expected_size: u64,
 ) -> io::Result<bool> {
     if file.metadata()?.len() != expected_size {
@@ -708,7 +722,7 @@ pub(super) fn file_matches(
     }
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha256Hasher::new();
     let mut buffer = [0; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
@@ -717,7 +731,7 @@ pub(super) fn file_matches(
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(nix32_sha256_matches(&hasher.finalize(), expected_hash))
+    Ok(hasher.matches(expected_hash))
 }
 
 pub(super) struct VerifiedCompressedNar<'file> {
@@ -731,7 +745,7 @@ pub(super) fn verify_encoded_compressed_file<'file>(
 ) -> io::Result<Option<VerifiedCompressedNar<'file>>> {
     if !file_matches(
         file,
-        &expectation.encoded.hash().to_string(),
+        &expectation.encoded.hash(),
         expectation.encoded.size().get(),
     )? {
         return Ok(None);
@@ -818,8 +832,7 @@ pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation) -> io::
 }
 
 fn raw_nar_file_matches(file: &File, identity: NarIdentity) -> io::Result<bool> {
-    let expected_hash = identity.hash().to_string();
-    file_matches(file, &expected_hash, identity.size().get())
+    file_matches(file, &identity.hash(), identity.size().get())
 }
 
 pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Result<bool> {

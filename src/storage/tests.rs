@@ -19,14 +19,16 @@ use super::compression::{
     write_uploaded_representation_as_raw_nar,
 };
 use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes, sync_dir};
-use super::ids::{nix32_sha256, nix32_sha256_matches};
+use super::ids::nix32_sha256;
 use super::publication::{Layout, PublishBoundary, PublishTarget};
 use super::{
     CapacityErrorKind, Directory, NarObjectId, PublishOutcome, ReconcileClass, Storage,
     StorageError, StoreHash, capacity_error_kind,
 };
 use crate::narinfo::{CompressedNarExpectation, NarEncoding};
-use crate::object::{EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
+use crate::object::{
+    EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarSize, Sha256Digest,
+};
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::encoding::{CompressionLevel, compress};
@@ -39,12 +41,19 @@ fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
 }
 
 #[test]
-fn nix32_sha256_matches_borrowed_hashes() {
+fn typed_sha256_hashes_match_borrowed_digests() {
     let digest = Sha256::digest(b"nar bytes");
     let hash = nix32_sha256(&digest);
+    let nar_hash = NarHash::parse(&hash).expect("NAR hash is valid");
+    let file_hash = FileHash::parse(&hash).expect("file hash is valid");
 
-    assert!(nix32_sha256_matches(&digest, &hash));
-    assert!(!nix32_sha256_matches(&digest, NAR_ID));
+    assert!(nar_hash.matches_sha256_digest(&digest));
+    assert!(file_hash.matches_sha256_digest(&digest));
+    assert!(
+        !NarHash::parse(NAR_ID)
+            .expect("NAR hash is valid")
+            .matches_sha256_digest(&digest)
+    );
 }
 
 #[test]

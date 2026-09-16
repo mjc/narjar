@@ -1,8 +1,7 @@
+#[cfg(test)]
 use data_encoding::{BitOrder, Encoding, Specification};
-use sha2::{Digest, Sha256};
 
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
-const NIX32_SHA256_LEN: usize = 52;
 
 pub use crate::object::InvalidObjectId;
 
@@ -46,6 +45,7 @@ fn valid_nix32(value: &str, expected_len: usize) -> bool {
     value.len() == expected_len && value.bytes().all(|byte| NIX32.as_bytes().contains(&byte))
 }
 
+#[cfg(test)]
 fn nix32_encoding() -> &'static Encoding {
     static ENCODING: std::sync::OnceLock<Encoding> = std::sync::OnceLock::new();
     ENCODING.get_or_init(|| {
@@ -65,15 +65,4 @@ pub(crate) fn nix32_sha256(digest: &[u8]) -> String {
     encoding.encode_mut(digest, &mut encoded);
     encoded.reverse();
     String::from_utf8(encoded).expect("Nix base32 encoding is ASCII")
-}
-
-pub(crate) fn nix32_sha256_matches(digest: &[u8], expected: &str) -> bool {
-    if digest.len() != Sha256::output_size() || expected.len() != NIX32_SHA256_LEN {
-        return false;
-    }
-
-    let mut encoded = [0; NIX32_SHA256_LEN];
-    nix32_encoding().encode_mut(digest, &mut encoded);
-    encoded.reverse();
-    expected.as_bytes() == encoded
 }
