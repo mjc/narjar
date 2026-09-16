@@ -725,27 +725,55 @@ pub(super) fn verify_encoded_compressed_file<'file>(
 pub(super) fn verify_decoded_compressed_file(
     verified: VerifiedCompressedNar<'_>,
 ) -> io::Result<Option<DecodedValidation>> {
-    let validation = match verified.expectation.encoded.encoding() {
-        NarEncoding::Zstd => validate_zstd(
-            verified.file,
-            Some(&verified.expectation.decoded.hash()),
-            None,
-            verified.expectation.decoded.size().get(),
-        ),
-        NarEncoding::Xz => validate_xz(
-            verified.file,
-            Some(&verified.expectation.decoded.hash()),
-            None,
-            verified.expectation.decoded.size().get(),
-        ),
-        NarEncoding::Raw => unreachable!("raw uploads do not use compressed verification"),
-    };
-    match validation {
-        Ok(decoded) if decoded.size == verified.expectation.decoded.size() => Ok(Some(decoded)),
-        Ok(_) => Ok(None),
+    let decoded = decode_compressed_payload_for_nar_identity(&verified)?;
+    Ok(decoded.and_then(|decoded| {
+        decoded_nar_with_expected_size(decoded, verified.expectation.decoded.size())
+    }))
+}
+
+fn decode_compressed_payload_for_nar_identity(
+    verified: &VerifiedCompressedNar<'_>,
+) -> io::Result<Option<DecodedValidation>> {
+    match validate_compressed_payload_for_nar_identity(verified) {
+        Ok(decoded) => Ok(Some(decoded)),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn validate_compressed_payload_for_nar_identity(
+    verified: &VerifiedCompressedNar<'_>,
+) -> io::Result<DecodedValidation> {
+    match verified.expectation.encoded.encoding() {
+        NarEncoding::Zstd => {
+            validate_zstd_payload_against_nar_identity(verified.file, verified.expectation.decoded)
+        }
+        NarEncoding::Xz => {
+            validate_xz_payload_against_nar_identity(verified.file, verified.expectation.decoded)
+        }
+        NarEncoding::Raw => unreachable!("raw uploads do not use compressed verification"),
+    }
+}
+
+fn decoded_nar_with_expected_size(
+    decoded: DecodedValidation,
+    expected_size: NarSize,
+) -> Option<DecodedValidation> {
+    (decoded.size == expected_size).then_some(decoded)
+}
+
+fn validate_xz_payload_against_nar_identity(
+    file: &File,
+    identity: NarIdentity,
+) -> io::Result<DecodedValidation> {
+    validate_xz(file, Some(&identity.hash()), None, identity.size().get())
+}
+
+fn validate_zstd_payload_against_nar_identity(
+    file: &File,
+    identity: NarIdentity,
+) -> io::Result<DecodedValidation> {
+    validate_zstd(file, Some(&identity.hash()), None, identity.size().get())
 }
 
 pub(super) fn validate_compressed_nar(
@@ -767,12 +795,21 @@ pub(super) fn compressed_nar_matches(
 
 pub(crate) fn nar_file_matches(file: &File, expectation: NarExpectation) -> io::Result<bool> {
     match expectation {
-        NarExpectation::Raw(identity) => {
-            let expected_hash = identity.hash().to_string();
-            file_matches(file, &expected_hash, identity.size().get())
-        }
-        NarExpectation::Compressed(expectation) => compressed_nar_matches(file, expectation),
+        NarExpectation::Raw(identity) => raw_nar_file_matches(file, identity),
+        NarExpectation::Compressed(expectation) => compressed_nar_file_matches(file, expectation),
     }
+}
+
+fn raw_nar_file_matches(file: &File, identity: NarIdentity) -> io::Result<bool> {
+    let expected_hash = identity.hash().to_string();
+    file_matches(file, &expected_hash, identity.size().get())
+}
+
+fn compressed_nar_file_matches(
+    file: &File,
+    expectation: CompressedNarExpectation,
+) -> io::Result<bool> {
+    compressed_nar_matches(file, expectation)
 }
 
 pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Result<bool> {

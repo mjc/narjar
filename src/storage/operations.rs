@@ -15,7 +15,7 @@ use std::{
 };
 
 use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation, ValidatedNarInfo};
-use crate::object::FileHash;
+use crate::object::{FileHash, NarIdentity};
 
 use super::{
     compression::{
@@ -453,16 +453,7 @@ impl Storage {
         store: &StoreHash,
         narinfo: ValidatedNarInfo,
     ) -> Result<PublishOutcome, StorageError> {
-        let expectation = narinfo.payload_expectation();
-        let raw_identity = match expectation {
-            NarExpectation::Raw(identity) => identity,
-            NarExpectation::Compressed(expectation) => {
-                let Some(receipt) = self.read_ingestion_receipt(expectation)? else {
-                    return Err(StorageError::NarMismatch);
-                };
-                receipt.decoded_identity()
-            }
-        };
+        let raw_identity = self.resolve_raw_identity_for_narinfo(narinfo.payload_expectation())?;
         let raw_id = NarObjectId::parse(&raw_identity.hash().to_string())
             .expect("binary SHA-256 Nix hash formats as a valid object ID");
         let Some(file) = self.open_nar(&raw_id)? else {
@@ -475,6 +466,28 @@ impl Storage {
             PublishTarget::NarInfo(store),
             Cursor::new(narinfo.into_raw_bytes()),
         )
+    }
+
+    fn resolve_raw_identity_for_narinfo(
+        &self,
+        expectation: NarExpectation,
+    ) -> Result<NarIdentity, StorageError> {
+        match expectation {
+            NarExpectation::Raw(identity) => Ok(identity),
+            NarExpectation::Compressed(expectation) => {
+                self.resolve_raw_identity_from_ingestion_receipt(expectation)
+            }
+        }
+    }
+
+    fn resolve_raw_identity_from_ingestion_receipt(
+        &self,
+        expectation: CompressedNarExpectation,
+    ) -> Result<NarIdentity, StorageError> {
+        let Some(receipt) = self.read_ingestion_receipt(expectation)? else {
+            return Err(StorageError::NarMismatch);
+        };
+        Ok(receipt.decoded_identity())
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {
