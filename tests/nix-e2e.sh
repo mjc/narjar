@@ -153,6 +153,7 @@ native_push_with_compression() {
   shift
   run narjar push \
     --netrc-file "$netrc" \
+    --insecure-http \
     --to "$server_url?compression=$compression" \
     --compression "$compression" \
     "$@"
@@ -162,6 +163,7 @@ native_push_refresh() {
   run narjar push \
     --refresh \
     --netrc-file "$netrc" \
+    --insecure-http \
     --to "$server_url?compression=none" \
     --compression none \
     "$@"
@@ -339,9 +341,11 @@ wait "$interrupted_pid" || true
 expect_missing "$data_dir/$interrupted_url"
 
 scenario 'restart during publication'
-restart_url="$ca_nar_url"
+restart_path=$(build_path restart "$nonce")
 restart_source="$temp_root/restart.nar"
-run mv "$ca_nar_file" "$restart_source"
+run nix_cli store dump-path -- "$restart_path" > "$restart_source"
+restart_hash=$(nix_cli hash file --type sha256 --base32 "$restart_source")
+restart_url="nar/$restart_hash.nar"
 cache_curl --limit-rate 65536 \
   --upload-file "$restart_source" \
   "$server_url/$restart_url" \

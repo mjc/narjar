@@ -961,7 +961,7 @@ pub(crate) fn stats(options: Stats) -> Result<(), Error> {
     let authorization = options
         .netrc_file
         .as_deref()
-        .map(|path| netrc_authorization(path, &options.url))
+        .map(|path| netrc_authorization(path, &options.url, false))
         .transpose()?
         .flatten();
     let metrics_url = options.url.endpoint(&["metrics"]);
@@ -993,8 +993,12 @@ pub(crate) fn stats(options: Stats) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn netrc_authorization(path: &Path, url: &HttpUrl) -> Result<Option<String>, Error> {
-    if !url.is_https() {
+pub(crate) fn netrc_authorization(
+    path: &Path,
+    url: &HttpUrl,
+    allow_insecure_http: bool,
+) -> Result<Option<String>, Error> {
+    if !url.is_https() && !allow_insecure_http {
         return Ok(None);
     }
 
@@ -1147,9 +1151,16 @@ machine other.example password other-secret
             .parse()
             .expect("HTTPS URL should parse");
 
-        assert_eq!(netrc_authorization(file.path(), &http).unwrap(), None);
         assert_eq!(
-            netrc_authorization(file.path(), &https).unwrap(),
+            netrc_authorization(file.path(), &http, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            netrc_authorization(file.path(), &https, false).unwrap(),
+            Some(BASE64.encode(b"cache-user:cache-secret"))
+        );
+        assert_eq!(
+            netrc_authorization(file.path(), &http, true).unwrap(),
             Some(BASE64.encode(b"cache-user:cache-secret"))
         );
     }

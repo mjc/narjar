@@ -201,6 +201,7 @@ mod tests {
             "4",
             "--netrc-file",
             "/tmp/netrc",
+            "--insecure-http",
             "--signing-key-file",
             "/tmp/narjar-secret-key",
             "/run/current-system",
