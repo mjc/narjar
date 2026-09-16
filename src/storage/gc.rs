@@ -638,7 +638,6 @@ fn apply_with_failure(
             unlink_at(&nar_directory, &entry.nar_name)?;
             fail_if(failure, FailurePoint::AfterNarDeleteBeforeSync)?;
             nar_directory.sync_all()?;
-            storage.remove_validation_evidence_for_nar(&entry.nar_name)?;
             deleted_nars += 1;
         }
     }

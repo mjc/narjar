@@ -318,10 +318,15 @@ fn valid_temp_filename(name: &OsStr) -> bool {
     let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".part")) else {
         return false;
     };
-    let Some(body) = ["cache-info-", "nar-", "narinfo-", "realisation-"]
-        .into_iter()
-        .find_map(|prefix| stem.strip_prefix(prefix))
-    else {
+    let Some(body) = [
+        "cache-info-",
+        "nar-",
+        "narinfo-",
+        "realisation-",
+        "validation-",
+    ]
+    .into_iter()
+    .find_map(|prefix| stem.strip_prefix(prefix)) else {
         return false;
     };
     !body.is_empty()

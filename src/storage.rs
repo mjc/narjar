@@ -756,6 +756,13 @@ impl PublishTarget<'_> {
             Self::Validation(_) => "validation",
         }
     }
+
+    fn replaces_destination(&self) -> bool {
+        match self {
+            Self::Validation(_) => true,
+            Self::CacheInfo | Self::Nar(_, _) | Self::NarInfo(_) => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1145,13 +1152,14 @@ impl Storage {
         let mut bytes = Vec::new();
         file.take(MAX_VALIDATION_EVIDENCE_BYTES + 1)
             .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_VALIDATION_EVIDENCE_BYTES {
+            return Ok(None);
+        }
         if let Some(evidence) =
             ValidationEvidence::parse(&bytes).filter(|evidence| evidence.matches(expectation))
         {
             return Ok(Some(evidence));
         }
-        unlink_at(&directory, &name)?;
-        directory.sync_all()?;
         Ok(None)
     }
 
@@ -1316,6 +1324,7 @@ impl Storage {
         let destination_directory = self.destination_directory(&target)?;
         let destination_name = target.destination_name();
         let destination_key = self.destination_key(&target, &destination_name);
+        let replace_destination = target.replaces_destination();
         let temp_name = self.next_temp_name(&target);
         let temporary_path = self.temporary_path(&target, &temp_name);
         let mut transaction = self.recovery.begin(&temporary_path)?;
@@ -1323,6 +1332,7 @@ impl Storage {
         let mut temp = self.create_temp_named(&target, temp_name)?;
         transaction.transition(PublicationState::Streaming)?;
         let mut durable = false;
+        let mut temp_moved = false;
         let result = (|| {
             checkpoint(PublishBoundary::AfterTempCreate)?;
             io::copy(&mut source, &mut temp.file)?;
@@ -1334,25 +1344,23 @@ impl Storage {
             }
             transaction.transition(PublicationState::Validated)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
-            let destination_lock = self.destination_lock(destination_key);
-            let _destination_guard = destination_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-            match hard_link_at(
-                &temp.directory,
-                &temp.name,
-                &destination_directory,
-                &destination_name,
-            ) {
+            let mut finalize_publication = |publish_result: io::Result<()>| match publish_result {
                 Ok(()) => {
+                    if replace_destination {
+                        temp_moved = true;
+                        temp.directory.sync_all()?;
+                    }
                     transaction.transition(PublicationState::Linked)?;
                     if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
-                        rollback_link_at(&destination_directory, &destination_name)?;
+                        if !replace_destination {
+                            rollback_link_at(&destination_directory, &destination_name)?;
+                        }
                         return Err(error);
                     }
                     if let Err(error) = destination_directory.sync_all() {
-                        rollback_link_at(&destination_directory, &destination_name)?;
+                        if !replace_destination {
+                            rollback_link_at(&destination_directory, &destination_name)?;
+                        }
                         return Err(error.into());
                     }
                     durable = true;
@@ -1360,7 +1368,9 @@ impl Storage {
                     checkpoint(PublishBoundary::AfterParentSync)?;
                     Ok(PublishOutcome::Created)
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err(error)
+                    if !replace_destination && error.kind() == io::ErrorKind::AlreadyExists =>
+                {
                     if files_equal_at(
                         &temp.directory,
                         &temp.name,
@@ -1374,10 +1384,34 @@ impl Storage {
                     }
                 }
                 Err(error) => Err(error.into()),
+            };
+            if replace_destination {
+                finalize_publication(rename_at(
+                    &temp.directory,
+                    &temp.name,
+                    &destination_directory,
+                    &destination_name,
+                ))
+            } else {
+                let destination_lock = self.destination_lock(destination_key);
+                let _destination_guard = destination_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                finalize_publication(hard_link_at(
+                    &temp.directory,
+                    &temp.name,
+                    &destination_directory,
+                    &destination_name,
+                ))
             }
         })();
 
-        let cleanup = self.remove_temp(&temp);
+        let cleanup = if temp_moved {
+            self.temporary_objects.fetch_sub(1, Ordering::Relaxed);
+            Ok(())
+        } else {
+            self.remove_temp(&temp)
+        };
 
         match result {
             Ok(outcome) => {
@@ -1501,29 +1535,6 @@ impl Storage {
     fn validation_directory(&self) -> Result<File, StorageError> {
         let root = self.root_directory()?;
         Ok(open_directory_at(&root, OsStr::new(VALIDATION_DIRECTORY))?)
-    }
-
-    pub(crate) fn remove_validation_evidence_for_nar(
-        &self,
-        nar_name: &OsStr,
-    ) -> Result<(), StorageError> {
-        let Some(name) = nar_name.to_str() else {
-            return Ok(());
-        };
-        let Some(_) = name
-            .strip_suffix(".nar.xz")
-            .or_else(|| name.strip_suffix(".nar.zst"))
-        else {
-            return Ok(());
-        };
-        let evidence_name = OsString::from(format!("{name}.validation"));
-        let directory = self.validation_directory()?;
-        match unlink_at(&directory, &evidence_name) {
-            Ok(()) => directory.sync_all()?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(())
     }
 
     fn remove_orphan_validation_evidence(&self) -> Result<(), StorageError> {
@@ -2189,6 +2200,41 @@ fn hard_link_at(
     }
 }
 
+fn rename_at(
+    source_directory: &File,
+    source_name: &OsStr,
+    destination_directory: &File,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    let source_name = CString::new(source_name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage entry name contains a NUL byte",
+        )
+    })?;
+    let destination_name = CString::new(destination_name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage entry name contains a NUL byte",
+        )
+    })?;
+    // SAFETY: both directory descriptors are live, both names are
+    // NUL-terminated, and renameat does not retain either pointer.
+    let result = unsafe {
+        libc::renameat(
+            source_directory.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_directory.as_raw_fd(),
+            destination_name.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn unlink_at(directory: &File, name: &OsStr) -> io::Result<()> {
     let name = CString::new(name.as_bytes()).map_err(|_| {
         io::Error::new(
@@ -2509,10 +2555,27 @@ mod tests {
                 .expect("repair validation evidence")
         );
         assert!(
-            fs::read_to_string(evidence_path)
+            fs::read_to_string(&evidence_path)
                 .expect("read repaired validation evidence")
                 .starts_with("version=1\n")
         );
+
+        let oversized = format!(
+            "version=1\nencoding=zstd\nencoded-hash={}\nencoded-size={:0>250}\ndecoded-hash={}\ndecoded-size={}\n",
+            encoded_hash.as_str(),
+            compressed.len(),
+            decoded_hash.as_str(),
+            raw.len(),
+        );
+        fs::write(&evidence_path, oversized).expect("write oversized validation evidence");
+        assert!(
+            storage
+                .compressed_nar_matches_with_evidence(&file, expectation)
+                .expect("repair oversized validation evidence")
+        );
+        let repaired = fs::read(&evidence_path).expect("read repaired oversized evidence");
+        assert!(repaired.starts_with(b"version=1\n"));
+        assert!(repaired.len() <= super::MAX_VALIDATION_EVIDENCE_BYTES as usize);
     }
 
     #[test]
@@ -3609,6 +3672,24 @@ mod tests {
         assert_eq!(young.class(), ReconcileClass::TempYoung);
         assert!(!storage.cleanup_stale_temp(young).expect("keep young temp"));
         assert!(young_path.exists());
+
+        let validation_path = directory.path().join(".tmp/validation-repair.part");
+        fs::write(&validation_path, b"temp").expect("write validation temp");
+        let validation_report = storage
+            .reconcile(
+                NonZeroUsize::new(16).expect("nonzero limit"),
+                SystemTime::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("past time"),
+            )
+            .expect("classify validation temp");
+        let validation = validation_report
+            .entries()
+            .iter()
+            .find(|entry| entry.relative_path() == Path::new(".tmp/validation-repair.part"))
+            .expect("validation temp entry");
+        assert_eq!(validation.class(), ReconcileClass::TempYoung);
+        assert!(validation_path.exists());
     }
 
     #[test]
