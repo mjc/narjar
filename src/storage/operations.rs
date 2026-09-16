@@ -1,5 +1,47 @@
 use super::*;
 
+const MAX_CACHE_INFO_BYTES: u64 = 1024;
+pub(crate) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
+pub(crate) const MAX_VALIDATION_EVIDENCE_BYTES: u64 = 256;
+
+fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() as u64 > MAX_CACHE_INFO_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "nix-cache-info exceeds configured size limit",
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nix-cache-info is not UTF-8"))?;
+    let mut store_dir = false;
+    let mut mass_query = false;
+    let mut priority = false;
+    for line in text.lines() {
+        let (name, value) = line.split_once(": ").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed nix-cache-info")
+        })?;
+        match name {
+            "StoreDir" if !store_dir && value == "/nix/store" => store_dir = true,
+            "WantMassQuery" if !mass_query && value == "0" => mass_query = true,
+            "Priority" if !priority && value.parse::<u32>().is_ok() => priority = true,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported or duplicate nix-cache-info field",
+                ));
+            }
+        }
+    }
+    if store_dir && mass_query && priority {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "nix-cache-info is missing a required field",
+        ))
+    }
+}
+
 impl Storage {
     pub fn initialize(root: &Directory) -> Result<Self, StorageError> {
         #[cfg(test)]
