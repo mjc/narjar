@@ -53,6 +53,13 @@ impl Sha256Hasher {
             .is_some_and(|hasher| expected.matches_digest(&hasher.clone().finalize()))
     }
 
+    fn matches_optional_expected_digest<H: Sha256DigestExpectation>(
+        &self,
+        expected: Option<&H>,
+    ) -> bool {
+        expected.is_none_or(|expected| self.matches_expected_digest(expected))
+    }
+
     fn finalize_digest(self) -> [u8; 32] {
         self.hasher
             .expect("a disabled SHA-256 hasher cannot be finished")
@@ -548,10 +555,6 @@ impl<R> HashingReader<R> {
             hasher: Sha256Hasher::new_if(enabled),
         }
     }
-
-    fn matches_expected_file_hash(self, expected: Option<&FileHash>) -> bool {
-        expected.is_none_or(|expected| self.hasher.matches_expected_digest(expected))
-    }
 }
 
 impl<R: Read> Read for HashingReader<R> {
@@ -672,7 +675,10 @@ pub(super) fn validate_xz(
             "trailing bytes after XZ NAR",
         ));
     }
-    if !actual_file_hash.matches_expected_file_hash(expected_file_hash) {
+    if !actual_file_hash
+        .hasher
+        .matches_optional_expected_digest(expected_file_hash)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "compressed NAR hash mismatch",
@@ -705,7 +711,10 @@ pub(super) fn validate_zstd(
             "trailing bytes after zstd NAR",
         ));
     }
-    if !actual_file_hash.matches_expected_file_hash(expected_file_hash) {
+    if !actual_file_hash
+        .hasher
+        .matches_optional_expected_digest(expected_file_hash)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "compressed NAR hash mismatch",
