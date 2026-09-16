@@ -3,11 +3,13 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+TOOL_MANIFEST="$ROOT/scripts/nar-corpus/Cargo.toml"
 BINARY="$ROOT/target/release/nar-report"
 SOURCE="$SCRIPT_DIR/nar-report.rs"
 
 MANIFEST=""
-SCANNER="$ROOT/target/release/nar-scan"
+DEFAULT_SCANNER="$ROOT/target/release/nar-scan"
+SCANNER="$DEFAULT_SCANNER"
 SCAN=""
 ARTIFACT_ROOT=""
 OUTPUT=""
@@ -58,6 +60,12 @@ done
 [[ ! -e "$OUTPUT" ]] || die "output already exists: $OUTPUT"
 command -v jq > /dev/null || die "jq is required; run inside devenv shell"
 command -v rustc > /dev/null || die "rustc is required; run inside devenv shell"
+
+if [[ -z "$SCAN" && ! -x "$SCANNER" ]]; then
+  [[ "$SCANNER" == "$DEFAULT_SCANNER" ]] || die "scanner is not executable: $SCANNER"
+  command -v cargo > /dev/null || die "scanner is not executable: $SCANNER"
+  cargo build --manifest-path "$TOOL_MANIFEST" --target-dir "$ROOT/target" --release --bin nar-scan
+fi
 
 mkdir -p "$OUTPUT"
 COMMAND_LOG="$OUTPUT/commands.txt"

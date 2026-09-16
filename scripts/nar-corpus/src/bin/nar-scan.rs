@@ -4,76 +4,78 @@ use std::{
     path::Path,
 };
 
-use narjar::nar::{Decoder, Event, EventSink, RootKind};
-use sha2::{Digest, Sha256};
+use narjar_corpus::{HashingReader, HashingWriter, hex};
+use nix_archive::nar::{Event, FileContents, decode_events_reader};
 
 struct Scanner<'a, W> {
     path: &'a str,
     output: &'a mut W,
-    file: Option<FileObject>,
+    root: Option<&'static str>,
+    entries: u64,
+    files: u64,
+    symlinks: u64,
 }
 
-struct FileObject {
-    executable: bool,
-    size: u64,
-    offset: u64,
-    digest: Sha256,
-}
-
-impl<W: Write> EventSink for Scanner<'_, W> {
-    type Error = io::Error;
-
-    fn event(&mut self, event: Event<'_>) -> io::Result<()> {
+impl<W: Write> Scanner<'_, W> {
+    fn visit<R: io::Read + ?Sized>(
+        &mut self,
+        event: Event<'_, FileContents<'_, R>>,
+        offset: u64,
+    ) -> Result<(), nix_archive::nar::Error> {
         match event {
-            Event::BeginFile {
+            Event::DirectoryStart { name } => self.record_node(name, "directory"),
+            Event::DirectoryEnd { .. } => {}
+            Event::Regular {
+                name,
                 executable,
-                size,
-                offset,
+                mut contents,
             } => {
-                self.file = Some(FileObject {
-                    executable,
-                    size,
-                    offset,
-                    digest: Sha256::new(),
-                });
-            }
-            Event::FileChunk(chunk) => {
-                let file = self
-                    .file
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("file chunk without file"))?;
-                file.digest.update(chunk);
-            }
-            Event::EndFile => {
-                let file = self
-                    .file
-                    .take()
-                    .ok_or_else(|| io::Error::other("file end without file"))?;
+                self.record_node(name, "regular");
+                let size = contents.size();
+                let mut digest = HashingWriter::new(io::sink());
+                let copied = contents.copy_to(&mut digest)?;
+                if copied != size {
+                    return Err(
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "short NAR file").into(),
+                    );
+                }
+                let (_, _, digest) = digest.finish();
                 writeln!(
                     self.output,
                     "O\t{}\tfile\t{}\t{}\t{}\t{}\t",
                     self.path,
-                    file.size,
-                    hex(file.digest.finalize().as_slice()),
-                    file.offset,
-                    u8::from(file.executable),
+                    size,
+                    hex(&digest),
+                    offset,
+                    u8::from(executable),
                 )?;
+                self.files += 1;
             }
-            Event::Symlink { target } => {
-                let mut digest = Sha256::new();
-                digest.update(&target);
+            Event::Symlink { name, target } => {
+                self.record_node(name, "symlink");
+                let mut digest = HashingWriter::new(io::sink());
+                digest.write_all(target)?;
+                let (_, _, digest) = digest.finish();
                 writeln!(
                     self.output,
                     "O\t{}\tsymlink\t{}\t{}\t-\t0\t{}",
                     self.path,
                     target.len(),
-                    hex(digest.finalize().as_slice()),
-                    hex(&target),
+                    hex(&digest),
+                    hex(target),
                 )?;
+                self.symlinks += 1;
             }
-            _ => {}
         }
         Ok(())
+    }
+
+    fn record_node(&mut self, name: Option<&[u8]>, root: &'static str) {
+        if name.is_some() {
+            self.entries += 1;
+        } else {
+            self.root = Some(root);
+        }
     }
 }
 
@@ -124,37 +126,27 @@ fn main() -> io::Result<()> {
 
 fn scan_one<W: Write>(path: &str, output: &mut W) -> io::Result<()> {
     let file = File::open(Path::new(path))?;
-    let mut decoder = Decoder::new(BufReader::with_capacity(1024 * 1024, file));
+    let (mut input, position) = HashingReader::new(BufReader::with_capacity(1024 * 1024, file));
     let mut scanner = Scanner {
         path,
         output,
-        file: None,
+        root: None,
+        entries: 0,
+        files: 0,
+        symlinks: 0,
     };
-    let summary = decoder
-        .decode(&mut scanner)
+    decode_events_reader(&mut input, |event| scanner.visit(event, position.get()))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let root = match summary.root {
-        RootKind::Directory => "directory",
-        RootKind::Regular => "regular",
-        RootKind::Symlink => "symlink",
-    };
+    let (_, raw_size, raw_sha256) = input.finish();
     writeln!(
         scanner.output,
         "N\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         path,
-        summary.raw_size,
-        hex(&summary.raw_sha256),
-        root,
-        summary.entries,
-        summary.files,
-        summary.symlinks,
+        raw_size,
+        hex(&raw_sha256),
+        scanner.root.unwrap_or("unknown"),
+        scanner.entries,
+        scanner.files,
+        scanner.symlinks,
     )
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
 }

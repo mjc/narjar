@@ -1,14 +1,16 @@
 # NAR research tools
 
-These tools are research-only. They read NAR files and cache HTTP traffic; they
-do not write to a Narjar data directory.
+These tools are research-only. They are kept in the separate
+`scripts/nar-corpus` package, read NAR files and cache HTTP traffic, and do not
+write to a Narjar data directory or ship in the Narjar package.
 
 ## Streaming decoder and corpus scan
 
 Build the bounded decoder and scanner with the normal release profile:
 
 ```sh
-cargo build --release --bin nar-scan
+cargo build --manifest-path scripts/nar-corpus/Cargo.toml \
+  --target-dir target --release --bin nar-scan
 ```
 
 `nar-scan` takes one NAR path per line and writes a machine-readable TSV:
@@ -21,7 +23,7 @@ target/release/nar-scan \
 
 ## Canonical streaming encoder
 
-`narjar::nar_encode::Encoder` is a version-1 research-only event sink. It emits
+`nix_archive::nar::Encoder` is a version-1 research-only event sink. It emits
 the canonical NAR framing, checks strictly increasing directory names, streams
 file chunks directly to its writer, and computes the raw SHA-256 and size in
 the same pass. It keeps only the open-node stack and one previous name per open
@@ -30,7 +32,8 @@ directory; it does not retain the NAR or file body.
 Build and run the RSS harness with the optimized encoder benchmark:
 
 ```sh
-cargo build --release --bin nar-encode-bench
+cargo build --manifest-path scripts/nar-corpus/Cargo.toml \
+  --target-dir target --release --bin nar-encode-bench
 scripts/nar-encode-memory --output /tmp/narjar-narj77.json
 ```
 
@@ -67,7 +70,8 @@ Build `nar-tree-report` to derive domain-separated semantic tree identities
 from the same streaming events:
 
 ```sh
-cargo build --release --bin nar-tree-report
+cargo build --manifest-path scripts/nar-corpus/Cargo.toml \
+  --target-dir target --release --bin nar-tree-report
 target/release/nar-tree-report \
   --input-list /path/to/nars.txt \
   --output /tmp/tree-report.tsv

@@ -3,7 +3,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-SCANNER="$ROOT/target/release/nar-scan"
+TOOL_MANIFEST="$ROOT/scripts/nar-corpus/Cargo.toml"
+DEFAULT_SCANNER="$ROOT/target/release/nar-scan"
+SCANNER="$DEFAULT_SCANNER"
 OUTPUT=""
 SIZES=()
 WORK=$(mktemp -d)
@@ -126,7 +128,11 @@ while (($#)); do
 done
 
 [[ -n "$OUTPUT" ]] || die "--output is required"
-[[ -x "$SCANNER" ]] || die "scanner is not executable: $SCANNER"
+if [[ ! -x "$SCANNER" ]]; then
+  [[ "$SCANNER" == "$DEFAULT_SCANNER" ]] || die "scanner is not executable: $SCANNER"
+  command -v cargo > /dev/null || die "scanner is not executable: $SCANNER"
+  cargo build --manifest-path "$TOOL_MANIFEST" --target-dir "$ROOT/target" --release --bin nar-scan
+fi
 [[ -d /proc ]] || die "Linux /proc is required"
 command -v jq > /dev/null || die "jq is required; run inside devenv shell"
 if ((${#SIZES[@]} == 0)); then

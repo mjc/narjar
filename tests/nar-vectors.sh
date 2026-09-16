@@ -9,7 +9,8 @@ trap 'rm -rf -- "$WORK"' EXIT
 command -v jq >/dev/null || { echo "jq is required; run inside devenv shell" >&2; exit 1; }
 REENCODER=$ROOT/target/release/nar-reencode
 if [[ ! -x "$REENCODER" ]]; then
-  cargo build --release --bin nar-reencode
+  cargo build --manifest-path "$ROOT/scripts/nar-corpus/Cargo.toml" \
+    --target-dir "$ROOT/target" --release --bin nar-reencode
 fi
 
 hex_file() {

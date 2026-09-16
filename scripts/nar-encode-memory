@@ -3,7 +3,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-ENCODER="$ROOT/target/release/nar-encode-bench"
+TOOL_MANIFEST="$ROOT/scripts/nar-corpus/Cargo.toml"
+DEFAULT_ENCODER="$ROOT/target/release/nar-encode-bench"
+ENCODER="$DEFAULT_ENCODER"
 OUTPUT=""
 SIZES=()
 WORK=$(mktemp -d)
@@ -87,7 +89,11 @@ while (($#)); do
 done
 
 [[ -n "$OUTPUT" ]] || die "--output is required"
-[[ -x "$ENCODER" ]] || die "encoder is not executable: $ENCODER"
+if [[ ! -x "$ENCODER" ]]; then
+  [[ "$ENCODER" == "$DEFAULT_ENCODER" ]] || die "encoder is not executable: $ENCODER"
+  command -v cargo > /dev/null || die "encoder is not executable: $ENCODER"
+  cargo build --manifest-path "$TOOL_MANIFEST" --target-dir "$ROOT/target" --release --bin nar-encode-bench
+fi
 command -v jq > /dev/null || die "jq is required; run inside devenv shell"
 command -v awk > /dev/null || die "awk is required"
 command -v date > /dev/null || die "date is required"

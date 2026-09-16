@@ -3,7 +3,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-REENCODER="$ROOT/target/release/nar-reencode"
+TOOL_MANIFEST="$ROOT/scripts/nar-corpus/Cargo.toml"
+DEFAULT_REENCODER="$ROOT/target/release/nar-reencode"
+REENCODER="$DEFAULT_REENCODER"
 NAR_ROOT=""
 OUTPUT=""
 WORK=$(mktemp -d)
@@ -36,7 +38,11 @@ done
 [[ -n "$NAR_ROOT" ]] || die "--root is required"
 [[ -n "$OUTPUT" ]] || die "--output is required"
 [[ -d "$NAR_ROOT" ]] || die "artifact root does not exist: $NAR_ROOT"
-[[ -x "$REENCODER" ]] || die "reencoder is not executable: $REENCODER"
+if [[ ! -x "$REENCODER" ]]; then
+  [[ "$REENCODER" == "$DEFAULT_REENCODER" ]] || die "reencoder is not executable: $REENCODER"
+  command -v cargo > /dev/null || die "reencoder is not executable: $REENCODER"
+  cargo build --manifest-path "$TOOL_MANIFEST" --target-dir "$ROOT/target" --release --bin nar-reencode
+fi
 command -v jq > /dev/null || die "jq is required; run inside devenv shell"
 command -v cmp > /dev/null || die "cmp is required"
 command -v find > /dev/null || die "find is required"

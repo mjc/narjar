@@ -7,7 +7,11 @@ trap 'rm -rf -- "$WORK"' EXIT
 
 REPORTER=$ROOT/target/debug/nar-tree-report
 [[ -x "$REPORTER" ]] || {
-  printf 'missing %s; build --bin nar-tree-report first\n' "$REPORTER" >&2
+  cargo build --manifest-path "$ROOT/scripts/nar-corpus/Cargo.toml" \
+    --target-dir "$ROOT/target" --bin nar-tree-report
+}
+[[ -x "$REPORTER" ]] || {
+  printf 'missing %s after build\n' "$REPORTER" >&2
   exit 1
 }
 command -v nix-store >/dev/null || {
