@@ -30,7 +30,7 @@ pub(super) struct CheckedUploadReader<'a, R, State = Receiving> {
     expected_length: u64,
     bytes_read: u64,
     hasher: Sha256,
-    done: bool,
+    upload_end_validated: bool,
     state: PhantomData<State>,
 }
 
@@ -45,12 +45,12 @@ impl<'a, R> CheckedUploadReader<'a, R, Receiving> {
             expected_length,
             bytes_read: 0,
             hasher: Sha256::new(),
-            done: false,
+            upload_end_validated: false,
             state: PhantomData,
         }
     }
 
-    fn validate_complete_upload(&self) -> io::Result<()> {
+    fn validate_observed_upload_hash_and_length(&self) -> io::Result<()> {
         if self.bytes_read != self.expected_length
             || !self
                 .expected_hash
@@ -64,31 +64,49 @@ impl<'a, R> CheckedUploadReader<'a, R, Receiving> {
         Ok(())
     }
 
-    pub(super) fn finish(mut self) -> io::Result<CheckedUploadReader<'a, R, Complete>>
+    pub(super) fn finish(self) -> io::Result<CheckedUploadReader<'a, R, Complete>>
     where
         R: Read,
     {
-        if !self.done {
-            let mut buffer = [0; 64 * 1024];
-            let read = self.inner.read(&mut buffer)?;
-            if read != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "encoded upload has trailing bytes",
-                ));
-            }
-            self.done = true;
+        let mut receiving = self;
+        receiving.ensure_upload_end_was_consumed()?;
+        Ok(receiving.into_complete_state())
+    }
+
+    fn ensure_upload_end_was_consumed(&mut self) -> io::Result<()>
+    where
+        R: Read,
+    {
+        if self.upload_end_validated {
+            return Ok(());
         }
-        self.validate_complete_upload()?;
-        Ok(CheckedUploadReader {
+
+        let mut buffer = [0; 64 * 1024];
+        if self.inner.read(&mut buffer)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded upload has trailing bytes",
+            ));
+        }
+        self.record_validated_upload_end()
+    }
+
+    fn record_validated_upload_end(&mut self) -> io::Result<()> {
+        self.validate_observed_upload_hash_and_length()?;
+        self.upload_end_validated = true;
+        Ok(())
+    }
+
+    fn into_complete_state(self) -> CheckedUploadReader<'a, R, Complete> {
+        CheckedUploadReader {
             inner: self.inner,
             expected_hash: self.expected_hash,
             expected_length: self.expected_length,
             bytes_read: self.bytes_read,
             hasher: self.hasher,
-            done: true,
+            upload_end_validated: true,
             state: PhantomData,
-        })
+        }
     }
 }
 
@@ -100,13 +118,12 @@ impl<R> CheckedUploadReader<'_, R, Complete> {
 
 impl<R: Read> Read for CheckedUploadReader<'_, R, Receiving> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.done {
+        if self.upload_end_validated {
             return Ok(0);
         }
         let read = self.inner.read(buffer)?;
         if read == 0 {
-            self.validate_complete_upload()?;
-            self.done = true;
+            self.record_validated_upload_end()?;
             return Ok(0);
         }
 

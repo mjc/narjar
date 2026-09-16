@@ -75,6 +75,57 @@ fn upload_reader_checks_encoded_hash_and_length() {
 }
 
 #[test]
+fn upload_reader_finish_does_not_read_after_validating_eof() {
+    let bytes = b"encoded NAR bytes";
+    let expected =
+        FileHash::parse(&nix32_sha256(&Sha256::digest(bytes))).expect("file hash is valid");
+    let mut reader = CheckedUploadReader::new(
+        FailsIfReadAfterEof::new(bytes),
+        &expected,
+        bytes.len() as u64,
+    );
+    let mut received = Vec::new();
+    reader
+        .read_to_end(&mut received)
+        .expect("matching upload should be readable");
+    assert_eq!(received, bytes);
+    reader
+        .finish()
+        .expect("finish should reuse the validated EOF");
+}
+
+struct FailsIfReadAfterEof {
+    bytes: &'static [u8],
+    delivered: bool,
+    eof_reported: bool,
+}
+
+impl FailsIfReadAfterEof {
+    fn new(bytes: &'static [u8]) -> Self {
+        Self {
+            bytes,
+            delivered: false,
+            eof_reported: false,
+        }
+    }
+}
+
+impl Read for FailsIfReadAfterEof {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if !self.delivered {
+            buffer[..self.bytes.len()].copy_from_slice(self.bytes);
+            self.delivered = true;
+            return Ok(self.bytes.len());
+        }
+        if !self.eof_reported {
+            self.eof_reported = true;
+            return Ok(0);
+        }
+        Err(io::Error::other("read after EOF"))
+    }
+}
+
+#[test]
 fn normalized_compressed_source_errors_remain_io_errors() {
     for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
         let directory = TestDir::new();
