@@ -106,7 +106,7 @@ Run the corpus report after building `nar-scan`:
 
 ```sh
 scripts/nar-report \
-  --manifest benchmarks/corpus-manifest.json \
+  --manifest /tmp/corpus-manifest.json \
   --scanner target/release/nar-scan \
   --output /tmp/narjar-exact-dedup \
   --threshold 4096

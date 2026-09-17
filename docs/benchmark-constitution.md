@@ -35,12 +35,13 @@ Storage-byte samples use allocated filesystem blocks (`st_blocks * 512`), not
 logical file lengths, so transparent filesystem compression is included in the
 measurement.
 
-The six frozen corpus slices and their exact selectors are in
-[`benchmarks/corpus-manifest.json`](../benchmarks/corpus-manifest.json):
-many-small-files, shared-subtrees,
-duplicate-content, large-contents, symlink-and-executable, and
-deep-and-irregular-names. The cardinality-only 10,000-root run is a startup
-and RSS control, not a substitute for those six semantic slices.
+The six frozen corpus slices and their exact selectors are defined by the
+versioned corpus spec and materialized into a generated manifest for each
+run: many-small-files, shared-subtrees, duplicate-content, large-contents,
+symlink-and-executable, and deep-and-irregular-names. The cardinality-only
+10,000-root run is a startup and RSS control, not a substitute for those six
+semantic slices. Generated manifests and NAR exports stay outside the
+repository.
 
 The hard gates cover ingest, full GET, 90%-resume Range TTFB, read
 amplification, offline maintenance, active/idle memory, startup, replication,
