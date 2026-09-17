@@ -819,6 +819,9 @@ mod tests {
             .expect("measure staging growth directory")
             .available_bytes;
         let exact_capacity = 2 * 1024 * 1024;
+        if available < exact_capacity {
+            return;
+        }
         let min_free_bytes = available - exact_capacity;
         let mut reservation = StagingReservation::empty(Arc::new(Mutex::new(Default::default())));
 
