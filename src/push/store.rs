@@ -1,9 +1,30 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use data_encoding::BASE64;
 use sqlite::{Connection, OpenFlags, State};
 
 use super::PathInfo;
+
+const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "ValidPaths",
+        &[
+            "id",
+            "path",
+            "hash",
+            "registrationTime",
+            "deriver",
+            "narSize",
+            "sigs",
+            "ca",
+        ],
+    ),
+    ("Refs", &["referrer", "reference"]),
+    ("SchemaMigrations", &["migration"]),
+];
 
 pub(super) struct LocalStore {
     database: Connection,
@@ -18,6 +39,7 @@ impl LocalStore {
         let database =
             Connection::open_with_flags(database_path, OpenFlags::new().with_read_only())
                 .map_err(|error| format!("opening the Nix store database: {error}"))?;
+        validate_supported_schema(&database)?;
         database
             .execute("BEGIN")
             .map_err(|error| format!("starting the Nix store database snapshot: {error}"))?;
@@ -124,6 +146,41 @@ impl LocalStore {
     }
 }
 
+fn validate_supported_schema(database: &Connection) -> Result<(), String> {
+    REQUIRED_TABLE_COLUMNS
+        .iter()
+        .try_for_each(|(table, required_columns)| {
+            let present_columns = table_columns(database, table)?;
+            if required_columns
+                .iter()
+                .any(|column| !present_columns.contains(*column))
+            {
+                return Err(format!(
+                    "unsupported or incomplete Nix store database schema: {table}"
+                ));
+            }
+            Ok(())
+        })
+}
+
+fn table_columns(database: &Connection, table: &str) -> Result<BTreeSet<String>, String> {
+    let mut statement = database
+        .prepare(format!("PRAGMA table_info({table})"))
+        .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?;
+    let mut columns = BTreeSet::new();
+    while let State::Row = statement
+        .next()
+        .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?
+    {
+        columns.insert(
+            statement
+                .read::<String, _>("name")
+                .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?,
+        );
+    }
+    Ok(columns)
+}
+
 pub(super) fn closure_paths(installables: &[String]) -> Result<Vec<PathInfo>, String> {
     LocalStore::open()?.closure_paths(installables)
 }
@@ -156,7 +213,9 @@ fn sri_sha256_from_base16(value: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::sri_sha256_from_base16;
+    use sqlite::Connection;
+
+    use super::{sri_sha256_from_base16, validate_supported_schema};
 
     #[test]
     fn converts_nix_store_hash_to_sri() {
@@ -167,5 +226,15 @@ mod tests {
             .expect("valid base16 SHA-256"),
             "sha256-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
         );
+    }
+
+    #[test]
+    fn rejects_an_incomplete_store_schema() {
+        let database = Connection::open(":memory:").expect("open schema test database");
+        database
+            .execute("CREATE TABLE ValidPaths (id INTEGER PRIMARY KEY)")
+            .expect("create incomplete schema");
+        let error = validate_supported_schema(&database).expect_err("schema must be rejected");
+        assert!(error.contains("unsupported or incomplete"));
     }
 }

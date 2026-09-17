@@ -322,6 +322,8 @@ fn native_push_fixture() -> NativePushFixture {
         .expect("native store object should be written");
     let state_dir = tools.path().join("state");
     fs::create_dir(&state_dir).expect("native state directory should be created");
+    fs::create_dir_all(state_dir.join("gcroots/auto"))
+        .expect("native automatic roots directory should be created");
     fs::create_dir(state_dir.join("db")).expect("native database directory should be created");
     let native_nar = native_nar_bytes();
     let nar_hash = nix32_sha256(&native_nar);
@@ -348,7 +350,8 @@ fn native_push_fixture() -> NativePushFixture {
                 referrer INTEGER NOT NULL,
                 reference INTEGER NOT NULL,
                 PRIMARY KEY (referrer, reference)
-            );",
+            );
+            CREATE TABLE SchemaMigrations (migration TEXT PRIMARY KEY NOT NULL);",
         )
         .expect("native metadata schema should be created");
     let mut insert = database

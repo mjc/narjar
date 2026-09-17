@@ -14,6 +14,7 @@ mod nar_stream;
 mod narinfo;
 mod payload;
 mod plan;
+mod root;
 mod signing;
 mod store;
 mod transfer;
@@ -21,6 +22,7 @@ use nar_stream::{open_verified_encoded_nar_reader, open_verified_nar_reader};
 use narinfo::{nix32_encoding, nix32_sha256_from_sri, serialize_narinfo};
 use payload::prepare_nar;
 use plan::dependency_waves;
+use root::StoreRoots;
 use signing::sign_metadata;
 use store::closure_paths;
 #[cfg(test)]
@@ -100,6 +102,7 @@ struct PathInfo {
 
 pub(crate) fn run(args: Push) -> Result<(), Error> {
     let mut metadata = closure_paths(&args.paths).map_err(Error::runtime)?;
+    let _roots = StoreRoots::hold(&args.paths).map_err(Error::runtime)?;
     if let Some(key_file) = args.signing_key_file.as_deref() {
         sign_metadata(key_file, &mut metadata).map_err(Error::runtime)?;
     }
