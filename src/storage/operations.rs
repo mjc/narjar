@@ -54,6 +54,60 @@ enum TemporaryLocation {
     Destination,
 }
 
+impl TemporaryLocation {
+    fn synchronize_source_directory_after_destination_creation(
+        self,
+        temp: &TemporaryFile,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Staging => Ok(()),
+            Self::Destination => Ok(temp.directory.sync_all()?),
+        }
+    }
+
+    fn rollback_destination_before_durability(
+        self,
+        destination_directory: &File,
+        destination_name: &OsStr,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Staging => Ok(rollback_link_at(destination_directory, destination_name)?),
+            Self::Destination => Ok(()),
+        }
+    }
+
+    fn remove_temporary(self, storage: &Storage, temp: &TemporaryFile) -> Result<(), StorageError> {
+        match self {
+            Self::Staging => storage.remove_temp(temp),
+            Self::Destination => {
+                storage.temporary_objects.fetch_sub(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+}
+
+enum DestinationPublicationAttempt {
+    Existing,
+    Created(TemporaryLocation),
+}
+
+struct CreatedDestination<'a> {
+    temporary_location: TemporaryLocation,
+    directory: &'a File,
+    name: &'a OsStr,
+}
+
+impl<'a> CreatedDestination<'a> {
+    fn new(temporary_location: TemporaryLocation, directory: &'a File, name: &'a OsStr) -> Self {
+        Self {
+            temporary_location,
+            directory,
+            name,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CleanupAction {
     Keep,
@@ -118,11 +172,8 @@ enum PublicationProgress {
 }
 
 impl PublicationProgress {
-    fn mark_temporary_moved(&mut self) {
-        *self = match *self {
-            Self::Pending(_) => Self::Pending(TemporaryLocation::Destination),
-            Self::Durable(_) => Self::Durable(TemporaryLocation::Destination),
-        };
+    fn created(location: TemporaryLocation) -> Self {
+        Self::Pending(location)
     }
 
     fn mark_durable(&mut self) {
@@ -130,20 +181,6 @@ impl PublicationProgress {
             Self::Pending(location) => Self::Durable(location),
             Self::Durable(location) => Self::Durable(location),
         };
-    }
-
-    fn cleanup_temporary_location(
-        location: TemporaryLocation,
-        storage: &Storage,
-        temp: &TemporaryFile,
-    ) -> Result<(), StorageError> {
-        match location {
-            TemporaryLocation::Staging => storage.remove_temp(temp),
-            TemporaryLocation::Destination => {
-                storage.temporary_objects.fetch_sub(1, Ordering::Relaxed);
-                Ok(())
-            }
-        }
     }
 
     fn finish(
@@ -155,17 +192,17 @@ impl PublicationProgress {
     ) -> Result<PublishOutcome, StorageError> {
         match (result, self) {
             (Ok(outcome), Self::Pending(location) | Self::Durable(location)) => {
-                Self::cleanup_temporary_location(location, storage, temp)?;
+                location.remove_temporary(storage, temp)?;
                 transaction.complete()?;
                 Ok(outcome)
             }
             (Err(error), Self::Durable(location)) => {
-                Self::cleanup_temporary_location(location, storage, temp)?;
+                location.remove_temporary(storage, temp)?;
                 transaction.complete()?;
                 Err(error)
             }
             (Err(error), Self::Pending(location)) => {
-                let _ = Self::cleanup_temporary_location(location, storage, temp);
+                let _ = location.remove_temporary(storage, temp);
                 Err(error)
             }
         }
@@ -623,106 +660,224 @@ impl Storage {
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
         let destination = target.destination();
-        let destination_key = self.destination_key(&destination);
         let mut progress = PublicationProgress::Pending(TemporaryLocation::Staging);
         let result = (|| {
             let destination_directory = self.destination_directory(destination.directory)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
-            let mut finalize_publication = |publish_result: io::Result<()>| match publish_result {
-                Ok(()) => {
-                    match destination.publication {
-                        DestinationPublication::Replace | DestinationPublication::Repair(_) => {
-                            progress.mark_temporary_moved();
-                            temp.directory.sync_all()?;
-                        }
-                        DestinationPublication::Link => {}
-                    }
-                    transaction.transition(PublicationState::Linked)?;
-                    if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
-                        match destination.publication {
-                            DestinationPublication::Link => {
-                                rollback_link_at(&destination_directory, &destination.name)?;
-                            }
-                            DestinationPublication::Replace | DestinationPublication::Repair(_) => {
-                            }
-                        }
-                        return Err(error);
-                    }
-                    if let Err(error) = destination_directory.sync_all() {
-                        match destination.publication {
-                            DestinationPublication::Link => {
-                                rollback_link_at(&destination_directory, &destination.name)?;
-                            }
-                            DestinationPublication::Replace | DestinationPublication::Repair(_) => {
-                            }
-                        }
-                        return Err(error.into());
-                    }
-                    progress.mark_durable();
-                    transaction.transition(PublicationState::Published)?;
-                    checkpoint(PublishBoundary::AfterParentSync)?;
-                    Ok(PublishOutcome::Created)
-                }
-                Err(error) => match destination.publication {
-                    DestinationPublication::Link | DestinationPublication::Repair(_)
-                        if error.kind() == io::ErrorKind::AlreadyExists =>
-                    {
-                        let identical = match destination.publication {
-                            DestinationPublication::Link => files_equal_at(
-                                &temp.directory,
-                                &temp.name,
-                                &destination_directory,
-                                &destination.name,
-                            )?,
-                            DestinationPublication::Repair(_) => true,
-                            DestinationPublication::Replace => false,
-                        };
-                        if identical {
-                            transaction.transition(PublicationState::Published)?;
-                            Ok(PublishOutcome::Identical)
-                        } else {
-                            Err(StorageError::Conflict)
-                        }
-                    }
-                    DestinationPublication::Link
-                    | DestinationPublication::Replace
-                    | DestinationPublication::Repair(_) => Err(error.into()),
-                },
-            };
-            match destination.publication {
-                DestinationPublication::Replace => finalize_publication(rename_at(
-                    &temp.directory,
-                    &temp.name,
-                    &destination_directory,
-                    &destination.name,
-                )),
-                DestinationPublication::Link => {
-                    let destination_lock = self.destination_lock(destination_key);
-                    let _destination_guard = destination_lock
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    finalize_publication(hard_link_at(
-                        &temp.directory,
-                        &temp.name,
-                        &destination_directory,
-                        &destination.name,
-                    ))
-                }
-                DestinationPublication::Repair(output) => {
-                    let destination_lock = self.destination_lock(destination_key);
-                    let _destination_guard = destination_lock
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    finalize_publication(self.replace_corrupt_egress_derivative(
-                        temp,
-                        &destination_directory,
-                        &destination.name,
-                        output,
-                    ))
-                }
-            }
+            self.publish_temporary_at_destination_or_resolve_existing(
+                &destination,
+                &destination_directory,
+                temp,
+                &mut transaction,
+                &mut checkpoint,
+                &mut progress,
+            )
         })();
         progress.finish(result, self, temp, transaction)
+    }
+
+    fn publish_temporary_at_destination_or_resolve_existing(
+        &self,
+        destination: &PublicationDestination,
+        destination_directory: &File,
+        temp: &TemporaryFile,
+        transaction: &mut PublicationTransaction,
+        checkpoint: &mut impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+        progress: &mut PublicationProgress,
+    ) -> Result<PublishOutcome, StorageError> {
+        match destination.publication {
+            DestinationPublication::Link | DestinationPublication::Repair(_) => self
+                .with_destination_lock(destination, || {
+                    self.publish_temporary_and_finalize_destination(
+                        destination,
+                        destination_directory,
+                        temp,
+                        transaction,
+                        checkpoint,
+                        progress,
+                    )
+                }),
+            DestinationPublication::Replace => self.publish_temporary_and_finalize_destination(
+                destination,
+                destination_directory,
+                temp,
+                transaction,
+                checkpoint,
+                progress,
+            ),
+        }
+    }
+
+    fn with_destination_lock<T>(
+        &self,
+        destination: &PublicationDestination,
+        action: impl FnOnce() -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let destination_lock = self.destination_lock(self.destination_key(destination));
+        let _destination_guard = destination_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        action()
+    }
+
+    fn publish_temporary_and_finalize_destination(
+        &self,
+        destination: &PublicationDestination,
+        destination_directory: &File,
+        temp: &TemporaryFile,
+        transaction: &mut PublicationTransaction,
+        checkpoint: &mut impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+        progress: &mut PublicationProgress,
+    ) -> Result<PublishOutcome, StorageError> {
+        match self.place_temporary_at_destination_or_resolve_existing(
+            destination,
+            destination_directory,
+            temp,
+        )? {
+            DestinationPublicationAttempt::Existing => {
+                transaction.transition(PublicationState::Published)?;
+                Ok(PublishOutcome::Identical)
+            }
+            DestinationPublicationAttempt::Created(location) => {
+                *progress = PublicationProgress::created(location);
+                self.durably_finalize_created_destination(
+                    CreatedDestination::new(location, destination_directory, &destination.name),
+                    temp,
+                    transaction,
+                    checkpoint,
+                    progress,
+                )?;
+                Ok(PublishOutcome::Created)
+            }
+        }
+    }
+
+    fn place_temporary_at_destination_or_resolve_existing(
+        &self,
+        destination: &PublicationDestination,
+        destination_directory: &File,
+        temp: &TemporaryFile,
+    ) -> Result<DestinationPublicationAttempt, StorageError> {
+        match destination.publication {
+            DestinationPublication::Replace => {
+                rename_at(
+                    &temp.directory,
+                    &temp.name,
+                    destination_directory,
+                    &destination.name,
+                )?;
+                Ok(DestinationPublicationAttempt::Created(
+                    TemporaryLocation::Destination,
+                ))
+            }
+            DestinationPublication::Link => self.link_temporary_while_destination_is_locked(
+                destination,
+                destination_directory,
+                temp,
+            ),
+            DestinationPublication::Repair(output) => self
+                .repair_egress_derivative_while_destination_is_locked(
+                    destination,
+                    destination_directory,
+                    temp,
+                    output,
+                ),
+        }
+    }
+
+    fn link_temporary_while_destination_is_locked(
+        &self,
+        destination: &PublicationDestination,
+        destination_directory: &File,
+        temp: &TemporaryFile,
+    ) -> Result<DestinationPublicationAttempt, StorageError> {
+        match hard_link_at(
+            &temp.directory,
+            &temp.name,
+            destination_directory,
+            &destination.name,
+        ) {
+            Ok(()) => Ok(DestinationPublicationAttempt::Created(
+                TemporaryLocation::Staging,
+            )),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => self
+                .compare_temporary_with_existing_destination(
+                    destination,
+                    destination_directory,
+                    temp,
+                ),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn compare_temporary_with_existing_destination(
+        &self,
+        destination: &PublicationDestination,
+        destination_directory: &File,
+        temp: &TemporaryFile,
+    ) -> Result<DestinationPublicationAttempt, StorageError> {
+        if files_equal_at(
+            &temp.directory,
+            &temp.name,
+            destination_directory,
+            &destination.name,
+        )? {
+            Ok(DestinationPublicationAttempt::Existing)
+        } else {
+            Err(StorageError::Conflict)
+        }
+    }
+
+    fn repair_egress_derivative_while_destination_is_locked(
+        &self,
+        destination: &PublicationDestination,
+        destination_directory: &File,
+        temp: &TemporaryFile,
+        output: EncodedIdentity,
+    ) -> Result<DestinationPublicationAttempt, StorageError> {
+        match self.replace_corrupt_egress_derivative(
+            temp,
+            destination_directory,
+            &destination.name,
+            output,
+        ) {
+            Ok(()) => Ok(DestinationPublicationAttempt::Created(
+                TemporaryLocation::Destination,
+            )),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Ok(DestinationPublicationAttempt::Existing)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn durably_finalize_created_destination(
+        &self,
+        destination: CreatedDestination<'_>,
+        temp: &TemporaryFile,
+        transaction: &mut PublicationTransaction,
+        checkpoint: &mut impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+        progress: &mut PublicationProgress,
+    ) -> Result<(), StorageError> {
+        destination
+            .temporary_location
+            .synchronize_source_directory_after_destination_creation(temp)?;
+        transaction.transition(PublicationState::Linked)?;
+        if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
+            destination
+                .temporary_location
+                .rollback_destination_before_durability(destination.directory, destination.name)?;
+            return Err(error);
+        }
+        if let Err(error) = destination.directory.sync_all() {
+            destination
+                .temporary_location
+                .rollback_destination_before_durability(destination.directory, destination.name)?;
+            return Err(error.into());
+        }
+        transaction.transition(PublicationState::Published)?;
+        progress.mark_durable();
+        checkpoint(PublishBoundary::AfterParentSync)
     }
 
     fn replace_corrupt_egress_derivative(
