@@ -193,6 +193,25 @@ nar_url_for() {
     cut -d ' ' -f 2
 }
 
+exercise_compression_pair() {
+  local description=$1
+  local input_compression=$2
+  local expected_suffix=$3
+  scenario "$description"
+  local path
+  path=$(build_path "${description// /-}" "$nonce")
+  sign_path "$path"
+  native_push_with_compression "$input_compression" "$path"
+  local destination="$temp_root/${input_compression}-to-${expected_suffix#.nar}.store"
+  substitute "$destination" "$trusted_key" "$path"
+  expect_file "$destination$path"
+  run cmp "$path" "$destination$path"
+  local nar_url
+  nar_url=$(nar_url_for "$path")
+  [[ "$nar_url" == *"$expected_suffix" ]] ||
+    fail "$description produced an unexpected URL: $nar_url"
+}
+
 http_status() {
   run curl --silent --output /dev/null --write-out '%{http_code}' \
     --netrc-file "$netrc" "$1"
@@ -474,6 +493,19 @@ run cmp "$zstd_input_path" "$zstd_input_root$zstd_input_path"
 zstd_input_nar_url=$(nar_url_for "$zstd_input_path")
 [[ "$zstd_input_nar_url" == *.nar ]] ||
   fail "zstd input did not produce a raw URL: $zstd_input_nar_url"
+
+stop_server
+start_server xz
+exercise_compression_pair 'XZ input is served as XZ' xz .nar.xz
+exercise_compression_pair 'Zstd input is served as XZ' zstd .nar.xz
+
+stop_server
+start_server zstd
+exercise_compression_pair 'XZ input is served as Zstd' xz .nar.zst
+exercise_compression_pair 'Zstd input is served as Zstd' zstd .nar.zst
+
+stop_server
+start_server none
 
 scenario 'offline GC retains a protected real-Nix closure'
 gc_base=$(build_path gc-base "$nonce")
