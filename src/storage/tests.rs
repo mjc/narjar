@@ -782,10 +782,13 @@ fn concurrent_requests_coalesce_compressed_derivative_generation() {
         .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
         .expect("raw NAR should be stored");
 
+    let barrier = Arc::new(std::sync::Barrier::new(4));
     let workers = (0..4)
         .map(|_| {
             let storage = Arc::clone(&storage);
+            let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
+                barrier.wait();
                 storage
                     .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
                     .expect("coalesced derivative generation should succeed")
