@@ -2,8 +2,7 @@
 
 Narjar is a small, filesystem-backed HTTP binary cache for Nix. It stores NAR
 files and signed narinfo files as immutable objects. The server does not need a
-Nix installation, database, signing private key, recompression pipeline, or
-online garbage collector.
+Nix installation, database, signing private key, or online garbage collector.
 
 The detailed protocol and operational rules are in [`docs/`](docs/), especially
 [`docs/protocol-v0.1.md`](docs/protocol-v0.1.md) and
@@ -35,6 +34,7 @@ variables:
 | `--max-in-flight` | `NARJAR_MAX_IN_FLIGHT` |
 | `--max-nar-bytes` | `NARJAR_MAX_NAR_BYTES` |
 | `--min-free-bytes` | `NARJAR_MIN_FREE_BYTES` |
+| `--egress-compression` | `NARJAR_EGRESS_COMPRESSION` |
 
 Put the service behind a TLS reverse proxy when it is not strictly local.
 Narjar itself speaks HTTP and supports public or token-authenticated reads plus
@@ -73,7 +73,12 @@ nix run . -- push \
 
 Use `--refresh` to re-check and re-upload paths already present at the
 destination. `--compression` is explicit and accepts `none`, `zstd`, or `xz`; it
-defaults to `none`. Netrc credentials are sent only over HTTPS by default;
+controls only the upload representation and defaults to `none`. The server
+independently selects the representation advertised to readers with
+`--egress-compression`, which also accepts `none`, `zstd`, or `xz` and defaults
+to `none`. Raw NAR bytes remain the authoritative stored object; a compressed
+egress file is materialized and published only after the raw object is durable.
+Netrc credentials are sent only over HTTPS by default;
 `--insecure-http` is an explicit opt-in for the loopback HTTP example above.
 The client uses fixed-length requests, streams NAR files from temporary files,
 and authenticates with the matching netrc entry. The native HTTP request

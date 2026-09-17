@@ -353,26 +353,40 @@ impl ValidatedNarInfo {
         self.0.payload
     }
 
+    pub(crate) fn decoded_identity(&self) -> NarIdentity {
+        self.0.payload.decoded_identity()
+    }
+
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.0.text.into_bytes()
     }
 
-    pub(crate) fn bind_raw(self, stored: StoredNar<'_>) -> Result<BoundNarInfo<'_>, NarInfoError> {
+    pub(crate) fn bind_raw(
+        self,
+        stored: StoredNar<'_>,
+        output_name: NarFileName,
+        output_size: EncodedSize,
+    ) -> Result<BoundNarInfo<'_>, NarInfoError> {
         if self.0.payload.decoded_identity() != stored.identity() {
             return Err(NarInfoError);
         }
         Ok(BoundNarInfo {
             metadata: self.0,
             stored,
+            output_name,
+            output_size,
         })
     }
 }
 
-/// Signed claims bound to an opened canonical payload. Only this state can
-/// project metadata for raw serving; it retains the file until publication.
+/// Signed claims bound to an opened canonical payload and selected output.
+/// Only this state can project metadata for serving; it retains the raw file
+/// until publication.
 pub(crate) struct BoundNarInfo<'storage> {
     metadata: ParsedNarInfo,
     stored: StoredNar<'storage>,
+    output_name: NarFileName,
+    output_size: EncodedSize,
 }
 
 impl BoundNarInfo<'_> {
@@ -384,22 +398,24 @@ impl BoundNarInfo<'_> {
         &self.metadata.store
     }
 
-    pub(crate) fn raw_bytes(&self) -> io::Result<Vec<u8>> {
+    pub(crate) fn output_bytes(&self) -> io::Result<Vec<u8>> {
         let mut output = BoundedNarInfoWriter::with_capacity(self.metadata.text.len());
         self.metadata
             .text
             .lines()
-            .try_for_each(|line| self.write_raw_field(line, &mut output))?;
+            .try_for_each(|line| self.write_output_field(line, &mut output))?;
         Ok(output.into_bytes())
     }
 
-    fn write_raw_field(&self, line: &str, output: &mut impl Write) -> io::Result<()> {
-        let identity = self.stored.identity();
+    fn write_output_field(&self, line: &str, output: &mut impl Write) -> io::Result<()> {
+        let name = self.output_name;
         match line.split_once(": ") {
-            Some(("URL", _)) => writeln!(output, "URL: nar/{}", NarFileName::raw(identity.hash())),
-            Some(("Compression", _)) => writeln!(output, "Compression: none"),
-            Some(("FileHash", _)) => writeln!(output, "FileHash: sha256:{}", identity.hash()),
-            Some(("FileSize", _)) => writeln!(output, "FileSize: {}", identity.size()),
+            Some(("URL", _)) => writeln!(output, "URL: nar/{name}"),
+            Some(("Compression", _)) => {
+                writeln!(output, "Compression: {}", name.encoding().compression())
+            }
+            Some(("FileHash", _)) => writeln!(output, "FileHash: sha256:{}", name.file_hash()),
+            Some(("FileSize", _)) => writeln!(output, "FileSize: {}", self.output_size),
             _ => writeln!(output, "{line}"),
         }
     }

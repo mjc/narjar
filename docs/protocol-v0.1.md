@@ -74,8 +74,10 @@ explicit migration because clients cache this file for days.
 
 All writes require a write token. Content-Length is required. The server rejects
 Transfer-Encoding request bodies, HTTP Content-Encoding, unexpected route
-suffixes, and bodies larger than configured route-specific limits. XZ uploads
-are validated against the decompressed NAR hash and size before publication.
+suffixes, and bodies larger than configured route-specific limits. XZ and Zstd
+uploads are validated against the decompressed NAR hash and size before
+publication. The server stores the canonical raw NAR and may materialize one
+selected compressed egress representation from it.
 
 Error classes:
 
@@ -149,6 +151,13 @@ Public immutable NAR and narinfo responses may use a long max-age plus
 immutable. nix-cache-info uses a shorter explicit policy because deployment
 priority may change only by migration. Private/authenticated responses default
 to private, no-store.
+
+The `serve --egress-compression` policy selects the representation named by
+newly published narinfo files: `none` serves the canonical raw file, while
+`zstd` and `xz` materialize an immutable compressed derivative from that raw
+file. The URL, Compression, FileHash, and FileSize fields always describe the
+same published derivative. A single cache URL is used for both uploads and
+substitution; the policy is server configuration, not an alternate endpoint.
 
 404 narinfo responses do not advertise long cache headers. Nix maintains its
 own negative cache, so operators use --refresh after a recent publication that

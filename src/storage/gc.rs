@@ -67,6 +67,8 @@ struct Entry {
     nar_name: OsString,
     narinfo_bytes: u64,
     nar_bytes: u64,
+    raw_nar_name: OsString,
+    raw_nar_bytes: u64,
     modified: SystemTime,
     protected: bool,
 }
@@ -229,6 +231,18 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
             )));
         }
 
+        let canonical_raw_name = OsString::from(
+            super::NarFileName::raw(validated.decoded_identity().hash()).to_string(),
+        );
+        let (raw_nar_name, raw_nar_bytes) =
+            match open_regular_at(&nar_directory, &canonical_raw_name) {
+                Ok(file) => (canonical_raw_name, file.metadata()?.len()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    (nar_name.clone(), nar_metadata.len())
+                }
+                Err(error) => return Err(error.into()),
+            };
+
         entries.push(Entry {
             store,
             store_path: validated.store_path().to_owned(),
@@ -241,6 +255,8 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
             nar_name,
             narinfo_bytes: metadata.len(),
             nar_bytes: nar_metadata.len(),
+            raw_nar_name,
+            raw_nar_bytes,
             modified: metadata.modified()?,
             protected: false,
         });
@@ -251,7 +267,11 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
 fn scan_orphans(storage: &Storage, entries: &[Entry]) -> Result<Vec<Orphan>, StorageError> {
     let referenced = entries
         .iter()
-        .map(|entry| (entry.nar_name.clone(), ()))
+        .flat_map(|entry| {
+            [entry.nar_name.clone(), entry.raw_nar_name.clone()]
+                .into_iter()
+                .map(|name| (name, ()))
+        })
         .collect::<BTreeMap<_, _>>();
     let nar_directory = storage.nar_directory()?;
     let mut orphans = Vec::new();
@@ -349,6 +369,8 @@ fn category_bytes(entries: &[Entry], include: impl Fn(&Entry) -> bool) -> u64 {
         total += entry.narinfo_bytes;
         nars.entry(entry.nar_name.clone())
             .or_insert(entry.nar_bytes);
+        nars.entry(entry.raw_nar_name.clone())
+            .or_insert(entry.raw_nar_bytes);
     }
     total + nars.values().copied().sum::<u64>()
 }
@@ -360,6 +382,9 @@ fn shared_bytes(entries: &[Entry]) -> u64 {
         sizes
             .entry(entry.nar_name.clone())
             .or_insert(entry.nar_bytes);
+        sizes
+            .entry(entry.raw_nar_name.clone())
+            .or_insert(entry.raw_nar_bytes);
     }
     counts
         .into_iter()
@@ -449,11 +474,23 @@ fn total_bytes(entries: &[Entry]) -> u64 {
     for entry in entries {
         nars.entry(entry.nar_name.clone())
             .or_insert(entry.nar_bytes);
+        nars.entry(entry.raw_nar_name.clone())
+            .or_insert(entry.raw_nar_bytes);
     }
     total += nars.values().copied().sum::<u64>();
     total
 }
 fn reference_counts(entries: &[Entry]) -> BTreeMap<OsString, u64> {
+    let mut references = BTreeMap::new();
+    for entry in entries {
+        *references
+            .entry(entry.raw_nar_name.clone())
+            .or_insert(0_u64) += 1;
+    }
+    references
+}
+
+fn output_reference_counts(entries: &[Entry]) -> BTreeMap<OsString, u64> {
     let mut references = BTreeMap::new();
     for entry in entries {
         *references.entry(entry.nar_name.clone()).or_insert(0_u64) += 1;
@@ -471,6 +508,7 @@ fn select(
     now: SystemTime,
 ) -> Vec<usize> {
     let mut references = reference_counts(entries);
+    let mut output_references = output_reference_counts(entries);
 
     let size_pressure = target_bytes
         .is_some_and(|target| max_bytes.map_or(current_bytes > target, |max| current_bytes > max));
@@ -502,10 +540,16 @@ fn select(
 
         selected.push(index);
         remaining = remaining.saturating_sub(entry.narinfo_bytes);
-        if let Some(count) = references.get_mut(&entry.nar_name) {
+        if let Some(count) = output_references.get_mut(&entry.nar_name) {
             *count -= 1;
             if *count == 0 {
                 remaining = remaining.saturating_sub(entry.nar_bytes);
+            }
+        }
+        if let Some(count) = references.get_mut(&entry.raw_nar_name) {
+            *count -= 1;
+            if *count == 0 {
+                remaining = remaining.saturating_sub(entry.raw_nar_bytes);
             }
         }
     }
@@ -570,13 +614,20 @@ fn logical_after_bytes(
 fn projected_published_bytes(entries: &[Entry], selected: &[usize]) -> u64 {
     let mut total = total_bytes(entries);
     let mut references = reference_counts(entries);
+    let mut output_references = output_reference_counts(entries);
     for &index in selected {
         let entry = &entries[index];
         total = total.saturating_sub(entry.narinfo_bytes);
-        if let Some(count) = references.get_mut(&entry.nar_name) {
+        if let Some(count) = output_references.get_mut(&entry.nar_name) {
             *count -= 1;
             if *count == 0 {
                 total = total.saturating_sub(entry.nar_bytes);
+            }
+        }
+        if let Some(count) = references.get_mut(&entry.raw_nar_name) {
+            *count -= 1;
+            if *count == 0 {
+                total = total.saturating_sub(entry.raw_nar_bytes);
             }
         }
     }
@@ -618,6 +669,7 @@ fn apply_with_failure(
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
     let mut references = reference_counts(entries);
+    let mut output_references = output_reference_counts(entries);
     let mut deleted_nars = 0;
     for &index in selected {
         let entry = &entries[index];
@@ -625,15 +677,26 @@ fn apply_with_failure(
         unlink_at(&root, &entry.narinfo_name)?;
         fail_if(failure, FailurePoint::AfterNarinfoDeleteBeforeSync)?;
         root.sync_all()?;
-        let count = references
-            .get_mut(&entry.nar_name)
+        let raw_count = references
+            .get_mut(&entry.raw_nar_name)
             .expect("scanned reference count");
-        *count -= 1;
+        *raw_count -= 1;
+        let output_count = output_references
+            .get_mut(&entry.nar_name)
+            .expect("scanned output reference count");
+        *output_count -= 1;
         fail_if(failure, FailurePoint::AfterNarinfoSyncBeforeNarDelete)?;
-        if *count == 0 {
+        if *output_count == 0 {
             unlink_at(&nar_directory, &entry.nar_name)?;
             fail_if(failure, FailurePoint::AfterNarDeleteBeforeSync)?;
+        }
+        if *raw_count == 0 && entry.raw_nar_name != entry.nar_name {
+            unlink_at(&nar_directory, &entry.raw_nar_name)?;
+        }
+        if *output_count == 0 || *raw_count == 0 {
             nar_directory.sync_all()?;
+        }
+        if *raw_count == 0 {
             deleted_nars += 1;
         }
     }
@@ -842,6 +905,8 @@ mod tests {
             nar_name: OsString::from(format!("{TEST_NAR_ID}.nar")),
             narinfo_bytes: 9,
             nar_bytes: 3,
+            raw_nar_name: OsString::from(format!("{TEST_NAR_ID}.nar")),
+            raw_nar_bytes: 3,
             modified: SystemTime::now(),
             protected: false,
         };
@@ -858,6 +923,8 @@ mod tests {
             .expect("rename fixture to XZ object");
         fs::write(nar_directory.join(&raw_name), b"raw").expect("write raw object");
         entry.nar_name = OsString::from(xz_name);
+        entry.raw_nar_name = entry.nar_name.clone();
+        entry.raw_nar_bytes = 3;
 
         let orphans = scan_orphans(&storage, &[entry]).expect("scan orphans");
 

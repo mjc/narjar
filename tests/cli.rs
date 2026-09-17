@@ -18,7 +18,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use structured_zstd::encoding::{CompressionLevel, compress};
+use structured_zstd::encoding::{CompressionLevel, StreamingEncoder, compress};
 use tempfile::TempDir;
 
 const CONFIG_ENV: &[&str] = &[
@@ -28,6 +28,7 @@ const CONFIG_ENV: &[&str] = &[
     "NARJAR_MAX_IN_FLIGHT",
     "NARJAR_MAX_NAR_BYTES",
     "NARJAR_MIN_FREE_BYTES",
+    "NARJAR_EGRESS_COMPRESSION",
     "NARJAR_SHUTDOWN_GRACE_SECONDS",
     "NARJAR_IO_TIMEOUT_SECONDS",
     "NARJAR_PUSH_TIMEOUT_SECONDS",
@@ -2466,6 +2467,149 @@ fn zstd_narinfo_is_published_as_the_canonical_raw_pair() {
     assert_eq!(nar_body, NAR_BYTES);
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn configured_compressed_egress_is_independent_of_ingress_encoding() {
+    for (output_encoding, input_encoding) in [
+        (WireEncoding::Zstd, WireEncoding::Xz),
+        (WireEncoding::Xz, WireEncoding::Zstd),
+    ] {
+        let output_name = test_encoding_name(output_encoding);
+        let input_suffix = compressed_test_suffix(input_encoding);
+        let output_suffix = compressed_test_suffix(output_encoding);
+        let server = RunningServer::start_with_args(
+            &format!("compressed-egress-{output_name}"),
+            &["--egress-compression", output_name],
+        );
+        let compressed = encode_test_nar(input_encoding);
+        let input_hash = nix32_sha256(&compressed);
+        let uploaded = server.request_with_body(
+            "PUT",
+            &format!("/nar/{input_hash}{input_suffix}"),
+            &[],
+            &compressed,
+        );
+        let narinfo = signed_compressed_narinfo(
+            input_encoding,
+            &input_hash,
+            NARJAR_HASH,
+            NAR_BYTES.len() as u64,
+            compressed.len() as u64,
+        );
+        let published = server.request_with_body(
+            "PUT",
+            &format!("/{STORE_HASH}.narinfo"),
+            &[],
+            narinfo.as_bytes(),
+        );
+        let narinfo_response = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
+        let (_, narinfo_body) = response_parts(&narinfo_response);
+        let narinfo_text = String::from_utf8(narinfo_body.to_vec()).expect("narinfo is UTF-8");
+        let output_url = narinfo_text
+            .lines()
+            .find_map(|line| line.strip_prefix("URL: "))
+            .expect("projected narinfo has a URL");
+        let output_bytes = encode_test_nar(output_encoding);
+        let output_hash = nix32_sha256(&output_bytes);
+        assert_eq!(output_url, format!("nar/{output_hash}{output_suffix}"));
+        assert!(narinfo_text.contains(&format!(
+            "Compression: {}",
+            compression_name(output_encoding)
+        )));
+        assert_eq!(
+            narinfo_text,
+            rewrite_transport_fields(&narinfo, output_encoding, &output_hash, output_bytes.len())
+        );
+        let output_response = server.request("GET", &format!("/{output_url}"));
+        let (_, output_body) = response_parts(&output_response);
+        let output_path = server
+            .data_dir
+            .join(format!("nar/{output_hash}{output_suffix}"));
+        let raw_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
+        assert!(output_path.is_file());
+        assert!(raw_path.is_file());
+        let (temp_dir, signal, status) = server.stop_preserving();
+
+        assert!(uploaded.starts_with(b"HTTP/1.1 201 Created\r\n"));
+        assert!(published.starts_with(b"HTTP/1.1 201 Created\r\n"));
+        assert!(output_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(output_body, output_bytes);
+        assert!(signal.success(), "SIGTERM should be sent");
+        assert!(status.success(), "narjar should shut down cleanly");
+
+        let gc = run(&[
+            "gc",
+            "--data-dir",
+            temp_dir
+                .path()
+                .to_str()
+                .expect("temporary path should be UTF-8"),
+            "--target-bytes",
+            "0",
+            "--min-age-seconds",
+            "0",
+            "--dry-run",
+            "--json",
+        ]);
+        assert!(gc.status.success(), "GC should inspect compressed egress");
+        assert!(
+            String::from_utf8_lossy(&gc.stdout).contains("\"orphaned\":0"),
+            "compressed output and its raw source should both be referenced: {}",
+            String::from_utf8_lossy(&gc.stdout)
+        );
+    }
+}
+
+fn encode_test_nar(encoding: WireEncoding) -> Vec<u8> {
+    match encoding {
+        WireEncoding::Raw => NAR_BYTES.to_vec(),
+        WireEncoding::Zstd => {
+            let mut compressed = Vec::new();
+            let mut encoder = StreamingEncoder::new(&mut compressed, CompressionLevel::Fastest);
+            encoder.write_all(NAR_BYTES).expect("compress NAR");
+            encoder.finish().expect("finish zstd stream");
+            compressed
+        }
+        WireEncoding::Xz => {
+            let mut compressed = Vec::new();
+            let mut writer = XzWriter::new(&mut compressed, XzOptions::with_preset(1))
+                .expect("create XZ writer");
+            writer.write_all(NAR_BYTES).expect("compress NAR");
+            writer.finish().expect("finish XZ stream");
+            compressed
+        }
+    }
+}
+
+fn rewrite_transport_fields(
+    narinfo: &str,
+    encoding: WireEncoding,
+    file_hash: &str,
+    file_size: usize,
+) -> String {
+    narinfo
+        .lines()
+        .map(|line| match line.split_once(": ") {
+            Some(("URL", _)) => format!("URL: nar/{file_hash}{}", compressed_test_suffix(encoding)),
+            Some(("Compression", _)) => {
+                format!("Compression: {}", compression_name(encoding))
+            }
+            Some(("FileHash", _)) => format!("FileHash: sha256:{file_hash}"),
+            Some(("FileSize", _)) => format!("FileSize: {file_size}"),
+            _ => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+fn compression_name(encoding: WireEncoding) -> &'static str {
+    match encoding {
+        WireEncoding::Xz => "xz",
+        WireEncoding::Zstd => "zstd",
+        WireEncoding::Raw => "none",
+    }
 }
 
 #[test]

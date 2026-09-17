@@ -9,7 +9,7 @@ use crate::{
     http_server::{Method, Request, Response, ResponseHeader as Header, StatusCode, static_header},
     metrics::{Metrics, RequestGuard, RequestMethod, RequestRoute, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
-    object::NarFileName,
+    object::{NarFileName, WireEncoding},
     storage::{
         CapacityErrorKind, NarUploadPolicy, PublishOutcome, StagingReservation, Storage,
         StorageError, StoreHash, capacity_error_kind,
@@ -355,6 +355,7 @@ impl PublicationRequest {
         storage: &Storage,
         trusted: &TrustedPublicKeys,
         policy: NarUploadPolicy,
+        egress_compression: WireEncoding,
         metrics: &Metrics,
         staging: StagingReservation,
     ) {
@@ -374,7 +375,15 @@ impl PublicationRequest {
             ),
             CacheRoute::NarInfo(store) => {
                 drop(staging);
-                respond_narinfo_put(upload, storage, &store, trusted, metrics, &guard)
+                respond_narinfo_put(
+                    upload,
+                    storage,
+                    &store,
+                    trusted,
+                    egress_compression,
+                    metrics,
+                    &guard,
+                )
             }
             CacheRoute::CacheInfo => {
                 drop(staging);
@@ -598,6 +607,7 @@ fn respond_narinfo_put(
     storage: &Storage,
     store: &StoreHash,
     trusted: &TrustedPublicKeys,
+    egress_compression: WireEncoding,
     metrics: &Metrics,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
@@ -618,7 +628,7 @@ fn respond_narinfo_put(
     };
     let started = Instant::now();
     let result = storage
-        .bind_narinfo(validated)
+        .bind_narinfo(validated, egress_compression)
         .and_then(|bound| bound.publish());
     metrics.publication(started.elapsed());
     if let Err(error) = &result {

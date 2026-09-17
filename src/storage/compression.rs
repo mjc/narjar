@@ -8,8 +8,10 @@ use std::{
 };
 
 use lzma_rust2::XzReader;
+use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
+use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
 use crate::narinfo::{CompressedNarExpectation, NarEncoding, ValidatedPayload};
 use crate::object::{
@@ -216,6 +218,76 @@ struct HashingWriter<'a, W: Write + ?Sized> {
     hasher: Sha256,
     bytes_written: u64,
     max_bytes: u64,
+}
+
+pub(super) struct EncodedOutput {
+    pub(super) hash: FileHash,
+    pub(super) size: EncodedSize,
+}
+
+struct EncodedOutputHasher<'a, W: Write + ?Sized> {
+    inner: &'a mut W,
+    hasher: Sha256,
+    bytes_written: u64,
+}
+
+impl<'a, W: Write + ?Sized> EncodedOutputHasher<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes_written: 0,
+        }
+    }
+
+    fn finish(self) -> EncodedOutput {
+        EncodedOutput {
+            hash: FileHash::from_digest(self.hasher.finalize().into()),
+            size: EncodedSize::new(self.bytes_written),
+        }
+    }
+}
+
+impl<W: Write + ?Sized> Write for EncodedOutputHasher<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(written as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "encoded NAR is too large")
+            })?;
+        self.hasher.update(&buffer[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub(super) fn encode_raw_nar(
+    source: &File,
+    codec: CompressionCodec,
+    destination: &mut File,
+) -> io::Result<EncodedOutput> {
+    let mut source = source.try_clone()?;
+    source.seek(SeekFrom::Start(0))?;
+    let mut output = EncodedOutputHasher::new(destination);
+    match codec {
+        CompressionCodec::Zstd => {
+            let mut encoder = StreamingEncoder::new(&mut output, CompressionLevel::Fastest);
+            io::copy(&mut source, &mut encoder)?;
+            encoder.finish()?;
+        }
+        CompressionCodec::Xz => {
+            let mut encoder =
+                XzWriter::new(&mut output, XzOptions::with_preset(1)).map_err(io::Error::other)?;
+            io::copy(&mut source, &mut encoder)?;
+            encoder.finish().map_err(io::Error::other)?;
+        }
+    }
+    Ok(output.finish())
 }
 
 impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
