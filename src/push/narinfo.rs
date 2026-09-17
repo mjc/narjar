@@ -51,17 +51,7 @@ pub(super) fn serialize_narinfo(
         .strip_prefix("/nix/store/")
         .ok_or_else(|| format!("invalid store path: {}", info.path))?;
     let nar_hash = nix32_sha256_from_sri(&info.nar_hash)?;
-    let mut references = info
-        .references
-        .iter()
-        .map(|reference| {
-            reference
-                .strip_prefix("/nix/store/")
-                .ok_or_else(|| format!("invalid reference path: {reference}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    references.sort_unstable();
-    references.dedup();
+    let references = normalized_reference_basenames(info)?;
 
     let mut output = format!(
         "StorePath: {}\nURL: nar/{}{}\nCompression: {}\nFileHash: sha256:{}\nFileSize: {}\nNarHash: sha256:{}\nNarSize: {}\nReferences: {}\n",
@@ -98,4 +88,34 @@ pub(super) fn serialize_narinfo(
         output.push('\n');
     }
     Ok(output.into_bytes())
+}
+
+pub(super) fn fingerprint_for(info: &PathInfo) -> Result<String, String> {
+    let nar_hash = nix32_sha256_from_sri(&info.nar_hash)?;
+    let references = normalized_reference_basenames(info)?
+        .into_iter()
+        .map(|reference| format!("/nix/store/{reference}"))
+        .collect::<Vec<_>>();
+    Ok(format!(
+        "1;{};sha256:{};{};{}",
+        info.path,
+        nar_hash,
+        info.nar_size,
+        references.join(",")
+    ))
+}
+
+fn normalized_reference_basenames(info: &PathInfo) -> Result<Vec<&str>, String> {
+    let mut references = info
+        .references
+        .iter()
+        .map(|reference| {
+            reference
+                .strip_prefix("/nix/store/")
+                .ok_or_else(|| format!("invalid reference path: {reference}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    references.sort_unstable();
+    references.dedup();
+    Ok(references)
 }

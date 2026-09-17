@@ -1,6 +1,9 @@
 mod config;
 mod error;
 mod http_url;
+#[allow(dead_code)]
+mod nar;
+mod nar_encode;
 mod operator;
 mod push;
 mod server;

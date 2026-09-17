@@ -1,4 +1,11 @@
-use std::{fs::File, io, path::Path, thread, time::Duration};
+use std::{
+    io::{self, Read},
+    thread,
+    time::Duration,
+};
+
+#[cfg(test)]
+use std::{fs::File, path::Path};
 
 use ureq::Agent;
 
@@ -148,6 +155,7 @@ where
     unreachable!("retry loop always returns")
 }
 
+#[cfg(test)]
 pub(super) fn put_file(
     agent: &Agent,
     url: &HttpUrl,
@@ -169,6 +177,35 @@ pub(super) fn put_file(
         }
         request
             .send(file)
+            .map_err(|error| format!("PUT {upload_url} failed: {error}"))
+    })
+}
+
+pub(super) fn put_reader<F>(
+    agent: &Agent,
+    url: &HttpUrl,
+    content_length: u64,
+    content_type: &str,
+    authorization: Option<&str>,
+    mut open: F,
+) -> Result<u16, String>
+where
+    F: FnMut() -> Result<Box<dyn Read + Send>, String>,
+{
+    put_with_redirects(url, |upload_url| {
+        let reader = open()?;
+        let mut request = agent
+            .put(upload_url.as_str())
+            .config()
+            .max_redirects(0)
+            .build()
+            .header("Content-Type", content_type)
+            .header("Content-Length", content_length.to_string());
+        if let Some(authorization) = authorization {
+            request = request.header("Authorization", format!("Basic {authorization}"));
+        }
+        request
+            .send(ureq::SendBody::from_owned_reader(reader))
             .map_err(|error| format!("PUT {upload_url} failed: {error}"))
     })
 }

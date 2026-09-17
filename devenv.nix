@@ -13,6 +13,7 @@ in
     git
     nix
     jq
+    sqlite
     curl
     cargo-nextest
     shellcheck
