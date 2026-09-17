@@ -3,18 +3,18 @@ use std::{
     fs::File,
     io,
     os::unix::fs::PermissionsExt,
-    sync::atomic::AtomicU64,
+    sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
 #[cfg(test)]
 use std::path::PathBuf;
 
 use super::{
-    compression::ValidationEvidence,
-    fs::{lock_exclusive, open_at},
-    ids::{NarObjectId, StoreHash},
+    compression::IngestionReceipt,
+    fs::{FilesystemSpace, filesystem_space, lock_exclusive, open_at},
+    ids::StoreHash,
 };
-use crate::narinfo::NarEncoding;
+use crate::object::NarFileName;
 
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
@@ -32,13 +32,12 @@ impl Layout {
         self.root.join("nar")
     }
 
-    pub(super) fn nar_path(&self, id: &NarObjectId) -> PathBuf {
-        self.nar_dir().join(format!("{}.nar", id.0))
+    pub(super) fn nar_path(&self, hash: crate::object::NarHash) -> PathBuf {
+        self.nar_dir().join(NarFileName::raw(hash).to_string())
     }
 
-    pub(super) fn nar_path_encoded(&self, id: &NarObjectId, encoding: NarEncoding) -> PathBuf {
-        self.nar_dir()
-            .join(format!("{}{}", id.0, encoding.suffix()))
+    pub(super) fn nar_path_encoded(&self, name: NarFileName) -> PathBuf {
+        self.nar_dir().join(name.to_string())
     }
 
     pub(super) fn nar_temp_dir(&self) -> PathBuf {
@@ -52,40 +51,48 @@ impl Layout {
     pub(super) fn temp_dir(&self) -> PathBuf {
         self.root.join(".tmp")
     }
+
+    pub(super) fn ingestion_receipt_dir(&self) -> PathBuf {
+        self.root.join(".narjar-ingress")
+    }
 }
 
 pub(super) enum PublishTarget<'a> {
     CacheInfo,
-    Nar(&'a NarObjectId, NarEncoding),
+    Nar(NarFileName),
     NarInfo(&'a StoreHash),
-    Validation(&'a ValidationEvidence),
+    IngestionReceipt(&'a IngestionReceipt),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DestinationPublication {
+    Link,
+    Replace,
 }
 
 impl PublishTarget<'_> {
     pub(super) fn destination_name(&self) -> OsString {
         match self {
             Self::CacheInfo => OsString::from("nix-cache-info"),
-            Self::Nar(id, encoding) => {
-                OsString::from(format!("{}{}", id.as_str(), encoding.suffix()))
-            }
+            Self::Nar(name) => name.os_string(),
             Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
-            Self::Validation(evidence) => evidence.file_name(),
+            Self::IngestionReceipt(evidence) => evidence.file_name(),
         }
     }
 
     pub(super) fn temp_prefix(&self) -> &'static str {
         match self {
             Self::CacheInfo => "cache-info",
-            Self::Nar(_, _) => "nar",
+            Self::Nar(_) => "nar",
             Self::NarInfo(_) => "narinfo",
-            Self::Validation(_) => "validation",
+            Self::IngestionReceipt(_) => "receipt",
         }
     }
 
-    pub(super) fn replaces_destination(&self) -> bool {
+    pub(super) fn destination_publication(&self) -> DestinationPublication {
         match self {
-            Self::Validation(_) => true,
-            Self::CacheInfo | Self::Nar(_, _) | Self::NarInfo(_) => false,
+            Self::IngestionReceipt(_) => DestinationPublication::Replace,
+            Self::CacheInfo | Self::Nar(_) | Self::NarInfo(_) => DestinationPublication::Link,
         }
     }
 }
@@ -106,6 +113,7 @@ pub(super) enum PublishBoundary {
     BeforeFinalLink,
     BeforeParentSync,
     AfterParentSync,
+    AfterNarPublication,
 }
 
 #[cfg(test)]
@@ -172,20 +180,93 @@ impl NarUploadPolicy {
             min_free_bytes,
         }
     }
+
+    pub const fn min_free_bytes(self) -> u64 {
+        self.min_free_bytes
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct StagingBudget {
+    outstanding_bytes: u64,
+}
+
+impl StagingBudget {
+    pub(super) fn reserve(
+        &mut self,
+        space: FilesystemSpace,
+        min_free_bytes: u64,
+        bytes: u64,
+    ) -> Result<(), StorageError> {
+        let total = self
+            .outstanding_bytes
+            .checked_add(bytes)
+            .ok_or(StorageError::InsufficientSpace)?;
+        let required = total
+            .checked_add(min_free_bytes)
+            .ok_or(StorageError::InsufficientSpace)?;
+        space.required_capacity(required)?;
+        self.outstanding_bytes = total;
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: u64) {
+        self.outstanding_bytes = self.outstanding_bytes.saturating_sub(bytes);
+    }
+
+    #[cfg(test)]
+    pub(super) const fn outstanding_bytes(&self) -> u64 {
+        self.outstanding_bytes
+    }
 }
 
 #[derive(Debug)]
 pub struct StagingReservation {
-    pub(super) reservations: std::sync::Arc<AtomicU64>,
+    pub(super) budget: Arc<Mutex<StagingBudget>>,
     pub(super) bytes: u64,
 }
 
 impl StagingReservation {
-    pub(super) fn empty(reservations: std::sync::Arc<AtomicU64>) -> Self {
-        Self {
-            reservations,
-            bytes: 0,
+    pub(super) fn empty(budget: Arc<Mutex<StagingBudget>>) -> Self {
+        Self { budget, bytes: 0 }
+    }
+
+    pub(super) fn grow_to(
+        &mut self,
+        directory: &File,
+        min_free_bytes: u64,
+        required_bytes: u64,
+    ) -> Result<(), StorageError> {
+        let additional = required_bytes.saturating_sub(self.bytes);
+        if additional == 0 {
+            return Ok(());
         }
+        let new_bytes = self
+            .bytes
+            .checked_add(additional)
+            .ok_or_else(|| io::Error::other("staging reservation size overflow"))?;
+        let mut budget = self
+            .budget
+            .lock()
+            .map_err(|_| StorageError::Io(io::Error::other("staging budget lock poisoned")))?;
+        budget.reserve(filesystem_space(directory)?, min_free_bytes, additional)?;
+        self.bytes = new_bytes;
+        Ok(())
+    }
+
+    pub(super) fn record_materialized_bytes(&mut self, bytes: u64) {
+        let released = bytes.min(self.bytes);
+        if released == 0 {
+            return;
+        }
+        if let Ok(mut budget) = self.budget.lock() {
+            budget.release(released);
+        }
+        self.bytes -= released;
+    }
+
+    pub(super) const fn reserved_bytes(&self) -> u64 {
+        self.bytes
     }
 }
 
@@ -194,10 +275,10 @@ impl Drop for StagingReservation {
         if self.bytes == 0 {
             return;
         }
-        let previous = self
-            .reservations
-            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Release);
-        debug_assert!(previous >= self.bytes);
+        if let Ok(mut budget) = self.budget.lock() {
+            debug_assert!(budget.outstanding_bytes >= self.bytes);
+            budget.release(self.bytes);
+        }
     }
 }
 

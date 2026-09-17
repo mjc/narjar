@@ -3,7 +3,7 @@ use std::{collections::HashSet, ffi::OsStr, fs::File, io};
 use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file},
     storage::{
-        Directory, NarObjectId, StoreHash, for_each_dir_name,
+        Directory, FileHash, StoreHash, for_each_dir_name,
         inspection::{NarinfoCandidate, NarinfoName, PayloadEntry, ReferencedPayload},
         open_directory_at, read_dir_names,
     },
@@ -112,22 +112,19 @@ pub enum VerificationMode {
 #[derive(Default)]
 struct MetadataScan {
     entries: Vec<InventoryEntry>,
-    references: HashSet<NarObjectId>,
+    references: HashSet<FileHash>,
 }
 
 enum MetadataAssessment {
     Rejected(InventoryEntry),
     Referenced {
         entry: InventoryEntry,
-        nar: NarObjectId,
+        nar: FileHash,
     },
 }
 
 impl VerificationMode {
-    fn inspect_referenced_payload(
-        self,
-        payload: ReferencedPayload<'_>,
-    ) -> io::Result<InventoryClass> {
+    fn inspect_referenced_payload(self, payload: ReferencedPayload) -> io::Result<InventoryClass> {
         let matches = match self {
             Self::Availability => payload.has_expected_size()?,
             Self::Content => payload.verify_content()?,
@@ -145,12 +142,8 @@ fn inspect_trusted_narinfo(
     metadata: ValidatedNarInfo,
     verification: VerificationMode,
 ) -> io::Result<MetadataAssessment> {
-    let nar = metadata.nar().clone();
-    let class = match ReferencedPayload::open(
-        payloads,
-        metadata.payload_name(),
-        metadata.payload_expectation(),
-    )? {
+    let nar = metadata.payload_name().file_hash();
+    let class = match ReferencedPayload::open(payloads, metadata.payload())? {
         None => InventoryClass::MissingNar,
         Some(payload) => verification.inspect_referenced_payload(payload)?,
     };
@@ -240,17 +233,17 @@ fn inspect_narinfo_entries(
 
 fn classify_unreferenced_payload(
     payload: PayloadEntry<'_>,
-    references: &HashSet<NarObjectId>,
+    references: &HashSet<FileHash>,
 ) -> Option<InventoryEntry> {
     match payload {
         PayloadEntry::Invalid(name) => {
             Some(InventoryEntry::new(InventoryClass::InvalidFilename, name))
         }
-        PayloadEntry::Identified(payload) => match references.contains(&payload.id) {
+        PayloadEntry::Identified(payload) => match references.contains(&payload.file_hash()) {
             true => None,
             false => Some(InventoryEntry::new(
                 InventoryClass::OrphanNar,
-                payload.id.as_str(),
+                payload.file_hash().to_string(),
             )),
         },
     }
@@ -258,7 +251,7 @@ fn classify_unreferenced_payload(
 
 fn inspect_unreferenced_payloads(
     directory: &File,
-    references: &HashSet<NarObjectId>,
+    references: &HashSet<FileHash>,
 ) -> io::Result<Vec<InventoryEntry>> {
     let mut entries = Vec::new();
     read_dir_names(directory)?.iter().try_for_each(|name| {

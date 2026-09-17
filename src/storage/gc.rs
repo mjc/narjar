@@ -11,7 +11,7 @@ use super::fs::unlink_at;
 use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
     storage::{
-        Directory, NarObjectId, Storage, StorageError, StoreHash, open_regular_at, read_dir_names,
+        Directory, FileHash, Storage, StorageError, StoreHash, open_regular_at, read_dir_names,
     },
 };
 
@@ -216,18 +216,14 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
                     invalid(format!("untrusted narinfo: {name_str}"))
                 }
             })?;
-        let nar_name = OsString::from(format!(
-            "{}{}",
-            validated.nar().as_str(),
-            validated.encoding().suffix()
-        ));
+        let nar_name = OsString::from(validated.payload_name().to_string());
         let nar_metadata = open_regular_at(&nar_directory, &nar_name)
             .and_then(|file| file.metadata())
             .map_err(|error| match error.kind() {
                 io::ErrorKind::NotFound => invalid(format!("missing NAR for narinfo: {name_str}")),
                 _ => error.into(),
             })?;
-        if nar_metadata.len() != validated.file_size() {
+        if nar_metadata.len() != validated.file_size().get() {
             return Err(invalid(format!(
                 "NAR size mismatch for narinfo: {name_str}"
             )));
@@ -270,7 +266,7 @@ fn scan_orphans(storage: &Storage, entries: &[Entry]) -> Result<Vec<Orphan>, Sto
         let Some(identifier) = identifier else {
             continue;
         };
-        if NarObjectId::parse(identifier).is_err()
+        if FileHash::parse(identifier).is_err()
             || !super::entry_is_regular_at(&nar_directory, &name)?
         {
             continue;
@@ -831,9 +827,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
         let storage = initialize_storage(directory.path()).expect("storage should initialize");
         let store = StoreHash::parse(TEST_STORE_HASH).expect("store hash should parse");
-        let nar = NarObjectId::parse(TEST_NAR_ID).expect("NAR id should parse");
+        let nar = crate::object::NarHash::parse(TEST_NAR_ID).expect("NAR hash should parse");
         let narinfo_name = OsString::from(format!("{TEST_STORE_HASH}.narinfo"));
-        let nar_path = storage.layout.nar_path(&nar);
+        let nar_path = storage.layout.nar_path(nar);
         let narinfo_path = directory.path().join(&narinfo_name);
         fs::write(&narinfo_path, b"published").expect("narinfo should be written");
         fs::write(&nar_path, b"nar").expect("NAR should be written");
@@ -910,9 +906,10 @@ mod tests {
     fn orphan_cleanup_failure_preserves_orphan() {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
         let storage = initialize_storage(directory.path()).expect("storage should initialize");
-        let nar = NarObjectId::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl")
-            .expect("NAR id should parse");
-        let path = storage.layout.nar_path(&nar);
+        let nar =
+            crate::object::NarHash::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl")
+                .expect("NAR hash should parse");
+        let path = storage.layout.nar_path(nar);
         fs::write(&path, b"orphan").expect("orphan should be written");
         let orphan = Orphan {
             name: OsString::from(format!("{TEST_NAR_ID}.nar")),

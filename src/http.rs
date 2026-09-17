@@ -5,13 +5,14 @@ use std::{
 };
 
 use crate::{
-    auth::{Authorizer, Permission},
+    auth::{Authorizer, Permission, ReadVisibility},
     http_server::{Method, Request, Response, ResponseHeader as Header, StatusCode, static_header},
     metrics::{Metrics, RequestGuard, RequestMethod, RequestRoute, ValidationClass},
-    narinfo::{MAX_NARINFO_BYTES, NarEncoding, TrustedPublicKeys},
+    narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
+    object::NarFileName,
     storage::{
-        CapacityErrorKind, NarObjectId, NarUploadPolicy, PublishOutcome, Storage, StorageError,
-        StoreHash, capacity_error_kind,
+        CapacityErrorKind, NarUploadPolicy, PublishOutcome, StagingReservation, Storage,
+        StorageError, StoreHash, capacity_error_kind,
     },
 };
 
@@ -43,12 +44,12 @@ fn internal_error(guard: &RequestGuard<'_>, request: Request) -> Option<TcpStrea
 fn nar_response(
     status: StatusCode,
     content_length: usize,
-    private_read: bool,
+    visibility: ReadVisibility,
 ) -> Response<io::Empty> {
     cache_policy(
         Response::new(status, io::empty(), content_length)
             .with_header(header("Content-Type", "application/x-nix-nar")),
-        private_read,
+        visibility,
         IMMUTABLE_CACHE_CONTROL,
     )
     .with_header(header("Accept-Ranges", "bytes"))
@@ -56,15 +57,14 @@ fn nar_response(
 
 fn cache_policy<R>(
     response: Response<R>,
-    private_read: bool,
+    visibility: ReadVisibility,
     public_control: &'static str,
 ) -> Response<R> {
-    if private_read {
-        response
+    match visibility {
+        ReadVisibility::Private => response
             .with_header(header("Cache-Control", "private, no-store"))
-            .with_header(header("Vary", "Authorization"))
-    } else {
-        response.with_header(header("Cache-Control", public_control))
+            .with_header(header("Vary", "Authorization")),
+        ReadVisibility::Public => response.with_header(header("Cache-Control", public_control)),
     }
 }
 
@@ -90,7 +90,7 @@ fn respond_narinfo(
     store: &StoreHash,
     trusted: &TrustedPublicKeys,
     guard: &RequestGuard<'_>,
-    private_read: bool,
+    visibility: ReadVisibility,
 ) -> Option<TcpStream> {
     let narinfo = match storage.open_narinfo(store) {
         Ok(Some(narinfo)) => narinfo,
@@ -120,7 +120,7 @@ fn respond_narinfo(
     let bytes_out = bytes.len() as u64;
     let response = cache_policy(
         Response::from_data(bytes).with_header(header("Content-Type", "text/x-nix-narinfo")),
-        private_read,
+        visibility,
         IMMUTABLE_CACHE_CONTROL,
     );
     send_response(guard, request, 200, response, bytes_out)
@@ -192,12 +192,11 @@ fn requested_range(request: &Request, length: u64) -> RequestedRange {
 fn respond_nar(
     request: Request,
     storage: &Storage,
-    nar: &NarObjectId,
-    encoding: NarEncoding,
+    name: NarFileName,
     guard: &RequestGuard<'_>,
-    private_read: bool,
+    visibility: ReadVisibility,
 ) -> Option<TcpStream> {
-    let file = match storage.open_nar_encoded(nar, encoding) {
+    let file = match storage.open_nar_encoded(name) {
         Ok(Some(file)) => file,
         Ok(None) => return not_found(guard, request),
         Err(_) => return internal_error(guard, request),
@@ -211,7 +210,7 @@ fn respond_nar(
             let Ok(content_length) = usize::try_from(length) else {
                 return internal_error(guard, request);
             };
-            let response = nar_response(StatusCode(200), content_length, private_read);
+            let response = nar_response(StatusCode(200), content_length, visibility);
             send_file_response(
                 guard,
                 request,
@@ -227,7 +226,7 @@ fn respond_nar(
             let Ok(content_length) = usize::try_from(response_length) else {
                 return internal_error(guard, request);
             };
-            let response = nar_response(StatusCode(206), content_length, private_read).with_header(
+            let response = nar_response(StatusCode(206), content_length, visibility).with_header(
                 Header::owned("Content-Range", format!("bytes {start}-{end}/{length}")),
             );
             send_file_response(guard, request, 206, response, file, start, response_length)
@@ -244,20 +243,20 @@ fn respond_nar(
 }
 
 #[derive(Debug)]
-enum ReadRoute {
+enum CacheRoute {
     CacheInfo,
-    Nar(NarObjectId, NarEncoding),
+    Nar(NarFileName),
     NarInfo(StoreHash),
 }
 
 #[derive(Debug)]
 enum RouteMatch {
-    Found(ReadRoute),
+    Found(CacheRoute),
     Invalid,
     Missing,
 }
 
-impl ReadRoute {
+impl CacheRoute {
     fn classify(url: &str) -> RouteMatch {
         if url.starts_with("//") || url.contains(['\\', '?', '#']) {
             return RouteMatch::Invalid;
@@ -274,24 +273,9 @@ impl ReadRoute {
         }
 
         if let Some(path) = url.strip_prefix("/nar/") {
-            if let Some(id) = path
-                .strip_suffix(".nar.zst")
-                .and_then(|id| NarObjectId::parse(id).ok())
-            {
-                return RouteMatch::Found(Self::Nar(id, NarEncoding::Zstd));
-            }
-            if let Some(id) = path
-                .strip_suffix(NarEncoding::Xz.suffix())
-                .and_then(|id| NarObjectId::parse(id).ok())
-            {
-                return RouteMatch::Found(Self::Nar(id, NarEncoding::Xz));
-            }
-            return match path
-                .strip_suffix(NarEncoding::None.suffix())
-                .and_then(|id| NarObjectId::parse(id).ok())
-            {
-                Some(id) => RouteMatch::Found(Self::Nar(id, NarEncoding::None)),
-                None => RouteMatch::Invalid,
+            return match NarFileName::parse(path) {
+                Ok(name) => RouteMatch::Found(Self::Nar(name)),
+                Err(_) => RouteMatch::Invalid,
             };
         }
         if url == "/nar" || url.starts_with("/nix-cache-info/") {
@@ -345,37 +329,24 @@ struct UploadRequest {
     length: usize,
 }
 
-#[derive(Debug)]
-enum WriteRoute {
-    CacheInfo,
-    Nar(NarObjectId, NarEncoding),
-    NarInfo(StoreHash),
-}
-
 pub struct PublicationRequest {
-    request: Request,
-    route: WriteRoute,
+    upload: UploadRequest,
+    route: CacheRoute,
 }
 
 impl PublicationRequest {
     pub fn reject(self, metrics: &Metrics, status: u16) {
-        let guard = metrics.request(RequestMethod::Put, request_route(self.request.url()));
-        let _ = send_response(
-            &guard,
-            self.request,
-            status,
-            Response::empty(StatusCode(status)),
-            0,
-        );
+        let guard = metrics.request(RequestMethod::Put, request_route(self.upload.request.url()));
+        let _ = self.upload.respond(&guard, status);
     }
 
     pub fn staging_bytes(&self, max_nar_bytes: u64) -> Option<u64> {
-        let length = u64::try_from(self.request.body_length()?).ok()?;
+        let length = u64::try_from(self.upload.length()).ok()?;
         match &self.route {
-            WriteRoute::Nar(_, _) if length <= max_nar_bytes => Some(length),
-            WriteRoute::Nar(_, _) => None,
-            WriteRoute::NarInfo(_) => Some(length.min(MAX_NARINFO_BYTES)),
-            WriteRoute::CacheInfo => Some(0),
+            CacheRoute::Nar(_) if length <= max_nar_bytes => Some(length),
+            CacheRoute::Nar(_) => None,
+            CacheRoute::NarInfo(_) => Some(length.min(MAX_NARINFO_BYTES)),
+            CacheRoute::CacheInfo => Some(0),
         }
     }
 
@@ -385,22 +356,30 @@ impl PublicationRequest {
         trusted: &TrustedPublicKeys,
         policy: NarUploadPolicy,
         metrics: &Metrics,
+        staging: StagingReservation,
     ) {
-        let guard = metrics.request(RequestMethod::Put, request_route(self.request.url()));
-        let _ = match self.route {
-            WriteRoute::Nar(id, encoding) => respond_nar_put(
-                self.request,
-                storage,
-                &id,
-                encoding,
-                policy,
-                metrics,
-                &guard,
+        let guard = metrics.request(RequestMethod::Put, request_route(self.upload.request.url()));
+        let Self { upload, route } = self;
+        let _ = match route {
+            CacheRoute::Nar(name) => respond_nar_put(
+                upload,
+                NarPutContext {
+                    storage,
+                    name,
+                    policy,
+                    metrics,
+                    guard: &guard,
+                    staging,
+                },
             ),
-            WriteRoute::NarInfo(store) => {
-                respond_narinfo_put(self.request, storage, &store, trusted, metrics, &guard)
+            CacheRoute::NarInfo(store) => {
+                drop(staging);
+                respond_narinfo_put(upload, storage, &store, trusted, metrics, &guard)
             }
-            WriteRoute::CacheInfo => respond_cache_info_put(self.request, storage, metrics, &guard),
+            CacheRoute::CacheInfo => {
+                drop(staging);
+                respond_cache_info_put(upload, storage, metrics, &guard)
+            }
         };
     }
 }
@@ -418,10 +397,8 @@ pub fn prepare_publication(
         return None;
     }
 
-    let route = match ReadRoute::classify(request.url()) {
-        RouteMatch::Found(ReadRoute::Nar(id, encoding)) => WriteRoute::Nar(id, encoding),
-        RouteMatch::Found(ReadRoute::NarInfo(store)) => WriteRoute::NarInfo(store),
-        RouteMatch::Found(ReadRoute::CacheInfo) => WriteRoute::CacheInfo,
+    let route = match CacheRoute::classify(request.url()) {
+        RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
             let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
             let _ = send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
@@ -434,54 +411,37 @@ pub fn prepare_publication(
         }
     };
 
-    if has_header(&request, "Transfer-Encoding") {
-        metrics.validation_failure(ValidationClass::Body);
-        let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-        let _ = send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
-        return None;
-    }
-    if has_header(&request, "Content-Encoding") {
-        metrics.validation_failure(ValidationClass::Body);
-        let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-        let _ = send_response(&guard, request, 415, Response::empty(StatusCode(415)), 0);
-        return None;
-    }
-    if request.body_length().is_none() {
-        metrics.validation_failure(ValidationClass::Body);
-        let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-        let _ = send_response(&guard, request, 411, Response::empty(StatusCode(411)), 0);
-        return None;
-    }
-
-    Some(PublicationRequest { request, route })
+    let upload = UploadRequest::accept(request, metrics)?;
+    Some(PublicationRequest { upload, route })
 }
 
 impl UploadRequest {
-    fn accept(
-        request: Request,
-        guard: &RequestGuard<'_>,
-        metrics: &Metrics,
-    ) -> Result<Self, Option<TcpStream>> {
-        let length = if has_header(&request, "Transfer-Encoding") {
-            Err(400)
-        } else if has_header(&request, "Content-Encoding") {
-            Err(415)
-        } else {
-            request.body_length().ok_or(411)
-        };
-        match length {
-            Ok(length) => Ok(Self { request, length }),
+    fn accept(request: Request, metrics: &Metrics) -> Option<Self> {
+        match Self::validate_headers_and_length(&request) {
+            Ok(length) => Some(Self { request, length }),
             Err(status) => {
                 metrics.validation_failure(ValidationClass::Body);
-                Err(send_response(
-                    guard,
+                let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
+                let _ = send_response(
+                    &guard,
                     request,
                     status,
                     Response::empty(StatusCode(status)),
                     0,
-                ))
+                );
+                None
             }
         }
+    }
+
+    fn validate_headers_and_length(request: &Request) -> Result<usize, u16> {
+        if has_header(request, "Transfer-Encoding") {
+            return Err(400);
+        }
+        if has_header(request, "Content-Encoding") {
+            return Err(415);
+        }
+        request.body_length().ok_or(411)
     }
 
     const fn length(&self) -> usize {
@@ -545,18 +505,14 @@ fn record_capacity_error(metrics: &Metrics, error: &StorageError) {
 }
 
 fn respond_cache_info_put(
-    request: Request,
+    mut upload: UploadRequest,
     storage: &Storage,
     metrics: &Metrics,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
     let cache_info = match storage.cache_info() {
         Ok(cache_info) => cache_info,
-        Err(_) => return send_response(guard, request, 500, Response::empty(StatusCode(500)), 0),
-    };
-    let mut upload = match UploadRequest::accept(request, guard, metrics) {
-        Ok(upload) => upload,
-        Err(stream) => return stream,
+        Err(_) => return upload.respond(guard, 500),
     };
     let _upload = metrics.upload(upload.length() as u64);
     if upload.length() != cache_info.len() {
@@ -591,23 +547,29 @@ fn respond_cache_info_put(
     upload.respond(guard, status)
 }
 
-fn respond_nar_put(
-    request: Request,
-    storage: &Storage,
-    id: &NarObjectId,
-    encoding: NarEncoding,
+struct NarPutContext<'storage, 'request> {
+    storage: &'storage Storage,
+    name: NarFileName,
     policy: NarUploadPolicy,
-    metrics: &Metrics,
-    guard: &RequestGuard<'_>,
-) -> Option<TcpStream> {
-    let mut upload = match UploadRequest::accept(request, guard, metrics) {
-        Ok(upload) => upload,
-        Err(stream) => return stream,
-    };
+    metrics: &'storage Metrics,
+    guard: &'request RequestGuard<'storage>,
+    staging: StagingReservation,
+}
+
+fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) -> Option<TcpStream> {
+    let NarPutContext {
+        storage,
+        name,
+        policy,
+        metrics,
+        guard,
+        staging,
+    } = context;
     let length = upload.length();
     let _upload = metrics.upload(length as u64);
     let started = Instant::now();
-    let result = storage.publish_nar(id, encoding, upload.reader(), length as u64, policy);
+    let result =
+        storage.publish_nar_with_staging(name, upload.reader(), length as u64, policy, staging);
     metrics.publication(started.elapsed());
     if !upload.body_complete() {
         metrics.validation_failure(ValidationClass::Nar);
@@ -632,17 +594,13 @@ fn respond_nar_put(
 }
 
 fn respond_narinfo_put(
-    request: Request,
+    mut upload: UploadRequest,
     storage: &Storage,
     store: &StoreHash,
     trusted: &TrustedPublicKeys,
     metrics: &Metrics,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
-    let mut upload = match UploadRequest::accept(request, guard, metrics) {
-        Ok(upload) => upload,
-        Err(stream) => return stream,
-    };
     let _upload = metrics.upload(upload.length() as u64);
     let bytes = match upload.read_body(MAX_NARINFO_BYTES as usize) {
         Ok(bytes) => bytes,
@@ -659,7 +617,9 @@ fn respond_narinfo_put(
         }
     };
     let started = Instant::now();
-    let result = storage.publish_narinfo(store, validated);
+    let result = storage
+        .bind_narinfo(validated)
+        .and_then(|bound| bound.publish());
     metrics.publication(started.elapsed());
     if let Err(error) = &result {
         record_capacity_error(metrics, error);
@@ -669,6 +629,7 @@ fn respond_narinfo_put(
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,
         Err(StorageError::MissingNar | StorageError::NarMismatch) => 422,
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => 422,
         Err(StorageError::Io(error)) => capacity_status(&error).unwrap_or(500),
         Err(_) => 500,
     };
@@ -691,7 +652,6 @@ pub fn respond(
     storage: &Storage,
     authorizer: &Authorizer,
     trusted: &TrustedPublicKeys,
-    policy: NarUploadPolicy,
     metrics: &Metrics,
     min_free_bytes: u64,
 ) -> Option<TcpStream> {
@@ -764,9 +724,9 @@ pub fn respond(
         metrics.auth_failure(matches!(permission, Permission::Write));
         return unauthorized(&guard, request);
     }
-    let private_read = authorizer.has_private_reads();
+    let visibility = authorizer.read_visibility();
 
-    let route = match ReadRoute::classify(request.url()) {
+    let route = match CacheRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
             return send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
@@ -774,24 +734,12 @@ pub fn respond(
         RouteMatch::Missing => return not_found(&guard, request),
     };
 
-    if matches!(request.method(), Method::Put) {
-        return match route {
-            ReadRoute::Nar(id, encoding) => {
-                respond_nar_put(request, storage, &id, encoding, policy, metrics, &guard)
-            }
-            ReadRoute::NarInfo(store) => {
-                respond_narinfo_put(request, storage, &store, trusted, metrics, &guard)
-            }
-            ReadRoute::CacheInfo => respond_cache_info_put(request, storage, metrics, &guard),
-        };
-    }
-
     if !matches!(request.method(), Method::Get | Method::Head) {
         return method_not_allowed(&guard, request, "GET, HEAD, PUT");
     }
 
     match route {
-        ReadRoute::CacheInfo => {
+        CacheRoute::CacheInfo => {
             let cache_info = match storage.cache_info() {
                 Ok(cache_info) => cache_info,
                 Err(_) => return internal_error(&guard, request),
@@ -800,54 +748,52 @@ pub fn respond(
             let response = cache_policy(
                 Response::from_data(cache_info)
                     .with_header(header("Content-Type", "text/x-nix-cache-info")),
-                private_read,
+                visibility,
                 "public, max-age=3600",
             );
             send_response(&guard, request, 200, response, cache_info_length)
         }
-        ReadRoute::Nar(id, encoding) => {
-            respond_nar(request, storage, &id, encoding, &guard, private_read)
-        }
-        ReadRoute::NarInfo(store) => {
-            respond_narinfo(request, storage, &store, trusted, &guard, private_read)
+        CacheRoute::Nar(name) => respond_nar(request, storage, name, &guard, visibility),
+        CacheRoute::NarInfo(store) => {
+            respond_narinfo(request, storage, &store, trusted, &guard, visibility)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadRoute, RouteMatch};
+    use super::{CacheRoute, RouteMatch};
     use crate::narinfo::NarEncoding;
 
     #[test]
     fn legacy_main_prefix_maps_to_cache_routes() {
         assert!(matches!(
-            ReadRoute::classify("/main/nix-cache-info"),
-            RouteMatch::Found(ReadRoute::CacheInfo)
+            CacheRoute::classify("/main/nix-cache-info"),
+            RouteMatch::Found(CacheRoute::CacheInfo)
         ));
         assert!(matches!(
-            ReadRoute::classify("/main/00000000000000000000000000000000.narinfo"),
-            RouteMatch::Found(ReadRoute::NarInfo(_))
+            CacheRoute::classify("/main/00000000000000000000000000000000.narinfo"),
+            RouteMatch::Found(CacheRoute::NarInfo(_))
         ));
         assert!(matches!(
-            ReadRoute::classify(
+            CacheRoute::classify(
                 "/main/nar/0000000000000000000000000000000000000000000000000000.nar"
             ),
-            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::None))
+            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == NarEncoding::Raw
         ));
     }
 
     #[test]
     fn encoded_nar_routes_preserve_the_requested_encoding() {
         assert!(matches!(
-            ReadRoute::classify("/nar/0000000000000000000000000000000000000000000000000000.nar.xz"),
-            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::Xz))
+            CacheRoute::classify("/nar/0000000000000000000000000000000000000000000000000000.nar.xz"),
+            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == NarEncoding::Xz
         ));
         assert!(matches!(
-            ReadRoute::classify(
+            CacheRoute::classify(
                 "/nar/0000000000000000000000000000000000000000000000000000.nar.zst"
             ),
-            RouteMatch::Found(ReadRoute::Nar(_, NarEncoding::Zstd))
+            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == NarEncoding::Zstd
         ));
     }
 }

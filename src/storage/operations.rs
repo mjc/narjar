@@ -14,13 +14,11 @@ use std::{
     time::SystemTime,
 };
 
-use crate::narinfo::{CompressedNarExpectation, NarEncoding, NarExpectation, ValidatedNarInfo};
+use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo, ValidatedPayload};
+use crate::object::{FileHash, NarFileName, NarHash, NarIdentity};
 
 use super::{
-    compression::{
-        CheckedUploadReader, ValidationEvidence, nar_encoding, nar_file_size_matches,
-        validate_compressed_nar, validate_xz, validate_zstd, validation_file_name,
-    },
+    compression::{IngestionReceipt, ingestion_receipt_file_name, nar_file_size_matches},
     directory::Directory,
     fs::{
         StorageCapacity, directory_is_empty, ensure_directory_at, entry_is_regular_at,
@@ -28,13 +26,14 @@ use super::{
         open_optional_at, open_regular_at, read_dir_names, remove_temp, rename_at,
         reserve_staging_bytes, rollback_link_at, unlink_at,
     },
-    ids::{NarObjectId, StoreHash},
+    ids::StoreHash,
     publication::{
-        NEXT_TEMP, NarUploadPolicy, ProcessLock, PublishBoundary, PublishOutcome, PublishTarget,
-        PublishedPair, StagingReservation, StorageError, TemporaryFile,
+        DestinationPublication, NEXT_TEMP, NarUploadPolicy, ProcessLock, PublishBoundary,
+        PublishOutcome, PublishTarget, PublishedPair, StagingReservation, StorageError,
+        TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
-    recovery::{PublicationState, RecoveryState},
+    recovery::{PublicationState, PublicationTransaction, RecoveryState},
     state::Storage,
 };
 
@@ -43,7 +42,96 @@ use super::publication::{Layout, injected_fault};
 
 const MAX_CACHE_INFO_BYTES: u64 = 1024;
 pub(super) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
-pub(super) const MAX_VALIDATION_EVIDENCE_BYTES: u64 = 256;
+pub(super) const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
+pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
+
+#[derive(Clone, Copy)]
+enum TemporaryLocation {
+    Staging,
+    Destination,
+}
+
+#[derive(Clone, Copy)]
+enum PublicationProgress {
+    Pending(TemporaryLocation),
+    Durable(TemporaryLocation),
+}
+
+impl PublicationProgress {
+    fn mark_temporary_moved(&mut self) {
+        *self = match *self {
+            Self::Pending(_) => Self::Pending(TemporaryLocation::Destination),
+            Self::Durable(_) => Self::Durable(TemporaryLocation::Destination),
+        };
+    }
+
+    fn mark_durable(&mut self) {
+        *self = match *self {
+            Self::Pending(location) => Self::Durable(location),
+            Self::Durable(location) => Self::Durable(location),
+        };
+    }
+
+    fn cleanup_temporary_location(
+        location: TemporaryLocation,
+        storage: &Storage,
+        temp: &TemporaryFile,
+    ) -> Result<(), StorageError> {
+        match location {
+            TemporaryLocation::Staging => storage.remove_temp(temp),
+            TemporaryLocation::Destination => {
+                storage.temporary_objects.fetch_sub(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(
+        self,
+        result: Result<PublishOutcome, StorageError>,
+        storage: &Storage,
+        temp: &TemporaryFile,
+        transaction: PublicationTransaction,
+    ) -> Result<PublishOutcome, StorageError> {
+        match (result, self) {
+            (Ok(outcome), Self::Pending(location) | Self::Durable(location)) => {
+                Self::cleanup_temporary_location(location, storage, temp)?;
+                transaction.complete()?;
+                Ok(outcome)
+            }
+            (Err(error), Self::Durable(location)) => {
+                Self::cleanup_temporary_location(location, storage, temp)?;
+                transaction.complete()?;
+                Err(error)
+            }
+            (Err(error), Self::Pending(location)) => {
+                let _ = Self::cleanup_temporary_location(location, storage, temp);
+                Err(error)
+            }
+        }
+    }
+}
+
+pub(crate) struct StoredNar<'storage> {
+    storage: &'storage Storage,
+    _file: File,
+    identity: NarIdentity,
+}
+
+impl StoredNar<'_> {
+    pub(crate) fn identity(&self) -> NarIdentity {
+        self.identity
+    }
+}
+
+impl BoundNarInfo<'_> {
+    pub(crate) fn publish(self) -> Result<PublishOutcome, StorageError> {
+        self.stored().storage.publish(
+            PublishTarget::NarInfo(self.store()),
+            Cursor::new(self.raw_bytes()?),
+        )
+    }
+}
 
 fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
     if bytes.len() as u64 > MAX_CACHE_INFO_BYTES {
@@ -54,17 +142,40 @@ fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
     }
     let text = std::str::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nix-cache-info is not UTF-8"))?;
-    let mut store_dir = false;
-    let mut mass_query = false;
-    let mut priority = false;
+    let mut fields = CacheInfoFields::default();
     for line in text.lines() {
         let (name, value) = line.split_once(": ").ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "malformed nix-cache-info")
         })?;
+        fields.record(name, value)?;
+    }
+    fields.finish()
+}
+
+#[derive(Default)]
+struct CacheInfoFields {
+    store_dir: Option<()>,
+    mass_query: Option<()>,
+    priority: Option<u32>,
+}
+
+impl CacheInfoFields {
+    fn record(&mut self, name: &str, value: &str) -> io::Result<()> {
         match name {
-            "StoreDir" if !store_dir && value == "/nix/store" => store_dir = true,
-            "WantMassQuery" if !mass_query && value == "0" => mass_query = true,
-            "Priority" if !priority && value.parse::<u32>().is_ok() => priority = true,
+            "StoreDir" if self.store_dir.is_none() && value == "/nix/store" => {
+                self.store_dir = Some(());
+            }
+            "WantMassQuery" if self.mass_query.is_none() && value == "0" => {
+                self.mass_query = Some(());
+            }
+            "Priority" if self.priority.is_none() => {
+                self.priority = Some(value.parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid nix-cache-info priority",
+                    )
+                })?);
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -72,14 +183,18 @@ fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
                 ));
             }
         }
-    }
-    if store_dir && mass_query && priority {
         Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "nix-cache-info is missing a required field",
-        ))
+    }
+
+    fn finish(self) -> io::Result<()> {
+        if self.store_dir.is_some() && self.mass_query.is_some() && self.priority.is_some() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "nix-cache-info is missing a required field",
+            ))
+        }
     }
 }
 
@@ -125,6 +240,11 @@ impl Storage {
             OsStr::new(VALIDATION_DIRECTORY),
             "validation evidence directory",
         )?;
+        ensure_directory_at(
+            &root_directory,
+            OsStr::new(INGESTION_RECEIPT_DIRECTORY),
+            "compressed ingestion receipt directory",
+        )?;
 
         root_directory.sync_all()?;
 
@@ -135,7 +255,7 @@ impl Storage {
             root: root_directory,
             recovery,
             publication_locks: Mutex::new(HashMap::new()),
-            staging_reservations: Arc::new(AtomicU64::new(0)),
+            staging_budget: Arc::new(Mutex::new(Default::default())),
             temporary_objects: AtomicU64::new(0),
             _lock: lock,
         };
@@ -161,6 +281,7 @@ impl Storage {
     /// Records that a full inventory scan has completed successfully.
     pub fn finish_recovery(&self) -> Result<(), StorageError> {
         self.remove_orphan_validation_evidence()?;
+        self.remove_orphan_ingestion_receipts()?;
         self.recovery.finish()
     }
 
@@ -170,22 +291,10 @@ impl Storage {
         min_free_bytes: u64,
     ) -> Result<StagingReservation, StorageError> {
         if bytes == 0 {
-            return Ok(StagingReservation::empty(Arc::clone(
-                &self.staging_reservations,
-            )));
+            return Ok(StagingReservation::empty(Arc::clone(&self.staging_budget)));
         }
         let directory = self.nar_temp_directory()?;
-        let space = filesystem_space(&directory)?;
-        let required_bytes = bytes
-            .checked_add(min_free_bytes)
-            .ok_or(StorageError::InsufficientSpace)?;
-        space.required_capacity(required_bytes)?;
-        reserve_staging_bytes(
-            &self.staging_reservations,
-            space.available_bytes,
-            min_free_bytes,
-            bytes,
-        )
+        reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, bytes)
     }
 
     pub fn publish_cache_info(&self, source: impl Read) -> Result<PublishOutcome, StorageError> {
@@ -204,8 +313,7 @@ impl Storage {
 
     pub fn publish_nar(
         &self,
-        id: &NarObjectId,
-        encoding: NarEncoding,
+        name: NarFileName,
         source: impl Read,
         expected_length: u64,
         policy: NarUploadPolicy,
@@ -214,170 +322,90 @@ impl Storage {
             return Err(StorageError::UploadTooLarge);
         }
 
-        let required_bytes = expected_length.saturating_add(policy.min_free_bytes);
-        let admit = || {
-            let directory = self.nar_temp_directory()?;
-            filesystem_space(&directory)?.required_capacity(required_bytes)
-        };
-        let validate = |file: &File| -> Result<Option<ValidationEvidence>, StorageError> {
-            match encoding {
-                NarEncoding::None => Ok(None),
-                NarEncoding::Zstd => validate_zstd(file, None, None, policy.max_bytes)
-                    .map(|decoded| {
-                        Some(ValidationEvidence::from_decoded(
-                            encoding,
-                            id.clone(),
-                            expected_length,
-                            decoded,
-                        ))
-                    })
-                    .map_err(Into::into),
-                NarEncoding::Xz => validate_xz(file, None, None, policy.max_bytes)
-                    .map(|decoded| {
-                        Some(ValidationEvidence::from_decoded(
-                            encoding,
-                            id.clone(),
-                            expected_length,
-                            decoded,
-                        ))
-                    })
-                    .map_err(Into::into),
-            }
-        };
+        let staging = self.reserve_staging(expected_length, policy.min_free_bytes)?;
+        self.publish_nar_with_staging(name, source, expected_length, policy, staging)
+    }
 
-        match encoding {
-            NarEncoding::None => self.publish_with_admission(
-                PublishTarget::Nar(id, encoding),
-                CheckedUploadReader::new(source, &id.0, expected_length),
-                admit,
-                validate,
-                |_| Ok(()),
-            ),
-            NarEncoding::Zstd | NarEncoding::Xz => self.publish_with_admission(
-                PublishTarget::Nar(id, encoding),
-                CheckedUploadReader::new(source, &id.0, expected_length),
-                admit,
-                validate,
-                |_| Ok(()),
-            ),
-        }
+    pub fn publish_nar_with_staging(
+        &self,
+        name: NarFileName,
+        source: impl Read,
+        expected_length: u64,
+        policy: NarUploadPolicy,
+        staging: StagingReservation,
+    ) -> Result<PublishOutcome, StorageError> {
+        let receiving = self.begin_upload(name, expected_length, policy, staging)?;
+        let complete = receiving.receive(source)?;
+        complete.commit()
     }
 
     #[cfg(test)]
     pub(super) fn publish_nar_unchecked(
         &self,
-        id: &NarObjectId,
+        hash: &NarHash,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
-        self.publish(PublishTarget::Nar(id, NarEncoding::None), source)
+        self.publish(PublishTarget::Nar(NarFileName::raw(*hash)), source)
     }
 
     #[cfg(test)]
     pub(super) fn publish_nar_fault(
         &self,
-        id: &NarObjectId,
+        hash: &NarHash,
         source: impl Read,
         fault: PublishBoundary,
     ) -> Result<PublishOutcome, StorageError> {
         self.publish_with(
-            PublishTarget::Nar(id, NarEncoding::None),
+            PublishTarget::Nar(NarFileName::raw(*hash)),
             source,
             |boundary| injected_fault(boundary, fault),
         )
     }
 
-    pub fn publish_narinfo(
+    pub(crate) fn bind_narinfo(
         &self,
-        store: &StoreHash,
         narinfo: ValidatedNarInfo,
-    ) -> Result<PublishOutcome, StorageError> {
-        let nar_directory = self.nar_directory()?;
-        let expectation = narinfo.payload_expectation();
-        let nar_name = narinfo.payload_name().to_string();
-        match open_regular_at(&nar_directory, OsStr::new(&nar_name)) {
-            Ok(file) => {
-                let matches = match expectation {
-                    NarExpectation::Raw { nar_size, .. } => nar_file_size_matches(&file, nar_size)?,
-                    NarExpectation::Compressed(expectation) => {
-                        self.compressed_nar_matches_with_evidence(&file, expectation)?
-                    }
-                };
-                if !matches {
-                    return Err(StorageError::NarMismatch);
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(StorageError::MissingNar);
-            }
-            Err(error) => return Err(error.into()),
-        }
-        self.publish(
-            PublishTarget::NarInfo(store),
-            Cursor::new(narinfo.into_bytes()),
-        )
-    }
-
-    pub(super) fn compressed_nar_matches_with_evidence(
-        &self,
-        file: &File,
-        expectation: CompressedNarExpectation<'_>,
-    ) -> Result<bool, StorageError> {
-        if let Some(evidence) = self.read_validation_evidence(expectation)? {
-            return Ok(evidence.matches(expectation));
-        }
-
-        let Some(decoded) = validate_compressed_nar(file, expectation)? else {
-            return Ok(false);
+    ) -> Result<BoundNarInfo<'_>, StorageError> {
+        let identity = match narinfo.payload() {
+            ValidatedPayload::Raw(identity) => identity,
+            ValidatedPayload::Compressed(expected) => self
+                .read_ingestion_receipt(expected)?
+                .ok_or(StorageError::NarMismatch)?
+                .decoded_identity(),
         };
-        self.publish_validation_evidence(ValidationEvidence::from_decoded(
-            nar_encoding(expectation.encoding),
-            expectation.encoded_hash.clone(),
-            expectation.encoded_size,
-            decoded,
-        ))?;
-        Ok(true)
-    }
-
-    pub(super) fn read_validation_evidence(
-        &self,
-        expectation: CompressedNarExpectation<'_>,
-    ) -> Result<Option<ValidationEvidence>, StorageError> {
-        let directory = self.validation_directory()?;
-        let name = validation_file_name(expectation);
-        let file = match open_regular_at(&directory, &name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let file = self
+            .open_nar(identity.hash())?
+            .ok_or(StorageError::MissingNar)?;
+        if !nar_file_size_matches(&file, identity.size().get())? {
+            return Err(StorageError::NarMismatch);
+        }
+        let stored = StoredNar {
+            storage: self,
+            _file: file,
+            identity,
         };
-        let mut bytes = Vec::new();
-        file.take(MAX_VALIDATION_EVIDENCE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_VALIDATION_EVIDENCE_BYTES {
-            return Ok(None);
-        }
-        if let Some(evidence) =
-            ValidationEvidence::parse(&bytes).filter(|evidence| evidence.matches(expectation))
-        {
-            return Ok(Some(evidence));
-        }
-        Ok(None)
+        narinfo
+            .bind_raw(stored)
+            .map_err(|_| StorageError::NarMismatch)
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {
-        let Some(file) = self.open_nar_encoded(narinfo.nar(), narinfo.encoding())? else {
+        let nar_directory = self.nar_directory()?;
+        let payload_name = narinfo.payload_name();
+        let Some(file) = open_optional_at(&nar_directory, &payload_name.os_string())? else {
             return Ok(false);
         };
-        nar_file_size_matches(&file, narinfo.file_size()).map_err(Into::into)
+        nar_file_size_matches(&file, narinfo.file_size().get()).map_err(Into::into)
     }
 
     #[cfg(test)]
     pub(super) fn publish_narinfo_unchecked(
         &self,
         store: &StoreHash,
-        nar: &NarObjectId,
+        nar: NarHash,
         source: impl Read,
     ) -> Result<PublishOutcome, StorageError> {
-        self.ensure_nar(nar)?;
+        self.ensure_nar(&nar)?;
         self.publish(PublishTarget::NarInfo(store), source)
     }
 
@@ -385,39 +413,34 @@ impl Storage {
     pub(super) fn publish_narinfo_fault(
         &self,
         store: &StoreHash,
-        nar: &NarObjectId,
+        nar: NarHash,
         source: impl Read,
         fault: PublishBoundary,
     ) -> Result<PublishOutcome, StorageError> {
-        self.ensure_nar(nar)?;
+        self.ensure_nar(&nar)?;
         self.publish_with(PublishTarget::NarInfo(store), source, |boundary| {
             injected_fault(boundary, fault)
         })
     }
 
     #[cfg(test)]
-    pub(super) fn ensure_nar(&self, nar: &NarObjectId) -> Result<(), StorageError> {
+    pub(super) fn ensure_nar(&self, nar: &NarHash) -> Result<(), StorageError> {
         let nar_directory = self.nar_directory()?;
-        let nar_name = format!("{}.nar", nar.as_str());
-        match open_regular_at(&nar_directory, OsStr::new(&nar_name)) {
+        let nar_name = NarFileName::raw(*nar);
+        match open_regular_at(&nar_directory, &nar_name.os_string()) {
             Ok(_) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StorageError::MissingNar),
             Err(error) => Err(error.into()),
         }
     }
 
-    pub fn open_nar(&self, nar: &NarObjectId) -> Result<Option<File>, StorageError> {
-        self.open_nar_encoded(nar, NarEncoding::None)
+    pub fn open_nar(&self, nar: NarHash) -> Result<Option<File>, StorageError> {
+        self.open_nar_encoded(NarFileName::raw(nar))
     }
 
-    pub fn open_nar_encoded(
-        &self,
-        nar: &NarObjectId,
-        encoding: NarEncoding,
-    ) -> Result<Option<File>, StorageError> {
+    pub fn open_nar_encoded(&self, name: NarFileName) -> Result<Option<File>, StorageError> {
         let directory = self.nar_directory()?;
-        let name = format!("{}{}", nar.as_str(), encoding.suffix());
-        open_optional_at(&directory, OsStr::new(&name))
+        open_optional_at(&directory, &name.os_string())
     }
 
     pub fn open_narinfo(&self, store: &StoreHash) -> Result<Option<File>, StorageError> {
@@ -429,7 +452,7 @@ impl Storage {
     pub fn open_pair(
         &self,
         store: &StoreHash,
-        nar: &NarObjectId,
+        nar: NarHash,
     ) -> Result<Option<PublishedPair>, StorageError> {
         let Some(narinfo) = self.open_narinfo(store)? else {
             return Ok(None);
@@ -507,128 +530,122 @@ impl Storage {
         &self,
         target: PublishTarget<'_>,
         source: impl Read,
-        checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
-    ) -> Result<PublishOutcome, StorageError> {
-        self.publish_with_admission(target, source, || Ok(()), |_| Ok(None), checkpoint)
-    }
-
-    pub(super) fn publish_with_admission(
-        &self,
-        target: PublishTarget<'_>,
-        mut source: impl Read,
-        admit: impl FnOnce() -> Result<(), StorageError>,
-        validate: impl FnOnce(&File) -> Result<Option<ValidationEvidence>, StorageError>,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        admit()?;
-        let destination_directory = self.destination_directory(&target)?;
-        let destination_name = target.destination_name();
-        let destination_key = self.destination_key(&target, &destination_name);
-        let replace_destination = target.replaces_destination();
+        let mut source = source;
         let temp_name = self.next_temp_name(&target);
         let temporary_path = self.temporary_path(&target, &temp_name);
         let mut transaction = self.recovery.begin(&temporary_path)?;
         checkpoint(PublishBoundary::BeforeTempCreate)?;
         let mut temp = self.create_temp_named(&target, temp_name)?;
         transaction.transition(PublicationState::Streaming)?;
-        let mut durable = false;
-        let mut temp_moved = false;
-        let result = (|| {
+        let staging = (|| {
             checkpoint(PublishBoundary::AfterTempCreate)?;
             io::copy(&mut source, &mut temp.file)?;
             checkpoint(PublishBoundary::AfterStream)?;
             temp.file.sync_all()?;
             checkpoint(PublishBoundary::AfterTempSync)?;
-            if let Some(evidence) = validate(&temp.file)? {
-                self.publish_validation_evidence(evidence)?;
-            }
-            transaction.transition(PublicationState::Validated)?;
+            transaction.transition(PublicationState::Validated)
+        })();
+
+        if let Err(error) = staging {
+            let _ = self.remove_temp(&temp);
+            return Err(error);
+        }
+
+        self.commit_temporary(target, &temp, transaction, checkpoint)
+    }
+
+    pub(super) fn commit_temporary(
+        &self,
+        target: PublishTarget<'_>,
+        temp: &TemporaryFile,
+        mut transaction: PublicationTransaction,
+        mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+    ) -> Result<PublishOutcome, StorageError> {
+        let destination_name = target.destination_name();
+        let destination_key = self.destination_key(&target, &destination_name);
+        let publication = target.destination_publication();
+        let mut progress = PublicationProgress::Pending(TemporaryLocation::Staging);
+        let result = (|| {
+            let destination_directory = self.destination_directory(&target)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
             let mut finalize_publication = |publish_result: io::Result<()>| match publish_result {
                 Ok(()) => {
-                    if replace_destination {
-                        temp_moved = true;
-                        temp.directory.sync_all()?;
+                    match publication {
+                        DestinationPublication::Replace => {
+                            progress.mark_temporary_moved();
+                            temp.directory.sync_all()?;
+                        }
+                        DestinationPublication::Link => {}
                     }
                     transaction.transition(PublicationState::Linked)?;
                     if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
-                        if !replace_destination {
-                            rollback_link_at(&destination_directory, &destination_name)?;
+                        match publication {
+                            DestinationPublication::Link => {
+                                rollback_link_at(&destination_directory, &destination_name)?;
+                            }
+                            DestinationPublication::Replace => {}
                         }
                         return Err(error);
                     }
                     if let Err(error) = destination_directory.sync_all() {
-                        if !replace_destination {
-                            rollback_link_at(&destination_directory, &destination_name)?;
+                        match publication {
+                            DestinationPublication::Link => {
+                                rollback_link_at(&destination_directory, &destination_name)?;
+                            }
+                            DestinationPublication::Replace => {}
                         }
                         return Err(error.into());
                     }
-                    durable = true;
+                    progress.mark_durable();
                     transaction.transition(PublicationState::Published)?;
                     checkpoint(PublishBoundary::AfterParentSync)?;
                     Ok(PublishOutcome::Created)
                 }
-                Err(error)
-                    if !replace_destination && error.kind() == io::ErrorKind::AlreadyExists =>
-                {
-                    if files_equal_at(
+                Err(error) => match publication {
+                    DestinationPublication::Link
+                        if error.kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        if files_equal_at(
+                            &temp.directory,
+                            &temp.name,
+                            &destination_directory,
+                            &destination_name,
+                        )? {
+                            transaction.transition(PublicationState::Published)?;
+                            Ok(PublishOutcome::Identical)
+                        } else {
+                            Err(StorageError::Conflict)
+                        }
+                    }
+                    DestinationPublication::Link | DestinationPublication::Replace => {
+                        Err(error.into())
+                    }
+                },
+            };
+            match publication {
+                DestinationPublication::Replace => finalize_publication(rename_at(
+                    &temp.directory,
+                    &temp.name,
+                    &destination_directory,
+                    &destination_name,
+                )),
+                DestinationPublication::Link => {
+                    let destination_lock = self.destination_lock(destination_key);
+                    let _destination_guard = destination_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    finalize_publication(hard_link_at(
                         &temp.directory,
                         &temp.name,
                         &destination_directory,
                         &destination_name,
-                    )? {
-                        transaction.transition(PublicationState::Published)?;
-                        Ok(PublishOutcome::Identical)
-                    } else {
-                        Err(StorageError::Conflict)
-                    }
+                    ))
                 }
-                Err(error) => Err(error.into()),
-            };
-            if replace_destination {
-                finalize_publication(rename_at(
-                    &temp.directory,
-                    &temp.name,
-                    &destination_directory,
-                    &destination_name,
-                ))
-            } else {
-                let destination_lock = self.destination_lock(destination_key);
-                let _destination_guard = destination_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                finalize_publication(hard_link_at(
-                    &temp.directory,
-                    &temp.name,
-                    &destination_directory,
-                    &destination_name,
-                ))
             }
         })();
-
-        let cleanup = if temp_moved {
-            self.temporary_objects.fetch_sub(1, Ordering::Relaxed);
-            Ok(())
-        } else {
-            self.remove_temp(&temp)
-        };
-
-        match result {
-            Ok(outcome) => {
-                cleanup?;
-                transaction.complete()?;
-                Ok(outcome)
-            }
-            Err(error) => {
-                if durable {
-                    cleanup?;
-                    transaction.complete()?;
-                } else {
-                    let _ = cleanup;
-                }
-                Err(error)
-            }
-        }
+        progress.finish(result, self, temp, transaction)
     }
 
     #[cfg(test)]
@@ -651,10 +668,10 @@ impl Storage {
 
     pub(super) fn temporary_path(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
         match target {
-            PublishTarget::Nar(_, _) => PathBuf::from("nar/.tmp").join(name),
-            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) | PublishTarget::Validation(_) => {
-                PathBuf::from(".tmp").join(name)
-            }
+            PublishTarget::Nar(_) => PathBuf::from("nar/.tmp").join(name),
+            PublishTarget::CacheInfo
+            | PublishTarget::NarInfo(_)
+            | PublishTarget::IngestionReceipt(_) => PathBuf::from(".tmp").join(name),
         }
     }
 
@@ -664,10 +681,10 @@ impl Storage {
         name: OsString,
     ) -> Result<TemporaryFile, StorageError> {
         let directory = match target {
-            PublishTarget::Nar(_, _) => self.nar_temp_directory()?,
-            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) | PublishTarget::Validation(_) => {
-                self.temp_directory()?
-            }
+            PublishTarget::Nar(_) => self.nar_temp_directory()?,
+            PublishTarget::CacheInfo
+            | PublishTarget::NarInfo(_)
+            | PublishTarget::IngestionReceipt(_) => self.temp_directory()?,
         };
         let file = open_at(
             &directory,
@@ -724,23 +741,117 @@ impl Storage {
         target: &PublishTarget<'_>,
     ) -> Result<File, StorageError> {
         match target {
-            PublishTarget::Nar(_, _) => self.nar_directory(),
+            PublishTarget::Nar(_) => self.nar_directory(),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.root_directory(),
-            PublishTarget::Validation(_) => self.validation_directory(),
+            PublishTarget::IngestionReceipt(_) => self.ingestion_receipt_directory(),
         }
     }
 
     pub(super) fn destination_key(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
         match target {
-            PublishTarget::Nar(_, _) => PathBuf::from("nar").join(name),
+            PublishTarget::Nar(_) => PathBuf::from("nar").join(name),
             PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => PathBuf::from(name),
-            PublishTarget::Validation(_) => PathBuf::from(VALIDATION_DIRECTORY).join(name),
+            PublishTarget::IngestionReceipt(_) => {
+                PathBuf::from(INGESTION_RECEIPT_DIRECTORY).join(name)
+            }
         }
     }
 
     pub(super) fn validation_directory(&self) -> Result<File, StorageError> {
         let root = self.root_directory()?;
         Ok(open_directory_at(&root, OsStr::new(VALIDATION_DIRECTORY))?)
+    }
+
+    pub(super) fn ingestion_receipt_directory(&self) -> Result<File, StorageError> {
+        let root = self.root_directory()?;
+        Ok(open_directory_at(
+            &root,
+            OsStr::new(INGESTION_RECEIPT_DIRECTORY),
+        )?)
+    }
+
+    pub(super) fn publish_ingestion_receipt(
+        &self,
+        receipt: IngestionReceipt,
+    ) -> Result<PublishOutcome, StorageError> {
+        let bytes = receipt.bytes();
+        self.publish(
+            PublishTarget::IngestionReceipt(&receipt),
+            Cursor::new(bytes),
+        )
+    }
+
+    pub(super) fn read_ingestion_receipt(
+        &self,
+        expectation: CompressedNarExpectation,
+    ) -> Result<Option<IngestionReceipt>, StorageError> {
+        let directory = self.ingestion_receipt_directory()?;
+        let name = ingestion_receipt_file_name(expectation);
+        Ok(Self::read_ingestion_receipt_file(&directory, &name)?
+            .filter(|receipt| receipt.matches(expectation)))
+    }
+
+    pub(super) fn remove_orphan_ingestion_receipts(&self) -> Result<(), StorageError> {
+        let receipts = self.ingestion_receipt_directory()?;
+        let nar = self.nar_directory()?;
+        let mut removed = false;
+        for name in read_dir_names(&receipts)? {
+            let Some(receipt) = Self::read_ingestion_receipt_file(&receipts, &name)? else {
+                if name
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".validation"))
+                {
+                    unlink_at(&receipts, &name)?;
+                    removed = true;
+                }
+                continue;
+            };
+            let identity = receipt.decoded_identity();
+            let nar_name = NarFileName::raw(identity.hash()).os_string();
+            let usable = match open_regular_at(&nar, &nar_name) {
+                Ok(file) => file.metadata()?.len() == identity.size().get(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error)
+                    if error.kind() == io::ErrorKind::InvalidData
+                        || error.raw_os_error() == Some(libc::ELOOP) =>
+                {
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if !usable {
+                unlink_at(&receipts, &name)?;
+                removed = true;
+            }
+        }
+        if removed {
+            receipts.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn read_ingestion_receipt_file(
+        directory: &File,
+        name: &OsStr,
+    ) -> Result<Option<IngestionReceipt>, StorageError> {
+        let file = match open_regular_at(directory, name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidData
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_INGESTION_RECEIPT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_INGESTION_RECEIPT_BYTES {
+            return Ok(None);
+        }
+        Ok(IngestionReceipt::parse(&bytes))
     }
 
     pub(super) fn remove_orphan_validation_evidence(&self) -> Result<(), StorageError> {
@@ -757,7 +868,7 @@ impl Storage {
             if !nar_name.ends_with(".nar.xz") && !nar_name.ends_with(".nar.zst") {
                 continue;
             }
-            if NarObjectId::parse(
+            if FileHash::parse(
                 nar_name
                     .strip_suffix(".nar.xz")
                     .or_else(|| nar_name.strip_suffix(".nar.zst"))
@@ -780,14 +891,6 @@ impl Storage {
             validation.sync_all()?;
         }
         Ok(())
-    }
-
-    pub(super) fn publish_validation_evidence(
-        &self,
-        evidence: ValidationEvidence,
-    ) -> Result<PublishOutcome, StorageError> {
-        let bytes = evidence.bytes();
-        self.publish(PublishTarget::Validation(&evidence), Cursor::new(bytes))
     }
 
     pub(super) fn destination_lock(&self, key: PathBuf) -> Arc<Mutex<()>> {

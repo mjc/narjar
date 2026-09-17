@@ -1,9 +1,10 @@
 //! Read-only discovery and payload inspection; inventory reporting belongs to the caller.
 
 use super::compression::{nar_file_matches, nar_file_size_matches};
-use super::{InvalidObjectId, NarObjectId, StoreHash, entry_is_regular_at, open_regular_at};
-use crate::narinfo::{NarEncoding, NarExpectation};
-use std::{ffi::OsStr, fmt, fs::File, io};
+use super::{StoreHash, entry_is_regular_at, open_regular_at};
+use crate::narinfo::ValidatedPayload;
+use crate::object::NarFileName;
+use std::{ffi::OsStr, fs::File, io};
 
 pub(crate) enum NarinfoName<'a> {
     Invalid(&'a str),
@@ -44,30 +45,6 @@ impl NarinfoCandidate<'_> {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct NarFileName {
-    pub(crate) id: NarObjectId,
-    pub(crate) encoding: NarEncoding,
-}
-
-impl NarFileName {
-    pub(crate) fn parse(name: &str) -> Result<Self, InvalidObjectId> {
-        [NarEncoding::Zstd, NarEncoding::Xz, NarEncoding::None]
-            .into_iter()
-            .find_map(|encoding| {
-                name.strip_suffix(encoding.suffix())
-                    .map(|hash| NarObjectId::parse(hash).map(|id| Self { id, encoding }))
-            })
-            .ok_or(InvalidObjectId)?
-    }
-}
-
-impl fmt::Display for NarFileName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}{}", self.id.as_str(), self.encoding.suffix())
-    }
-}
-
 pub(crate) enum PayloadEntry<'a> {
     Invalid(&'a str),
     Identified(NarFileName),
@@ -88,30 +65,27 @@ impl<'a> PayloadEntry<'a> {
     }
 }
 
-pub(crate) struct ReferencedPayload<'a> {
+pub(crate) struct ReferencedPayload {
     file: File,
-    expectation: NarExpectation<'a>,
+    payload: ValidatedPayload,
 }
 
-impl<'a> ReferencedPayload<'a> {
-    pub(crate) fn open(
-        directory: &File,
-        name: &NarFileName,
-        expectation: NarExpectation<'a>,
-    ) -> io::Result<Option<Self>> {
-        match open_regular_at(directory, OsStr::new(&name.to_string())) {
-            Ok(file) => Ok(Some(Self { file, expectation })),
+impl ReferencedPayload {
+    pub(crate) fn open(directory: &File, payload: ValidatedPayload) -> io::Result<Option<Self>> {
+        let name = payload.payload_name();
+        match open_regular_at(directory, &name.os_string()) {
+            Ok(file) => Ok(Some(Self { file, payload })),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }
 
     pub(crate) fn has_expected_size(&self) -> io::Result<bool> {
-        nar_file_size_matches(&self.file, self.expectation.encoded_size())
+        nar_file_size_matches(&self.file, self.payload.encoded_size().get())
     }
 
     pub(crate) fn verify_content(self) -> io::Result<bool> {
-        nar_file_matches(&self.file, self.expectation)
+        nar_file_matches(&self.file, self.payload)
     }
 }
 

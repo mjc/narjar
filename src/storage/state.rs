@@ -7,7 +7,7 @@ use std::{
 
 #[cfg(test)]
 use super::publication::Layout;
-use super::publication::ProcessLock;
+use super::publication::{ProcessLock, StagingBudget};
 use super::recovery::RecoveryState;
 
 #[derive(Debug)]
@@ -17,7 +17,7 @@ pub struct Storage {
     pub(super) root: File,
     pub(super) recovery: RecoveryState,
     pub(super) publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
-    pub(super) staging_reservations: Arc<AtomicU64>,
+    pub(super) staging_budget: Arc<Mutex<StagingBudget>>,
     pub(super) temporary_objects: AtomicU64,
     pub(super) _lock: ProcessLock,
 }

@@ -17,6 +17,12 @@ pub enum Permission {
     Write,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadVisibility {
+    Public,
+    Private,
+}
+
 #[derive(Debug, Default)]
 struct TokenHashes(TokenFile);
 
@@ -94,8 +100,11 @@ impl Authorizer {
         bool::from(accepted)
     }
 
-    pub(crate) fn has_private_reads(&self) -> bool {
-        matches!(self.read, ReadPolicy::Private(_))
+    pub(crate) fn read_visibility(&self) -> ReadVisibility {
+        match self.read {
+            ReadPolicy::Public => ReadVisibility::Public,
+            ReadPolicy::Private(_) => ReadVisibility::Private,
+        }
     }
 }
 

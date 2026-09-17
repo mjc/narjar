@@ -201,13 +201,14 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                 .name(format!("narjar-publication-{index}"))
                 .spawn(move || {
                     while let Ok(publication) = publication_receiver.recv() {
-                        metrics.publication_dequeued(publication.queued_at);
-                        publication.request.respond(
-                            &storage,
-                            &trusted_keys,
-                            upload_policy,
-                            &metrics,
-                        );
+                        let QueuedPublication {
+                            request,
+                            _admission,
+                            _staging,
+                            queued_at,
+                        } = publication;
+                        metrics.publication_dequeued(queued_at);
+                        request.respond(&storage, &trusted_keys, upload_policy, &metrics, _staging);
                     }
                 })
                 .map_err(|error| {
@@ -277,7 +278,6 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                                 &storage,
                                 &authorizer,
                                 &trusted_keys,
-                                upload_policy,
                                 &metrics,
                                 min_free_bytes,
                             ) {

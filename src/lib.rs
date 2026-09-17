@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod nar;
 pub mod nar_encode;
 pub mod narinfo;
+pub mod object;
 pub mod storage;
 #[doc(hidden)]
 pub mod token_file;

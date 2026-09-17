@@ -31,7 +31,7 @@ pub(crate) struct Push {
     #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
     jobs: NonZeroUsize,
 
-    /// NAR representation requested from the destination cache.
+    /// Compression used for the uploaded NAR payload; the cache selects its stored and served representation.
     #[arg(long, value_enum, default_value_t = Compression::None)]
     compression: Compression,
 
