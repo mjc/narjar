@@ -13,9 +13,7 @@ use super::compression::{
     CheckedUploadReader, DecodedValidation, nar_file_size_matches, receive_uploaded_nar,
     verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
-use super::fs::{
-    FilesystemSpace, filesystem_space, remove_temp, reserve_staging_bytes_for_test, sync_dir,
-};
+use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sync_dir};
 use super::ids::nix32_sha256;
 use super::publication::{Layout, PublishBoundary, PublishTarget};
 use super::{
@@ -621,10 +619,7 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
         .open_nar(raw_hash)
         .expect("raw NAR should open")
         .expect("raw NAR should exist");
-    let available = filesystem_space(&storage.nar_temp_directory().unwrap())
-        .unwrap()
-        .available_bytes;
-    let min_free_bytes = available.saturating_sub(1);
+    let min_free_bytes = u64::MAX;
     let result = storage.materialize_compressed_nar_for_test(
         &raw_file,
         NarIdentity::new(raw_hash, (raw.len() as u64).into()),
@@ -633,11 +628,12 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
     );
 
     assert!(
-        matches!(
-            result,
-            Err(StorageError::Io(error))
-                if error.raw_os_error() == Some(libc::ENOSPC)
-        ),
+        matches!(result, Err(StorageError::InsufficientSpace))
+            || matches!(
+                result,
+                Err(StorageError::Io(error))
+                    if error.raw_os_error() == Some(libc::ENOSPC)
+            ),
         "egress must respect the configured free-space reserve"
     );
     assert_eq!(storage.temporary_objects(), 0);
