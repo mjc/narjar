@@ -194,13 +194,20 @@ impl<'storage> OwnedTemporary<'storage> {
     pub(super) fn into_file(mut self) -> TemporaryFile {
         self.file.take().expect("owned temporary file is present")
     }
+
+    pub(super) fn cleanup(&mut self) -> Result<(), StorageError> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        self.storage.remove_temp(file)?;
+        self.file = None;
+        Ok(())
+    }
 }
 
 impl Drop for OwnedTemporary<'_> {
     fn drop(&mut self) {
-        if let Some(file) = self.file.as_ref() {
-            let _ = self.storage.remove_temp(file);
-        }
+        let _ = self.cleanup();
     }
 }
 

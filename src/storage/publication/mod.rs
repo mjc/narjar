@@ -32,28 +32,66 @@ pub(super) struct TemporaryFile {
 pub(super) struct Streaming;
 pub(super) struct Validated;
 
-struct OwnedTransaction(Option<PublicationTransaction>);
+struct OwnedPublication<'storage> {
+    temporary: Option<OwnedTemporary<'storage>>,
+    transaction: Option<PublicationTransaction>,
+}
 
-impl OwnedTransaction {
-    fn new(transaction: PublicationTransaction) -> Self {
-        Self(Some(transaction))
+impl<'storage> OwnedPublication<'storage> {
+    fn new(temporary: OwnedTemporary<'storage>, transaction: PublicationTransaction) -> Self {
+        Self {
+            temporary: Some(temporary),
+            transaction: Some(transaction),
+        }
     }
 
-    fn into_inner(mut self) -> PublicationTransaction {
-        self.0
-            .take()
+    fn temporary(&self) -> &OwnedTemporary<'storage> {
+        self.temporary
+            .as_ref()
+            .expect("owned publication temporary is present")
+    }
+
+    fn temporary_mut(&mut self) -> &mut OwnedTemporary<'storage> {
+        self.temporary
+            .as_mut()
+            .expect("owned publication temporary is present")
+    }
+
+    fn transaction_mut(&mut self) -> &mut PublicationTransaction {
+        self.transaction
+            .as_mut()
             .expect("owned publication transaction is present")
     }
 
-    fn preserve_recovery_record(mut self) {
-        let _ = self.0.take();
+    fn preserve_recovery_record(&mut self) {
+        let _ = self.transaction.take();
+    }
+
+    fn into_parts(mut self) -> (OwnedTemporary<'storage>, PublicationTransaction) {
+        (
+            self.temporary
+                .take()
+                .expect("owned publication temporary is present"),
+            self.transaction
+                .take()
+                .expect("owned publication transaction is present"),
+        )
     }
 }
 
-impl Drop for OwnedTransaction {
+impl Drop for OwnedPublication<'_> {
     fn drop(&mut self) {
-        if let Some(transaction) = self.0.take() {
+        let Some(transaction) = self.transaction.take() else {
+            return;
+        };
+        let temporary_cleaned = match self.temporary.as_mut() {
+            Some(temporary) => temporary.cleanup().is_ok(),
+            None => true,
+        };
+        if temporary_cleaned {
             transaction.cancel();
+        } else {
+            drop(transaction);
         }
     }
 }
@@ -61,8 +99,7 @@ impl Drop for OwnedTransaction {
 pub(super) struct StagedPublication<'storage, Checkpoint, State> {
     pub(super) storage: &'storage Storage,
     pub(super) destination: PublicationDestination,
-    temporary: OwnedTemporary<'storage>,
-    transaction: OwnedTransaction,
+    publication: OwnedPublication<'storage>,
     checkpoint: Checkpoint,
     _state: PhantomData<State>,
 }
@@ -78,8 +115,7 @@ impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
         Self {
             storage,
             destination,
-            temporary,
-            transaction: OwnedTransaction::new(transaction),
+            publication: OwnedPublication::new(temporary, transaction),
             checkpoint,
             _state: PhantomData,
         }
@@ -96,35 +132,31 @@ where
     ) -> Result<StagedPublication<'storage, Checkpoint, Validated>, StorageError> {
         let result = (|| {
             (self.checkpoint)(PublishBoundary::AfterTempCreate)?;
-            io::copy(&mut source, self.temporary.file_mut())?;
+            io::copy(&mut source, self.publication.temporary_mut().file_mut())?;
             (self.checkpoint)(PublishBoundary::AfterStream)?;
-            self.temporary.file().file.sync_all()?;
+            self.publication.temporary().file().file.sync_all()?;
             (self.checkpoint)(PublishBoundary::AfterTempSync)?;
-            self.transaction
-                .0
-                .as_mut()
-                .expect("owned publication transaction is present")
+            self.publication
+                .transaction_mut()
                 .transition(PublicationState::Validated)?;
             Ok::<_, StorageError>(())
         })();
         if let Err(error) = result {
-            self.transaction.preserve_recovery_record();
+            self.publication.preserve_recovery_record();
             return Err(error);
         }
 
         let Self {
             storage,
             destination,
-            temporary,
-            transaction,
+            publication,
             checkpoint,
             _state: _,
         } = self;
         Ok(StagedPublication {
             storage,
             destination,
-            temporary,
-            transaction,
+            publication,
             checkpoint,
             _state: PhantomData,
         })
@@ -139,18 +171,13 @@ where
         let Self {
             storage,
             destination,
-            temporary,
-            transaction,
+            publication,
             checkpoint,
             _state: _,
         } = self;
+        let (temporary, transaction) = publication.into_parts();
         let temporary = temporary.into_file();
-        storage.commit_temporary(
-            destination,
-            &temporary,
-            transaction.into_inner(),
-            checkpoint,
-        )
+        storage.commit_temporary(destination, &temporary, transaction, checkpoint)
     }
 }
 

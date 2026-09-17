@@ -465,7 +465,7 @@ mod tests {
             })
         }
 
-        for redirect_status in [307, 308] {
+        for redirect_status in [301, 302, 303, 307, 308] {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind GET redirect listener");
             let address = listener
                 .local_addr()
@@ -477,7 +477,7 @@ mod tests {
                 assert!(has_authorization(&request));
                 write!(
                     stream,
-                    "HTTP/1.1 {redirect_status} Temporary Redirect\r\nLocation: /redirected/narinfo\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {redirect_status} Redirect\r\nLocation: /redirected/narinfo\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .expect("write GET redirect response");
 

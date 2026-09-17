@@ -221,6 +221,30 @@ fn abandoned_generic_publication_cleans_up_staging() {
 }
 
 #[test]
+fn abandoned_generic_publication_retains_recovery_when_temp_cleanup_fails() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
+    let target = PublishTarget::Nar(NarFileName::raw(nar));
+    let streaming = storage.begin_publication(target, |_| Ok(())).unwrap();
+    let temporary_directory = storage.layout().nar_temp_dir();
+    fs::set_permissions(&temporary_directory, fs::Permissions::from_mode(0o500))
+        .expect("make temporary directory unavailable for unlink");
+
+    drop(streaming);
+
+    fs::set_permissions(&temporary_directory, fs::Permissions::from_mode(0o700))
+        .expect("restore temporary directory permissions");
+    assert!(storage.recovery_required().unwrap());
+    assert_eq!(fs::read_dir(&temporary_directory).unwrap().count(), 1);
+
+    storage.finish_recovery().unwrap();
+
+    assert!(!storage.recovery_required().unwrap());
+    assert_eq!(fs::read_dir(&temporary_directory).unwrap().count(), 0);
+}
+
+#[test]
 fn failed_generic_publication_stream_cleans_up_staging() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).unwrap();

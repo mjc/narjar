@@ -7,9 +7,20 @@ use crate::http_url::HttpUrl;
 const MAX_ATTEMPTS: usize = 3;
 const MAX_REDIRECTS: usize = 10;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
+const RETRYABLE_STATUSES: &[u16] = &[408, 429, 500, 502, 503, 504];
+const GET_REDIRECT_STATUSES: &[u16] = &[301, 302, 303, 307, 308];
+const PUT_REDIRECT_STATUSES: &[u16] = &[307, 308];
 
 pub(super) fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+    RETRYABLE_STATUSES.contains(&status)
+}
+
+fn is_get_redirect_status(status: u16) -> bool {
+    GET_REDIRECT_STATUSES.contains(&status)
+}
+
+fn is_put_redirect_status(status: u16) -> bool {
+    PUT_REDIRECT_STATUSES.contains(&status)
 }
 
 pub(super) fn retry_after_delay(value: &str) -> Option<Duration> {
@@ -57,7 +68,7 @@ pub(super) fn request_status(
                         format!("reading GET {request_url} response failed: {error}")
                     })?;
 
-                    if matches!(status, 307 | 308) {
+                    if is_get_redirect_status(status) {
                         if redirect == MAX_REDIRECTS {
                             return Err(format!("GET {url} followed too many redirects"));
                         }
@@ -115,7 +126,7 @@ where
             io::copy(&mut body, &mut io::sink())
                 .map_err(|error| format!("reading PUT {upload_url} response failed: {error}"))?;
 
-            if matches!(status, 307 | 308) {
+            if is_put_redirect_status(status) {
                 if redirect == MAX_REDIRECTS {
                     return Err(format!("PUT {url} followed too many redirects"));
                 }
