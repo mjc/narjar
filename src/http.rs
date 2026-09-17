@@ -11,8 +11,8 @@ use crate::{
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::{NarFileName, WireEncoding},
     storage::{
-        CapacityErrorKind, NarUploadPolicy, PublishOutcome, StagingReservation, Storage,
-        StorageError, StoreHash, capacity_error_kind,
+        CapacityErrorKind, NarMatch, NarUploadPolicy, PublishOutcome, StagingReservation, Storage,
+        StorageError, StorageReadiness, StoreHash, capacity_error_kind,
     },
 };
 
@@ -111,8 +111,8 @@ fn respond_narinfo(
         Err(_) => return internal_error(guard, request),
     };
     match storage.nar_matches(&validated) {
-        Ok(true) => {}
-        Ok(false) => return not_found(guard, request),
+        Ok(NarMatch::Match) => {}
+        Ok(NarMatch::Missing | NarMatch::Mismatch) => return not_found(guard, request),
         Err(_) => return internal_error(guard, request),
     }
 
@@ -709,12 +709,13 @@ pub fn respond(
             metrics.auth_failure(false);
             return unauthorized(&guard, request);
         }
-        let ready = storage.is_ready(min_free_bytes).unwrap_or(false);
+        let ready = storage
+            .is_ready(min_free_bytes)
+            .unwrap_or(StorageReadiness::Insufficient);
         if request.url() == "/readyz" {
-            let (status, body) = if ready {
-                (200, "ready\n")
-            } else {
-                (503, "insufficient_space\n")
+            let (status, body) = match ready {
+                StorageReadiness::Ready => (200, "ready\n"),
+                StorageReadiness::Insufficient => (503, "insufficient_space\n"),
             };
             return send_response(
                 &guard,
@@ -727,7 +728,7 @@ pub fn respond(
             );
         } else {
             metrics.set_temp_objects(storage.temporary_objects());
-            let body = metrics.render(ready, storage.capacity().ok());
+            let body = metrics.render(ready.is_ready(), storage.capacity().ok());
             return send_response(
                 &guard,
                 request,

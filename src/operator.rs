@@ -19,7 +19,7 @@ use narjar::{
     inventory::{Inventory, InventoryClass, VerificationMode},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
-        Directory, ReconcileClass, Storage, StoreHash,
+        CleanupOutcome, Directory, ReconcileClass, Storage, StoreHash,
         gc::{self, GcOptions},
     },
 };
@@ -447,10 +447,9 @@ fn structural_scan(
 
     for entry in report.entries() {
         let action = if cleanup && entry.class() == ReconcileClass::TempStale {
-            if storage.cleanup_stale_temp(entry).map_err(runtime)? {
-                "deleted"
-            } else {
-                "kept_replaced"
+            match storage.cleanup_stale_temp(entry).map_err(runtime)? {
+                CleanupOutcome::Removed => "deleted",
+                CleanupOutcome::Unchanged => "kept_replaced",
             }
         } else if cleanup {
             "kept"

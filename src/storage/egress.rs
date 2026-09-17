@@ -10,7 +10,8 @@ use std::sync::atomic::Ordering;
 
 use crate::narinfo::ValidatedPayload;
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, NarFileName, NarHash, NarIdentity, WireEncoding,
+    CompressionCodec, EncodedIdentity, EncodedSize, NarFileName, NarHash, NarIdentity, NarSize,
+    WireEncoding,
 };
 
 use super::compression::{
@@ -96,25 +97,138 @@ impl EgressRepresentation {
     }
 }
 
+struct VerifiedDerivative(EncodedIdentity);
+
+impl VerifiedDerivative {
+    fn identity(&self) -> EncodedIdentity {
+        self.0
+    }
+}
+
 enum ExistingDerivative {
     Missing,
     Corrupt,
-    Usable(EncodedIdentity),
+    Usable(VerifiedDerivative),
 }
 
-enum DerivativeDecision {
-    Reuse(EncodedIdentity),
-    Materialize(DerivativeCommit),
+enum BoundedFile {
+    Missing,
+    Invalid,
+    Present(Vec<u8>),
 }
 
-enum DerivativeCommit {
-    ServerGenerated,
-    Reproduce(EncodedIdentity),
+#[derive(Debug)]
+pub(super) enum CanonicalRawStatus {
+    Missing,
+    WrongSize,
+    Present,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupAction {
+    Keep,
+    Remove,
+}
+
+impl CleanupAction {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Remove, _) | (_, Self::Remove) => Self::Remove,
+            (Self::Keep, Self::Keep) => Self::Keep,
+        }
+    }
+}
+
+#[derive(Default)]
+struct EgressReceiptFields {
+    version: Option<u8>,
+    raw_hash: Option<NarHash>,
+    raw_size: Option<NarSize>,
+    codec: Option<CompressionCodec>,
+    encoded_hash: Option<crate::object::FileHash>,
+    encoded_size: Option<EncodedSize>,
+}
+
+impl EgressReceiptFields {
+    fn record(mut self, line: &str) -> Option<Self> {
+        let (name, value) = line.split_once('=')?;
+        match name {
+            "version" if self.version.is_none() => {
+                self.version = Some(value.parse().ok()?);
+            }
+            "raw-hash" if self.raw_hash.is_none() => {
+                self.raw_hash = Some(NarHash::parse(value).ok()?);
+            }
+            "raw-size" if self.raw_size.is_none() => {
+                self.raw_size = Some(value.parse::<u64>().ok()?.into());
+            }
+            "encoding" if self.codec.is_none() => {
+                self.codec = Some(match value {
+                    "zstd" => CompressionCodec::Zstd,
+                    "xz" => CompressionCodec::Xz,
+                    _ => return None,
+                });
+            }
+            "encoded-hash" if self.encoded_hash.is_none() => {
+                self.encoded_hash = Some(crate::object::FileHash::parse(value).ok()?);
+            }
+            "encoded-size" if self.encoded_size.is_none() => {
+                self.encoded_size = Some(value.parse::<u64>().ok()?.into());
+            }
+            _ => return None,
+        }
+        Some(self)
+    }
+
+    fn finish(self) -> Option<EgressReceipt> {
+        (self.version? == EGRESS_RECEIPT_VERSION).then_some(())?;
+        let codec = self.codec?;
+        Some(EgressReceipt::new(
+            EgressSlot::new(NarIdentity::new(self.raw_hash?, self.raw_size?), codec),
+            EncodedIdentity::new(codec, self.encoded_hash?, self.encoded_size?),
+        ))
+    }
+}
+
+enum DerivativeWork {
+    Reuse(VerifiedDerivative),
+    Generate(GenerationContract),
+}
+
+enum GenerationContract {
+    AnyOutput,
+    ExactOutput(EncodedIdentity),
+}
+
+impl GenerationContract {
+    fn verify(self, output: EncodedIdentity) -> Result<EncodedIdentity, StorageError> {
+        match self {
+            Self::AnyOutput => Ok(output),
+            Self::ExactOutput(expected) if expected == output => Ok(output),
+            Self::ExactOutput(_) => Err(StorageError::NarMismatch),
+        }
+    }
 }
 
 struct StagedDerivativeFile<'storage> {
     storage: &'storage Storage,
     file: Option<TemporaryFile>,
+}
+
+impl StagedDerivativeFile<'_> {
+    fn file_mut(&mut self) -> &mut File {
+        &mut self
+            .file
+            .as_mut()
+            .expect("staged derivative owns its temporary file")
+            .file
+    }
+
+    fn take_file(&mut self) -> TemporaryFile {
+        self.file
+            .take()
+            .expect("staged derivative owns its temporary file")
+    }
 }
 
 impl Drop for StagedDerivativeFile<'_> {
@@ -156,7 +270,7 @@ impl<'storage> StagedDerivative<'storage> {
         raw: &StoredNar<'_>,
         slot: EgressSlot,
         policy: NarUploadPolicy,
-        commit: &DerivativeCommit,
+        contract: GenerationContract,
     ) -> Result<ReadyDerivative<'storage>, StorageError> {
         let Self {
             mut file,
@@ -164,24 +278,22 @@ impl<'storage> StagedDerivative<'storage> {
         } = self;
         let storage = file.storage;
         transaction.transition(PublicationState::Streaming)?;
-        let temporary = file.file.as_mut().expect("staged derivative file exists");
         let mut reservation = storage.empty_staging_reservation(policy.min_free_bytes())?;
-        let mut destination = CapacityCheckedStagingWriter::new(
-            &mut temporary.file,
-            &mut reservation,
-            policy.min_free_bytes(),
-        );
         #[cfg(test)]
         storage.egress_generations.fetch_add(1, Ordering::Relaxed);
-        let output = encode_raw_nar(&raw.file, slot.codec(), &mut destination)?;
+        let output = {
+            let mut destination = CapacityCheckedStagingWriter::new(
+                file.file_mut(),
+                &mut reservation,
+                policy.min_free_bytes(),
+            );
+            let output = encode_raw_nar(&raw.file, slot.codec(), &mut destination)?;
+            destination.flush()?;
+            output
+        };
         let output = EncodedIdentity::new(slot.codec(), output.hash, output.size);
-        if let DerivativeCommit::Reproduce(expected) = commit
-            && output != *expected
-        {
-            return Err(StorageError::NarMismatch);
-        }
-        destination.flush()?;
-        temporary.file.sync_all()?;
+        let output = contract.verify(output)?;
+        file.file_mut().sync_all()?;
         transaction.transition(PublicationState::Validated)?;
         Ok(ReadyDerivative {
             file,
@@ -192,13 +304,9 @@ impl<'storage> StagedDerivative<'storage> {
 }
 
 impl ReadyDerivative<'_> {
-    fn commit(mut self, commit: DerivativeCommit) -> Result<EncodedIdentity, StorageError> {
-        let temporary = self.file.file.take().expect("ready derivative file exists");
-        let target = match commit {
-            DerivativeCommit::ServerGenerated | DerivativeCommit::Reproduce(_) => {
-                PublishTarget::RepairEgressNar(self.output)
-            }
-        };
+    fn commit(mut self) -> Result<EncodedIdentity, StorageError> {
+        let temporary = self.file.take_file();
+        let target = PublishTarget::RepairEgressNar(self.output);
         self.file
             .storage
             .commit_temporary(target, &temporary, self.transaction, |_| Ok(()))?;
@@ -236,47 +344,13 @@ impl EgressReceipt {
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
-        if !text.ends_with('\n') {
-            return None;
-        }
-        let mut version: Option<u8> = None;
-        let mut raw_hash = None;
-        let mut raw_size = None;
-        let mut codec = None;
-        let mut encoded_hash = None;
-        let mut encoded_size = None;
-        for line in text.lines() {
-            let (name, value) = line.split_once('=')?;
-            match name {
-                "version" if version.is_none() => version = Some(value.parse().ok()?),
-                "raw-hash" if raw_hash.is_none() => raw_hash = Some(NarHash::parse(value).ok()?),
-                "raw-size" if raw_size.is_none() => {
-                    raw_size = Some(value.parse::<u64>().ok()?.into())
-                }
-                "encoding" if codec.is_none() => {
-                    codec = Some(match value {
-                        "zstd" => CompressionCodec::Zstd,
-                        "xz" => CompressionCodec::Xz,
-                        _ => return None,
-                    })
-                }
-                "encoded-hash" if encoded_hash.is_none() => {
-                    encoded_hash = Some(crate::object::FileHash::parse(value).ok()?)
-                }
-                "encoded-size" if encoded_size.is_none() => {
-                    encoded_size = Some(value.parse::<u64>().ok()?.into())
-                }
-                _ => return None,
-            }
-        }
-        if version? != EGRESS_RECEIPT_VERSION {
-            return None;
-        }
-        let codec = codec?;
-        Some(Self::new(
-            EgressSlot::new(NarIdentity::new(raw_hash?, raw_size?), codec),
-            EncodedIdentity::new(codec, encoded_hash?, encoded_size?),
-        ))
+        text.ends_with('\n')
+            .then_some(text)
+            .and_then(|text| {
+                text.lines()
+                    .try_fold(EgressReceiptFields::default(), EgressReceiptFields::record)
+            })
+            .and_then(EgressReceiptFields::finish)
     }
 
     pub(super) fn matches(&self, slot: EgressSlot) -> bool {
@@ -346,28 +420,31 @@ impl Storage {
     ) -> Result<EgressRepresentation, StorageError> {
         let lock = self.destination_lock(slot.lock_key());
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let decision = match self.read_egress_receipt(slot)? {
-            Some(receipt) => match self.inspect_egress_derivative(receipt.output())? {
-                ExistingDerivative::Usable(output) => DerivativeDecision::Reuse(output),
-                ExistingDerivative::Missing => {
-                    DerivativeDecision::Materialize(DerivativeCommit::Reproduce(receipt.output()))
-                }
-                ExistingDerivative::Corrupt => {
-                    DerivativeDecision::Materialize(DerivativeCommit::Reproduce(receipt.output()))
-                }
-            },
-            None => DerivativeDecision::Materialize(DerivativeCommit::ServerGenerated),
-        };
+        let decision = self.resolve_derivative_work(slot)?;
         let output = match decision {
-            DerivativeDecision::Reuse(output) => {
-                return Ok(EgressRepresentation::Compressed(output));
-            }
-            DerivativeDecision::Materialize(commit) => {
-                self.materialize_compressed_nar(raw, slot, policy, commit)?
+            DerivativeWork::Reuse(output) => output.identity(),
+            DerivativeWork::Generate(contract) => {
+                self.materialize_compressed_nar(raw, slot, policy, contract)?
             }
         };
         self.publish_egress_receipt(EgressReceipt::new(slot, output))?;
         Ok(EgressRepresentation::Compressed(output))
+    }
+
+    fn resolve_derivative_work(&self, slot: EgressSlot) -> Result<DerivativeWork, StorageError> {
+        self.read_egress_receipt(slot)?.map_or(
+            Ok(DerivativeWork::Generate(GenerationContract::AnyOutput)),
+            |receipt| self.work_for_receipt(receipt),
+        )
+    }
+
+    fn work_for_receipt(&self, receipt: EgressReceipt) -> Result<DerivativeWork, StorageError> {
+        match self.inspect_egress_derivative(receipt.output())? {
+            ExistingDerivative::Usable(output) => Ok(DerivativeWork::Reuse(output)),
+            ExistingDerivative::Missing | ExistingDerivative::Corrupt => Ok(
+                DerivativeWork::Generate(GenerationContract::ExactOutput(receipt.output())),
+            ),
+        }
     }
 
     fn materialize_compressed_nar(
@@ -375,11 +452,11 @@ impl Storage {
         raw: &StoredNar<'_>,
         slot: EgressSlot,
         policy: NarUploadPolicy,
-        commit: DerivativeCommit,
+        contract: GenerationContract,
     ) -> Result<EncodedIdentity, StorageError> {
         let staged = StagedDerivative::begin(self)?;
-        let ready = staged.encode(raw, slot, policy, &commit)?;
-        ready.commit(commit)
+        let ready = staged.encode(raw, slot, policy, contract)?;
+        ready.commit()
     }
 
     fn inspect_egress_derivative(
@@ -387,13 +464,17 @@ impl Storage {
         output: EncodedIdentity,
     ) -> Result<ExistingDerivative, StorageError> {
         let nar = self.nar_directory()?;
-        let Some(file) = open_optional_at(&nar, &output.file_name().os_string())? else {
-            return Ok(ExistingDerivative::Missing);
-        };
-        if !encoded_file_matches(&file, output)? {
-            return Ok(ExistingDerivative::Corrupt);
-        }
-        Ok(ExistingDerivative::Usable(output))
+        open_optional_at(&nar, &output.file_name().os_string())?.map_or(
+            Ok(ExistingDerivative::Missing),
+            |file| {
+                Ok(
+                    encoded_file_matches(&file, output).map(|matches| match matches {
+                        true => ExistingDerivative::Usable(VerifiedDerivative(output)),
+                        false => ExistingDerivative::Corrupt,
+                    })?,
+                )
+            },
+        )
     }
 
     fn publish_egress_receipt(
@@ -409,23 +490,24 @@ impl Storage {
     fn read_egress_receipt(&self, slot: EgressSlot) -> Result<Option<EgressReceipt>, StorageError> {
         let directory = self.egress_receipt_directory()?;
         let name = slot.receipt_name();
-        let Some(bytes) = read_bounded_regular_file(&directory, &name, MAX_EGRESS_RECEIPT_BYTES)?
-        else {
-            return Ok(None);
-        };
-        Ok(EgressReceipt::parse(&bytes).filter(|receipt| receipt.matches(slot)))
+        match read_bounded_regular_file(&directory, &name, MAX_EGRESS_RECEIPT_BYTES)? {
+            BoundedFile::Missing | BoundedFile::Invalid => Ok(None),
+            BoundedFile::Present(bytes) => {
+                Ok(EgressReceipt::parse(&bytes).filter(|receipt| receipt.matches(slot)))
+            }
+        }
     }
 
     pub(super) fn remove_orphan_egress_receipts(&self) -> Result<(), StorageError> {
         let directory = self.egress_receipt_directory()?;
-        let removed =
-            read_dir_names(&directory)?
-                .into_iter()
-                .try_fold(false, |removed, name| {
-                    self.remove_orphan_egress_receipt(&directory, &name)
-                        .map(|was_removed| removed || was_removed)
-                })?;
-        if removed {
+        let action = read_dir_names(&directory)?.into_iter().try_fold(
+            CleanupAction::Keep,
+            |action, name| {
+                self.remove_orphan_egress_receipt(&directory, &name)
+                    .map(|entry_action| action.combine(entry_action))
+            },
+        )?;
+        if action == CleanupAction::Remove {
             directory.sync_all()?;
         }
         Ok(())
@@ -435,31 +517,61 @@ impl Storage {
         &self,
         directory: &File,
         name: &OsStr,
-    ) -> Result<bool, StorageError> {
-        let Some(bytes) = read_bounded_regular_file(directory, name, MAX_EGRESS_RECEIPT_BYTES)?
-        else {
-            unlink_at(directory, name)?;
-            return Ok(true);
-        };
-        let Some(receipt) =
-            EgressReceipt::parse(&bytes).filter(|receipt| receipt.file_name().as_os_str() == name)
-        else {
-            unlink_at(directory, name)?;
-            return Ok(true);
-        };
-        let raw_is_usable = self.canonical_raw_has_expected_size(receipt.slot().raw())?;
-        if raw_is_usable {
-            return Ok(false);
+    ) -> Result<CleanupAction, StorageError> {
+        match read_bounded_regular_file(directory, name, MAX_EGRESS_RECEIPT_BYTES)? {
+            BoundedFile::Missing => Ok(CleanupAction::Keep),
+            BoundedFile::Invalid => {
+                unlink_at(directory, name)?;
+                Ok(CleanupAction::Remove)
+            }
+            BoundedFile::Present(bytes) => Self::parse_named_egress_receipt(&bytes, name)
+                .map_or_else(
+                    || self.remove_egress_receipt(directory, name),
+                    |receipt| self.retain_or_remove_egress_receipt(directory, name, receipt),
+                ),
         }
-        unlink_at(directory, name)?;
-        Ok(true)
     }
 
-    fn canonical_raw_has_expected_size(&self, identity: NarIdentity) -> Result<bool, StorageError> {
-        let Some(file) = self.open_nar(identity.hash())? else {
-            return Ok(false);
-        };
-        Ok(nar_file_size_matches(&file, identity.size().get())?)
+    fn parse_named_egress_receipt(bytes: &[u8], name: &OsStr) -> Option<EgressReceipt> {
+        EgressReceipt::parse(bytes).filter(|receipt| receipt.file_name().as_os_str() == name)
+    }
+
+    fn retain_or_remove_egress_receipt(
+        &self,
+        directory: &File,
+        name: &OsStr,
+        receipt: EgressReceipt,
+    ) -> Result<CleanupAction, StorageError> {
+        match self.canonical_raw_status(receipt.slot().raw())? {
+            CanonicalRawStatus::Present => Ok(CleanupAction::Keep),
+            CanonicalRawStatus::Missing | CanonicalRawStatus::WrongSize => {
+                self.remove_egress_receipt(directory, name)
+            }
+        }
+    }
+
+    fn remove_egress_receipt(
+        &self,
+        directory: &File,
+        name: &OsStr,
+    ) -> Result<CleanupAction, StorageError> {
+        unlink_at(directory, name)?;
+        Ok(CleanupAction::Remove)
+    }
+
+    pub(super) fn canonical_raw_status(
+        &self,
+        identity: NarIdentity,
+    ) -> Result<CanonicalRawStatus, StorageError> {
+        self.open_nar(identity.hash())?
+            .map_or(Ok(CanonicalRawStatus::Missing), |file| {
+                Ok(nar_file_size_matches(&file, identity.size().get()).map(
+                    |matches| match matches {
+                        true => CanonicalRawStatus::Present,
+                        false => CanonicalRawStatus::WrongSize,
+                    },
+                )?)
+            })
     }
 
     pub(super) fn egress_receipt_directory(&self) -> Result<File, StorageError> {
@@ -503,7 +615,7 @@ impl Storage {
             &stored,
             EgressSlot::new(identity, codec),
             NarUploadPolicy::new(u64::MAX, min_free_bytes),
-            DerivativeCommit::ServerGenerated,
+            GenerationContract::AnyOutput,
         )
         .map(|_| ())
     }
@@ -518,22 +630,22 @@ fn read_bounded_regular_file(
     directory: &File,
     name: &OsStr,
     max_bytes: u64,
-) -> Result<Option<Vec<u8>>, StorageError> {
+) -> Result<BoundedFile, StorageError> {
     let file = match open_regular_at(directory, name) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BoundedFile::Missing),
         Err(error)
             if error.kind() == io::ErrorKind::InvalidData
                 || error.raw_os_error() == Some(libc::ELOOP) =>
         {
-            return Ok(None);
+            return Ok(BoundedFile::Invalid);
         }
         Err(error) => return Err(error.into()),
     };
     let mut bytes = Vec::new();
     file.take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
-        return Ok(None);
+        return Ok(BoundedFile::Invalid);
     }
-    Ok(Some(bytes))
+    Ok(BoundedFile::Present(bytes))
 }

@@ -627,13 +627,8 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
     );
 
     assert!(
-        matches!(result, Err(StorageError::InsufficientSpace))
-            || matches!(
-                result,
-                Err(StorageError::Io(error))
-                    if error.raw_os_error() == Some(libc::ENOSPC)
-            ),
-        "egress must respect the configured free-space reserve"
+        matches!(result, Err(StorageError::InsufficientSpace)),
+        "egress must reject the configured free-space reserve before writing"
     );
     assert_eq!(storage.temporary_objects(), 0);
     assert_eq!(
@@ -1920,13 +1915,10 @@ fn process_lock_survives_lockfile_replacement() {
     fs::remove_file(&lock).expect("remove lock pathname");
     fs::write(&lock, b"replacement").expect("replace lock pathname");
 
-    assert!(matches!(
-        initialize_storage(directory.path()),
-        Err(StorageError::Locked)
-    ));
+    assert_lock_probe_status(directory.path(), "held");
 
     drop(first);
-    initialize_storage(directory.path()).expect("reacquire after lease release");
+    assert_lock_probe_status(directory.path(), "available");
 }
 
 #[test]
@@ -1937,19 +1929,27 @@ fn process_lock_replacement_blocks_a_child_process() {
     fs::remove_file(&lock).expect("remove lock pathname");
     fs::write(&lock, b"replacement").expect("replace lock pathname");
 
+    assert_lock_probe_status(directory.path(), "held");
+
+    drop(first);
+    initialize_storage(directory.path()).expect("reacquire after lease release");
+}
+
+fn assert_lock_probe_status(path: &Path, expected: &str) {
     let status = process::Command::new(env::current_exe().expect("test executable path"))
         .args([
             "--exact",
             "storage::tests::process_lock_replacement_probe",
             "--nocapture",
         ])
-        .env("NARJAR_LOCK_PROBE_DATA", directory.path())
+        .env("NARJAR_LOCK_PROBE_DATA", path)
+        .env("NARJAR_LOCK_PROBE_EXPECTED", expected)
         .status()
         .expect("run lock probe child");
-    assert!(status.success(), "child process should observe the lease");
-
-    drop(first);
-    initialize_storage(directory.path()).expect("reacquire after lease release");
+    assert!(
+        status.success(),
+        "child process should report the {expected} lease state"
+    );
 }
 
 #[test]
@@ -1957,10 +1957,17 @@ fn process_lock_replacement_probe() {
     let Some(path) = env::var_os("NARJAR_LOCK_PROBE_DATA") else {
         return;
     };
-    assert!(matches!(
-        initialize_storage(Path::new(&path)),
-        Err(StorageError::Locked)
-    ));
+    match env::var("NARJAR_LOCK_PROBE_EXPECTED").as_deref() {
+        Ok("available") => {
+            initialize_storage(Path::new(&path))
+                .expect("lock should be available after lease release");
+        }
+        Ok("held") => assert!(matches!(
+            initialize_storage(Path::new(&path)),
+            Err(StorageError::Locked)
+        )),
+        other => panic!("unexpected lock probe expectation: {other:?}"),
+    }
 }
 
 #[test]
@@ -2021,10 +2028,11 @@ fn cleanup_removes_only_reported_stale_temps() {
         .find(|entry| entry.relative_path() == Path::new(".tmp/nar-stale.part"))
         .expect("stale temp entry");
     assert_eq!(stale.class(), ReconcileClass::TempStale);
-    assert!(
+    assert_eq!(
         storage
             .cleanup_stale_temp(stale)
-            .expect("cleanup stale temp")
+            .expect("cleanup stale temp"),
+        super::reconcile::CleanupOutcome::Removed
     );
     assert!(!stale_path.exists());
 
@@ -2044,7 +2052,10 @@ fn cleanup_removes_only_reported_stale_temps() {
         .find(|entry| entry.relative_path() == Path::new(".tmp/nar-young.part"))
         .expect("young temp entry");
     assert_eq!(young.class(), ReconcileClass::TempYoung);
-    assert!(!storage.cleanup_stale_temp(young).expect("keep young temp"));
+    assert_eq!(
+        storage.cleanup_stale_temp(young).expect("keep young temp"),
+        super::reconcile::CleanupOutcome::Unchanged
+    );
     assert!(young_path.exists());
 
     let validation_path = directory.path().join(".tmp/validation-repair.part");
@@ -2079,10 +2090,11 @@ fn cleanup_removes_only_reported_stale_temps() {
         .find(|entry| entry.relative_path() == Path::new(".tmp/egress-receipt-stale.part"))
         .expect("egress receipt temp entry");
     assert_eq!(egress.class(), ReconcileClass::TempStale);
-    assert!(
+    assert_eq!(
         storage
             .cleanup_stale_temp(egress)
-            .expect("cleanup egress receipt temp")
+            .expect("cleanup egress receipt temp"),
+        super::reconcile::CleanupOutcome::Removed
     );
     assert!(!egress_path.exists());
 }
@@ -2108,10 +2120,11 @@ fn cleanup_does_not_remove_a_replaced_stale_temp() {
     fs::remove_file(&path).expect("remove reported temp");
     fs::write(&path, b"replacement").expect("write replacement temp");
 
-    assert!(
-        !storage
+    assert_eq!(
+        storage
             .cleanup_stale_temp(stale)
-            .expect("replacement should not be removed")
+            .expect("replacement should not be removed"),
+        super::reconcile::CleanupOutcome::Unchanged
     );
     assert_eq!(fs::read(&path).expect("read replacement"), b"replacement");
 }
@@ -2129,7 +2142,10 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
         .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
         .expect("publish narinfo");
 
-    assert!(storage.delete_narinfo(&store).expect("delete narinfo"));
+    assert_eq!(
+        storage.delete_narinfo(&store).expect("delete narinfo"),
+        super::operations::NarInfoDeletion::Deleted
+    );
     assert!(
         storage
             .open_pair(&store, nar)
@@ -2137,7 +2153,10 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
             .is_none()
     );
     assert!(storage.layout().nar_path(nar).is_file());
-    assert!(!storage.delete_narinfo(&store).expect("repeat delete"));
+    assert_eq!(
+        storage.delete_narinfo(&store).expect("repeat delete"),
+        super::operations::NarInfoDeletion::Absent
+    );
 }
 
 struct TestDir(tempfile::TempDir);

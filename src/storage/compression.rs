@@ -532,6 +532,56 @@ pub(super) struct IngestionReceipt {
     decoded: NarIdentity,
 }
 
+#[derive(Default)]
+struct IngestionReceiptFields {
+    version: Option<u8>,
+    codec: Option<CompressionCodec>,
+    encoded_hash: Option<FileHash>,
+    encoded_size: Option<EncodedSize>,
+    decoded_hash: Option<NarHash>,
+    decoded_size: Option<NarSize>,
+}
+
+impl IngestionReceiptFields {
+    fn record(mut self, line: &str) -> Option<Self> {
+        let (name, value) = line.split_once('=')?;
+        match name {
+            "version" if self.version.is_none() => {
+                self.version = Some(value.parse().ok()?);
+            }
+            "encoding" if self.codec.is_none() => {
+                self.codec = Some(match value {
+                    "zstd" => CompressionCodec::Zstd,
+                    "xz" => CompressionCodec::Xz,
+                    _ => return None,
+                });
+            }
+            "encoded-hash" if self.encoded_hash.is_none() => {
+                self.encoded_hash = Some(FileHash::parse(value).ok()?);
+            }
+            "encoded-size" if self.encoded_size.is_none() => {
+                self.encoded_size = Some(EncodedSize::new(value.parse().ok()?));
+            }
+            "decoded-hash" if self.decoded_hash.is_none() => {
+                self.decoded_hash = Some(NarHash::parse(value).ok()?);
+            }
+            "decoded-size" if self.decoded_size.is_none() => {
+                self.decoded_size = Some(NarSize::new(value.parse().ok()?));
+            }
+            _ => return None,
+        }
+        Some(self)
+    }
+
+    fn finish(self) -> Option<IngestionReceipt> {
+        (self.version? == INGESTION_RECEIPT_VERSION).then_some(())?;
+        Some(IngestionReceipt {
+            encoded: EncodedIdentity::new(self.codec?, self.encoded_hash?, self.encoded_size?),
+            decoded: NarIdentity::new(self.decoded_hash?, self.decoded_size?),
+        })
+    }
+}
+
 impl IngestionReceipt {
     fn from_decoded(encoded: EncodedIdentity, decoded: DecodedValidation) -> Self {
         Self {
@@ -562,45 +612,15 @@ impl IngestionReceipt {
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
-        if !text.ends_with('\n') {
-            return None;
-        }
-        let mut version: Option<u8> = None;
-        let mut encoding = None;
-        let mut encoded_hash = None;
-        let mut encoded_size = None;
-        let mut decoded_hash = None;
-        let mut decoded_size = None;
-        for line in text.lines() {
-            let (name, value) = line.split_once('=')?;
-            match name {
-                "version" if version.is_none() => version = Some(value.parse().ok()?),
-                "encoding" if encoding.is_none() => {
-                    encoding = Some(match value {
-                        "zstd" => CompressionCodec::Zstd,
-                        "xz" => CompressionCodec::Xz,
-                        _ => return None,
-                    })
-                }
-                "encoded-hash" if encoded_hash.is_none() => {
-                    encoded_hash = Some(FileHash::parse(value).ok()?)
-                }
-                "encoded-size" if encoded_size.is_none() => {
-                    encoded_size = Some(EncodedSize::new(value.parse().ok()?))
-                }
-                "decoded-hash" if decoded_hash.is_none() => {
-                    decoded_hash = Some(NarHash::parse(value).ok()?)
-                }
-                "decoded-size" if decoded_size.is_none() => {
-                    decoded_size = Some(NarSize::new(value.parse().ok()?))
-                }
-                _ => return None,
-            }
-        }
-        let encoded = EncodedIdentity::new(encoding?, encoded_hash?, encoded_size?);
-        let decoded = NarIdentity::new(decoded_hash?, decoded_size?);
-        let evidence = Self { encoded, decoded };
-        (version? == INGESTION_RECEIPT_VERSION).then_some(evidence)
+        text.ends_with('\n')
+            .then_some(text)
+            .and_then(|text| {
+                text.lines().try_fold(
+                    IngestionReceiptFields::default(),
+                    IngestionReceiptFields::record,
+                )
+            })
+            .and_then(IngestionReceiptFields::finish)
     }
 
     pub(super) fn matches(&self, expectation: CompressedNarExpectation) -> bool {
@@ -877,11 +897,41 @@ pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Resu
 mod tests {
     use std::{
         fs::File,
+        io::{self, Seek, SeekFrom, Write},
         sync::{Arc, Mutex},
     };
 
-    use super::{StagingReservation, reserve_preferred_or_exact_staging_growth};
+    use super::{StagingReservation, encode_raw_nar, reserve_preferred_or_exact_staging_growth};
+    use crate::object::CompressionCodec;
     use crate::storage::fs::filesystem_space;
+
+    struct EnospcWriter;
+
+    impl Write for EnospcWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn encoding_propagates_physical_enospc() {
+        let mut source = tempfile::tempfile().expect("create source NAR");
+        source
+            .write_all(b"raw NAR bytes")
+            .expect("write source NAR");
+        source.seek(SeekFrom::Start(0)).expect("rewind source NAR");
+
+        for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
+            let error = encode_raw_nar(&source, codec, &mut EnospcWriter)
+                .err()
+                .expect("physical output exhaustion should fail encoding");
+            assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        }
+    }
 
     #[test]
     fn staging_growth_falls_back_to_the_exact_immediate_requirement() {

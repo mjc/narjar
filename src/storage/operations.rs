@@ -15,14 +15,14 @@ use std::{
 };
 
 use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo};
-use crate::object::{EncodedIdentity, FileHash, NarFileName, NarHash, WireEncoding};
+use crate::object::{EncodedIdentity, NarFileName, NarHash, WireEncoding};
 
 use super::{
     compression::{
         IngestionReceipt, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
     },
     directory::Directory,
-    egress::EGRESS_RECEIPT_DIRECTORY,
+    egress::{CanonicalRawStatus, EGRESS_RECEIPT_DIRECTORY},
     fs::{
         StorageCapacity, directory_is_empty, ensure_directory_at, entry_is_regular_at,
         files_equal_at, filesystem_space, hard_link_at, open_at, open_directory_at,
@@ -31,9 +31,9 @@ use super::{
     },
     ids::StoreHash,
     publication::{
-        DestinationPublication, NEXT_TEMP, NarUploadPolicy, ProcessLock, PublishBoundary,
-        PublishOutcome, PublishTarget, PublishedPair, StagingReservation, StorageError,
-        TemporaryFile,
+        DestinationPublication, NEXT_TEMP, NarUploadPolicy, ProcessLock, PublicationDestination,
+        PublicationDirectory, PublishBoundary, PublishOutcome, PublishTarget, PublishedPair,
+        StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction, RecoveryState},
@@ -52,6 +52,69 @@ pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
 enum TemporaryLocation {
     Staging,
     Destination,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CleanupAction {
+    Keep,
+    Remove,
+}
+
+impl CleanupAction {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Remove, _) | (_, Self::Remove) => Self::Remove,
+            (Self::Keep, Self::Keep) => Self::Keep,
+        }
+    }
+}
+
+struct CompressedValidationName(NarFileName);
+
+impl CompressedValidationName {
+    fn parse(name: &OsStr) -> Option<Self> {
+        let stem = name.to_str()?.strip_suffix(".validation")?;
+        let nar_name = NarFileName::parse(stem).ok()?;
+        (nar_name.encoding() != WireEncoding::Raw).then_some(Self(nar_name))
+    }
+
+    fn nar_name(&self) -> OsString {
+        self.0.os_string()
+    }
+}
+
+enum IngestionReceiptFile {
+    Missing,
+    Invalid,
+    Valid(IngestionReceipt),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NarMatch {
+    Missing,
+    Mismatch,
+    Match,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageReadiness {
+    Ready,
+    Insufficient,
+}
+
+impl StorageReadiness {
+    pub(crate) const fn is_ready(self) -> bool {
+        match self {
+            Self::Ready => true,
+            Self::Insufficient => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NarInfoDeletion {
+    Deleted,
+    Absent,
 }
 
 #[derive(Clone, Copy)]
@@ -382,13 +445,20 @@ impl Storage {
             .map_err(|_| StorageError::NarMismatch)
     }
 
-    pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {
+    pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<NarMatch, StorageError> {
         let nar_directory = self.nar_directory()?;
         let payload_name = narinfo.payload_name();
-        let Some(file) = open_optional_at(&nar_directory, &payload_name.os_string())? else {
-            return Ok(false);
-        };
-        nar_file_size_matches(&file, narinfo.file_size().get()).map_err(Into::into)
+        open_optional_at(&nar_directory, &payload_name.os_string())?.map_or(
+            Ok(NarMatch::Missing),
+            |file| {
+                nar_file_size_matches(&file, narinfo.file_size().get())
+                    .map(|matches| match matches {
+                        true => NarMatch::Match,
+                        false => NarMatch::Mismatch,
+                    })
+                    .map_err(Into::into)
+            },
+        )
     }
 
     #[cfg(test)]
@@ -447,21 +517,20 @@ impl Storage {
         store: &StoreHash,
         nar: NarHash,
     ) -> Result<Option<PublishedPair>, StorageError> {
-        let Some(narinfo) = self.open_narinfo(store)? else {
-            return Ok(None);
-        };
-        let Some(nar) = self.open_nar(nar)? else {
-            return Ok(None);
-        };
-
-        Ok(Some(PublishedPair { nar, narinfo }))
+        Ok(self
+            .open_narinfo(store)?
+            .zip(self.open_nar(nar)?)
+            .map(|(narinfo, nar)| PublishedPair { nar, narinfo }))
     }
 
-    pub fn is_ready(&self, min_free_bytes: u64) -> Result<bool, StorageError> {
+    pub fn is_ready(&self, min_free_bytes: u64) -> Result<StorageReadiness, StorageError> {
         let directory = self.nar_temp_directory()?;
-        Ok(filesystem_space(&directory)?
-            .required_capacity(min_free_bytes)
-            .is_ok())
+        Ok(
+            match filesystem_space(&directory)?.required_capacity(min_free_bytes) {
+                Ok(()) => StorageReadiness::Ready,
+                Err(_) => StorageReadiness::Insufficient,
+            },
+        )
     }
 
     pub(crate) fn capacity(&self) -> Result<StorageCapacity, StorageError> {
@@ -488,25 +557,28 @@ impl Storage {
         reconcile::scan(self, limit, stale_before)
     }
 
-    pub fn cleanup_stale_temp(&self, entry: &ReconcileEntry) -> Result<bool, StorageError> {
+    pub fn cleanup_stale_temp(
+        &self,
+        entry: &ReconcileEntry,
+    ) -> Result<reconcile::CleanupOutcome, StorageError> {
         reconcile::cleanup_stale_temp(self, entry)
     }
 
-    pub fn delete_narinfo(&self, store: &StoreHash) -> Result<bool, StorageError> {
+    pub fn delete_narinfo(&self, store: &StoreHash) -> Result<NarInfoDeletion, StorageError> {
         let root = self.root_directory()?;
         let name = OsString::from(format!("{}.narinfo", store.as_str()));
         match entry_is_regular_at(&root, &name) {
             Ok(true) => {
                 unlink_at(&root, &name)?;
                 root.sync_all()?;
-                Ok(true)
+                Ok(NarInfoDeletion::Deleted)
             }
             Ok(false) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "narinfo is not a regular file",
             )
             .into()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(NarInfoDeletion::Absent),
             Err(error) => Err(error.into()),
         }
     }
@@ -556,16 +628,15 @@ impl Storage {
         mut transaction: PublicationTransaction,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        let destination_name = target.destination_name();
-        let destination_key = self.destination_key(&target, &destination_name);
-        let publication = target.destination_publication();
+        let destination = target.destination();
+        let destination_key = self.destination_key(&destination);
         let mut progress = PublicationProgress::Pending(TemporaryLocation::Staging);
         let result = (|| {
-            let destination_directory = self.destination_directory(&target)?;
+            let destination_directory = self.destination_directory(destination.directory)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
             let mut finalize_publication = |publish_result: io::Result<()>| match publish_result {
                 Ok(()) => {
-                    match publication {
+                    match destination.publication {
                         DestinationPublication::Replace | DestinationPublication::Repair(_) => {
                             progress.mark_temporary_moved();
                             temp.directory.sync_all()?;
@@ -574,9 +645,9 @@ impl Storage {
                     }
                     transaction.transition(PublicationState::Linked)?;
                     if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
-                        match publication {
+                        match destination.publication {
                             DestinationPublication::Link => {
-                                rollback_link_at(&destination_directory, &destination_name)?;
+                                rollback_link_at(&destination_directory, &destination.name)?;
                             }
                             DestinationPublication::Replace | DestinationPublication::Repair(_) => {
                             }
@@ -584,9 +655,9 @@ impl Storage {
                         return Err(error);
                     }
                     if let Err(error) = destination_directory.sync_all() {
-                        match publication {
+                        match destination.publication {
                             DestinationPublication::Link => {
-                                rollback_link_at(&destination_directory, &destination_name)?;
+                                rollback_link_at(&destination_directory, &destination.name)?;
                             }
                             DestinationPublication::Replace | DestinationPublication::Repair(_) => {
                             }
@@ -598,16 +669,16 @@ impl Storage {
                     checkpoint(PublishBoundary::AfterParentSync)?;
                     Ok(PublishOutcome::Created)
                 }
-                Err(error) => match publication {
+                Err(error) => match destination.publication {
                     DestinationPublication::Link | DestinationPublication::Repair(_)
                         if error.kind() == io::ErrorKind::AlreadyExists =>
                     {
-                        let identical = match publication {
+                        let identical = match destination.publication {
                             DestinationPublication::Link => files_equal_at(
                                 &temp.directory,
                                 &temp.name,
                                 &destination_directory,
-                                &destination_name,
+                                &destination.name,
                             )?,
                             DestinationPublication::Repair(_) => true,
                             DestinationPublication::Replace => false,
@@ -624,12 +695,12 @@ impl Storage {
                     | DestinationPublication::Repair(_) => Err(error.into()),
                 },
             };
-            match publication {
+            match destination.publication {
                 DestinationPublication::Replace => finalize_publication(rename_at(
                     &temp.directory,
                     &temp.name,
                     &destination_directory,
-                    &destination_name,
+                    &destination.name,
                 )),
                 DestinationPublication::Link => {
                     let destination_lock = self.destination_lock(destination_key);
@@ -640,7 +711,7 @@ impl Storage {
                         &temp.directory,
                         &temp.name,
                         &destination_directory,
-                        &destination_name,
+                        &destination.name,
                     ))
                 }
                 DestinationPublication::Repair(output) => {
@@ -651,7 +722,7 @@ impl Storage {
                     finalize_publication(self.replace_corrupt_egress_derivative(
                         temp,
                         &destination_directory,
-                        &destination_name,
+                        &destination.name,
                         output,
                     ))
                 }
@@ -698,7 +769,7 @@ impl Storage {
     }
 
     pub(super) fn next_temp_name(&self, target: &PublishTarget<'_>) -> OsString {
-        self.next_temp_name_with_prefix(target.temp_prefix())
+        self.next_temp_name_with_prefix(target.destination().temp_prefix)
     }
 
     pub(super) fn next_temp_name_with_prefix(&self, prefix: &str) -> OsString {
@@ -707,15 +778,8 @@ impl Storage {
     }
 
     pub(super) fn temporary_path(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
-        match target {
-            PublishTarget::Nar(_) | PublishTarget::RepairEgressNar(_) => {
-                PathBuf::from("nar/.tmp").join(name)
-            }
-            PublishTarget::CacheInfo
-            | PublishTarget::NarInfo(_)
-            | PublishTarget::IngestionReceipt(_)
-            | PublishTarget::EgressReceipt(_) => PathBuf::from(".tmp").join(name),
-        }
+        let destination = target.destination();
+        Self::temporary_path_for(destination.temporary_directory, name)
     }
 
     pub(super) fn create_temp_named(
@@ -723,15 +787,7 @@ impl Storage {
         target: &PublishTarget<'_>,
         name: OsString,
     ) -> Result<TemporaryFile, StorageError> {
-        let directory = match target {
-            PublishTarget::Nar(_) | PublishTarget::RepairEgressNar(_) => {
-                self.nar_temp_directory()?
-            }
-            PublishTarget::CacheInfo
-            | PublishTarget::NarInfo(_)
-            | PublishTarget::IngestionReceipt(_)
-            | PublishTarget::EgressReceipt(_) => self.temp_directory()?,
-        };
+        let directory = self.temporary_directory(target.destination().temporary_directory)?;
         self.create_temp_in_directory(directory, name)
     }
 
@@ -799,26 +855,40 @@ impl Storage {
 
     pub(super) fn destination_directory(
         &self,
-        target: &PublishTarget<'_>,
+        directory: PublicationDirectory,
     ) -> Result<File, StorageError> {
-        match target {
-            PublishTarget::Nar(_) | PublishTarget::RepairEgressNar(_) => self.nar_directory(),
-            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => self.root_directory(),
-            PublishTarget::IngestionReceipt(_) => self.ingestion_receipt_directory(),
-            PublishTarget::EgressReceipt(_) => self.egress_receipt_directory(),
+        match directory {
+            PublicationDirectory::Root => self.root_directory(),
+            PublicationDirectory::Nar => self.nar_directory(),
+            PublicationDirectory::IngestionReceipts => self.ingestion_receipt_directory(),
+            PublicationDirectory::EgressReceipts => self.egress_receipt_directory(),
         }
     }
 
-    pub(super) fn destination_key(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
-        match target {
-            PublishTarget::Nar(_) | PublishTarget::RepairEgressNar(_) => {
-                PathBuf::from("nar").join(name)
+    pub(super) fn destination_key(&self, destination: &PublicationDestination) -> PathBuf {
+        match destination.directory {
+            PublicationDirectory::Root => PathBuf::from(&destination.name),
+            PublicationDirectory::Nar => PathBuf::from("nar").join(&destination.name),
+            PublicationDirectory::IngestionReceipts => {
+                PathBuf::from(INGESTION_RECEIPT_DIRECTORY).join(&destination.name)
             }
-            PublishTarget::CacheInfo | PublishTarget::NarInfo(_) => PathBuf::from(name),
-            PublishTarget::IngestionReceipt(_) => {
-                PathBuf::from(INGESTION_RECEIPT_DIRECTORY).join(name)
+            PublicationDirectory::EgressReceipts => {
+                PathBuf::from(EGRESS_RECEIPT_DIRECTORY).join(&destination.name)
             }
-            PublishTarget::EgressReceipt(_) => PathBuf::from(EGRESS_RECEIPT_DIRECTORY).join(name),
+        }
+    }
+
+    fn temporary_directory(&self, directory: TemporaryDirectory) -> Result<File, StorageError> {
+        match directory {
+            TemporaryDirectory::Root => self.temp_directory(),
+            TemporaryDirectory::Nar => self.nar_temp_directory(),
+        }
+    }
+
+    fn temporary_path_for(directory: TemporaryDirectory, name: &OsStr) -> PathBuf {
+        match directory {
+            TemporaryDirectory::Root => PathBuf::from(".tmp").join(name),
+            TemporaryDirectory::Nar => PathBuf::from("nar/.tmp").join(name),
         }
     }
 
@@ -852,61 +922,70 @@ impl Storage {
     ) -> Result<Option<IngestionReceipt>, StorageError> {
         let directory = self.ingestion_receipt_directory()?;
         let name = ingestion_receipt_file_name(expectation);
-        Ok(Self::read_ingestion_receipt_file(&directory, &name)?
-            .filter(|receipt| receipt.matches(expectation)))
+        match Self::read_ingestion_receipt_file(&directory, &name)? {
+            IngestionReceiptFile::Valid(receipt) if receipt.matches(expectation) => {
+                Ok(Some(receipt))
+            }
+            IngestionReceiptFile::Missing
+            | IngestionReceiptFile::Invalid
+            | IngestionReceiptFile::Valid(_) => Ok(None),
+        }
     }
 
     pub(super) fn remove_orphan_ingestion_receipts(&self) -> Result<(), StorageError> {
         let receipts = self.ingestion_receipt_directory()?;
-        let nar = self.nar_directory()?;
-        let mut removed = false;
-        for name in read_dir_names(&receipts)? {
-            let Some(receipt) = Self::read_ingestion_receipt_file(&receipts, &name)? else {
-                if name
-                    .to_str()
-                    .is_some_and(|name| name.ends_with(".validation"))
-                {
-                    unlink_at(&receipts, &name)?;
-                    removed = true;
-                }
-                continue;
-            };
-            let identity = receipt.decoded_identity();
-            let nar_name = NarFileName::raw(identity.hash()).os_string();
-            let usable = match open_regular_at(&nar, &nar_name) {
-                Ok(file) => file.metadata()?.len() == identity.size().get(),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(error)
-                    if error.kind() == io::ErrorKind::InvalidData
-                        || error.raw_os_error() == Some(libc::ELOOP) =>
-                {
-                    false
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if !usable {
-                unlink_at(&receipts, &name)?;
-                removed = true;
-            }
-        }
-        if removed {
+        let action = read_dir_names(&receipts)?.into_iter().try_fold(
+            CleanupAction::Keep,
+            |action, name| {
+                self.cleanup_ingestion_receipt(&receipts, &name)
+                    .map(|entry_action| action.combine(entry_action))
+            },
+        )?;
+        if action == CleanupAction::Remove {
             receipts.sync_all()?;
         }
         Ok(())
     }
 
+    fn cleanup_ingestion_receipt(
+        &self,
+        receipts: &File,
+        name: &OsStr,
+    ) -> Result<CleanupAction, StorageError> {
+        match Self::read_ingestion_receipt_file(receipts, name)? {
+            IngestionReceiptFile::Missing => Ok(CleanupAction::Keep),
+            IngestionReceiptFile::Invalid => {
+                CompressedValidationName::parse(name).map_or(Ok(CleanupAction::Keep), |_| {
+                    unlink_at(receipts, name)?;
+                    Ok(CleanupAction::Remove)
+                })
+            }
+            IngestionReceiptFile::Valid(receipt) => {
+                match self.canonical_raw_status(receipt.decoded_identity())? {
+                    CanonicalRawStatus::Present => Ok(CleanupAction::Keep),
+                    CanonicalRawStatus::Missing | CanonicalRawStatus::WrongSize => {
+                        unlink_at(receipts, name)?;
+                        Ok(CleanupAction::Remove)
+                    }
+                }
+            }
+        }
+    }
+
     fn read_ingestion_receipt_file(
         directory: &File,
         name: &OsStr,
-    ) -> Result<Option<IngestionReceipt>, StorageError> {
+    ) -> Result<IngestionReceiptFile, StorageError> {
         let file = match open_regular_at(directory, name) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(IngestionReceiptFile::Missing);
+            }
             Err(error)
                 if error.kind() == io::ErrorKind::InvalidData
                     || error.raw_os_error() == Some(libc::ELOOP) =>
             {
-                return Ok(None);
+                return Ok(IngestionReceiptFile::Invalid);
             }
             Err(error) => return Err(error.into()),
         };
@@ -914,48 +993,54 @@ impl Storage {
         file.take(MAX_INGESTION_RECEIPT_BYTES + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_INGESTION_RECEIPT_BYTES {
-            return Ok(None);
+            return Ok(IngestionReceiptFile::Invalid);
         }
-        Ok(IngestionReceipt::parse(&bytes))
+        Ok(IngestionReceipt::parse(&bytes)
+            .map_or(IngestionReceiptFile::Invalid, IngestionReceiptFile::Valid))
     }
 
     pub(super) fn remove_orphan_validation_evidence(&self) -> Result<(), StorageError> {
         let validation = self.validation_directory()?;
         let nar = self.nar_directory()?;
-        let mut removed = false;
-        for name in read_dir_names(&validation)? {
-            let Some(evidence_name) = name.to_str() else {
-                continue;
-            };
-            let Some(nar_name) = evidence_name.strip_suffix(".validation") else {
-                continue;
-            };
-            if !nar_name.ends_with(".nar.xz") && !nar_name.ends_with(".nar.zst") {
-                continue;
-            }
-            if FileHash::parse(
-                nar_name
-                    .strip_suffix(".nar.xz")
-                    .or_else(|| nar_name.strip_suffix(".nar.zst"))
-                    .unwrap_or_default(),
-            )
-            .is_err()
-            {
-                continue;
-            }
-            match entry_is_regular_at(&nar, OsStr::new(nar_name)) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            unlink_at(&validation, &name)?;
-            removed = true;
-        }
-        if removed {
+        let action = read_dir_names(&validation)?.into_iter().try_fold(
+            CleanupAction::Keep,
+            |action, name| {
+                self.cleanup_validation_evidence(&validation, &nar, &name)
+                    .map(|entry_action| action.combine(entry_action))
+            },
+        )?;
+        if action == CleanupAction::Remove {
             validation.sync_all()?;
         }
         Ok(())
+    }
+
+    fn cleanup_validation_evidence(
+        &self,
+        validation: &File,
+        nar: &File,
+        name: &OsStr,
+    ) -> Result<CleanupAction, StorageError> {
+        let Some(evidence_name) = CompressedValidationName::parse(name) else {
+            return Ok(CleanupAction::Keep);
+        };
+        match entry_is_regular_at(nar, &evidence_name.nar_name()) {
+            Ok(true) => Ok(CleanupAction::Keep),
+            Ok(false) => self.remove_validation_evidence(validation, name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.remove_validation_evidence(validation, name)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remove_validation_evidence(
+        &self,
+        validation: &File,
+        name: &OsStr,
+    ) -> Result<CleanupAction, StorageError> {
+        unlink_at(validation, name)?;
+        Ok(CleanupAction::Remove)
     }
 
     pub(super) fn destination_lock(&self, key: PathBuf) -> Arc<Mutex<()>> {

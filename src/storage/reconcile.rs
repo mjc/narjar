@@ -64,6 +64,12 @@ pub struct ReconcileReport {
     truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupOutcome {
+    Removed,
+    Unchanged,
+}
+
 impl ReconcileReport {
     pub fn entries(&self) -> &[ReconcileEntry] {
         &self.entries
@@ -101,20 +107,13 @@ pub(super) fn scan(
     }
 
     let nar_directory = storage.nar_directory()?;
-    for name in read_dir_names(&nar_directory)? {
-        if name == OsStr::new(".tmp") {
-            continue;
-        }
-        let relative = PathBuf::from("nar").join(&name);
-        let class = if !entry_is_regular_at(&nar_directory, &name)? {
-            ReconcileClass::UnexpectedType
-        } else if valid_nar_filename(&name) {
-            ReconcileClass::NarObject
-        } else {
-            ReconcileClass::InvalidFilename
-        };
-        found.record(relative, class, entry_identity_at(&nar_directory, &name)?);
-    }
+    scan_named_directory(
+        &mut found,
+        &nar_directory,
+        Path::new("nar"),
+        ReconcileClass::NarObject,
+        valid_nar_filename,
+    )?;
     scan_temps(
         &mut found,
         &storage.nar_temp_directory()?,
@@ -130,24 +129,13 @@ pub(super) fn scan(
     )?;
 
     let realisations_directory = storage.realisations_directory()?;
-    for name in read_dir_names(&realisations_directory)? {
-        if name == OsStr::new(".tmp") {
-            continue;
-        }
-        let relative = PathBuf::from("realisations").join(&name);
-        let class = if !entry_is_regular_at(&realisations_directory, &name)? {
-            ReconcileClass::UnexpectedType
-        } else if valid_realisation_filename(&name) {
-            ReconcileClass::Realisation
-        } else {
-            ReconcileClass::InvalidFilename
-        };
-        found.record(
-            relative,
-            class,
-            entry_identity_at(&realisations_directory, &name)?,
-        );
-    }
+    scan_named_directory(
+        &mut found,
+        &realisations_directory,
+        Path::new("realisations"),
+        ReconcileClass::Realisation,
+        valid_realisation_filename,
+    )?;
     scan_temps(
         &mut found,
         &storage.realisations_temp_directory()?,
@@ -158,35 +146,73 @@ pub(super) fn scan(
     Ok(found.finish())
 }
 
+fn scan_named_directory(
+    found: &mut BoundedEntries,
+    directory: &fs::File,
+    relative_prefix: &Path,
+    valid_class: ReconcileClass,
+    is_valid_name: fn(&OsStr) -> bool,
+) -> Result<(), StorageError> {
+    read_dir_names(directory)?
+        .into_iter()
+        .filter(|name| name != OsStr::new(".tmp"))
+        .try_for_each(|name| {
+            let relative = relative_prefix.join(&name);
+            let class = classify_named_entry(directory, &name, valid_class, is_valid_name)?;
+            found.record(relative, class, entry_identity_at(directory, &name)?);
+            Ok::<(), StorageError>(())
+        })
+}
+
+fn classify_named_entry(
+    directory: &fs::File,
+    name: &OsStr,
+    valid_class: ReconcileClass,
+    is_valid_name: fn(&OsStr) -> bool,
+) -> Result<ReconcileClass, StorageError> {
+    Ok(match entry_is_regular_at(directory, name)? {
+        true if is_valid_name(name) => valid_class,
+        true => ReconcileClass::InvalidFilename,
+        false => ReconcileClass::UnexpectedType,
+    })
+}
+
 fn scan_temps(
     found: &mut BoundedEntries,
     directory: &fs::File,
     prefix: &Path,
     stale_before: SystemTime,
 ) -> Result<(), StorageError> {
-    for name in read_dir_names(directory)? {
+    read_dir_names(directory)?.into_iter().try_for_each(|name| {
         let relative = prefix.join(&name);
         let identity = entry_identity_at(directory, &name)?;
-        let class = if !entry_is_regular_at(directory, &name)? {
-            ReconcileClass::UnexpectedType
-        } else if !valid_temp_filename(&name) {
-            ReconcileClass::InvalidFilename
-        } else if open_regular_at(directory, &name)?.metadata()?.modified()? <= stale_before {
-            ReconcileClass::TempStale
-        } else {
-            ReconcileClass::TempYoung
-        };
+        let class = classify_temp_entry(directory, &name, stale_before)?;
         found.record(relative, class, identity);
-    }
-    Ok(())
+        Ok::<(), StorageError>(())
+    })
+}
+
+fn classify_temp_entry(
+    directory: &fs::File,
+    name: &OsStr,
+    stale_before: SystemTime,
+) -> Result<ReconcileClass, StorageError> {
+    Ok(match entry_is_regular_at(directory, name)? {
+        false => ReconcileClass::UnexpectedType,
+        true if !valid_temp_filename(name) => ReconcileClass::InvalidFilename,
+        true => match open_regular_at(directory, name)?.metadata()?.modified()? <= stale_before {
+            true => ReconcileClass::TempStale,
+            false => ReconcileClass::TempYoung,
+        },
+    })
 }
 
 pub(super) fn cleanup_stale_temp(
     storage: &Storage,
     entry: &ReconcileEntry,
-) -> Result<bool, StorageError> {
+) -> Result<CleanupOutcome, StorageError> {
     if entry.class != ReconcileClass::TempStale {
-        return Ok(false);
+        return Ok(CleanupOutcome::Unchanged);
     }
 
     let (directory, parent) = match entry.relative_path.parent() {
@@ -195,7 +221,7 @@ pub(super) fn cleanup_stale_temp(
         Some(path) if path == Path::new("realisations/.tmp") => {
             (storage.realisations_temp_directory()?, path)
         }
-        _ => return Ok(false),
+        _ => return Ok(CleanupOutcome::Unchanged),
     };
     debug_assert_eq!(entry.relative_path.parent(), Some(parent));
     let name = entry
@@ -209,16 +235,18 @@ pub(super) fn cleanup_stale_temp(
             change_time_seconds,
             change_time_nanoseconds,
         },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(CleanupOutcome::Unchanged);
+        }
         Err(error) => return Err(error.into()),
     };
     if identity != entry.identity {
-        return Ok(false);
+        return Ok(CleanupOutcome::Unchanged);
     }
 
     unlink_at(&directory, name)?;
     directory.sync_all()?;
-    Ok(true)
+    Ok(CleanupOutcome::Removed)
 }
 
 #[derive(Debug)]

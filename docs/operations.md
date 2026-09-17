@@ -394,7 +394,7 @@ For a consistent portable copy:
 1. Stop Narjar and wait for the process to exit.
 2. Copy the complete data directory, including `.narjar-clean`,
    `.narjar-recovery`, `.narjar-transactions/`, `lock`, `nar/`, `.tmp/`,
-   `realisations/`, `.narjar-validation/`, `nix-cache-info`,
+   `realisations/`, `.narjar-validation/`, `.narjar-egress/`, `nix-cache-info`,
    `trusted-public-keys`, and `auth/`.
 3. Preserve the directory and file permissions; do not expose the copy while
    it contains credentials.

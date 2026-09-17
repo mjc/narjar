@@ -29,7 +29,8 @@ pub use publication::{
 };
 pub use state::Storage;
 
-pub use reconcile::{ReconcileClass, ReconcileEntry, ReconcileReport};
+pub use operations::{NarInfoDeletion, NarMatch, StorageReadiness};
+pub use reconcile::{CleanupOutcome, ReconcileClass, ReconcileEntry, ReconcileReport};
 
 #[cfg(test)]
 mod tests;

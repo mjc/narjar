@@ -27,11 +27,12 @@ directory. That is separate from final-object publication. User-uploaded NAR
 and narinfo objects remain no-replace publications. Narjar may additionally
 use an atomic `renameat` replacement for a server-generated compressed egress
 derivative, but only after the existing derivative fails its recorded content
-identity check and the replacement has been fully encoded, hashed, flushed,
-and synced. The replacement occurs while holding the raw-NAR/codec payload
-lock; the source and destination directories are synced at the same durability
-boundaries as other publications. This exception does not apply to user
-uploads or narinfo files.
+identity check or, when no receipt exists, fails comparison with the newly
+materialized server-generated `EncodedIdentity`. The replacement must be fully
+encoded, hashed, flushed, and synced. It occurs while holding the raw-NAR/codec
+payload lock; the source and destination directories are synced at the same
+durability boundaries as other publications. This exception does not apply to
+user uploads or narinfo files.
 
 Capacity and readiness diagnostics use `fstatvfs`, regular-file checks, and
 the lease. HTTP delivery may use `sendfile` where available, but retains the
