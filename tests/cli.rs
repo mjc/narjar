@@ -3560,6 +3560,10 @@ fn inventory_scan_recognizes_formats_and_keeps_trusted_references() {
         let payload = root.join(format!("nar/{hash}{suffix}"));
         let narinfo = root.join(format!("{STORE_HASH}.narinfo"));
         fs::write(&payload, &bytes).unwrap();
+        let canonical_raw = root.join(format!("nar/{NARJAR_HASH}.nar"));
+        if suffix != ".nar" {
+            fs::write(&canonical_raw, NAR_BYTES).unwrap();
+        }
         fs::write(&narinfo, &metadata).unwrap();
         let scan = |mode| {
             Inventory::scan(&root_directory, &trusted, mode)
@@ -3615,31 +3619,62 @@ fn inventory_scan_recognizes_formats_and_keeps_trusted_references() {
         fs::remove_file(alternate).unwrap();
 
         fs::write(&payload, &bytes).unwrap();
+        if suffix != ".nar" {
+            fs::write(&canonical_raw, vec![0; NAR_BYTES.len()]).unwrap();
+            assert_eq!(
+                scan(Mode::Availability),
+                [(Class::ValidPair, STORE_HASH.into())]
+            );
+            assert_eq!(
+                scan(Mode::Content),
+                [(Class::HashOrSizeMismatch, STORE_HASH.into())]
+            );
+            fs::write(&canonical_raw, b"x").unwrap();
+            assert_eq!(
+                scan(Mode::Availability),
+                [(Class::HashOrSizeMismatch, STORE_HASH.into())]
+            );
+            fs::remove_file(&canonical_raw).unwrap();
+            assert_eq!(
+                scan(Mode::Content),
+                [(Class::MissingNar, STORE_HASH.into())]
+            );
+            fs::write(&canonical_raw, NAR_BYTES).unwrap();
+        }
         fs::write(
             &narinfo,
             metadata.replace("Sig: narjar-test:", "Sig: unknown:"),
         )
         .unwrap();
         assert_metadata_trusted(false);
-        assert_eq!(
-            scan(Mode::Content),
-            [
-                (Class::OrphanNar, hash.clone()),
-                (Class::UntrustedSignature, STORE_HASH.into()),
-            ]
-        );
+        let mut expected = vec![
+            (Class::OrphanNar, hash.clone()),
+            (Class::UntrustedSignature, STORE_HASH.into()),
+        ];
+        if suffix != ".nar" {
+            expected.push((Class::OrphanNar, NARJAR_HASH.into()));
+        }
+        expected.sort();
+        assert_eq!(scan(Mode::Content), expected);
         fs::write(&narinfo, b"malformed\n").unwrap();
         assert_metadata_trusted(false);
-        assert_eq!(
-            scan(Mode::Content),
-            [
-                (Class::OrphanNar, hash.clone()),
-                (Class::MalformedNarInfo, STORE_HASH.into()),
-            ]
-        );
+        let mut expected = vec![
+            (Class::OrphanNar, hash.clone()),
+            (Class::MalformedNarInfo, STORE_HASH.into()),
+        ];
+        if suffix != ".nar" {
+            expected.push((Class::OrphanNar, NARJAR_HASH.into()));
+        }
+        expected.sort();
+        assert_eq!(scan(Mode::Content), expected);
         fs::remove_file(&narinfo).unwrap();
         assert_metadata_trusted(true);
-        assert_eq!(scan(Mode::Content), [(Class::OrphanNar, hash)]);
+        let mut expected = vec![(Class::OrphanNar, hash)];
+        if suffix != ".nar" {
+            expected.push((Class::OrphanNar, NARJAR_HASH.into()));
+        }
+        expected.sort();
+        assert_eq!(scan(Mode::Content), expected);
     }
 }
 

@@ -135,14 +135,14 @@ impl<R: Read> Read for CheckedUploadReader<'_, R> {
     }
 }
 
-pub(super) struct RawStagingWriter<'a> {
+pub(super) struct CapacityCheckedStagingWriter<'a> {
     file: &'a mut File,
     reservation: &'a mut StagingReservation,
     min_free_bytes: u64,
     bytes_written: u64,
 }
 
-impl<'a> RawStagingWriter<'a> {
+impl<'a> CapacityCheckedStagingWriter<'a> {
     pub(super) fn new(
         file: &'a mut File,
         reservation: &'a mut StagingReservation,
@@ -185,7 +185,7 @@ fn reserve_preferred_or_exact_staging_growth(
         .or_else(|_| reservation.grow_to(directory, min_free_bytes, additional_required))
 }
 
-impl Write for RawStagingWriter<'_> {
+impl Write for CapacityCheckedStagingWriter<'_> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let next_size = self
             .bytes_written
@@ -269,7 +269,7 @@ impl<W: Write + ?Sized> Write for EncodedOutputHasher<'_, W> {
 pub(super) fn encode_raw_nar(
     source: &File,
     codec: CompressionCodec,
-    destination: &mut File,
+    destination: &mut impl Write,
 ) -> io::Result<EncodedOutput> {
     let mut source = source.try_clone()?;
     source.seek(SeekFrom::Start(0))?;

@@ -367,25 +367,14 @@ fn category_bytes(entries: &[Entry], include: impl Fn(&Entry) -> bool) -> u64 {
     let mut nars = BTreeMap::new();
     for entry in entries.iter().filter(|entry| include(entry)) {
         total += entry.narinfo_bytes;
-        nars.entry(entry.nar_name.clone())
-            .or_insert(entry.nar_bytes);
-        nars.entry(entry.raw_nar_name.clone())
-            .or_insert(entry.raw_nar_bytes);
+        record_entry_payload_sizes(entry, &mut nars);
     }
     total + nars.values().copied().sum::<u64>()
 }
 
 fn shared_bytes(entries: &[Entry]) -> u64 {
     let counts = reference_counts(entries);
-    let mut sizes = BTreeMap::new();
-    for entry in entries {
-        sizes
-            .entry(entry.nar_name.clone())
-            .or_insert(entry.nar_bytes);
-        sizes
-            .entry(entry.raw_nar_name.clone())
-            .or_insert(entry.raw_nar_bytes);
-    }
+    let sizes = payload_sizes(entries);
     counts
         .into_iter()
         .filter_map(|(nar, count)| (count > 1).then(|| sizes[&nar]))
@@ -470,30 +459,40 @@ fn validate_root(root: &str) -> Result<(), StorageError> {
 
 fn total_bytes(entries: &[Entry]) -> u64 {
     let mut total = entries.iter().map(|entry| entry.narinfo_bytes).sum();
-    let mut nars = BTreeMap::new();
-    for entry in entries {
-        nars.entry(entry.nar_name.clone())
-            .or_insert(entry.nar_bytes);
-        nars.entry(entry.raw_nar_name.clone())
-            .or_insert(entry.raw_nar_bytes);
-    }
-    total += nars.values().copied().sum::<u64>();
+    total += payload_sizes(entries).values().copied().sum::<u64>();
     total
 }
+
+fn entry_payload_names(entry: &Entry) -> impl Iterator<Item = &OsString> {
+    std::iter::once(&entry.nar_name)
+        .chain((entry.raw_nar_name != entry.nar_name).then_some(&entry.raw_nar_name))
+}
+
+fn record_entry_payload_sizes(entry: &Entry, sizes: &mut BTreeMap<OsString, u64>) {
+    sizes
+        .entry(entry.nar_name.clone())
+        .or_insert(entry.nar_bytes);
+    if entry.raw_nar_name != entry.nar_name {
+        sizes
+            .entry(entry.raw_nar_name.clone())
+            .or_insert(entry.raw_nar_bytes);
+    }
+}
+
+fn payload_sizes(entries: &[Entry]) -> BTreeMap<OsString, u64> {
+    let mut sizes = BTreeMap::new();
+    entries
+        .iter()
+        .for_each(|entry| record_entry_payload_sizes(entry, &mut sizes));
+    sizes
+}
+
 fn reference_counts(entries: &[Entry]) -> BTreeMap<OsString, u64> {
     let mut references = BTreeMap::new();
     for entry in entries {
-        *references
-            .entry(entry.raw_nar_name.clone())
-            .or_insert(0_u64) += 1;
-    }
-    references
-}
-
-fn output_reference_counts(entries: &[Entry]) -> BTreeMap<OsString, u64> {
-    let mut references = BTreeMap::new();
-    for entry in entries {
-        *references.entry(entry.nar_name.clone()).or_insert(0_u64) += 1;
+        for name in entry_payload_names(entry) {
+            *references.entry(name.clone()).or_insert(0_u64) += 1;
+        }
     }
     references
 }
@@ -508,7 +507,7 @@ fn select(
     now: SystemTime,
 ) -> Vec<usize> {
     let mut references = reference_counts(entries);
-    let mut output_references = output_reference_counts(entries);
+    let sizes = payload_sizes(entries);
 
     let size_pressure = target_bytes
         .is_some_and(|target| max_bytes.map_or(current_bytes > target, |max| current_bytes > max));
@@ -540,16 +539,13 @@ fn select(
 
         selected.push(index);
         remaining = remaining.saturating_sub(entry.narinfo_bytes);
-        if let Some(count) = output_references.get_mut(&entry.nar_name) {
+        for name in entry_payload_names(entry) {
+            let count = references
+                .get_mut(name)
+                .expect("scanned payload reference count");
             *count -= 1;
             if *count == 0 {
-                remaining = remaining.saturating_sub(entry.nar_bytes);
-            }
-        }
-        if let Some(count) = references.get_mut(&entry.raw_nar_name) {
-            *count -= 1;
-            if *count == 0 {
-                remaining = remaining.saturating_sub(entry.raw_nar_bytes);
+                remaining = remaining.saturating_sub(sizes[name]);
             }
         }
     }
@@ -614,20 +610,17 @@ fn logical_after_bytes(
 fn projected_published_bytes(entries: &[Entry], selected: &[usize]) -> u64 {
     let mut total = total_bytes(entries);
     let mut references = reference_counts(entries);
-    let mut output_references = output_reference_counts(entries);
+    let sizes = payload_sizes(entries);
     for &index in selected {
         let entry = &entries[index];
         total = total.saturating_sub(entry.narinfo_bytes);
-        if let Some(count) = output_references.get_mut(&entry.nar_name) {
+        for name in entry_payload_names(entry) {
+            let count = references
+                .get_mut(name)
+                .expect("scanned payload reference count");
             *count -= 1;
             if *count == 0 {
-                total = total.saturating_sub(entry.nar_bytes);
-            }
-        }
-        if let Some(count) = references.get_mut(&entry.raw_nar_name) {
-            *count -= 1;
-            if *count == 0 {
-                total = total.saturating_sub(entry.raw_nar_bytes);
+                total = total.saturating_sub(sizes[name]);
             }
         }
     }
@@ -669,7 +662,6 @@ fn apply_with_failure(
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
     let mut references = reference_counts(entries);
-    let mut output_references = output_reference_counts(entries);
     let mut deleted_nars = 0;
     for &index in selected {
         let entry = &entries[index];
@@ -677,26 +669,26 @@ fn apply_with_failure(
         unlink_at(&root, &entry.narinfo_name)?;
         fail_if(failure, FailurePoint::AfterNarinfoDeleteBeforeSync)?;
         root.sync_all()?;
-        let raw_count = references
-            .get_mut(&entry.raw_nar_name)
-            .expect("scanned reference count");
-        *raw_count -= 1;
-        let output_count = output_references
-            .get_mut(&entry.nar_name)
-            .expect("scanned output reference count");
-        *output_count -= 1;
         fail_if(failure, FailurePoint::AfterNarinfoSyncBeforeNarDelete)?;
-        if *output_count == 0 {
-            unlink_at(&nar_directory, &entry.nar_name)?;
+        let mut deleted_payload = false;
+        let mut deleted_raw_nar = false;
+        for name in entry_payload_names(entry) {
+            let count = references
+                .get_mut(name)
+                .expect("scanned payload reference count");
+            *count -= 1;
+            if *count != 0 {
+                continue;
+            }
+            unlink_at(&nar_directory, name)?;
+            deleted_payload = true;
+            deleted_raw_nar |= *name == entry.raw_nar_name;
             fail_if(failure, FailurePoint::AfterNarDeleteBeforeSync)?;
         }
-        if *raw_count == 0 && entry.raw_nar_name != entry.nar_name {
-            unlink_at(&nar_directory, &entry.raw_nar_name)?;
-        }
-        if *output_count == 0 || *raw_count == 0 {
+        if deleted_payload {
             nar_directory.sync_all()?;
         }
-        if *raw_count == 0 {
+        if deleted_raw_nar {
             deleted_nars += 1;
         }
     }
@@ -884,7 +876,9 @@ mod tests {
     }
 
     const TEST_STORE_HASH: &str = "00000000000000000000000000000000";
+    const TEST_SECOND_STORE_HASH: &str = "11111111111111111111111111111111";
     const TEST_NAR_ID: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    const TEST_ZSTD_ID: &str = "1li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
 
     fn pair_fixture() -> (tempfile::TempDir, Storage, Entry) {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
@@ -913,6 +907,53 @@ mod tests {
         (directory, storage, entry)
     }
 
+    fn mixed_pair_fixture() -> (tempfile::TempDir, Storage, Vec<Entry>) {
+        let directory = tempfile::tempdir().expect("fixture directory should be created");
+        let storage = initialize_storage(directory.path()).expect("storage should initialize");
+        let raw_name = OsString::from(format!("{TEST_NAR_ID}.nar"));
+        let zstd_name = OsString::from(format!("{TEST_ZSTD_ID}.nar.zst"));
+        fs::write(directory.path().join("nar").join(&raw_name), b"raw")
+            .expect("raw NAR should be written");
+        fs::write(directory.path().join("nar").join(&zstd_name), b"zstd")
+            .expect("Zstd NAR should be written");
+
+        let raw_entry = Entry {
+            store: StoreHash::parse(TEST_STORE_HASH).expect("store hash should parse"),
+            store_path: format!("/nix/store/{TEST_STORE_HASH}-narjar"),
+            references: Vec::new(),
+            narinfo_name: OsString::from(format!("{TEST_STORE_HASH}.narinfo")),
+            nar_name: raw_name.clone(),
+            narinfo_bytes: 9,
+            nar_bytes: 3,
+            raw_nar_name: raw_name.clone(),
+            raw_nar_bytes: 3,
+            modified: SystemTime::now(),
+            protected: false,
+        };
+        let compressed_entry = Entry {
+            store: StoreHash::parse(TEST_SECOND_STORE_HASH)
+                .expect("second store hash should parse"),
+            store_path: format!("/nix/store/{TEST_SECOND_STORE_HASH}-narjar"),
+            references: Vec::new(),
+            narinfo_name: OsString::from(format!("{TEST_SECOND_STORE_HASH}.narinfo")),
+            nar_name: zstd_name,
+            narinfo_bytes: 9,
+            nar_bytes: 4,
+            raw_nar_name: raw_name,
+            raw_nar_bytes: 3,
+            modified: SystemTime::now(),
+            protected: false,
+        };
+        fs::write(directory.path().join(&raw_entry.narinfo_name), b"published")
+            .expect("raw narinfo should be written");
+        fs::write(
+            directory.path().join(&compressed_entry.narinfo_name),
+            b"published",
+        )
+        .expect("compressed narinfo should be written");
+        (directory, storage, vec![raw_entry, compressed_entry])
+    }
+
     #[test]
     fn orphan_scan_distinguishes_raw_and_xz_objects_with_the_same_hash() {
         let (directory, storage, mut entry) = pair_fixture();
@@ -930,6 +971,64 @@ mod tests {
 
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].name, OsString::from(raw_name));
+    }
+
+    #[test]
+    fn gc_unifies_shared_raw_and_output_references() {
+        let (directory, storage, entries) = mixed_pair_fixture();
+        let raw_path = directory
+            .path()
+            .join("nar")
+            .join(format!("{TEST_NAR_ID}.nar"));
+        let zstd_path = directory
+            .path()
+            .join("nar")
+            .join(format!("{TEST_ZSTD_ID}.nar.zst"));
+
+        let result = apply(&storage, &entries, &[0]).expect("first entry should be evicted");
+        assert_eq!(result, (1, 0));
+        assert!(
+            !directory
+                .path()
+                .join(format!("{TEST_STORE_HASH}.narinfo"))
+                .exists()
+        );
+        assert!(raw_path.exists(), "protected entry still needs its raw NAR");
+        assert!(
+            zstd_path.exists(),
+            "protected entry still needs its output NAR"
+        );
+    }
+
+    #[test]
+    fn gc_deletes_shared_payloads_once_in_either_eviction_order() {
+        for selected in [[0, 1], [1, 0]] {
+            let (directory, storage, entries) = mixed_pair_fixture();
+            let result = apply(&storage, &entries, &selected).expect("entries should be evicted");
+            assert_eq!(result, (2, 1));
+            assert!(
+                !directory
+                    .path()
+                    .join(format!("nar/{TEST_NAR_ID}.nar"))
+                    .exists()
+            );
+            assert!(
+                !directory
+                    .path()
+                    .join(format!("nar/{TEST_ZSTD_ID}.nar.zst"))
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn gc_projection_does_not_double_count_a_raw_only_payload() {
+        let (directory, storage, entry) = pair_fixture();
+        let entries = [entry];
+        assert_eq!(total_bytes(&entries), 12);
+        assert_eq!(projected_published_bytes(&entries, &[0]), 0);
+        drop(storage);
+        drop(directory);
     }
 
     #[test]

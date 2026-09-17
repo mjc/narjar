@@ -377,12 +377,15 @@ impl PublicationRequest {
                 drop(staging);
                 respond_narinfo_put(
                     upload,
-                    storage,
-                    &store,
-                    trusted,
-                    egress_compression,
-                    metrics,
-                    &guard,
+                    NarInfoPutContext {
+                        storage,
+                        store: &store,
+                        trusted,
+                        egress_compression,
+                        policy,
+                        metrics,
+                        guard: &guard,
+                    },
                 )
             }
             CacheRoute::CacheInfo => {
@@ -602,15 +605,29 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
     upload.respond(guard, status)
 }
 
+struct NarInfoPutContext<'storage, 'request> {
+    storage: &'storage Storage,
+    store: &'storage StoreHash,
+    trusted: &'storage TrustedPublicKeys,
+    egress_compression: WireEncoding,
+    policy: NarUploadPolicy,
+    metrics: &'storage Metrics,
+    guard: &'request RequestGuard<'storage>,
+}
+
 fn respond_narinfo_put(
     mut upload: UploadRequest,
-    storage: &Storage,
-    store: &StoreHash,
-    trusted: &TrustedPublicKeys,
-    egress_compression: WireEncoding,
-    metrics: &Metrics,
-    guard: &RequestGuard<'_>,
+    context: NarInfoPutContext<'_, '_>,
 ) -> Option<TcpStream> {
+    let NarInfoPutContext {
+        storage,
+        store,
+        trusted,
+        egress_compression,
+        policy,
+        metrics,
+        guard,
+    } = context;
     let _upload = metrics.upload(upload.length() as u64);
     let bytes = match upload.read_body(MAX_NARINFO_BYTES as usize) {
         Ok(bytes) => bytes,
@@ -628,7 +645,7 @@ fn respond_narinfo_put(
     };
     let started = Instant::now();
     let result = storage
-        .bind_narinfo(validated, egress_compression)
+        .bind_narinfo(validated, egress_compression, policy)
         .and_then(|bound| bound.publish());
     metrics.publication(started.elapsed());
     if let Err(error) = &result {
@@ -639,6 +656,7 @@ fn respond_narinfo_put(
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,
         Err(StorageError::MissingNar | StorageError::NarMismatch) => 422,
+        Err(StorageError::InsufficientSpace | StorageError::InsufficientInodes) => 507,
         Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => 422,
         Err(StorageError::Io(error)) => capacity_status(&error).unwrap_or(500),
         Err(_) => 500,

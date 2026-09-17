@@ -1,7 +1,10 @@
 use std::{collections::HashSet, ffi::OsStr, fs::File, io};
 
 use crate::{
-    narinfo::{PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file},
+    narinfo::{
+        PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, ValidatedPayload,
+        read_narinfo_file,
+    },
     storage::{
         Directory, FileHash, StoreHash, for_each_dir_name,
         inspection::{NarinfoCandidate, NarinfoName, PayloadEntry, ReferencedPayload},
@@ -137,6 +140,32 @@ impl VerificationMode {
     }
 }
 
+fn inspect_payload(
+    payloads: &File,
+    payload: ValidatedPayload,
+    verification: VerificationMode,
+) -> io::Result<InventoryClass> {
+    match ReferencedPayload::open(payloads, payload)? {
+        None => Ok(InventoryClass::MissingNar),
+        Some(payload) => verification.inspect_referenced_payload(payload),
+    }
+}
+
+fn combine_payload_classes(
+    advertised: InventoryClass,
+    canonical: InventoryClass,
+) -> InventoryClass {
+    match (advertised, canonical) {
+        (InventoryClass::MissingNar, _) | (_, InventoryClass::MissingNar) => {
+            InventoryClass::MissingNar
+        }
+        (InventoryClass::HashOrSizeMismatch, _) | (_, InventoryClass::HashOrSizeMismatch) => {
+            InventoryClass::HashOrSizeMismatch
+        }
+        _ => InventoryClass::ValidPair,
+    }
+}
+
 fn inspect_trusted_narinfo(
     payloads: &File,
     store: &StoreHash,
@@ -145,9 +174,17 @@ fn inspect_trusted_narinfo(
 ) -> io::Result<MetadataAssessment> {
     let payload = metadata.payload_name().file_hash();
     let raw_nar = FileHash::from_nar_hash(metadata.decoded_identity().hash());
-    let class = match ReferencedPayload::open(payloads, metadata.payload())? {
-        None => InventoryClass::MissingNar,
-        Some(payload) => verification.inspect_referenced_payload(payload)?,
+    let advertised_class = inspect_payload(payloads, metadata.payload(), verification)?;
+    let class = match metadata.payload() {
+        ValidatedPayload::Raw(_) => advertised_class,
+        ValidatedPayload::Compressed(_) => combine_payload_classes(
+            advertised_class,
+            inspect_payload(
+                payloads,
+                ValidatedPayload::Raw(metadata.decoded_identity()),
+                verification,
+            )?,
+        ),
     };
     // Trust establishes the reference even when its payload is missing or corrupt.
     Ok(MetadataAssessment::Referenced {
