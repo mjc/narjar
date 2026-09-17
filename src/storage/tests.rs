@@ -724,6 +724,39 @@ fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
 }
 
 #[test]
+fn corrupt_compressed_derivative_is_not_replaced_under_its_content_name() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let raw = b"raw NAR with a corrupt derivative";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let output = storage
+        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .expect("derivative should be created");
+    let output_path = storage.layout().nar_path_encoded(output.0);
+    let mut corrupt = fs::read(&output_path).expect("derivative should be readable");
+    corrupt[0] ^= 1;
+    fs::write(&output_path, &corrupt).expect("test should corrupt the derivative");
+
+    assert!(
+        matches!(
+            storage.compressed_representation_for_test(identity, WireEncoding::Zstd, 0),
+            Err(StorageError::Conflict)
+        ),
+        "an immutable derivative must not be overwritten after corruption"
+    );
+    assert_eq!(
+        fs::read(output_path).expect("corrupt derivative should remain"),
+        corrupt
+    );
+    assert_eq!(storage.temporary_objects(), 0);
+}
+
+#[test]
 fn concurrent_requests_coalesce_compressed_derivative_generation() {
     let directory = TestDir::new();
     let storage =
