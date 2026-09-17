@@ -158,6 +158,30 @@ fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
 }
 
 #[test]
+fn generic_publication_commits_only_after_finishing_its_stream() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
+    let target = super::publication::PublishTarget::Nar(NarFileName::raw(nar));
+
+    let streaming = storage
+        .begin_publication(target, |_| Ok(()))
+        .expect("begin publication");
+    let validated = streaming
+        .finish_and_sync(Cursor::new(b"nar bytes"))
+        .expect("finish publication stream");
+
+    assert_eq!(
+        validated.commit().expect("commit publication"),
+        PublishOutcome::Created
+    );
+    assert_eq!(
+        fs::read(storage.layout().nar_path(nar)).unwrap(),
+        b"nar bytes"
+    );
+}
+
+#[test]
 fn a_completed_upload_commits_its_own_bytes_and_releases_resources() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).unwrap();

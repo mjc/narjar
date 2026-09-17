@@ -1,25 +1,25 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::{self, Read, Seek, SeekFrom, Write},
     num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::OnceLock,
     thread,
     time::Duration,
 };
 
 use clap::Args;
-use data_encoding::{BASE64, BitOrder, Encoding, Specification};
-use lzma_rust2::{XzOptions, XzWriter};
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
-use tempfile::NamedTempFile;
 use ureq::Agent;
 
 use crate::{error::Error, http_url::HttpUrl, operator::netrc_authorization};
+
+mod narinfo;
+mod nix;
+mod payload;
+mod plan;
+mod transfer;
+use narinfo::{nix32_encoding, nix32_sha256_from_sri, serialize_narinfo};
+use nix::{closure_paths, format_command_failure, sign_paths};
+use payload::prepare_nar;
+use plan::dependency_waves;
+use transfer::{put_bytes, put_file, request_status};
 
 #[derive(Debug, Args)]
 pub(crate) struct Push {
@@ -60,6 +60,27 @@ pub(crate) struct Push {
     paths: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingNarinfo {
+    Skip,
+    Refresh,
+}
+
+impl From<bool> for ExistingNarinfo {
+    fn from(refresh: bool) -> Self {
+        match refresh {
+            true => Self::Refresh,
+            false => Self::Skip,
+        }
+    }
+}
+
+impl ExistingNarinfo {
+    const fn should_upload(self) -> bool {
+        matches!(self, Self::Refresh)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PathInfo {
     path: String,
@@ -69,131 +90,6 @@ struct PathInfo {
     nar_size: u64,
     references: Vec<String>,
     signatures: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct RawPathInfo {
-    ca: Option<String>,
-    deriver: Option<String>,
-    #[serde(rename = "narHash")]
-    nar_hash: String,
-    #[serde(rename = "narSize")]
-    nar_size: u64,
-    references: Vec<String>,
-    signatures: Vec<String>,
-}
-
-fn parse_path_info(bytes: &[u8]) -> Result<Vec<PathInfo>, String> {
-    let entries: BTreeMap<String, RawPathInfo> = serde_json::from_slice(bytes)
-        .map_err(|error| format!("invalid nix path-info JSON: {error}"))?;
-    Ok(entries
-        .into_iter()
-        .map(|(path, info)| PathInfo {
-            path,
-            ca: info.ca,
-            deriver: info.deriver,
-            nar_hash: info.nar_hash,
-            nar_size: info.nar_size,
-            references: info.references,
-            signatures: info.signatures,
-        })
-        .collect())
-}
-
-fn nix32_encoding() -> &'static Encoding {
-    static ENCODING: OnceLock<Encoding> = OnceLock::new();
-    ENCODING.get_or_init(|| {
-        let mut specification = Specification::new();
-        specification
-            .symbols
-            .push_str("0123456789abcdfghijklmnpqrsvwxyz");
-        specification.bit_order = BitOrder::LeastSignificantFirst;
-        specification
-            .encoding()
-            .expect("Nix base32 specification is valid")
-    })
-}
-
-fn nix32_sha256_from_sri(value: &str) -> Result<String, String> {
-    let (algorithm, encoded) = value
-        .split_once('-')
-        .ok_or_else(|| format!("unsupported Nix hash: {value}"))?;
-    if algorithm != "sha256" {
-        return Err(format!("unsupported Nix hash algorithm: {algorithm}"));
-    }
-    let digest = BASE64
-        .decode(encoded.as_bytes())
-        .map_err(|error| format!("invalid Nix hash {value}: {error}"))?;
-    if digest.len() != 32 {
-        return Err(format!(
-            "invalid SHA-256 length in Nix hash: {}",
-            digest.len()
-        ));
-    }
-    let encoding = nix32_encoding();
-    let mut output = vec![0; encoding.encode_len(digest.len())];
-    encoding.encode_mut(&digest, &mut output);
-    output.reverse();
-    String::from_utf8(output).map_err(|error| format!("invalid Nix base32 output: {error}"))
-}
-
-fn serialize_narinfo(
-    info: &PathInfo,
-    file_hash: &str,
-    file_size: u64,
-    compression: Compression,
-) -> Result<Vec<u8>, String> {
-    info.path
-        .strip_prefix("/nix/store/")
-        .ok_or_else(|| format!("invalid store path: {}", info.path))?;
-    let nar_hash = nix32_sha256_from_sri(&info.nar_hash)?;
-    let mut references = info
-        .references
-        .iter()
-        .map(|reference| {
-            reference
-                .strip_prefix("/nix/store/")
-                .ok_or_else(|| format!("invalid reference path: {reference}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    references.sort_unstable();
-    references.dedup();
-
-    let mut output = format!(
-        "StorePath: {}\nURL: nar/{}{}\nCompression: {}\nFileHash: sha256:{}\nFileSize: {}\nNarHash: sha256:{}\nNarSize: {}\nReferences: {}\n",
-        info.path,
-        file_hash,
-        compression.suffix(),
-        compression.query_value(),
-        file_hash,
-        file_size,
-        nar_hash,
-        info.nar_size,
-        references.join(" "),
-    );
-    for signature in &info.signatures {
-        output.push_str("Sig: ");
-        output.push_str(signature);
-        output.push('\n');
-    }
-    if let Some(deriver) = &info.deriver {
-        if deriver == "unknown-deriver" {
-            output.push_str("Deriver: unknown-deriver\n");
-        } else {
-            let deriver = deriver
-                .strip_prefix("/nix/store/")
-                .ok_or_else(|| format!("invalid deriver path: {deriver}"))?;
-            output.push_str("Deriver: ");
-            output.push_str(deriver);
-            output.push('\n');
-        }
-    }
-    if let Some(ca) = &info.ca {
-        output.push_str("CA: ");
-        output.push_str(ca);
-        output.push('\n');
-    }
-    Ok(output.into_bytes())
 }
 
 pub(crate) fn run(args: Push) -> Result<(), Error> {
@@ -206,6 +102,7 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
     let waves = dependency_waves(metadata)?;
     let total_paths = waves.iter().map(Vec::len).sum::<usize>();
     let worker_count = args.jobs.get().min(total_paths);
+    let existing_narinfo = ExistingNarinfo::from(args.refresh);
 
     let mut failures = 0;
     for wave in waves {
@@ -217,7 +114,6 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
             let target = args.to.clone();
             let netrc_file = args.netrc_file.clone();
             let insecure_http = args.insecure_http;
-            let refresh = args.refresh;
             let compression = args.compression;
             let timeout_seconds = args.timeout_seconds;
             let metadata = chunk.to_vec();
@@ -226,7 +122,7 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
                     &target,
                     netrc_file.as_deref(),
                     insecure_http,
-                    refresh,
+                    existing_narinfo,
                     compression,
                     timeout_seconds,
                     &metadata,
@@ -285,161 +181,11 @@ impl Compression {
     }
 }
 
-fn sign_paths(key_file: &std::path::Path, paths: &[String]) -> Result<(), Error> {
-    let mut command = Command::new("nix");
-    command
-        .arg("store")
-        .arg("sign")
-        .arg("--key-file")
-        .arg(key_file);
-    run_path_command(command, paths, "nix store sign").map_err(Error::runtime)
-}
-
-fn closure_paths(installables: &[String]) -> Result<Vec<PathInfo>, Error> {
-    let output = Command::new("nix")
-        .arg("path-info")
-        .arg("--recursive")
-        .arg("--json")
-        .arg("--")
-        .args(installables)
-        .output()
-        .map_err(|error| Error::runtime(format!("failed to run nix path-info: {error}")))?;
-
-    if !output.status.success() {
-        return Err(Error::runtime(format_command_failure(
-            "nix path-info",
-            &output.stderr,
-        )));
-    }
-
-    let paths = parse_path_info(&output.stdout).map_err(Error::runtime)?;
-
-    if paths.is_empty() {
-        Err(Error::runtime("nix path-info returned no store paths"))
-    } else {
-        Ok(paths)
-    }
-}
-
-fn dependency_waves(metadata: Vec<PathInfo>) -> Result<Vec<Vec<PathInfo>>, Error> {
-    let mut by_path = BTreeMap::new();
-    for info in metadata {
-        if by_path.insert(info.path.clone(), info).is_some() {
-            return Err(Error::runtime(
-                "nix path-info returned a duplicate store path",
-            ));
-        }
-    }
-
-    let mut indegree = by_path
-        .keys()
-        .map(|path| (path.clone(), 0usize))
-        .collect::<BTreeMap<_, _>>();
-    let mut dependents = BTreeMap::<String, Vec<String>>::new();
-    for info in by_path.values() {
-        let mut references = info.references.iter().collect::<Vec<_>>();
-        references.sort_unstable();
-        references.dedup();
-        for reference in references {
-            if reference == &info.path {
-                continue;
-            }
-            if !by_path.contains_key(reference) {
-                return Err(Error::runtime(format!(
-                    "{} has missing referenced store path {}",
-                    info.path, reference
-                )));
-            }
-            *indegree
-                .get_mut(&info.path)
-                .expect("every path has an indegree") += 1;
-            dependents
-                .entry(reference.clone())
-                .or_default()
-                .push(info.path.clone());
-        }
-    }
-
-    let mut ready = indegree
-        .iter()
-        .filter(|(_, degree)| **degree == 0)
-        .map(|(path, _)| path.clone())
-        .collect::<BTreeSet<_>>();
-    let mut waves = Vec::new();
-    let mut emitted = 0;
-
-    while !ready.is_empty() {
-        let paths = ready.iter().cloned().collect::<Vec<_>>();
-        ready.clear();
-        let mut wave = Vec::with_capacity(paths.len());
-        for path in paths {
-            wave.push(
-                by_path
-                    .remove(&path)
-                    .expect("ready path should have metadata"),
-            );
-            emitted += 1;
-        }
-        for info in &wave {
-            if let Some(children) = dependents.get(&info.path) {
-                for child in children {
-                    let degree = indegree
-                        .get_mut(child)
-                        .expect("dependent path has an indegree");
-                    *degree -= 1;
-                    if *degree == 0 {
-                        ready.insert(child.clone());
-                    }
-                }
-            }
-        }
-        waves.push(wave);
-    }
-
-    if emitted != indegree.len() {
-        return Err(Error::runtime(
-            "nix path-info returned cyclic store references",
-        ));
-    }
-    Ok(waves)
-}
-
-fn run_path_command(mut command: Command, paths: &[String], name: &str) -> Result<(), String> {
-    let mut child = command
-        .arg("--stdin")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to run {name}: {error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("{name} stdin was not piped"))?;
-    for path in paths {
-        writeln!(stdin, "{path}")
-            .map_err(|error| format!("failed to write {name} paths: {error}"))?;
-    }
-    drop(stdin);
-    let status = child
-        .wait()
-        .map_err(|error| format!("failed to wait for {name}: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{name} exited with {status}"))
-    }
-}
-
-struct PreparedNar {
-    file: NamedTempFile,
-    file_hash: String,
-    file_size: u64,
-}
-
 fn native_copy_paths(
     target: &HttpUrl,
     netrc_file: Option<&Path>,
     insecure_http: bool,
-    refresh: bool,
+    existing_narinfo: ExistingNarinfo,
     compression: Compression,
     timeout_seconds: NonZeroU64,
     metadata: &[PathInfo],
@@ -460,7 +206,7 @@ fn native_copy_paths(
         let store_hash = store_hash_for_path(&info.path)?;
         let narinfo_name = format!("{store_hash}.narinfo");
         let narinfo_url = target.endpoint(&[&narinfo_name]);
-        if !refresh {
+        if !existing_narinfo.should_upload() {
             match request_status(&agent, &narinfo_url, authorization.as_deref())? {
                 200 => continue,
                 404 => {}
@@ -527,298 +273,13 @@ fn store_hash_for_path(path: &str) -> Result<&str, String> {
     }
 }
 
-const MAX_ATTEMPTS: usize = 3;
-const MAX_REDIRECTS: usize = 10;
-const MAX_RETRY_AFTER_SECONDS: u64 = 60;
-
-fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
-}
-
-fn retry_after_delay(value: &str) -> Option<Duration> {
-    let seconds = value.trim().parse::<u64>().ok()?;
-    Some(Duration::from_secs(seconds.min(MAX_RETRY_AFTER_SECONDS)))
-}
-
-fn retry_sleep(attempt: usize, retry_after: Option<Duration>) {
-    let multiplier = 1u64 << attempt.min(6);
-    thread::sleep(retry_after.unwrap_or_else(|| Duration::from_millis(100 * multiplier)));
-}
-
-fn request_status(
-    agent: &Agent,
-    url: &HttpUrl,
-    authorization: Option<&str>,
-) -> Result<u16, String> {
-    for attempt in 0..MAX_ATTEMPTS {
-        let mut request = agent.get(url.as_str());
-        if let Some(authorization) = authorization {
-            request = request.header("Authorization", format!("Basic {authorization}"));
-        }
-        match request.call() {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let retry_after = response
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(retry_after_delay);
-                let mut body = response.into_body().into_reader();
-                io::copy(&mut body, &mut io::sink())
-                    .map_err(|error| format!("reading GET {url} response failed: {error}"))?;
-                if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                    retry_sleep(attempt, retry_after);
-                    continue;
-                }
-                return Ok(status);
-            }
-            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt, None),
-            Err(error) => return Err(format!("GET {url} failed: {error}")),
-        }
-    }
-    unreachable!("retry loop always returns")
-}
-
-fn put_with_redirects<F>(url: &HttpUrl, mut send: F) -> Result<u16, String>
-where
-    F: FnMut(&HttpUrl) -> Result<ureq::http::Response<ureq::Body>, String>,
-{
-    let mut upload_url = url.clone();
-    'attempts: for attempt in 0..MAX_ATTEMPTS {
-        for redirect in 0..=MAX_REDIRECTS {
-            let response = match send(&upload_url) {
-                Ok(response) => response,
-                Err(_error) if attempt + 1 < MAX_ATTEMPTS => {
-                    retry_sleep(attempt, None);
-                    continue 'attempts;
-                }
-                Err(error) => return Err(error),
-            };
-            let status = response.status().as_u16();
-            let retry_after = response
-                .headers()
-                .get("Retry-After")
-                .and_then(|value| value.to_str().ok())
-                .and_then(retry_after_delay);
-            let location = response
-                .headers()
-                .get("Location")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let mut body = response.into_body().into_reader();
-            io::copy(&mut body, &mut io::sink())
-                .map_err(|error| format!("reading PUT {upload_url} response failed: {error}"))?;
-
-            if matches!(status, 307 | 308) {
-                if redirect == MAX_REDIRECTS {
-                    return Err(format!("PUT {url} followed too many redirects"));
-                }
-                let location = location.ok_or_else(|| {
-                    format!("PUT {upload_url} redirect response had no Location header")
-                })?;
-                upload_url = upload_url.resolve_trusted_redirect(&location)?;
-                continue;
-            }
-
-            if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                retry_sleep(attempt, retry_after);
-                continue 'attempts;
-            }
-            return Ok(status);
-        }
-        unreachable!("redirect loop always returns")
-    }
-    unreachable!("retry loop always returns")
-}
-
-fn put_file(
-    agent: &Agent,
-    url: &HttpUrl,
-    path: &Path,
-    content_type: &str,
-    authorization: Option<&str>,
-) -> Result<u16, String> {
-    put_with_redirects(url, |upload_url| {
-        let file = File::open(path)
-            .map_err(|error| format!("opening NAR for PUT {upload_url} failed: {error}"))?;
-        let mut request = agent
-            .put(upload_url.as_str())
-            .config()
-            .max_redirects(0)
-            .build()
-            .header("Content-Type", content_type);
-        if let Some(authorization) = authorization {
-            request = request.header("Authorization", format!("Basic {authorization}"));
-        }
-        request
-            .send(file)
-            .map_err(|error| format!("PUT {upload_url} failed: {error}"))
-    })
-}
-
-fn put_bytes(
-    agent: &Agent,
-    url: &HttpUrl,
-    bytes: &[u8],
-    content_type: &str,
-    authorization: Option<&str>,
-) -> Result<u16, String> {
-    put_with_redirects(url, |upload_url| {
-        let mut request = agent
-            .put(upload_url.as_str())
-            .config()
-            .max_redirects(0)
-            .build()
-            .header("Content-Type", content_type);
-        if let Some(authorization) = authorization {
-            request = request.header("Authorization", format!("Basic {authorization}"));
-        }
-        request
-            .send(bytes)
-            .map_err(|error| format!("PUT {upload_url} failed: {error}"))
-    })
-}
-
-fn prepare_nar(info: &PathInfo, compression: Compression) -> Result<PreparedNar, String> {
-    let mut raw =
-        NamedTempFile::new().map_err(|error| format!("creating NAR temporary: {error}"))?;
-    let stdout = raw
-        .as_file()
-        .try_clone()
-        .map_err(|error| format!("opening NAR temporary: {error}"))?;
-    let output = Command::new("nix")
-        .arg("store")
-        .arg("dump-path")
-        .arg("--")
-        .arg(&info.path)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to run nix store dump-path: {error}"))?
-        .wait_with_output()
-        .map_err(|error| format!("failed to wait for nix store dump-path: {error}"))?;
-    if !output.status.success() {
-        return Err(format_command_failure(
-            "nix store dump-path",
-            &output.stderr,
-        ));
-    }
-    raw.as_file_mut()
-        .sync_all()
-        .map_err(|error| format!("syncing NAR temporary: {error}"))?;
-    let raw_size = raw
-        .as_file()
-        .metadata()
-        .map_err(|error| format!("statting NAR temporary: {error}"))?
-        .len();
-    if raw_size != info.nar_size {
-        return Err(format!(
-            "NAR size mismatch for {}: expected {}, got {raw_size}",
-            info.path, info.nar_size
-        ));
-    }
-    let expected_hash = nix32_sha256_from_sri(&info.nar_hash)?;
-    let actual_hash = sha256_file(raw.as_file())?;
-    if actual_hash != expected_hash {
-        return Err(format!(
-            "NAR hash mismatch for {}: expected {expected_hash}, got {actual_hash}",
-            info.path
-        ));
-    }
-
-    if compression == Compression::None {
-        return Ok(PreparedNar {
-            file: raw,
-            file_hash: actual_hash,
-            file_size: raw_size,
-        });
-    }
-
-    raw.as_file_mut()
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("rewinding NAR temporary: {error}"))?;
-    let mut encoded =
-        NamedTempFile::new().map_err(|error| format!("creating encoded NAR temporary: {error}"))?;
-    match compression {
-        Compression::None => unreachable!(),
-        Compression::Zstd => {
-            let mut encoder =
-                StreamingEncoder::new(encoded.as_file_mut(), CompressionLevel::Fastest);
-            io::copy(raw.as_file_mut(), &mut encoder)
-                .map_err(|error| format!("compressing NAR with zstd: {error}"))?;
-            encoder
-                .finish()
-                .map_err(|error| format!("finishing zstd NAR: {error}"))?;
-        }
-        Compression::Xz => {
-            let mut encoder = XzWriter::new(encoded.as_file_mut(), XzOptions::with_preset(1))
-                .map_err(|error| format!("creating XZ encoder: {error}"))?;
-            io::copy(raw.as_file_mut(), &mut encoder)
-                .map_err(|error| format!("compressing NAR with XZ: {error}"))?;
-            encoder
-                .finish()
-                .map_err(|error| format!("finishing XZ NAR: {error}"))?;
-        }
-    }
-    encoded
-        .as_file_mut()
-        .sync_all()
-        .map_err(|error| format!("syncing encoded NAR temporary: {error}"))?;
-    let file_size = encoded
-        .as_file()
-        .metadata()
-        .map_err(|error| format!("statting encoded NAR temporary: {error}"))?
-        .len();
-    let file_hash = sha256_file(encoded.as_file())?;
-    Ok(PreparedNar {
-        file: encoded,
-        file_hash,
-        file_size,
-    })
-}
-
-fn sha256_file(file: &File) -> Result<String, String> {
-    let mut file = file
-        .try_clone()
-        .map_err(|error| format!("cloning NAR file for hashing: {error}"))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("rewinding NAR file for hashing: {error}"))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 1024 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("hashing NAR file: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let digest = hasher.finalize();
-    let encoding = nix32_encoding();
-    let mut output = vec![0; encoding.encode_len(digest.len())];
-    encoding.encode_mut(&digest, &mut output);
-    output.reverse();
-    String::from_utf8(output).map_err(|error| format!("invalid Nix base32 output: {error}"))
-}
-
-fn format_command_failure(command: &str, stderr: &[u8]) -> String {
-    let detail = String::from_utf8_lossy(stderr).trim().to_owned();
-    if detail.is_empty() {
-        format!("{command} failed")
-    } else {
-        format!("{command} failed: {detail}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use clap::{Args, Command, FromArgMatches};
 
-    use super::{
-        Agent, Compression, PathInfo, Push, dependency_waves, is_retryable_status, parse_path_info,
-        retry_after_delay, serialize_narinfo,
-    };
+    use super::nix::parse_path_info;
+    use super::transfer::{is_retryable_status, retry_after_delay};
+    use super::{Agent, Compression, PathInfo, Push, dependency_waves, serialize_narinfo};
     use crate::http_url::HttpUrl;
 
     fn http_url(value: impl AsRef<str>) -> HttpUrl {

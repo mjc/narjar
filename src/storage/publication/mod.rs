@@ -1,159 +1,147 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
-    io,
+    io::{self, Read},
+    marker::PhantomData,
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
-#[cfg(test)]
-use std::path::PathBuf;
-
 use super::{
-    compression::IngestionReceipt,
-    egress::EgressReceipt,
     fs::{FilesystemSpace, filesystem_space, lock_exclusive, open_at},
-    ids::StoreHash,
+    recovery::{PublicationState, PublicationTransaction},
+    state::Storage,
 };
-use crate::object::{EncodedIdentity, NarFileName};
 
+mod target;
 #[cfg(test)]
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct Layout {
-    root: PathBuf,
-}
-
-#[cfg(test)]
-impl Layout {
-    pub(super) fn new(root: PathBuf) -> Self {
-        Self { root }
-    }
-
-    pub(super) fn nar_dir(&self) -> PathBuf {
-        self.root.join("nar")
-    }
-
-    pub(super) fn nar_path(&self, hash: crate::object::NarHash) -> PathBuf {
-        self.nar_dir().join(NarFileName::raw(hash).to_string())
-    }
-
-    pub(super) fn nar_path_encoded(&self, name: NarFileName) -> PathBuf {
-        self.nar_dir().join(name.to_string())
-    }
-
-    pub(super) fn nar_temp_dir(&self) -> PathBuf {
-        self.nar_dir().join(".tmp")
-    }
-
-    pub(super) fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
-        self.root.join(format!("{}.narinfo", hash.0))
-    }
-
-    pub(super) fn temp_dir(&self) -> PathBuf {
-        self.root.join(".tmp")
-    }
-
-    pub(super) fn ingestion_receipt_dir(&self) -> PathBuf {
-        self.root.join(".narjar-ingress")
-    }
-
-    pub(super) fn egress_receipt_dir(&self) -> PathBuf {
-        self.root.join(".narjar-egress")
-    }
-}
-
-pub(super) enum PublishTarget<'a> {
-    CacheInfo,
-    Nar(NarFileName),
-    NarInfo(&'a StoreHash),
-    IngestionReceipt(&'a IngestionReceipt),
-    EgressReceipt(&'a EgressReceipt),
-    RepairEgressNar(EncodedIdentity),
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum PublicationDirectory {
-    Root,
-    Nar,
-    IngestionReceipts,
-    EgressReceipts,
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum TemporaryDirectory {
-    Root,
-    Nar,
-}
-
-pub(super) struct PublicationDestination {
-    pub(super) directory: PublicationDirectory,
-    pub(super) temporary_directory: TemporaryDirectory,
-    pub(super) name: OsString,
-    pub(super) publication: DestinationPublication,
-    pub(super) temp_prefix: &'static str,
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum DestinationPublication {
-    Link,
-    Replace,
-    Repair(EncodedIdentity),
-}
-
-impl PublishTarget<'_> {
-    pub(super) fn destination(&self) -> PublicationDestination {
-        match self {
-            Self::CacheInfo => PublicationDestination {
-                directory: PublicationDirectory::Root,
-                temporary_directory: TemporaryDirectory::Root,
-                name: OsString::from("nix-cache-info"),
-                publication: DestinationPublication::Link,
-                temp_prefix: "cache-info",
-            },
-            Self::Nar(name) => PublicationDestination {
-                directory: PublicationDirectory::Nar,
-                temporary_directory: TemporaryDirectory::Nar,
-                name: name.os_string(),
-                publication: DestinationPublication::Link,
-                temp_prefix: "nar",
-            },
-            Self::NarInfo(store) => PublicationDestination {
-                directory: PublicationDirectory::Root,
-                temporary_directory: TemporaryDirectory::Root,
-                name: OsString::from(format!("{}.narinfo", store.as_str())),
-                publication: DestinationPublication::Link,
-                temp_prefix: "narinfo",
-            },
-            Self::IngestionReceipt(receipt) => PublicationDestination {
-                directory: PublicationDirectory::IngestionReceipts,
-                temporary_directory: TemporaryDirectory::Root,
-                name: receipt.file_name(),
-                publication: DestinationPublication::Replace,
-                temp_prefix: "receipt",
-            },
-            Self::EgressReceipt(receipt) => PublicationDestination {
-                directory: PublicationDirectory::EgressReceipts,
-                temporary_directory: TemporaryDirectory::Root,
-                name: receipt.file_name(),
-                publication: DestinationPublication::Replace,
-                temp_prefix: "egress-receipt",
-            },
-            Self::RepairEgressNar(output) => PublicationDestination {
-                directory: PublicationDirectory::Nar,
-                temporary_directory: TemporaryDirectory::Nar,
-                name: NarFileName::new(output.hash(), output.codec().wire_encoding()).os_string(),
-                publication: DestinationPublication::Repair(*output),
-                temp_prefix: "nar",
-            },
-        }
-    }
-}
+pub(super) use target::Layout;
+pub(super) use target::{
+    DestinationPublication, PublicationDestination, PublicationDirectory, PublishTarget,
+    TemporaryDirectory,
+};
 
 #[derive(Debug)]
 pub(super) struct TemporaryFile {
     pub(super) name: OsString,
     pub(super) directory: File,
     pub(super) file: File,
+}
+
+pub(super) struct Streaming;
+pub(super) struct Validated;
+
+struct OwnedTemporary<'storage> {
+    storage: &'storage Storage,
+    file: Option<TemporaryFile>,
+}
+
+impl<'storage> OwnedTemporary<'storage> {
+    fn new(storage: &'storage Storage, file: TemporaryFile) -> Self {
+        Self {
+            storage,
+            file: Some(file),
+        }
+    }
+
+    fn file(&self) -> &TemporaryFile {
+        self.file.as_ref().expect("owned temporary file is present")
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        &mut self
+            .file
+            .as_mut()
+            .expect("owned temporary file is present")
+            .file
+    }
+}
+
+impl Drop for OwnedTemporary<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.as_ref() {
+            let _ = self.storage.remove_temp(file);
+        }
+    }
+}
+
+pub(super) struct StagedPublication<'storage, Checkpoint, State> {
+    pub(super) storage: &'storage Storage,
+    pub(super) destination: PublicationDestination,
+    temporary: OwnedTemporary<'storage>,
+    pub(super) transaction: PublicationTransaction,
+    checkpoint: Checkpoint,
+    _state: PhantomData<State>,
+}
+
+impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
+    pub(super) fn from_parts(
+        storage: &'storage Storage,
+        destination: PublicationDestination,
+        temporary: TemporaryFile,
+        transaction: PublicationTransaction,
+        checkpoint: Checkpoint,
+    ) -> Self {
+        Self {
+            storage,
+            destination,
+            temporary: OwnedTemporary::new(storage, temporary),
+            transaction,
+            checkpoint,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming>
+where
+    Checkpoint: FnMut(PublishBoundary) -> Result<(), StorageError>,
+{
+    pub(super) fn finish_and_sync(
+        mut self,
+        mut source: impl Read,
+    ) -> Result<StagedPublication<'storage, Checkpoint, Validated>, StorageError> {
+        (self.checkpoint)(PublishBoundary::AfterTempCreate)?;
+        io::copy(&mut source, self.temporary.file_mut())?;
+        (self.checkpoint)(PublishBoundary::AfterStream)?;
+        self.temporary.file().file.sync_all()?;
+        (self.checkpoint)(PublishBoundary::AfterTempSync)?;
+        self.transaction.transition(PublicationState::Validated)?;
+
+        let Self {
+            storage,
+            destination,
+            temporary,
+            transaction,
+            checkpoint,
+            _state: _,
+        } = self;
+        Ok(StagedPublication {
+            storage,
+            destination,
+            temporary,
+            transaction,
+            checkpoint,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Validated>
+where
+    Checkpoint: FnMut(PublishBoundary) -> Result<(), StorageError>,
+{
+    pub(super) fn commit(self) -> Result<PublishOutcome, StorageError> {
+        let Self {
+            storage,
+            destination,
+            temporary,
+            transaction,
+            checkpoint,
+            _state: _,
+        } = self;
+        storage.commit_temporary(destination, temporary.file(), transaction, checkpoint)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -33,7 +33,8 @@ use super::{
     publication::{
         DestinationPublication, NEXT_TEMP, NarUploadPolicy, ProcessLock, PublicationDestination,
         PublicationDirectory, PublishBoundary, PublishOutcome, PublishTarget, PublishedPair,
-        StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
+        StagedPublication, StagingReservation, StorageError, Streaming, TemporaryDirectory,
+        TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction, RecoveryState},
@@ -622,44 +623,52 @@ impl Storage {
         self.publish_with(target, source, |_| Ok(()))
     }
 
+    pub(super) fn begin_publication<'storage, 'target, Checkpoint>(
+        &'storage self,
+        target: PublishTarget<'target>,
+        mut checkpoint: Checkpoint,
+    ) -> Result<StagedPublication<'storage, Checkpoint, Streaming>, StorageError>
+    where
+        Checkpoint: FnMut(PublishBoundary) -> Result<(), StorageError>,
+    {
+        let destination = target.destination();
+        let temp_name = self.next_temp_name(&target);
+        let temporary_path = self.temporary_path(&target, &temp_name);
+        let mut transaction = self.recovery.begin(&temporary_path)?;
+        checkpoint(PublishBoundary::BeforeTempCreate)?;
+        let temporary = self.create_temp_named(&target, temp_name)?;
+        if let Err(error) = transaction.transition(PublicationState::Streaming) {
+            let _ = self.remove_temp(&temporary);
+            return Err(error);
+        }
+
+        Ok(StagedPublication::from_parts(
+            self,
+            destination,
+            temporary,
+            transaction,
+            checkpoint,
+        ))
+    }
+
     pub(super) fn publish_with(
         &self,
         target: PublishTarget<'_>,
         source: impl Read,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        let mut source = source;
-        let temp_name = self.next_temp_name(&target);
-        let temporary_path = self.temporary_path(&target, &temp_name);
-        let mut transaction = self.recovery.begin(&temporary_path)?;
-        checkpoint(PublishBoundary::BeforeTempCreate)?;
-        let mut temp = self.create_temp_named(&target, temp_name)?;
-        transaction.transition(PublicationState::Streaming)?;
-        let staging = (|| {
-            checkpoint(PublishBoundary::AfterTempCreate)?;
-            io::copy(&mut source, &mut temp.file)?;
-            checkpoint(PublishBoundary::AfterStream)?;
-            temp.file.sync_all()?;
-            checkpoint(PublishBoundary::AfterTempSync)?;
-            transaction.transition(PublicationState::Validated)
-        })();
-
-        if let Err(error) = staging {
-            let _ = self.remove_temp(&temp);
-            return Err(error);
-        }
-
-        self.commit_temporary(target, &temp, transaction, checkpoint)
+        self.begin_publication(target, &mut checkpoint)?
+            .finish_and_sync(source)?
+            .commit()
     }
 
     pub(super) fn commit_temporary(
         &self,
-        target: PublishTarget<'_>,
+        destination: PublicationDestination,
         temp: &TemporaryFile,
         mut transaction: PublicationTransaction,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        let destination = target.destination();
         let mut progress = PublicationProgress::Pending(TemporaryLocation::Staging);
         let result = (|| {
             let destination_directory = self.destination_directory(destination.directory)?;

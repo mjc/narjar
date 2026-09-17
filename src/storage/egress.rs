@@ -277,8 +277,9 @@ impl ReadyDerivative<'_> {
     fn commit(mut self) -> Result<EncodedIdentity, StorageError> {
         let temporary = self.temporary.take_temporary();
         let target = PublishTarget::RepairEgressNar(self.output);
+        let destination = target.destination();
         self.temporary.storage.commit_temporary(
-            target,
+            destination,
             &temporary,
             self.transaction,
             |_| Ok(()),

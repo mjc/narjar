@@ -47,12 +47,10 @@ impl UploadTemporary<'_> {
         identity: NarIdentity,
         transaction: PublicationTransaction,
     ) -> Result<PublishOutcome, StorageError> {
-        self.storage.commit_temporary(
-            PublishTarget::Nar(NarFileName::raw(identity.hash())),
-            &self.file,
-            transaction,
-            |_| Ok(()),
-        )
+        let target = PublishTarget::Nar(NarFileName::raw(identity.hash()));
+        let destination = target.destination();
+        self.storage
+            .commit_temporary(destination, &self.file, transaction, |_| Ok(()))
     }
 }
 
