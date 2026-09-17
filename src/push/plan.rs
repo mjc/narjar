@@ -9,7 +9,7 @@ pub(super) fn dependency_waves(metadata: Vec<PathInfo>) -> Result<Vec<Vec<PathIn
     for info in metadata {
         if by_path.insert(info.path.clone(), info).is_some() {
             return Err(Error::runtime(
-                "nix path-info returned a duplicate store path",
+                "local store metadata returned a duplicate store path",
             ));
         }
     }
@@ -81,7 +81,7 @@ pub(super) fn dependency_waves(metadata: Vec<PathInfo>) -> Result<Vec<Vec<PathIn
 
     if emitted != indegree.len() {
         return Err(Error::runtime(
-            "nix path-info returned cyclic store references",
+            "local store metadata returned cyclic store references",
         ));
     }
     Ok(waves)

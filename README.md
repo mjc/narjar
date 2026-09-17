@@ -54,8 +54,9 @@ chmod 600 ./producer.sec
 cp ./producer.pub ./cache/trusted-public-keys
 ```
 
-Create a netrc containing the write token. The `push` command resolves and signs
-the closure with Nix, then performs the NAR and narinfo HTTP uploads in Rust:
+Create a netrc containing the write token. The `push` command reads the local
+store database, serializes and signs the closure in Rust, then performs the NAR
+and narinfo HTTP uploads:
 
 ```sh
 printf 'machine 127.0.0.1 login narjar password %s\n' "$(cat ./write.token)" > ./narjar.netrc
@@ -80,14 +81,15 @@ to `none`. Raw NAR bytes remain the authoritative stored object; a compressed
 egress file is materialized and published only after the raw object is durable.
 Netrc credentials are sent only over HTTPS by default;
 `--insecure-http` is an explicit opt-in for the loopback HTTP example above.
-The client uses fixed-length requests, streams NAR files from temporary files,
-and authenticates with the matching netrc entry. The native HTTP request
+The client uses fixed-length requests, streams canonical NAR bytes directly
+from the local store, and authenticates with the matching netrc entry. The native HTTP request
 timeout defaults to 30 seconds and can be changed with
 `--timeout-seconds` or `NARJAR_PUSH_TIMEOUT_SECONDS`. The server publishes the
 NAR before its narinfo, and consumers only see a path after the metadata is
-durable. Nix remains required for closure enumeration,
-signing, and canonical NAR serialization; the push transfer itself does not
-invoke `nix copy`. Referenced store paths are uploaded in deterministic
+durable. The push command does not invoke `nix copy` or any other Nix
+subprocess; it requires the local Nix store and its SQLite metadata database,
+and currently accepts concrete store paths rather than Nix expressions or flake
+installables. Referenced store paths are uploaded in deterministic
 dependency waves; independent paths within a wave use the bounded `--jobs`
 parallelism.
 

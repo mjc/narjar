@@ -1,6 +1,7 @@
 use data_encoding::{BASE64, BitOrder, Specification};
 use ed25519_dalek::{Signer, SigningKey};
 use lzma_rust2::{XzOptions, XzWriter};
+use narjar::nar_encode::{Encoder, Event as NarEvent};
 use narjar::storage::WireEncoding;
 use sha2::{Digest, Sha256};
 use std::{
@@ -229,11 +230,85 @@ fn push_uses_native_transfer_without_nix_copy() {
     }
 }
 
+#[test]
+fn native_push_signs_metadata_without_invoking_nix() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind native signing listener");
+    let address = listener
+        .local_addr()
+        .expect("inspect native signing listener");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept native narinfo lookup");
+        let request = read_http_request(&mut stream);
+        assert!(String::from_utf8_lossy(&request).starts_with("GET /"));
+        write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write missing narinfo response");
+
+        let (mut stream, _) = listener.accept().expect("accept native NAR upload");
+        let request = read_http_request(&mut stream);
+        assert!(String::from_utf8_lossy(&request).starts_with("PUT /nar/"));
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write native NAR response");
+
+        let (mut stream, _) = listener.accept().expect("accept signed narinfo upload");
+        let request = read_http_request(&mut stream);
+        let body = String::from_utf8_lossy(&request[http_request_body_start(&request)..]);
+        assert_eq!(body.matches("Sig: ").count(), 1);
+        assert!(body.contains("Sig: narjar-test:"));
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write signed narinfo response");
+    });
+
+    let fixture = native_push_fixture();
+    let output =
+        run_native_push_fixture_with_signing(&fixture, &format!("http://{address}"), "none", false);
+    server.join().expect("native signing server should exit");
+    assert!(
+        output.status.success(),
+        "native signing push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !fixture.invocation_log.exists(),
+        "native signing push must not invoke Nix"
+    );
+}
+
 struct NativePushFixture {
     tools: TempDir,
     invocation_log: PathBuf,
     netrc: PathBuf,
+    signing_key: PathBuf,
     store_path: String,
+    store_dir: PathBuf,
+    state_dir: PathBuf,
+}
+
+fn native_nar_bytes() -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output).expect("create native NAR fixture encoder");
+    encoder
+        .push(NarEvent::BeginFile {
+            executable: false,
+            size: NAR_BYTES.len() as u64,
+        })
+        .expect("begin native NAR fixture file");
+    encoder
+        .push(NarEvent::FileChunk(NAR_BYTES))
+        .expect("write native NAR fixture file");
+    encoder
+        .push(NarEvent::EndFile)
+        .expect("finish native NAR fixture file");
+    encoder.finish().expect("finish native NAR fixture encoder");
+    output
 }
 
 fn native_push_fixture() -> NativePushFixture {
@@ -241,19 +316,73 @@ fn native_push_fixture() -> NativePushFixture {
     let fake_nix = tools.path().join("nix");
     let invocation_log = tools.path().join("nix-invocations");
     let store_path = format!("/nix/store/{STORE_HASH}-narjar");
-    let nar_hash = nix32_sha256(NAR_BYTES);
-    let nar_hash_sri = format!("sha256-{}", BASE64.encode(&Sha256::digest(NAR_BYTES)));
-    let fingerprint = format!("1;{store_path};sha256:{nar_hash};{};", NAR_BYTES.len());
+    let store_dir = tools.path().join("store");
+    fs::create_dir(&store_dir).expect("native store directory should be created");
+    fs::write(store_dir.join(format!("{STORE_HASH}-narjar")), NAR_BYTES)
+        .expect("native store object should be written");
+    let state_dir = tools.path().join("state");
+    fs::create_dir(&state_dir).expect("native state directory should be created");
+    fs::create_dir_all(state_dir.join("gcroots/auto"))
+        .expect("native automatic roots directory should be created");
+    fs::create_dir(state_dir.join("db")).expect("native database directory should be created");
+    let native_nar = native_nar_bytes();
+    let nar_hash = nix32_sha256(&native_nar);
+    let nar_hash_sri = format!("sha256-{}", BASE64.encode(&Sha256::digest(&native_nar)));
+    let fingerprint = format!("1;{store_path};sha256:{nar_hash};{};", native_nar.len());
     let signature = SigningKey::from_bytes(&[7; 32]).sign(fingerprint.as_bytes());
     let signature = format!("narjar-test:{}", BASE64.encode(&signature.to_bytes()));
+    let database = sqlite::open(state_dir.join("db/db.sqlite"))
+        .expect("native metadata database should be created");
+    database
+        .execute(
+            "CREATE TABLE ValidPaths (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                hash TEXT NOT NULL,
+                registrationTime INTEGER NOT NULL,
+                deriver TEXT,
+                narSize INTEGER,
+                ultimate INTEGER,
+                sigs TEXT,
+                ca TEXT
+            );
+            CREATE TABLE Refs (
+                referrer INTEGER NOT NULL,
+                reference INTEGER NOT NULL,
+                PRIMARY KEY (referrer, reference)
+            );
+            CREATE TABLE SchemaMigrations (migration TEXT PRIMARY KEY NOT NULL);",
+        )
+        .expect("native metadata schema should be created");
+    let mut insert = database
+        .prepare(
+            "INSERT INTO ValidPaths
+             (id, path, hash, registrationTime, narSize, sigs)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .expect("native metadata insert should prepare");
+    insert.bind((1, 1_i64)).expect("bind native path id");
+    insert
+        .bind((2, store_path.as_str()))
+        .expect("bind native path");
+    let native_nar_hash = format!("sha256:{}", hex_sha256(&Sha256::digest(&native_nar)));
+    insert
+        .bind((3, native_nar_hash.as_str()))
+        .expect("bind native NAR hash");
+    insert
+        .bind((4, 1_i64))
+        .expect("bind native registration time");
+    insert
+        .bind((5, native_nar.len() as i64))
+        .expect("bind native NAR size");
+    insert.bind((6, "")).expect("bind native signature");
+    insert.next().expect("native metadata row should insert");
     let fake_nix_contents = format!(
         concat!(
             "#!/bin/sh\n",
             "printf '%s\\n' \"$*\" >> \"$NIX_TEST_INVOCATIONS\"\n",
             "if [ \"$1\" = path-info ]; then\n",
             "  printf '%s\\n' '{{\"{store_path}\":{{\"ca\":null,\"deriver\":null,\"narHash\":\"{nar_hash_sri}\",\"narSize\":{nar_size},\"references\":[],\"signatures\":[\"{signature}\"]}}}}'\n",
-            "elif [ \"$1\" = store ] && [ \"$2\" = dump-path ]; then\n",
-            "  printf '%s' narjar\n",
             "else\n",
             "  printf '%s\\n' \"unexpected nix invocation: $*\" >&2\n",
             "  exit 1\n",
@@ -262,7 +391,7 @@ fn native_push_fixture() -> NativePushFixture {
         store_path = store_path,
         nar_hash_sri = nar_hash_sri,
         signature = signature,
-        nar_size = NAR_BYTES.len()
+        nar_size = native_nar.len()
     );
     fs::write(&fake_nix, fake_nix_contents).expect("fake Nix should be written");
     fs::set_permissions(&fake_nix, fs::Permissions::from_mode(0o755))
@@ -275,13 +404,31 @@ fn native_push_fixture() -> NativePushFixture {
     .expect("netrc should be written");
     fs::set_permissions(&netrc, fs::Permissions::from_mode(0o600))
         .expect("netrc should be private");
+    let signing_key = tools.path().join("secret-key");
+    let mut secret = [0; 64];
+    secret[..32].copy_from_slice(&[7; 32]);
+    secret[32..].copy_from_slice(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes());
+    fs::write(
+        &signing_key,
+        format!("narjar-test:{}\n", BASE64.encode(&secret)),
+    )
+    .expect("native signing key should be written");
+    fs::set_permissions(&signing_key, fs::Permissions::from_mode(0o600))
+        .expect("native signing key should be private");
 
     NativePushFixture {
         tools,
         invocation_log,
         netrc,
+        signing_key,
         store_path,
+        store_dir,
+        state_dir,
     }
+}
+
+fn hex_sha256(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn run_native_push_fixture(
@@ -290,7 +437,30 @@ fn run_native_push_fixture(
     compression: &str,
     refresh: bool,
 ) -> Output {
-    run_native_push_fixture_with_timeout(fixture, target, compression, refresh, None)
+    run_native_push_fixture_with_timeout_and_signing(
+        fixture,
+        target,
+        compression,
+        refresh,
+        None,
+        false,
+    )
+}
+
+fn run_native_push_fixture_with_signing(
+    fixture: &NativePushFixture,
+    target: &str,
+    compression: &str,
+    refresh: bool,
+) -> Output {
+    run_native_push_fixture_with_timeout_and_signing(
+        fixture,
+        target,
+        compression,
+        refresh,
+        None,
+        true,
+    )
 }
 
 fn run_native_push_fixture_with_timeout(
@@ -299,6 +469,24 @@ fn run_native_push_fixture_with_timeout(
     compression: &str,
     refresh: bool,
     timeout_seconds: Option<u64>,
+) -> Output {
+    run_native_push_fixture_with_timeout_and_signing(
+        fixture,
+        target,
+        compression,
+        refresh,
+        timeout_seconds,
+        false,
+    )
+}
+
+fn run_native_push_fixture_with_timeout_and_signing(
+    fixture: &NativePushFixture,
+    target: &str,
+    compression: &str,
+    refresh: bool,
+    timeout_seconds: Option<u64>,
+    signing: bool,
 ) -> Output {
     let original_path = std::env::var_os("PATH").expect("test PATH should be set");
     let path = format!(
@@ -326,11 +514,23 @@ fn run_native_push_fixture_with_timeout(
     if refresh {
         args.push("--refresh".to_owned());
     }
+    if signing {
+        args.push("--signing-key-file".to_owned());
+        args.push(
+            fixture
+                .signing_key
+                .to_str()
+                .expect("signing key path should be UTF-8")
+                .to_owned(),
+        );
+    }
     args.push(fixture.store_path.clone());
     command()
         .args(&args)
         .env("PATH", path)
         .env("NIX_TEST_INVOCATIONS", &fixture.invocation_log)
+        .env("NIX_STORE_DIR", &fixture.store_dir)
+        .env("NIX_STATE_DIR", &fixture.state_dir)
         .output()
         .expect("narjar push should run")
 }
@@ -407,6 +607,7 @@ fn native_push_retries_a_429_at_the_process_boundary() {
     let address = listener
         .local_addr()
         .expect("inspect native retry listener");
+    let expected_nar = native_nar_bytes();
     let server = thread::spawn(move || {
         for (request_number, status) in [(0, 429), (1, 201), (2, 201)] {
             let (mut stream, _) = listener.accept().expect("accept native retry request");
@@ -418,7 +619,7 @@ fn native_push_retries_a_429_at_the_process_boundary() {
                 + 4;
             let body = &request[header_end..];
             if request_number < 2 {
-                assert_eq!(body, NAR_BYTES, "every NAR retry must resend the body");
+                assert_eq!(body, expected_nar, "every NAR retry must resend the body");
                 assert!(
                     String::from_utf8_lossy(&request).starts_with("PUT /nar/"),
                     "request {request_number} should upload the NAR"
@@ -446,12 +647,9 @@ fn native_push_retries_a_429_at_the_process_boundary() {
         "native push retry failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        fs::read_to_string(fixture.invocation_log).expect("Nix invocations should be logged"),
-        format!(
-            "path-info --recursive --json -- {}\nstore dump-path -- {}\n",
-            fixture.store_path, fixture.store_path
-        )
+    assert!(
+        !fixture.invocation_log.exists(),
+        "native push must not invoke Nix"
     );
 }
 
@@ -461,6 +659,7 @@ fn native_push_follows_a_307_for_the_nar_upload_at_the_process_boundary() {
     let address = listener
         .local_addr()
         .expect("inspect native redirect listener");
+    let expected_nar = native_nar_bytes();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept initial native upload");
         let request = read_http_request(&mut stream);
@@ -474,7 +673,7 @@ fn native_push_follows_a_307_for_the_nar_upload_at_the_process_boundary() {
             request_text.starts_with("PUT /nar/"),
             "initial request should upload the NAR"
         );
-        assert_eq!(&request[header_end..], NAR_BYTES);
+        assert_eq!(&request[header_end..], expected_nar);
         write!(
             stream,
             "HTTP/1.1 307 Temporary Redirect\r\nLocation: /redirect-target/nar/upload.nar\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -493,7 +692,7 @@ fn native_push_follows_a_307_for_the_nar_upload_at_the_process_boundary() {
             request_text.starts_with("PUT /redirect-target/nar/upload.nar"),
             "redirected request should use the Location path"
         );
-        assert_eq!(&request[header_end..], NAR_BYTES);
+        assert_eq!(&request[header_end..], expected_nar);
         write!(
             stream,
             "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -523,12 +722,9 @@ fn native_push_follows_a_307_for_the_nar_upload_at_the_process_boundary() {
         "native redirect push failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        fs::read_to_string(fixture.invocation_log).expect("Nix invocations should be logged"),
-        format!(
-            "path-info --recursive --json -- {}\nstore dump-path -- {}\n",
-            fixture.store_path, fixture.store_path
-        )
+    assert!(
+        !fixture.invocation_log.exists(),
+        "native push must not invoke Nix"
     );
 }
 
@@ -538,6 +734,7 @@ fn native_push_retries_after_an_interrupted_upload_at_the_process_boundary() {
     let address = listener
         .local_addr()
         .expect("inspect native interruption listener");
+    let expected_nar = native_nar_bytes();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept interrupted native upload");
         let mut request = Vec::new();
@@ -570,7 +767,7 @@ fn native_push_retries_after_an_interrupted_upload_at_the_process_boundary() {
             .position(|window| window == b"\r\n\r\n")
             .expect("retried request should contain headers")
             + 4;
-        assert_eq!(&request[header_end..], NAR_BYTES);
+        assert_eq!(&request[header_end..], expected_nar);
         assert!(String::from_utf8_lossy(&request).starts_with("PUT /nar/"));
         write!(
             stream,
@@ -603,12 +800,9 @@ fn native_push_retries_after_an_interrupted_upload_at_the_process_boundary() {
         "native push interruption retry failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        fs::read_to_string(fixture.invocation_log).expect("Nix invocations should be logged"),
-        format!(
-            "path-info --recursive --json -- {}\nstore dump-path -- {}\n",
-            fixture.store_path, fixture.store_path
-        )
+    assert!(
+        !fixture.invocation_log.exists(),
+        "native push must not invoke Nix"
     );
 }
 
@@ -617,6 +811,7 @@ fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
     let address = listener.local_addr().expect("inspect native push listener");
     let expected_compression = compression.to_owned();
     let expected_suffix = suffix.to_owned();
+    let expected_nar = native_nar_bytes();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept narinfo lookup");
         let request = read_http_request(&mut stream);
@@ -645,9 +840,9 @@ fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
             "NAR upload should have a body"
         );
         if expected_compression == "none" {
-            assert_eq!(&request[header_end..], NAR_BYTES);
+            assert_eq!(&request[header_end..], expected_nar);
         } else {
-            assert_ne!(&request[header_end..], NAR_BYTES);
+            assert_ne!(&request[header_end..], expected_nar);
         }
         write!(
             stream,
@@ -674,7 +869,7 @@ fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
             "NAR URL should use {expected_suffix:?}"
         );
         assert!(narinfo.contains(&format!("Compression: {expected_compression}\n")));
-        assert!(narinfo.contains(&format!("NarSize: {}\n", NAR_BYTES.len())));
+        assert!(narinfo.contains(&format!("NarSize: {}\n", expected_nar.len())));
         write!(
             stream,
             "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -700,16 +895,10 @@ fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
         "pushed 1 paths with 1 workers\n"
     );
 
-    let invocations =
-        fs::read_to_string(fixture.invocation_log).expect("Nix invocations should be logged");
-    assert_eq!(
-        invocations,
-        format!(
-            "path-info --recursive --json -- {}\nstore dump-path -- {}\n",
-            fixture.store_path, fixture.store_path
-        )
+    assert!(
+        !fixture.invocation_log.exists(),
+        "native push must not invoke Nix"
     );
-    assert!(!invocations.contains(" copy "));
 }
 
 struct TestDir(TempDir);

@@ -8,18 +8,31 @@ use std::{
 use clap::Args;
 use ureq::Agent;
 
-use crate::{error::Error, http_url::HttpUrl, operator::netrc_authorization};
+use crate::{
+    error::Error,
+    http_url::HttpUrl,
+    object::{EncodedSize, FileHash, NarIdentity},
+    operator::netrc_authorization,
+};
 
+mod nar_stream;
 mod narinfo;
-mod nix;
 mod payload;
 mod plan;
+mod root;
+mod signing;
+mod store;
 mod transfer;
-use narinfo::{nix32_encoding, nix32_sha256_from_sri, serialize_narinfo};
-use nix::{closure_paths, format_command_failure, sign_paths};
+use nar_stream::{open_verified_encoded_nar_reader, open_verified_nar_reader};
+use narinfo::serialize_narinfo;
 use payload::prepare_nar;
 use plan::dependency_waves;
-use transfer::{put_bytes, put_file, request_status};
+use root::StoreRoots;
+use signing::sign_metadata;
+use store::closure_paths;
+#[cfg(test)]
+use transfer::put_file;
+use transfer::{put_bytes, put_reader, request_status};
 
 #[derive(Debug, Args)]
 pub(crate) struct Push {
@@ -55,8 +68,8 @@ pub(crate) struct Push {
     #[arg(long)]
     refresh: bool,
 
-    /// Store paths or installables whose closure should be pushed.
-    #[arg(value_name = "INSTALLABLE", required = true, num_args = 1..)]
+    /// Concrete local store paths whose closures should be pushed.
+    #[arg(value_name = "STORE_PATH", required = true, num_args = 1..)]
     paths: Vec<String>,
 }
 
@@ -86,18 +99,16 @@ struct PathInfo {
     path: String,
     ca: Option<String>,
     deriver: Option<String>,
-    nar_hash: String,
-    nar_size: u64,
+    nar: NarIdentity,
     references: Vec<String>,
     signatures: Vec<String>,
 }
 
 pub(crate) fn run(args: Push) -> Result<(), Error> {
-    let mut metadata = closure_paths(&args.paths)?;
-    let paths: Vec<_> = metadata.iter().map(|info| info.path.clone()).collect();
+    let mut metadata = closure_paths(&args.paths).map_err(Error::runtime)?;
+    let _roots = StoreRoots::hold(&args.paths).map_err(Error::runtime)?;
     if let Some(key_file) = args.signing_key_file.as_deref() {
-        sign_paths(key_file, &paths)?;
-        metadata = closure_paths(&args.paths)?;
+        sign_metadata(key_file, &mut metadata).map_err(Error::runtime)?;
     }
     let waves = dependency_waves(metadata)?;
     let total_paths = waves.iter().map(Vec::len).sum::<usize>();
@@ -219,15 +230,55 @@ fn native_copy_paths(
             }
         }
 
+        if compression == Compression::None {
+            let nar_name = format!("{}{}", info.nar.hash(), Compression::None.suffix());
+            let nar_url = target.endpoint(&["nar", &nar_name]);
+            let nar_status = put_reader(
+                &agent,
+                &nar_url,
+                info.nar.size().get(),
+                "application/x-nix-nar",
+                authorization.as_deref(),
+                || open_verified_nar_reader(info),
+            )?;
+            if !matches!(nar_status, 200 | 201) {
+                return Err(format!(
+                    "NAR upload for {} returned HTTP {nar_status}",
+                    info.path
+                ));
+            }
+            let narinfo = serialize_narinfo(
+                info,
+                FileHash::from_nar_hash(info.nar.hash()),
+                EncodedSize::new(info.nar.size().get()),
+                compression,
+            )?;
+            let narinfo_status = put_bytes(
+                &agent,
+                &narinfo_url,
+                &narinfo,
+                "text/x-nix-narinfo",
+                authorization.as_deref(),
+            )?;
+            if !matches!(narinfo_status, 200 | 201) {
+                return Err(format!(
+                    "narinfo upload for {} returned HTTP {narinfo_status}",
+                    info.path
+                ));
+            }
+            continue;
+        }
+
         let prepared = prepare_nar(info, compression)?;
-        let nar_name = format!("{}{}", prepared.file_hash, compression.suffix());
+        let nar_name = format!("{}{}", prepared.identity.hash(), compression.suffix());
         let nar_url = target.endpoint(&["nar", &nar_name]);
-        let nar_status = put_file(
+        let nar_status = put_reader(
             &agent,
             &nar_url,
-            prepared.file.path(),
+            prepared.identity.size().get(),
             "application/x-nix-nar",
             authorization.as_deref(),
+            || open_verified_encoded_nar_reader(info, compression, prepared.identity),
         )?;
         if !matches!(nar_status, 200 | 201) {
             return Err(format!(
@@ -236,8 +287,12 @@ fn native_copy_paths(
             ));
         }
 
-        let narinfo =
-            serialize_narinfo(info, &prepared.file_hash, prepared.file_size, compression)?;
+        let narinfo = serialize_narinfo(
+            info,
+            prepared.identity.hash(),
+            prepared.identity.size(),
+            compression,
+        )?;
         let narinfo_status = put_bytes(
             &agent,
             &narinfo_url,
@@ -277,64 +332,30 @@ fn store_hash_for_path(path: &str) -> Result<&str, String> {
 mod tests {
     use clap::{Args, Command, FromArgMatches};
 
-    use super::nix::parse_path_info;
     use super::transfer::{is_retryable_status, retry_after_delay};
     use super::{Agent, Compression, PathInfo, Push, dependency_waves, serialize_narinfo};
     use crate::http_url::HttpUrl;
+    use crate::object::{EncodedSize, FileHash, NarHash, NarIdentity, NarSize};
 
     fn http_url(value: impl AsRef<str>) -> HttpUrl {
         value.as_ref().parse().expect("test HTTP URL should parse")
     }
-    use std::time::Duration;
 
-    #[test]
-    fn parses_nix_path_info_metadata() {
-        let metadata = parse_path_info(
-            br#"{
-                "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package": {
-                    "ca": null,
-                    "deriver": "/nix/store/abcdefghijklmnopqrstuvwxyz0123456789.drv",
-                    "narHash": "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=",
-                    "narSize": 289656,
-                    "references": [
-                        "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency"
-                    ],
-                    "signatures": ["cache.example:signature"],
-                    "ultimate": true
-                }
-            }"#,
+    fn test_nar_identity() -> NarIdentity {
+        NarIdentity::new(
+            NarHash::parse("01nvfd133isi40l4id6if932mbwc7mxgwxd8x625xqhjdz6mpzai")
+                .expect("test NAR hash should parse"),
+            NarSize::new(289_656),
         )
-        .expect("valid path-info JSON");
-
-        assert_eq!(metadata.len(), 1);
-        let info = &metadata[0];
-        assert_eq!(
-            info.path,
-            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package"
-        );
-        assert_eq!(
-            info.nar_hash,
-            "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY="
-        );
-        assert_eq!(info.nar_size, 289656);
-        assert_eq!(
-            info.references,
-            vec!["/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency"]
-        );
-        assert_eq!(info.signatures, vec!["cache.example:signature"]);
-        assert_eq!(
-            info.deriver.as_deref(),
-            Some("/nix/store/abcdefghijklmnopqrstuvwxyz0123456789.drv")
-        );
     }
+    use std::time::Duration;
 
     #[test]
     fn serializes_signed_narinfo_from_path_info() {
         let info = PathInfo {
             path: "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package".to_owned(),
             deriver: Some("/nix/store/abcdefghijklmnopqrstuvwxyz0123456789.drv".to_owned()),
-            nar_hash: "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=".to_owned(),
-            nar_size: 289656,
+            nar: test_nar_identity(),
             references: vec![
                 "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency".to_owned(),
                 "/nix/store/11111111111111111111111111111111-dependency".to_owned(),
@@ -345,8 +366,8 @@ mod tests {
 
         let bytes = serialize_narinfo(
             &info,
-            "01nvfd133isi40l4id6if932mbwc7mxgwxd8x625xqhjdz6mpzai",
-            289656,
+            FileHash::from_nar_hash(info.nar.hash()),
+            EncodedSize::new(info.nar.size().get()),
             Compression::None,
         )
         .expect("path-info metadata should serialize");
@@ -520,6 +541,9 @@ mod tests {
 
         let payload = tempfile::NamedTempFile::new().expect("create upload test file");
         fs::write(payload.path(), b"retryable NAR payload").expect("write upload test file");
+        let payload_size = fs::metadata(payload.path())
+            .expect("stat upload test file")
+            .len();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test listener");
         let address = listener.local_addr().expect("inspect upload test listener");
         let server = thread::spawn(move || {
@@ -576,12 +600,17 @@ mod tests {
             .into();
 
         assert_eq!(
-            super::put_file(
+            super::put_reader(
                 &agent,
                 &http_url(format!("http://{address}/nar/test.nar")),
-                payload.path(),
+                payload_size,
                 "application/x-nix-nar",
-                None
+                None,
+                || {
+                    std::fs::File::open(payload.path())
+                        .map(|file| Box::new(file) as Box<dyn std::io::Read + Send>)
+                        .map_err(|error| error.to_string())
+                }
             )
             .expect("upload retry should eventually succeed"),
             201
@@ -820,8 +849,7 @@ mod tests {
             path: "/nix/store/00000000000000000000000000000000-dependency".to_owned(),
             ca: None,
             deriver: None,
-            nar_hash: "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=".to_owned(),
-            nar_size: 289656,
+            nar: test_nar_identity(),
             references: Vec::new(),
             signatures: Vec::new(),
         };
@@ -852,8 +880,7 @@ mod tests {
             path: path.to_owned(),
             ca: None,
             deriver: None,
-            nar_hash: "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=".to_owned(),
-            nar_size: 289656,
+            nar: test_nar_identity(),
             references: vec![path.to_owned()],
             signatures: Vec::new(),
         };
@@ -871,8 +898,7 @@ mod tests {
             path: "/nix/store/11111111111111111111111111111111-dependent".to_owned(),
             ca: None,
             deriver: None,
-            nar_hash: "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=".to_owned(),
-            nar_size: 289656,
+            nar: test_nar_identity(),
             references: vec!["/nix/store/00000000000000000000000000000000-missing".to_owned()],
             signatures: Vec::new(),
         };

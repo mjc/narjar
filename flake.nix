@@ -83,6 +83,8 @@
             pname = "narjar";
             version = "0.1.0";
             strictDeps = true;
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.sqlite ];
           }
           // extraArgs;
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -194,7 +196,11 @@
         cargoExtraArgs = "--locked --target ${staticTarget}";
         extraArgs = {
           CARGO_BUILD_TARGET = staticTarget;
-          nativeBuildInputs = [ staticPkgs.pkgsStatic.stdenv.cc ];
+          nativeBuildInputs = [
+            staticPkgs.pkgsStatic.stdenv.cc
+            staticPkgs.pkgsStatic.pkg-config
+          ];
+          buildInputs = [ staticPkgs.pkgsStatic.sqlite ];
         };
       };
       containerImage = staticPkgs.dockerTools.buildLayeredImage {

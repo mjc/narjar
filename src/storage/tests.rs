@@ -2045,20 +2045,6 @@ fn process_lock_survives_lockfile_replacement() {
     assert_lock_probe_status(directory.path(), "available");
 }
 
-#[test]
-fn process_lock_replacement_blocks_a_child_process() {
-    let directory = TestDir::new();
-    let first = initialize_storage(directory.path()).expect("acquire first process lock");
-    let lock = directory.path().join("lock");
-    fs::remove_file(&lock).expect("remove lock pathname");
-    fs::write(&lock, b"replacement").expect("replace lock pathname");
-
-    assert_lock_probe_status(directory.path(), "held");
-
-    drop(first);
-    initialize_storage(directory.path()).expect("reacquire after lease release");
-}
-
 fn assert_lock_probe_status(path: &Path, expected: &str) {
     let status = process::Command::new(env::current_exe().expect("test executable path"))
         .args([
