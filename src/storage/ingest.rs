@@ -33,33 +33,26 @@ pub(super) struct Staged<'storage, State> {
 struct UploadTemporary<'storage> {
     storage: &'storage Storage,
     file: TemporaryFile,
-    cleanup_on_drop: bool,
 }
 
 impl Drop for UploadTemporary<'_> {
     fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            let _ = self.storage.remove_temp(&self.file);
-        }
+        let _ = self.storage.remove_temp(&self.file);
     }
 }
 
 impl UploadTemporary<'_> {
     fn commit(
-        mut self,
+        self,
         identity: NarIdentity,
         transaction: PublicationTransaction,
     ) -> Result<PublishOutcome, StorageError> {
-        let result = self.storage.commit_temporary(
+        self.storage.commit_temporary(
             PublishTarget::Nar(NarFileName::raw(identity.hash())),
             &self.file,
             transaction,
             |_| Ok(()),
-        );
-        // The commit protocol performs fallible cleanup on both success and
-        // failure. Drop still handles abandonment and unwinding before return.
-        self.cleanup_on_drop = false;
-        result
+        )
     }
 }
 
@@ -82,7 +75,6 @@ impl Storage {
         let temporary = UploadTemporary {
             storage: self,
             file: self.create_temp_named(&target, temp_name)?,
-            cleanup_on_drop: true,
         };
         Ok(Staged {
             temporary,

@@ -28,8 +28,9 @@ use super::{
     },
     ids::StoreHash,
     publication::{
-        NEXT_TEMP, NarUploadPolicy, ProcessLock, PublishBoundary, PublishOutcome, PublishTarget,
-        PublishedPair, StagingReservation, StorageError, TemporaryFile,
+        DestinationPublication, NEXT_TEMP, NarUploadPolicy, ProcessLock, PublishBoundary,
+        PublishOutcome, PublishTarget, PublishedPair, StagingReservation, StorageError,
+        TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction, RecoveryState},
@@ -43,6 +44,73 @@ const MAX_CACHE_INFO_BYTES: u64 = 1024;
 pub(super) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
 pub(super) const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
 pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
+
+#[derive(Clone, Copy)]
+enum TemporaryLocation {
+    Staging,
+    Destination,
+}
+
+#[derive(Clone, Copy)]
+enum PublicationProgress {
+    Pending(TemporaryLocation),
+    Durable(TemporaryLocation),
+}
+
+impl PublicationProgress {
+    fn mark_temporary_moved(&mut self) {
+        *self = match *self {
+            Self::Pending(_) => Self::Pending(TemporaryLocation::Destination),
+            Self::Durable(_) => Self::Durable(TemporaryLocation::Destination),
+        };
+    }
+
+    fn mark_durable(&mut self) {
+        *self = match *self {
+            Self::Pending(location) => Self::Durable(location),
+            Self::Durable(location) => Self::Durable(location),
+        };
+    }
+
+    fn cleanup_temporary_location(
+        location: TemporaryLocation,
+        storage: &Storage,
+        temp: &TemporaryFile,
+    ) -> Result<(), StorageError> {
+        match location {
+            TemporaryLocation::Staging => storage.remove_temp(temp),
+            TemporaryLocation::Destination => {
+                storage.temporary_objects.fetch_sub(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(
+        self,
+        result: Result<PublishOutcome, StorageError>,
+        storage: &Storage,
+        temp: &TemporaryFile,
+        transaction: PublicationTransaction,
+    ) -> Result<PublishOutcome, StorageError> {
+        match (result, self) {
+            (Ok(outcome), Self::Pending(location) | Self::Durable(location)) => {
+                Self::cleanup_temporary_location(location, storage, temp)?;
+                transaction.complete()?;
+                Ok(outcome)
+            }
+            (Err(error), Self::Durable(location)) => {
+                Self::cleanup_temporary_location(location, storage, temp)?;
+                transaction.complete()?;
+                Err(error)
+            }
+            (Err(error), Self::Pending(location)) => {
+                let _ = Self::cleanup_temporary_location(location, storage, temp);
+                Err(error)
+            }
+        }
+    }
+}
 
 pub(crate) struct StoredNar<'storage> {
     storage: &'storage Storage,
@@ -74,17 +142,40 @@ fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
     }
     let text = std::str::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nix-cache-info is not UTF-8"))?;
-    let mut store_dir = false;
-    let mut mass_query = false;
-    let mut priority = false;
+    let mut fields = CacheInfoFields::default();
     for line in text.lines() {
         let (name, value) = line.split_once(": ").ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "malformed nix-cache-info")
         })?;
+        fields.record(name, value)?;
+    }
+    fields.finish()
+}
+
+#[derive(Default)]
+struct CacheInfoFields {
+    store_dir: Option<()>,
+    mass_query: Option<()>,
+    priority: Option<u32>,
+}
+
+impl CacheInfoFields {
+    fn record(&mut self, name: &str, value: &str) -> io::Result<()> {
         match name {
-            "StoreDir" if !store_dir && value == "/nix/store" => store_dir = true,
-            "WantMassQuery" if !mass_query && value == "0" => mass_query = true,
-            "Priority" if !priority && value.parse::<u32>().is_ok() => priority = true,
+            "StoreDir" if self.store_dir.is_none() && value == "/nix/store" => {
+                self.store_dir = Some(());
+            }
+            "WantMassQuery" if self.mass_query.is_none() && value == "0" => {
+                self.mass_query = Some(());
+            }
+            "Priority" if self.priority.is_none() => {
+                self.priority = Some(value.parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid nix-cache-info priority",
+                    )
+                })?);
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -92,14 +183,18 @@ fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
                 ));
             }
         }
-    }
-    if store_dir && mass_query && priority {
         Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "nix-cache-info is missing a required field",
-        ))
+    }
+
+    fn finish(self) -> io::Result<()> {
+        if self.store_dir.is_some() && self.mass_query.is_some() && self.priority.is_some() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "nix-cache-info is missing a required field",
+            ))
+        }
     }
 }
 
@@ -482,97 +577,87 @@ impl Storage {
     ) -> Result<PublishOutcome, StorageError> {
         let destination_name = target.destination_name();
         let destination_key = self.destination_key(&target, &destination_name);
-        let replace_destination = target.replaces_destination();
-        let mut durable = false;
-        let mut temp_moved = false;
+        let publication = target.destination_publication();
+        let mut progress = PublicationProgress::Pending(TemporaryLocation::Staging);
         let result = (|| {
             let destination_directory = self.destination_directory(&target)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
             let mut finalize_publication = |publish_result: io::Result<()>| match publish_result {
                 Ok(()) => {
-                    if replace_destination {
-                        temp_moved = true;
-                        temp.directory.sync_all()?;
+                    match publication {
+                        DestinationPublication::Replace => {
+                            progress.mark_temporary_moved();
+                            temp.directory.sync_all()?;
+                        }
+                        DestinationPublication::Link => {}
                     }
                     transaction.transition(PublicationState::Linked)?;
                     if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
-                        if !replace_destination {
-                            rollback_link_at(&destination_directory, &destination_name)?;
+                        match publication {
+                            DestinationPublication::Link => {
+                                rollback_link_at(&destination_directory, &destination_name)?;
+                            }
+                            DestinationPublication::Replace => {}
                         }
                         return Err(error);
                     }
                     if let Err(error) = destination_directory.sync_all() {
-                        if !replace_destination {
-                            rollback_link_at(&destination_directory, &destination_name)?;
+                        match publication {
+                            DestinationPublication::Link => {
+                                rollback_link_at(&destination_directory, &destination_name)?;
+                            }
+                            DestinationPublication::Replace => {}
                         }
                         return Err(error.into());
                     }
-                    durable = true;
+                    progress.mark_durable();
                     transaction.transition(PublicationState::Published)?;
                     checkpoint(PublishBoundary::AfterParentSync)?;
                     Ok(PublishOutcome::Created)
                 }
-                Err(error)
-                    if !replace_destination && error.kind() == io::ErrorKind::AlreadyExists =>
-                {
-                    if files_equal_at(
+                Err(error) => match publication {
+                    DestinationPublication::Link
+                        if error.kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        if files_equal_at(
+                            &temp.directory,
+                            &temp.name,
+                            &destination_directory,
+                            &destination_name,
+                        )? {
+                            transaction.transition(PublicationState::Published)?;
+                            Ok(PublishOutcome::Identical)
+                        } else {
+                            Err(StorageError::Conflict)
+                        }
+                    }
+                    DestinationPublication::Link | DestinationPublication::Replace => {
+                        Err(error.into())
+                    }
+                },
+            };
+            match publication {
+                DestinationPublication::Replace => finalize_publication(rename_at(
+                    &temp.directory,
+                    &temp.name,
+                    &destination_directory,
+                    &destination_name,
+                )),
+                DestinationPublication::Link => {
+                    let destination_lock = self.destination_lock(destination_key);
+                    let _destination_guard = destination_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    finalize_publication(hard_link_at(
                         &temp.directory,
                         &temp.name,
                         &destination_directory,
                         &destination_name,
-                    )? {
-                        transaction.transition(PublicationState::Published)?;
-                        Ok(PublishOutcome::Identical)
-                    } else {
-                        Err(StorageError::Conflict)
-                    }
+                    ))
                 }
-                Err(error) => Err(error.into()),
-            };
-            if replace_destination {
-                finalize_publication(rename_at(
-                    &temp.directory,
-                    &temp.name,
-                    &destination_directory,
-                    &destination_name,
-                ))
-            } else {
-                let destination_lock = self.destination_lock(destination_key);
-                let _destination_guard = destination_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                finalize_publication(hard_link_at(
-                    &temp.directory,
-                    &temp.name,
-                    &destination_directory,
-                    &destination_name,
-                ))
             }
         })();
-
-        let cleanup = if temp_moved {
-            self.temporary_objects.fetch_sub(1, Ordering::Relaxed);
-            Ok(())
-        } else {
-            self.remove_temp(temp)
-        };
-
-        match result {
-            Ok(outcome) => {
-                cleanup?;
-                transaction.complete()?;
-                Ok(outcome)
-            }
-            Err(error) => {
-                if durable {
-                    cleanup?;
-                    transaction.complete()?;
-                } else {
-                    let _ = cleanup;
-                }
-                Err(error)
-            }
-        }
+        progress.finish(result, self, temp, transaction)
     }
 
     #[cfg(test)]

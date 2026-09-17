@@ -64,6 +64,12 @@ pub(super) enum PublishTarget<'a> {
     IngestionReceipt(&'a IngestionReceipt),
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum DestinationPublication {
+    Link,
+    Replace,
+}
+
 impl PublishTarget<'_> {
     pub(super) fn destination_name(&self) -> OsString {
         match self {
@@ -83,10 +89,10 @@ impl PublishTarget<'_> {
         }
     }
 
-    pub(super) fn replaces_destination(&self) -> bool {
+    pub(super) fn destination_publication(&self) -> DestinationPublication {
         match self {
-            Self::IngestionReceipt(_) => true,
-            Self::CacheInfo | Self::Nar(_) | Self::NarInfo(_) => false,
+            Self::IngestionReceipt(_) => DestinationPublication::Replace,
+            Self::CacheInfo | Self::Nar(_) | Self::NarInfo(_) => DestinationPublication::Link,
         }
     }
 }

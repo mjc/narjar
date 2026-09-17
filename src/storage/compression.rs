@@ -31,7 +31,12 @@ pub(super) struct CheckedUploadReader<'a, R> {
     expected_length: u64,
     bytes_read: u64,
     hasher: Sha256,
-    upload_end_validated: bool,
+    phase: UploadReadPhase,
+}
+
+enum UploadReadPhase {
+    Reading,
+    EndValidated,
 }
 
 pub(super) struct CompleteUpload<R> {
@@ -46,7 +51,7 @@ impl<'a, R> CheckedUploadReader<'a, R> {
             expected_length,
             bytes_read: 0,
             hasher: Sha256::new(),
-            upload_end_validated: false,
+            phase: UploadReadPhase::Reading,
         }
     }
 
@@ -76,23 +81,24 @@ impl<'a, R> CheckedUploadReader<'a, R> {
     where
         R: Read,
     {
-        if self.upload_end_validated {
-            return Ok(());
+        match self.phase {
+            UploadReadPhase::EndValidated => Ok(()),
+            UploadReadPhase::Reading => {
+                let mut buffer = [0; 64 * 1024];
+                if self.inner.read(&mut buffer)? != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "encoded upload has trailing bytes",
+                    ));
+                }
+                self.record_validated_upload_end()
+            }
         }
-
-        let mut buffer = [0; 64 * 1024];
-        if self.inner.read(&mut buffer)? != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "encoded upload has trailing bytes",
-            ));
-        }
-        self.record_validated_upload_end()
     }
 
     fn record_validated_upload_end(&mut self) -> io::Result<()> {
         self.validate_observed_upload_hash_and_length()?;
-        self.upload_end_validated = true;
+        self.phase = UploadReadPhase::EndValidated;
         Ok(())
     }
 }
@@ -105,27 +111,28 @@ impl<R> CompleteUpload<R> {
 
 impl<R: Read> Read for CheckedUploadReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.upload_end_validated {
-            return Ok(0);
-        }
-        let read = self.inner.read(buffer)?;
-        if read == 0 {
-            self.record_validated_upload_end()?;
-            return Ok(0);
-        }
+        match self.phase {
+            UploadReadPhase::EndValidated => Ok(0),
+            UploadReadPhase::Reading => {
+                let read = self.inner.read(buffer)?;
+                if read == 0 {
+                    self.record_validated_upload_end()?;
+                    return Ok(0);
+                }
 
-        self.bytes_read = self
-            .bytes_read
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?;
-        if self.bytes_read > self.expected_length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "NAR exceeds declared length",
-            ));
+                self.bytes_read = self.bytes_read.checked_add(read as u64).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "NAR is too large")
+                })?;
+                if self.bytes_read > self.expected_length {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "NAR exceeds declared length",
+                    ));
+                }
+                self.hasher.update(&buffer[..read]);
+                Ok(read)
+            }
         }
-        self.hasher.update(&buffer[..read]);
-        Ok(read)
     }
 }
 

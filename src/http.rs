@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    auth::{Authorizer, Permission},
+    auth::{Authorizer, Permission, ReadVisibility},
     http_server::{Method, Request, Response, ResponseHeader as Header, StatusCode, static_header},
     metrics::{Metrics, RequestGuard, RequestMethod, RequestRoute, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
@@ -44,12 +44,12 @@ fn internal_error(guard: &RequestGuard<'_>, request: Request) -> Option<TcpStrea
 fn nar_response(
     status: StatusCode,
     content_length: usize,
-    private_read: bool,
+    visibility: ReadVisibility,
 ) -> Response<io::Empty> {
     cache_policy(
         Response::new(status, io::empty(), content_length)
             .with_header(header("Content-Type", "application/x-nix-nar")),
-        private_read,
+        visibility,
         IMMUTABLE_CACHE_CONTROL,
     )
     .with_header(header("Accept-Ranges", "bytes"))
@@ -57,15 +57,14 @@ fn nar_response(
 
 fn cache_policy<R>(
     response: Response<R>,
-    private_read: bool,
+    visibility: ReadVisibility,
     public_control: &'static str,
 ) -> Response<R> {
-    if private_read {
-        response
+    match visibility {
+        ReadVisibility::Private => response
             .with_header(header("Cache-Control", "private, no-store"))
-            .with_header(header("Vary", "Authorization"))
-    } else {
-        response.with_header(header("Cache-Control", public_control))
+            .with_header(header("Vary", "Authorization")),
+        ReadVisibility::Public => response.with_header(header("Cache-Control", public_control)),
     }
 }
 
@@ -91,7 +90,7 @@ fn respond_narinfo(
     store: &StoreHash,
     trusted: &TrustedPublicKeys,
     guard: &RequestGuard<'_>,
-    private_read: bool,
+    visibility: ReadVisibility,
 ) -> Option<TcpStream> {
     let narinfo = match storage.open_narinfo(store) {
         Ok(Some(narinfo)) => narinfo,
@@ -121,7 +120,7 @@ fn respond_narinfo(
     let bytes_out = bytes.len() as u64;
     let response = cache_policy(
         Response::from_data(bytes).with_header(header("Content-Type", "text/x-nix-narinfo")),
-        private_read,
+        visibility,
         IMMUTABLE_CACHE_CONTROL,
     );
     send_response(guard, request, 200, response, bytes_out)
@@ -195,7 +194,7 @@ fn respond_nar(
     storage: &Storage,
     name: NarFileName,
     guard: &RequestGuard<'_>,
-    private_read: bool,
+    visibility: ReadVisibility,
 ) -> Option<TcpStream> {
     let file = match storage.open_nar_encoded(name) {
         Ok(Some(file)) => file,
@@ -211,7 +210,7 @@ fn respond_nar(
             let Ok(content_length) = usize::try_from(length) else {
                 return internal_error(guard, request);
             };
-            let response = nar_response(StatusCode(200), content_length, private_read);
+            let response = nar_response(StatusCode(200), content_length, visibility);
             send_file_response(
                 guard,
                 request,
@@ -227,7 +226,7 @@ fn respond_nar(
             let Ok(content_length) = usize::try_from(response_length) else {
                 return internal_error(guard, request);
             };
-            let response = nar_response(StatusCode(206), content_length, private_read).with_header(
+            let response = nar_response(StatusCode(206), content_length, visibility).with_header(
                 Header::owned("Content-Range", format!("bytes {start}-{end}/{length}")),
             );
             send_file_response(guard, request, 206, response, file, start, response_length)
@@ -724,7 +723,7 @@ pub fn respond(
         metrics.auth_failure(matches!(permission, Permission::Write));
         return unauthorized(&guard, request);
     }
-    let private_read = authorizer.has_private_reads();
+    let visibility = authorizer.read_visibility();
 
     let route = match CacheRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
@@ -748,14 +747,14 @@ pub fn respond(
             let response = cache_policy(
                 Response::from_data(cache_info)
                     .with_header(header("Content-Type", "text/x-nix-cache-info")),
-                private_read,
+                visibility,
                 "public, max-age=3600",
             );
             send_response(&guard, request, 200, response, cache_info_length)
         }
-        CacheRoute::Nar(name) => respond_nar(request, storage, name, &guard, private_read),
+        CacheRoute::Nar(name) => respond_nar(request, storage, name, &guard, visibility),
         CacheRoute::NarInfo(store) => {
-            respond_narinfo(request, storage, &store, trusted, &guard, private_read)
+            respond_narinfo(request, storage, &store, trusted, &guard, visibility)
         }
     }
 }
