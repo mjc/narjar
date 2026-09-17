@@ -22,7 +22,6 @@ use crate::object::{
 use super::publication::{StagingReservation, StorageError};
 
 const INGESTION_RECEIPT_VERSION: u8 = 1;
-const EGRESS_RECEIPT_VERSION: u8 = 1;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) struct CheckedUploadReader<'a, R> {
@@ -224,94 +223,6 @@ struct HashingWriter<'a, W: Write + ?Sized> {
 pub(super) struct EncodedOutput {
     pub(super) hash: FileHash,
     pub(super) size: EncodedSize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct EgressReceipt {
-    raw: NarIdentity,
-    output: EncodedIdentity,
-}
-
-impl EgressReceipt {
-    pub(super) fn new(raw: NarIdentity, output: EncodedIdentity) -> Self {
-        Self { raw, output }
-    }
-
-    pub(super) fn file_name(&self) -> OsString {
-        egress_receipt_file_name(self.raw, self.output.codec())
-    }
-
-    pub(super) fn bytes(&self) -> Vec<u8> {
-        format!(
-            "version={EGRESS_RECEIPT_VERSION}\nraw-hash={}\nraw-size={}\nencoding={}\nencoded-hash={}\nencoded-size={}\n",
-            self.raw.hash(),
-            self.raw.size(),
-            self.output.codec().compression(),
-            self.output.hash(),
-            self.output.size(),
-        )
-        .into_bytes()
-    }
-
-    pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        if !text.ends_with('\n') {
-            return None;
-        }
-        let mut version: Option<u8> = None;
-        let mut raw_hash = None;
-        let mut raw_size = None;
-        let mut codec = None;
-        let mut encoded_hash = None;
-        let mut encoded_size = None;
-        for line in text.lines() {
-            let (name, value) = line.split_once('=')?;
-            match name {
-                "version" if version.is_none() => version = Some(value.parse().ok()?),
-                "raw-hash" if raw_hash.is_none() => raw_hash = Some(NarHash::parse(value).ok()?),
-                "raw-size" if raw_size.is_none() => {
-                    raw_size = Some(NarSize::new(value.parse().ok()?))
-                }
-                "encoding" if codec.is_none() => {
-                    codec = Some(match value {
-                        "zstd" => CompressionCodec::Zstd,
-                        "xz" => CompressionCodec::Xz,
-                        _ => return None,
-                    })
-                }
-                "encoded-hash" if encoded_hash.is_none() => {
-                    encoded_hash = Some(FileHash::parse(value).ok()?)
-                }
-                "encoded-size" if encoded_size.is_none() => {
-                    encoded_size = Some(EncodedSize::new(value.parse().ok()?))
-                }
-                _ => return None,
-            }
-        }
-        if version? != EGRESS_RECEIPT_VERSION {
-            return None;
-        }
-        Some(Self {
-            raw: NarIdentity::new(raw_hash?, raw_size?),
-            output: EncodedIdentity::new(codec?, encoded_hash?, encoded_size?),
-        })
-    }
-
-    pub(super) fn matches(&self, raw: NarIdentity, codec: CompressionCodec) -> bool {
-        self.raw == raw && self.output.codec() == codec
-    }
-
-    pub(super) const fn output(&self) -> EncodedIdentity {
-        self.output
-    }
-
-    pub(super) const fn raw_identity(&self) -> NarIdentity {
-        self.raw
-    }
-}
-
-pub(super) fn egress_receipt_file_name(raw: NarIdentity, codec: CompressionCodec) -> OsString {
-    OsString::from(format!("{}{}.receipt", raw.hash(), codec.suffix()))
 }
 
 struct EncodedOutputHasher<'a, W: Write + ?Sized> {

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{File, Permissions},
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read},
     num::NonZeroUsize,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
@@ -14,17 +14,15 @@ use std::{
     time::SystemTime,
 };
 
-use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo, ValidatedPayload};
-use crate::object::{
-    CompressionCodec, EncodedIdentity, FileHash, NarFileName, NarHash, NarIdentity, WireEncoding,
-};
+use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo};
+use crate::object::{EncodedIdentity, FileHash, NarFileName, NarHash, WireEncoding};
 
 use super::{
     compression::{
-        CapacityCheckedStagingWriter, EgressReceipt, IngestionReceipt, egress_receipt_file_name,
-        encode_raw_nar, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
+        IngestionReceipt, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
     },
     directory::Directory,
+    egress::EGRESS_RECEIPT_DIRECTORY,
     fs::{
         StorageCapacity, directory_is_empty, ensure_directory_at, entry_is_regular_at,
         files_equal_at, filesystem_space, hard_link_at, open_at, open_directory_at,
@@ -48,9 +46,7 @@ use super::publication::{Layout, injected_fault};
 const MAX_CACHE_INFO_BYTES: u64 = 1024;
 pub(super) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
 pub(super) const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
-pub(super) const EGRESS_RECEIPT_DIRECTORY: &str = ".narjar-egress";
 pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
-pub(super) const MAX_EGRESS_RECEIPT_BYTES: u64 = 256;
 
 #[derive(Clone, Copy)]
 enum TemporaryLocation {
@@ -119,32 +115,9 @@ impl PublicationProgress {
     }
 }
 
-pub(crate) struct StoredNar<'storage> {
-    storage: &'storage Storage,
-    _file: File,
-    identity: NarIdentity,
-}
-
-struct CompressedRepresentation {
-    name: NarFileName,
-    size: crate::object::EncodedSize,
-}
-
-enum EgressDerivative {
-    Missing,
-    Corrupt,
-    Usable(CompressedRepresentation),
-}
-
-impl StoredNar<'_> {
-    pub(crate) fn identity(&self) -> NarIdentity {
-        self.identity
-    }
-}
-
 impl BoundNarInfo<'_> {
     pub(crate) fn publish(self) -> Result<PublishOutcome, StorageError> {
-        self.stored().storage.publish(
+        self.stored().storage().publish(
             PublishTarget::NarInfo(self.store()),
             Cursor::new(self.output_bytes()?),
         )
@@ -323,7 +296,7 @@ impl Storage {
         reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, bytes)
     }
 
-    fn empty_staging_reservation(
+    pub(super) fn empty_staging_reservation(
         &self,
         min_free_bytes: u64,
     ) -> Result<StagingReservation, StorageError> {
@@ -402,188 +375,11 @@ impl Storage {
         output_encoding: WireEncoding,
         policy: NarUploadPolicy,
     ) -> Result<BoundNarInfo<'_>, StorageError> {
-        let identity = match narinfo.payload() {
-            ValidatedPayload::Raw(identity) => identity,
-            ValidatedPayload::Compressed(expected) => self
-                .read_ingestion_receipt(expected)?
-                .ok_or(StorageError::NarMismatch)?
-                .decoded_identity(),
-        };
-        let (output_name, output_size) = match output_encoding {
-            WireEncoding::Raw => (
-                NarFileName::raw(identity.hash()),
-                identity.size().get().into(),
-            ),
-            WireEncoding::Zstd | WireEncoding::Xz => {
-                let output = self.compressed_representation(
-                    identity,
-                    output_encoding,
-                    policy.min_free_bytes(),
-                )?;
-                (output.name, output.size)
-            }
-        };
-        let file = self
-            .open_nar(identity.hash())?
-            .ok_or(StorageError::MissingNar)?;
-        if !nar_file_size_matches(&file, identity.size().get())? {
-            return Err(StorageError::NarMismatch);
-        }
-        let stored = StoredNar {
-            storage: self,
-            _file: file,
-            identity,
-        };
+        let stored = self.open_verified_canonical_nar(narinfo.payload())?;
+        let output = self.select_egress(&stored, output_encoding, policy)?;
         narinfo
-            .bind_raw(stored, output_name, output_size)
+            .bind_raw(stored, output.file_name(), output.size())
             .map_err(|_| StorageError::NarMismatch)
-    }
-
-    fn materialize_compressed_nar(
-        &self,
-        raw: &File,
-        identity: NarIdentity,
-        encoding: WireEncoding,
-        min_free_bytes: u64,
-        repair_output: Option<EncodedIdentity>,
-    ) -> Result<CompressedRepresentation, StorageError> {
-        let codec = compression_codec(encoding);
-        let staging_target = repair_output
-            .map(PublishTarget::RepairEgressNar)
-            .unwrap_or_else(|| PublishTarget::Nar(NarFileName::raw(identity.hash())));
-        let temp_name = self.next_temp_name(&staging_target);
-        let temporary_path = self.temporary_path(&staging_target, &temp_name);
-        let mut transaction = self.recovery.begin(&temporary_path)?;
-        let mut temp = self.create_temp_named(&staging_target, temp_name)?;
-        let output = (|| {
-            transaction.transition(PublicationState::Streaming)?;
-            let mut reservation = self.empty_staging_reservation(min_free_bytes)?;
-            let mut destination =
-                CapacityCheckedStagingWriter::new(&mut temp.file, &mut reservation, min_free_bytes);
-            #[cfg(test)]
-            self.egress_generations.fetch_add(1, Ordering::Relaxed);
-            let output = encode_raw_nar(raw, codec, &mut destination)?;
-            let actual_output = EncodedIdentity::new(codec, output.hash, output.size);
-            if repair_output.is_some_and(|expected| expected != actual_output) {
-                return Err(StorageError::NarMismatch);
-            }
-            destination.flush()?;
-            temp.file.sync_all()?;
-            transaction.transition(PublicationState::Validated)?;
-            Ok::<_, StorageError>(output)
-        })();
-        let output = match output {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = self.remove_temp(&temp);
-                return Err(error);
-            }
-        };
-        let name = NarFileName::new(output.hash, encoding);
-        let target = repair_output
-            .map(PublishTarget::RepairEgressNar)
-            .unwrap_or(PublishTarget::Nar(name));
-        self.commit_temporary(target, &temp, transaction, |_| Ok(()))?;
-        Ok(CompressedRepresentation {
-            name,
-            size: output.size,
-        })
-    }
-
-    fn compressed_representation(
-        &self,
-        identity: NarIdentity,
-        encoding: WireEncoding,
-        min_free_bytes: u64,
-    ) -> Result<CompressedRepresentation, StorageError> {
-        let codec = compression_codec(encoding);
-        let receipt_name = egress_receipt_file_name(identity, codec);
-        let lock =
-            self.destination_lock(PathBuf::from(EGRESS_RECEIPT_DIRECTORY).join(&receipt_name));
-        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let repair_output = if let Some(receipt) = self.read_egress_receipt(identity, codec)? {
-            match self.inspect_egress_derivative(receipt.output())? {
-                EgressDerivative::Usable(output) => return Ok(output),
-                EgressDerivative::Missing => None,
-                EgressDerivative::Corrupt => Some(receipt.output()),
-            }
-        } else {
-            None
-        };
-
-        let raw = self
-            .open_nar(identity.hash())?
-            .ok_or(StorageError::MissingNar)?;
-        if !nar_file_size_matches(&raw, identity.size().get())? {
-            return Err(StorageError::NarMismatch);
-        }
-        let output = self.materialize_compressed_nar(
-            &raw,
-            identity,
-            encoding,
-            min_free_bytes,
-            repair_output,
-        )?;
-        let receipt = EgressReceipt::new(
-            identity,
-            EncodedIdentity::new(codec, output.name.file_hash(), output.size),
-        );
-        self.publish_egress_receipt(receipt)?;
-        Ok(output)
-    }
-
-    fn inspect_egress_derivative(
-        &self,
-        output: EncodedIdentity,
-    ) -> Result<EgressDerivative, StorageError> {
-        let name = NarFileName::new(output.hash(), output.codec().wire_encoding());
-        let nar = self.nar_directory()?;
-        let Some(file) = open_optional_at(&nar, &name.os_string())? else {
-            return Ok(EgressDerivative::Missing);
-        };
-        if !encoded_file_matches(&file, output)? {
-            return Ok(EgressDerivative::Corrupt);
-        }
-        Ok(EgressDerivative::Usable(CompressedRepresentation {
-            name,
-            size: output.size(),
-        }))
-    }
-
-    fn egress_representation_has_expected_size(
-        &self,
-        output: EncodedIdentity,
-    ) -> Result<bool, StorageError> {
-        let name = NarFileName::new(output.hash(), output.codec().wire_encoding());
-        let nar = self.nar_directory()?;
-        let Some(file) = open_optional_at(&nar, &name.os_string())? else {
-            return Ok(false);
-        };
-        Ok(file.metadata()?.len() == output.size().get())
-    }
-
-    #[cfg(test)]
-    pub(super) fn compressed_representation_for_test(
-        &self,
-        identity: NarIdentity,
-        encoding: WireEncoding,
-        min_free_bytes: u64,
-    ) -> Result<(NarFileName, crate::object::EncodedSize), StorageError> {
-        self.compressed_representation(identity, encoding, min_free_bytes)
-            .map(|output| (output.name, output.size))
-    }
-
-    #[cfg(test)]
-    pub(super) fn materialize_compressed_nar_for_test(
-        &self,
-        raw: &File,
-        identity: NarIdentity,
-        encoding: WireEncoding,
-        min_free_bytes: u64,
-    ) -> Result<(), StorageError> {
-        self.materialize_compressed_nar(raw, identity, encoding, min_free_bytes, None)
-            .map(|_| ())
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {
@@ -684,11 +480,6 @@ impl Storage {
         self.temporary_objects.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(super) fn egress_generations(&self) -> u64 {
-        self.egress_generations.load(Ordering::Relaxed)
-    }
-
     pub fn reconcile(
         &self,
         limit: NonZeroUsize,
@@ -775,7 +566,7 @@ impl Storage {
             let mut finalize_publication = |publish_result: io::Result<()>| match publish_result {
                 Ok(()) => {
                     match publication {
-                        DestinationPublication::Replace | DestinationPublication::Repair => {
+                        DestinationPublication::Replace | DestinationPublication::Repair(_) => {
                             progress.mark_temporary_moved();
                             temp.directory.sync_all()?;
                         }
@@ -787,7 +578,8 @@ impl Storage {
                             DestinationPublication::Link => {
                                 rollback_link_at(&destination_directory, &destination_name)?;
                             }
-                            DestinationPublication::Replace | DestinationPublication::Repair => {}
+                            DestinationPublication::Replace | DestinationPublication::Repair(_) => {
+                            }
                         }
                         return Err(error);
                     }
@@ -796,7 +588,8 @@ impl Storage {
                             DestinationPublication::Link => {
                                 rollback_link_at(&destination_directory, &destination_name)?;
                             }
-                            DestinationPublication::Replace | DestinationPublication::Repair => {}
+                            DestinationPublication::Replace | DestinationPublication::Repair(_) => {
+                            }
                         }
                         return Err(error.into());
                     }
@@ -806,7 +599,7 @@ impl Storage {
                     Ok(PublishOutcome::Created)
                 }
                 Err(error) => match publication {
-                    DestinationPublication::Link | DestinationPublication::Repair
+                    DestinationPublication::Link | DestinationPublication::Repair(_)
                         if error.kind() == io::ErrorKind::AlreadyExists =>
                     {
                         let identical = match publication {
@@ -816,7 +609,7 @@ impl Storage {
                                 &destination_directory,
                                 &destination_name,
                             )?,
-                            DestinationPublication::Repair => true,
+                            DestinationPublication::Repair(_) => true,
                             DestinationPublication::Replace => false,
                         };
                         if identical {
@@ -828,7 +621,7 @@ impl Storage {
                     }
                     DestinationPublication::Link
                     | DestinationPublication::Replace
-                    | DestinationPublication::Repair => Err(error.into()),
+                    | DestinationPublication::Repair(_) => Err(error.into()),
                 },
             };
             match publication {
@@ -850,11 +643,7 @@ impl Storage {
                         &destination_name,
                     ))
                 }
-                DestinationPublication::Repair => {
-                    let output = match &target {
-                        PublishTarget::RepairEgressNar(output) => *output,
-                        _ => unreachable!("repair publication requires an egress target"),
-                    };
+                DestinationPublication::Repair(output) => {
                     let destination_lock = self.destination_lock(destination_key);
                     let _destination_guard = destination_lock
                         .lock()
@@ -909,12 +698,12 @@ impl Storage {
     }
 
     pub(super) fn next_temp_name(&self, target: &PublishTarget<'_>) -> OsString {
+        self.next_temp_name_with_prefix(target.temp_prefix())
+    }
+
+    pub(super) fn next_temp_name_with_prefix(&self, prefix: &str) -> OsString {
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        OsString::from(format!(
-            "{}-{}-{sequence:016x}.part",
-            target.temp_prefix(),
-            process::id()
-        ))
+        OsString::from(format!("{prefix}-{}-{sequence:016x}.part", process::id()))
     }
 
     pub(super) fn temporary_path(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
@@ -943,6 +732,21 @@ impl Storage {
             | PublishTarget::IngestionReceipt(_)
             | PublishTarget::EgressReceipt(_) => self.temp_directory()?,
         };
+        self.create_temp_in_directory(directory, name)
+    }
+
+    pub(super) fn create_nar_temp_named(
+        &self,
+        name: OsString,
+    ) -> Result<TemporaryFile, StorageError> {
+        self.create_temp_in_directory(self.nar_temp_directory()?, name)
+    }
+
+    fn create_temp_in_directory(
+        &self,
+        directory: File,
+        name: OsString,
+    ) -> Result<TemporaryFile, StorageError> {
         let file = open_at(
             &directory,
             &name,
@@ -1031,14 +835,6 @@ impl Storage {
         )?)
     }
 
-    pub(super) fn egress_receipt_directory(&self) -> Result<File, StorageError> {
-        let root = self.root_directory()?;
-        Ok(open_directory_at(
-            &root,
-            OsStr::new(EGRESS_RECEIPT_DIRECTORY),
-        )?)
-    }
-
     pub(super) fn publish_ingestion_receipt(
         &self,
         receipt: IngestionReceipt,
@@ -1058,93 +854,6 @@ impl Storage {
         let name = ingestion_receipt_file_name(expectation);
         Ok(Self::read_ingestion_receipt_file(&directory, &name)?
             .filter(|receipt| receipt.matches(expectation)))
-    }
-
-    fn publish_egress_receipt(
-        &self,
-        receipt: EgressReceipt,
-    ) -> Result<PublishOutcome, StorageError> {
-        self.publish(
-            PublishTarget::EgressReceipt(&receipt),
-            Cursor::new(receipt.bytes()),
-        )
-    }
-
-    fn read_egress_receipt(
-        &self,
-        identity: NarIdentity,
-        codec: CompressionCodec,
-    ) -> Result<Option<EgressReceipt>, StorageError> {
-        let directory = self.egress_receipt_directory()?;
-        let name = egress_receipt_file_name(identity, codec);
-        let file = match open_regular_at(&directory, &name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error)
-                if error.kind() == io::ErrorKind::InvalidData
-                    || error.raw_os_error() == Some(libc::ELOOP) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let mut bytes = Vec::new();
-        file.take(MAX_EGRESS_RECEIPT_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_EGRESS_RECEIPT_BYTES {
-            return Ok(None);
-        }
-        Ok(EgressReceipt::parse(&bytes).filter(|receipt| receipt.matches(identity, codec)))
-    }
-
-    fn remove_orphan_egress_receipts(&self) -> Result<(), StorageError> {
-        let receipts = self.egress_receipt_directory()?;
-        let mut removed = false;
-        for name in read_dir_names(&receipts)? {
-            let Some(receipt) = Self::read_egress_receipt_file(&receipts, &name)? else {
-                unlink_at(&receipts, &name)?;
-                removed = true;
-                continue;
-            };
-            let raw = self.open_nar(receipt.raw_identity().hash())?;
-            let output = self.egress_representation_has_expected_size(receipt.output())?;
-            let usable = raw.is_some_and(|file| {
-                file.metadata()
-                    .is_ok_and(|metadata| metadata.len() == receipt.raw_identity().size().get())
-            }) && output;
-            if !usable {
-                unlink_at(&receipts, &name)?;
-                removed = true;
-            }
-        }
-        if removed {
-            receipts.sync_all()?;
-        }
-        Ok(())
-    }
-
-    fn read_egress_receipt_file(
-        directory: &File,
-        name: &OsStr,
-    ) -> Result<Option<EgressReceipt>, StorageError> {
-        let file = match open_regular_at(directory, name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error)
-                if error.kind() == io::ErrorKind::InvalidData
-                    || error.raw_os_error() == Some(libc::ELOOP) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let mut bytes = Vec::new();
-        file.take(MAX_EGRESS_RECEIPT_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_EGRESS_RECEIPT_BYTES {
-            return Ok(None);
-        }
-        Ok(EgressReceipt::parse(&bytes).filter(|receipt| receipt.file_name().as_os_str() == name))
     }
 
     pub(super) fn remove_orphan_ingestion_receipts(&self) -> Result<(), StorageError> {
@@ -1261,13 +970,5 @@ impl Storage {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(key, Arc::downgrade(&lock));
         lock
-    }
-}
-
-fn compression_codec(encoding: WireEncoding) -> CompressionCodec {
-    match encoding {
-        WireEncoding::Zstd => CompressionCodec::Zstd,
-        WireEncoding::Xz => CompressionCodec::Xz,
-        WireEncoding::Raw => unreachable!("raw output does not have a compression codec"),
     }
 }

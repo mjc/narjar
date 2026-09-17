@@ -1,5 +1,6 @@
 mod compression;
 mod directory;
+mod egress;
 mod fs;
 pub mod gc;
 mod ids;
@@ -21,8 +22,8 @@ pub use crate::object::{
     EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize, WireEncoding,
 };
 pub use directory::Directory;
+pub(crate) use egress::StoredNar;
 pub use ids::{InvalidObjectId, StoreHash};
-pub(crate) use operations::StoredNar;
 pub use publication::{
     NarUploadPolicy, PublishOutcome, PublishedPair, StagingReservation, StorageError,
 };

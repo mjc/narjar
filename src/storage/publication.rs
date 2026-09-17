@@ -10,7 +10,8 @@ use std::{
 use std::path::PathBuf;
 
 use super::{
-    compression::{EgressReceipt, IngestionReceipt},
+    compression::IngestionReceipt,
+    egress::EgressReceipt,
     fs::{FilesystemSpace, filesystem_space, lock_exclusive, open_at},
     ids::StoreHash,
 };
@@ -74,7 +75,7 @@ pub(super) enum PublishTarget<'a> {
 pub(super) enum DestinationPublication {
     Link,
     Replace,
-    Repair,
+    Repair(EncodedIdentity),
 }
 
 impl PublishTarget<'_> {
@@ -105,7 +106,7 @@ impl PublishTarget<'_> {
     pub(super) fn destination_publication(&self) -> DestinationPublication {
         match self {
             Self::IngestionReceipt(_) | Self::EgressReceipt(_) => DestinationPublication::Replace,
-            Self::RepairEgressNar(_) => DestinationPublication::Repair,
+            Self::RepairEgressNar(output) => DestinationPublication::Repair(*output),
             Self::CacheInfo | Self::Nar(_) | Self::NarInfo(_) => DestinationPublication::Link,
         }
     }

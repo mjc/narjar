@@ -85,6 +85,10 @@ impl EncodedIdentity {
     pub(crate) const fn size(self) -> EncodedSize {
         self.size
     }
+
+    pub(crate) const fn file_name(self) -> NarFileName {
+        NarFileName::new(self.hash, self.codec.wire_encoding())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

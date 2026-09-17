@@ -23,7 +23,6 @@ use super::{
 use crate::narinfo::{CompressedNarExpectation, NarEncoding};
 use crate::object::{
     CompressionCodec, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize,
-    WireEncoding,
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
@@ -623,7 +622,7 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
     let result = storage.materialize_compressed_nar_for_test(
         &raw_file,
         NarIdentity::new(raw_hash, (raw.len() as u64).into()),
-        WireEncoding::Zstd,
+        CompressionCodec::Zstd,
         min_free_bytes,
     );
 
@@ -658,11 +657,11 @@ fn repeated_compressed_egress_reuses_its_durable_derivative() {
         .expect("raw NAR should be stored");
 
     let first = storage
-        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
         .expect("first derivative should be created");
     assert_eq!(storage.egress_generations(), 1);
     let second = storage
-        .compressed_representation_for_test(identity, WireEncoding::Zstd, u64::MAX)
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, u64::MAX)
         .expect("second publication should reuse the derivative");
 
     assert_eq!(second, first);
@@ -688,7 +687,7 @@ fn restarting_storage_reuses_a_durable_compressed_derivative() {
             .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
             .expect("raw NAR should be stored");
         let output = storage
-            .compressed_representation_for_test(identity, WireEncoding::Xz, 0)
+            .compressed_representation_for_test(identity, CompressionCodec::Xz, 0)
             .expect("first derivative should be created");
         (output, storage.egress_generations())
     };
@@ -696,7 +695,7 @@ fn restarting_storage_reuses_a_durable_compressed_derivative() {
 
     let restarted = initialize_storage(directory.path()).expect("storage should restart");
     let second = restarted
-        .compressed_representation_for_test(identity, WireEncoding::Xz, u64::MAX)
+        .compressed_representation_for_test(identity, CompressionCodec::Xz, u64::MAX)
         .expect("restart should reuse the derivative");
 
     assert_eq!(second, first);
@@ -715,13 +714,13 @@ fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
         .expect("raw NAR should be stored");
 
     let first = storage
-        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
         .expect("first derivative should be created");
     fs::remove_file(storage.layout().nar_path_encoded(first.0))
         .expect("derivative should be removable for the recovery test");
 
     let rebuilt = storage
-        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
         .expect("missing derivative should be rebuilt");
 
     assert_eq!(rebuilt, first);
@@ -729,16 +728,67 @@ fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
 }
 
 #[test]
+fn missing_compressed_derivative_must_reproduce_its_receipt_identity() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let raw = b"raw NAR with a binding receipt";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let output = storage
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+        .expect("derivative should be created");
+    fs::remove_file(storage.layout().nar_path_encoded(output.0))
+        .expect("derivative should be removable for the binding test");
+    let receipt_path = fs::read_dir(storage.layout().egress_receipt_dir())
+        .expect("egress receipt directory should be readable")
+        .next()
+        .expect("egress receipt should exist")
+        .expect("egress receipt should be readable")
+        .path();
+    let receipt = String::from_utf8(fs::read(&receipt_path).expect("receipt should be readable"))
+        .expect("receipt should be UTF-8");
+    let rewritten = receipt
+        .lines()
+        .map(|line| {
+            line.strip_prefix("encoded-hash=").map_or_else(
+                || line.to_owned(),
+                |value| format!("encoded-hash={}", "0".repeat(value.len())),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(receipt_path, rewritten).expect("test should rewrite the receipt identity");
+
+    assert!(matches!(
+        storage.compressed_representation_for_test(identity, CompressionCodec::Zstd, 0),
+        Err(StorageError::NarMismatch)
+    ));
+}
+
+#[test]
 fn same_size_corrupt_compressed_derivative_is_repaired() {
-    assert_egress_derivative_is_repaired(|bytes| bytes[0] ^= 1);
+    assert_egress_derivative_is_repaired(|bytes| bytes[0] ^= 1, false);
 }
 
 #[test]
 fn truncated_compressed_derivative_is_repaired() {
-    assert_egress_derivative_is_repaired(|bytes| bytes.truncate(bytes.len() / 2));
+    assert_egress_derivative_is_repaired(|bytes| bytes.truncate(bytes.len() / 2), false);
 }
 
-fn assert_egress_derivative_is_repaired(corrupt_derivative: impl FnOnce(&mut Vec<u8>)) {
+#[test]
+fn server_generated_derivative_is_repaired_without_a_receipt() {
+    assert_egress_derivative_is_repaired(|bytes| bytes[0] ^= 1, true);
+}
+
+fn assert_egress_derivative_is_repaired(
+    corrupt_derivative: impl FnOnce(&mut Vec<u8>),
+    remove_receipt: bool,
+) {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("storage should initialize");
     let raw = b"raw NAR with a corrupt derivative";
@@ -749,17 +799,36 @@ fn assert_egress_derivative_is_repaired(corrupt_derivative: impl FnOnce(&mut Vec
         .expect("raw NAR should be stored");
 
     let output = storage
-        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
         .expect("derivative should be created");
     let output_path = storage.layout().nar_path_encoded(output.0);
     let original = fs::read(&output_path).expect("derivative should be readable");
     let mut corrupt = fs::read(&output_path).expect("derivative should be readable");
     corrupt_derivative(&mut corrupt);
     fs::write(&output_path, &corrupt).expect("test should corrupt the derivative");
+    storage
+        .finish_recovery()
+        .expect("recovery should retain repair evidence for an existing raw NAR");
+    assert_eq!(
+        fs::read_dir(storage.layout().egress_receipt_dir())
+            .expect("egress receipt directory should be readable")
+            .count(),
+        1,
+        "recovery must retain the receipt while its raw source exists"
+    );
+    if remove_receipt {
+        let receipt = fs::read_dir(storage.layout().egress_receipt_dir())
+            .expect("egress receipt directory should be readable")
+            .next()
+            .expect("egress receipt should exist")
+            .expect("egress receipt should be readable")
+            .path();
+        fs::remove_file(receipt).expect("test should remove the egress receipt");
+    }
 
     assert_eq!(
         storage
-            .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+            .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
             .expect("a server-generated corrupt derivative should be repaired"),
         output
     );
@@ -790,7 +859,7 @@ fn concurrent_requests_coalesce_compressed_derivative_generation() {
             std::thread::spawn(move || {
                 barrier.wait();
                 storage
-                    .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+                    .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
                     .expect("coalesced derivative generation should succeed")
             })
         })
