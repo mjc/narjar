@@ -9,6 +9,7 @@ use std::{
 
 use lzma_rust2::XzReader;
 use lzma_rust2::{XzOptions, XzWriter};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
@@ -20,8 +21,10 @@ use crate::object::{
 };
 
 use super::publication::{StagingReservation, StorageError};
+use super::receipt::parse_legacy_fields;
 
-const INGESTION_RECEIPT_VERSION: u8 = 1;
+const LEGACY_INGESTION_RECEIPT_VERSION: u8 = 1;
+const INGESTION_RECEIPT_VERSION: u8 = 2;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) struct CheckedUploadReader<'a, R> {
@@ -532,52 +535,45 @@ pub(super) struct IngestionReceipt {
     decoded: NarIdentity,
 }
 
-#[derive(Default)]
-struct IngestionReceiptFields {
-    version: Option<u8>,
-    codec: Option<CompressionCodec>,
-    encoded_hash: Option<FileHash>,
-    encoded_size: Option<EncodedSize>,
-    decoded_hash: Option<NarHash>,
-    decoded_size: Option<NarSize>,
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IngestionReceiptRecord {
+    version: u8,
+    encoding: CompressionCodec,
+    #[serde(rename = "encoded-hash")]
+    encoded_hash: String,
+    #[serde(rename = "encoded-size")]
+    encoded_size: u64,
+    #[serde(rename = "decoded-hash")]
+    decoded_hash: String,
+    #[serde(rename = "decoded-size")]
+    decoded_size: u64,
 }
 
-impl IngestionReceiptFields {
-    fn record(mut self, line: &str) -> Option<Self> {
-        let (name, value) = line.split_once('=')?;
-        match name {
-            "version" if self.version.is_none() => {
-                self.version = Some(value.parse().ok()?);
-            }
-            "encoding" if self.codec.is_none() => {
-                self.codec = Some(match value {
-                    "zstd" => CompressionCodec::Zstd,
-                    "xz" => CompressionCodec::Xz,
-                    _ => return None,
-                });
-            }
-            "encoded-hash" if self.encoded_hash.is_none() => {
-                self.encoded_hash = Some(FileHash::parse(value).ok()?);
-            }
-            "encoded-size" if self.encoded_size.is_none() => {
-                self.encoded_size = Some(EncodedSize::new(value.parse().ok()?));
-            }
-            "decoded-hash" if self.decoded_hash.is_none() => {
-                self.decoded_hash = Some(NarHash::parse(value).ok()?);
-            }
-            "decoded-size" if self.decoded_size.is_none() => {
-                self.decoded_size = Some(NarSize::new(value.parse().ok()?));
-            }
-            _ => return None,
+impl IngestionReceiptRecord {
+    fn from_receipt(receipt: &IngestionReceipt) -> Self {
+        Self {
+            version: INGESTION_RECEIPT_VERSION,
+            encoding: receipt.encoded.codec(),
+            encoded_hash: receipt.encoded.hash().to_string(),
+            encoded_size: receipt.encoded.size().get(),
+            decoded_hash: receipt.decoded.hash().to_string(),
+            decoded_size: receipt.decoded.size().get(),
         }
-        Some(self)
     }
 
-    fn finish(self) -> Option<IngestionReceipt> {
-        (self.version? == INGESTION_RECEIPT_VERSION).then_some(())?;
+    fn into_receipt(self) -> Option<IngestionReceipt> {
+        (self.version == INGESTION_RECEIPT_VERSION).then_some(())?;
         Some(IngestionReceipt {
-            encoded: EncodedIdentity::new(self.codec?, self.encoded_hash?, self.encoded_size?),
-            decoded: NarIdentity::new(self.decoded_hash?, self.decoded_size?),
+            encoded: EncodedIdentity::new(
+                self.encoding,
+                FileHash::parse(&self.encoded_hash).ok()?,
+                self.encoded_size.into(),
+            ),
+            decoded: NarIdentity::new(
+                NarHash::parse(&self.decoded_hash).ok()?,
+                self.decoded_size.into(),
+            ),
         })
     }
 }
@@ -599,28 +595,15 @@ impl IngestionReceipt {
     }
 
     pub(super) fn bytes(&self) -> Vec<u8> {
-        format!(
-            "version={INGESTION_RECEIPT_VERSION}\nencoding={}\nencoded-hash={}\nencoded-size={}\ndecoded-hash={}\ndecoded-size={}\n",
-            self.encoded.codec().compression(),
-            self.encoded.hash(),
-            self.encoded.size(),
-            self.decoded.hash(),
-            self.decoded.size(),
-        )
-        .into_bytes()
+        serde_json::to_vec(&IngestionReceiptRecord::from_receipt(self))
+            .expect("ingestion receipt serialization cannot fail")
     }
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        text.ends_with('\n')
-            .then_some(text)
-            .and_then(|text| {
-                text.lines().try_fold(
-                    IngestionReceiptFields::default(),
-                    IngestionReceiptFields::record,
-                )
-            })
-            .and_then(IngestionReceiptFields::finish)
+        serde_json::from_slice::<IngestionReceiptRecord>(bytes)
+            .ok()
+            .and_then(IngestionReceiptRecord::into_receipt)
+            .or_else(|| parse_legacy_ingestion_receipt(bytes))
     }
 
     pub(super) fn matches(&self, expectation: CompressedNarExpectation) -> bool {
@@ -630,6 +613,23 @@ impl IngestionReceipt {
     pub(super) fn decoded_identity(&self) -> NarIdentity {
         self.decoded
     }
+}
+
+fn parse_legacy_ingestion_receipt(bytes: &[u8]) -> Option<IngestionReceipt> {
+    let fields = parse_legacy_fields(bytes, 6)?;
+    let version = fields.get("version")?.parse::<u8>().ok()?;
+    (version == LEGACY_INGESTION_RECEIPT_VERSION).then_some(())?;
+    Some(IngestionReceipt {
+        encoded: EncodedIdentity::new(
+            fields.get("encoding")?.parse().ok()?,
+            FileHash::parse(fields.get("encoded-hash")?).ok()?,
+            fields.get("encoded-size")?.parse::<u64>().ok()?.into(),
+        ),
+        decoded: NarIdentity::new(
+            NarHash::parse(fields.get("decoded-hash")?).ok()?,
+            fields.get("decoded-size")?.parse::<u64>().ok()?.into(),
+        ),
+    })
 }
 
 pub(super) fn ingestion_receipt_file_name(expectation: CompressedNarExpectation) -> OsString {

@@ -1,6 +1,7 @@
-use std::{ffi::OsString, fmt, sync::OnceLock};
+use std::{ffi::OsString, fmt, str::FromStr, sync::OnceLock};
 
 use data_encoding::{BitOrder, Encoding, Specification};
+use serde::{Deserialize, Serialize};
 
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const NIX32_SHA256_LEN: usize = 52;
@@ -221,10 +222,23 @@ pub enum WireEncoding {
     Xz,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum CompressionCodec {
     Zstd,
     Xz,
+}
+
+impl FromStr for CompressionCodec {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "zstd" => Ok(Self::Zstd),
+            "xz" => Ok(Self::Xz),
+            _ => Err(()),
+        }
+    }
 }
 
 impl CompressionCodec {
@@ -233,10 +247,6 @@ impl CompressionCodec {
             Self::Zstd => WireEncoding::Zstd,
             Self::Xz => WireEncoding::Xz,
         }
-    }
-
-    pub(crate) const fn compression(self) -> &'static str {
-        self.wire_encoding().compression()
     }
 
     pub(crate) const fn suffix(self) -> &'static str {

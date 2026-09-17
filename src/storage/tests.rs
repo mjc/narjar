@@ -10,9 +10,10 @@ use std::{
 };
 
 use super::compression::{
-    CheckedUploadReader, DecodedValidation, nar_file_size_matches, receive_uploaded_nar,
-    verify_decoded_compressed_file, verify_encoded_compressed_file,
+    CheckedUploadReader, DecodedValidation, IngestionReceipt, nar_file_size_matches,
+    receive_uploaded_nar, verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
+use super::egress::{EgressReceipt, EgressSlot};
 use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sync_dir};
 use super::ids::nix32_sha256;
 use super::publication::{Layout, PublishBoundary, PublishTarget};
@@ -22,7 +23,8 @@ use super::{
 };
 use crate::narinfo::{CompressedNarExpectation, NarEncoding};
 use crate::object::{
-    CompressionCodec, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize,
+    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
+    NarSize,
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
@@ -30,6 +32,54 @@ use structured_zstd::encoding::{CompressionLevel, compress};
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const STORE_HASH: &str = "00000000000000000000000000000000";
+
+#[test]
+fn receipt_parser_accepts_new_records_and_existing_legacy_records() {
+    let raw_hash = NarHash::parse(NAR_ID).expect("test NAR hash is valid");
+    let encoded_hash = FileHash::parse(NAR_ID).expect("test file hash is valid");
+    let raw_size = NarSize::new(17);
+    let encoded_size = EncodedSize::new(23);
+    let legacy_ingestion = format!(
+        "version=1\nencoding=zstd\nencoded-hash={encoded_hash}\nencoded-size={encoded_size}\ndecoded-hash={raw_hash}\ndecoded-size={raw_size}\n"
+    );
+    let ingestion = IngestionReceipt::parse(legacy_ingestion.as_bytes())
+        .expect("legacy ingestion receipt should remain readable");
+    assert_eq!(
+        ingestion.decoded_identity(),
+        NarIdentity::new(raw_hash, raw_size)
+    );
+
+    let json_ingestion = format!(
+        r#"{{"version":2,"encoding":"zstd","encoded-hash":"{encoded_hash}","encoded-size":{encoded_size},"decoded-hash":"{raw_hash}","decoded-size":{raw_size}}}"#
+    );
+    assert_eq!(
+        IngestionReceipt::parse(json_ingestion.as_bytes())
+            .expect("JSON ingestion receipt should be readable")
+            .decoded_identity(),
+        NarIdentity::new(raw_hash, raw_size)
+    );
+
+    let json_egress = format!(
+        r#"{{"version":2,"raw-hash":"{raw_hash}","raw-size":{raw_size},"encoding":"zstd","encoded-hash":"{encoded_hash}","encoded-size":{encoded_size}}}"#
+    );
+    let slot = EgressSlot::new(NarIdentity::new(raw_hash, raw_size), CompressionCodec::Zstd);
+    let egress = EgressReceipt::parse(json_egress.as_bytes())
+        .expect("JSON egress receipt should be readable");
+    assert!(egress.matches(slot));
+    assert_eq!(
+        egress.output(),
+        EncodedIdentity::new(CompressionCodec::Zstd, encoded_hash, encoded_size)
+    );
+
+    let legacy_egress = format!(
+        "version=1\nraw-hash={raw_hash}\nraw-size={raw_size}\nencoding=zstd\nencoded-hash={encoded_hash}\nencoded-size={encoded_size}\n"
+    );
+    assert!(
+        EgressReceipt::parse(legacy_egress.as_bytes())
+            .expect("legacy egress receipt should remain readable")
+            .matches(slot)
+    );
+}
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
     Storage::initialize(&Directory::open(path)?)
@@ -744,20 +794,15 @@ fn missing_compressed_derivative_must_reproduce_its_receipt_identity() {
         .expect("egress receipt should exist")
         .expect("egress receipt should be readable")
         .path();
-    let receipt = String::from_utf8(fs::read(&receipt_path).expect("receipt should be readable"))
-        .expect("receipt should be UTF-8");
-    let rewritten = receipt
-        .lines()
-        .map(|line| {
-            line.strip_prefix("encoded-hash=").map_or_else(
-                || line.to_owned(),
-                |value| format!("encoded-hash={}", "0".repeat(value.len())),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
-    fs::write(receipt_path, rewritten).expect("test should rewrite the receipt identity");
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).expect("receipt should be readable"))
+            .expect("receipt should be JSON");
+    receipt["encoded-hash"] = serde_json::Value::String("0".repeat(52));
+    fs::write(
+        receipt_path,
+        serde_json::to_vec(&receipt).expect("rewritten receipt should be JSON"),
+    )
+    .expect("test should rewrite the receipt identity");
 
     assert!(matches!(
         storage.compressed_representation_for_test(identity, CompressionCodec::Zstd, 0),

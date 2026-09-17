@@ -8,10 +8,11 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
+use serde::{Deserialize, Serialize};
+
 use crate::narinfo::ValidatedPayload;
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, NarFileName, NarHash, NarIdentity, NarSize,
-    WireEncoding,
+    CompressionCodec, EncodedIdentity, EncodedSize, NarFileName, NarHash, NarIdentity, WireEncoding,
 };
 
 use super::compression::{
@@ -21,10 +22,12 @@ use super::fs::{open_optional_at, open_regular_at, read_dir_names, unlink_at};
 use super::publication::{
     NarUploadPolicy, PublishOutcome, PublishTarget, StorageError, TemporaryFile,
 };
+use super::receipt::parse_legacy_fields;
 use super::recovery::PublicationState;
 use super::state::Storage;
 
-const EGRESS_RECEIPT_VERSION: u8 = 1;
+const LEGACY_EGRESS_RECEIPT_VERSION: u8 = 1;
+const EGRESS_RECEIPT_VERSION: u8 = 2;
 pub(super) const EGRESS_RECEIPT_DIRECTORY: &str = ".narjar-egress";
 pub(super) const MAX_EGRESS_RECEIPT_BYTES: u64 = 256;
 
@@ -139,53 +142,43 @@ impl CleanupAction {
     }
 }
 
-#[derive(Default)]
-struct EgressReceiptFields {
-    version: Option<u8>,
-    raw_hash: Option<NarHash>,
-    raw_size: Option<NarSize>,
-    codec: Option<CompressionCodec>,
-    encoded_hash: Option<crate::object::FileHash>,
-    encoded_size: Option<EncodedSize>,
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EgressReceiptRecord {
+    version: u8,
+    #[serde(rename = "raw-hash")]
+    raw_hash: String,
+    #[serde(rename = "raw-size")]
+    raw_size: u64,
+    encoding: CompressionCodec,
+    #[serde(rename = "encoded-hash")]
+    encoded_hash: String,
+    #[serde(rename = "encoded-size")]
+    encoded_size: u64,
 }
 
-impl EgressReceiptFields {
-    fn record(mut self, line: &str) -> Option<Self> {
-        let (name, value) = line.split_once('=')?;
-        match name {
-            "version" if self.version.is_none() => {
-                self.version = Some(value.parse().ok()?);
-            }
-            "raw-hash" if self.raw_hash.is_none() => {
-                self.raw_hash = Some(NarHash::parse(value).ok()?);
-            }
-            "raw-size" if self.raw_size.is_none() => {
-                self.raw_size = Some(value.parse::<u64>().ok()?.into());
-            }
-            "encoding" if self.codec.is_none() => {
-                self.codec = Some(match value {
-                    "zstd" => CompressionCodec::Zstd,
-                    "xz" => CompressionCodec::Xz,
-                    _ => return None,
-                });
-            }
-            "encoded-hash" if self.encoded_hash.is_none() => {
-                self.encoded_hash = Some(crate::object::FileHash::parse(value).ok()?);
-            }
-            "encoded-size" if self.encoded_size.is_none() => {
-                self.encoded_size = Some(value.parse::<u64>().ok()?.into());
-            }
-            _ => return None,
+impl EgressReceiptRecord {
+    fn from_receipt(receipt: &EgressReceipt) -> Self {
+        Self {
+            version: EGRESS_RECEIPT_VERSION,
+            raw_hash: receipt.slot.raw().hash().to_string(),
+            raw_size: receipt.slot.raw().size().get(),
+            encoding: receipt.slot.codec(),
+            encoded_hash: receipt.output.hash().to_string(),
+            encoded_size: receipt.output.size().get(),
         }
-        Some(self)
     }
 
-    fn finish(self) -> Option<EgressReceipt> {
-        (self.version? == EGRESS_RECEIPT_VERSION).then_some(())?;
-        let codec = self.codec?;
+    fn into_receipt(self) -> Option<EgressReceipt> {
+        (self.version == EGRESS_RECEIPT_VERSION).then_some(())?;
+        let raw = NarIdentity::new(NarHash::parse(&self.raw_hash).ok()?, self.raw_size.into());
         Some(EgressReceipt::new(
-            EgressSlot::new(NarIdentity::new(self.raw_hash?, self.raw_size?), codec),
-            EncodedIdentity::new(codec, self.encoded_hash?, self.encoded_size?),
+            EgressSlot::new(raw, self.encoding),
+            EncodedIdentity::new(
+                self.encoding,
+                crate::object::FileHash::parse(&self.encoded_hash).ok()?,
+                self.encoded_size.into(),
+            ),
         ))
     }
 }
@@ -331,26 +324,15 @@ impl EgressReceipt {
     }
 
     pub(super) fn bytes(&self) -> Vec<u8> {
-        format!(
-            "version={EGRESS_RECEIPT_VERSION}\nraw-hash={}\nraw-size={}\nencoding={}\nencoded-hash={}\nencoded-size={}\n",
-            self.slot.raw().hash(),
-            self.slot.raw().size(),
-            self.slot.codec().compression(),
-            self.output.hash(),
-            self.output.size(),
-        )
-        .into_bytes()
+        serde_json::to_vec(&EgressReceiptRecord::from_receipt(self))
+            .expect("egress receipt serialization cannot fail")
     }
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        text.ends_with('\n')
-            .then_some(text)
-            .and_then(|text| {
-                text.lines()
-                    .try_fold(EgressReceiptFields::default(), EgressReceiptFields::record)
-            })
-            .and_then(EgressReceiptFields::finish)
+        serde_json::from_slice::<EgressReceiptRecord>(bytes)
+            .ok()
+            .and_then(EgressReceiptRecord::into_receipt)
+            .or_else(|| parse_legacy_egress_receipt(bytes))
     }
 
     pub(super) fn matches(&self, slot: EgressSlot) -> bool {
@@ -364,6 +346,27 @@ impl EgressReceipt {
     pub(super) const fn slot(&self) -> EgressSlot {
         self.slot
     }
+}
+
+fn parse_legacy_egress_receipt(bytes: &[u8]) -> Option<EgressReceipt> {
+    let fields = parse_legacy_fields(bytes, 6)?;
+    let version = fields.get("version")?.parse::<u8>().ok()?;
+    (version == LEGACY_EGRESS_RECEIPT_VERSION).then_some(())?;
+    let codec = fields.get("encoding")?.parse().ok()?;
+    Some(EgressReceipt::new(
+        EgressSlot::new(
+            NarIdentity::new(
+                NarHash::parse(fields.get("raw-hash")?).ok()?,
+                fields.get("raw-size")?.parse::<u64>().ok()?.into(),
+            ),
+            codec,
+        ),
+        EncodedIdentity::new(
+            codec,
+            crate::object::FileHash::parse(fields.get("encoded-hash")?).ok()?,
+            fields.get("encoded-size")?.parse::<u64>().ok()?.into(),
+        ),
+    ))
 }
 
 impl Storage {
