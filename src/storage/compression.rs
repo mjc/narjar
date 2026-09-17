@@ -21,10 +21,7 @@ use crate::object::{
 };
 
 use super::publication::{StagingReservation, StorageError};
-use super::receipt::parse_legacy_fields;
-
-const LEGACY_INGESTION_RECEIPT_VERSION: u8 = 1;
-const INGESTION_RECEIPT_VERSION: u8 = 2;
+const INGESTION_RECEIPT_VERSION: u8 = 1;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) struct CheckedUploadReader<'a, R> {
@@ -536,18 +533,13 @@ pub(super) struct IngestionReceipt {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct IngestionReceiptRecord {
     version: u8,
     encoding: CompressionCodec,
-    #[serde(rename = "encoded-hash")]
-    encoded_hash: String,
-    #[serde(rename = "encoded-size")]
-    encoded_size: u64,
-    #[serde(rename = "decoded-hash")]
-    decoded_hash: String,
-    #[serde(rename = "decoded-size")]
-    decoded_size: u64,
+    encoded_hash: FileHash,
+    encoded_size: EncodedSize,
+    decoded_hash: NarHash,
+    decoded_size: NarSize,
 }
 
 impl IngestionReceiptRecord {
@@ -555,31 +547,24 @@ impl IngestionReceiptRecord {
         Self {
             version: INGESTION_RECEIPT_VERSION,
             encoding: receipt.encoded.codec(),
-            encoded_hash: receipt.encoded.hash().to_string(),
-            encoded_size: receipt.encoded.size().get(),
-            decoded_hash: receipt.decoded.hash().to_string(),
-            decoded_size: receipt.decoded.size().get(),
+            encoded_hash: receipt.encoded.hash(),
+            encoded_size: receipt.encoded.size(),
+            decoded_hash: receipt.decoded.hash(),
+            decoded_size: receipt.decoded.size(),
         }
     }
 
     fn into_receipt(self) -> Option<IngestionReceipt> {
         (self.version == INGESTION_RECEIPT_VERSION).then_some(())?;
         Some(IngestionReceipt {
-            encoded: EncodedIdentity::new(
-                self.encoding,
-                FileHash::parse(&self.encoded_hash).ok()?,
-                self.encoded_size.into(),
-            ),
-            decoded: NarIdentity::new(
-                NarHash::parse(&self.decoded_hash).ok()?,
-                self.decoded_size.into(),
-            ),
+            encoded: EncodedIdentity::new(self.encoding, self.encoded_hash, self.encoded_size),
+            decoded: NarIdentity::new(self.decoded_hash, self.decoded_size),
         })
     }
 }
 
 impl IngestionReceipt {
-    fn from_decoded(encoded: EncodedIdentity, decoded: DecodedValidation) -> Self {
+    pub(super) fn from_decoded(encoded: EncodedIdentity, decoded: DecodedValidation) -> Self {
         Self {
             encoded,
             decoded: NarIdentity::new(decoded.hash, decoded.size),
@@ -595,15 +580,14 @@ impl IngestionReceipt {
     }
 
     pub(super) fn bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(&IngestionReceiptRecord::from_receipt(self))
+        postcard::to_allocvec(&IngestionReceiptRecord::from_receipt(self))
             .expect("ingestion receipt serialization cannot fail")
     }
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
-        serde_json::from_slice::<IngestionReceiptRecord>(bytes)
+        postcard::from_bytes::<IngestionReceiptRecord>(bytes)
             .ok()
             .and_then(IngestionReceiptRecord::into_receipt)
-            .or_else(|| parse_legacy_ingestion_receipt(bytes))
     }
 
     pub(super) fn matches(&self, expectation: CompressedNarExpectation) -> bool {
@@ -613,23 +597,6 @@ impl IngestionReceipt {
     pub(super) fn decoded_identity(&self) -> NarIdentity {
         self.decoded
     }
-}
-
-fn parse_legacy_ingestion_receipt(bytes: &[u8]) -> Option<IngestionReceipt> {
-    let fields = parse_legacy_fields(bytes, 6)?;
-    let version = fields.get("version")?.parse::<u8>().ok()?;
-    (version == LEGACY_INGESTION_RECEIPT_VERSION).then_some(())?;
-    Some(IngestionReceipt {
-        encoded: EncodedIdentity::new(
-            fields.get("encoding")?.parse().ok()?,
-            FileHash::parse(fields.get("encoded-hash")?).ok()?,
-            fields.get("encoded-size")?.parse::<u64>().ok()?.into(),
-        ),
-        decoded: NarIdentity::new(
-            NarHash::parse(fields.get("decoded-hash")?).ok()?,
-            fields.get("decoded-size")?.parse::<u64>().ok()?.into(),
-        ),
-    })
 }
 
 pub(super) fn ingestion_receipt_file_name(expectation: CompressedNarExpectation) -> OsString {

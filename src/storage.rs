@@ -8,7 +8,6 @@ mod ingest;
 pub(crate) mod inspection;
 mod operations;
 mod publication;
-mod receipt;
 mod reconcile;
 mod recovery;
 mod state;

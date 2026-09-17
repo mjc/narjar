@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::narinfo::ValidatedPayload;
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, NarFileName, NarHash, NarIdentity, WireEncoding,
+    CompressionCodec, EncodedIdentity, EncodedSize, NarFileName, NarHash, NarIdentity, NarSize,
+    WireEncoding,
 };
 
 use super::compression::{
@@ -22,12 +23,10 @@ use super::fs::{open_optional_at, open_regular_at, read_dir_names, unlink_at};
 use super::publication::{
     NarUploadPolicy, PublishOutcome, PublishTarget, StorageError, TemporaryFile,
 };
-use super::receipt::parse_legacy_fields;
 use super::recovery::PublicationState;
 use super::state::Storage;
 
-const LEGACY_EGRESS_RECEIPT_VERSION: u8 = 1;
-const EGRESS_RECEIPT_VERSION: u8 = 2;
+const EGRESS_RECEIPT_VERSION: u8 = 1;
 pub(super) const EGRESS_RECEIPT_DIRECTORY: &str = ".narjar-egress";
 pub(super) const MAX_EGRESS_RECEIPT_BYTES: u64 = 256;
 
@@ -139,47 +138,6 @@ impl CleanupAction {
             (Self::Remove, _) | (_, Self::Remove) => Self::Remove,
             (Self::Keep, Self::Keep) => Self::Keep,
         }
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EgressReceiptRecord {
-    version: u8,
-    #[serde(rename = "raw-hash")]
-    raw_hash: String,
-    #[serde(rename = "raw-size")]
-    raw_size: u64,
-    encoding: CompressionCodec,
-    #[serde(rename = "encoded-hash")]
-    encoded_hash: String,
-    #[serde(rename = "encoded-size")]
-    encoded_size: u64,
-}
-
-impl EgressReceiptRecord {
-    fn from_receipt(receipt: &EgressReceipt) -> Self {
-        Self {
-            version: EGRESS_RECEIPT_VERSION,
-            raw_hash: receipt.slot.raw().hash().to_string(),
-            raw_size: receipt.slot.raw().size().get(),
-            encoding: receipt.slot.codec(),
-            encoded_hash: receipt.output.hash().to_string(),
-            encoded_size: receipt.output.size().get(),
-        }
-    }
-
-    fn into_receipt(self) -> Option<EgressReceipt> {
-        (self.version == EGRESS_RECEIPT_VERSION).then_some(())?;
-        let raw = NarIdentity::new(NarHash::parse(&self.raw_hash).ok()?, self.raw_size.into());
-        Some(EgressReceipt::new(
-            EgressSlot::new(raw, self.encoding),
-            EncodedIdentity::new(
-                self.encoding,
-                crate::object::FileHash::parse(&self.encoded_hash).ok()?,
-                self.encoded_size.into(),
-            ),
-        ))
     }
 }
 
@@ -313,6 +271,38 @@ pub(super) struct EgressReceipt {
     output: EncodedIdentity,
 }
 
+#[derive(Deserialize, Serialize)]
+struct EgressReceiptRecord {
+    version: u8,
+    raw_hash: NarHash,
+    raw_size: NarSize,
+    encoding: CompressionCodec,
+    encoded_hash: crate::object::FileHash,
+    encoded_size: EncodedSize,
+}
+
+impl EgressReceiptRecord {
+    fn from_receipt(receipt: &EgressReceipt) -> Self {
+        Self {
+            version: EGRESS_RECEIPT_VERSION,
+            raw_hash: receipt.slot.raw().hash(),
+            raw_size: receipt.slot.raw().size(),
+            encoding: receipt.slot.codec(),
+            encoded_hash: receipt.output.hash(),
+            encoded_size: receipt.output.size(),
+        }
+    }
+
+    fn into_receipt(self) -> Option<EgressReceipt> {
+        (self.version == EGRESS_RECEIPT_VERSION).then_some(())?;
+        let raw = NarIdentity::new(self.raw_hash, self.raw_size);
+        Some(EgressReceipt::new(
+            EgressSlot::new(raw, self.encoding),
+            EncodedIdentity::new(self.encoding, self.encoded_hash, self.encoded_size),
+        ))
+    }
+}
+
 impl EgressReceipt {
     pub(super) fn new(slot: EgressSlot, output: EncodedIdentity) -> Self {
         debug_assert_eq!(slot.codec(), output.codec());
@@ -324,15 +314,14 @@ impl EgressReceipt {
     }
 
     pub(super) fn bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(&EgressReceiptRecord::from_receipt(self))
+        postcard::to_allocvec(&EgressReceiptRecord::from_receipt(self))
             .expect("egress receipt serialization cannot fail")
     }
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
-        serde_json::from_slice::<EgressReceiptRecord>(bytes)
+        postcard::from_bytes::<EgressReceiptRecord>(bytes)
             .ok()
             .and_then(EgressReceiptRecord::into_receipt)
-            .or_else(|| parse_legacy_egress_receipt(bytes))
     }
 
     pub(super) fn matches(&self, slot: EgressSlot) -> bool {
@@ -346,27 +335,6 @@ impl EgressReceipt {
     pub(super) const fn slot(&self) -> EgressSlot {
         self.slot
     }
-}
-
-fn parse_legacy_egress_receipt(bytes: &[u8]) -> Option<EgressReceipt> {
-    let fields = parse_legacy_fields(bytes, 6)?;
-    let version = fields.get("version")?.parse::<u8>().ok()?;
-    (version == LEGACY_EGRESS_RECEIPT_VERSION).then_some(())?;
-    let codec = fields.get("encoding")?.parse().ok()?;
-    Some(EgressReceipt::new(
-        EgressSlot::new(
-            NarIdentity::new(
-                NarHash::parse(fields.get("raw-hash")?).ok()?,
-                fields.get("raw-size")?.parse::<u64>().ok()?.into(),
-            ),
-            codec,
-        ),
-        EncodedIdentity::new(
-            codec,
-            crate::object::FileHash::parse(fields.get("encoded-hash")?).ok()?,
-            fields.get("encoded-size")?.parse::<u64>().ok()?.into(),
-        ),
-    ))
 }
 
 impl Storage {
