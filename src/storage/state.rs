@@ -19,5 +19,7 @@ pub struct Storage {
     pub(super) publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     pub(super) staging_budget: Arc<Mutex<StagingBudget>>,
     pub(super) temporary_objects: AtomicU64,
+    #[cfg(test)]
+    pub(super) egress_generations: AtomicU64,
     pub(super) _lock: ProcessLock,
 }

@@ -660,11 +660,13 @@ fn repeated_compressed_egress_reuses_its_durable_derivative() {
     let first = storage
         .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
         .expect("first derivative should be created");
+    assert_eq!(storage.egress_generations(), 1);
     let second = storage
-        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .compressed_representation_for_test(identity, WireEncoding::Zstd, u64::MAX)
         .expect("second publication should reuse the derivative");
 
     assert_eq!(second, first);
+    assert_eq!(storage.egress_generations(), 1);
     assert_eq!(
         fs::read_dir(storage.layout().egress_receipt_dir())
             .expect("egress receipt directory should be readable")
@@ -680,22 +682,25 @@ fn restarting_storage_reuses_a_durable_compressed_derivative() {
     let raw = b"raw NAR for restart reuse";
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
-    let first = {
+    let (first, initial_generations) = {
         let storage = initialize_storage(directory.path()).expect("storage should initialize");
         storage
             .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
             .expect("raw NAR should be stored");
-        storage
+        let output = storage
             .compressed_representation_for_test(identity, WireEncoding::Xz, 0)
-            .expect("first derivative should be created")
+            .expect("first derivative should be created");
+        (output, storage.egress_generations())
     };
+    assert_eq!(initial_generations, 1);
 
     let restarted = initialize_storage(directory.path()).expect("storage should restart");
     let second = restarted
-        .compressed_representation_for_test(identity, WireEncoding::Xz, 0)
+        .compressed_representation_for_test(identity, WireEncoding::Xz, u64::MAX)
         .expect("restart should reuse the derivative");
 
     assert_eq!(second, first);
+    assert_eq!(restarted.egress_generations(), 0);
 }
 
 #[test]
@@ -724,7 +729,16 @@ fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
 }
 
 #[test]
-fn corrupt_compressed_derivative_is_not_replaced_under_its_content_name() {
+fn same_size_corrupt_compressed_derivative_is_repaired() {
+    assert_egress_derivative_is_repaired(|bytes| bytes[0] ^= 1);
+}
+
+#[test]
+fn truncated_compressed_derivative_is_repaired() {
+    assert_egress_derivative_is_repaired(|bytes| bytes.truncate(bytes.len() / 2));
+}
+
+fn assert_egress_derivative_is_repaired(corrupt_derivative: impl FnOnce(&mut Vec<u8>)) {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("storage should initialize");
     let raw = b"raw NAR with a corrupt derivative";
@@ -738,20 +752,20 @@ fn corrupt_compressed_derivative_is_not_replaced_under_its_content_name() {
         .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
         .expect("derivative should be created");
     let output_path = storage.layout().nar_path_encoded(output.0);
+    let original = fs::read(&output_path).expect("derivative should be readable");
     let mut corrupt = fs::read(&output_path).expect("derivative should be readable");
-    corrupt[0] ^= 1;
+    corrupt_derivative(&mut corrupt);
     fs::write(&output_path, &corrupt).expect("test should corrupt the derivative");
 
-    assert!(
-        matches!(
-            storage.compressed_representation_for_test(identity, WireEncoding::Zstd, 0),
-            Err(StorageError::Conflict)
-        ),
-        "an immutable derivative must not be overwritten after corruption"
+    assert_eq!(
+        storage
+            .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+            .expect("a server-generated corrupt derivative should be repaired"),
+        output
     );
     assert_eq!(
-        fs::read(output_path).expect("corrupt derivative should remain"),
-        corrupt
+        fs::read(output_path).expect("repaired derivative should be readable"),
+        original
     );
     assert_eq!(storage.temporary_objects(), 0);
 }
@@ -784,6 +798,7 @@ fn concurrent_requests_coalesce_compressed_derivative_generation() {
         .collect::<Vec<_>>();
 
     assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(storage.egress_generations(), 1);
     assert_eq!(
         fs::read_dir(storage.layout().egress_receipt_dir())
             .expect("egress receipt directory should be readable")
@@ -1977,6 +1992,27 @@ fn cleanup_removes_only_reported_stale_temps() {
         .expect("validation temp entry");
     assert_eq!(validation.class(), ReconcileClass::TempYoung);
     assert!(validation_path.exists());
+
+    let egress_path = directory.path().join(".tmp/egress-receipt-stale.part");
+    fs::write(&egress_path, b"temp").expect("write egress receipt temp");
+    let egress_report = storage
+        .reconcile(
+            NonZeroUsize::new(16).expect("nonzero limit"),
+            SystemTime::now() + Duration::from_secs(1),
+        )
+        .expect("classify egress receipt temp");
+    let egress = egress_report
+        .entries()
+        .iter()
+        .find(|entry| entry.relative_path() == Path::new(".tmp/egress-receipt-stale.part"))
+        .expect("egress receipt temp entry");
+    assert_eq!(egress.class(), ReconcileClass::TempStale);
+    assert!(
+        storage
+            .cleanup_stale_temp(egress)
+            .expect("cleanup egress receipt temp")
+    );
+    assert!(!egress_path.exists());
 }
 
 #[test]

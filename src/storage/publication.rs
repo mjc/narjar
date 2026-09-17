@@ -14,7 +14,7 @@ use super::{
     fs::{FilesystemSpace, filesystem_space, lock_exclusive, open_at},
     ids::StoreHash,
 };
-use crate::object::NarFileName;
+use crate::object::{EncodedIdentity, NarFileName};
 
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
@@ -67,12 +67,14 @@ pub(super) enum PublishTarget<'a> {
     NarInfo(&'a StoreHash),
     IngestionReceipt(&'a IngestionReceipt),
     EgressReceipt(&'a EgressReceipt),
+    RepairEgressNar(EncodedIdentity),
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum DestinationPublication {
     Link,
     Replace,
+    Repair,
 }
 
 impl PublishTarget<'_> {
@@ -83,6 +85,9 @@ impl PublishTarget<'_> {
             Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
             Self::IngestionReceipt(evidence) => evidence.file_name(),
             Self::EgressReceipt(receipt) => receipt.file_name(),
+            Self::RepairEgressNar(output) => {
+                NarFileName::new(output.hash(), output.codec().wire_encoding()).os_string()
+            }
         }
     }
 
@@ -93,12 +98,14 @@ impl PublishTarget<'_> {
             Self::NarInfo(_) => "narinfo",
             Self::IngestionReceipt(_) => "receipt",
             Self::EgressReceipt(_) => "egress-receipt",
+            Self::RepairEgressNar(_) => "nar",
         }
     }
 
     pub(super) fn destination_publication(&self) -> DestinationPublication {
         match self {
             Self::IngestionReceipt(_) | Self::EgressReceipt(_) => DestinationPublication::Replace,
+            Self::RepairEgressNar(_) => DestinationPublication::Repair,
             Self::CacheInfo | Self::Nar(_) | Self::NarInfo(_) => DestinationPublication::Link,
         }
     }
