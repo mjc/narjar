@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io,
     os::unix::fs::PermissionsExt,
-    sync::atomic::AtomicU64,
+    sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
 #[cfg(test)]
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use super::{
     compression::IngestionReceipt,
-    fs::{lock_exclusive, open_at},
+    fs::{filesystem_space, lock_exclusive, open_at},
     ids::StoreHash,
 };
 use crate::object::NarFileName;
@@ -186,23 +186,57 @@ impl NarUploadPolicy {
     }
 }
 
+#[derive(Debug, Default)]
+pub(super) struct StagingBudget {
+    outstanding_bytes: u64,
+}
+
+impl StagingBudget {
+    pub(super) fn reserve(
+        &mut self,
+        directory: &File,
+        min_free_bytes: u64,
+        bytes: u64,
+    ) -> Result<(), StorageError> {
+        let available_bytes = filesystem_space(directory)?.available_bytes;
+        let capacity = available_bytes
+            .checked_sub(min_free_bytes)
+            .ok_or(StorageError::InsufficientSpace)?;
+        let total = self
+            .outstanding_bytes
+            .checked_add(bytes)
+            .ok_or(StorageError::InsufficientSpace)?;
+        if total > capacity {
+            return Err(StorageError::InsufficientSpace);
+        }
+        self.outstanding_bytes = total;
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: u64) {
+        self.outstanding_bytes = self.outstanding_bytes.saturating_sub(bytes);
+    }
+
+    #[cfg(test)]
+    pub(super) const fn outstanding_bytes(&self) -> u64 {
+        self.outstanding_bytes
+    }
+}
+
 #[derive(Debug)]
 pub struct StagingReservation {
-    pub(super) reservations: std::sync::Arc<AtomicU64>,
+    pub(super) budget: Arc<Mutex<StagingBudget>>,
     pub(super) bytes: u64,
 }
 
 impl StagingReservation {
-    pub(super) fn empty(reservations: std::sync::Arc<AtomicU64>) -> Self {
-        Self {
-            reservations,
-            bytes: 0,
-        }
+    pub(super) fn empty(budget: Arc<Mutex<StagingBudget>>) -> Self {
+        Self { budget, bytes: 0 }
     }
 
     pub(super) fn grow_to(
         &mut self,
-        available_bytes: u64,
+        directory: &File,
         min_free_bytes: u64,
         required_bytes: u64,
     ) -> Result<(), StorageError> {
@@ -213,21 +247,12 @@ impl StagingReservation {
         let new_bytes = self
             .bytes
             .checked_add(additional)
-            .ok_or(StorageError::InsufficientSpace)?;
-        let capacity = available_bytes
-            .checked_sub(min_free_bytes)
-            .ok_or(StorageError::InsufficientSpace)?;
-        self.reservations
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |reserved| {
-                    reserved
-                        .checked_add(additional)
-                        .filter(|total| *total <= capacity)
-                },
-            )
-            .map_err(|_| StorageError::InsufficientSpace)?;
+            .ok_or_else(|| io::Error::other("staging reservation size overflow"))?;
+        let mut budget = self
+            .budget
+            .lock()
+            .map_err(|_| StorageError::Io(io::Error::other("staging budget lock poisoned")))?;
+        budget.reserve(directory, min_free_bytes, additional)?;
         self.bytes = new_bytes;
         Ok(())
     }
@@ -237,8 +262,9 @@ impl StagingReservation {
         if released == 0 {
             return;
         }
-        self.reservations
-            .fetch_sub(released, std::sync::atomic::Ordering::AcqRel);
+        if let Ok(mut budget) = self.budget.lock() {
+            budget.release(released);
+        }
         self.bytes -= released;
     }
 
@@ -252,10 +278,10 @@ impl Drop for StagingReservation {
         if self.bytes == 0 {
             return;
         }
-        let previous = self
-            .reservations
-            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Release);
-        debug_assert!(previous >= self.bytes);
+        if let Ok(mut budget) = self.budget.lock() {
+            debug_assert!(budget.outstanding_bytes >= self.bytes);
+            budget.release(self.bytes);
+        }
     }
 }
 

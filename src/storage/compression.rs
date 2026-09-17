@@ -17,10 +17,7 @@ use crate::object::{
     NarSize,
 };
 
-use super::{
-    fs::filesystem_space,
-    publication::{StagingReservation, StorageError},
-};
+use super::publication::{StagingReservation, StorageError};
 
 const INGESTION_RECEIPT_VERSION: u8 = 1;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
@@ -162,10 +159,9 @@ impl<'a> RawStagingWriter<'a> {
         if additional_required <= self.reservation.reserved_bytes() {
             return Ok(());
         }
-        let available_bytes = filesystem_space(self.file)?.available_bytes;
         reserve_preferred_or_exact_staging_growth(
             self.reservation,
-            available_bytes,
+            self.file,
             self.min_free_bytes,
             additional_required,
         )
@@ -175,7 +171,7 @@ impl<'a> RawStagingWriter<'a> {
 
 fn reserve_preferred_or_exact_staging_growth(
     reservation: &mut StagingReservation,
-    available_bytes: u64,
+    directory: &File,
     min_free_bytes: u64,
     additional_required: u64,
 ) -> Result<(), StorageError> {
@@ -183,8 +179,8 @@ fn reserve_preferred_or_exact_staging_growth(
         .div_ceil(RAW_STAGING_GROWTH_BYTES)
         .saturating_mul(RAW_STAGING_GROWTH_BYTES);
     reservation
-        .grow_to(available_bytes, min_free_bytes, preferred_bytes)
-        .or_else(|_| reservation.grow_to(available_bytes, min_free_bytes, additional_required))
+        .grow_to(directory, min_free_bytes, preferred_bytes)
+        .or_else(|_| reservation.grow_to(directory, min_free_bytes, additional_required))
 }
 
 impl Write for RawStagingWriter<'_> {
@@ -807,18 +803,29 @@ pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Resu
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicU64};
+    use std::{
+        fs::File,
+        sync::{Arc, Mutex},
+    };
 
     use super::{StagingReservation, reserve_preferred_or_exact_staging_growth};
+    use crate::storage::fs::filesystem_space;
 
     #[test]
     fn staging_growth_falls_back_to_the_exact_immediate_requirement() {
-        let mut reservation = StagingReservation::empty(Arc::new(AtomicU64::new(0)));
+        let directory = tempfile::tempdir().expect("staging growth directory");
+        let file = File::open(directory.path()).expect("open staging growth directory");
+        let available = filesystem_space(&file)
+            .expect("measure staging growth directory")
+            .available_bytes;
+        let exact_capacity = 2 * 1024 * 1024;
+        let min_free_bytes = available - exact_capacity;
+        let mut reservation = StagingReservation::empty(Arc::new(Mutex::new(Default::default())));
 
         reserve_preferred_or_exact_staging_growth(
             &mut reservation,
-            2 * 1024 * 1024,
-            1024 * 1024,
+            &file,
+            min_free_bytes,
             512 * 1024,
         )
         .expect("the exact output requirement should fit when the preferred chunk does not");

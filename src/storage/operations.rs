@@ -255,7 +255,7 @@ impl Storage {
             root: root_directory,
             recovery,
             publication_locks: Mutex::new(HashMap::new()),
-            staging_reservations: Arc::new(AtomicU64::new(0)),
+            staging_budget: Arc::new(Mutex::new(Default::default())),
             temporary_objects: AtomicU64::new(0),
             _lock: lock,
         };
@@ -291,22 +291,10 @@ impl Storage {
         min_free_bytes: u64,
     ) -> Result<StagingReservation, StorageError> {
         if bytes == 0 {
-            return Ok(StagingReservation::empty(Arc::clone(
-                &self.staging_reservations,
-            )));
+            return Ok(StagingReservation::empty(Arc::clone(&self.staging_budget)));
         }
         let directory = self.nar_temp_directory()?;
-        let space = filesystem_space(&directory)?;
-        let required_bytes = bytes
-            .checked_add(min_free_bytes)
-            .ok_or(StorageError::InsufficientSpace)?;
-        space.required_capacity(required_bytes)?;
-        reserve_staging_bytes(
-            &self.staging_reservations,
-            space.available_bytes,
-            min_free_bytes,
-            bytes,
-        )
+        reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, bytes)
     }
 
     pub fn publish_cache_info(&self, source: impl Read) -> Result<PublishOutcome, StorageError> {

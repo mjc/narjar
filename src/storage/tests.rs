@@ -5,11 +5,7 @@ use std::{
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     process,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, SystemTime},
 };
 
@@ -84,7 +80,7 @@ fn assert_upload_resources_released(storage: &Storage) {
         "temporary accounting must be released"
     );
     assert_eq!(
-        storage.staging_reservations.load(Ordering::Relaxed),
+        storage.staging_budget.lock().unwrap().outstanding_bytes(),
         0,
         "the upload must release its disk reservation"
     );
@@ -103,7 +99,10 @@ fn abandoning_a_receiving_upload_releases_its_file_and_reservation() {
     let storage = initialize_storage(directory.path()).unwrap();
     let receiving = begin_raw_upload(&storage, b"raw NAR");
     assert_eq!(storage.temporary_objects(), 1);
-    assert_eq!(storage.staging_reservations.load(Ordering::Relaxed), 7);
+    assert_eq!(
+        storage.staging_budget.lock().unwrap().outstanding_bytes(),
+        7
+    );
     drop(receiving);
     assert_upload_resources_released(&storage);
 }
@@ -127,7 +126,7 @@ fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
         "the complete state still owns staging"
     );
     assert_eq!(
-        storage.staging_reservations.load(Ordering::Relaxed),
+        storage.staging_budget.lock().unwrap().outstanding_bytes(),
         0,
         "materialized raw bytes must no longer occupy outstanding reservation capacity"
     );
@@ -1405,57 +1404,68 @@ fn capacity_errors_have_stable_categories() {
 
 #[test]
 fn staging_reservations_are_bounded_and_released() {
-    let reservations = Arc::new(AtomicU64::new(0));
-    let first =
-        reserve_staging_bytes(&reservations, 100, 10, 90).expect("first reservation should fit");
+    let directory = TestDir::new();
+    let directory_file = fs::File::open(directory.path()).unwrap();
+    let reservations = Arc::new(Mutex::new(Default::default()));
+    let available = super::fs::filesystem_space(&directory_file)
+        .unwrap()
+        .available_bytes;
+    let min_free_bytes = 10;
+    let first_bytes = available - min_free_bytes;
+    let first = reserve_staging_bytes(&reservations, &directory_file, min_free_bytes, first_bytes)
+        .expect("first reservation should fit");
     assert!(
-        reserve_staging_bytes(&reservations, 100, 10, 1).is_err(),
+        reserve_staging_bytes(&reservations, &directory_file, min_free_bytes, 1).is_err(),
         "reservations must not exceed available bytes after the free-space reserve"
     );
 
     drop(first);
-    reserve_staging_bytes(&reservations, 100, 10, 1)
+    reserve_staging_bytes(&reservations, &directory_file, min_free_bytes, 1)
         .expect("released staging capacity should be reusable");
 }
 
 #[test]
 fn staging_reservation_growth_is_atomic_and_monotonic() {
-    let reservations = Arc::new(AtomicU64::new(0));
+    let directory = TestDir::new();
+    let directory_file = fs::File::open(directory.path()).unwrap();
+    let reservations = Arc::new(Mutex::new(Default::default()));
     let mut reservation = super::publication::StagingReservation::empty(reservations.clone());
 
     reservation
-        .grow_to(100, 10, 64)
+        .grow_to(&directory_file, 10, 64)
         .expect("first growth should fit");
     assert_eq!(reservation.reserved_bytes(), 64);
-    assert_eq!(reservations.load(Ordering::Relaxed), 64);
+    assert_eq!(reservations.lock().unwrap().outstanding_bytes(), 64);
 
     reservation
-        .grow_to(100, 10, 32)
+        .grow_to(&directory_file, 10, 32)
         .expect("smaller growth should be a no-op");
     assert_eq!(reservation.reserved_bytes(), 64);
-    assert_eq!(reservations.load(Ordering::Relaxed), 64);
+    assert_eq!(reservations.lock().unwrap().outstanding_bytes(), 64);
 
-    assert!(reservation.grow_to(70, 10, 100).is_err());
+    assert!(reservation.grow_to(&directory_file, u64::MAX, 100).is_err());
     assert_eq!(reservation.reserved_bytes(), 64);
-    assert_eq!(reservations.load(Ordering::Relaxed), 64);
+    assert_eq!(reservations.lock().unwrap().outstanding_bytes(), 64);
 }
 
 #[test]
 fn materialized_staging_bytes_are_not_counted_against_free_space() {
-    let reservations = Arc::new(AtomicU64::new(0));
+    let directory = TestDir::new();
+    let directory_file = fs::File::open(directory.path()).unwrap();
+    let reservations = Arc::new(Mutex::new(Default::default()));
     let mut first = super::publication::StagingReservation::empty(reservations.clone());
 
     first
-        .grow_to(160, 10, 64)
+        .grow_to(&directory_file, 10, 64)
         .expect("the first staging chunk should fit");
     first.record_materialized_bytes(64);
-    assert_eq!(reservations.load(Ordering::Relaxed), 0);
+    assert_eq!(reservations.lock().unwrap().outstanding_bytes(), 0);
 
     let mut second = super::publication::StagingReservation::empty(reservations.clone());
     second
-        .grow_to(96, 10, 64)
+        .grow_to(&directory_file, 10, 64)
         .expect("the next chunk should be checked only against remaining free space");
-    assert_eq!(reservations.load(Ordering::Relaxed), 64);
+    assert_eq!(reservations.lock().unwrap().outstanding_bytes(), 64);
 }
 
 struct BrokenReader {

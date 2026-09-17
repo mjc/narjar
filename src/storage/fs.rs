@@ -18,11 +18,10 @@ use std::{
         unix::fs::{OpenOptionsExt, PermissionsExt},
     },
     path::Path,
-    sync::Arc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
 
-use super::publication::TemporaryFile;
+use super::publication::{StagingBudget, TemporaryFile};
 use super::{StagingReservation, StorageError};
 
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
@@ -70,25 +69,20 @@ impl FilesystemSpace {
 }
 
 pub(super) fn reserve_staging_bytes(
-    reservations: &Arc<AtomicU64>,
-    available_bytes: u64,
+    budget: &Arc<Mutex<StagingBudget>>,
+    directory: &File,
     min_free_bytes: u64,
     bytes: u64,
 ) -> Result<StagingReservation, StorageError> {
-    let capacity = available_bytes
-        .checked_sub(min_free_bytes)
-        .ok_or(StorageError::InsufficientSpace)?;
-    reservations
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-            reserved
-                .checked_add(bytes)
-                .filter(|total| *total <= capacity)
-        })
-        .map(|_| StagingReservation {
-            reservations: Arc::clone(reservations),
-            bytes,
-        })
-        .map_err(|_| StorageError::InsufficientSpace)
+    let mut budget_guard = budget
+        .lock()
+        .map_err(|_| StorageError::Io(io::Error::other("staging budget lock poisoned")))?;
+    budget_guard.reserve(directory, min_free_bytes, bytes)?;
+    drop(budget_guard);
+    Ok(StagingReservation {
+        budget: Arc::clone(budget),
+        bytes,
+    })
 }
 
 pub(super) fn filesystem_space(directory: &File) -> io::Result<FilesystemSpace> {

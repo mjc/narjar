@@ -10,11 +10,11 @@ use std::{
 
 use narjar::{
     http_server::Request,
-    inventory::{Inventory, VerificationMode},
+    inventory::{Inventory, InventoryClass, VerificationMode},
     nar::{Decoder, Event},
     nar_encode::{self, Encoder},
     narinfo::TrustedPublicKeys,
-    storage::{Directory, NarHash, Storage},
+    storage::{Directory, NarFileName, NarHash, Storage},
 };
 
 const OBJECT_ID: &str = "19rci548pgfshmx7rd3wzw2mhkq2dg8x3mq4q1kfkikgb2raqzxd";
@@ -108,11 +108,27 @@ fn bench_inventory() {
         object_id[1] = NIX32[index / NIX32.len()];
         object_id[2] = NIX32[index % NIX32.len()];
         let name = String::from_utf8(object_id.to_vec()).expect("object name");
+        NarFileName::parse(&format!("{name}.nar")).expect("canonical inventory NAR name");
         fs::write(directory.path().join("nar").join(format!("{name}.nar")), [])
             .expect("write inventory NAR");
     }
     drop(storage);
     let root = Directory::open(directory.path()).expect("open inventory root");
+    let inventory = Inventory::scan(
+        &root,
+        &TrustedPublicKeys::default(),
+        VerificationMode::Availability,
+    )
+    .expect("validate inventory benchmark fixtures");
+    assert_eq!(
+        inventory
+            .entries()
+            .iter()
+            .filter(|entry| entry.class() == InventoryClass::OrphanNar)
+            .count(),
+        FILES,
+        "every fixture should be a valid unreferenced NAR"
+    );
 
     run("inventory scan (256 NARs)", 20, || {
         let inventory = Inventory::scan(
