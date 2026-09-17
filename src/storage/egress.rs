@@ -489,9 +489,9 @@ impl Storage {
     fn read_egress_receipt(&self, slot: EgressSlot) -> Result<Option<EgressReceipt>, StorageError> {
         let directory = self.egress_receipt_directory()?;
         let name = slot.receipt_name();
-        match read_bounded_regular_file(&directory, &name, MAX_EGRESS_RECEIPT_BYTES, |bytes| {
-            EgressReceipt::parse(bytes).filter(|receipt| receipt.matches(slot))
-        })? {
+        match read_bounded_regular_file(&directory, &name, MAX_EGRESS_RECEIPT_BYTES)?
+            .parse(|bytes| EgressReceipt::parse(bytes).filter(|receipt| receipt.matches(slot)))
+        {
             BoundedRegularFile::Valid(receipt) => Ok(Some(receipt)),
             BoundedRegularFile::Missing | BoundedRegularFile::Invalid => Ok(None),
         }
@@ -517,9 +517,9 @@ impl Storage {
         directory: &File,
         name: &OsStr,
     ) -> Result<CleanupAction, StorageError> {
-        match read_bounded_regular_file(directory, name, MAX_EGRESS_RECEIPT_BYTES, |bytes| {
-            Self::parse_named_egress_receipt(bytes, name)
-        })? {
+        match read_bounded_regular_file(directory, name, MAX_EGRESS_RECEIPT_BYTES)?
+            .parse(|bytes| Self::parse_named_egress_receipt(bytes, name))
+        {
             BoundedRegularFile::Missing => Ok(CleanupAction::Keep),
             BoundedRegularFile::Invalid => {
                 unlink_at(directory, name)?;

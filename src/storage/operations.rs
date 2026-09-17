@@ -968,11 +968,9 @@ impl Storage {
         directory: &File,
         name: &OsStr,
     ) -> Result<BoundedRegularFile<IngestionReceipt>, StorageError> {
-        read_bounded_regular_file(
-            directory,
-            name,
-            MAX_INGESTION_RECEIPT_BYTES,
-            IngestionReceipt::parse,
+        Ok(
+            read_bounded_regular_file(directory, name, MAX_INGESTION_RECEIPT_BYTES)?
+                .parse(IngestionReceipt::parse),
         )
     }
 
