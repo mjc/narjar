@@ -55,6 +55,7 @@ crash_server() {
 
 temp_root=$(mktemp -d "${TMPDIR:-/tmp}/narjar-nix-e2e.XXXXXX")
 temp_root=$(cd "$temp_root" && pwd -P)
+export XDG_CACHE_HOME="$temp_root/nix-cache"
 cleanup() {
   stop_server
   rm -rf -- "$temp_root"
@@ -105,7 +106,8 @@ build_path() {
   local build_nonce="$2-$1"
   # The single-quoted expression is expanded by Nix, not Bash.
   # shellcheck disable=SC2016
-  NARJAR_E2E_BUILD_NONCE="$build_nonce" run nix-build --impure --no-out-link --expr 'let
+  run env NIX_CONFIG="secret-key-files = $secret_key" \
+    NARJAR_E2E_BUILD_NONCE="$build_nonce" nix-build --impure --no-out-link --expr 'let
       nonce = builtins.getEnv "NARJAR_E2E_BUILD_NONCE";
     in
     derivation {
@@ -122,7 +124,9 @@ build_referencing_path() {
   local label=$2
   local build_nonce="$label-$nonce"
   # shellcheck disable=SC2016
-  NARJAR_E2E_BUILD_NONCE="$build_nonce" NARJAR_E2E_REFERENCE="$base" run nix-build --impure --no-out-link --expr 'let
+  run env NIX_CONFIG="secret-key-files = $secret_key" \
+    NARJAR_E2E_BUILD_NONCE="$build_nonce" NARJAR_E2E_REFERENCE="$base" \
+    nix-build --impure --no-out-link --expr 'let
       nonce = builtins.getEnv "NARJAR_E2E_BUILD_NONCE";
       reference = builtins.storePath (builtins.getEnv "NARJAR_E2E_REFERENCE");
     in
@@ -202,7 +206,10 @@ exercise_compression_pair() {
   path=$(build_path "${description// /-}" "$nonce")
   sign_path "$path"
   native_push_with_compression "$input_compression" "$path"
-  local destination="$temp_root/${input_compression}-to-${expected_suffix#.nar}.store"
+  local output_name=${expected_suffix#.nar}
+  output_name=${output_name#.}
+  [[ -n "$output_name" ]] || output_name=raw
+  local destination="$temp_root/${input_compression}-to-$output_name.store"
   substitute "$destination" "$trusted_key" "$path"
   expect_file "$destination$path"
   run cmp "$path" "$destination$path"
