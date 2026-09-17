@@ -79,6 +79,7 @@ fn valid_key_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::{NarHash, NarIdentity, NarSize};
     use ed25519_dalek::Verifier;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -109,8 +110,11 @@ mod tests {
             path: "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package".to_owned(),
             ca: None,
             deriver: None,
-            nar_hash: "sha256-Uf1bzW8S4l6E6ah1/no9jK8qRnLRtEgoIFHHMUJz2wY=".to_owned(),
-            nar_size: 289_656,
+            nar: NarIdentity::new(
+                NarHash::parse("01nvfd133isi40l4id6if932mbwc7mxgwxd8x625xqhjdz6mpzai")
+                    .expect("test NAR hash should parse"),
+                NarSize::new(289_656),
+            ),
             references: vec![
                 "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency".to_owned(),
                 "/nix/store/11111111111111111111111111111111-dependency".to_owned(),

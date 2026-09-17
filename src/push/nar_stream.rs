@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::{Compression, PathInfo};
 use crate::nar_encode::{EncodeSummary, Encoder, Event};
+use crate::object::{EncodedIdentity, FileHash, NarHash};
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -34,12 +35,14 @@ pub(super) fn local_store_path(store_path: &str) -> Result<PathBuf, String> {
 }
 
 pub(super) fn verify_nar_summary(info: &PathInfo, summary: &EncodeSummary) -> Result<(), String> {
-    let expected_hash = super::nix32_sha256_from_sri(&info.nar_hash)?;
-    let actual_hash = nix32_digest(summary.raw_sha256);
-    if summary.raw_size != info.nar_size || actual_hash != expected_hash {
+    let expected_hash = info.nar.hash();
+    let actual_hash = NarHash::from_digest(summary.raw_sha256);
+    if summary.raw_size != info.nar.size().get() || actual_hash != expected_hash {
         return Err(format!(
             "NAR identity mismatch for {}: expected {expected_hash}/{}; got {actual_hash}/{}",
-            info.path, info.nar_size, summary.raw_size
+            info.path,
+            info.nar.size(),
+            summary.raw_size
         ));
     }
     Ok(())
@@ -53,11 +56,10 @@ fn open_verified_nar_reader_at(
     info: &PathInfo,
     path: PathBuf,
 ) -> Result<Box<dyn Read + Send>, String> {
-    let expected_hash = super::nix32_sha256_from_sri(&info.nar_hash)?;
     let reader = VerifiedNarReader {
         reader: spawn_nar_writer(path, Compression::None, None)?,
-        expected_hash,
-        expected_size: info.nar_size,
+        expected_hash: FileHash::from_nar_hash(info.nar.hash()),
+        expected_size: info.nar.size().get(),
         digest: Sha256::new(),
         bytes_read: 0,
         complete: false,
@@ -68,8 +70,7 @@ fn open_verified_nar_reader_at(
 pub(super) fn open_verified_encoded_nar_reader(
     info: &PathInfo,
     compression: Compression,
-    expected_hash: &str,
-    expected_size: u64,
+    expected: EncodedIdentity,
 ) -> Result<Box<dyn Read + Send>, String> {
     let reader = VerifiedNarReader {
         reader: spawn_nar_writer(
@@ -77,8 +78,8 @@ pub(super) fn open_verified_encoded_nar_reader(
             compression,
             Some(info.clone()),
         )?,
-        expected_hash: expected_hash.to_owned(),
-        expected_size,
+        expected_hash: expected.hash(),
+        expected_size: expected.size().get(),
         digest: Sha256::new(),
         bytes_read: 0,
         complete: false,
@@ -146,7 +147,7 @@ fn write_encoded_nar<W: Write>(
 
 struct VerifiedNarReader {
     reader: PipeReader,
-    expected_hash: String,
+    expected_hash: FileHash,
     expected_size: u64,
     digest: Sha256,
     bytes_read: u64,
@@ -177,8 +178,7 @@ impl Read for VerifiedNarReader {
         }
         self.digest.update(&buffer[..length]);
         if self.bytes_read == self.expected_size {
-            let actual_hash =
-                super::nar_stream::nix32_digest(self.digest.clone().finalize().into());
+            let actual_hash = FileHash::from_digest(self.digest.clone().finalize().into());
             if actual_hash != self.expected_hash {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -275,23 +275,14 @@ fn encode_io_error(error: crate::nar_encode::EncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-pub(super) fn nix32_digest(digest: [u8; 32]) -> String {
-    let encoding = super::nix32_encoding();
-    let mut output = vec![0; encoding.encode_len(digest.len())];
-    encoding.encode_mut(&digest, &mut output);
-    output.reverse();
-    String::from_utf8(output).expect("Nix base32 alphabet is ASCII")
-}
-
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
     use std::{convert::Infallible, fs, io::Read};
 
-    use data_encoding::BASE64;
-
-    use super::{nix32_digest, open_verified_nar_reader_at, write_nar};
+    use super::{open_verified_nar_reader_at, write_nar};
     use crate::nar::{Decoder, Event};
+    use crate::object::{NarHash, NarIdentity, NarSize};
     use crate::push::PathInfo;
 
     #[test]
@@ -331,8 +322,10 @@ mod tests {
             path: directory.path().display().to_string(),
             ca: None,
             deriver: None,
-            nar_hash: format!("sha256-{}", BASE64.encode(&summary.raw_sha256)),
-            nar_size: summary.raw_size,
+            nar: NarIdentity::new(
+                NarHash::from_digest(summary.raw_sha256),
+                NarSize::new(summary.raw_size),
+            ),
             references: Vec::new(),
             signatures: Vec::new(),
         };
@@ -344,9 +337,6 @@ mod tests {
             .read_to_end(&mut actual)
             .expect("read verified NAR stream");
         assert_eq!(actual, expected);
-        assert_eq!(
-            nix32_digest(summary.raw_sha256),
-            super::super::nix32_sha256_from_sri(&info.nar_hash).expect("Nix hash")
-        );
+        assert_eq!(info.nar.hash(), NarHash::from_digest(summary.raw_sha256));
     }
 }

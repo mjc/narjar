@@ -6,10 +6,10 @@ use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
 use super::nar_stream::{local_store_path, verify_nar_summary, write_nar};
 use super::{Compression, PathInfo};
+use crate::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
 
 pub(super) struct PreparedNar {
-    pub(super) file_hash: String,
-    pub(super) file_size: u64,
+    pub(super) identity: EncodedIdentity,
 }
 
 pub(super) fn prepare_nar(
@@ -39,9 +39,13 @@ pub(super) fn prepare_nar(
         }
     }
     let (_, file_hash, file_size) = measured.finish();
+    let codec = match compression {
+        Compression::Zstd => CompressionCodec::Zstd,
+        Compression::Xz => CompressionCodec::Xz,
+        Compression::None => unreachable!(),
+    };
     Ok(PreparedNar {
-        file_hash,
-        file_size,
+        identity: EncodedIdentity::new(codec, file_hash, file_size),
     })
 }
 
@@ -60,16 +64,11 @@ impl<W> MeasuredWriter<W> {
         }
     }
 
-    fn finish(self) -> (W, String, u64) {
-        let digest = self.digest.finalize();
-        let encoding = super::nix32_encoding();
-        let mut output = vec![0; encoding.encode_len(digest.len())];
-        encoding.encode_mut(&digest, &mut output);
-        output.reverse();
+    fn finish(self) -> (W, FileHash, EncodedSize) {
         (
             self.writer,
-            String::from_utf8(output).expect("Nix base32 output is ASCII"),
-            self.bytes,
+            FileHash::from_digest(self.digest.finalize().into()),
+            EncodedSize::new(self.bytes),
         )
     }
 }

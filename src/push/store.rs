@@ -3,10 +3,10 @@ use std::{
     path::PathBuf,
 };
 
-use data_encoding::BASE64;
 use sqlite::{Connection, OpenFlags, State};
 
 use super::PathInfo;
+use crate::object::{NarHash, NarIdentity, NarSize};
 
 const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
     (
@@ -112,8 +112,7 @@ impl LocalStore {
             path: path.to_owned(),
             ca,
             deriver,
-            nar_hash: sri_sha256_from_base16(&hash)?,
-            nar_size,
+            nar: NarIdentity::new(nar_hash_from_base16(&hash)?, NarSize::new(nar_size)),
             references,
             signatures,
         })
@@ -196,7 +195,7 @@ fn concrete_store_path(value: &str) -> Result<String, String> {
     Ok(format!("/nix/store/{relative}"))
 }
 
-fn sri_sha256_from_base16(value: &str) -> Result<String, String> {
+fn nar_hash_from_base16(value: &str) -> Result<NarHash, String> {
     let value = value
         .strip_prefix("sha256:")
         .ok_or_else(|| format!("unsupported Nix path hash: {value}"))?;
@@ -208,23 +207,27 @@ fn sri_sha256_from_base16(value: &str) -> Result<String, String> {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
             .map_err(|_| "invalid Nix base16 SHA-256".to_owned())?;
     }
-    Ok(format!("sha256-{}", BASE64.encode(&digest)))
+    Ok(NarHash::from_digest(digest))
 }
 
 #[cfg(test)]
 mod tests {
     use sqlite::Connection;
 
-    use super::{sri_sha256_from_base16, validate_supported_schema};
+    use super::{nar_hash_from_base16, validate_supported_schema};
+    use crate::object::NarHash;
 
     #[test]
-    fn converts_nix_store_hash_to_sri() {
+    fn converts_nix_store_hash_to_binary_identity() {
         assert_eq!(
-            sri_sha256_from_base16(
+            nar_hash_from_base16(
                 "sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
             )
             .expect("valid base16 SHA-256"),
-            "sha256-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+            NarHash::from_digest([
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31,
+            ])
         );
     }
 

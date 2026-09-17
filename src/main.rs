@@ -4,6 +4,8 @@ mod http_url;
 #[allow(dead_code)]
 mod nar;
 mod nar_encode;
+#[allow(dead_code)]
+mod object;
 mod operator;
 mod push;
 mod server;

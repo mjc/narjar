@@ -1,56 +1,15 @@
-use std::sync::OnceLock;
-
-use data_encoding::{BASE64, BitOrder, Encoding, Specification};
-
 use super::{Compression, PathInfo};
-
-pub(super) fn nix32_encoding() -> &'static Encoding {
-    static ENCODING: OnceLock<Encoding> = OnceLock::new();
-    ENCODING.get_or_init(|| {
-        let mut specification = Specification::new();
-        specification
-            .symbols
-            .push_str("0123456789abcdfghijklmnpqrsvwxyz");
-        specification.bit_order = BitOrder::LeastSignificantFirst;
-        specification
-            .encoding()
-            .expect("Nix base32 specification is valid")
-    })
-}
-
-pub(super) fn nix32_sha256_from_sri(value: &str) -> Result<String, String> {
-    let (algorithm, encoded) = value
-        .split_once('-')
-        .ok_or_else(|| format!("unsupported Nix hash: {value}"))?;
-    if algorithm != "sha256" {
-        return Err(format!("unsupported Nix hash algorithm: {algorithm}"));
-    }
-    let digest = BASE64
-        .decode(encoded.as_bytes())
-        .map_err(|error| format!("invalid Nix hash {value}: {error}"))?;
-    if digest.len() != 32 {
-        return Err(format!(
-            "invalid SHA-256 length in Nix hash: {}",
-            digest.len()
-        ));
-    }
-    let encoding = nix32_encoding();
-    let mut output = vec![0; encoding.encode_len(digest.len())];
-    encoding.encode_mut(&digest, &mut output);
-    output.reverse();
-    String::from_utf8(output).map_err(|error| format!("invalid Nix base32 output: {error}"))
-}
+use crate::object::{EncodedSize, FileHash};
 
 pub(super) fn serialize_narinfo(
     info: &PathInfo,
-    file_hash: &str,
-    file_size: u64,
+    file_hash: FileHash,
+    file_size: EncodedSize,
     compression: Compression,
 ) -> Result<Vec<u8>, String> {
     info.path
         .strip_prefix("/nix/store/")
         .ok_or_else(|| format!("invalid store path: {}", info.path))?;
-    let nar_hash = nix32_sha256_from_sri(&info.nar_hash)?;
     let references = normalized_reference_basenames(info)?;
 
     let mut output = format!(
@@ -61,8 +20,8 @@ pub(super) fn serialize_narinfo(
         compression.query_value(),
         file_hash,
         file_size,
-        nar_hash,
-        info.nar_size,
+        info.nar.hash(),
+        info.nar.size(),
         references.join(" "),
     );
     for signature in &info.signatures {
@@ -91,7 +50,6 @@ pub(super) fn serialize_narinfo(
 }
 
 pub(super) fn fingerprint_for(info: &PathInfo) -> Result<String, String> {
-    let nar_hash = nix32_sha256_from_sri(&info.nar_hash)?;
     let references = normalized_reference_basenames(info)?
         .into_iter()
         .map(|reference| format!("/nix/store/{reference}"))
@@ -99,8 +57,8 @@ pub(super) fn fingerprint_for(info: &PathInfo) -> Result<String, String> {
     Ok(format!(
         "1;{};sha256:{};{};{}",
         info.path,
-        nar_hash,
-        info.nar_size,
+        info.nar.hash(),
+        info.nar.size(),
         references.join(",")
     ))
 }

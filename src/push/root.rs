@@ -35,12 +35,14 @@ impl StoreRoots {
         automatic_roots: &Path,
         targets: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Self, String> {
-        let mut entries = Vec::new();
+        let mut roots = Self {
+            entries: Vec::new(),
+        };
         for target in targets {
             let entry = allocate_root_entry(automatic_roots, &target)?;
-            entries.push(entry);
+            roots.entries.push(entry);
         }
-        Ok(Self { entries })
+        Ok(roots)
     }
 }
 
