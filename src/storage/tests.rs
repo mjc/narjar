@@ -13,7 +13,9 @@ use super::compression::{
     CheckedUploadReader, DecodedValidation, nar_file_size_matches, receive_uploaded_nar,
     verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
-use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sync_dir};
+use super::fs::{
+    FilesystemSpace, filesystem_space, remove_temp, reserve_staging_bytes_for_test, sync_dir,
+};
 use super::ids::nix32_sha256;
 use super::publication::{Layout, PublishBoundary, PublishTarget};
 use super::{
@@ -23,6 +25,7 @@ use super::{
 use crate::narinfo::{CompressedNarExpectation, NarEncoding};
 use crate::object::{
     CompressionCodec, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize,
+    WireEncoding,
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
@@ -600,6 +603,50 @@ fn compressed_uploads_converge_on_one_raw_object() {
             .layout()
             .nar_path_encoded(NarFileName::new(zstd_id, NarEncoding::Zstd))
             .exists()
+    );
+}
+
+#[test]
+fn compressed_egress_respects_the_staging_capacity_reserve() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let raw = (0_u32..2_000_000)
+        .map(|index| index.wrapping_mul(37) as u8)
+        .collect::<Vec<_>>();
+    let raw_hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(&raw))
+        .expect("raw NAR should be stored");
+    let raw_file = storage
+        .open_nar(raw_hash)
+        .expect("raw NAR should open")
+        .expect("raw NAR should exist");
+    let available = filesystem_space(&storage.nar_temp_directory().unwrap())
+        .unwrap()
+        .available_bytes;
+    let min_free_bytes = available.saturating_sub(1);
+    let result = storage.materialize_compressed_nar_for_test(
+        &raw_file,
+        NarIdentity::new(raw_hash, (raw.len() as u64).into()),
+        WireEncoding::Zstd,
+        min_free_bytes,
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::Io(error))
+                if error.raw_os_error() == Some(libc::ENOSPC)
+        ),
+        "egress must respect the configured free-space reserve"
+    );
+    assert_eq!(storage.temporary_objects(), 0);
+    assert_eq!(
+        fs::read_dir(storage.layout().nar_temp_dir())
+            .unwrap()
+            .count(),
+        0,
+        "failed egress must remove its temporary payload"
     );
 }
 

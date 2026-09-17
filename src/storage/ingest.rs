@@ -6,7 +6,7 @@ use crate::object::{NarFileName, NarIdentity};
 
 use super::{
     PublishOutcome, StagingReservation, Storage, StorageError,
-    compression::{RawStagingWriter, ReceivedNar, receive_uploaded_nar},
+    compression::{CapacityCheckedStagingWriter, ReceivedNar, receive_uploaded_nar},
     publication::{NarUploadPolicy, PublishTarget, TemporaryFile},
     recovery::{PublicationState, PublicationTransaction},
 };
@@ -110,7 +110,7 @@ impl<'storage> Staged<'storage, Receiving> {
         &mut self,
         source: impl Read,
     ) -> Result<ReceivedNar, StorageError> {
-        let mut destination = RawStagingWriter::new(
+        let mut destination = CapacityCheckedStagingWriter::new(
             &mut self.temporary.file.file,
             &mut self.reservation,
             self.state.policy.min_free_bytes,

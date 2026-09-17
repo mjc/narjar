@@ -5,6 +5,8 @@ use std::{
 };
 
 use clap::Args;
+use clap::ValueEnum;
+use narjar::object::WireEncoding;
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
@@ -16,6 +18,24 @@ pub(crate) struct ServeConfig {
     pub(crate) min_free_bytes: u64,
     pub(crate) shutdown_grace_seconds: NonZeroU64,
     pub(crate) io_timeout_seconds: NonZeroU64,
+    pub(crate) egress_compression: WireEncoding,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EgressCompression {
+    None,
+    Zstd,
+    Xz,
+}
+
+impl From<EgressCompression> for WireEncoding {
+    fn from(compression: EgressCompression) -> Self {
+        match compression {
+            EgressCompression::None => Self::Raw,
+            EgressCompression::Zstd => Self::Zstd,
+            EgressCompression::Xz => Self::Xz,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -44,6 +64,13 @@ pub(crate) struct ServeArgs {
         default_value_t = NonZeroU64::new(30).unwrap()
     )]
     io_timeout_seconds: NonZeroU64,
+    #[arg(
+        long,
+        env = "NARJAR_EGRESS_COMPRESSION",
+        value_enum,
+        default_value = "none"
+    )]
+    egress_compression: EgressCompression,
 }
 
 impl From<ServeArgs> for ServeConfig {
@@ -57,6 +84,7 @@ impl From<ServeArgs> for ServeConfig {
             min_free_bytes: args.min_free_bytes,
             shutdown_grace_seconds: args.shutdown_grace_seconds,
             io_timeout_seconds: args.io_timeout_seconds,
+            egress_compression: args.egress_compression.into(),
         }
     }
 }

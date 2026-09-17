@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{File, Permissions},
-    io::{self, Cursor, Read},
+    io::{self, Cursor, Read, Write},
     num::NonZeroUsize,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
@@ -15,10 +15,13 @@ use std::{
 };
 
 use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo, ValidatedPayload};
-use crate::object::{FileHash, NarFileName, NarHash, NarIdentity};
+use crate::object::{CompressionCodec, FileHash, NarFileName, NarHash, NarIdentity, WireEncoding};
 
 use super::{
-    compression::{IngestionReceipt, ingestion_receipt_file_name, nar_file_size_matches},
+    compression::{
+        CapacityCheckedStagingWriter, IngestionReceipt, encode_raw_nar,
+        ingestion_receipt_file_name, nar_file_size_matches,
+    },
     directory::Directory,
     fs::{
         StorageCapacity, directory_is_empty, ensure_directory_at, entry_is_regular_at,
@@ -118,6 +121,11 @@ pub(crate) struct StoredNar<'storage> {
     identity: NarIdentity,
 }
 
+struct CompressedRepresentation {
+    name: NarFileName,
+    size: crate::object::EncodedSize,
+}
+
 impl StoredNar<'_> {
     pub(crate) fn identity(&self) -> NarIdentity {
         self.identity
@@ -128,7 +136,7 @@ impl BoundNarInfo<'_> {
     pub(crate) fn publish(self) -> Result<PublishOutcome, StorageError> {
         self.stored().storage.publish(
             PublishTarget::NarInfo(self.store()),
-            Cursor::new(self.raw_bytes()?),
+            Cursor::new(self.output_bytes()?),
         )
     }
 }
@@ -297,6 +305,14 @@ impl Storage {
         reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, bytes)
     }
 
+    fn empty_staging_reservation(
+        &self,
+        min_free_bytes: u64,
+    ) -> Result<StagingReservation, StorageError> {
+        let directory = self.nar_temp_directory()?;
+        reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, 0)
+    }
+
     pub fn publish_cache_info(&self, source: impl Read) -> Result<PublishOutcome, StorageError> {
         self.publish(PublishTarget::CacheInfo, source)
     }
@@ -365,6 +381,8 @@ impl Storage {
     pub(crate) fn bind_narinfo(
         &self,
         narinfo: ValidatedNarInfo,
+        output_encoding: WireEncoding,
+        policy: NarUploadPolicy,
     ) -> Result<BoundNarInfo<'_>, StorageError> {
         let identity = match narinfo.payload() {
             ValidatedPayload::Raw(identity) => identity,
@@ -379,14 +397,84 @@ impl Storage {
         if !nar_file_size_matches(&file, identity.size().get())? {
             return Err(StorageError::NarMismatch);
         }
+        let (output_name, output_size) = match output_encoding {
+            WireEncoding::Raw => (
+                NarFileName::raw(identity.hash()),
+                identity.size().get().into(),
+            ),
+            WireEncoding::Zstd | WireEncoding::Xz => {
+                let output = self.materialize_compressed_nar(
+                    &file,
+                    identity,
+                    output_encoding,
+                    policy.min_free_bytes(),
+                )?;
+                (output.name, output.size)
+            }
+        };
         let stored = StoredNar {
             storage: self,
             _file: file,
             identity,
         };
         narinfo
-            .bind_raw(stored)
+            .bind_raw(stored, output_name, output_size)
             .map_err(|_| StorageError::NarMismatch)
+    }
+
+    fn materialize_compressed_nar(
+        &self,
+        raw: &File,
+        identity: NarIdentity,
+        encoding: WireEncoding,
+        min_free_bytes: u64,
+    ) -> Result<CompressedRepresentation, StorageError> {
+        let codec = match encoding {
+            WireEncoding::Zstd => CompressionCodec::Zstd,
+            WireEncoding::Xz => CompressionCodec::Xz,
+            WireEncoding::Raw => unreachable!("raw output does not need encoding"),
+        };
+        let staging_target = PublishTarget::Nar(NarFileName::raw(identity.hash()));
+        let temp_name = self.next_temp_name(&staging_target);
+        let temporary_path = self.temporary_path(&staging_target, &temp_name);
+        let mut transaction = self.recovery.begin(&temporary_path)?;
+        let mut temp = self.create_temp_named(&staging_target, temp_name)?;
+        let output = (|| {
+            transaction.transition(PublicationState::Streaming)?;
+            let mut reservation = self.empty_staging_reservation(min_free_bytes)?;
+            let mut destination =
+                CapacityCheckedStagingWriter::new(&mut temp.file, &mut reservation, min_free_bytes);
+            let output = encode_raw_nar(raw, codec, &mut destination)?;
+            destination.flush()?;
+            temp.file.sync_all()?;
+            transaction.transition(PublicationState::Validated)?;
+            Ok::<_, StorageError>(output)
+        })();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = self.remove_temp(&temp);
+                return Err(error);
+            }
+        };
+        let name = NarFileName::new(output.hash, encoding);
+        self.commit_temporary(PublishTarget::Nar(name), &temp, transaction, |_| Ok(()))?;
+        Ok(CompressedRepresentation {
+            name,
+            size: output.size,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn materialize_compressed_nar_for_test(
+        &self,
+        raw: &File,
+        identity: NarIdentity,
+        encoding: WireEncoding,
+        min_free_bytes: u64,
+    ) -> Result<(), StorageError> {
+        self.materialize_compressed_nar(raw, identity, encoding, min_free_bytes)
+            .map(|_| ())
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<bool, StorageError> {

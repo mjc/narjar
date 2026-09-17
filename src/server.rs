@@ -185,6 +185,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .map_err(|error| Error::runtime(format!("cannot report listener: {error}")))?;
 
     let min_free_bytes = config.min_free_bytes;
+    let egress_compression = config.egress_compression;
     let upload_policy = NarUploadPolicy::new(config.max_nar_bytes.get(), config.min_free_bytes);
     let max_nar_bytes = config.max_nar_bytes.get();
     let max_in_flight = config.max_in_flight.get();
@@ -208,7 +209,14 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                             queued_at,
                         } = publication;
                         metrics.publication_dequeued(queued_at);
-                        request.respond(&storage, &trusted_keys, upload_policy, &metrics, _staging);
+                        request.respond(
+                            &storage,
+                            &trusted_keys,
+                            upload_policy,
+                            egress_compression,
+                            &metrics,
+                            _staging,
+                        );
                     }
                 })
                 .map_err(|error| {
