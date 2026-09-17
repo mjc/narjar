@@ -305,7 +305,7 @@ impl Storage {
         reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, bytes)
     }
 
-    fn reserve_staging_capacity(
+    fn empty_staging_reservation(
         &self,
         min_free_bytes: u64,
     ) -> Result<StagingReservation, StorageError> {
@@ -441,7 +441,7 @@ impl Storage {
         let mut temp = self.create_temp_named(&staging_target, temp_name)?;
         let output = (|| {
             transaction.transition(PublicationState::Streaming)?;
-            let mut reservation = self.reserve_staging_capacity(min_free_bytes)?;
+            let mut reservation = self.empty_staging_reservation(min_free_bytes)?;
             let mut destination =
                 CapacityCheckedStagingWriter::new(&mut temp.file, &mut reservation, min_free_bytes);
             let output = encode_raw_nar(raw, codec, &mut destination)?;
