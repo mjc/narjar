@@ -281,6 +281,7 @@ fn classify_root_entry(
             | ".tmp"
             | ".narjar-transactions"
             | ".narjar-ingress"
+            | ".narjar-egress"
             | ".narjar-validation"
             | "realisations"
             | "auth",

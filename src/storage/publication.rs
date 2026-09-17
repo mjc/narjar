@@ -10,7 +10,7 @@ use std::{
 use std::path::PathBuf;
 
 use super::{
-    compression::IngestionReceipt,
+    compression::{EgressReceipt, IngestionReceipt},
     fs::{FilesystemSpace, filesystem_space, lock_exclusive, open_at},
     ids::StoreHash,
 };
@@ -55,6 +55,10 @@ impl Layout {
     pub(super) fn ingestion_receipt_dir(&self) -> PathBuf {
         self.root.join(".narjar-ingress")
     }
+
+    pub(super) fn egress_receipt_dir(&self) -> PathBuf {
+        self.root.join(".narjar-egress")
+    }
 }
 
 pub(super) enum PublishTarget<'a> {
@@ -62,6 +66,7 @@ pub(super) enum PublishTarget<'a> {
     Nar(NarFileName),
     NarInfo(&'a StoreHash),
     IngestionReceipt(&'a IngestionReceipt),
+    EgressReceipt(&'a EgressReceipt),
 }
 
 #[derive(Clone, Copy)]
@@ -77,6 +82,7 @@ impl PublishTarget<'_> {
             Self::Nar(name) => name.os_string(),
             Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
             Self::IngestionReceipt(evidence) => evidence.file_name(),
+            Self::EgressReceipt(receipt) => receipt.file_name(),
         }
     }
 
@@ -86,12 +92,13 @@ impl PublishTarget<'_> {
             Self::Nar(_) => "nar",
             Self::NarInfo(_) => "narinfo",
             Self::IngestionReceipt(_) => "receipt",
+            Self::EgressReceipt(_) => "egress-receipt",
         }
     }
 
     pub(super) fn destination_publication(&self) -> DestinationPublication {
         match self {
-            Self::IngestionReceipt(_) => DestinationPublication::Replace,
+            Self::IngestionReceipt(_) | Self::EgressReceipt(_) => DestinationPublication::Replace,
             Self::CacheInfo | Self::Nar(_) | Self::NarInfo(_) => DestinationPublication::Link,
         }
     }

@@ -651,6 +651,119 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
 }
 
 #[test]
+fn repeated_compressed_egress_reuses_its_durable_derivative() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let raw = b"raw NAR for durable egress reuse";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let first = storage
+        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .expect("first derivative should be created");
+    let second = storage
+        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .expect("second publication should reuse the derivative");
+
+    assert_eq!(second, first);
+    assert_eq!(
+        fs::read_dir(storage.layout().egress_receipt_dir())
+            .expect("egress receipt directory should be readable")
+            .count(),
+        1
+    );
+    assert!(storage.layout().nar_path_encoded(first.0).is_file());
+}
+
+#[test]
+fn restarting_storage_reuses_a_durable_compressed_derivative() {
+    let directory = TestDir::new();
+    let raw = b"raw NAR for restart reuse";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    let first = {
+        let storage = initialize_storage(directory.path()).expect("storage should initialize");
+        storage
+            .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+            .expect("raw NAR should be stored");
+        storage
+            .compressed_representation_for_test(identity, WireEncoding::Xz, 0)
+            .expect("first derivative should be created")
+    };
+
+    let restarted = initialize_storage(directory.path()).expect("storage should restart");
+    let second = restarted
+        .compressed_representation_for_test(identity, WireEncoding::Xz, 0)
+        .expect("restart should reuse the derivative");
+
+    assert_eq!(second, first);
+}
+
+#[test]
+fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let raw = b"raw NAR with a removable derivative";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let first = storage
+        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .expect("first derivative should be created");
+    fs::remove_file(storage.layout().nar_path_encoded(first.0))
+        .expect("derivative should be removable for the recovery test");
+
+    let rebuilt = storage
+        .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+        .expect("missing derivative should be rebuilt");
+
+    assert_eq!(rebuilt, first);
+    assert!(storage.layout().nar_path_encoded(rebuilt.0).is_file());
+}
+
+#[test]
+fn concurrent_requests_coalesce_compressed_derivative_generation() {
+    let directory = TestDir::new();
+    let storage =
+        Arc::new(initialize_storage(directory.path()).expect("storage should initialize"));
+    let raw = b"raw NAR for concurrent egress generation";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let workers = (0..4)
+        .map(|_| {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || {
+                storage
+                    .compressed_representation_for_test(identity, WireEncoding::Zstd, 0)
+                    .expect("coalesced derivative generation should succeed")
+            })
+        })
+        .collect::<Vec<_>>();
+    let outputs = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker should not panic"))
+        .collect::<Vec<_>>();
+
+    assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(
+        fs::read_dir(storage.layout().egress_receipt_dir())
+            .expect("egress receipt directory should be readable")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn zstd_validation_rejects_bytes_after_the_frame() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");

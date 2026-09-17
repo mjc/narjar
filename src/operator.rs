@@ -61,6 +61,7 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
         "realisations",
         ".narjar-validation",
         ".narjar-ingress",
+        ".narjar-egress",
     ] {
         ensure_directory(&root.join(directory), 0o700)?;
     }
@@ -84,6 +85,7 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
 const INIT_ROOT_ENTRIES: &[&str] = &[
     ".narjar-clean",
     ".narjar-ingress",
+    ".narjar-egress",
     ".narjar-recovery",
     ".narjar-transactions",
     ".narjar-validation",
@@ -740,6 +742,7 @@ fn inspect_doctor(root: &Path) -> Result<DoctorReport, Error> {
         paths.push(inspect_doctor_path(root, path, true, true));
     }
     paths.push(inspect_doctor_path(root, ".narjar-ingress", false, true));
+    paths.push(inspect_doctor_path(root, ".narjar-egress", false, true));
     for path in DOCTOR_FILES {
         paths.push(inspect_doctor_path(root, path, true, false));
     }
