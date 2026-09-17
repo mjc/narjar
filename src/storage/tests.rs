@@ -158,6 +158,118 @@ fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
 }
 
 #[test]
+fn generic_publication_commits_only_after_finishing_its_stream() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
+    let target = super::publication::PublishTarget::Nar(NarFileName::raw(nar));
+
+    let streaming = storage
+        .begin_publication(target, |_| Ok(()))
+        .expect("begin publication");
+    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert_eq!(storage.temporary_objects(), 1);
+    let validated = streaming
+        .finish_and_sync(Cursor::new(b"nar bytes"))
+        .expect("finish publication stream");
+    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert_eq!(storage.temporary_objects(), 1);
+
+    assert_eq!(
+        validated.commit().expect("commit publication"),
+        PublishOutcome::Created
+    );
+    assert_eq!(storage.temporary_objects(), 0);
+    assert_eq!(
+        fs::read(storage.layout().nar_path(nar)).unwrap(),
+        b"nar bytes"
+    );
+}
+
+#[test]
+fn abandoned_generic_publication_cleans_up_staging() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
+    let target = super::publication::PublishTarget::Nar(NarFileName::raw(nar));
+
+    let streaming = storage.begin_publication(target, |_| Ok(())).unwrap();
+    assert!(storage.recovery_required().unwrap());
+    drop(streaming);
+    assert!(!storage.recovery_required().unwrap());
+    assert_eq!(storage.temporary_objects(), 0);
+
+    let target = super::publication::PublishTarget::Nar(NarFileName::raw(nar));
+    let validated = storage
+        .begin_publication(target, |_| Ok(()))
+        .unwrap()
+        .finish_and_sync(Cursor::new(b"nar bytes"))
+        .unwrap();
+    assert_eq!(storage.temporary_objects(), 1);
+    assert!(storage.recovery_required().unwrap());
+    drop(validated);
+
+    assert_eq!(storage.temporary_objects(), 0);
+    assert!(!storage.recovery_required().unwrap());
+    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(
+        fs::read_dir(storage.layout().nar_temp_dir())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn abandoned_generic_publication_retains_recovery_when_temp_cleanup_fails() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
+    let target = PublishTarget::Nar(NarFileName::raw(nar));
+    let streaming = storage.begin_publication(target, |_| Ok(())).unwrap();
+    let temporary_directory = storage.layout().nar_temp_dir();
+    fs::set_permissions(&temporary_directory, fs::Permissions::from_mode(0o500))
+        .expect("make temporary directory unavailable for unlink");
+
+    drop(streaming);
+
+    fs::set_permissions(&temporary_directory, fs::Permissions::from_mode(0o700))
+        .expect("restore temporary directory permissions");
+    assert!(storage.recovery_required().unwrap());
+    assert_eq!(fs::read_dir(&temporary_directory).unwrap().count(), 1);
+
+    storage.finish_recovery().unwrap();
+
+    assert!(!storage.recovery_required().unwrap());
+    assert_eq!(fs::read_dir(&temporary_directory).unwrap().count(), 0);
+}
+
+#[test]
+fn failed_generic_publication_stream_cleans_up_staging() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
+    let target = PublishTarget::Nar(NarFileName::raw(nar));
+
+    let result = storage
+        .begin_publication(target, |_| Ok(()))
+        .unwrap()
+        .finish_and_sync(BrokenReader::new(libc::EIO));
+
+    assert!(
+        matches!(result, Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EIO))
+    );
+    assert_eq!(storage.temporary_objects(), 0);
+    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(
+        fs::read_dir(storage.layout().nar_temp_dir())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
 fn a_completed_upload_commits_its_own_bytes_and_releases_resources() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).unwrap();

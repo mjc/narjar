@@ -16,6 +16,7 @@ use crate::object::{
     NarSize, WireEncoding,
 };
 
+use super::EGRESS_RECEIPT_DIRECTORY;
 use super::compression::{
     CapacityCheckedStagingWriter, encode_raw_nar, encoded_file_matches, nar_file_size_matches,
 };
@@ -29,7 +30,6 @@ use super::recovery::PublicationState;
 use super::state::Storage;
 
 const EGRESS_RECEIPT_VERSION: u8 = 1;
-pub(super) const EGRESS_RECEIPT_DIRECTORY: &str = ".narjar-egress";
 pub(super) const MAX_EGRESS_RECEIPT_BYTES: u64 = 256;
 
 pub(crate) struct StoredNar<'storage> {
@@ -277,8 +277,9 @@ impl ReadyDerivative<'_> {
     fn commit(mut self) -> Result<EncodedIdentity, StorageError> {
         let temporary = self.temporary.take_temporary();
         let target = PublishTarget::RepairEgressNar(self.output);
+        let destination = target.destination();
         self.temporary.storage.commit_temporary(
-            target,
+            destination,
             &temporary,
             self.transaction,
             |_| Ok(()),

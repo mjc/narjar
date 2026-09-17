@@ -23,7 +23,7 @@ static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub(super) struct PublicationTransaction {
     directory: File,
-    name: OsString,
+    name: Option<OsString>,
     path: PathBuf,
 }
 
@@ -65,9 +65,13 @@ impl PublicationState {
 
 impl PublicationTransaction {
     pub(super) fn transition(&mut self, state: PublicationState) -> Result<(), StorageError> {
+        let name = self
+            .name
+            .as_ref()
+            .expect("active publication transaction has a record name");
         let temporary_name = OsString::from(format!(
             "{}.next-{sequence:016x}",
-            self.name.to_string_lossy(),
+            name.to_string_lossy(),
             sequence = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| {
@@ -86,12 +90,7 @@ impl PublicationTransaction {
             })?;
             write!(replacement, "state={}\npath={path}\n", state.as_str())?;
             replacement.sync_all()?;
-            rename_at(
-                &self.directory,
-                &temporary_name,
-                &self.directory,
-                &self.name,
-            )?;
+            rename_at(&self.directory, &temporary_name, &self.directory, name)?;
             self.directory.sync_all()?;
             Ok::<_, io::Error>(())
         })();
@@ -102,10 +101,21 @@ impl PublicationTransaction {
         Ok(())
     }
 
-    pub(super) fn complete(&self) -> Result<(), StorageError> {
-        unlink_at(&self.directory, &self.name)?;
+    pub(super) fn complete(mut self) -> Result<(), StorageError> {
+        let name = self
+            .name
+            .take()
+            .expect("active publication transaction has a record name");
+        unlink_at(&self.directory, &name)?;
         self.directory.sync_all()?;
         Ok(())
+    }
+
+    pub(super) fn cancel(self) {
+        let Some(name) = self.name else {
+            return;
+        };
+        let _ = unlink_at(&self.directory, &name).and_then(|()| self.directory.sync_all());
     }
 }
 
@@ -175,7 +185,7 @@ impl RecoveryState {
                     self.transactions.sync_all()?;
                     return Ok(PublicationTransaction {
                         directory: self.transactions.try_clone()?,
-                        name,
+                        name: Some(name),
                         path: temporary_path,
                     });
                 }

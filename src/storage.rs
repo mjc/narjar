@@ -32,5 +32,12 @@ pub use state::Storage;
 pub use operations::{NarInfoDeletion, NarMatch, StorageReadiness};
 pub use reconcile::{CleanupOutcome, ReconcileClass, ReconcileEntry, ReconcileReport};
 
+pub const NAR_DIRECTORY: &str = "nar";
+pub const TEMPORARY_DIRECTORY: &str = ".tmp";
+pub const REALISATIONS_DIRECTORY: &str = "realisations";
+pub const VALIDATION_DIRECTORY: &str = ".narjar-validation";
+pub const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
+pub const EGRESS_RECEIPT_DIRECTORY: &str = ".narjar-egress";
+
 #[cfg(test)]
 mod tests;

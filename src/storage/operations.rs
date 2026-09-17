@@ -18,11 +18,13 @@ use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo};
 use crate::object::{EncodedIdentity, NarFileName, NarHash, WireEncoding};
 
 use super::{
+    EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY,
+    TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
     compression::{
         IngestionReceipt, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
     },
     directory::Directory,
-    egress::{CanonicalRawStatus, EGRESS_RECEIPT_DIRECTORY},
+    egress::CanonicalRawStatus,
     fs::{
         BoundedRegularFile, StorageCapacity, directory_is_empty, ensure_directory_at,
         entry_is_regular_at, files_equal_at, filesystem_space, hard_link_at, open_at,
@@ -33,7 +35,8 @@ use super::{
     publication::{
         DestinationPublication, NEXT_TEMP, NarUploadPolicy, ProcessLock, PublicationDestination,
         PublicationDirectory, PublishBoundary, PublishOutcome, PublishTarget, PublishedPair,
-        StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
+        StagedPublication, StagingReservation, StorageError, Streaming, TemporaryDirectory,
+        TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction, RecoveryState},
@@ -44,8 +47,6 @@ use super::{
 use super::publication::{Layout, injected_fault};
 
 const MAX_CACHE_INFO_BYTES: u64 = 1024;
-pub(super) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
-pub(super) const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
 pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
 
 #[derive(Clone, Copy)]
@@ -163,6 +164,51 @@ impl StorageReadiness {
 pub enum NarInfoDeletion {
     Deleted,
     Absent,
+}
+
+pub(super) struct OwnedTemporary<'storage> {
+    storage: &'storage Storage,
+    file: Option<TemporaryFile>,
+}
+
+impl<'storage> OwnedTemporary<'storage> {
+    pub(super) fn new(storage: &'storage Storage, file: TemporaryFile) -> Self {
+        Self {
+            storage,
+            file: Some(file),
+        }
+    }
+
+    pub(super) fn file(&self) -> &TemporaryFile {
+        self.file.as_ref().expect("owned temporary file is present")
+    }
+
+    pub(super) fn file_mut(&mut self) -> &mut File {
+        &mut self
+            .file
+            .as_mut()
+            .expect("owned temporary file is present")
+            .file
+    }
+
+    pub(super) fn into_file(mut self) -> TemporaryFile {
+        self.file.take().expect("owned temporary file is present")
+    }
+
+    pub(super) fn cleanup(&mut self) -> Result<(), StorageError> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        self.storage.remove_temp(file)?;
+        self.file = None;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedTemporary<'_> {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -297,13 +343,17 @@ impl Storage {
         )?)?;
         ProcessLock::validate_lock_file(&root_directory)?;
         let nar_directory =
-            ensure_directory_at(&root_directory, OsStr::new("nar"), "nar directory")?;
+            ensure_directory_at(&root_directory, OsStr::new(NAR_DIRECTORY), "nar directory")?;
         ensure_directory_at(
             &nar_directory,
-            OsStr::new(".tmp"),
+            OsStr::new(TEMPORARY_DIRECTORY),
             "NAR temporary directory",
         )?;
-        ensure_directory_at(&root_directory, OsStr::new(".tmp"), "temporary directory")?;
+        ensure_directory_at(
+            &root_directory,
+            OsStr::new(TEMPORARY_DIRECTORY),
+            "temporary directory",
+        )?;
         let transactions = ensure_directory_at(
             &root_directory,
             OsStr::new(".narjar-transactions"),
@@ -312,7 +362,7 @@ impl Storage {
         transactions.set_permissions(Permissions::from_mode(0o700))?;
         let realisations_directory = ensure_directory_at(
             &root_directory,
-            OsStr::new("realisations"),
+            OsStr::new(REALISATIONS_DIRECTORY),
             "realisations directory",
         )?;
         ensure_directory_at(
@@ -622,44 +672,49 @@ impl Storage {
         self.publish_with(target, source, |_| Ok(()))
     }
 
+    pub(super) fn begin_publication<'storage, 'target, Checkpoint>(
+        &'storage self,
+        target: PublishTarget<'target>,
+        mut checkpoint: Checkpoint,
+    ) -> Result<StagedPublication<'storage, Checkpoint, Streaming>, StorageError>
+    where
+        Checkpoint: FnMut(PublishBoundary) -> Result<(), StorageError>,
+    {
+        let destination = target.destination();
+        let temp_name = self.next_temp_name(&target);
+        let temporary_path = self.temporary_path(&target, &temp_name);
+        let mut transaction = self.recovery.begin(&temporary_path)?;
+        checkpoint(PublishBoundary::BeforeTempCreate)?;
+        let temporary = OwnedTemporary::new(self, self.create_temp_named(&target, temp_name)?);
+        transaction.transition(PublicationState::Streaming)?;
+
+        Ok(StagedPublication::from_parts(
+            self,
+            destination,
+            temporary,
+            transaction,
+            checkpoint,
+        ))
+    }
+
     pub(super) fn publish_with(
         &self,
         target: PublishTarget<'_>,
         source: impl Read,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        let mut source = source;
-        let temp_name = self.next_temp_name(&target);
-        let temporary_path = self.temporary_path(&target, &temp_name);
-        let mut transaction = self.recovery.begin(&temporary_path)?;
-        checkpoint(PublishBoundary::BeforeTempCreate)?;
-        let mut temp = self.create_temp_named(&target, temp_name)?;
-        transaction.transition(PublicationState::Streaming)?;
-        let staging = (|| {
-            checkpoint(PublishBoundary::AfterTempCreate)?;
-            io::copy(&mut source, &mut temp.file)?;
-            checkpoint(PublishBoundary::AfterStream)?;
-            temp.file.sync_all()?;
-            checkpoint(PublishBoundary::AfterTempSync)?;
-            transaction.transition(PublicationState::Validated)
-        })();
-
-        if let Err(error) = staging {
-            let _ = self.remove_temp(&temp);
-            return Err(error);
-        }
-
-        self.commit_temporary(target, &temp, transaction, checkpoint)
+        self.begin_publication(target, &mut checkpoint)?
+            .finish_and_sync(source)?
+            .commit()
     }
 
     pub(super) fn commit_temporary(
         &self,
-        target: PublishTarget<'_>,
+        destination: PublicationDestination,
         temp: &TemporaryFile,
         mut transaction: PublicationTransaction,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        let destination = target.destination();
         let mut progress = PublicationProgress::Pending(TemporaryLocation::Staging);
         let result = (|| {
             let destination_directory = self.destination_directory(destination.directory)?;
