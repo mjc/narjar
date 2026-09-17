@@ -412,27 +412,29 @@ pub fn prepare_publication(
         }
     };
 
-    let length = match UploadRequest::validate_headers_and_length(&request) {
-        Ok(length) => length,
-        Err(status) => {
-            metrics.validation_failure(ValidationClass::Body);
-            let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-            let _ = send_response(
-                &guard,
-                request,
-                status,
-                Response::empty(StatusCode(status)),
-                0,
-            );
-            return None;
-        }
-    };
-    let upload = UploadRequest::from_validated_request(request, length);
-
+    let upload = UploadRequest::accept(request, metrics)?;
     Some(PublicationRequest { upload, route })
 }
 
 impl UploadRequest {
+    fn accept(request: Request, metrics: &Metrics) -> Option<Self> {
+        match Self::validate_headers_and_length(&request) {
+            Ok(length) => Some(Self { request, length }),
+            Err(status) => {
+                metrics.validation_failure(ValidationClass::Body);
+                let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
+                let _ = send_response(
+                    &guard,
+                    request,
+                    status,
+                    Response::empty(StatusCode(status)),
+                    0,
+                );
+                None
+            }
+        }
+    }
+
     fn validate_headers_and_length(request: &Request) -> Result<usize, u16> {
         if has_header(request, "Transfer-Encoding") {
             return Err(400);
@@ -441,10 +443,6 @@ impl UploadRequest {
             return Err(415);
         }
         request.body_length().ok_or(411)
-    }
-
-    fn from_validated_request(request: Request, length: usize) -> Self {
-        Self { request, length }
     }
 
     const fn length(&self) -> usize {
@@ -620,7 +618,9 @@ fn respond_narinfo_put(
         }
     };
     let started = Instant::now();
-    let result = storage.publish_narinfo(store, validated);
+    let result = storage
+        .bind_narinfo(validated)
+        .and_then(|bound| bound.publish());
     metrics.publication(started.elapsed());
     if let Err(error) = &result {
         record_capacity_error(metrics, error);

@@ -5,7 +5,7 @@ const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 
 pub use crate::object::InvalidObjectId;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreHash(pub(super) String);
 
 impl StoreHash {

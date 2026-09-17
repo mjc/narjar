@@ -14,8 +14,8 @@ use std::{
 };
 
 use super::compression::{
-    CheckedUploadReader, DecodedValidation, nar_file_size_matches, verify_decoded_compressed_file,
-    verify_encoded_compressed_file, write_uploaded_representation_as_raw_nar,
+    CheckedUploadReader, DecodedValidation, nar_file_size_matches, receive_uploaded_nar,
+    verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
 use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes, sync_dir};
 use super::ids::nix32_sha256;
@@ -37,6 +37,144 @@ const STORE_HASH: &str = "00000000000000000000000000000000";
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
     Storage::initialize(&Directory::open(path)?)
+}
+
+fn begin_raw_upload<'storage>(
+    storage: &'storage Storage,
+    bytes: &[u8],
+) -> super::ingest::Staged<'storage, super::ingest::Receiving> {
+    let name = NarFileName::new(
+        FileHash::from_digest(Sha256::digest(bytes).into()),
+        NarEncoding::Raw,
+    );
+    let length = bytes.len() as u64;
+    let reservation = storage.reserve_staging(length, 0).unwrap();
+    storage
+        .begin_upload(
+            name,
+            length,
+            super::NarUploadPolicy::new(length, 0),
+            reservation,
+        )
+        .unwrap()
+}
+
+fn assert_upload_resources_released(storage: &Storage) {
+    assert_eq!(
+        storage.temporary_objects(),
+        0,
+        "temporary accounting must be released"
+    );
+    assert_eq!(
+        storage.staging_reservations.load(Ordering::Relaxed),
+        0,
+        "the upload must release its disk reservation"
+    );
+    assert_eq!(
+        fs::read_dir(storage.layout().nar_temp_dir())
+            .unwrap()
+            .count(),
+        0,
+        "dropping an upload must unlink its temporary file"
+    );
+}
+
+#[test]
+fn abandoning_a_receiving_upload_releases_its_file_and_reservation() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let receiving = begin_raw_upload(&storage, b"raw NAR");
+    assert_eq!(storage.temporary_objects(), 1);
+    assert_eq!(storage.staging_reservations.load(Ordering::Relaxed), 7);
+    drop(receiving);
+    assert_upload_resources_released(&storage);
+}
+
+#[test]
+fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let bytes = b"raw NAR";
+    let complete = begin_raw_upload(&storage, bytes)
+        .receive(bytes.as_slice())
+        .unwrap();
+    let hash = NarHash::from_digest(Sha256::digest(bytes).into());
+    assert!(
+        storage.open_nar(hash).unwrap().is_none(),
+        "receive must not publish"
+    );
+    assert_eq!(
+        storage.temporary_objects(),
+        1,
+        "the complete state still owns staging"
+    );
+    assert_eq!(
+        storage.staging_reservations.load(Ordering::Relaxed),
+        bytes.len() as u64,
+        "a raw upload must retain its exact reservation without expanding to a chunk"
+    );
+    drop(complete);
+    assert_upload_resources_released(&storage);
+    assert!(storage.open_nar(hash).unwrap().is_none());
+}
+
+#[test]
+fn a_completed_upload_commits_its_own_bytes_and_releases_resources() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let bytes = b"raw NAR";
+    let complete = begin_raw_upload(&storage, bytes)
+        .receive(FailsIfReadAfterEof::new(bytes))
+        .unwrap();
+    assert_eq!(complete.commit().unwrap(), PublishOutcome::Created);
+    assert_upload_resources_released(&storage);
+    let hash = NarHash::from_digest(Sha256::digest(bytes).into());
+    assert_eq!(fs::read(storage.layout().nar_path(hash)).unwrap(), bytes);
+}
+
+#[test]
+fn source_errors_and_unwinding_release_upload_resources() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let failed = begin_raw_upload(&storage, b"raw NAR").receive(BrokenReader::new(libc::EIO));
+    assert!(
+        matches!(failed, Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EIO))
+    );
+    assert_upload_resources_released(&storage);
+
+    struct PanickingReader;
+    impl Read for PanickingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("injected upload reader panic");
+        }
+    }
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = begin_raw_upload(&storage, b"raw NAR").receive(PanickingReader);
+    }));
+    assert!(unwound.is_err());
+    assert_upload_resources_released(&storage);
+}
+
+#[test]
+fn a_commit_destination_open_failure_still_cleans_the_owned_staging_file() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let complete = begin_raw_upload(&storage, b"raw NAR")
+        .receive(&b"raw NAR"[..])
+        .unwrap();
+    let moved = directory.path().join("moved-nar");
+    fs::rename(storage.layout().nar_dir(), &moved).unwrap();
+    symlink(&moved, storage.layout().nar_dir()).unwrap();
+    assert!(
+        complete.commit().is_err(),
+        "publication must reject the replaced directory"
+    );
+    assert_upload_resources_released(&storage);
+    assert_eq!(
+        fs::read_dir(&moved).unwrap().count(),
+        1,
+        "only the empty .tmp directory remains"
+    );
 }
 
 #[test]
@@ -123,14 +261,14 @@ fn normalized_compressed_source_errors_remain_io_errors() {
         let directory = TestDir::new();
         let destination = directory.path().join("raw.nar");
         let mut destination = fs::File::create(destination).expect("create raw staging file");
-        let error = write_uploaded_representation_as_raw_nar(
+        let error = receive_uploaded_nar(
             BrokenReader::new(libc::EIO),
-            encoding,
-            super::compression::EncodedUploadExpectation {
-                expected_file_hash: &FileHash::parse(NAR_ID).expect("file hash is valid"),
-                expected_file_size: EncodedSize::new(3),
-                max_nar_size: u64::MAX,
-            },
+            NarFileName::new(
+                FileHash::parse(NAR_ID).expect("file hash is valid"),
+                encoding,
+            ),
+            3,
+            u64::MAX,
             &mut destination,
         )
         .expect_err("source failure must not become invalid content");

@@ -2376,6 +2376,8 @@ fn xz_narinfo_is_published_as_the_canonical_raw_pair() {
         NAR_BYTES.len() as u64,
         compressed.len() as u64,
     );
+    let optional_fields = format!("Deriver: unknown-deriver\nCA: fixed:r:sha256:{NARJAR_HASH}\n");
+    let narinfo = narinfo + &optional_fields;
 
     let nar_path = format!("/nar/{file_hash}.nar.xz");
     let uploaded = server.request_with_body("PUT", &nar_path, &[], &compressed);
@@ -2398,7 +2400,8 @@ fn xz_narinfo_is_published_as_the_canonical_raw_pair() {
     let (_, narinfo_body) = response_parts(&narinfo_get);
     assert_eq!(
         narinfo_body,
-        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64).as_bytes()
+        (signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64) + &optional_fields).as_bytes(),
+        "raw projection must preserve signatures and optional fields exactly"
     );
     let (_, nar_body) = response_parts(&nar_get);
     assert_eq!(nar_body, NAR_BYTES);
@@ -2561,6 +2564,45 @@ fn compressed_publication_rejects_a_receipt_for_a_different_nar_identity() {
         let (signal, status) = server.stop();
         assert!(signal.success(), "{encoding:?} server should stop cleanly");
         assert!(status.success(), "{encoding:?} server should stop cleanly");
+    }
+}
+
+#[test]
+fn an_ingestion_receipt_cannot_bind_a_missing_or_wrong_sized_raw_payload() {
+    for encoding in [WireEncoding::Xz, WireEncoding::Zstd] {
+        let server = RunningServer::start("receipt-needs-raw-payload");
+        let (compressed, narinfo, suffix) = compressed_upload_fixture(encoding);
+        let uploaded = server.request_with_body(
+            "PUT",
+            &format!("/nar/{}{suffix}", nix32_sha256(&compressed)),
+            &[],
+            &compressed,
+        );
+        assert!(response_parts(&uploaded).0.starts_with("HTTP/1.1 201"));
+        let raw_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
+        fs::write(&raw_path, b"truncated").unwrap();
+        let metadata_path = format!("/{STORE_HASH}.narinfo");
+        let wrong_size = server.request_with_body("PUT", &metadata_path, &[], narinfo.as_bytes());
+        assert!(
+            response_parts(&wrong_size).0.starts_with("HTTP/1.1 422"),
+            "{encoding:?}: a receipt must not replace checking the raw file size"
+        );
+
+        fs::remove_file(&raw_path).unwrap();
+        let missing = server.request_with_body("PUT", &metadata_path, &[], narinfo.as_bytes());
+        assert!(
+            response_parts(&missing).0.starts_with("HTTP/1.1 422"),
+            "{encoding:?}: a receipt must not replace opening the raw file"
+        );
+        assert!(
+            !server
+                .data_dir
+                .join(format!("{STORE_HASH}.narinfo"))
+                .exists()
+        );
+        let (signal, status) = server.stop();
+        assert!(signal.success());
+        assert!(status.success());
     }
 }
 

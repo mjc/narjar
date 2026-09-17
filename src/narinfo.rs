@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fmt,
-    io::{self, Read},
+    io::{self, Read, Write},
     os::unix::fs::MetadataExt,
 };
 
@@ -14,7 +14,7 @@ use crate::object::{
     CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
     NarSize,
 };
-use crate::storage::{Directory, StoreHash, open_regular_at};
+use crate::storage::{Directory, StoreHash, StoredNar, open_regular_at};
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
@@ -135,12 +135,13 @@ impl NamedSignature {
 
 #[derive(Debug)]
 struct ParsedNarInfo {
+    store: StoreHash,
     store_path: String,
     references: String,
     payload: ValidatedPayload,
     fingerprint: String,
     signatures: Vec<NamedSignature>,
-    bytes: Vec<u8>,
+    text: String,
 }
 
 impl ParsedNarInfo {
@@ -148,7 +149,7 @@ impl ParsedNarInfo {
         if bytes.len() as u64 > MAX_NARINFO_BYTES {
             return Err(NarInfoError);
         }
-        let text = std::str::from_utf8(&bytes).map_err(|_| NarInfoError)?;
+        let text = String::from_utf8(bytes).map_err(|_| NarInfoError)?;
         if !text.ends_with('\n') || text.contains('\r') {
             return Err(NarInfoError);
         }
@@ -236,12 +237,13 @@ impl ParsedNarInfo {
         }
 
         Ok(Self {
+            store: route.clone(),
             store_path: store_path.to_owned(),
             references,
             payload,
             fingerprint,
             signatures,
-            bytes,
+            text,
         })
     }
 }
@@ -352,47 +354,54 @@ impl ValidatedNarInfo {
     }
 
     pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.0.bytes
+        self.0.text.into_bytes()
     }
 
-    pub(crate) fn bind_raw(self, identity: NarIdentity) -> Result<RawNarInfo, NarInfoError> {
-        if self.0.payload.decoded_identity() != identity {
+    pub(crate) fn bind_raw(self, stored: StoredNar<'_>) -> Result<BoundNarInfo<'_>, NarInfoError> {
+        if self.0.payload.decoded_identity() != stored.identity() {
             return Err(NarInfoError);
         }
-        let text = std::str::from_utf8(&self.0.bytes).expect("validated narinfo is UTF-8");
-        let raw_url = format!("nar/{}{}", identity.hash(), NarEncoding::Raw.suffix());
-        let raw_file_hash = format!("sha256:{}", identity.hash());
-        let bytes = text
-            .strip_suffix('\n')
-            .expect("validated narinfo ends with a newline")
-            .split('\n')
-            .map(|line| {
-                let (name, _) = line
-                    .split_once(": ")
-                    .expect("validated narinfo has field separators");
-                match name {
-                    "URL" => format!("URL: {raw_url}"),
-                    "Compression" => "Compression: none".to_owned(),
-                    "FileHash" => format!("FileHash: {raw_file_hash}"),
-                    "FileSize" => format!("FileSize: {}", identity.size()),
-                    _ => line.to_owned(),
-                }
-            })
-            .chain(std::iter::once(String::new()))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .into_bytes();
-        Ok(RawNarInfo { bytes })
+        Ok(BoundNarInfo {
+            metadata: self.0,
+            stored,
+        })
     }
 }
 
-pub(crate) struct RawNarInfo {
-    bytes: Vec<u8>,
+/// Signed claims bound to an opened canonical payload. Only this state can
+/// project metadata for raw serving; it retains the file until publication.
+pub(crate) struct BoundNarInfo<'storage> {
+    metadata: ParsedNarInfo,
+    stored: StoredNar<'storage>,
 }
 
-impl RawNarInfo {
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+impl BoundNarInfo<'_> {
+    pub(crate) fn stored(&self) -> &StoredNar<'_> {
+        &self.stored
+    }
+
+    pub(crate) fn store(&self) -> &StoreHash {
+        &self.metadata.store
+    }
+
+    pub(crate) fn raw_bytes(&self) -> io::Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(self.metadata.text.len());
+        self.metadata
+            .text
+            .lines()
+            .try_for_each(|line| self.write_raw_field(line, &mut output))?;
+        Ok(output)
+    }
+
+    fn write_raw_field(&self, line: &str, output: &mut impl Write) -> io::Result<()> {
+        let identity = self.stored.identity();
+        match line.split_once(": ") {
+            Some(("URL", _)) => writeln!(output, "URL: nar/{}", NarFileName::raw(identity.hash())),
+            Some(("Compression", _)) => writeln!(output, "Compression: none"),
+            Some(("FileHash", _)) => writeln!(output, "FileHash: sha256:{}", identity.hash()),
+            Some(("FileSize", _)) => writeln!(output, "FileSize: {}", identity.size()),
+            _ => writeln!(output, "{line}"),
+        }
     }
 }
 

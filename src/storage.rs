@@ -3,6 +3,7 @@ mod directory;
 mod fs;
 pub mod gc;
 mod ids;
+mod ingest;
 pub(crate) mod inspection;
 mod operations;
 mod publication;
@@ -21,6 +22,7 @@ pub use crate::object::{
 };
 pub use directory::Directory;
 pub use ids::{InvalidObjectId, StoreHash};
+pub(crate) use operations::StoredNar;
 pub use publication::{
     NarUploadPolicy, PublishOutcome, PublishedPair, StagingReservation, StorageError,
 };
