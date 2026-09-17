@@ -128,8 +128,8 @@ fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
     );
     assert_eq!(
         storage.staging_reservations.load(Ordering::Relaxed),
-        bytes.len() as u64,
-        "a raw upload must retain its exact reservation without expanding to a chunk"
+        0,
+        "materialized raw bytes must no longer occupy outstanding reservation capacity"
     );
     drop(complete);
     assert_upload_resources_released(&storage);
@@ -1437,6 +1437,24 @@ fn staging_reservation_growth_is_atomic_and_monotonic() {
 
     assert!(reservation.grow_to(70, 10, 100).is_err());
     assert_eq!(reservation.reserved_bytes(), 64);
+    assert_eq!(reservations.load(Ordering::Relaxed), 64);
+}
+
+#[test]
+fn materialized_staging_bytes_are_not_counted_against_free_space() {
+    let reservations = Arc::new(AtomicU64::new(0));
+    let mut first = super::publication::StagingReservation::empty(reservations.clone());
+
+    first
+        .grow_to(160, 10, 64)
+        .expect("the first staging chunk should fit");
+    first.record_materialized_bytes(64);
+    assert_eq!(reservations.load(Ordering::Relaxed), 0);
+
+    let mut second = super::publication::StagingReservation::empty(reservations.clone());
+    second
+        .grow_to(96, 10, 64)
+        .expect("the next chunk should be checked only against remaining free space");
     assert_eq!(reservations.load(Ordering::Relaxed), 64);
 }
 

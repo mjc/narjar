@@ -629,6 +629,7 @@ fn respond_narinfo_put(
         Ok(PublishOutcome::Identical) => 200,
         Err(StorageError::Conflict) => 409,
         Err(StorageError::MissingNar | StorageError::NarMismatch) => 422,
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => 422,
         Err(StorageError::Io(error)) => capacity_status(&error).unwrap_or(500),
         Err(_) => 500,
     };

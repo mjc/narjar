@@ -17,7 +17,8 @@ use narjar::{
     storage::{Directory, NarHash, Storage},
 };
 
-const OBJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OBJECT_ID: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+const MISSING_OBJECT_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 fn report(name: &str, iterations: usize, elapsed: Duration) {
@@ -70,8 +71,7 @@ fn bench_storage() {
     let directory = tempfile::tempdir().expect("storage benchmark directory");
     let storage = initialized_storage(directory.path());
     let id = NarHash::parse(OBJECT_ID).expect("benchmark NAR hash");
-    let missing_id = NarHash::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        .expect("missing NAR hash");
+    let missing_id = NarHash::parse(MISSING_OBJECT_ID).expect("missing NAR hash");
     fs::write(
         directory
             .path()

@@ -385,12 +385,12 @@ impl BoundNarInfo<'_> {
     }
 
     pub(crate) fn raw_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut output = Vec::with_capacity(self.metadata.text.len());
+        let mut output = BoundedNarInfoWriter::with_capacity(self.metadata.text.len());
         self.metadata
             .text
             .lines()
             .try_for_each(|line| self.write_raw_field(line, &mut output))?;
-        Ok(output)
+        Ok(output.into_bytes())
     }
 
     fn write_raw_field(&self, line: &str, output: &mut impl Write) -> io::Result<()> {
@@ -402,6 +402,43 @@ impl BoundNarInfo<'_> {
             Some(("FileSize", _)) => writeln!(output, "FileSize: {}", identity.size()),
             _ => writeln!(output, "{line}"),
         }
+    }
+}
+
+struct BoundedNarInfoWriter {
+    bytes: Vec<u8>,
+}
+
+impl BoundedNarInfoWriter {
+    fn with_capacity(input_length: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(input_length.min(MAX_NARINFO_BYTES as usize)),
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedNarInfoWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let new_length =
+            self.bytes.len().checked_add(bytes.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "narinfo is too large")
+            })?;
+        if new_length as u64 > MAX_NARINFO_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "projected narinfo exceeds configured size limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -564,6 +601,19 @@ mod tests {
 
         assert!(bytes.len() as u64 > MAX_NARINFO_BYTES);
         assert!(ParsedNarInfo::parse(&route, bytes).is_err());
+    }
+
+    #[test]
+    fn projected_narinfo_writer_rejects_output_over_the_read_limit() {
+        let mut writer = BoundedNarInfoWriter::with_capacity(MAX_NARINFO_BYTES as usize);
+        writer
+            .write_all(&vec![b'x'; MAX_NARINFO_BYTES as usize])
+            .expect("a boundary-sized projection should fit");
+
+        let error = writer
+            .write(b"x")
+            .expect_err("the projection must not exceed the read limit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

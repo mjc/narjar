@@ -232,6 +232,16 @@ impl StagingReservation {
         Ok(())
     }
 
+    pub(super) fn record_materialized_bytes(&mut self, bytes: u64) {
+        let released = bytes.min(self.bytes);
+        if released == 0 {
+            return;
+        }
+        self.reservations
+            .fetch_sub(released, std::sync::atomic::Ordering::AcqRel);
+        self.bytes -= released;
+    }
+
     pub(super) const fn reserved_bytes(&self) -> u64 {
         self.bytes
     }

@@ -158,17 +158,33 @@ impl<'a> RawStagingWriter<'a> {
     }
 
     fn reserve_before_write(&mut self, next_size: u64) -> io::Result<()> {
-        if next_size <= self.reservation.reserved_bytes() {
+        let additional_required = next_size.saturating_sub(self.bytes_written);
+        if additional_required <= self.reservation.reserved_bytes() {
             return Ok(());
         }
-        let required_bytes = next_size
-            .div_ceil(RAW_STAGING_GROWTH_BYTES)
-            .saturating_mul(RAW_STAGING_GROWTH_BYTES);
         let available_bytes = filesystem_space(self.file)?.available_bytes;
-        self.reservation
-            .grow_to(available_bytes, self.min_free_bytes, required_bytes)
-            .map_err(storage_capacity_error)
+        reserve_preferred_or_exact_staging_growth(
+            self.reservation,
+            available_bytes,
+            self.min_free_bytes,
+            additional_required,
+        )
+        .map_err(storage_capacity_error)
     }
+}
+
+fn reserve_preferred_or_exact_staging_growth(
+    reservation: &mut StagingReservation,
+    available_bytes: u64,
+    min_free_bytes: u64,
+    additional_required: u64,
+) -> Result<(), StorageError> {
+    let preferred_bytes = additional_required
+        .div_ceil(RAW_STAGING_GROWTH_BYTES)
+        .saturating_mul(RAW_STAGING_GROWTH_BYTES);
+    reservation
+        .grow_to(available_bytes, min_free_bytes, preferred_bytes)
+        .or_else(|_| reservation.grow_to(available_bytes, min_free_bytes, additional_required))
 }
 
 impl Write for RawStagingWriter<'_> {
@@ -180,6 +196,7 @@ impl Write for RawStagingWriter<'_> {
         self.reserve_before_write(next_size)?;
         let written = self.file.write(buffer)?;
         self.bytes_written += written as u64;
+        self.reservation.record_materialized_bytes(written as u64);
         Ok(written)
     }
 
@@ -786,4 +803,26 @@ pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Resu
     // service-owned cache tree and process lease keep published files stable
     // while this cheap availability check runs.
     Ok(file.metadata()?.len() == expected_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    use super::{StagingReservation, reserve_preferred_or_exact_staging_growth};
+
+    #[test]
+    fn staging_growth_falls_back_to_the_exact_immediate_requirement() {
+        let mut reservation = StagingReservation::empty(Arc::new(AtomicU64::new(0)));
+
+        reserve_preferred_or_exact_staging_growth(
+            &mut reservation,
+            2 * 1024 * 1024,
+            1024 * 1024,
+            512 * 1024,
+        )
+        .expect("the exact output requirement should fit when the preferred chunk does not");
+
+        assert_eq!(reservation.reserved_bytes(), 512 * 1024);
+    }
 }
