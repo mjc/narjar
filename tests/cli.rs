@@ -2474,12 +2474,18 @@ fn configured_compressed_egress_is_independent_of_ingress_encoding() {
     for (output_encoding, input_encoding) in [
         (WireEncoding::Zstd, WireEncoding::Xz),
         (WireEncoding::Xz, WireEncoding::Zstd),
+        (WireEncoding::Xz, WireEncoding::Raw),
+        (WireEncoding::Zstd, WireEncoding::Raw),
+        (WireEncoding::Raw, WireEncoding::Zstd),
     ] {
-        let output_name = test_encoding_name(output_encoding);
-        let input_suffix = compressed_test_suffix(input_encoding);
-        let output_suffix = compressed_test_suffix(output_encoding);
+        let output_name = compression_name(output_encoding);
+        let input_suffix = test_nar_suffix(input_encoding);
+        let output_suffix = test_nar_suffix(output_encoding);
         let server = RunningServer::start_with_args(
-            &format!("compressed-egress-{output_name}"),
+            &format!(
+                "egress-{}-to-{output_name}",
+                test_encoding_name(input_encoding)
+            ),
             &["--egress-compression", output_name],
         );
         let compressed = encode_test_nar(input_encoding);
@@ -2490,7 +2496,7 @@ fn configured_compressed_egress_is_independent_of_ingress_encoding() {
             &[],
             &compressed,
         );
-        let narinfo = signed_compressed_narinfo(
+        let narinfo = signed_narinfo_for_encoding(
             input_encoding,
             &input_hash,
             NARJAR_HASH,
@@ -2591,7 +2597,7 @@ fn rewrite_transport_fields(
     narinfo
         .lines()
         .map(|line| match line.split_once(": ") {
-            Some(("URL", _)) => format!("URL: nar/{file_hash}{}", compressed_test_suffix(encoding)),
+            Some(("URL", _)) => format!("URL: nar/{file_hash}{}", test_nar_suffix(encoding)),
             Some(("Compression", _)) => {
                 format!("Compression: {}", compression_name(encoding))
             }
@@ -2609,6 +2615,14 @@ fn compression_name(encoding: WireEncoding) -> &'static str {
         WireEncoding::Xz => "xz",
         WireEncoding::Zstd => "zstd",
         WireEncoding::Raw => "none",
+    }
+}
+
+fn test_nar_suffix(encoding: WireEncoding) -> &'static str {
+    match encoding {
+        WireEncoding::Raw => ".nar",
+        WireEncoding::Xz => ".nar.xz",
+        WireEncoding::Zstd => ".nar.zst",
     }
 }
 
@@ -2668,7 +2682,7 @@ fn compressed_publication_rejects_a_receipt_for_a_different_nar_identity() {
         ));
         let (compressed, _, suffix) = compressed_upload_fixture(encoding);
         let encoded_hash = nix32_sha256(&compressed);
-        let mismatched_narinfo = signed_compressed_narinfo(
+        let mismatched_narinfo = signed_narinfo_for_encoding(
             encoding,
             &encoded_hash,
             &different_hash,
@@ -2753,7 +2767,7 @@ fn an_ingestion_receipt_cannot_bind_a_missing_or_wrong_sized_raw_payload() {
 fn compressed_upload_fixture(encoding: WireEncoding) -> (Vec<u8>, String, &'static str) {
     let compressed = encode_test_nar_with(encoding);
     let encoded_hash = nix32_sha256(&compressed);
-    let narinfo = signed_compressed_narinfo(
+    let narinfo = signed_narinfo_for_encoding(
         encoding,
         &encoded_hash,
         NARJAR_HASH,
@@ -2790,7 +2804,7 @@ fn encode_test_nar_as_zstd() -> Vec<u8> {
     compressed
 }
 
-fn signed_compressed_narinfo(
+fn signed_narinfo_for_encoding(
     encoding: WireEncoding,
     encoded_hash: &str,
     nar_hash: &str,
@@ -2798,9 +2812,9 @@ fn signed_compressed_narinfo(
     encoded_size: u64,
 ) -> String {
     match encoding {
+        WireEncoding::Raw => signed_narinfo(nar_hash, nar_size),
         WireEncoding::Xz => signed_xz_narinfo(encoded_hash, nar_hash, nar_size, encoded_size),
         WireEncoding::Zstd => signed_zstd_narinfo(encoded_hash, nar_hash, nar_size, encoded_size),
-        WireEncoding::Raw => panic!("raw is not a compressed test encoding"),
     }
 }
 
