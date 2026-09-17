@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use super::{
     compression::IngestionReceipt,
+    egress::EgressReceipt,
     fs::{FilesystemSpace, filesystem_space, lock_exclusive, open_at},
     ids::StoreHash,
 };
-use crate::object::NarFileName;
+use crate::object::{EncodedIdentity, NarFileName};
 
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
@@ -55,6 +56,10 @@ impl Layout {
     pub(super) fn ingestion_receipt_dir(&self) -> PathBuf {
         self.root.join(".narjar-ingress")
     }
+
+    pub(super) fn egress_receipt_dir(&self) -> PathBuf {
+        self.root.join(".narjar-egress")
+    }
 }
 
 pub(super) enum PublishTarget<'a> {
@@ -62,37 +67,84 @@ pub(super) enum PublishTarget<'a> {
     Nar(NarFileName),
     NarInfo(&'a StoreHash),
     IngestionReceipt(&'a IngestionReceipt),
+    EgressReceipt(&'a EgressReceipt),
+    RepairEgressNar(EncodedIdentity),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PublicationDirectory {
+    Root,
+    Nar,
+    IngestionReceipts,
+    EgressReceipts,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum TemporaryDirectory {
+    Root,
+    Nar,
+}
+
+pub(super) struct PublicationDestination {
+    pub(super) directory: PublicationDirectory,
+    pub(super) temporary_directory: TemporaryDirectory,
+    pub(super) name: OsString,
+    pub(super) publication: DestinationPublication,
+    pub(super) temp_prefix: &'static str,
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum DestinationPublication {
     Link,
     Replace,
+    Repair(EncodedIdentity),
 }
 
 impl PublishTarget<'_> {
-    pub(super) fn destination_name(&self) -> OsString {
+    pub(super) fn destination(&self) -> PublicationDestination {
         match self {
-            Self::CacheInfo => OsString::from("nix-cache-info"),
-            Self::Nar(name) => name.os_string(),
-            Self::NarInfo(store) => OsString::from(format!("{}.narinfo", store.as_str())),
-            Self::IngestionReceipt(evidence) => evidence.file_name(),
-        }
-    }
-
-    pub(super) fn temp_prefix(&self) -> &'static str {
-        match self {
-            Self::CacheInfo => "cache-info",
-            Self::Nar(_) => "nar",
-            Self::NarInfo(_) => "narinfo",
-            Self::IngestionReceipt(_) => "receipt",
-        }
-    }
-
-    pub(super) fn destination_publication(&self) -> DestinationPublication {
-        match self {
-            Self::IngestionReceipt(_) => DestinationPublication::Replace,
-            Self::CacheInfo | Self::Nar(_) | Self::NarInfo(_) => DestinationPublication::Link,
+            Self::CacheInfo => PublicationDestination {
+                directory: PublicationDirectory::Root,
+                temporary_directory: TemporaryDirectory::Root,
+                name: OsString::from("nix-cache-info"),
+                publication: DestinationPublication::Link,
+                temp_prefix: "cache-info",
+            },
+            Self::Nar(name) => PublicationDestination {
+                directory: PublicationDirectory::Nar,
+                temporary_directory: TemporaryDirectory::Nar,
+                name: name.os_string(),
+                publication: DestinationPublication::Link,
+                temp_prefix: "nar",
+            },
+            Self::NarInfo(store) => PublicationDestination {
+                directory: PublicationDirectory::Root,
+                temporary_directory: TemporaryDirectory::Root,
+                name: OsString::from(format!("{}.narinfo", store.as_str())),
+                publication: DestinationPublication::Link,
+                temp_prefix: "narinfo",
+            },
+            Self::IngestionReceipt(receipt) => PublicationDestination {
+                directory: PublicationDirectory::IngestionReceipts,
+                temporary_directory: TemporaryDirectory::Root,
+                name: receipt.file_name(),
+                publication: DestinationPublication::Replace,
+                temp_prefix: "receipt",
+            },
+            Self::EgressReceipt(receipt) => PublicationDestination {
+                directory: PublicationDirectory::EgressReceipts,
+                temporary_directory: TemporaryDirectory::Root,
+                name: receipt.file_name(),
+                publication: DestinationPublication::Replace,
+                temp_prefix: "egress-receipt",
+            },
+            Self::RepairEgressNar(output) => PublicationDestination {
+                directory: PublicationDirectory::Nar,
+                temporary_directory: TemporaryDirectory::Nar,
+                name: NarFileName::new(output.hash(), output.codec().wire_encoding()).os_string(),
+                publication: DestinationPublication::Repair(*output),
+                temp_prefix: "nar",
+            },
         }
     }
 }

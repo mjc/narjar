@@ -138,6 +138,10 @@ A temporary same-filesystem fixture exercises each failure boundary:
 | temp file sync failure | no final |
 | no-replace conflict, identical | existing final unchanged, idempotent success |
 | no-replace conflict, different | existing final unchanged, 409 |
+| egress derivative missing with receipt | exact receipt identity is reproduced or publication fails; receipt remains |
+| egress derivative corrupt with receipt | replacement is encoded, hashed, synced, and atomically repaired |
+| egress repair rename fault | old derivative or fully durable replacement remains; transaction recovery is required |
+| egress source/destination directory-sync fault | no success is reported before the corresponding durability boundary |
 | parent directory sync failure | no 201; reconcile-safe state |
 | crash after NAR publication | orphan NAR, no narinfo visibility |
 | crash during narinfo temp | published NAR plus temp only |

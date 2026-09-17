@@ -13,9 +13,8 @@ use super::compression::{
     CheckedUploadReader, DecodedValidation, nar_file_size_matches, receive_uploaded_nar,
     verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
-use super::fs::{
-    FilesystemSpace, filesystem_space, remove_temp, reserve_staging_bytes_for_test, sync_dir,
-};
+use super::egress::{EgressReceipt, EgressSlot};
+use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sync_dir};
 use super::ids::nix32_sha256;
 use super::publication::{Layout, PublishBoundary, PublishTarget};
 use super::{
@@ -24,8 +23,8 @@ use super::{
 };
 use crate::narinfo::{CompressedNarExpectation, NarEncoding};
 use crate::object::{
-    CompressionCodec, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize,
-    WireEncoding,
+    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
+    NarSize,
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
@@ -33,6 +32,26 @@ use structured_zstd::encoding::{CompressionLevel, compress};
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const STORE_HASH: &str = "00000000000000000000000000000000";
+
+#[test]
+fn egress_receipt_round_trips_through_compact_binary_serialization() {
+    let raw_hash = NarHash::parse(NAR_ID).expect("test NAR hash is valid");
+    let encoded_hash = FileHash::parse(NAR_ID).expect("test file hash is valid");
+    let raw_size = NarSize::new(17);
+    let encoded_size = EncodedSize::new(23);
+    let slot = EgressSlot::new(NarIdentity::new(raw_hash, raw_size), CompressionCodec::Zstd);
+    let egress = EgressReceipt::new(slot, encoded_hash, encoded_size);
+    let egress =
+        EgressReceipt::parse(&egress.bytes()).expect("typed egress receipt should be readable");
+    assert!(egress.matches(slot));
+    assert_eq!(
+        egress.output(),
+        EncodedIdentity::new(CompressionCodec::Zstd, encoded_hash, encoded_size)
+    );
+
+    let bytes = egress.bytes();
+    assert!(EgressReceipt::parse(&bytes[..bytes.len() - 1]).is_none());
+}
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
     Storage::initialize(&Directory::open(path)?)
@@ -621,24 +640,17 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
         .open_nar(raw_hash)
         .expect("raw NAR should open")
         .expect("raw NAR should exist");
-    let available = filesystem_space(&storage.nar_temp_directory().unwrap())
-        .unwrap()
-        .available_bytes;
-    let min_free_bytes = available.saturating_sub(1);
+    let min_free_bytes = u64::MAX;
     let result = storage.materialize_compressed_nar_for_test(
         &raw_file,
         NarIdentity::new(raw_hash, (raw.len() as u64).into()),
-        WireEncoding::Zstd,
+        CompressionCodec::Zstd,
         min_free_bytes,
     );
 
     assert!(
-        matches!(
-            result,
-            Err(StorageError::Io(error))
-                if error.raw_os_error() == Some(libc::ENOSPC)
-        ),
-        "egress must respect the configured free-space reserve"
+        matches!(result, Err(StorageError::InsufficientSpace)),
+        "egress must reject the configured free-space reserve before writing"
     );
     assert_eq!(storage.temporary_objects(), 0);
     assert_eq!(
@@ -647,6 +659,230 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
             .count(),
         0,
         "failed egress must remove its temporary payload"
+    );
+}
+
+#[test]
+fn repeated_compressed_egress_reuses_its_durable_derivative() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let raw = b"raw NAR for durable egress reuse";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let first = storage
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+        .expect("first derivative should be created");
+    assert_eq!(storage.egress_generations(), 1);
+    let second = storage
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, u64::MAX)
+        .expect("second publication should reuse the derivative");
+
+    assert_eq!(second, first);
+    assert_eq!(storage.egress_generations(), 1);
+    assert_eq!(
+        fs::read_dir(storage.layout().egress_receipt_dir())
+            .expect("egress receipt directory should be readable")
+            .count(),
+        1
+    );
+    assert!(storage.layout().nar_path_encoded(first.0).is_file());
+}
+
+#[test]
+fn restarting_storage_reuses_a_durable_compressed_derivative() {
+    let directory = TestDir::new();
+    let raw = b"raw NAR for restart reuse";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    let (first, initial_generations) = {
+        let storage = initialize_storage(directory.path()).expect("storage should initialize");
+        storage
+            .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+            .expect("raw NAR should be stored");
+        let output = storage
+            .compressed_representation_for_test(identity, CompressionCodec::Xz, 0)
+            .expect("first derivative should be created");
+        (output, storage.egress_generations())
+    };
+    assert_eq!(initial_generations, 1);
+
+    let restarted = initialize_storage(directory.path()).expect("storage should restart");
+    let second = restarted
+        .compressed_representation_for_test(identity, CompressionCodec::Xz, u64::MAX)
+        .expect("restart should reuse the derivative");
+
+    assert_eq!(second, first);
+    assert_eq!(restarted.egress_generations(), 0);
+}
+
+#[test]
+fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let raw = b"raw NAR with a removable derivative";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let first = storage
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+        .expect("first derivative should be created");
+    fs::remove_file(storage.layout().nar_path_encoded(first.0))
+        .expect("derivative should be removable for the recovery test");
+
+    let rebuilt = storage
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+        .expect("missing derivative should be rebuilt");
+
+    assert_eq!(rebuilt, first);
+    assert!(storage.layout().nar_path_encoded(rebuilt.0).is_file());
+}
+
+#[test]
+fn missing_compressed_derivative_must_reproduce_its_receipt_identity() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let raw = b"raw NAR with a binding receipt";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let output = storage
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+        .expect("derivative should be created");
+    fs::remove_file(storage.layout().nar_path_encoded(output.0))
+        .expect("derivative should be removable for the binding test");
+    let receipt_path = fs::read_dir(storage.layout().egress_receipt_dir())
+        .expect("egress receipt directory should be readable")
+        .next()
+        .expect("egress receipt should exist")
+        .expect("egress receipt should be readable")
+        .path();
+    let mut receipt = fs::read(&receipt_path).expect("receipt should be readable");
+    const ENCODED_HASH_OFFSET: usize = 1 + 32 + 1 + 1;
+    receipt[ENCODED_HASH_OFFSET] ^= 1;
+    fs::write(receipt_path, receipt).expect("test should rewrite the receipt identity");
+
+    assert!(matches!(
+        storage.compressed_representation_for_test(identity, CompressionCodec::Zstd, 0),
+        Err(StorageError::NarMismatch)
+    ));
+}
+
+#[test]
+fn same_size_corrupt_compressed_derivative_is_repaired() {
+    assert_egress_derivative_is_repaired(|bytes| bytes[0] ^= 1, false);
+}
+
+#[test]
+fn truncated_compressed_derivative_is_repaired() {
+    assert_egress_derivative_is_repaired(|bytes| bytes.truncate(bytes.len() / 2), false);
+}
+
+#[test]
+fn server_generated_derivative_is_repaired_without_a_receipt() {
+    assert_egress_derivative_is_repaired(|bytes| bytes[0] ^= 1, true);
+}
+
+fn assert_egress_derivative_is_repaired(
+    corrupt_derivative: impl FnOnce(&mut Vec<u8>),
+    remove_receipt: bool,
+) {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let raw = b"raw NAR with a corrupt derivative";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let output = storage
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+        .expect("derivative should be created");
+    let output_path = storage.layout().nar_path_encoded(output.0);
+    let original = fs::read(&output_path).expect("derivative should be readable");
+    let mut corrupt = fs::read(&output_path).expect("derivative should be readable");
+    corrupt_derivative(&mut corrupt);
+    fs::write(&output_path, &corrupt).expect("test should corrupt the derivative");
+    storage
+        .finish_recovery()
+        .expect("recovery should retain repair evidence for an existing raw NAR");
+    assert_eq!(
+        fs::read_dir(storage.layout().egress_receipt_dir())
+            .expect("egress receipt directory should be readable")
+            .count(),
+        1,
+        "recovery must retain the receipt while its raw source exists"
+    );
+    if remove_receipt {
+        let receipt = fs::read_dir(storage.layout().egress_receipt_dir())
+            .expect("egress receipt directory should be readable")
+            .next()
+            .expect("egress receipt should exist")
+            .expect("egress receipt should be readable")
+            .path();
+        fs::remove_file(receipt).expect("test should remove the egress receipt");
+    }
+
+    assert_eq!(
+        storage
+            .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+            .expect("a server-generated corrupt derivative should be repaired"),
+        output
+    );
+    assert_eq!(
+        fs::read(output_path).expect("repaired derivative should be readable"),
+        original
+    );
+    assert_eq!(storage.temporary_objects(), 0);
+}
+
+#[test]
+fn concurrent_requests_coalesce_compressed_derivative_generation() {
+    let directory = TestDir::new();
+    let storage =
+        Arc::new(initialize_storage(directory.path()).expect("storage should initialize"));
+    let raw = b"raw NAR for concurrent egress generation";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    storage
+        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .expect("raw NAR should be stored");
+
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let workers = (0..4)
+        .map(|_| {
+            let storage = Arc::clone(&storage);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                storage
+                    .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+                    .expect("coalesced derivative generation should succeed")
+            })
+        })
+        .collect::<Vec<_>>();
+    let outputs = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker should not panic"))
+        .collect::<Vec<_>>();
+
+    assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(storage.egress_generations(), 1);
+    assert_eq!(
+        fs::read_dir(storage.layout().egress_receipt_dir())
+            .expect("egress receipt directory should be readable")
+            .count(),
+        1
     );
 }
 
@@ -1691,13 +1927,10 @@ fn process_lock_survives_lockfile_replacement() {
     fs::remove_file(&lock).expect("remove lock pathname");
     fs::write(&lock, b"replacement").expect("replace lock pathname");
 
-    assert!(matches!(
-        initialize_storage(directory.path()),
-        Err(StorageError::Locked)
-    ));
+    assert_lock_probe_status(directory.path(), "held");
 
     drop(first);
-    initialize_storage(directory.path()).expect("reacquire after lease release");
+    assert_lock_probe_status(directory.path(), "available");
 }
 
 #[test]
@@ -1708,19 +1941,27 @@ fn process_lock_replacement_blocks_a_child_process() {
     fs::remove_file(&lock).expect("remove lock pathname");
     fs::write(&lock, b"replacement").expect("replace lock pathname");
 
+    assert_lock_probe_status(directory.path(), "held");
+
+    drop(first);
+    initialize_storage(directory.path()).expect("reacquire after lease release");
+}
+
+fn assert_lock_probe_status(path: &Path, expected: &str) {
     let status = process::Command::new(env::current_exe().expect("test executable path"))
         .args([
             "--exact",
             "storage::tests::process_lock_replacement_probe",
             "--nocapture",
         ])
-        .env("NARJAR_LOCK_PROBE_DATA", directory.path())
+        .env("NARJAR_LOCK_PROBE_DATA", path)
+        .env("NARJAR_LOCK_PROBE_EXPECTED", expected)
         .status()
         .expect("run lock probe child");
-    assert!(status.success(), "child process should observe the lease");
-
-    drop(first);
-    initialize_storage(directory.path()).expect("reacquire after lease release");
+    assert!(
+        status.success(),
+        "child process should report the {expected} lease state"
+    );
 }
 
 #[test]
@@ -1728,10 +1969,17 @@ fn process_lock_replacement_probe() {
     let Some(path) = env::var_os("NARJAR_LOCK_PROBE_DATA") else {
         return;
     };
-    assert!(matches!(
-        initialize_storage(Path::new(&path)),
-        Err(StorageError::Locked)
-    ));
+    match env::var("NARJAR_LOCK_PROBE_EXPECTED").as_deref() {
+        Ok("available") => {
+            initialize_storage(Path::new(&path))
+                .expect("lock should be available after lease release");
+        }
+        Ok("held") => assert!(matches!(
+            initialize_storage(Path::new(&path)),
+            Err(StorageError::Locked)
+        )),
+        other => panic!("unexpected lock probe expectation: {other:?}"),
+    }
 }
 
 #[test]
@@ -1792,10 +2040,11 @@ fn cleanup_removes_only_reported_stale_temps() {
         .find(|entry| entry.relative_path() == Path::new(".tmp/nar-stale.part"))
         .expect("stale temp entry");
     assert_eq!(stale.class(), ReconcileClass::TempStale);
-    assert!(
+    assert_eq!(
         storage
             .cleanup_stale_temp(stale)
-            .expect("cleanup stale temp")
+            .expect("cleanup stale temp"),
+        super::reconcile::CleanupOutcome::Removed
     );
     assert!(!stale_path.exists());
 
@@ -1815,7 +2064,10 @@ fn cleanup_removes_only_reported_stale_temps() {
         .find(|entry| entry.relative_path() == Path::new(".tmp/nar-young.part"))
         .expect("young temp entry");
     assert_eq!(young.class(), ReconcileClass::TempYoung);
-    assert!(!storage.cleanup_stale_temp(young).expect("keep young temp"));
+    assert_eq!(
+        storage.cleanup_stale_temp(young).expect("keep young temp"),
+        super::reconcile::CleanupOutcome::Unchanged
+    );
     assert!(young_path.exists());
 
     let validation_path = directory.path().join(".tmp/validation-repair.part");
@@ -1835,6 +2087,28 @@ fn cleanup_removes_only_reported_stale_temps() {
         .expect("validation temp entry");
     assert_eq!(validation.class(), ReconcileClass::TempYoung);
     assert!(validation_path.exists());
+
+    let egress_path = directory.path().join(".tmp/egress-receipt-stale.part");
+    fs::write(&egress_path, b"temp").expect("write egress receipt temp");
+    let egress_report = storage
+        .reconcile(
+            NonZeroUsize::new(16).expect("nonzero limit"),
+            SystemTime::now() + Duration::from_secs(1),
+        )
+        .expect("classify egress receipt temp");
+    let egress = egress_report
+        .entries()
+        .iter()
+        .find(|entry| entry.relative_path() == Path::new(".tmp/egress-receipt-stale.part"))
+        .expect("egress receipt temp entry");
+    assert_eq!(egress.class(), ReconcileClass::TempStale);
+    assert_eq!(
+        storage
+            .cleanup_stale_temp(egress)
+            .expect("cleanup egress receipt temp"),
+        super::reconcile::CleanupOutcome::Removed
+    );
+    assert!(!egress_path.exists());
 }
 
 #[test]
@@ -1858,10 +2132,11 @@ fn cleanup_does_not_remove_a_replaced_stale_temp() {
     fs::remove_file(&path).expect("remove reported temp");
     fs::write(&path, b"replacement").expect("write replacement temp");
 
-    assert!(
-        !storage
+    assert_eq!(
+        storage
             .cleanup_stale_temp(stale)
-            .expect("replacement should not be removed")
+            .expect("replacement should not be removed"),
+        super::reconcile::CleanupOutcome::Unchanged
     );
     assert_eq!(fs::read(&path).expect("read replacement"), b"replacement");
 }
@@ -1879,7 +2154,10 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
         .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
         .expect("publish narinfo");
 
-    assert!(storage.delete_narinfo(&store).expect("delete narinfo"));
+    assert_eq!(
+        storage.delete_narinfo(&store).expect("delete narinfo"),
+        super::operations::NarInfoDeletion::Deleted
+    );
     assert!(
         storage
             .open_pair(&store, nar)
@@ -1887,7 +2165,10 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
             .is_none()
     );
     assert!(storage.layout().nar_path(nar).is_file());
-    assert!(!storage.delete_narinfo(&store).expect("repeat delete"));
+    assert_eq!(
+        storage.delete_narinfo(&store).expect("repeat delete"),
+        super::operations::NarInfoDeletion::Absent
+    );
 }
 
 struct TestDir(tempfile::TempDir);

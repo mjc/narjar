@@ -23,8 +23,16 @@ The portable publication contract requires:
 - an exclusive process lease using local `flock` semantics.
 
 Transaction-record replacement uses `renameat` inside the transaction
-directory. That is separate from final-object publication: Narjar does not
-use rename-overwrite semantics for immutable NAR or narinfo objects.
+directory. That is separate from final-object publication. User-uploaded NAR
+and narinfo objects remain no-replace publications. Narjar may additionally
+use an atomic `renameat` replacement for a server-generated compressed egress
+derivative, but only after the existing derivative fails its recorded content
+identity check or, when no receipt exists, fails comparison with the newly
+materialized server-generated `EncodedIdentity`. The replacement must be fully
+encoded, hashed, flushed, and synced. It occurs while holding the raw-NAR/codec
+payload lock; the source and destination directories are synced at the same
+durability boundaries as other publications. This exception does not apply to
+user uploads or narinfo files.
 
 Capacity and readiness diagnostics use `fstatvfs`, regular-file checks, and
 the lease. HTTP delivery may use `sendfile` where available, but retains the

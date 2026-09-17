@@ -315,6 +315,15 @@ when recovery records are present, then removes only those recorded temporary
 objects before serving exact files. Reconciliation remains deterministic and
 operator-triggered for other stale temporary files.
 
+Server-generated compressed egress has a durable receipt under
+`.narjar-egress/` binding one canonical raw identity and codec to the exact
+encoded hash and size. Recovery removes malformed receipts and receipts whose
+canonical raw source no longer exists. It retains a well-formed receipt when
+the derivative is missing, truncated, or corrupt so a later request can
+reproduce the recorded identity. Materialization verifies the replacement
+identity before an atomic repair rename; ordinary uploaded NAR and narinfo
+destinations remain immutable no-replace publications.
+
 Upload validation is the first content-integrity boundary. Raw narinfo
 publication and normal availability checks inspect only that the regular file
 exists with the declared encoded size. Compressed upload validation durably
@@ -385,7 +394,7 @@ For a consistent portable copy:
 1. Stop Narjar and wait for the process to exit.
 2. Copy the complete data directory, including `.narjar-clean`,
    `.narjar-recovery`, `.narjar-transactions/`, `lock`, `nar/`, `.tmp/`,
-   `realisations/`, `.narjar-validation/`, `nix-cache-info`,
+   `realisations/`, `.narjar-validation/`, `.narjar-egress/`, `nix-cache-info`,
    `trusted-public-keys`, and `auth/`.
 3. Preserve the directory and file permissions; do not expose the copy while
    it contains credentials.

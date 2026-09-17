@@ -2509,6 +2509,12 @@ fn configured_compressed_egress_is_independent_of_ingress_encoding() {
             &[],
             narinfo.as_bytes(),
         );
+        let repeated = server.request_with_body(
+            "PUT",
+            &format!("/{STORE_HASH}.narinfo"),
+            &[],
+            narinfo.as_bytes(),
+        );
         let narinfo_response = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
         let (_, narinfo_body) = response_parts(&narinfo_response);
         let narinfo_text = String::from_utf8(narinfo_body.to_vec()).expect("narinfo is UTF-8");
@@ -2539,6 +2545,7 @@ fn configured_compressed_egress_is_independent_of_ingress_encoding() {
 
         assert!(uploaded.starts_with(b"HTTP/1.1 201 Created\r\n"));
         assert!(published.starts_with(b"HTTP/1.1 201 Created\r\n"));
+        assert!(repeated.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(output_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert_eq!(output_body, output_bytes);
         assert!(signal.success(), "SIGTERM should be sent");

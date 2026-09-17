@@ -9,6 +9,7 @@ use std::{
 
 use lzma_rust2::XzReader;
 use lzma_rust2::{XzOptions, XzWriter};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
@@ -20,7 +21,6 @@ use crate::object::{
 };
 
 use super::publication::{StagingReservation, StorageError};
-
 const INGESTION_RECEIPT_VERSION: u8 = 1;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -532,6 +532,37 @@ pub(super) struct IngestionReceipt {
     decoded: NarIdentity,
 }
 
+#[derive(Deserialize, Serialize)]
+struct IngestionReceiptRecord {
+    version: u8,
+    encoding: CompressionCodec,
+    encoded_hash: FileHash,
+    encoded_size: EncodedSize,
+    decoded_hash: NarHash,
+    decoded_size: NarSize,
+}
+
+impl IngestionReceiptRecord {
+    fn from_receipt(receipt: &IngestionReceipt) -> Self {
+        Self {
+            version: INGESTION_RECEIPT_VERSION,
+            encoding: receipt.encoded.codec(),
+            encoded_hash: receipt.encoded.hash(),
+            encoded_size: receipt.encoded.size(),
+            decoded_hash: receipt.decoded.hash(),
+            decoded_size: receipt.decoded.size(),
+        }
+    }
+
+    fn into_receipt(self) -> Option<IngestionReceipt> {
+        (self.version == INGESTION_RECEIPT_VERSION).then_some(())?;
+        Some(IngestionReceipt {
+            encoded: EncodedIdentity::new(self.encoding, self.encoded_hash, self.encoded_size),
+            decoded: NarIdentity::new(self.decoded_hash, self.decoded_size),
+        })
+    }
+}
+
 impl IngestionReceipt {
     fn from_decoded(encoded: EncodedIdentity, decoded: DecodedValidation) -> Self {
         Self {
@@ -549,58 +580,14 @@ impl IngestionReceipt {
     }
 
     pub(super) fn bytes(&self) -> Vec<u8> {
-        format!(
-            "version={INGESTION_RECEIPT_VERSION}\nencoding={}\nencoded-hash={}\nencoded-size={}\ndecoded-hash={}\ndecoded-size={}\n",
-            self.encoded.codec().compression(),
-            self.encoded.hash(),
-            self.encoded.size(),
-            self.decoded.hash(),
-            self.decoded.size(),
-        )
-        .into_bytes()
+        postcard::to_allocvec(&IngestionReceiptRecord::from_receipt(self))
+            .expect("ingestion receipt serialization cannot fail")
     }
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        if !text.ends_with('\n') {
-            return None;
-        }
-        let mut version: Option<u8> = None;
-        let mut encoding = None;
-        let mut encoded_hash = None;
-        let mut encoded_size = None;
-        let mut decoded_hash = None;
-        let mut decoded_size = None;
-        for line in text.lines() {
-            let (name, value) = line.split_once('=')?;
-            match name {
-                "version" if version.is_none() => version = Some(value.parse().ok()?),
-                "encoding" if encoding.is_none() => {
-                    encoding = Some(match value {
-                        "zstd" => CompressionCodec::Zstd,
-                        "xz" => CompressionCodec::Xz,
-                        _ => return None,
-                    })
-                }
-                "encoded-hash" if encoded_hash.is_none() => {
-                    encoded_hash = Some(FileHash::parse(value).ok()?)
-                }
-                "encoded-size" if encoded_size.is_none() => {
-                    encoded_size = Some(EncodedSize::new(value.parse().ok()?))
-                }
-                "decoded-hash" if decoded_hash.is_none() => {
-                    decoded_hash = Some(NarHash::parse(value).ok()?)
-                }
-                "decoded-size" if decoded_size.is_none() => {
-                    decoded_size = Some(NarSize::new(value.parse().ok()?))
-                }
-                _ => return None,
-            }
-        }
-        let encoded = EncodedIdentity::new(encoding?, encoded_hash?, encoded_size?);
-        let decoded = NarIdentity::new(decoded_hash?, decoded_size?);
-        let evidence = Self { encoded, decoded };
-        (version? == INGESTION_RECEIPT_VERSION).then_some(evidence)
+        postcard::from_bytes::<IngestionReceiptRecord>(bytes)
+            .ok()
+            .and_then(IngestionReceiptRecord::into_receipt)
     }
 
     pub(super) fn matches(&self, expectation: CompressedNarExpectation) -> bool {
@@ -737,7 +724,7 @@ fn sha256_file(file: &File) -> io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn encoded_file_matches(file: &File, identity: EncodedIdentity) -> io::Result<bool> {
+pub(super) fn encoded_file_matches(file: &File, identity: EncodedIdentity) -> io::Result<bool> {
     if file.metadata()?.len() != identity.size().get() {
         return Ok(false);
     }
@@ -877,11 +864,67 @@ pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Resu
 mod tests {
     use std::{
         fs::File,
+        io::{self, Seek, SeekFrom, Write},
         sync::{Arc, Mutex},
     };
 
-    use super::{StagingReservation, reserve_preferred_or_exact_staging_growth};
+    use super::{
+        DecodedValidation, EncodedIdentity, EncodedSize, FileHash, IngestionReceipt, NarHash,
+        NarIdentity, NarSize, StagingReservation, encode_raw_nar,
+        reserve_preferred_or_exact_staging_growth,
+    };
+    use crate::object::CompressionCodec;
     use crate::storage::fs::filesystem_space;
+
+    struct EnospcWriter;
+
+    impl Write for EnospcWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn encoding_propagates_physical_enospc() {
+        let mut source = tempfile::tempfile().expect("create source NAR");
+        source
+            .write_all(b"raw NAR bytes")
+            .expect("write source NAR");
+        source.seek(SeekFrom::Start(0)).expect("rewind source NAR");
+
+        for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
+            let error = encode_raw_nar(&source, codec, &mut EnospcWriter)
+                .err()
+                .expect("physical output exhaustion should fail encoding");
+            assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        }
+    }
+
+    #[test]
+    fn ingestion_receipt_round_trips_through_compact_binary_serialization() {
+        let encoded_hash = FileHash::from_digest([0; 32]);
+        let decoded_hash = NarHash::from_digest([1; 32]);
+        let decoded_identity = NarIdentity::new(decoded_hash, NarSize::new(17));
+        let receipt = IngestionReceipt::from_decoded(
+            EncodedIdentity::new(CompressionCodec::Zstd, encoded_hash, EncodedSize::new(23)),
+            DecodedValidation {
+                hash: decoded_hash,
+                size: decoded_identity.size(),
+            },
+        );
+        let bytes = receipt.bytes();
+        assert_eq!(
+            IngestionReceipt::parse(&bytes)
+                .expect("typed ingestion receipt should be readable")
+                .decoded_identity(),
+            decoded_identity
+        );
+        assert!(IngestionReceipt::parse(&bytes[..bytes.len() - 1]).is_none());
+    }
 
     #[test]
     fn staging_growth_falls_back_to_the_exact_immediate_requirement() {

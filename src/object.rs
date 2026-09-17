@@ -1,6 +1,7 @@
 use std::{ffi::OsString, fmt, sync::OnceLock};
 
 use data_encoding::{BitOrder, Encoding, Specification};
+use serde::{Deserialize, Serialize};
 
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const NIX32_SHA256_LEN: usize = 52;
@@ -16,7 +17,7 @@ impl fmt::Display for InvalidObjectId {
 
 impl std::error::Error for InvalidObjectId {}
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct NarHash([u8; 32]);
 
 impl NarHash {
@@ -35,7 +36,7 @@ impl fmt::Display for NarHash {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct FileHash([u8; 32]);
 
 impl FileHash {
@@ -85,9 +86,13 @@ impl EncodedIdentity {
     pub(crate) const fn size(self) -> EncodedSize {
         self.size
     }
+
+    pub(crate) const fn file_name(self) -> NarFileName {
+        NarFileName::new(self.hash, self.codec.wire_encoding())
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct NarSize(u64);
 
 impl NarSize {
@@ -112,7 +117,7 @@ impl fmt::Display for NarSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct EncodedSize(u64);
 
 impl EncodedSize {
@@ -217,7 +222,7 @@ pub enum WireEncoding {
     Xz,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) enum CompressionCodec {
     Zstd,
     Xz,
@@ -229,10 +234,6 @@ impl CompressionCodec {
             Self::Zstd => WireEncoding::Zstd,
             Self::Xz => WireEncoding::Xz,
         }
-    }
-
-    pub(crate) const fn compression(self) -> &'static str {
-        self.wire_encoding().compression()
     }
 
     pub(crate) const fn suffix(self) -> &'static str {

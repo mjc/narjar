@@ -19,7 +19,7 @@ use narjar::{
     inventory::{Inventory, InventoryClass, VerificationMode},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
-        Directory, ReconcileClass, Storage, StoreHash,
+        CleanupOutcome, Directory, ReconcileClass, Storage, StoreHash,
         gc::{self, GcOptions},
     },
 };
@@ -61,6 +61,7 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
         "realisations",
         ".narjar-validation",
         ".narjar-ingress",
+        ".narjar-egress",
     ] {
         ensure_directory(&root.join(directory), 0o700)?;
     }
@@ -84,6 +85,7 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
 const INIT_ROOT_ENTRIES: &[&str] = &[
     ".narjar-clean",
     ".narjar-ingress",
+    ".narjar-egress",
     ".narjar-recovery",
     ".narjar-transactions",
     ".narjar-validation",
@@ -445,10 +447,9 @@ fn structural_scan(
 
     for entry in report.entries() {
         let action = if cleanup && entry.class() == ReconcileClass::TempStale {
-            if storage.cleanup_stale_temp(entry).map_err(runtime)? {
-                "deleted"
-            } else {
-                "kept_replaced"
+            match storage.cleanup_stale_temp(entry).map_err(runtime)? {
+                CleanupOutcome::Removed => "deleted",
+                CleanupOutcome::Unchanged => "kept_replaced",
             }
         } else if cleanup {
             "kept"
@@ -740,6 +741,7 @@ fn inspect_doctor(root: &Path) -> Result<DoctorReport, Error> {
         paths.push(inspect_doctor_path(root, path, true, true));
     }
     paths.push(inspect_doctor_path(root, ".narjar-ingress", false, true));
+    paths.push(inspect_doctor_path(root, ".narjar-egress", false, true));
     for path in DOCTOR_FILES {
         paths.push(inspect_doctor_path(root, path, true, false));
     }

@@ -6,11 +6,14 @@ remain subject to the evidence gates recorded below.
 ## Decision
 
 Narjar is a flat, filesystem-only HTTP binary cache. It does not expose a
-native /nix/store, invoke Nix, maintain a database, recompress payloads, own a
-signing key, run background workers, or perform online garbage collection. It
+native /nix/store, invoke Nix, own a signing key, run background workers, or
+perform online garbage collection. It can normalize uploaded NAR
+representations to canonical raw storage and materialize deterministic
+compressed egress derivatives on demand. It
 does provide a bounded, operator-invoked offline retention pass. It accepts
-Nix's raw `.nar`, precompressed `.nar.zst`, and `.nar.xz` forms and stores each form
-byte-for-byte.
+Nix's raw `.nar`, precompressed `.nar.zst`, and `.nar.xz` forms as upload
+transports, while storing one canonical raw `.nar` plus any requested
+server-generated egress derivatives.
 
 The differentiator from bincache is deletion of redb, server signing,
 recompression, io_uring-specific paths, sharding, and maintenance state. The
@@ -124,6 +127,9 @@ DATA/
   .narjar-validation/
     <encoded-hash>.nar.zst.validation   durable decoded identity evidence
     <encoded-hash>.nar.xz.validation
+  .narjar-egress/
+    <raw-hash>.nar.zst.receipt           raw-to-egress identity binding
+    <raw-hash>.nar.xz.receipt
   trusted-public-keys                   mode 0600
   lock                                  single-writer process lock
 ~~~
@@ -185,8 +191,10 @@ PUT /<store-hash>.narinfo
   -> require URL nar/<file-hash>.nar, .nar.zst, or .nar.xz
   -> require Compression to match the URL suffix
   -> validate encoded FileHash/FileSize and raw NarHash/NarSize
-  -> require referenced NAR file metadata and size
+  -> require referenced canonical raw NAR file metadata and size
   -> verify at least one signature from trusted-public-keys
+  -> select the configured output representation
+  -> reuse or materialize a server-owned compressed derivative when required
   -> write canonical original bytes to DATA/.tmp with create-new
   -> sync temporary file
   -> no-replace hard link to DATA/<store-hash>.narinfo
@@ -202,12 +210,15 @@ producer signature authorizes the raw hash and size, and consumer Nix verifies
 and parses the NAR while importing. A second parser would add attack surface
 without adding authenticity.
 
-Narjar does not recompress. The upload and stored object remain identical; XZ is
-decoded only while validating the raw hash and configured decompressed-size
-limit. NAR staging is under `DATA/nar/.tmp`, so a split NAR destination can
-publish with a same-filesystem no-replace hard link; metadata remains staged
-under `DATA/.tmp`. The bandwidth and CPU tradeoff is explicit and must be
-measured.
+Compressed uploads are decoded while validating and are normalized to the
+canonical raw NAR. When compressed output is selected, Narjar materializes a
+server-owned derivative from that raw file, records its exact encoded identity
+in `.narjar-egress/`, and reuses it on later requests. A missing or corrupt
+derivative is regenerated only when the receipt's exact identity can be
+reproduced; a receipt-less server-generated derivative is repaired after its
+new identity is measured. User-uploaded immutable objects retain no-replace
+publication semantics. NAR staging is under `DATA/nar/.tmp`, while metadata
+remains staged under `DATA/.tmp`.
 
 Upload validation is the first content-integrity boundary. Raw narinfo
 publication and ordinary NAR availability checks inspect only that the regular
