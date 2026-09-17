@@ -56,13 +56,13 @@ impl HttpUrl {
 
     pub(crate) fn resolve_trusted_redirect(&self, location: &str) -> Result<Self, String> {
         let reference = UriRef::parse(location.trim())
-            .map_err(|error| format!("PUT {self} redirect has an invalid Location: {error}"))?;
+            .map_err(|error| format!("{self} redirect has an invalid Location: {error}"))?;
         let mut next = reference
             .resolve_against(&self.0)
-            .map_err(|error| format!("PUT {self} redirect has an invalid Location: {error}"))?;
+            .map_err(|error| format!("{self} redirect has an invalid Location: {error}"))?;
         next.set_fragment(None);
         let next = Self::try_from_uri(next)
-            .map_err(|error| format!("PUT {self} redirect is invalid: {error}"))?;
+            .map_err(|error| format!("{self} redirect is invalid: {error}"))?;
 
         let same_authority = self.authority().as_str() == next.authority().as_str();
         let safe_scheme = self.0.scheme() == next.0.scheme()
@@ -71,7 +71,7 @@ impl HttpUrl {
             Ok(next)
         } else {
             Err(format!(
-                "PUT {self} redirect leaves the trusted cache authority"
+                "{self} redirect leaves the trusted cache authority"
             ))
         }
     }

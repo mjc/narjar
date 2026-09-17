@@ -27,30 +27,59 @@ pub(super) fn request_status(
     url: &HttpUrl,
     authorization: Option<&str>,
 ) -> Result<u16, String> {
-    for attempt in 0..MAX_ATTEMPTS {
-        let mut request = agent.get(url.as_str());
-        if let Some(authorization) = authorization {
-            request = request.header("Authorization", format!("Basic {authorization}"));
-        }
-        match request.call() {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let retry_after = response
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(retry_after_delay);
-                let mut body = response.into_body().into_reader();
-                io::copy(&mut body, &mut io::sink())
-                    .map_err(|error| format!("reading GET {url} response failed: {error}"))?;
-                if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                    retry_sleep(attempt, retry_after);
-                    continue;
-                }
-                return Ok(status);
+    'attempts: for attempt in 0..MAX_ATTEMPTS {
+        let mut request_url = url.clone();
+        for redirect in 0..=MAX_REDIRECTS {
+            let mut request = agent
+                .get(request_url.as_str())
+                .config()
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .build();
+            if let Some(authorization) = authorization {
+                request = request.header("Authorization", format!("Basic {authorization}"));
             }
-            Err(_error) if attempt + 1 < MAX_ATTEMPTS => retry_sleep(attempt, None),
-            Err(error) => return Err(format!("GET {url} failed: {error}")),
+            match request.call() {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let retry_after = response
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(retry_after_delay);
+                    let location = response
+                        .headers()
+                        .get("Location")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let mut body = response.into_body().into_reader();
+                    io::copy(&mut body, &mut io::sink()).map_err(|error| {
+                        format!("reading GET {request_url} response failed: {error}")
+                    })?;
+
+                    if matches!(status, 307 | 308) {
+                        if redirect == MAX_REDIRECTS {
+                            return Err(format!("GET {url} followed too many redirects"));
+                        }
+                        let location = location.ok_or_else(|| {
+                            format!("GET {request_url} redirect response had no Location header")
+                        })?;
+                        request_url = request_url.resolve_trusted_redirect(&location)?;
+                        continue;
+                    }
+
+                    if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
+                        retry_sleep(attempt, retry_after);
+                        continue 'attempts;
+                    }
+                    return Ok(status);
+                }
+                Err(_error) if attempt + 1 < MAX_ATTEMPTS => {
+                    retry_sleep(attempt, None);
+                    continue 'attempts;
+                }
+                Err(error) => return Err(format!("GET {request_url} failed: {error}")),
+            }
         }
     }
     unreachable!("retry loop always returns")

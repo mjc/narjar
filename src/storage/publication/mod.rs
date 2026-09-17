@@ -32,11 +32,37 @@ pub(super) struct TemporaryFile {
 pub(super) struct Streaming;
 pub(super) struct Validated;
 
+struct OwnedTransaction(Option<PublicationTransaction>);
+
+impl OwnedTransaction {
+    fn new(transaction: PublicationTransaction) -> Self {
+        Self(Some(transaction))
+    }
+
+    fn into_inner(mut self) -> PublicationTransaction {
+        self.0
+            .take()
+            .expect("owned publication transaction is present")
+    }
+
+    fn preserve_recovery_record(mut self) {
+        let _ = self.0.take();
+    }
+}
+
+impl Drop for OwnedTransaction {
+    fn drop(&mut self) {
+        if let Some(transaction) = self.0.take() {
+            transaction.cancel();
+        }
+    }
+}
+
 pub(super) struct StagedPublication<'storage, Checkpoint, State> {
     pub(super) storage: &'storage Storage,
     pub(super) destination: PublicationDestination,
     temporary: OwnedTemporary<'storage>,
-    pub(super) transaction: PublicationTransaction,
+    transaction: OwnedTransaction,
     checkpoint: Checkpoint,
     _state: PhantomData<State>,
 }
@@ -53,7 +79,7 @@ impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
             storage,
             destination,
             temporary,
-            transaction,
+            transaction: OwnedTransaction::new(transaction),
             checkpoint,
             _state: PhantomData,
         }
@@ -68,12 +94,23 @@ where
         mut self,
         mut source: impl Read,
     ) -> Result<StagedPublication<'storage, Checkpoint, Validated>, StorageError> {
-        (self.checkpoint)(PublishBoundary::AfterTempCreate)?;
-        io::copy(&mut source, self.temporary.file_mut())?;
-        (self.checkpoint)(PublishBoundary::AfterStream)?;
-        self.temporary.file().file.sync_all()?;
-        (self.checkpoint)(PublishBoundary::AfterTempSync)?;
-        self.transaction.transition(PublicationState::Validated)?;
+        let result = (|| {
+            (self.checkpoint)(PublishBoundary::AfterTempCreate)?;
+            io::copy(&mut source, self.temporary.file_mut())?;
+            (self.checkpoint)(PublishBoundary::AfterStream)?;
+            self.temporary.file().file.sync_all()?;
+            (self.checkpoint)(PublishBoundary::AfterTempSync)?;
+            self.transaction
+                .0
+                .as_mut()
+                .expect("owned publication transaction is present")
+                .transition(PublicationState::Validated)?;
+            Ok::<_, StorageError>(())
+        })();
+        if let Err(error) = result {
+            self.transaction.preserve_recovery_record();
+            return Err(error);
+        }
 
         let Self {
             storage,
@@ -108,7 +145,12 @@ where
             _state: _,
         } = self;
         let temporary = temporary.into_file();
-        storage.commit_temporary(destination, &temporary, transaction, checkpoint)
+        storage.commit_temporary(
+            destination,
+            &temporary,
+            transaction.into_inner(),
+            checkpoint,
+        )
     }
 }
 

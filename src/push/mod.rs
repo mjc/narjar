@@ -436,6 +436,80 @@ mod tests {
     }
 
     #[test]
+    fn follows_authenticated_get_redirects_without_leaving_the_cache() {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        fn read_headers(stream: &mut TcpStream) -> String {
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 1024];
+                let read = stream.read(&mut buffer).expect("read GET request");
+                assert_ne!(read, 0, "GET request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return String::from_utf8(request).expect("GET request should be UTF-8");
+                }
+            }
+        }
+
+        fn has_authorization(request: &str) -> bool {
+            request.lines().any(|line| {
+                let Some((name, value)) = line.split_once(':') else {
+                    return false;
+                };
+                name.eq_ignore_ascii_case("authorization") && value.trim() == "Basic dXNlcjpwYXNz"
+            })
+        }
+
+        for redirect_status in [307, 308] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind GET redirect listener");
+            let address = listener
+                .local_addr()
+                .expect("inspect GET redirect listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept initial GET request");
+                let request = read_headers(&mut stream);
+                assert!(request.starts_with("GET /narinfo HTTP/1.1"));
+                assert!(has_authorization(&request));
+                write!(
+                    stream,
+                    "HTTP/1.1 {redirect_status} Temporary Redirect\r\nLocation: /redirected/narinfo\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write GET redirect response");
+
+                let (mut stream, _) = listener.accept().expect("accept redirected GET request");
+                let request = read_headers(&mut stream);
+                assert!(request.starts_with("GET /redirected/narinfo HTTP/1.1"));
+                assert!(has_authorization(&request));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write redirected GET response");
+            });
+            let agent: Agent = Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into();
+
+            assert_eq!(
+                super::request_status(
+                    &agent,
+                    &http_url(format!("http://{address}/narinfo")),
+                    Some("dXNlcjpwYXNz"),
+                )
+                .expect("authenticated GET redirect should succeed"),
+                200
+            );
+            server.join().expect("GET redirect server should exit");
+        }
+    }
+
+    #[test]
     fn retries_a_429_during_file_upload() {
         use std::{
             fs,

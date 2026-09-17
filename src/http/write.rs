@@ -70,8 +70,7 @@ impl PublicationRequest {
                 },
             ),
             CacheRoute::NarInfo(store) => {
-                drop(staging);
-                respond_narinfo_put(
+                let result = respond_narinfo_put(
                     upload,
                     NarInfoPutContext {
                         storage,
@@ -82,7 +81,9 @@ impl PublicationRequest {
                         metrics,
                         guard: &guard,
                     },
-                )
+                );
+                drop(staging);
+                result
             }
             CacheRoute::CacheInfo => {
                 drop(staging);

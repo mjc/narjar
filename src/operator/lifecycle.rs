@@ -9,7 +9,10 @@ use std::{
 use clap::{Args, Subcommand};
 use data_encoding::BASE64;
 use ed25519_dalek::SigningKey;
-use narjar::storage::{Directory, Storage};
+use narjar::storage::{
+    Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY,
+    REALISATIONS_DIRECTORY, Storage, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+};
 
 use crate::error::Error;
 
@@ -44,12 +47,12 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
     let directory = Directory::open(&root).map_err(runtime)?;
     let storage = Storage::initialize(&directory).map_err(runtime)?;
     for directory in [
-        "nar",
-        ".tmp",
-        "realisations",
-        ".narjar-validation",
-        ".narjar-ingress",
-        ".narjar-egress",
+        NAR_DIRECTORY,
+        TEMPORARY_DIRECTORY,
+        REALISATIONS_DIRECTORY,
+        VALIDATION_DIRECTORY,
+        INGESTION_RECEIPT_DIRECTORY,
+        EGRESS_RECEIPT_DIRECTORY,
     ] {
         ensure_directory(&root.join(directory), 0o700)?;
     }
@@ -72,17 +75,17 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
 
 const INIT_ROOT_ENTRIES: &[&str] = &[
     ".narjar-clean",
-    ".narjar-ingress",
-    ".narjar-egress",
+    INGESTION_RECEIPT_DIRECTORY,
+    EGRESS_RECEIPT_DIRECTORY,
     ".narjar-recovery",
     ".narjar-transactions",
-    ".narjar-validation",
-    ".tmp",
+    VALIDATION_DIRECTORY,
+    TEMPORARY_DIRECTORY,
     "auth",
-    "nar",
+    NAR_DIRECTORY,
     "nix-cache-info",
     "lock",
-    "realisations",
+    REALISATIONS_DIRECTORY,
     "trusted-public-keys",
 ];
 

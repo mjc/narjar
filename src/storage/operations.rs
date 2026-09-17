@@ -18,11 +18,13 @@ use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo};
 use crate::object::{EncodedIdentity, NarFileName, NarHash, WireEncoding};
 
 use super::{
+    EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY,
+    TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
     compression::{
         IngestionReceipt, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
     },
     directory::Directory,
-    egress::{CanonicalRawStatus, EGRESS_RECEIPT_DIRECTORY},
+    egress::CanonicalRawStatus,
     fs::{
         BoundedRegularFile, StorageCapacity, directory_is_empty, ensure_directory_at,
         entry_is_regular_at, files_equal_at, filesystem_space, hard_link_at, open_at,
@@ -45,8 +47,6 @@ use super::{
 use super::publication::{Layout, injected_fault};
 
 const MAX_CACHE_INFO_BYTES: u64 = 1024;
-pub(super) const VALIDATION_DIRECTORY: &str = ".narjar-validation";
-pub(super) const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
 pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
 
 #[derive(Clone, Copy)]
@@ -336,13 +336,17 @@ impl Storage {
         )?)?;
         ProcessLock::validate_lock_file(&root_directory)?;
         let nar_directory =
-            ensure_directory_at(&root_directory, OsStr::new("nar"), "nar directory")?;
+            ensure_directory_at(&root_directory, OsStr::new(NAR_DIRECTORY), "nar directory")?;
         ensure_directory_at(
             &nar_directory,
-            OsStr::new(".tmp"),
+            OsStr::new(TEMPORARY_DIRECTORY),
             "NAR temporary directory",
         )?;
-        ensure_directory_at(&root_directory, OsStr::new(".tmp"), "temporary directory")?;
+        ensure_directory_at(
+            &root_directory,
+            OsStr::new(TEMPORARY_DIRECTORY),
+            "temporary directory",
+        )?;
         let transactions = ensure_directory_at(
             &root_directory,
             OsStr::new(".narjar-transactions"),
@@ -351,7 +355,7 @@ impl Storage {
         transactions.set_permissions(Permissions::from_mode(0o700))?;
         let realisations_directory = ensure_directory_at(
             &root_directory,
-            OsStr::new("realisations"),
+            OsStr::new(REALISATIONS_DIRECTORY),
             "realisations directory",
         )?;
         ensure_directory_at(

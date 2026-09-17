@@ -193,15 +193,24 @@ fn abandoned_generic_publication_cleans_up_staging() {
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let target = super::publication::PublishTarget::Nar(NarFileName::raw(nar));
 
+    let streaming = storage.begin_publication(target, |_| Ok(())).unwrap();
+    assert!(storage.recovery_required().unwrap());
+    drop(streaming);
+    assert!(!storage.recovery_required().unwrap());
+    assert_eq!(storage.temporary_objects(), 0);
+
+    let target = super::publication::PublishTarget::Nar(NarFileName::raw(nar));
     let validated = storage
         .begin_publication(target, |_| Ok(()))
         .unwrap()
         .finish_and_sync(Cursor::new(b"nar bytes"))
         .unwrap();
     assert_eq!(storage.temporary_objects(), 1);
+    assert!(storage.recovery_required().unwrap());
     drop(validated);
 
     assert_eq!(storage.temporary_objects(), 0);
+    assert!(!storage.recovery_required().unwrap());
     assert!(storage.open_nar(nar).unwrap().is_none());
     assert!(
         fs::read_dir(storage.layout().nar_temp_dir())
