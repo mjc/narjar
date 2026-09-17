@@ -9,6 +9,7 @@ use std::{
 
 use super::{
     fs::{FilesystemSpace, filesystem_space, lock_exclusive, open_at},
+    operations::OwnedTemporary,
     recovery::{PublicationState, PublicationTransaction},
     state::Storage,
 };
@@ -31,40 +32,6 @@ pub(super) struct TemporaryFile {
 pub(super) struct Streaming;
 pub(super) struct Validated;
 
-struct OwnedTemporary<'storage> {
-    storage: &'storage Storage,
-    file: Option<TemporaryFile>,
-}
-
-impl<'storage> OwnedTemporary<'storage> {
-    fn new(storage: &'storage Storage, file: TemporaryFile) -> Self {
-        Self {
-            storage,
-            file: Some(file),
-        }
-    }
-
-    fn file(&self) -> &TemporaryFile {
-        self.file.as_ref().expect("owned temporary file is present")
-    }
-
-    fn file_mut(&mut self) -> &mut File {
-        &mut self
-            .file
-            .as_mut()
-            .expect("owned temporary file is present")
-            .file
-    }
-}
-
-impl Drop for OwnedTemporary<'_> {
-    fn drop(&mut self) {
-        if let Some(file) = self.file.as_ref() {
-            let _ = self.storage.remove_temp(file);
-        }
-    }
-}
-
 pub(super) struct StagedPublication<'storage, Checkpoint, State> {
     pub(super) storage: &'storage Storage,
     pub(super) destination: PublicationDestination,
@@ -78,14 +45,14 @@ impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
     pub(super) fn from_parts(
         storage: &'storage Storage,
         destination: PublicationDestination,
-        temporary: TemporaryFile,
+        temporary: OwnedTemporary<'storage>,
         transaction: PublicationTransaction,
         checkpoint: Checkpoint,
     ) -> Self {
         Self {
             storage,
             destination,
-            temporary: OwnedTemporary::new(storage, temporary),
+            temporary,
             transaction,
             checkpoint,
             _state: PhantomData,
@@ -140,7 +107,8 @@ where
             checkpoint,
             _state: _,
         } = self;
-        storage.commit_temporary(destination, temporary.file(), transaction, checkpoint)
+        let temporary = temporary.into_file();
+        storage.commit_temporary(destination, &temporary, transaction, checkpoint)
     }
 }
 

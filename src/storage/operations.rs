@@ -166,6 +166,44 @@ pub enum NarInfoDeletion {
     Absent,
 }
 
+pub(super) struct OwnedTemporary<'storage> {
+    storage: &'storage Storage,
+    file: Option<TemporaryFile>,
+}
+
+impl<'storage> OwnedTemporary<'storage> {
+    pub(super) fn new(storage: &'storage Storage, file: TemporaryFile) -> Self {
+        Self {
+            storage,
+            file: Some(file),
+        }
+    }
+
+    pub(super) fn file(&self) -> &TemporaryFile {
+        self.file.as_ref().expect("owned temporary file is present")
+    }
+
+    pub(super) fn file_mut(&mut self) -> &mut File {
+        &mut self
+            .file
+            .as_mut()
+            .expect("owned temporary file is present")
+            .file
+    }
+
+    pub(super) fn into_file(mut self) -> TemporaryFile {
+        self.file.take().expect("owned temporary file is present")
+    }
+}
+
+impl Drop for OwnedTemporary<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.as_ref() {
+            let _ = self.storage.remove_temp(file);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PublicationProgress {
     Pending(TemporaryLocation),
@@ -636,11 +674,8 @@ impl Storage {
         let temporary_path = self.temporary_path(&target, &temp_name);
         let mut transaction = self.recovery.begin(&temporary_path)?;
         checkpoint(PublishBoundary::BeforeTempCreate)?;
-        let temporary = self.create_temp_named(&target, temp_name)?;
-        if let Err(error) = transaction.transition(PublicationState::Streaming) {
-            let _ = self.remove_temp(&temporary);
-            return Err(error);
-        }
+        let temporary = OwnedTemporary::new(self, self.create_temp_named(&target, temp_name)?);
+        transaction.transition(PublicationState::Streaming)?;
 
         Ok(StagedPublication::from_parts(
             self,
