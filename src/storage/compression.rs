@@ -564,7 +564,7 @@ impl IngestionReceiptRecord {
 }
 
 impl IngestionReceipt {
-    pub(super) fn from_decoded(encoded: EncodedIdentity, decoded: DecodedValidation) -> Self {
+    fn from_decoded(encoded: EncodedIdentity, decoded: DecodedValidation) -> Self {
         Self {
             encoded,
             decoded: NarIdentity::new(decoded.hash, decoded.size),
@@ -868,7 +868,11 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use super::{StagingReservation, encode_raw_nar, reserve_preferred_or_exact_staging_growth};
+    use super::{
+        DecodedValidation, EncodedIdentity, EncodedSize, FileHash, IngestionReceipt, NarHash,
+        NarIdentity, NarSize, StagingReservation, encode_raw_nar,
+        reserve_preferred_or_exact_staging_growth,
+    };
     use crate::object::CompressionCodec;
     use crate::storage::fs::filesystem_space;
 
@@ -898,6 +902,28 @@ mod tests {
                 .expect("physical output exhaustion should fail encoding");
             assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
         }
+    }
+
+    #[test]
+    fn ingestion_receipt_round_trips_through_compact_binary_serialization() {
+        let encoded_hash = FileHash::from_digest([0; 32]);
+        let decoded_hash = NarHash::from_digest([1; 32]);
+        let decoded_identity = NarIdentity::new(decoded_hash, NarSize::new(17));
+        let receipt = IngestionReceipt::from_decoded(
+            EncodedIdentity::new(CompressionCodec::Zstd, encoded_hash, EncodedSize::new(23)),
+            DecodedValidation {
+                hash: decoded_hash,
+                size: decoded_identity.size(),
+            },
+        );
+        let bytes = receipt.bytes();
+        assert_eq!(
+            IngestionReceipt::parse(&bytes)
+                .expect("typed ingestion receipt should be readable")
+                .decoded_identity(),
+            decoded_identity
+        );
+        assert!(IngestionReceipt::parse(&bytes[..bytes.len() - 1]).is_none());
     }
 
     #[test]

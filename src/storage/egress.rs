@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
-    io::{self, Cursor, Read, Write},
+    io::{Cursor, Write},
     path::PathBuf,
 };
 
@@ -12,14 +12,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::narinfo::ValidatedPayload;
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, NarFileName, NarHash, NarIdentity, NarSize,
-    WireEncoding,
+    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
+    NarSize, WireEncoding,
 };
 
 use super::compression::{
     CapacityCheckedStagingWriter, encode_raw_nar, encoded_file_matches, nar_file_size_matches,
 };
-use super::fs::{open_optional_at, open_regular_at, read_dir_names, unlink_at};
+use super::fs::{
+    BoundedRegularFile, open_optional_at, read_bounded_regular_file, read_dir_names, unlink_at,
+};
 use super::publication::{
     NarUploadPolicy, PublishOutcome, PublishTarget, StorageError, TemporaryFile,
 };
@@ -113,12 +115,6 @@ enum ExistingDerivative {
     Usable(VerifiedDerivative),
 }
 
-enum BoundedFile {
-    Missing,
-    Invalid,
-    Present(Vec<u8>),
-}
-
 #[derive(Debug)]
 pub(super) enum CanonicalRawStatus {
     Missing,
@@ -152,51 +148,56 @@ enum GenerationContract {
 }
 
 impl GenerationContract {
-    fn verify(self, output: EncodedIdentity) -> Result<EncodedIdentity, StorageError> {
+    fn verify_generated_output(self, output: EncodedIdentity) -> Result<(), StorageError> {
         match self {
-            Self::AnyOutput => Ok(output),
-            Self::ExactOutput(expected) if expected == output => Ok(output),
+            Self::AnyOutput => Ok(()),
+            Self::ExactOutput(expected) if expected == output => Ok(()),
             Self::ExactOutput(_) => Err(StorageError::NarMismatch),
         }
     }
 }
 
-struct StagedDerivativeFile<'storage> {
+struct TemporaryDerivative<'storage> {
     storage: &'storage Storage,
-    file: Option<TemporaryFile>,
+    temporary: Option<TemporaryFile>,
 }
 
-impl StagedDerivativeFile<'_> {
-    fn file_mut(&mut self) -> &mut File {
+impl TemporaryDerivative<'_> {
+    fn writer(&mut self) -> &mut File {
         &mut self
-            .file
+            .temporary
             .as_mut()
             .expect("staged derivative owns its temporary file")
             .file
     }
 
-    fn take_file(&mut self) -> TemporaryFile {
-        self.file
+    fn take_temporary(&mut self) -> TemporaryFile {
+        self.temporary
             .take()
             .expect("staged derivative owns its temporary file")
     }
 }
 
-impl Drop for StagedDerivativeFile<'_> {
+impl Drop for TemporaryDerivative<'_> {
     fn drop(&mut self) {
-        if let Some(file) = &self.file {
-            let _ = self.storage.remove_temp(file);
+        if let Some(temporary) = &self.temporary {
+            let _ = self.storage.remove_temp(temporary);
         }
     }
 }
 
 struct StagedDerivative<'storage> {
-    file: StagedDerivativeFile<'storage>,
+    temporary: TemporaryDerivative<'storage>,
+    transaction: super::recovery::PublicationTransaction,
+}
+
+struct StreamingDerivative<'storage> {
+    temporary: TemporaryDerivative<'storage>,
     transaction: super::recovery::PublicationTransaction,
 }
 
 struct ReadyDerivative<'storage> {
-    file: StagedDerivativeFile<'storage>,
+    temporary: TemporaryDerivative<'storage>,
     transaction: super::recovery::PublicationTransaction,
     output: EncodedIdentity,
 }
@@ -208,15 +209,25 @@ impl<'storage> StagedDerivative<'storage> {
         let transaction = storage.recovery.begin(&temporary_path)?;
         let file = storage.create_nar_temp_named(temp_name)?;
         Ok(Self {
-            file: StagedDerivativeFile {
+            temporary: TemporaryDerivative {
                 storage,
-                file: Some(file),
+                temporary: Some(file),
             },
             transaction,
         })
     }
 
-    fn encode(
+    fn start_streaming(mut self) -> Result<StreamingDerivative<'storage>, StorageError> {
+        self.transaction.transition(PublicationState::Streaming)?;
+        Ok(StreamingDerivative {
+            temporary: self.temporary,
+            transaction: self.transaction,
+        })
+    }
+}
+
+impl<'storage> StreamingDerivative<'storage> {
+    fn encode_canonical_raw_nar(
         self,
         raw: &StoredNar<'_>,
         slot: EgressSlot,
@@ -224,43 +235,54 @@ impl<'storage> StagedDerivative<'storage> {
         contract: GenerationContract,
     ) -> Result<ReadyDerivative<'storage>, StorageError> {
         let Self {
-            mut file,
+            mut temporary,
             mut transaction,
         } = self;
-        let storage = file.storage;
-        transaction.transition(PublicationState::Streaming)?;
+        let storage = temporary.storage;
         let mut reservation = storage.empty_staging_reservation(policy.min_free_bytes())?;
         #[cfg(test)]
         storage.egress_generations.fetch_add(1, Ordering::Relaxed);
-        let output = {
-            let mut destination = CapacityCheckedStagingWriter::new(
-                file.file_mut(),
-                &mut reservation,
-                policy.min_free_bytes(),
-            );
-            let output = encode_raw_nar(&raw.file, slot.codec(), &mut destination)?;
-            destination.flush()?;
-            output
-        };
-        let output = EncodedIdentity::new(slot.codec(), output.hash, output.size);
-        let output = contract.verify(output)?;
-        file.file_mut().sync_all()?;
+        let output = encode_canonical_raw_nar_into_capacity_checked_staging_file(
+            &raw.file,
+            slot.codec(),
+            temporary.writer(),
+            &mut reservation,
+            policy.min_free_bytes(),
+        )?;
+        contract.verify_generated_output(output)?;
+        temporary.writer().sync_all()?;
         transaction.transition(PublicationState::Validated)?;
         Ok(ReadyDerivative {
-            file,
+            temporary,
             transaction,
             output,
         })
     }
 }
 
+fn encode_canonical_raw_nar_into_capacity_checked_staging_file(
+    raw: &File,
+    codec: CompressionCodec,
+    temporary: &mut File,
+    reservation: &mut super::publication::StagingReservation,
+    min_free_bytes: u64,
+) -> Result<EncodedIdentity, StorageError> {
+    let mut destination = CapacityCheckedStagingWriter::new(temporary, reservation, min_free_bytes);
+    let output = encode_raw_nar(raw, codec, &mut destination)?;
+    destination.flush()?;
+    Ok(EncodedIdentity::new(codec, output.hash, output.size))
+}
+
 impl ReadyDerivative<'_> {
     fn commit(mut self) -> Result<EncodedIdentity, StorageError> {
-        let temporary = self.file.take_file();
+        let temporary = self.temporary.take_temporary();
         let target = PublishTarget::RepairEgressNar(self.output);
-        self.file
-            .storage
-            .commit_temporary(target, &temporary, self.transaction, |_| Ok(()))?;
+        self.temporary.storage.commit_temporary(
+            target,
+            &temporary,
+            self.transaction,
+            |_| Ok(()),
+        )?;
         Ok(self.output)
     }
 }
@@ -268,7 +290,8 @@ impl ReadyDerivative<'_> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct EgressReceipt {
     slot: EgressSlot,
-    output: EncodedIdentity,
+    encoded_hash: FileHash,
+    encoded_size: EncodedSize,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -288,8 +311,8 @@ impl EgressReceiptRecord {
             raw_hash: receipt.slot.raw().hash(),
             raw_size: receipt.slot.raw().size(),
             encoding: receipt.slot.codec(),
-            encoded_hash: receipt.output.hash(),
-            encoded_size: receipt.output.size(),
+            encoded_hash: receipt.encoded_hash,
+            encoded_size: receipt.encoded_size,
         }
     }
 
@@ -298,15 +321,19 @@ impl EgressReceiptRecord {
         let raw = NarIdentity::new(self.raw_hash, self.raw_size);
         Some(EgressReceipt::new(
             EgressSlot::new(raw, self.encoding),
-            EncodedIdentity::new(self.encoding, self.encoded_hash, self.encoded_size),
+            self.encoded_hash,
+            self.encoded_size,
         ))
     }
 }
 
 impl EgressReceipt {
-    pub(super) fn new(slot: EgressSlot, output: EncodedIdentity) -> Self {
-        debug_assert_eq!(slot.codec(), output.codec());
-        Self { slot, output }
+    pub(super) fn new(slot: EgressSlot, encoded_hash: FileHash, encoded_size: EncodedSize) -> Self {
+        Self {
+            slot,
+            encoded_hash,
+            encoded_size,
+        }
     }
 
     pub(super) fn file_name(&self) -> OsString {
@@ -325,11 +352,11 @@ impl EgressReceipt {
     }
 
     pub(super) fn matches(&self, slot: EgressSlot) -> bool {
-        self.slot == slot && self.output.codec() == slot.codec()
+        self.slot == slot
     }
 
     pub(super) const fn output(&self) -> EncodedIdentity {
-        self.output
+        EncodedIdentity::new(self.slot.codec(), self.encoded_hash, self.encoded_size)
     }
 
     pub(super) const fn slot(&self) -> EgressSlot {
@@ -398,7 +425,7 @@ impl Storage {
                 self.materialize_compressed_nar(raw, slot, policy, contract)?
             }
         };
-        self.publish_egress_receipt(EgressReceipt::new(slot, output))?;
+        self.publish_egress_receipt(EgressReceipt::new(slot, output.hash(), output.size()))?;
         Ok(EgressRepresentation::Compressed(output))
     }
 
@@ -425,9 +452,10 @@ impl Storage {
         policy: NarUploadPolicy,
         contract: GenerationContract,
     ) -> Result<EncodedIdentity, StorageError> {
-        let staged = StagedDerivative::begin(self)?;
-        let ready = staged.encode(raw, slot, policy, contract)?;
-        ready.commit()
+        StagedDerivative::begin(self)?
+            .start_streaming()?
+            .encode_canonical_raw_nar(raw, slot, policy, contract)?
+            .commit()
     }
 
     fn inspect_egress_derivative(
@@ -461,11 +489,11 @@ impl Storage {
     fn read_egress_receipt(&self, slot: EgressSlot) -> Result<Option<EgressReceipt>, StorageError> {
         let directory = self.egress_receipt_directory()?;
         let name = slot.receipt_name();
-        match read_bounded_regular_file(&directory, &name, MAX_EGRESS_RECEIPT_BYTES)? {
-            BoundedFile::Missing | BoundedFile::Invalid => Ok(None),
-            BoundedFile::Present(bytes) => {
-                Ok(EgressReceipt::parse(&bytes).filter(|receipt| receipt.matches(slot)))
-            }
+        match read_bounded_regular_file(&directory, &name, MAX_EGRESS_RECEIPT_BYTES, |bytes| {
+            EgressReceipt::parse(bytes).filter(|receipt| receipt.matches(slot))
+        })? {
+            BoundedRegularFile::Valid(receipt) => Ok(Some(receipt)),
+            BoundedRegularFile::Missing | BoundedRegularFile::Invalid => Ok(None),
         }
     }
 
@@ -489,17 +517,17 @@ impl Storage {
         directory: &File,
         name: &OsStr,
     ) -> Result<CleanupAction, StorageError> {
-        match read_bounded_regular_file(directory, name, MAX_EGRESS_RECEIPT_BYTES)? {
-            BoundedFile::Missing => Ok(CleanupAction::Keep),
-            BoundedFile::Invalid => {
+        match read_bounded_regular_file(directory, name, MAX_EGRESS_RECEIPT_BYTES, |bytes| {
+            Self::parse_named_egress_receipt(bytes, name)
+        })? {
+            BoundedRegularFile::Missing => Ok(CleanupAction::Keep),
+            BoundedRegularFile::Invalid => {
                 unlink_at(directory, name)?;
                 Ok(CleanupAction::Remove)
             }
-            BoundedFile::Present(bytes) => Self::parse_named_egress_receipt(&bytes, name)
-                .map_or_else(
-                    || self.remove_egress_receipt(directory, name),
-                    |receipt| self.retain_or_remove_egress_receipt(directory, name, receipt),
-                ),
+            BoundedRegularFile::Valid(receipt) => {
+                self.retain_or_remove_egress_receipt(directory, name, receipt)
+            }
         }
     }
 
@@ -595,28 +623,4 @@ impl Storage {
     pub(super) fn egress_generations(&self) -> u64 {
         self.egress_generations.load(Ordering::Relaxed)
     }
-}
-
-fn read_bounded_regular_file(
-    directory: &File,
-    name: &OsStr,
-    max_bytes: u64,
-) -> Result<BoundedFile, StorageError> {
-    let file = match open_regular_at(directory, name) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BoundedFile::Missing),
-        Err(error)
-            if error.kind() == io::ErrorKind::InvalidData
-                || error.raw_os_error() == Some(libc::ELOOP) =>
-        {
-            return Ok(BoundedFile::Invalid);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let mut bytes = Vec::new();
-    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        return Ok(BoundedFile::Invalid);
-    }
-    Ok(BoundedFile::Present(bytes))
 }

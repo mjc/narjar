@@ -10,8 +10,8 @@ use std::{
 };
 
 use super::compression::{
-    CheckedUploadReader, DecodedValidation, IngestionReceipt, nar_file_size_matches,
-    receive_uploaded_nar, verify_decoded_compressed_file, verify_encoded_compressed_file,
+    CheckedUploadReader, DecodedValidation, nar_file_size_matches, receive_uploaded_nar,
+    verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
 use super::egress::{EgressReceipt, EgressSlot};
 use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sync_dir};
@@ -34,30 +34,13 @@ const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const STORE_HASH: &str = "00000000000000000000000000000000";
 
 #[test]
-fn receipt_records_round_trip_through_compact_binary_serialization() {
+fn egress_receipt_round_trips_through_compact_binary_serialization() {
     let raw_hash = NarHash::parse(NAR_ID).expect("test NAR hash is valid");
     let encoded_hash = FileHash::parse(NAR_ID).expect("test file hash is valid");
     let raw_size = NarSize::new(17);
     let encoded_size = EncodedSize::new(23);
-    let ingestion = IngestionReceipt::from_decoded(
-        EncodedIdentity::new(CompressionCodec::Zstd, encoded_hash, encoded_size),
-        DecodedValidation {
-            hash: raw_hash,
-            size: raw_size,
-        },
-    );
-    assert_eq!(
-        IngestionReceipt::parse(&ingestion.bytes())
-            .expect("typed ingestion receipt should be readable")
-            .decoded_identity(),
-        NarIdentity::new(raw_hash, raw_size)
-    );
-
     let slot = EgressSlot::new(NarIdentity::new(raw_hash, raw_size), CompressionCodec::Zstd);
-    let egress = EgressReceipt::new(
-        slot,
-        EncodedIdentity::new(CompressionCodec::Zstd, encoded_hash, encoded_size),
-    );
+    let egress = EgressReceipt::new(slot, encoded_hash, encoded_size);
     let egress =
         EgressReceipt::parse(&egress.bytes()).expect("typed egress receipt should be readable");
     assert!(egress.matches(slot));
@@ -66,8 +49,8 @@ fn receipt_records_round_trip_through_compact_binary_serialization() {
         EncodedIdentity::new(CompressionCodec::Zstd, encoded_hash, encoded_size)
     );
 
-    let truncated = ingestion.bytes();
-    assert!(IngestionReceipt::parse(&truncated[..truncated.len() - 1]).is_none());
+    let bytes = egress.bytes();
+    assert!(EgressReceipt::parse(&bytes[..bytes.len() - 1]).is_none());
 }
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {

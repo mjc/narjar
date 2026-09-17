@@ -26,6 +26,39 @@ use super::{StagingReservation, StorageError};
 
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 
+pub(super) enum BoundedRegularFile<T> {
+    Missing,
+    Invalid,
+    Valid(T),
+}
+
+pub(super) fn read_bounded_regular_file<T>(
+    directory: &File,
+    name: &OsStr,
+    max_bytes: u64,
+    parse: impl FnOnce(&[u8]) -> Option<T>,
+) -> Result<BoundedRegularFile<T>, StorageError> {
+    let file = match open_regular_at(directory, name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(BoundedRegularFile::Missing);
+        }
+        Err(error)
+            if error.kind() == io::ErrorKind::InvalidData
+                || error.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return Ok(BoundedRegularFile::Invalid);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Ok(BoundedRegularFile::Invalid);
+    }
+    Ok(parse(&bytes).map_or(BoundedRegularFile::Invalid, BoundedRegularFile::Valid))
+}
+
 pub(crate) fn capacity_error_kind(raw_error: i32) -> CapacityErrorKind {
     match raw_error {
         libc::ENOSPC => CapacityErrorKind::NoSpace,

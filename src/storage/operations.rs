@@ -24,10 +24,10 @@ use super::{
     directory::Directory,
     egress::{CanonicalRawStatus, EGRESS_RECEIPT_DIRECTORY},
     fs::{
-        StorageCapacity, directory_is_empty, ensure_directory_at, entry_is_regular_at,
-        files_equal_at, filesystem_space, hard_link_at, open_at, open_directory_at,
-        open_optional_at, open_regular_at, read_dir_names, remove_temp, rename_at,
-        reserve_staging_bytes, rollback_link_at, unlink_at,
+        BoundedRegularFile, StorageCapacity, directory_is_empty, ensure_directory_at,
+        entry_is_regular_at, files_equal_at, filesystem_space, hard_link_at, open_at,
+        open_directory_at, open_optional_at, open_regular_at, read_bounded_regular_file,
+        read_dir_names, remove_temp, rename_at, reserve_staging_bytes, rollback_link_at, unlink_at,
     },
     ids::StoreHash,
     publication::{
@@ -81,12 +81,6 @@ impl CompressedValidationName {
     fn nar_name(&self) -> OsString {
         self.0.os_string()
     }
-}
-
-enum IngestionReceiptFile {
-    Missing,
-    Invalid,
-    Valid(IngestionReceipt),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -923,12 +917,10 @@ impl Storage {
         let directory = self.ingestion_receipt_directory()?;
         let name = ingestion_receipt_file_name(expectation);
         match Self::read_ingestion_receipt_file(&directory, &name)? {
-            IngestionReceiptFile::Valid(receipt) if receipt.matches(expectation) => {
-                Ok(Some(receipt))
-            }
-            IngestionReceiptFile::Missing
-            | IngestionReceiptFile::Invalid
-            | IngestionReceiptFile::Valid(_) => Ok(None),
+            BoundedRegularFile::Valid(receipt) if receipt.matches(expectation) => Ok(Some(receipt)),
+            BoundedRegularFile::Missing
+            | BoundedRegularFile::Invalid
+            | BoundedRegularFile::Valid(_) => Ok(None),
         }
     }
 
@@ -953,14 +945,14 @@ impl Storage {
         name: &OsStr,
     ) -> Result<CleanupAction, StorageError> {
         match Self::read_ingestion_receipt_file(receipts, name)? {
-            IngestionReceiptFile::Missing => Ok(CleanupAction::Keep),
-            IngestionReceiptFile::Invalid => {
+            BoundedRegularFile::Missing => Ok(CleanupAction::Keep),
+            BoundedRegularFile::Invalid => {
                 CompressedValidationName::parse(name).map_or(Ok(CleanupAction::Keep), |_| {
                     unlink_at(receipts, name)?;
                     Ok(CleanupAction::Remove)
                 })
             }
-            IngestionReceiptFile::Valid(receipt) => {
+            BoundedRegularFile::Valid(receipt) => {
                 match self.canonical_raw_status(receipt.decoded_identity())? {
                     CanonicalRawStatus::Present => Ok(CleanupAction::Keep),
                     CanonicalRawStatus::Missing | CanonicalRawStatus::WrongSize => {
@@ -975,28 +967,13 @@ impl Storage {
     fn read_ingestion_receipt_file(
         directory: &File,
         name: &OsStr,
-    ) -> Result<IngestionReceiptFile, StorageError> {
-        let file = match open_regular_at(directory, name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(IngestionReceiptFile::Missing);
-            }
-            Err(error)
-                if error.kind() == io::ErrorKind::InvalidData
-                    || error.raw_os_error() == Some(libc::ELOOP) =>
-            {
-                return Ok(IngestionReceiptFile::Invalid);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let mut bytes = Vec::new();
-        file.take(MAX_INGESTION_RECEIPT_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_INGESTION_RECEIPT_BYTES {
-            return Ok(IngestionReceiptFile::Invalid);
-        }
-        Ok(IngestionReceipt::parse(&bytes)
-            .map_or(IngestionReceiptFile::Invalid, IngestionReceiptFile::Valid))
+    ) -> Result<BoundedRegularFile<IngestionReceipt>, StorageError> {
+        read_bounded_regular_file(
+            directory,
+            name,
+            MAX_INGESTION_RECEIPT_BYTES,
+            IngestionReceipt::parse,
+        )
     }
 
     pub(super) fn remove_orphan_validation_evidence(&self) -> Result<(), StorageError> {
