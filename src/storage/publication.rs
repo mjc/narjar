@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use super::{
     compression::IngestionReceipt,
-    fs::{filesystem_space, lock_exclusive, open_at},
+    fs::{FilesystemSpace, filesystem_space, lock_exclusive, open_at},
     ids::StoreHash,
 };
 use crate::object::NarFileName;
@@ -194,21 +194,18 @@ pub(super) struct StagingBudget {
 impl StagingBudget {
     pub(super) fn reserve(
         &mut self,
-        directory: &File,
+        space: FilesystemSpace,
         min_free_bytes: u64,
         bytes: u64,
     ) -> Result<(), StorageError> {
-        let available_bytes = filesystem_space(directory)?.available_bytes;
-        let capacity = available_bytes
-            .checked_sub(min_free_bytes)
-            .ok_or(StorageError::InsufficientSpace)?;
         let total = self
             .outstanding_bytes
             .checked_add(bytes)
             .ok_or(StorageError::InsufficientSpace)?;
-        if total > capacity {
-            return Err(StorageError::InsufficientSpace);
-        }
+        let required = total
+            .checked_add(min_free_bytes)
+            .ok_or(StorageError::InsufficientSpace)?;
+        space.required_capacity(required)?;
         self.outstanding_bytes = total;
         Ok(())
     }
@@ -252,7 +249,7 @@ impl StagingReservation {
             .budget
             .lock()
             .map_err(|_| StorageError::Io(io::Error::other("staging budget lock poisoned")))?;
-        budget.reserve(directory, min_free_bytes, additional)?;
+        budget.reserve(filesystem_space(directory)?, min_free_bytes, additional)?;
         self.bytes = new_bytes;
         Ok(())
     }

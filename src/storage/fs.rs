@@ -74,15 +74,36 @@ pub(super) fn reserve_staging_bytes(
     min_free_bytes: u64,
     bytes: u64,
 ) -> Result<StagingReservation, StorageError> {
+    reserve_staging_bytes_with_measurement(budget, min_free_bytes, bytes, || {
+        filesystem_space(directory)
+    })
+}
+
+fn reserve_staging_bytes_with_measurement(
+    budget: &Arc<Mutex<StagingBudget>>,
+    min_free_bytes: u64,
+    bytes: u64,
+    measure: impl FnOnce() -> io::Result<FilesystemSpace>,
+) -> Result<StagingReservation, StorageError> {
     let mut budget_guard = budget
         .lock()
         .map_err(|_| StorageError::Io(io::Error::other("staging budget lock poisoned")))?;
-    budget_guard.reserve(directory, min_free_bytes, bytes)?;
+    budget_guard.reserve(measure()?, min_free_bytes, bytes)?;
     drop(budget_guard);
     Ok(StagingReservation {
         budget: Arc::clone(budget),
         bytes,
     })
+}
+
+#[cfg(test)]
+pub(super) fn reserve_staging_bytes_for_test(
+    budget: &Arc<Mutex<StagingBudget>>,
+    min_free_bytes: u64,
+    bytes: u64,
+    measure: impl FnOnce() -> io::Result<FilesystemSpace>,
+) -> Result<StagingReservation, StorageError> {
+    reserve_staging_bytes_with_measurement(budget, min_free_bytes, bytes, measure)
 }
 
 pub(super) fn filesystem_space(directory: &File) -> io::Result<FilesystemSpace> {

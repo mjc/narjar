@@ -13,7 +13,7 @@ use super::compression::{
     CheckedUploadReader, DecodedValidation, nar_file_size_matches, receive_uploaded_nar,
     verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
-use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes, sync_dir};
+use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sync_dir};
 use super::ids::nix32_sha256;
 use super::publication::{Layout, PublishBoundary, PublishTarget};
 use super::{
@@ -1404,24 +1404,56 @@ fn capacity_errors_have_stable_categories() {
 
 #[test]
 fn staging_reservations_are_bounded_and_released() {
-    let directory = TestDir::new();
-    let directory_file = fs::File::open(directory.path()).unwrap();
     let reservations = Arc::new(Mutex::new(Default::default()));
-    let available = super::fs::filesystem_space(&directory_file)
-        .unwrap()
-        .available_bytes;
+    let space = FilesystemSpace {
+        total_bytes: 100,
+        available_bytes: 100,
+        total_inodes: 2,
+        available_inodes: 2,
+        read_only: false,
+    };
     let min_free_bytes = 10;
-    let first_bytes = available - min_free_bytes;
-    let first = reserve_staging_bytes(&reservations, &directory_file, min_free_bytes, first_bytes)
+    let first = reserve_staging_bytes_for_test(&reservations, min_free_bytes, 90, || Ok(space))
         .expect("first reservation should fit");
     assert!(
-        reserve_staging_bytes(&reservations, &directory_file, min_free_bytes, 1).is_err(),
+        reserve_staging_bytes_for_test(&reservations, min_free_bytes, 1, || Ok(space)).is_err(),
         "reservations must not exceed available bytes after the free-space reserve"
     );
 
     drop(first);
-    reserve_staging_bytes(&reservations, &directory_file, min_free_bytes, 1)
+    reserve_staging_bytes_for_test(&reservations, min_free_bytes, 1, || Ok(space))
         .expect("released staging capacity should be reusable");
+}
+
+#[test]
+fn staging_admission_rejects_read_only_and_inode_exhausted_filesystems() {
+    let read_only = FilesystemSpace {
+        total_bytes: 100,
+        available_bytes: 100,
+        total_inodes: 2,
+        available_inodes: 2,
+        read_only: true,
+    };
+    let inode_exhausted = FilesystemSpace {
+        total_bytes: 100,
+        available_bytes: 100,
+        total_inodes: 2,
+        available_inodes: 0,
+        read_only: false,
+    };
+
+    for space in [read_only, inode_exhausted] {
+        let reservations = Arc::new(Mutex::new(Default::default()));
+        assert!(
+            reserve_staging_bytes_for_test(&reservations, 10, 1, || Ok(space)).is_err(),
+            "staging admission must retain all filesystem capability checks"
+        );
+        assert_eq!(
+            reservations.lock().unwrap().outstanding_bytes(),
+            0,
+            "rejected admission must not consume budget"
+        );
+    }
 }
 
 #[test]
