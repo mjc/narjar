@@ -186,6 +186,7 @@ impl Storage {
     /// Records that a full inventory scan has completed successfully.
     pub fn finish_recovery(&self) -> Result<(), StorageError> {
         self.remove_orphan_validation_evidence()?;
+        self.remove_orphan_ingestion_receipts()?;
         self.recovery.finish()
     }
 
@@ -713,9 +714,62 @@ impl Storage {
     ) -> Result<Option<IngestionReceipt>, StorageError> {
         let directory = self.ingestion_receipt_directory()?;
         let name = ingestion_receipt_file_name(expectation);
-        let file = match open_regular_at(&directory, &name) {
+        Ok(Self::read_ingestion_receipt_file(&directory, &name)?
+            .filter(|receipt| receipt.matches(expectation)))
+    }
+
+    pub(super) fn remove_orphan_ingestion_receipts(&self) -> Result<(), StorageError> {
+        let receipts = self.ingestion_receipt_directory()?;
+        let nar = self.nar_directory()?;
+        let mut removed = false;
+        for name in read_dir_names(&receipts)? {
+            let Some(receipt) = Self::read_ingestion_receipt_file(&receipts, &name)? else {
+                if name
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".validation"))
+                {
+                    unlink_at(&receipts, &name)?;
+                    removed = true;
+                }
+                continue;
+            };
+            let identity = receipt.decoded_identity();
+            let nar_name = NarFileName::raw(identity.hash()).os_string();
+            let usable = match open_regular_at(&nar, &nar_name) {
+                Ok(file) => file.metadata()?.len() == identity.size().get(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error)
+                    if error.kind() == io::ErrorKind::InvalidData
+                        || error.raw_os_error() == Some(libc::ELOOP) =>
+                {
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if !usable {
+                unlink_at(&receipts, &name)?;
+                removed = true;
+            }
+        }
+        if removed {
+            receipts.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn read_ingestion_receipt_file(
+        directory: &File,
+        name: &OsStr,
+    ) -> Result<Option<IngestionReceipt>, StorageError> {
+        let file = match open_regular_at(directory, name) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidData
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(error.into()),
         };
         let mut bytes = Vec::new();
@@ -724,7 +778,7 @@ impl Storage {
         if bytes.len() as u64 > MAX_INGESTION_RECEIPT_BYTES {
             return Ok(None);
         }
-        Ok(IngestionReceipt::parse(&bytes).filter(|receipt| receipt.matches(expectation)))
+        Ok(IngestionReceipt::parse(&bytes))
     }
 
     pub(super) fn remove_orphan_validation_evidence(&self) -> Result<(), StorageError> {

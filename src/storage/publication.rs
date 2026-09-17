@@ -51,6 +51,10 @@ impl Layout {
     pub(super) fn temp_dir(&self) -> PathBuf {
         self.root.join(".tmp")
     }
+
+    pub(super) fn ingestion_receipt_dir(&self) -> PathBuf {
+        self.root.join(".narjar-ingress")
+    }
 }
 
 pub(super) enum PublishTarget<'a> {
@@ -103,6 +107,7 @@ pub(super) enum PublishBoundary {
     BeforeFinalLink,
     BeforeParentSync,
     AfterParentSync,
+    AfterNarPublication,
 }
 
 #[cfg(test)]

@@ -135,18 +135,40 @@ impl<'storage> Staged<'storage, Receiving> {
 
 impl Staged<'_, Complete> {
     pub(super) fn commit(self) -> Result<PublishOutcome, StorageError> {
-        let storage = self.temporary.storage;
-        let outcome = self
-            .temporary
-            .commit(self.state.received.identity(), self.transaction)?;
-        match self.state.received {
+        self.commit_with_receipt_checkpoint(|_| Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_fault(
+        self,
+        fault: super::publication::PublishBoundary,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.commit_with_receipt_checkpoint(|boundary| {
+            super::publication::injected_fault(boundary, fault)
+        })
+    }
+
+    fn commit_with_receipt_checkpoint(
+        self,
+        mut checkpoint: impl FnMut(super::publication::PublishBoundary) -> Result<(), StorageError>,
+    ) -> Result<PublishOutcome, StorageError> {
+        let Staged {
+            temporary,
+            transaction,
+            reservation,
+            state: Complete { received },
+        } = self;
+        let storage = temporary.storage;
+        let outcome = temporary.commit(received.identity(), transaction)?;
+        checkpoint(super::publication::PublishBoundary::AfterNarPublication)?;
+        match received {
             ReceivedNar::Raw(_) => {}
             ReceivedNar::Compressed(receipt) => {
                 storage.publish_ingestion_receipt(receipt)?;
             }
         }
         // Keep the disk reservation until both payload and receipt are durable.
-        drop(self.reservation);
+        drop(reservation);
         Ok(outcome)
     }
 }

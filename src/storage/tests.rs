@@ -39,6 +39,24 @@ fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
     Storage::initialize(&Directory::open(path)?)
 }
 
+fn compressed_bytes(encoding: NarEncoding, raw: &[u8]) -> Vec<u8> {
+    match encoding {
+        NarEncoding::Xz => {
+            let mut compressed = Vec::new();
+            let mut writer = XzWriter::new(&mut compressed, XzOptions::with_preset(1)).unwrap();
+            writer.write_all(raw).unwrap();
+            writer.finish().unwrap();
+            compressed
+        }
+        NarEncoding::Zstd => {
+            let mut compressed = Vec::new();
+            compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
+            compressed
+        }
+        NarEncoding::Raw => panic!("test helper only compresses XZ and Zstd"),
+    }
+}
+
 fn begin_raw_upload<'storage>(
     storage: &'storage Storage,
     bytes: &[u8],
@@ -428,6 +446,113 @@ fn zstd_uploads_are_normalized_to_the_raw_nar() {
         b"nar bytes"
     );
     assert!(!directory.path().join(format!("{encoded}.nar.zst")).exists());
+}
+
+#[test]
+fn a_restart_after_raw_commit_retries_receipt_publication() {
+    for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
+        let directory = TestDir::new();
+        let raw = b"nar bytes";
+        let compressed = compressed_bytes(encoding, raw);
+        let encoded = FileHash::from_digest(Sha256::digest(&compressed).into());
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
+        let reservation = storage
+            .reserve_staging(compressed.len() as u64, 0)
+            .expect("reserve compressed upload");
+        let complete = storage
+            .begin_upload(
+                NarFileName::new(encoded, encoding),
+                compressed.len() as u64,
+                super::NarUploadPolicy::new(1024, 0),
+                reservation,
+            )
+            .expect("begin compressed upload")
+            .receive(Cursor::new(&compressed))
+            .expect("receive compressed upload");
+
+        assert!(
+            complete
+                .commit_fault(PublishBoundary::AfterNarPublication)
+                .is_err(),
+            "receipt boundary should simulate lost acknowledgement"
+        );
+        let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+        assert_eq!(
+            fs::read(storage.layout().nar_path(raw_hash)).unwrap(),
+            raw,
+            "the canonical raw object is durable before receipt publication"
+        );
+        assert_eq!(
+            fs::read_dir(storage.layout().ingestion_receipt_dir())
+                .unwrap()
+                .count(),
+            0,
+            "the failed receipt publication must not leave partial evidence"
+        );
+        drop(storage);
+
+        let restarted = initialize_storage(directory.path()).expect("restart storage");
+        let outcome = restarted
+            .publish_nar(
+                NarFileName::new(encoded, encoding),
+                Cursor::new(&compressed),
+                compressed.len() as u64,
+                super::NarUploadPolicy::new(1024, 0),
+            )
+            .expect("retry compressed upload");
+        assert_eq!(outcome, PublishOutcome::Identical);
+        assert_eq!(
+            fs::read_dir(restarted.layout().ingestion_receipt_dir())
+                .unwrap()
+                .count(),
+            1,
+            "the retry must publish exactly one durable receipt"
+        );
+    }
+}
+
+#[test]
+fn recovery_removes_receipts_without_a_usable_raw_object() {
+    for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
+        let directory = TestDir::new();
+        let raw = b"nar bytes";
+        let compressed = compressed_bytes(encoding, raw);
+        let encoded = FileHash::from_digest(Sha256::digest(&compressed).into());
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
+        storage
+            .publish_nar(
+                NarFileName::new(encoded, encoding),
+                Cursor::new(&compressed),
+                compressed.len() as u64,
+                super::NarUploadPolicy::new(1024, 0),
+            )
+            .expect("publish compressed upload");
+        storage
+            .finish_recovery()
+            .expect("retain a receipt with a usable raw object");
+        let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+        fs::remove_file(storage.layout().nar_path(raw_hash)).expect("remove raw object");
+        drop(storage);
+
+        let restarted = initialize_storage(directory.path()).expect("restart storage");
+        assert_eq!(
+            fs::read_dir(restarted.layout().ingestion_receipt_dir())
+                .unwrap()
+                .count(),
+            1,
+            "restart must see the stale receipt before recovery"
+        );
+        restarted
+            .finish_recovery()
+            .expect("clean the receipt for the missing raw object");
+        assert_eq!(
+            fs::read_dir(restarted.layout().ingestion_receipt_dir())
+                .unwrap()
+                .count(),
+            0,
+            "recovery must remove unusable receipt evidence"
+        );
+    }
 }
 
 #[test]
