@@ -21,19 +21,19 @@ roots or metadata fail the run.
 ```sh
 scripts/nix-corpus collect \
   --spec benchmarks/corpus-spec.json \
-  --manifest benchmarks/corpus-manifest.json \
+  --manifest /tmp/corpus-manifest.json \
   --export-dir /path/to/uncompressed-nars \
   --build \
   --log /path/to/corpus-collect.commands
 
 scripts/nix-corpus validate \
-  --manifest benchmarks/corpus-manifest.json \
+  --manifest /tmp/corpus-manifest.json \
   --artifact-root /path/to/uncompressed-nars
 
 # Expensive byte-for-byte check against the local Nix store, plus rebuild
 # validation against each target's recorded NAR identity:
 scripts/nix-corpus validate \
-  --manifest benchmarks/corpus-manifest.json --store --rebuild
+  --manifest /tmp/corpus-manifest.json --store --rebuild
 ```
 
 For a fast structural check that does not open or hash exported NAR files, use
@@ -42,7 +42,7 @@ and `--rebuild`:
 
 ```sh
 scripts/nix-corpus validate \
-  --manifest benchmarks/corpus-manifest.json --schema-only
+  --manifest /tmp/corpus-manifest.json --schema-only
 ```
 
 Pass `--spec` with `--schema-only` to verify that a manifest was collected
@@ -52,14 +52,14 @@ reference and attribute, machine, families, subset, and input overrides):
 
 ```sh
 scripts/nix-corpus validate \
-  --manifest benchmarks/corpus-manifest.json \
+  --manifest /tmp/corpus-manifest.json \
   --spec benchmarks/corpus-spec.json \
   --schema-only
 ```
 
-The retained historical manifest intentionally does not pass this comparison
-until clean regeneration replaces it; a schema-only pass without `--spec` is
-not evidence that it matches the current candidate.
+The generated manifest is intentionally kept outside the repository; a
+schema-only pass without `--spec` is not evidence that it matches the current
+candidate.
 
 When present, the manifest's `targets` list must contain collected target
 records with an id, generation, pinned nixpkgs revision, flake reference,
@@ -74,8 +74,8 @@ compares the rebuilt root's `narHash` and `narSize` with the metadata recorded
 for the target's expected root in the manifest, so historical expected roots
 do not need to remain in the local store.
 
-Keep the spec and manifest in version control; keep large NAR exports and
-regeneration roots outside the repository. The manifest's `requirements` block
+Keep the spec in version control; keep generated manifests, large NAR exports,
+and regeneration roots outside the repository. The manifest's `requirements` block
 is intentionally enforced during validation so a partial local store cannot
 silently become the headline corpus. When present, `min_generations` and
 `min_nixpkgs_revisions` must be finite nonnegative integers, and

@@ -30,7 +30,6 @@
     "raw_samples"
   ],
   "metric_required_fields": ["savings_percent", "median", "p95", "unit"],
-  "corpus_manifest": "benchmarks/corpus-manifest.json",
   "corpus_categories": [
     "many-small-files",
     "shared-subtrees",

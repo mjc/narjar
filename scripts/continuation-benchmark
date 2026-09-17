@@ -882,7 +882,7 @@ write_report() {
       narjar_output:$narjar_output,bincache_binary:$bincache,bincache_binary_sha256:$bincache_sha,bincache_output:$bincache_output,narjar_commit:$commit,
       bincache_commit:"'$BINCACHE_COMMIT'",repetitions:$repetitions,warmups:$warmups,random_seed:$seed,
       quick:($quick==1),launch_command:$launch,command_log:"commands.txt",raw_samples:"samples.jsonl",
-      corpus_manifest:"benchmarks/corpus-manifest.json",corpus_category:"flat-baseline-control",
+      corpus_manifest:"not-applicable: flat-baseline-control",corpus_category:"flat-baseline-control",
       cache_state:"warm and cold page-cache controls"}' > "$OUTPUT/environment.json"
   jq -n --argjson rows "$(cat "$OUTPUT/summary.json")" \
     --slurpfile environment "$OUTPUT/environment.json" --slurpfile wire "$OUTPUT/wire-compression.json" \
