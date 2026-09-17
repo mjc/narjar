@@ -17,7 +17,7 @@ use narjar::{
     storage::{Directory, NarHash, Storage},
 };
 
-const OBJECT_ID: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+const OBJECT_ID: &str = "19rci548pgfshmx7rd3wzw2mhkq2dg8x3mq4q1kfkikgb2raqzxd";
 const MISSING_OBJECT_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
@@ -104,8 +104,9 @@ fn bench_inventory() {
     let storage = initialized_storage(directory.path());
     for index in 0..FILES {
         let mut object_id = [b'a'; 52];
-        object_id[0] = NIX32[index / NIX32.len()];
-        object_id[1] = NIX32[index % NIX32.len()];
+        object_id[0] = b'0';
+        object_id[1] = NIX32[index / NIX32.len()];
+        object_id[2] = NIX32[index % NIX32.len()];
         let name = String::from_utf8(object_id.to_vec()).expect("object name");
         fs::write(directory.path().join("nar").join(format!("{name}.nar")), [])
             .expect("write inventory NAR");
