@@ -23,7 +23,7 @@ use narjar::{
 };
 use ureq::Agent;
 
-use crate::{error::Error, http_url::HttpUrl};
+use crate::{config::StorageBackendOption, error::Error, http_url::HttpUrl};
 
 mod lifecycle;
 pub(crate) use lifecycle::{Init, Key, init, key};
@@ -42,6 +42,8 @@ pub(crate) struct Reconcile {
     limit: usize,
     #[arg(long, default_value_t = 3_600)]
     min_age_seconds: u64,
+    #[arg(long, value_enum, default_value = "flat")]
+    storage_backend: StorageBackendOption,
 }
 
 pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
@@ -51,6 +53,7 @@ pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
             options.limit,
             options.min_age_seconds,
             options.json,
+            options.storage_backend.backend(),
         );
     }
     report(
@@ -58,6 +61,7 @@ pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
         ReportMode::Reconcile,
         options.verify_hashes,
         options.json,
+        options.storage_backend.backend(),
     )
 }
 
@@ -71,6 +75,8 @@ pub(crate) struct Cleanup {
     limit: usize,
     #[arg(long)]
     json: bool,
+    #[arg(long, value_enum, default_value = "flat")]
+    storage_backend: StorageBackendOption,
 }
 
 pub(crate) fn cleanup(options: Cleanup) -> Result<(), Error> {
@@ -79,6 +85,7 @@ pub(crate) fn cleanup(options: Cleanup) -> Result<(), Error> {
         options.limit,
         options.min_age_seconds,
         options.json,
+        options.storage_backend.backend(),
         StructuralAction::Cleanup,
     )
 }
@@ -89,10 +96,18 @@ pub(crate) struct Verify {
     data_dir: PathBuf,
     #[arg(long)]
     json: bool,
+    #[arg(long, value_enum, default_value = "flat")]
+    storage_backend: StorageBackendOption,
 }
 
 pub(crate) fn verify(options: Verify) -> Result<(), Error> {
-    report(options.data_dir, ReportMode::Verify, false, options.json)
+    report(
+        options.data_dir,
+        ReportMode::Verify,
+        false,
+        options.json,
+        options.storage_backend.backend(),
+    )
 }
 
 #[derive(Args)]
@@ -103,6 +118,8 @@ pub(crate) struct ListOrphans {
     verify_hashes: bool,
     #[arg(long)]
     json: bool,
+    #[arg(long, value_enum, default_value = "flat")]
+    storage_backend: StorageBackendOption,
 }
 
 pub(crate) fn list_orphans(options: ListOrphans) -> Result<(), Error> {
@@ -111,6 +128,7 @@ pub(crate) fn list_orphans(options: ListOrphans) -> Result<(), Error> {
         ReportMode::Orphans,
         options.verify_hashes,
         options.json,
+        options.storage_backend.backend(),
     )
 }
 
@@ -134,7 +152,13 @@ impl ReportMode {
     }
 }
 
-fn report(root: PathBuf, mode: ReportMode, verify_hashes: bool, json: bool) -> Result<(), Error> {
+fn report(
+    root: PathBuf,
+    mode: ReportMode,
+    verify_hashes: bool,
+    json: bool,
+    backend: narjar::storage::StorageBackend,
+) -> Result<(), Error> {
     let root = Directory::open(&root).map_err(runtime)?;
     let trusted = TrustedPublicKeys::load(&root).map_err(runtime)?;
     let verification = match mode {
@@ -144,7 +168,8 @@ fn report(root: PathBuf, mode: ReportMode, verify_hashes: bool, json: bool) -> R
             false => VerificationMode::Availability,
         },
     };
-    let inventory = Inventory::scan(&root, &trusted, verification).map_err(runtime)?;
+    let storage = Storage::initialize_with_backend(&root, backend).map_err(runtime)?;
+    let inventory = Inventory::scan_storage(&storage, &trusted, verification).map_err(runtime)?;
 
     for finding in inventory
         .entries()
@@ -184,12 +209,14 @@ fn structural_report(
     limit: usize,
     min_age_seconds: u64,
     json: bool,
+    backend: narjar::storage::StorageBackend,
 ) -> Result<(), Error> {
     structural_scan(
         root,
         limit,
         min_age_seconds,
         json,
+        backend,
         StructuralAction::Inspect,
     )
 }
@@ -205,6 +232,7 @@ fn structural_scan(
     limit: usize,
     min_age_seconds: u64,
     json: bool,
+    backend: narjar::storage::StorageBackend,
     action: StructuralAction,
 ) -> Result<(), Error> {
     let limit =
@@ -213,7 +241,7 @@ fn structural_scan(
         .checked_sub(Duration::from_secs(min_age_seconds))
         .ok_or_else(|| Error::usage("minimum age is out of range"))?;
     let root = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize(&root).map_err(runtime)?;
+    let storage = Storage::initialize_with_backend(&root, backend).map_err(runtime)?;
     let report = storage.reconcile(limit, stale_before).map_err(runtime)?;
 
     for entry in report.entries() {

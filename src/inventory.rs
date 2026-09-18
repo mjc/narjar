@@ -596,6 +596,16 @@ mod tests {
             InventoryClass::ValidPair
         );
 
+        let inventory = Inventory::scan_storage(
+            &storage,
+            &TrustedPublicKeys::default(),
+            VerificationMode::Availability,
+        )
+        .unwrap();
+        assert!(inventory.entries().iter().any(|entry| {
+            entry.class() == InventoryClass::OrphanNar && entry.identifier() == hash.to_string()
+        }));
+
         let manifest = Path::new(directory.path())
             .join(crate::storage::MANIFEST_DIRECTORY)
             .join(format!("{hash}.manifest"));

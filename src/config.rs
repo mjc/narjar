@@ -30,7 +30,7 @@ enum EgressCompression {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum StorageBackendOption {
+pub(crate) enum StorageBackendOption {
     Flat,
     Chunked,
 }
@@ -40,6 +40,15 @@ impl From<StorageBackendOption> for StorageBackend {
         match backend {
             StorageBackendOption::Flat => Self::Flat,
             StorageBackendOption::Chunked => Self::Chunked,
+        }
+    }
+}
+
+impl StorageBackendOption {
+    pub(crate) const fn backend(self) -> StorageBackend {
+        match self {
+            Self::Flat => StorageBackend::Flat,
+            Self::Chunked => StorageBackend::Chunked,
         }
     }
 }
