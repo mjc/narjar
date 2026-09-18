@@ -9,9 +9,11 @@ use std::{
 
 use super::fs::unlink_at;
 use crate::{
-    narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
+    narinfo::{PublishedNarInfoError, TrustedPublicKeys, ValidatedPayload, read_narinfo_file},
+    object::NarHash,
     storage::{
-        Directory, FileHash, Storage, StorageError, StoreHash, open_regular_at, read_dir_names,
+        Directory, FileHash, Storage, StorageBackend, StorageError, StoreHash, open_regular_at,
+        read_dir_names,
     },
 };
 
@@ -23,6 +25,7 @@ pub struct GcOptions {
     pub min_age: Duration,
     pub protected_roots: Option<PathBuf>,
     pub apply: bool,
+    pub backend: StorageBackend,
 }
 
 pub struct GcReport {
@@ -72,6 +75,41 @@ struct Entry {
     modified: SystemTime,
     protected: bool,
 }
+
+struct ChunkedEntry {
+    store: StoreHash,
+    store_path: String,
+    references: Vec<String>,
+    narinfo_name: OsString,
+    output_name: Option<OsString>,
+    output_bytes: u64,
+    raw_hash: NarHash,
+    manifest_bytes: u64,
+    narinfo_bytes: u64,
+    modified: SystemTime,
+    protected: bool,
+}
+
+struct ChunkedProtectionReport {
+    protected: usize,
+    missing_roots: usize,
+    missing_references: usize,
+}
+
+struct ChunkedGcReportInput<'a> {
+    before_entries: &'a [ChunkedEntry],
+    after_entries: &'a [ChunkedEntry],
+    before_bytes: u64,
+    after_bytes: u64,
+    target_bytes: Option<u64>,
+    dry_run: bool,
+    protection: ChunkedProtectionReport,
+    protected_bytes: u64,
+    eligible: usize,
+    eligible_bytes: u64,
+    evicted: usize,
+    deleted: (usize, usize, usize),
+}
 struct Orphan {
     name: OsString,
     bytes: u64,
@@ -92,8 +130,11 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     }
 
     let root = Directory::open(&options.data_dir)?;
-    let storage = Storage::initialize(&root)?;
+    let storage = Storage::initialize_with_backend(&root, options.backend)?;
     let trusted = TrustedPublicKeys::load(&root).map_err(|error| invalid(error.to_string()))?;
+    if options.backend == StorageBackend::Chunked {
+        return run_chunked(options, storage, trusted, target_bytes);
+    }
     let mut entries = scan(&storage, &trusted)?;
     let protection = protect(&mut entries, options.protected_roots.as_deref())?;
     let orphans = scan_orphans(&storage, &entries)?;
@@ -262,6 +303,491 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
         });
     }
     Ok(entries)
+}
+
+fn run_chunked(
+    options: GcOptions,
+    storage: Storage,
+    trusted: TrustedPublicKeys,
+    target_bytes: Option<u64>,
+) -> Result<GcReport, StorageError> {
+    let mut entries = scan_chunked(&storage, &trusted)?;
+    let protection = protect_chunked(&mut entries, options.protected_roots.as_deref())?;
+    let now = SystemTime::now();
+    let before_bytes = chunked_before_bytes(&storage, &entries)?;
+    let eligible = entries
+        .iter()
+        .filter(|entry| is_chunked_eligible(entry, now, options.min_age))
+        .count();
+    let eligible_bytes = chunked_entry_bytes(&storage, &entries, now, options.min_age)?;
+    let protected_bytes =
+        chunked_bytes_for_entries(&storage, entries.iter().filter(|entry| entry.protected))?;
+    let selected = select_chunked(
+        &storage,
+        &entries,
+        target_bytes,
+        options.max_age,
+        options.min_age,
+        now,
+    )?;
+    let after_bytes = chunked_projected_bytes(&storage, &entries, &selected)?;
+    let dry_run = !options.apply;
+    let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
+        (0, 0, 0)
+    } else {
+        let deleted = apply_chunked(&storage, &entries, &selected)?;
+        let remaining = scan_chunked(&storage, &trusted)?;
+        storage.finish_recovery()?;
+        let actual_after = chunked_before_bytes(&storage, &remaining)?;
+        return Ok(chunked_report(ChunkedGcReportInput {
+            before_entries: &entries,
+            after_entries: &remaining,
+            before_bytes,
+            after_bytes: actual_after,
+            target_bytes,
+            dry_run,
+            protection,
+            protected_bytes,
+            eligible,
+            eligible_bytes,
+            evicted: selected.len(),
+            deleted,
+        }));
+    };
+
+    Ok(chunked_report(ChunkedGcReportInput {
+        before_entries: &entries,
+        after_entries: &entries,
+        before_bytes,
+        after_bytes,
+        target_bytes,
+        dry_run,
+        protection,
+        protected_bytes,
+        eligible,
+        eligible_bytes,
+        evicted: selected.len(),
+        deleted: (deleted_narinfos, deleted_nars, deleted_orphans),
+    }))
+}
+
+fn scan_chunked(
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
+) -> Result<Vec<ChunkedEntry>, StorageError> {
+    let root = storage.root_directory()?;
+    let nar_directory = storage.nar_directory()?;
+    let mut entries = Vec::new();
+    for name in read_dir_names(&root)? {
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(route) = name_str.strip_suffix(".narinfo") else {
+            continue;
+        };
+        let store = StoreHash::parse(route)
+            .map_err(|_| invalid(format!("invalid narinfo filename: {name_str}")))?;
+        let narinfo = open_regular_at(&root, &name).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => {
+                invalid(format!("narinfo disappeared during scan: {name_str}"))
+            }
+            _ => error.into(),
+        })?;
+        let metadata = narinfo.metadata()?;
+        let bytes = read_narinfo_file(narinfo)?;
+        let validated = trusted
+            .inspect(&store, bytes)
+            .map_err(|error| match error {
+                PublishedNarInfoError::Malformed => {
+                    invalid(format!("malformed narinfo: {name_str}"))
+                }
+                PublishedNarInfoError::UntrustedSignature => {
+                    invalid(format!("untrusted narinfo: {name_str}"))
+                }
+            })?;
+        let raw_hash = validated.decoded_identity().hash();
+        let manifest = storage
+            .chunk_store
+            .manifest_identity(raw_hash)
+            .map_err(chunk_store_error)?
+            .ok_or_else(|| invalid(format!("missing chunk manifest for narinfo: {name_str}")))?;
+        if manifest.identity() != validated.decoded_identity() {
+            return Err(invalid(format!(
+                "chunk manifest identity mismatch for narinfo: {name_str}"
+            )));
+        }
+        let manifest_bytes = storage
+            .chunk_store
+            .open_manifest(raw_hash)?
+            .ok_or_else(|| invalid(format!("chunk manifest disappeared: {name_str}")))?
+            .metadata()?
+            .len();
+        let (output_name, output_bytes) = match validated.payload() {
+            ValidatedPayload::Raw(_) => (None, 0),
+            ValidatedPayload::Compressed(_) => {
+                let output_name = validated.payload_name().os_string();
+                let output = open_regular_at(&nar_directory, &output_name).map_err(|error| {
+                    match error.kind() {
+                        io::ErrorKind::NotFound => {
+                            invalid(format!("missing compressed output: {name_str}"))
+                        }
+                        _ => error.into(),
+                    }
+                })?;
+                let output_bytes = output.metadata()?.len();
+                if output_bytes != validated.file_size().get() {
+                    return Err(invalid(format!(
+                        "compressed output size mismatch for narinfo: {name_str}"
+                    )));
+                }
+                (Some(output_name), output_bytes)
+            }
+        };
+        entries.push(ChunkedEntry {
+            store,
+            store_path: validated.store_path().to_owned(),
+            references: validated
+                .references()
+                .split_ascii_whitespace()
+                .map(|reference| format!("/nix/store/{reference}"))
+                .collect(),
+            narinfo_name: name,
+            output_name,
+            output_bytes,
+            raw_hash,
+            manifest_bytes,
+            narinfo_bytes: metadata.len(),
+            modified: metadata.modified()?,
+            protected: false,
+        });
+    }
+    Ok(entries)
+}
+
+fn chunk_store_error(error: impl std::error::Error + Send + Sync + 'static) -> StorageError {
+    StorageError::Io(io::Error::other(error))
+}
+
+fn protect_chunked(
+    entries: &mut [ChunkedEntry],
+    path: Option<&Path>,
+) -> Result<ChunkedProtectionReport, StorageError> {
+    let Some(path) = path else {
+        return Ok(ChunkedProtectionReport {
+            protected: 0,
+            missing_roots: 0,
+            missing_references: 0,
+        });
+    };
+    let contents = fs::read_to_string(path)?;
+    let mut roots = BTreeSet::new();
+    for root in contents
+        .lines()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        validate_root(root)?;
+        roots.insert(root.to_owned());
+    }
+    let mut pending = roots.iter().cloned().collect::<Vec<_>>();
+    let mut missing_roots = BTreeSet::new();
+    let mut missing_references = BTreeSet::new();
+    while let Some(root) = pending.pop() {
+        let Some(index) = entries
+            .iter()
+            .position(|entry| entry.store_path == root || entry.store.0 == root)
+        else {
+            if roots.contains(&root) {
+                missing_roots.insert(root);
+            } else {
+                missing_references.insert(root);
+            }
+            continue;
+        };
+        if entries[index].protected {
+            continue;
+        }
+        entries[index].protected = true;
+        pending.extend(entries[index].references.iter().cloned());
+    }
+    Ok(ChunkedProtectionReport {
+        protected: entries.iter().filter(|entry| entry.protected).count(),
+        missing_roots: missing_roots.len(),
+        missing_references: missing_references.len(),
+    })
+}
+
+fn is_chunked_eligible(entry: &ChunkedEntry, now: SystemTime, min_age: Duration) -> bool {
+    !entry.protected && now.duration_since(entry.modified).unwrap_or_default() >= min_age
+}
+
+fn chunked_entry_bytes(
+    storage: &Storage,
+    entries: &[ChunkedEntry],
+    now: SystemTime,
+    min_age: Duration,
+) -> Result<u64, StorageError> {
+    chunked_bytes_for_entries(
+        storage,
+        entries
+            .iter()
+            .filter(|entry| is_chunked_eligible(entry, now, min_age)),
+    )
+}
+
+fn chunked_live_hashes<'a>(
+    entries: &'a [ChunkedEntry],
+    selected: &'a [usize],
+) -> impl Iterator<Item = NarHash> + 'a {
+    entries
+        .iter()
+        .enumerate()
+        .filter(move |(index, _)| !selected.contains(index))
+        .map(|(_, entry)| entry.raw_hash)
+}
+
+fn chunked_projected_bytes(
+    storage: &Storage,
+    entries: &[ChunkedEntry],
+    selected: &[usize],
+) -> Result<u64, StorageError> {
+    chunked_bytes_for_entries(
+        storage,
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !selected.contains(index))
+            .map(|(_, entry)| entry),
+    )
+}
+
+fn chunked_bytes_for_entries<'a>(
+    storage: &Storage,
+    entries: impl IntoIterator<Item = &'a ChunkedEntry>,
+) -> Result<u64, StorageError> {
+    let mut manifests = BTreeMap::new();
+    let mut outputs = BTreeMap::new();
+    let mut narinfo_bytes = 0_u64;
+    for entry in entries {
+        manifests
+            .entry(entry.raw_hash)
+            .or_insert(entry.manifest_bytes);
+        if let Some(name) = &entry.output_name {
+            outputs.entry(name.clone()).or_insert(entry.output_bytes);
+        }
+        narinfo_bytes = narinfo_bytes
+            .checked_add(entry.narinfo_bytes)
+            .ok_or_else(|| invalid("narinfo byte count overflow"))?;
+    }
+    let chunk_bytes = storage
+        .chunk_store
+        .reachable_chunk_bytes(manifests.keys().copied())
+        .map_err(chunk_store_error)?;
+    chunk_bytes
+        .checked_add(manifests.values().sum())
+        .and_then(|bytes| bytes.checked_add(outputs.values().sum::<u64>()))
+        .and_then(|bytes| bytes.checked_add(narinfo_bytes))
+        .ok_or_else(|| invalid("chunked byte count overflow"))
+}
+
+fn chunked_before_bytes(storage: &Storage, entries: &[ChunkedEntry]) -> Result<u64, StorageError> {
+    let physical = storage
+        .chunk_store
+        .physical_bytes()
+        .map_err(chunk_store_error)?;
+    let nar_directory = storage.nar_directory()?;
+    let output_bytes =
+        read_dir_names(&nar_directory)?
+            .into_iter()
+            .try_fold(0_u64, |total, name| {
+                if !super::entry_is_regular_at(&nar_directory, &name)? {
+                    return Ok(total);
+                }
+                total
+                    .checked_add(open_regular_at(&nar_directory, &name)?.metadata()?.len())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "output byte count overflow")
+                    })
+            })?;
+    let metadata_bytes = entries.iter().try_fold(0_u64, |total, entry| {
+        total.checked_add(entry.narinfo_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "narinfo byte count overflow")
+        })
+    })?;
+    physical
+        .chunks
+        .checked_add(physical.manifests)
+        .and_then(|bytes| bytes.checked_add(output_bytes))
+        .and_then(|bytes| bytes.checked_add(metadata_bytes))
+        .ok_or_else(|| invalid("chunked byte count overflow"))
+}
+
+fn select_chunked(
+    storage: &Storage,
+    entries: &[ChunkedEntry],
+    target_bytes: Option<u64>,
+    max_age: Option<Duration>,
+    min_age: Duration,
+    now: SystemTime,
+) -> Result<Vec<usize>, StorageError> {
+    let mut order = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| is_chunked_eligible(entry, now, min_age))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    order.sort_unstable_by(|&left, &right| {
+        entries[left]
+            .modified
+            .cmp(&entries[right].modified)
+            .then_with(|| entries[left].store.0.cmp(&entries[right].store.0))
+    });
+    let mut selected = Vec::new();
+    for index in order {
+        let expired = max_age.is_some_and(|age| {
+            now.duration_since(entries[index].modified)
+                .unwrap_or_default()
+                >= age
+        });
+        let pressure = match target_bytes {
+            Some(target) => chunked_projected_bytes(storage, entries, &selected)? > target,
+            None => false,
+        };
+        if expired || pressure {
+            selected.push(index);
+        }
+    }
+    Ok(selected)
+}
+
+fn apply_chunked(
+    storage: &Storage,
+    entries: &[ChunkedEntry],
+    selected: &[usize],
+) -> Result<(usize, usize, usize), StorageError> {
+    storage.recovery.require()?;
+    let root = storage.root_directory()?;
+    let nar_directory = storage.nar_directory()?;
+    for &index in selected {
+        unlink_at(&root, &entries[index].narinfo_name)?;
+    }
+    if !selected.is_empty() {
+        root.sync_all()?;
+    }
+    let selected_outputs = selected
+        .iter()
+        .filter_map(|&index| entries[index].output_name.as_ref())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let live_outputs = entries
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected.contains(index))
+        .filter_map(|(_, entry)| entry.output_name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut deleted_outputs = 0;
+    for name in selected_outputs.union(&orphan_output_names(&nar_directory, &live_outputs)?) {
+        if live_outputs.contains(name) {
+            continue;
+        }
+        match unlink_at(&nar_directory, name) {
+            Ok(()) => deleted_outputs += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if deleted_outputs > 0 {
+        nar_directory.sync_all()?;
+    }
+    let sweep = storage
+        .chunk_store
+        .sweep_unreachable(chunked_live_hashes(entries, selected))
+        .map_err(chunk_store_error)?;
+    Ok((selected.len(), sweep.deleted_manifests, deleted_outputs))
+}
+
+fn orphan_output_names(
+    directory: &File,
+    live_outputs: &BTreeSet<OsString>,
+) -> Result<BTreeSet<OsString>, StorageError> {
+    let mut names = BTreeSet::new();
+    for name in read_dir_names(directory)? {
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        if (text.ends_with(".nar") || text.ends_with(".nar.xz") || text.ends_with(".nar.zst"))
+            && !live_outputs.contains(&name)
+            && super::entry_is_regular_at(directory, &name)?
+        {
+            names.insert(name);
+        }
+    }
+    Ok(names)
+}
+
+fn chunked_report(input: ChunkedGcReportInput<'_>) -> GcReport {
+    let shared = input
+        .before_entries
+        .iter()
+        .fold(BTreeMap::<NarHash, usize>::new(), |mut counts, entry| {
+            *counts.entry(entry.raw_hash).or_default() += 1;
+            counts
+        })
+        .values()
+        .filter(|&&count| count > 1)
+        .count();
+    let shared_bytes = input
+        .before_entries
+        .iter()
+        .fold(
+            BTreeMap::<NarHash, (usize, u64)>::new(),
+            |mut counts, entry| {
+                let item = counts
+                    .entry(entry.raw_hash)
+                    .or_insert((0, entry.manifest_bytes));
+                item.0 += 1;
+                item.1 = entry.manifest_bytes;
+                counts
+            },
+        )
+        .into_values()
+        .filter_map(|(count, bytes)| (count > 1).then_some(bytes))
+        .sum();
+    let deleted_narinfos = input.deleted.0;
+    let deleted_nars = input.deleted.1;
+    let deleted_orphans = input.deleted.2;
+    GcReport {
+        accounting_basis: "logical",
+        dry_run: input.dry_run,
+        before_bytes: input.before_bytes,
+        after_bytes: input.after_bytes,
+        target_met: input
+            .target_bytes
+            .is_none_or(|target| input.after_bytes <= target),
+        candidates: input.evicted,
+        protected: input.protection.protected,
+        eligible: input.eligible,
+        evicted: input.evicted,
+        shared,
+        orphaned: input
+            .before_entries
+            .len()
+            .saturating_sub(input.after_entries.len()),
+        temporary: 0,
+        malformed: 0,
+        missing_roots: input.protection.missing_roots,
+        missing_references: input.protection.missing_references,
+        protected_bytes: input.protected_bytes,
+        eligible_bytes: input.eligible_bytes,
+        evicted_bytes: input.before_bytes.saturating_sub(input.after_bytes),
+        shared_bytes,
+        orphaned_bytes: 0,
+        temporary_bytes: 0,
+        malformed_bytes: 0,
+        deleted_narinfos,
+        deleted_nars,
+        deleted_orphans,
+    }
 }
 
 fn scan_orphans(storage: &Storage, entries: &[Entry]) -> Result<Vec<Orphan>, StorageError> {
@@ -727,7 +1253,9 @@ fn invalid(message: impl Into<String>) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Directory;
+    use crate::object::NarFileName;
+    use crate::storage::{Directory, NarUploadPolicy};
+    use sha2::Digest;
     use std::{
         fs,
         os::unix::fs::symlink,
@@ -749,6 +1277,10 @@ mod tests {
 
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
         Storage::initialize(&Directory::open(path)?)
+    }
+
+    fn initialize_chunked_storage(path: &Path) -> Result<Storage, StorageError> {
+        Storage::initialize_with_backend(&Directory::open(path)?, StorageBackend::Chunked)
     }
 
     fn select_candidates(
@@ -1029,6 +1561,54 @@ mod tests {
         assert_eq!(projected_published_bytes(&entries, &[0]), 0);
         drop(storage);
         drop(directory);
+    }
+
+    #[test]
+    fn chunked_gc_sweeps_unreferenced_manifests_and_chunks() {
+        let directory = tempfile::tempdir().expect("fixture directory should be created");
+        let storage =
+            initialize_chunked_storage(directory.path()).expect("storage should initialize");
+        let raw = vec![b'x'; 100_000];
+        let hash = NarHash::from_digest(sha2::Sha256::digest(&raw).into());
+        storage
+            .publish_nar(
+                NarFileName::raw(hash),
+                io::Cursor::new(&raw),
+                raw.len() as u64,
+                NarUploadPolicy::new(raw.len() as u64, 0),
+            )
+            .expect("chunked NAR should be published");
+        let before = storage
+            .chunk_store
+            .physical_bytes()
+            .expect("chunked physical bytes should be readable");
+        assert!(before.manifests > 0);
+        assert!(before.chunks > 0);
+        drop(storage);
+
+        let report = run(GcOptions {
+            data_dir: directory.path().to_owned(),
+            max_bytes: None,
+            target_bytes: Some(0),
+            max_age: None,
+            min_age: Duration::ZERO,
+            protected_roots: None,
+            apply: true,
+            backend: StorageBackend::Chunked,
+        })
+        .expect("chunked GC should complete");
+
+        assert_eq!(report.deleted_narinfos, 0);
+        assert_eq!(report.deleted_nars, 1);
+        assert_eq!(report.deleted_orphans, 0);
+        assert_eq!(report.after_bytes, 0);
+
+        let reopened = initialize_chunked_storage(directory.path()).expect("storage should reopen");
+        let after = reopened
+            .chunk_store
+            .physical_bytes()
+            .expect("chunked physical bytes should be readable");
+        assert_eq!(after, Default::default());
     }
 
     #[test]

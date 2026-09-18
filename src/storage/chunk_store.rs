@@ -44,6 +44,12 @@ pub(crate) struct ChunkSweepReport {
     pub(crate) deleted_chunks: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChunkPhysicalBytes {
+    pub(crate) chunks: u64,
+    pub(crate) manifests: u64,
+}
+
 impl ChunkStore {
     pub(crate) fn initialize(root: &File) -> io::Result<Self> {
         let manifests = ensure_directory_at(
@@ -229,6 +235,25 @@ impl ChunkStore {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error.into()),
         }
+    }
+
+    pub(crate) fn physical_bytes(&self) -> Result<ChunkPhysicalBytes, ChunkStoreError> {
+        let manifests = sum_regular_file_bytes(&self.manifests)?;
+        let chunks =
+            read_dir_names(&self.chunks)?
+                .into_iter()
+                .try_fold(0_u64, |total, shard_name| {
+                    if !is_chunk_shard_name(&shard_name) {
+                        return Ok(total);
+                    }
+                    let shard = open_directory_at(&self.chunks, &shard_name)?;
+                    total
+                        .checked_add(sum_regular_file_bytes(&shard)?)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "chunk byte count overflow")
+                        })
+                })?;
+        Ok(ChunkPhysicalBytes { chunks, manifests })
     }
 
     fn prepare_gc_marks(&self) -> Result<File, ChunkStoreError> {
@@ -858,6 +883,20 @@ fn gc_marker_exists(directory: &File, name: &OsStr) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn sum_regular_file_bytes(directory: &File) -> io::Result<u64> {
+    read_dir_names(directory)?
+        .into_iter()
+        .try_fold(0_u64, |total, name| {
+            if !super::fs::entry_is_regular_at(directory, &name)? {
+                return Ok(total);
+            }
+            let file = open_regular_at(directory, &name)?;
+            total.checked_add(file.metadata()?.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "file byte count overflow")
+            })
+        })
 }
 
 fn clear_gc_mark_files(directory: &File) -> io::Result<()> {

@@ -4402,6 +4402,7 @@ fn restored_cache_verifies_before_serving() {
     }
     for relative in [
         ".narjar-clean",
+        ".narjar-layout",
         "lock",
         "nix-cache-info",
         "trusted-public-keys",

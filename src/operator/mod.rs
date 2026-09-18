@@ -299,6 +299,8 @@ pub(crate) struct Gc {
     apply: bool,
     #[arg(long)]
     json: bool,
+    #[arg(long, value_enum, default_value = "flat")]
+    storage_backend: StorageBackendOption,
 }
 
 pub(crate) fn gc(options: Gc) -> Result<(), Error> {
@@ -312,6 +314,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         dry_run: _,
         apply,
         json,
+        storage_backend,
     } = options;
     let report = gc::run(GcOptions {
         data_dir,
@@ -321,6 +324,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         min_age: std::time::Duration::from_secs(min_age_seconds),
         protected_roots,
         apply,
+        backend: storage_backend.backend(),
     })
     .map_err(runtime)?;
 
