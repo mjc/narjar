@@ -100,6 +100,7 @@ fn chunked_backend_routes_the_complete_nar_publication() {
             .unwrap(),
         PublishOutcome::Created
     );
+    storage.ensure_nar(&hash).unwrap();
 
     let opened = storage
         .open_nar_range(name, 12_345..54_321)

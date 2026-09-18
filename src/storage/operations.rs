@@ -14,8 +14,8 @@ use std::{
     time::SystemTime,
 };
 
-use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo};
-use crate::object::{EncodedIdentity, NarFileName, NarHash, WireEncoding};
+use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo, ValidatedPayload};
+use crate::object::{EncodedIdentity, NarFileName, NarHash, NarIdentity, WireEncoding};
 
 use super::{
     EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY,
@@ -658,6 +658,9 @@ impl Storage {
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<NarMatch, StorageError> {
+        if let ValidatedPayload::Raw(identity) = narinfo.payload() {
+            return self.canonical_nar_matches(identity);
+        }
         let nar_directory = self.nar_directory()?;
         let payload_name = narinfo.payload_name();
         open_optional_at(&nar_directory, &payload_name.os_string())?.map_or(
@@ -671,6 +674,33 @@ impl Storage {
                     .map_err(Into::into)
             },
         )
+    }
+
+    fn canonical_nar_matches(&self, identity: NarIdentity) -> Result<NarMatch, StorageError> {
+        if self.backend == StorageBackend::Chunked {
+            return Ok(
+                match self
+                    .chunk_store
+                    .manifest_identity(identity.hash())
+                    .map_err(storage_error_for_chunk_store)?
+                {
+                    None => NarMatch::Missing,
+                    Some(manifest) if manifest.identity() == identity => NarMatch::Match,
+                    Some(_) => NarMatch::Mismatch,
+                },
+            );
+        }
+
+        let nar_directory = self.nar_directory()?;
+        let name = NarFileName::raw(identity.hash());
+        open_optional_at(&nar_directory, &name.os_string())?.map_or(Ok(NarMatch::Missing), |file| {
+            nar_file_size_matches(&file, identity.size().get())
+                .map(|matches| match matches {
+                    true => NarMatch::Match,
+                    false => NarMatch::Mismatch,
+                })
+                .map_err(Into::into)
+        })
     }
 
     #[cfg(test)]
@@ -700,6 +730,18 @@ impl Storage {
 
     #[cfg(test)]
     pub(super) fn ensure_nar(&self, nar: &NarHash) -> Result<(), StorageError> {
+        if self.backend == StorageBackend::Chunked {
+            return match self
+                .chunk_store
+                .manifest_identity(*nar)
+                .map_err(storage_error_for_chunk_store)?
+            {
+                Some(manifest) if manifest.identity().hash() == *nar => Ok(()),
+                Some(_) => Err(StorageError::NarMismatch),
+                None => Err(StorageError::MissingNar),
+            };
+        }
+
         let nar_directory = self.nar_directory()?;
         let nar_name = NarFileName::raw(*nar);
         match open_regular_at(&nar_directory, &nar_name.os_string()) {
