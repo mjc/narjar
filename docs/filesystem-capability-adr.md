@@ -1,6 +1,6 @@
 # ADR: Portable filesystem capability model
 
-- Status: accepted for the current flat-storage implementation
+- Status: accepted for the flat and chunked storage implementations
 - Scope: DATA filesystem behavior and deployment integration
 - Related work: NARJ-43, NARJ-46, NARJ-68, NARJ-69, NARJ-73
 
@@ -12,7 +12,7 @@ not discover, create, mount, tune, snapshot, scrub, or replicate a filesystem.
 The NixOS module may require the configured mount before starting the service,
 but the mount remains administrator-owned.
 
-The portable publication contract requires:
+The portable publication contract for both backends requires:
 
 - directory creation and traversal with no-follow checks;
 - private named temporary files created with exclusive creation;
@@ -21,6 +21,12 @@ The portable publication contract requires:
 - same-filesystem no-replace hard-link publication with `linkat`;
 - unlink and directory synchronization for cleanup; and
 - an exclusive process lease using local `flock` semantics.
+
+The chunked backend additionally requires bounded creation and traversal of
+`.narjar-chunks/` and `.narjar-manifests/`, immutable no-replace chunk and
+manifest publication, and enough file/directory synchronization to make a
+completed manifest reconstructible after restart. A manifest is authoritative
+metadata: a chunk directory without its manifest is not a readable NAR.
 
 Transaction-record replacement uses `renameat` inside the transaction
 directory. That is separate from final-object publication. User-uploaded NAR
@@ -47,7 +53,9 @@ default `/var/lib/narjar` path on the VM's ext4 root; the
 unmount/remount conformance lane at present. ZFS is the primary
 deployment profile, but compression, copy-on-write, sparse extents, snapshots,
 and physical space accounting are filesystem observations rather than Narjar
-correctness requirements. XFS, btrfs, ZFS-specific behavior, overlay,
+correctness requirements. The chunked backend is intended for a DATA dataset
+configured by the operator with `compression=zstd-19`; Narjar does not set or
+verify ZFS properties. XFS, btrfs, ZFS-specific behavior, overlay,
 bind-mount variants, quota/inode exhaustion, read-only remounts, and Darwin
 APFS remain unverified until the corresponding evidence work is complete.
 
@@ -59,7 +67,7 @@ NARJ-46/NARJ-68 evidence artifacts, not in this capability contract.
 
 The current flat-storage design deliberately does not add:
 
-- a `StorageBackend` abstraction or a second storage engine;
+- automatic backend migration, legacy-layout fallback, or mixed-layout reads;
 - libzfs bindings, elevated filesystem privileges, or daemon hooks for
   datasets, snapshots, scrubs, quotas, or replication;
 - per-object datasets, Docker-style storage orchestration, or a cross-filesystem

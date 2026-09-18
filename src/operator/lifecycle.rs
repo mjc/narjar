@@ -12,12 +12,12 @@ use ed25519_dalek::SigningKey;
 use narjar::storage::{
     CHUNK_DIRECTORY, Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY,
     LAYOUT_DESCRIPTOR, MANIFEST_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY, Storage,
-    StorageBackend, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+    TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
 };
 
 use crate::error::Error;
 
-use super::{create_file, runtime, valid_key_name};
+use super::{StorageBackendOption, create_file, runtime, valid_key_name};
 
 #[derive(Args)]
 pub(crate) struct Init {
@@ -27,6 +27,8 @@ pub(crate) struct Init {
     pub(crate) priority: u32,
     #[arg(long)]
     pub(crate) private_read: bool,
+    #[arg(long, value_enum, default_value = "flat")]
+    pub(crate) storage_backend: StorageBackendOption,
 }
 
 pub(crate) fn init(options: Init) -> Result<(), Error> {
@@ -34,6 +36,7 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
         data_dir: root,
         priority,
         private_read,
+        storage_backend,
     } = options;
 
     if root.exists() {
@@ -47,12 +50,13 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
     create_recovery_marker(&root)?;
     create_file(
         &root.join(LAYOUT_DESCRIPTOR),
-        StorageBackend::Flat.layout_descriptor(),
+        storage_backend.backend().layout_descriptor(),
         0o600,
         true,
     )?;
     let directory = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize(&directory).map_err(runtime)?;
+    let storage =
+        Storage::initialize_with_backend(&directory, storage_backend.backend()).map_err(runtime)?;
     for directory in [
         NAR_DIRECTORY,
         TEMPORARY_DIRECTORY,

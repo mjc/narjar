@@ -987,12 +987,14 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: true,
+            storage_backend: StorageBackendOption::Flat,
         })
         .expect("partial initialization should resume");
         init(Init {
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: true,
+            storage_backend: StorageBackendOption::Flat,
         })
         .expect("completed initialization should be idempotent");
 
@@ -1002,12 +1004,32 @@ machine other.example password other-secret
     }
 
     #[test]
+    fn init_can_select_the_chunked_storage_backend() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+            storage_backend: StorageBackendOption::Chunked,
+        })
+        .expect("chunked cache should initialize");
+
+        assert_eq!(
+            fs::read(directory.path().join(".narjar-layout")).unwrap(),
+            b"narjar-layout-v1\nbackend=chunked\n"
+        );
+        assert!(directory.path().join(".narjar-chunks").is_dir());
+        assert!(directory.path().join(".narjar-manifests").is_dir());
+    }
+
+    #[test]
     fn init_preserves_existing_trust_and_token_material() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         init(Init {
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: true,
+            storage_backend: StorageBackendOption::Flat,
         })
         .expect("initialization should succeed");
 
@@ -1025,6 +1047,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: true,
+            storage_backend: StorageBackendOption::Flat,
         })
         .expect("retry should preserve existing material");
 
@@ -1052,6 +1075,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: false,
+            storage_backend: StorageBackendOption::Flat,
         })
         .expect_err("unknown entries should fail closed");
 
@@ -1066,6 +1090,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: false,
+            storage_backend: StorageBackendOption::Flat,
         })
         .expect("cache should initialize");
 
@@ -1085,6 +1110,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: false,
+            storage_backend: StorageBackendOption::Flat,
         })
         .expect("cache should initialize");
         fs::remove_dir_all(directory.path().join("nar"))
@@ -1109,6 +1135,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: false,
+            storage_backend: StorageBackendOption::Flat,
         })
         .expect("cache should initialize");
         let held = File::open(directory.path()).expect("data directory should open");

@@ -152,6 +152,47 @@ No general storage abstraction is added solely for fault injection. Introduce
 the smallest test hook at the exact publication boundary if OS-level fixtures
 cannot trigger an error deterministically.
 
+### Chunked backend invariants
+
+The chunked backend uses the exact decoded NAR byte stream as its input. These
+tests are required in addition to the flat publication cases:
+
+- `ChunkHash` values cannot be passed where `NarHash` or `FileHash` is
+  required; the manifest profile and binary schema are tested with golden
+  bytes.
+- Fragmented source reads, repeated data, NAR framing/padding, and uploads in
+  raw/XZ/Zstd form produce identical logical identities and converge on the
+  same immutable chunks and manifest.
+- Bad manifest magic/version/profile, truncation, count/length overflow,
+  non-increasing ends, invalid chunk lengths, wrong final size, checksum
+  mismatch, trailing bytes, missing chunks, truncated chunks, and same-size
+  corrupt chunks fail with their distinct integrity or I/O classification.
+- Full reads and every supported HTTP range form equal the corresponding
+  slice of the original decoded stream. A range opens and hashes only the
+  intersecting chunks after bounded manifest validation.
+- Fresh `flat` and `chunked` roots reject the opposite layout descriptor;
+  `narjar init --storage-backend chunked` creates the chunk directories and
+  no full canonical raw duplicate.
+- Each recovery boundary from chunk temp through manifest publication is
+  restart-tested. A failed upload may leave independently valid orphan chunks,
+  but never a visible incomplete manifest or narinfo.
+- Inventory checks manifest/chunk availability and, in content mode,
+  reconstructs and hashes the full logical NAR. A valid compressed derivative
+  must not hide missing or corrupt canonical chunks.
+- GC dry-run and apply use the same deduplicated manifest/chunk reachability
+  model. Shared chunks survive eviction of one root, repeated chunk records do
+  not inflate accounting, and unreadable live manifests abort destructive
+  sweep.
+
+The matched storage experiment uses two fresh roots containing the same
+recorded NAR identities: one flat and one chunked. Both datasets use the same
+operator-owned ZFS settings, including `compression=zstd-19`, and are synced
+before recording `used`, `logicalused`, dataset/snapshot contributions,
+manifest overhead, chunk counts, and exact reconstruction results. The
+experiment reports physical allocation separately from logical byte totals;
+it does not change the default backend or claim that a busy-host timing is
+valid.
+
 ### Real socket conformance
 
 Start the actual binary on 127.0.0.1 with a temporary DATA directory and assert

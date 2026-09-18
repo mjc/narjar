@@ -5,14 +5,16 @@ remain subject to the evidence gates recorded below.
 
 ## Decision
 
-Narjar is a flat, filesystem-only HTTP binary cache. It does not expose a
+Narjar is a filesystem-only HTTP binary cache with two explicit canonical
+storage backends: flat files and shared content-defined chunks. It does not expose a
 native /nix/store, invoke Nix, own a signing key, run background workers, or
 perform online garbage collection. It can normalize uploaded NAR
 representations to canonical raw storage and materialize deterministic
 compressed egress derivatives on demand. It
 does provide a bounded, operator-invoked offline retention pass. It accepts
 Nix's raw `.nar`, precompressed `.nar.zst`, and `.nar.xz` forms as upload
-transports, while storing one canonical raw `.nar` plus any requested
+transports. A selected backend stores either one canonical raw `.nar` or one
+ordered manifest plus shared raw chunks, together with any requested
 server-generated egress derivatives.
 
 The differentiator from bincache is deletion of redb, server signing,
@@ -36,9 +38,9 @@ TLS reverse proxy
   v
 Narjar process
   |
-  | same-filesystem temporary + fsync + no-replace hard link
+  | selected canonical backend; private temp + fsync + no-replace publication
   v
-flat cache directory
+cache DATA directory
 
 consumer Nix
   |
@@ -108,6 +110,11 @@ Exact v0.1 layout:
 
 ~~~text
 DATA/
+  .narjar-layout                    selected canonical backend descriptor
+  .narjar-chunks/                   chunked backend only: sharded raw chunks
+    <hex-shard>/<chunk-sha256>
+  .narjar-manifests/                chunked backend only: ordered manifests
+    <nar-hash>.manifest
   nix-cache-info
   nar/
     .tmp/
@@ -141,29 +148,51 @@ access. Paths are constructed from validated identifiers, never joined from a
 raw request path.
 
 No startup index or full scan is needed to serve: an exact route maps to an
-exact file. Startup creates required directories, validates required entries
-and modes, acquires the process lock, and removes no data. `nix-cache-info` is
-validated when it is read or published; offline inventory commands validate it
-as part of their own work. Offline reconcile and GC perform the potentially
-unbounded scans.
+exact file or logical manifest. Startup creates required directories, validates
+the selected layout descriptor and modes, acquires the process lock, and
+removes no data. `nix-cache-info` is validated when it is read or published;
+offline inventory commands validate it as part of their own work. Offline
+reconcile and GC perform the potentially unbounded scans.
+
+## Canonical storage backends
+
+`narjar init --storage-backend flat|chunked` selects the canonical layout for a
+new DATA root; `flat` remains the default. The choice is recorded in the
+small `.narjar-layout` descriptor and is immutable for that root. Startup and
+offline commands reject a missing descriptor on a populated root or a
+descriptor that disagrees with the requested backend. There is no migration,
+legacy-layout fallback, mixed per-object selection, or automatic conversion.
+
+The flat backend stores the complete decoded NAR at `nar/<NarHash>.nar`.
+The chunked backend stores the exact decoded byte stream as immutable
+content-addressed chunks below `.narjar-chunks/` and one bounded ordered
+manifest at `.narjar-manifests/<NarHash>.manifest`. The manifest records the
+profile, logical identity, cumulative chunk ends, and chunk hashes; it is
+required data, not a rebuildable cache index. ZFS may compress these files
+with `compression=zstd-19`, but ZFS compression is not part of a content ID.
+Both backends expose the same logical NAR identity, Nix HTTP routes, egress
+selection, signatures, and offline maintenance semantics.
 
 ## Offline retention and GC
 
 `narjar gc` is disabled by default and requires the same exclusive DATA lease
-as serving. It first validates every published narinfo and its referenced NAR,
+as serving. It first validates every published narinfo and its referenced
+canonical representation,
 then computes deterministic FIFO candidates from narinfo modification time.
 Optional protected roots retain their transitive `References` closure; a
 minimum age protects both recent publications and unreferenced NARs. The policy
 is an explicit maximum/target logical byte count and/or maximum age, never an
 access-time heuristic or resident worker.
 
-Apply removes and syncs narinfo first. It removes and syncs a NAR only after
-its final published reference is gone; old unreferenced NARs use the same age
-grace. A crash can therefore leave a harmless orphan but never a durable
-narinfo for a deleted NAR. Apply marks recovery before mutation and clears it
-only after a fresh validated inventory; startup revalidates a marked cache
-before serving. Logical totals intentionally exclude compression, CoW,
-reflinks, and snapshot-held physical blocks.
+Apply removes and syncs narinfo first. Flat storage removes a NAR only after
+its final published reference is gone. Chunked storage first marks live
+manifests, follows their ordered chunk edges, and then removes unreferenced
+manifests and chunks; shared chunks survive until the last live manifest is
+gone. A crash can therefore leave harmless orphan data but never a durable
+narinfo for a deleted canonical object. Apply marks recovery before mutation
+and clears it only after a fresh validated inventory; startup revalidates a
+marked cache before serving. Logical totals intentionally exclude
+compression, CoW, reflinks, and snapshot-held physical blocks.
 
 There is no HTTP delete/GC endpoint and no online read/delete race.
 
@@ -173,14 +202,12 @@ There is no HTTP delete/GC endpoint and no online read/delete race.
 PUT /nar/<file-hash>.nar[.zst|.xz]
   -> authorize writer
   -> validate route and Content-Length <= configured maximum
-  -> create DATA/nar/.tmp/nar-<random>.part with create-new
-  -> stream body once to a private temporary file
+  -> stream body once through the selected canonical backend
   -> for every encoding, hash/count the received bytes while streaming the upload
   -> for `.nar.zst`/`.nar.xz`, stream-decode the stored bytes to validate the raw NAR hash/size
   -> reject length/hash/empty mismatch or an oversized decompressed NAR
-  -> sync temporary file
-  -> no-replace hard link to DATA/nar/<file-hash>.nar[.zst|.xz]
-  -> sync DATA/nar
+  -> sync and no-replace publish the flat file, or finalize the chunk manifest
+     after each shared chunk is durably published
   -> 201 for newly durable object, 200 for identical existing object
 
 PUT /<store-hash>.narinfo
@@ -191,11 +218,11 @@ PUT /<store-hash>.narinfo
   -> require URL nar/<file-hash>.nar, .nar.zst, or .nar.xz
   -> require Compression to match the URL suffix
   -> validate encoded FileHash/FileSize and raw NarHash/NarSize
-  -> require referenced canonical raw NAR file metadata and size
+  -> require referenced canonical raw representation metadata and size
   -> verify at least one signature from trusted-public-keys
   -> select the configured output representation
   -> reuse or materialize a server-owned compressed derivative when required
-  -> write canonical original bytes to DATA/.tmp with create-new
+  -> write projected metadata to DATA/.tmp with create-new
   -> sync temporary file
   -> no-replace hard link to DATA/<store-hash>.narinfo
   -> sync DATA
@@ -211,8 +238,9 @@ and parses the NAR while importing. A second parser would add attack surface
 without adding authenticity.
 
 Compressed uploads are decoded while validating and are normalized to the
-canonical raw NAR. When compressed output is selected, Narjar materializes a
-server-owned derivative from that raw file, records its exact encoded identity
+selected canonical backend. When compressed output is selected, Narjar
+reconstructs the logical raw stream from that backend, materializes a
+server-owned derivative, records its exact encoded identity
 in `.narjar-egress/`, and reuses it on later requests. A missing or corrupt
 derivative is regenerated only when the receipt's exact identity can be
 reproduced; a receipt-less server-generated derivative is repaired after its
@@ -294,11 +322,12 @@ negative cache until --refresh; the server cannot invalidate client caches.
 ## Explicit non-goals
 
 - Native /nix/store serving or a server-side Nix installation.
-- gzip, chunked-NAR storage, or server recompression.
+- gzip, semantic-tree storage, or server recompression outside the existing
+  raw/zstd/xz egress options.
 - Server-side signing or private signing-key custody.
 - Multi-tenancy, quotas, namespaces, UI, database, Redis, S3, mirrors, workers.
 - Online delete or GC, access-time retention, a resident retention worker, or
-  payload deduplication.
+  a resident chunk catalog.
 - NAR listings, build logs, mass query, debug-info indexes, pull-through cache.
 - Built-in TLS, ACME, OIDC, mTLS, or proxy configuration generation.
 - Multiple HTTP ranges or conditional mutation.
@@ -306,7 +335,7 @@ negative cache until --refresh; the server cannot invalidate client caches.
 
 ## Open follow-up evidence gates
 
-The v0.1 flat-storage decision is accepted; these items qualify the remaining
+The v0.1 storage contract is accepted; these items qualify the remaining
 deployment and architecture claims rather than reopening the serving contract:
 
 - Complete the clean-host real-Nix and cross-host evidence for the native push
@@ -319,3 +348,5 @@ deployment and architecture claims rather than reopening the serving contract:
   measurements to preserve its correctness invariants.
 - Keep the semantic-storage investigation (NARJ-74) separate; it remains the
   gate for any parsed-NAR or content-addressed replacement.
+- Complete NARJ-130's matched flat-versus-chunked ZFS evidence before changing
+  the default backend or making physical-space claims.

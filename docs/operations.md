@@ -13,6 +13,7 @@ narjar init
   --data-dir PATH
   [--priority 30]
   [--private-read]
+  [--storage-backend flat|chunked]
 
 narjar serve
   --data-dir PATH
@@ -23,6 +24,7 @@ narjar serve
   [--min-free-bytes 1073741824]
   [--shutdown-grace-seconds 30]
   [--io-timeout-seconds 30]
+  [--storage-backend flat|chunked]
 
 narjar token create
   --data-dir PATH
@@ -41,16 +43,19 @@ narjar reconcile
   [--structural]
   [--limit N]
   [--min-age-seconds N]
+  [--storage-backend flat|chunked]
 
 narjar cleanup
   --data-dir PATH
   [--min-age-seconds N]
   [--limit N]
   [--json]
+  [--storage-backend flat|chunked]
 
 narjar verify
   --data-dir PATH
   [--json]
+  [--storage-backend flat|chunked]
 
 narjar delete
   --data-dir PATH
@@ -66,11 +71,13 @@ narjar gc
   [--protected-roots PATH]
   [--dry-run | --apply]
   [--json]
+  [--storage-backend flat|chunked]
 
 narjar list-orphans
   --data-dir PATH
   [--verify-hashes]
   [--json]
+  [--storage-backend flat|chunked]
 
 narjar doctor
   --data-dir PATH
@@ -98,7 +105,9 @@ narjar push
 ~~~
 
 init creates the deterministic layout, nix-cache-info, empty token files, and
-trusted-public-keys with restrictive modes. It refuses a non-empty incompatible
+trusted-public-keys with restrictive modes. `--storage-backend` writes the
+immutable layout descriptor and creates the chunk directories when `chunked`
+is selected; it defaults to `flat`. It refuses a non-empty incompatible
 directory.
 
 token create generates a random 256-bit token, writes only its SHA-256 hash and
@@ -133,7 +142,9 @@ surfaces are required.
 
 delete is offline-only: it refuses while the serve lock is held, removes the
 published narinfo after validation and directory sync, and deliberately leaves
-the NAR object. list-orphans reports NARs unreferenced by any valid narinfo.
+the canonical object. list-orphans reports unreferenced flat NARs or chunked
+manifests. For chunked storage, `verify` and `reconcile --verify-hashes`
+reconstruct the canonical stream and inspect the referenced chunks.
 gc is also offline-only and takes the same data-directory lock. It defaults to
 dry-run unless --apply is explicit, validates the complete published inventory
 before selecting anything, and evicts FIFO by narinfo filesystem modification
@@ -153,12 +164,13 @@ and byte total are zero on a successful scan; the error identifies the
 offending path. Compression, sparse/reflinked extents, and snapshot-held space
 are filesystem observations outside these deterministic logical totals.
 
-Apply removes narinfo first and syncs the cache directory. A referenced NAR is
-removed only after its final narinfo is gone, then the nar directory is synced.
-Old unreferenced NARs are reclaimed subject to the same minimum-age grace
-period. Malformed metadata, missing NARs, symlinked narinfos, and invalid policy
-abort the pass before deletion. No online delete endpoint or resident GC worker
-is part of this interface.
+Apply removes narinfo first and syncs the cache directory. Flat referenced NARs
+are removed only after their final narinfo is gone. Chunked apply marks the
+manifests retained by remaining narinfos, follows each manifest's chunk
+records, then removes unreferenced manifests and shared chunks. Malformed
+metadata, missing canonical objects, symlinked narinfos, or an unreadable
+manifest abort the pass before destructive sweep. No online delete endpoint or
+resident GC worker is part of this interface.
 
 ## Configuration and precedence
 
