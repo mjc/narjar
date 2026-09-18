@@ -16,6 +16,11 @@ use sha2::{Digest, Sha256};
 
 const DEFAULT_FIXED_CHUNK_SIZE: usize = 8 * 1024;
 const DEFAULT_HYBRID_SMALL_FILE_SIZE: u64 = 64 * 1024;
+const PREDECLARED_RAW_WINDOWS: &[(usize, usize)] = &[
+    (2 * 1024, 8 * 1024),
+    (4 * 1024, 12 * 1024),
+    (8 * 1024, 24 * 1024),
+];
 const CHUNK_DESCRIPTOR_BYTES: u64 = 8 + 8 + 32;
 const WHOLE_FILE_DESCRIPTOR_BYTES: u64 = 8 + 32;
 const FILE_MANIFEST_HEADER_BYTES: u64 = 8;
@@ -59,6 +64,7 @@ enum MeasurementSelection {
     All,
     SemanticOnly,
     HybridOnly,
+    RawSweep,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -151,6 +157,20 @@ fn main() -> io::Result<()> {
     );
 
     let parameters = ChunkParameters::new(command_line.min_size, command_line.max_size);
+    if command_line.selection == MeasurementSelection::RawSweep {
+        for &(min_size, max_size) in PREDECLARED_RAW_WINDOWS {
+            let parameters = ChunkParameters::new(min_size, max_size);
+            println!("sweep_min_size={min_size} sweep_max_size={max_size}");
+            let result = measure_strategy(
+                &files,
+                MeasurementStrategy::RawCdc(ChunkAlgorithm::MinCdcHash4),
+                parameters,
+                command_line.fixed_size,
+            )?;
+            print_result(&result, command_line.fixed_size);
+        }
+        return Ok(());
+    }
     let semantic_strategies: &[MeasurementStrategy] = &[
         MeasurementStrategy::SemanticCdc(ChunkAlgorithm::MinCdcHash4),
         MeasurementStrategy::SemanticCdc(ChunkAlgorithm::MinCdc4),
@@ -168,6 +188,9 @@ fn main() -> io::Result<()> {
         MeasurementSelection::All => all_strategies,
         MeasurementSelection::SemanticOnly => semantic_strategies,
         MeasurementSelection::HybridOnly => &[MeasurementStrategy::HybridSmallWholeFile],
+        MeasurementSelection::RawSweep => {
+            unreachable!("raw sweep returned before normal selection")
+        }
     };
     for &strategy in strategies {
         let result = measure_strategy(&files, strategy, parameters, command_line.fixed_size)?;
@@ -184,8 +207,8 @@ fn main() -> io::Result<()> {
 impl CommandLine {
     fn parse(mut arguments: impl Iterator<Item = String>) -> io::Result<Self> {
         let mut corpus = None;
-        let mut min_size = 4 * 1024;
-        let mut max_size = 12 * 1024;
+        let mut min_size = 8 * 1024;
+        let mut max_size = 24 * 1024;
         let mut fixed_size = DEFAULT_FIXED_CHUNK_SIZE;
         let mut max_files = None;
         let mut selection = MeasurementSelection::All;
@@ -193,11 +216,15 @@ impl CommandLine {
 
         while let Some(argument) = arguments.next() {
             if argument == "--semantic-only" {
-                selection = MeasurementSelection::SemanticOnly;
+                selection = select_measurement(selection, MeasurementSelection::SemanticOnly)?;
                 continue;
             }
             if argument == "--hybrid-only" {
-                selection = MeasurementSelection::HybridOnly;
+                selection = select_measurement(selection, MeasurementSelection::HybridOnly)?;
+                continue;
+            }
+            if argument == "--raw-sweep" {
+                selection = select_measurement(selection, MeasurementSelection::RawSweep)?;
                 continue;
             }
             let (option, value) = argument.split_once('=').map_or_else(
@@ -227,7 +254,7 @@ impl CommandLine {
         }
         if store_root.is_some() && selection != MeasurementSelection::All {
             return Err(invalid_argument(
-                "--store-root models raw MinCdcHash4; omit --semantic-only or --hybrid-only",
+                "--store-root models raw MinCdcHash4; omit benchmark-only selection flags",
             ));
         }
         if min_size == 0 || min_size > max_size || fixed_size == 0 {
@@ -266,8 +293,20 @@ fn invalid_argument(message: impl Into<String>) -> io::Error {
 
 fn print_help() {
     println!(
-        "Usage: narjar-nar-chunking --corpus PATH [--min-size BYTES] [--max-size BYTES] [--fixed-size BYTES] [--max-files COUNT] [--semantic-only|--hybrid-only] [--store-root PATH]\n\nMeasures raw and semantic MinCDC, a fixed hybrid policy, fixed-size, and whole-file CAS controls over sorted .nar files. --store-root materializes a bounded raw MinCdcHash4 sample."
+        "Usage: narjar-nar-chunking --corpus PATH [--min-size BYTES] [--max-size BYTES] [--fixed-size BYTES] [--max-files COUNT] [--semantic-only|--hybrid-only|--raw-sweep] [--store-root PATH]\n\nMeasures raw and semantic MinCDC, a fixed hybrid policy, fixed-size, and whole-file CAS controls over sorted .nar files. --raw-sweep runs the predeclared raw Hash4 windows. --store-root materializes a bounded raw MinCdcHash4 sample."
     );
+}
+
+fn select_measurement(
+    current: MeasurementSelection,
+    requested: MeasurementSelection,
+) -> io::Result<MeasurementSelection> {
+    if current != MeasurementSelection::All {
+        return Err(invalid_argument(
+            "measurement selection options are exclusive",
+        ));
+    }
+    Ok(requested)
 }
 
 fn collect_nar_files(root: &Path, max_files: Option<usize>) -> io::Result<Vec<PathBuf>> {
@@ -732,7 +771,7 @@ mod tests {
         let mut measurements = ChunkMeasurements::default();
         let mut sink = SemanticCdcSink::new(
             &mut measurements,
-            ChunkParameters::eight_kibibyte_window(),
+            ChunkParameters::selected_window(),
             ChunkAlgorithm::MinCdcHash4,
         );
         sink.event(Event::BeginFile {

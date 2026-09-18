@@ -26,6 +26,17 @@ content-addressed chunks, verifies existing duplicate chunks, and reports
 apparent bytes, allocated bytes, and file/directory counts. It is an
 experiment store, not Narjar production storage.
 
+Run the fixed raw-Hash4 parameter sweep with:
+
+```console
+cargo run --release -p narjar-nar-chunking -- \
+  --corpus /home/mjc/narjar-corpora/narjar-real-nix-v1 \
+  --raw-sweep
+```
+
+The sweep is deliberately limited to 2–8 KiB, 4–12 KiB, and 8–24 KiB. It is
+not an open-ended parameter search.
+
 The command walks `.nar` files in sorted path order and prints one stable
 `key=value` record for each control:
 
@@ -51,4 +62,4 @@ allocation, indexes, and inode costs still need to be added to the experiment
 report separately.
 
 Use `--max-files` for a bounded smoke run. The default raw MinCDC parameters
-are a fixed 4–12 KiB window and are part of the experiment identity.
+are the selected fixed 8–24 KiB window and are part of the experiment identity.

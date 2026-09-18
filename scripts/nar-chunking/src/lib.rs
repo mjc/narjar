@@ -9,8 +9,8 @@ use std::os::unix::fs::MetadataExt;
 use mincdc::{Cdc, MinCdc4, MinCdcHash4, ReadChunker};
 use sha2::{Digest, Sha256};
 
-const DEFAULT_MIN_CHUNK_SIZE: usize = 4 * 1024;
-const DEFAULT_MAX_CHUNK_SIZE: usize = 12 * 1024;
+const DEFAULT_MIN_CHUNK_SIZE: usize = 8 * 1024;
+const DEFAULT_MAX_CHUNK_SIZE: usize = 24 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChunkParameters {
@@ -32,7 +32,7 @@ impl ChunkParameters {
     }
 
     #[must_use]
-    pub const fn eight_kibibyte_window() -> Self {
+    pub const fn selected_window() -> Self {
         Self::new(DEFAULT_MIN_CHUNK_SIZE, DEFAULT_MAX_CHUNK_SIZE)
     }
 
@@ -418,7 +418,7 @@ mod tests {
                 bytes: input,
                 read_size,
             },
-            ChunkParameters::eight_kibibyte_window(),
+            ChunkParameters::selected_window(),
             ChunkAlgorithm::MinCdcHash4,
             |_, chunk| {
                 chunks.push(chunk.to_vec());
@@ -457,6 +457,7 @@ mod tests {
     fn descriptors_cover_the_input_and_hash_each_chunk() {
         let input = test_input();
         let (manifest, chunks) = chunk_input(&input, 4096);
+        let selected_window = ChunkParameters::selected_window();
 
         assert_eq!(manifest.total_size(), input.len() as u64);
         assert_eq!(manifest.chunks().len(), chunks.len());
@@ -468,7 +469,7 @@ mod tests {
             manifest
                 .chunks()
                 .iter()
-                .all(|chunk| chunk.size() <= 12 * 1024)
+                .all(|chunk| chunk.size() <= selected_window.max_size() as u64)
         );
         assert!(
             manifest
@@ -490,7 +491,7 @@ mod tests {
                     bytes: &input,
                     read_size: 4096,
                 },
-                ChunkParameters::eight_kibibyte_window(),
+                ChunkParameters::selected_window(),
                 algorithm,
                 |_, chunk| {
                     reconstructed.extend_from_slice(chunk);
@@ -504,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn mincdc_hash4_cut_points_are_stable_for_the_pinned_parameters() {
+    fn mincdc_hash4_cut_points_are_stable_for_the_selected_parameters() {
         let input: Vec<_> = (0usize..(32 * 1024))
             .map(|index| index.wrapping_mul(37) as u8)
             .collect();
@@ -512,7 +513,7 @@ mod tests {
 
         chunk_reader(
             input.as_slice(),
-            ChunkParameters::eight_kibibyte_window(),
+            ChunkParameters::selected_window(),
             ChunkAlgorithm::MinCdcHash4,
             |descriptor, _| {
                 descriptors.push((descriptor.offset(), descriptor.size()));
@@ -523,16 +524,7 @@ mod tests {
 
         assert_eq!(
             descriptors,
-            vec![
-                (0, 4271),
-                (4271, 4096),
-                (8367, 4096),
-                (12463, 4096),
-                (16559, 4096),
-                (20655, 4096),
-                (24751, 4096),
-                (28847, 3921),
-            ]
+            vec![(0, 8367), (8367, 8192), (16559, 8192), (24751, 8017),]
         );
     }
 
@@ -550,7 +542,7 @@ mod tests {
         let input = test_input();
         let manifest = chunk_reader(
             input.as_slice(),
-            ChunkParameters::eight_kibibyte_window(),
+            ChunkParameters::selected_window(),
             ChunkAlgorithm::MinCdcHash4,
             |descriptor, chunk| store.store_chunk(descriptor, chunk),
         )
