@@ -1,0 +1,11 @@
+[package]
+name = "narjar-nar-chunking"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[dependencies]
+mincdc = "=0.1.0"
+narjar = { path = "../.." }
+sha2 = { version = "=0.11.0", default-features = false }

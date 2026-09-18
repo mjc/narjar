@@ -389,6 +389,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "mincdc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d2923e26fcf6c3699531d13e141a4c18bb0852d5614da154805dcf6348fbf21"
+
+[[package]]
 name = "narjar"
 version = "0.1.0"
 dependencies = [
@@ -417,6 +423,15 @@ name = "narjar-corpus"
 version = "0.1.0"
 dependencies = [
  "nix-archive",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "narjar-nar-chunking"
+version = "0.1.0"
+dependencies = [
+ "mincdc",
+ "narjar",
  "sha2 0.11.0",
 ]
 
