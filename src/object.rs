@@ -28,6 +28,16 @@ impl NarHash {
     pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
         Self(digest)
     }
+
+    #[allow(dead_code)]
+    pub(crate) const fn bytes_for_storage(self) -> [u8; 32] {
+        self.0
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn from_storage_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Display for NarHash {

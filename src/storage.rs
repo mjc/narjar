@@ -1,3 +1,6 @@
+// The typed chunk foundation is consumed by the storage integration that follows.
+#[allow(dead_code)]
+pub(crate) mod chunked;
 mod compression;
 mod directory;
 mod egress;

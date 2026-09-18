@@ -407,6 +407,7 @@ dependencies = [
  "libc",
  "lzma-rust2",
  "memchr",
+ "mincdc",
  "postcard",
  "serde",
  "sha2 0.11.0",
