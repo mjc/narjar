@@ -1,7 +1,8 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
+    ops::Range,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -103,6 +104,27 @@ impl ChunkStore {
         }
     }
 
+    pub(crate) fn read_range<W: Write>(
+        &self,
+        hash: NarHash,
+        range: Range<u64>,
+        max_manifest_bytes: u64,
+        destination: &mut W,
+    ) -> Result<(), ChunkStoreError> {
+        let manifest_file = self
+            .open_manifest(hash)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let mut manifest_bytes = Vec::new();
+        manifest_file
+            .take(max_manifest_bytes.saturating_add(1))
+            .read_to_end(&mut manifest_bytes)?;
+        if manifest_bytes.len() as u64 > max_manifest_bytes {
+            return Err(ChunkStoreError::Manifest(ManifestError::LengthOverflow));
+        }
+        let manifest = ChunkManifest::decode(&manifest_bytes)?;
+        write_manifest_range(self, &manifest, range, destination)
+    }
+
     fn store_chunk(&self, hash: ChunkHash, bytes: &[u8]) -> io::Result<()> {
         let shard = self.open_or_create_shard(hash)?;
         publish_immutable_bytes(&shard, &chunk_name(hash), CHUNK_TEMP_PREFIX, bytes)
@@ -129,6 +151,46 @@ impl ChunkStore {
     fn open_shard(&self, hash: ChunkHash) -> io::Result<File> {
         super::fs::open_directory_at(&self.chunks, OsStr::new(&shard_name(hash)))
     }
+}
+
+fn write_manifest_range<W: Write>(
+    store: &ChunkStore,
+    manifest: &ChunkManifest,
+    range: Range<u64>,
+    destination: &mut W,
+) -> Result<(), ChunkStoreError> {
+    validate_range(manifest, &range)?;
+    manifest
+        .chunks()
+        .iter()
+        .scan(0_u64, |start, chunk| {
+            let current_start = *start;
+            *start = chunk.end();
+            Some((current_start, *chunk))
+        })
+        .filter(|(chunk_start, chunk)| range.start < chunk.end() && range.end > *chunk_start)
+        .try_for_each(|(chunk_start, chunk)| {
+            let chunk_end = chunk.end();
+            let read_start = range.start.max(chunk_start);
+            let read_end = range.end.min(chunk_end);
+            let mut file = store
+                .open_chunk(chunk.hash())?
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            file.seek(SeekFrom::Start(read_start - chunk_start))?;
+            io::copy(&mut file.take(read_end - read_start), destination)?;
+            Ok(())
+        })
+}
+
+fn validate_range(manifest: &ChunkManifest, range: &Range<u64>) -> Result<(), ChunkStoreError> {
+    if range.start > range.end || range.end > manifest.identity().size().get() {
+        return Err(ChunkStoreError::InvalidRange {
+            start: range.start,
+            end: range.end,
+            size: manifest.identity().size().get(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) struct ChunkingWriter<'store> {
@@ -345,6 +407,7 @@ fn hex_name(bytes: [u8; 32]) -> String {
 
 #[derive(Debug)]
 pub(crate) enum ChunkStoreError {
+    InvalidRange { start: u64, end: u64, size: u64 },
     Io(io::Error),
     Manifest(ManifestError),
     NarHashMismatch { expected: NarHash, actual: NarHash },
@@ -410,6 +473,25 @@ mod tests {
                 .iter()
                 .all(|chunk| store.open_chunk(chunk.hash()).unwrap().is_some())
         );
+
+        let mut reconstructed = Vec::new();
+        store
+            .read_range(hash, 0..input.len() as u64, 1_000_000, &mut reconstructed)
+            .unwrap();
+        assert_eq!(reconstructed, input);
+
+        let mut range = Vec::new();
+        store
+            .read_range(hash, 12_345..54_321, 1_000_000, &mut range)
+            .unwrap();
+        assert_eq!(range, input[12_345..54_321]);
+
+        let invalid_start = 54_321;
+        let invalid_end = 12_345;
+        assert!(matches!(
+            store.read_range(hash, invalid_start..invalid_end, 1_000_000, &mut range),
+            Err(ChunkStoreError::InvalidRange { .. })
+        ));
     }
 
     #[test]

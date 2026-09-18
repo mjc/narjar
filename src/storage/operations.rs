@@ -55,6 +55,10 @@ pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
 #[allow(dead_code)]
 fn storage_error_for_chunk_store(error: ChunkStoreError) -> StorageError {
     match error {
+        ChunkStoreError::InvalidRange { .. } => StorageError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chunked NAR range is outside the object",
+        )),
         ChunkStoreError::Io(error) => StorageError::Io(error),
         ChunkStoreError::Manifest(error) => {
             StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
