@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{File, Permissions},
-    io::{self, Cursor, Read},
+    io::{self, Cursor, Read, Write},
     num::NonZeroUsize,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
@@ -18,8 +18,8 @@ use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo, V
 use crate::object::{EncodedIdentity, NarFileName, NarHash, NarIdentity, WireEncoding};
 
 use super::{
-    EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY,
-    TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+    EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, LAYOUT_DESCRIPTOR, NAR_DIRECTORY,
+    REALISATIONS_DIRECTORY, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
     chunk_store::{ChunkStoreError, ChunkedNarReader, ChunkingWriter, MAX_CHUNK_MANIFEST_BYTES},
     chunked::{ChunkManifest, ChunkProfile},
     compression::{
@@ -430,6 +430,7 @@ impl Storage {
             OsStr::new(EGRESS_RECEIPT_DIRECTORY),
             "compressed egress receipt directory",
         )?;
+        ensure_backend_layout(&root_directory, backend, root_is_empty)?;
         let chunk_store = super::chunk_store::ChunkStore::initialize(&root_directory)?;
 
         root_directory.sync_all()?;
@@ -1457,5 +1458,49 @@ impl Storage {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(key, Arc::downgrade(&lock));
         lock
+    }
+}
+
+fn ensure_backend_layout(
+    root: &File,
+    backend: StorageBackend,
+    root_is_empty: bool,
+) -> io::Result<()> {
+    let name = OsStr::new(LAYOUT_DESCRIPTOR);
+    match open_optional_at(root, name).map_err(storage_error_as_io)? {
+        Some(descriptor) => {
+            let mut bytes = Vec::new();
+            descriptor.take(64).read_to_end(&mut bytes)?;
+            if bytes == backend.layout_descriptor() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "data directory uses a different storage backend",
+                ))
+            }
+        }
+        None if !root_is_empty => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "initialized data directory is missing its storage-layout descriptor",
+        )),
+        None => {
+            let mut descriptor = open_at(
+                root,
+                name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                0o600,
+            )?;
+            descriptor.write_all(backend.layout_descriptor())?;
+            descriptor.sync_all()?;
+            root.sync_all()
+        }
+    }
+}
+
+fn storage_error_as_io(error: StorageError) -> io::Error {
+    match error {
+        StorageError::Io(error) => error,
+        error => io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
     }
 }

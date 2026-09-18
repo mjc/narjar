@@ -17,6 +17,15 @@ pub enum StorageBackend {
     Chunked,
 }
 
+impl StorageBackend {
+    pub const fn layout_descriptor(self) -> &'static [u8] {
+        match self {
+            Self::Flat => b"narjar-layout-v1\nbackend=flat\n",
+            Self::Chunked => b"narjar-layout-v1\nbackend=chunked\n",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Storage {
     #[cfg(test)]

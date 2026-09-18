@@ -1230,12 +1230,28 @@ fn initialization_creates_only_the_fixed_layout() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
 
+    assert_eq!(
+        fs::read(directory.path().join(super::LAYOUT_DESCRIPTOR)).unwrap(),
+        StorageBackend::Flat.layout_descriptor()
+    );
     assert!(directory.path().join("nar").is_dir());
     assert!(directory.path().join("nar/.tmp").is_dir());
     assert!(directory.path().join(".tmp").is_dir());
     assert!(directory.path().join("realisations").is_dir());
     assert!(directory.path().join("realisations/.tmp").is_dir());
     assert_eq!(storage.layout(), &Layout::new(directory.path().to_owned()));
+}
+
+#[test]
+fn initialization_rejects_a_different_storage_backend() {
+    let directory = TestDir::new();
+    let root = Directory::open(directory.path()).unwrap();
+    let storage = Storage::initialize_with_backend(&root, StorageBackend::Flat).unwrap();
+    drop(storage);
+
+    let error = Storage::initialize_with_backend(&root, StorageBackend::Chunked)
+        .expect_err("a populated root must retain its selected backend");
+    assert!(error.to_string().contains("different storage backend"));
 }
 
 #[test]

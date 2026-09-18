@@ -11,8 +11,8 @@ use data_encoding::BASE64;
 use ed25519_dalek::SigningKey;
 use narjar::storage::{
     CHUNK_DIRECTORY, Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY,
-    MANIFEST_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY, Storage, TEMPORARY_DIRECTORY,
-    VALIDATION_DIRECTORY,
+    LAYOUT_DESCRIPTOR, MANIFEST_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY, Storage,
+    StorageBackend, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
 };
 
 use crate::error::Error;
@@ -45,6 +45,12 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
 
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(runtime)?;
     create_recovery_marker(&root)?;
+    create_file(
+        &root.join(LAYOUT_DESCRIPTOR),
+        StorageBackend::Flat.layout_descriptor(),
+        0o600,
+        true,
+    )?;
     let directory = Directory::open(&root).map_err(runtime)?;
     let storage = Storage::initialize(&directory).map_err(runtime)?;
     for directory in [
@@ -83,6 +89,7 @@ const INIT_ROOT_ENTRIES: &[&str] = &[
     CHUNK_DIRECTORY,
     MANIFEST_DIRECTORY,
     ".narjar-recovery",
+    LAYOUT_DESCRIPTOR,
     ".narjar-transactions",
     VALIDATION_DIRECTORY,
     TEMPORARY_DIRECTORY,
