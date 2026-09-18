@@ -212,6 +212,25 @@ impl ChunkStore {
         }
     }
 
+    pub(crate) fn reachable_chunk_bytes<I>(&self, live_manifests: I) -> Result<u64, ChunkStoreError>
+    where
+        I: IntoIterator<Item = NarHash>,
+    {
+        let marks = self.prepare_gc_marks()?;
+        let result = (|| {
+            live_manifests
+                .into_iter()
+                .try_for_each(|hash| self.mark_live_manifest(&marks, hash))?;
+            self.marked_chunk_bytes(&marks)
+        })();
+        let cleanup = clear_gc_mark_files(&marks);
+        match (result, cleanup) {
+            (Ok(bytes), Ok(())) => Ok(bytes),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
+    }
+
     fn prepare_gc_marks(&self) -> Result<File, ChunkStoreError> {
         let marks = ensure_directory_at(
             &self.chunks,
@@ -308,6 +327,29 @@ impl ChunkStore {
             deleted_manifests: 0,
             deleted_chunks,
         })
+    }
+
+    fn marked_chunk_bytes(&self, marks: &File) -> Result<u64, ChunkStoreError> {
+        Ok(read_dir_names(marks)?
+            .into_iter()
+            .try_fold(0_u64, |total, shard_name| {
+                if !is_chunk_shard_name(&shard_name) {
+                    return Ok(total);
+                }
+                let marked_shard = open_directory_at(marks, &shard_name)?;
+                read_dir_names(&marked_shard)?
+                    .into_iter()
+                    .try_fold(total, |total, name| {
+                        if !is_chunk_name(&name) {
+                            return Ok(total);
+                        }
+                        let chunk_shard = open_directory_at(&self.chunks, &shard_name)?;
+                        let chunk = open_regular_at(&chunk_shard, &name)?;
+                        total.checked_add(chunk.metadata()?.len()).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "chunk byte count overflow")
+                        })
+                    })
+            })?)
     }
 
     fn store_chunk(&self, hash: ChunkHash, bytes: &[u8]) -> io::Result<()> {
@@ -1124,6 +1166,12 @@ mod tests {
             )
             .unwrap();
 
+        assert!(
+            store
+                .reachable_chunk_bytes([first_hash, second_hash])
+                .unwrap()
+                > 0
+        );
         let report = store.sweep_unreachable([first_hash]).unwrap();
         assert_eq!(report.deleted_manifests, 1);
         assert!(report.deleted_chunks > 0);
