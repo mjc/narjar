@@ -1,4 +1,5 @@
-// The typed chunk foundation is consumed by the storage integration that follows.
+#[allow(dead_code)]
+pub(crate) mod chunk_store;
 #[allow(dead_code)]
 pub(crate) mod chunked;
 mod compression;

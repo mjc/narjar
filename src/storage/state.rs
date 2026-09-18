@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex, Weak, atomic::AtomicU64},
 };
 
+use super::chunk_store::ChunkStore;
 #[cfg(test)]
 use super::publication::Layout;
 use super::publication::{ProcessLock, StagingBudget};
@@ -15,6 +16,8 @@ pub struct Storage {
     #[cfg(test)]
     pub(super) layout: Layout,
     pub(super) root: File,
+    #[allow(dead_code)]
+    pub(super) chunk_store: ChunkStore,
     pub(super) recovery: RecoveryState,
     pub(super) publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     pub(super) staging_budget: Arc<Mutex<StagingBudget>>,

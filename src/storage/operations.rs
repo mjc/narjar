@@ -385,6 +385,7 @@ impl Storage {
             OsStr::new(EGRESS_RECEIPT_DIRECTORY),
             "compressed egress receipt directory",
         )?;
+        let chunk_store = super::chunk_store::ChunkStore::initialize(&root_directory)?;
 
         root_directory.sync_all()?;
 
@@ -393,6 +394,7 @@ impl Storage {
             #[cfg(test)]
             layout,
             root: root_directory,
+            chunk_store,
             recovery,
             publication_locks: Mutex::new(HashMap::new()),
             staging_budget: Arc::new(Mutex::new(Default::default())),
