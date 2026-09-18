@@ -5,17 +5,18 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use mincdc::{MinCdcHash4, SliceChunker};
 use sha2::{Digest, Sha256};
 
 use crate::object::{NarHash, NarIdentity};
 
 use super::{
-    chunked::{ChunkHash, ChunkManifest, ChunkProfile, ManifestError, chunk_stream},
+    CHUNK_DIRECTORY, MANIFEST_DIRECTORY,
+    chunked::{ChunkHash, ChunkManifest, ChunkProfile, ManifestError},
     fs::{ensure_directory_at, files_equal_at, hard_link_at, open_at, open_regular_at, unlink_at},
+    publication::{StagingReservation, StorageError},
 };
 
-const CHUNK_DIRECTORY: &str = ".narjar-chunks";
-const MANIFEST_DIRECTORY: &str = ".narjar-manifests";
 const CHUNK_TEMP_PREFIX: &str = "chunk";
 const MANIFEST_TEMP_PREFIX: &str = "manifest";
 
@@ -41,34 +42,44 @@ impl ChunkStore {
 
     pub(crate) fn store_nar<R: Read>(
         &self,
-        source: R,
+        mut source: R,
         identity: NarIdentity,
         profile: ChunkProfile,
     ) -> Result<ChunkManifest, ChunkStoreError> {
-        let mut manifest = ChunkManifest::new(identity, profile);
-        let mut nar_hasher = Sha256::new();
-        let total_size = chunk_stream(source, profile, |end, hash, bytes| {
-            nar_hasher.update(bytes);
-            self.store_chunk(hash, bytes)?;
-            manifest.push_chunk(end, hash).map_err(io_for_manifest)
-        })?;
-        let actual_size = identity.size().get();
-        if total_size != actual_size {
-            return Err(ChunkStoreError::NarSizeMismatch {
-                expected: actual_size,
-                actual: total_size,
-            });
+        let mut writer = self.begin_ingest(profile);
+        io::copy(&mut source, &mut writer)?;
+        writer.finish(identity)
+    }
+
+    pub(crate) fn begin_ingest(&self, profile: ChunkProfile) -> ChunkingWriter<'_> {
+        self.begin_ingest_with_optional_reservation(profile, None, 0)
+    }
+
+    pub(crate) fn begin_ingest_with_reservation(
+        &self,
+        profile: ChunkProfile,
+        reservation: StagingReservation,
+        min_free_bytes: u64,
+    ) -> ChunkingWriter<'_> {
+        self.begin_ingest_with_optional_reservation(profile, Some(reservation), min_free_bytes)
+    }
+
+    fn begin_ingest_with_optional_reservation(
+        &self,
+        profile: ChunkProfile,
+        reservation: Option<StagingReservation>,
+        min_free_bytes: u64,
+    ) -> ChunkingWriter<'_> {
+        ChunkingWriter {
+            store: self,
+            profile,
+            pending: Vec::new(),
+            chunks: Vec::new(),
+            hasher: Sha256::new(),
+            size: 0,
+            reservation,
+            min_free_bytes,
         }
-        let actual_hash = NarHash::from_digest(nar_hasher.finalize().into());
-        if actual_hash != identity.hash() {
-            return Err(ChunkStoreError::NarHashMismatch {
-                expected: identity.hash(),
-                actual: actual_hash,
-            });
-        }
-        let manifest = manifest.finish()?;
-        self.publish_manifest(&manifest)?;
-        Ok(manifest)
     }
 
     pub(crate) fn open_chunk(&self, hash: ChunkHash) -> io::Result<Option<File>> {
@@ -97,13 +108,16 @@ impl ChunkStore {
         publish_immutable_bytes(&shard, &chunk_name(hash), CHUNK_TEMP_PREFIX, bytes)
     }
 
-    fn publish_manifest(&self, manifest: &ChunkManifest) -> Result<(), ChunkStoreError> {
-        let bytes = manifest.encode()?;
+    fn publish_manifest_bytes(
+        &self,
+        manifest: &ChunkManifest,
+        bytes: &[u8],
+    ) -> Result<(), ChunkStoreError> {
         publish_immutable_bytes(
             &self.manifests,
             &manifest_name(manifest.identity().hash()),
             MANIFEST_TEMP_PREFIX,
-            &bytes,
+            bytes,
         )
         .map_err(Into::into)
     }
@@ -114,6 +128,134 @@ impl ChunkStore {
 
     fn open_shard(&self, hash: ChunkHash) -> io::Result<File> {
         super::fs::open_directory_at(&self.chunks, OsStr::new(&shard_name(hash)))
+    }
+}
+
+pub(crate) struct ChunkingWriter<'store> {
+    store: &'store ChunkStore,
+    profile: ChunkProfile,
+    pending: Vec<u8>,
+    chunks: Vec<(u64, ChunkHash)>,
+    hasher: Sha256,
+    size: u64,
+    reservation: Option<StagingReservation>,
+    min_free_bytes: u64,
+}
+
+impl ChunkingWriter<'_> {
+    pub(crate) fn finish(
+        mut self,
+        expected: NarIdentity,
+    ) -> Result<ChunkManifest, ChunkStoreError> {
+        self.publish_pending_chunk()?;
+        let actual = NarIdentity::new(
+            NarHash::from_digest(self.hasher.clone().finalize().into()),
+            self.size.into(),
+        );
+        if actual != expected {
+            return Err(if actual.hash() != expected.hash() {
+                ChunkStoreError::NarHashMismatch {
+                    expected: expected.hash(),
+                    actual: actual.hash(),
+                }
+            } else {
+                ChunkStoreError::NarSizeMismatch {
+                    expected: expected.size().get(),
+                    actual: actual.size().get(),
+                }
+            });
+        }
+        let mut manifest = ChunkManifest::new(actual, self.profile);
+        self.chunks
+            .iter()
+            .copied()
+            .try_for_each(|(end, hash)| manifest.push_chunk(end, hash))?;
+        let manifest = manifest.finish()?;
+        let manifest_bytes = manifest.encode()?;
+        self.reserve_before_materialization(&self.store.manifests, manifest_bytes.len() as u64)?;
+        self.store
+            .publish_manifest_bytes(&manifest, &manifest_bytes)?;
+        self.release_materialized_bytes(manifest_bytes.len() as u64);
+        Ok(manifest)
+    }
+
+    fn publish_complete_chunks(&mut self) -> io::Result<()> {
+        while self.pending.len() >= self.profile.max_size() as usize {
+            self.publish_next_chunk()?;
+        }
+        Ok(())
+    }
+
+    fn publish_pending_chunk(&mut self) -> Result<(), ChunkStoreError> {
+        while !self.pending.is_empty() {
+            self.publish_next_chunk().map_err(ChunkStoreError::from)?;
+        }
+        Ok(())
+    }
+
+    fn publish_next_chunk(&mut self) -> io::Result<()> {
+        let chunk_length = SliceChunker::new(
+            &self.pending,
+            self.profile.min_size() as usize,
+            self.profile.max_size() as usize,
+            MinCdcHash4::new(),
+        )
+        .next()
+        .expect("a non-empty pending buffer produces a chunk")
+        .len();
+        let hash = ChunkHash::from_digest(Sha256::digest(&self.pending[..chunk_length]).into());
+        self.reserve_before_materialization(&self.store.chunks, chunk_length as u64)?;
+        self.store
+            .store_chunk(hash, &self.pending[..chunk_length])?;
+        self.release_materialized_bytes(chunk_length as u64);
+        let remaining = u64::try_from(self.pending.len() - chunk_length)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk buffer is too large"))?;
+        let end = self
+            .size
+            .checked_sub(remaining)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end underflow"))?;
+        self.chunks.push((end, hash));
+        self.pending.drain(..chunk_length);
+        Ok(())
+    }
+
+    fn reserve_before_materialization(&mut self, directory: &File, bytes: u64) -> io::Result<()> {
+        let Some(reservation) = self.reservation.as_mut() else {
+            return Ok(());
+        };
+        reservation
+            .grow_to(
+                directory,
+                self.min_free_bytes,
+                reservation.reserved_bytes().saturating_add(bytes),
+            )
+            .map_err(io_for_storage_error)
+    }
+
+    fn release_materialized_bytes(&mut self, bytes: u64) {
+        if let Some(reservation) = self.reservation.as_mut() {
+            reservation.record_materialized_bytes(bytes);
+        }
+    }
+}
+
+impl Write for ChunkingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.hasher.update(bytes);
+        self.size = self
+            .size
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?,
+            )
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?;
+        self.pending.extend_from_slice(bytes);
+        self.publish_complete_chunks()?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -169,6 +311,16 @@ fn temporary_name(prefix: &str) -> OsString {
     .into()
 }
 
+fn io_for_storage_error(error: StorageError) -> io::Error {
+    match error {
+        StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
+            io::Error::from_raw_os_error(libc::ENOSPC)
+        }
+        StorageError::Io(error) => error,
+        error => io::Error::other(error),
+    }
+}
+
 fn shard_name(hash: ChunkHash) -> String {
     hex_name(hash.bytes())[..2].to_owned()
 }
@@ -189,10 +341,6 @@ fn hex_name(bytes: [u8; 32]) -> String {
         output[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
     });
     String::from_utf8(output.to_vec()).expect("hexadecimal bytes are valid UTF-8")
-}
-
-fn io_for_manifest(error: ManifestError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 #[derive(Debug)]

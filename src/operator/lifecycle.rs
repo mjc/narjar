@@ -10,8 +10,9 @@ use clap::{Args, Subcommand};
 use data_encoding::BASE64;
 use ed25519_dalek::SigningKey;
 use narjar::storage::{
-    Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY,
-    REALISATIONS_DIRECTORY, Storage, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+    CHUNK_DIRECTORY, Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY,
+    MANIFEST_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY, Storage, TEMPORARY_DIRECTORY,
+    VALIDATION_DIRECTORY,
 };
 
 use crate::error::Error;
@@ -53,6 +54,8 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
         VALIDATION_DIRECTORY,
         INGESTION_RECEIPT_DIRECTORY,
         EGRESS_RECEIPT_DIRECTORY,
+        CHUNK_DIRECTORY,
+        MANIFEST_DIRECTORY,
     ] {
         ensure_directory(&root.join(directory), 0o700)?;
     }
@@ -77,6 +80,8 @@ const INIT_ROOT_ENTRIES: &[&str] = &[
     ".narjar-clean",
     INGESTION_RECEIPT_DIRECTORY,
     EGRESS_RECEIPT_DIRECTORY,
+    CHUNK_DIRECTORY,
+    MANIFEST_DIRECTORY,
     ".narjar-recovery",
     ".narjar-transactions",
     VALIDATION_DIRECTORY,

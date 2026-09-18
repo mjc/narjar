@@ -20,8 +20,11 @@ use crate::object::{EncodedIdentity, NarFileName, NarHash, WireEncoding};
 use super::{
     EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY,
     TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+    chunk_store::{ChunkStoreError, ChunkingWriter},
+    chunked::{ChunkManifest, ChunkProfile},
     compression::{
         IngestionReceipt, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
+        receive_uploaded_nar,
     },
     directory::Directory,
     egress::CanonicalRawStatus,
@@ -48,6 +51,19 @@ use super::publication::{Layout, injected_fault};
 
 const MAX_CACHE_INFO_BYTES: u64 = 1024;
 pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
+
+#[allow(dead_code)]
+fn storage_error_for_chunk_store(error: ChunkStoreError) -> StorageError {
+    match error {
+        ChunkStoreError::Io(error) => StorageError::Io(error),
+        ChunkStoreError::Manifest(error) => {
+            StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
+        }
+        ChunkStoreError::NarHashMismatch { .. } | ChunkStoreError::NarSizeMismatch { .. } => {
+            StorageError::NarMismatch
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum TemporaryLocation {
@@ -477,6 +493,35 @@ impl Storage {
 
         let staging = self.reserve_staging(expected_length, policy.min_free_bytes)?;
         self.publish_nar_with_staging(name, source, expected_length, policy, staging)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn publish_chunked_nar(
+        &self,
+        name: NarFileName,
+        source: impl Read,
+        expected_length: u64,
+        policy: NarUploadPolicy,
+    ) -> Result<ChunkManifest, StorageError> {
+        if expected_length > policy.max_bytes {
+            return Err(StorageError::UploadTooLarge);
+        }
+        let reservation = self.empty_staging_reservation(policy.min_free_bytes)?;
+        let mut destination: ChunkingWriter<'_> = self.chunk_store.begin_ingest_with_reservation(
+            ChunkProfile::MinCdcHash4V1,
+            reservation,
+            policy.min_free_bytes,
+        );
+        let received = receive_uploaded_nar(
+            source,
+            name,
+            expected_length,
+            policy.max_bytes,
+            &mut destination,
+        )?;
+        destination
+            .finish(received.identity())
+            .map_err(storage_error_for_chunk_store)
     }
 
     pub fn publish_nar_with_staging(

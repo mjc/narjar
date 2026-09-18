@@ -42,6 +42,8 @@ pub const REALISATIONS_DIRECTORY: &str = "realisations";
 pub const VALIDATION_DIRECTORY: &str = ".narjar-validation";
 pub const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
 pub const EGRESS_RECEIPT_DIRECTORY: &str = ".narjar-egress";
+pub const CHUNK_DIRECTORY: &str = ".narjar-chunks";
+pub const MANIFEST_DIRECTORY: &str = ".narjar-manifests";
 
 #[cfg(test)]
 mod tests;

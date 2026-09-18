@@ -57,6 +57,36 @@ fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
     Storage::initialize(&Directory::open(path)?)
 }
 
+#[test]
+fn chunked_ingestion_publishes_a_verified_manifest() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let raw = vec![b'x'; 100_000];
+    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    let name = NarFileName::raw(hash);
+    let manifest = storage
+        .publish_chunked_nar(
+            name,
+            Cursor::new(&raw),
+            raw.len() as u64,
+            super::NarUploadPolicy::new(200_000, 0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        manifest.identity(),
+        NarIdentity::new(hash, (raw.len() as u64).into())
+    );
+    assert!(storage.chunk_store.open_manifest(hash).unwrap().is_some());
+    assert!(manifest.chunks().iter().all(|chunk| {
+        storage
+            .chunk_store
+            .open_chunk(chunk.hash())
+            .unwrap()
+            .is_some()
+    }));
+}
+
 fn compressed_bytes(encoding: NarEncoding, raw: &[u8]) -> Vec<u8> {
     match encoding {
         NarEncoding::Xz => {
