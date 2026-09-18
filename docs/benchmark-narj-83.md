@@ -28,6 +28,15 @@ cargo run --release -p narjar-nar-chunking --locked -- \
   --semantic-only
 ```
 
+The bounded materialization check used the first 100 sorted files:
+
+```console
+cargo run --release -p narjar-nar-chunking --locked -- \
+  --corpus /home/mjc/narjar-corpora/narjar-real-nix-v1 \
+  --max-files 100 \
+  --store-root /tmp/narj83-store-sample
+```
+
 The pinned experiment parameters are `mincdc = 0.1.0`, a 4 KiB minimum,
 12 KiB maximum, and 8 KiB fixed-size control. The recorded `mincdc` source is
 the Cargo.lock-selected release. `MinCdcHash4` uses the crate defaults;
@@ -65,3 +74,22 @@ blocked dependency. The raw rows do reconstruct exact bytes in the prototype
 tests.
 
 No production storage code was changed by this experiment.
+
+## Bounded file-backed store check
+
+The first 100 files contained 232,264,816 logical bytes and 29,357 raw
+MinCdcHash4 chunks. The research store wrote 27,909 unique chunk files and
+100 manifests:
+
+| Measure | Value |
+| --- | ---: |
+| Apparent bytes | 222,850,737 |
+| Allocated bytes | 92,177,408 |
+| Files | 28,009 |
+| Directories | 3 |
+| Full and 90%-resume ranges verified | 200 |
+
+The allocated-byte result is specific to the ZFS dataset and its compression;
+it is evidence that file-backed overhead can be measured, not a portable
+promise for the eventual storage layout. The prototype rejects non-contiguous
+or reordered manifests and verifies every chunk hash while serving a range.

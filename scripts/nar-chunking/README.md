@@ -10,6 +10,22 @@ cargo run --release -p narjar-nar-chunking -- \
   --corpus /home/mjc/narjar-corpora/narjar-real-nix-v1
 ```
 
+Materialize a bounded raw-store sample and verify full plus 90%-resume
+ranges with:
+
+```console
+cargo run --release -p narjar-nar-chunking -- \
+  --corpus /home/mjc/narjar-corpora/narjar-real-nix-v1 \
+  --max-files 100 \
+  --store-root /tmp/narj83-store-sample
+```
+
+`--store-root` refuses an unbounded run and refuses a non-empty destination.
+It uses the selected raw `MinCdcHash4` policy, writes binary manifests and
+content-addressed chunks, verifies existing duplicate chunks, and reports
+apparent bytes, allocated bytes, and file/directory counts. It is an
+experiment store, not Narjar production storage.
+
 The command walks `.nar` files in sorted path order and prints one stable
 `key=value` record for each control:
 

@@ -1,4 +1,10 @@
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use mincdc::{Cdc, MinCdc4, MinCdcHash4, ReadChunker};
 use sha2::{Digest, Sha256};
@@ -71,6 +77,44 @@ pub struct ChunkManifest {
     chunks: Vec<ChunkDescriptor>,
 }
 
+const MANIFEST_MAGIC: &[u8] = b"NARJ83M\0";
+
+/// A file-backed store used only by the NARJ-83 experiment.
+pub struct ResearchChunkStore {
+    root: PathBuf,
+}
+
+/// On-disk usage for a [`ResearchChunkStore`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StoreUsage {
+    files: u64,
+    directories: u64,
+    apparent_bytes: u64,
+    allocated_bytes: u64,
+}
+
+impl StoreUsage {
+    #[must_use]
+    pub const fn files(self) -> u64 {
+        self.files
+    }
+
+    #[must_use]
+    pub const fn directories(self) -> u64 {
+        self.directories
+    }
+
+    #[must_use]
+    pub const fn apparent_bytes(self) -> u64 {
+        self.apparent_bytes
+    }
+
+    #[must_use]
+    pub const fn allocated_bytes(self) -> u64 {
+        self.allocated_bytes
+    }
+}
+
 impl ChunkManifest {
     #[must_use]
     pub const fn total_size(&self) -> u64 {
@@ -80,6 +124,204 @@ impl ChunkManifest {
     #[must_use]
     pub fn chunks(&self) -> &[ChunkDescriptor] {
         &self.chunks
+    }
+}
+
+impl ResearchChunkStore {
+    /// Creates the experiment store layout without deleting existing data.
+    pub fn create(root: impl Into<PathBuf>) -> io::Result<Self> {
+        let root = root.into();
+        if root.exists() && fs::read_dir(&root)?.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "research chunk store root must be empty",
+            ));
+        }
+        fs::create_dir_all(root.join("chunks"))?;
+        fs::create_dir_all(root.join("manifests"))?;
+        Ok(Self { root })
+    }
+
+    /// Stores one content-addressed chunk, verifying an existing duplicate.
+    pub fn store_chunk(&self, descriptor: ChunkDescriptor, bytes: &[u8]) -> io::Result<()> {
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        if descriptor.size != u64::try_from(bytes.len()).expect("slice length fits in u64")
+            || descriptor.sha256 != digest
+        {
+            return Err(invalid_chunk("descriptor does not match chunk bytes"));
+        }
+        let path = self.chunk_path(descriptor.sha256);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => file.write_all(bytes),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = fs::read(path)?;
+                if existing == bytes {
+                    Ok(())
+                } else {
+                    Err(invalid_chunk(
+                        "existing chunk differs from its content hash",
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Writes an ordered binary manifest for one input file.
+    pub fn store_manifest(&self, index: u64, manifest: &ChunkManifest) -> io::Result<()> {
+        let mut file = File::create(self.manifest_path(index))?;
+        file.write_all(MANIFEST_MAGIC)?;
+        file.write_all(&manifest.total_size.to_le_bytes())?;
+        file.write_all(
+            &u64::try_from(manifest.chunks.len())
+                .expect("manifest chunk count fits in u64")
+                .to_le_bytes(),
+        )?;
+        for chunk in &manifest.chunks {
+            file.write_all(&chunk.offset.to_le_bytes())?;
+            file.write_all(&chunk.size.to_le_bytes())?;
+            file.write_all(&chunk.sha256)?;
+        }
+        Ok(())
+    }
+
+    /// Hashes the exact bytes selected by a logical range in a manifest.
+    pub fn hash_range(&self, manifest: &ChunkManifest, range: Range<u64>) -> io::Result<[u8; 32]> {
+        validate_range(manifest, &range)?;
+        let mut writer = DigestWriter(Sha256::new());
+        self.write_range(manifest, range, &mut writer)?;
+        Ok(writer.0.finalize().into())
+    }
+
+    /// Writes the exact bytes selected by a logical range in a manifest.
+    pub fn write_range<W: Write>(
+        &self,
+        manifest: &ChunkManifest,
+        range: Range<u64>,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        validate_range(manifest, &range)?;
+        for chunk in &manifest.chunks {
+            let chunk_end = chunk
+                .offset
+                .checked_add(chunk.size)
+                .ok_or_else(|| invalid_chunk("chunk range overflows u64"))?;
+            let write_start = range.start.max(chunk.offset);
+            let write_end = range.end.min(chunk_end);
+            if write_start >= write_end {
+                continue;
+            }
+            let bytes = fs::read(self.chunk_path(chunk.sha256))?;
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            if bytes.len() != usize::try_from(chunk.size).expect("chunk size fits in usize")
+                || digest != chunk.sha256
+            {
+                return Err(invalid_chunk("stored chunk failed descriptor verification"));
+            }
+            let start = usize::try_from(write_start - chunk.offset).expect("range fits usize");
+            let end = usize::try_from(write_end - chunk.offset).expect("range fits usize");
+            writer.write_all(&bytes[start..end])?;
+        }
+        Ok(())
+    }
+
+    /// Measures apparent and allocated bytes under the experiment root.
+    pub fn usage(&self) -> io::Result<StoreUsage> {
+        measure_store_usage(&self.root)
+    }
+
+    fn chunk_path(&self, digest: [u8; 32]) -> PathBuf {
+        self.root.join("chunks").join(hex_digest(digest))
+    }
+
+    fn manifest_path(&self, index: u64) -> PathBuf {
+        self.root.join("manifests").join(format!("{index:020}.bin"))
+    }
+}
+
+fn validate_range(manifest: &ChunkManifest, range: &Range<u64>) -> io::Result<()> {
+    validate_manifest(manifest)?;
+    if range.start > range.end || range.end > manifest.total_size {
+        return Err(invalid_chunk("range is outside the manifest"));
+    }
+    Ok(())
+}
+
+fn validate_manifest(manifest: &ChunkManifest) -> io::Result<()> {
+    let mut expected_offset = 0;
+    for chunk in &manifest.chunks {
+        if chunk.offset != expected_offset {
+            return Err(invalid_chunk(
+                "manifest chunks are not ordered and contiguous",
+            ));
+        }
+        expected_offset = chunk
+            .offset
+            .checked_add(chunk.size)
+            .ok_or_else(|| invalid_chunk("manifest chunk range overflows u64"))?;
+    }
+    if expected_offset != manifest.total_size {
+        return Err(invalid_chunk(
+            "manifest total size does not match its chunks",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_chunk(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn measure_store_usage(root: &Path) -> io::Result<StoreUsage> {
+    fs::metadata(root)?;
+    let mut usage = StoreUsage {
+        directories: 1,
+        ..StoreUsage::default()
+    };
+    measure_store_usage_recursively(root, &mut usage)?;
+    Ok(usage)
+}
+
+fn measure_store_usage_recursively(directory: &Path, usage: &mut StoreUsage) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            usage.directories += 1;
+            measure_store_usage_recursively(&entry.path(), usage)?;
+        } else if metadata.is_file() {
+            usage.files += 1;
+            usage.apparent_bytes += metadata.len();
+            usage.allocated_bytes += allocated_bytes(&metadata);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
+}
+
+struct DigestWriter(Sha256);
+
+impl Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -148,9 +390,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::fs;
     use std::io::{self, Read};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{ChunkAlgorithm, ChunkManifest, ChunkParameters, chunk_reader};
+    use super::{ChunkAlgorithm, ChunkManifest, ChunkParameters, ResearchChunkStore, chunk_reader};
 
     struct FixedReadSize<'a> {
         bytes: &'a [u8],
@@ -289,5 +534,66 @@ mod tests {
                 (28847, 3921),
             ]
         );
+    }
+
+    #[test]
+    fn research_store_reconstructs_full_and_resumed_ranges() {
+        let root = std::env::temp_dir().join(format!(
+            "narj83-store-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        ));
+        let store = ResearchChunkStore::create(&root).expect("store should be created");
+        let input = test_input();
+        let manifest = chunk_reader(
+            input.as_slice(),
+            ChunkParameters::eight_kibibyte_window(),
+            ChunkAlgorithm::MinCdcHash4,
+            |descriptor, chunk| store.store_chunk(descriptor, chunk),
+        )
+        .expect("test input should be readable");
+        store
+            .store_manifest(0, &manifest)
+            .expect("manifest should be writable");
+
+        let mut reconstructed = Vec::new();
+        store
+            .write_range(&manifest, 0..manifest.total_size(), &mut reconstructed)
+            .expect("full range should be readable");
+        assert_eq!(reconstructed, input);
+
+        let resume_start = manifest.total_size() * 9 / 10;
+        let mut resumed = Vec::new();
+        store
+            .write_range(&manifest, resume_start..manifest.total_size(), &mut resumed)
+            .expect("resumed range should be readable");
+        assert_eq!(resumed, input[resume_start as usize..]);
+
+        let usage = store.usage().expect("store usage should be readable");
+        let unique_chunks = manifest
+            .chunks()
+            .iter()
+            .map(|chunk| (chunk.sha256(), chunk.size()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(usage.files(), unique_chunks.len() as u64 + 1);
+        assert_eq!(usage.directories(), 3);
+        let manifest_bytes = 8 + 8 + 8 + manifest.chunks().len() as u64 * (8 + 8 + 32);
+        assert_eq!(
+            usage.apparent_bytes(),
+            unique_chunks.values().sum::<u64>() + manifest_bytes
+        );
+        assert!(usage.allocated_bytes() > 0);
+
+        let mut reordered = manifest.clone();
+        reordered.chunks.swap(0, 1);
+        assert!(
+            store
+                .hash_range(&reordered, 0..reordered.total_size())
+                .is_err()
+        );
+        fs::remove_dir_all(root).expect("test store should be removable");
     }
 }

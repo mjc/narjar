@@ -2,13 +2,16 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mincdc::{Cdc, MinCdc4, MinCdcHash4};
 use narjar::nar::{DecodeError, Decoder, Event, EventSink};
-use narjar_nar_chunking::{ChunkAlgorithm, ChunkParameters, chunk_reader};
+use narjar_nar_chunking::{
+    ChunkAlgorithm, ChunkManifest, ChunkParameters, ResearchChunkStore, StoreUsage, chunk_reader,
+};
 use sha2::{Digest, Sha256};
 
 const DEFAULT_FIXED_CHUNK_SIZE: usize = 8 * 1024;
@@ -45,6 +48,7 @@ struct CommandLine {
     fixed_size: usize,
     max_files: Option<usize>,
     semantic_only: bool,
+    store_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -158,6 +162,10 @@ fn main() -> io::Result<()> {
         let result = measure_strategy(&files, strategy, parameters, command_line.fixed_size)?;
         print_result(&result, command_line.fixed_size);
     }
+    if let Some(store_root) = command_line.store_root {
+        let result = measure_research_store(&files, &store_root, parameters)?;
+        print_store_result(&store_root, &result);
+    }
 
     Ok(())
 }
@@ -170,6 +178,7 @@ impl CommandLine {
         let mut fixed_size = DEFAULT_FIXED_CHUNK_SIZE;
         let mut max_files = None;
         let mut semantic_only = false;
+        let mut store_root = None;
 
         while let Some(argument) = arguments.next() {
             if argument == "--semantic-only" {
@@ -186,6 +195,7 @@ impl CommandLine {
                 "--max-size" => max_size = parse_usize(value, option)?,
                 "--fixed-size" => fixed_size = parse_usize(value, option)?,
                 "--max-files" => max_files = Some(parse_usize(value, option)?),
+                "--store-root" => store_root = Some(parse_path(value, option)?),
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -195,6 +205,16 @@ impl CommandLine {
         }
 
         let corpus = corpus.ok_or_else(|| invalid_argument("--corpus is required"))?;
+        if store_root.is_some() && max_files.is_none() {
+            return Err(invalid_argument(
+                "--store-root requires --max-files to keep materialization bounded",
+            ));
+        }
+        if store_root.is_some() && semantic_only {
+            return Err(invalid_argument(
+                "--store-root models raw MinCdcHash4; omit --semantic-only",
+            ));
+        }
         if min_size == 0 || min_size > max_size || fixed_size == 0 {
             return Err(invalid_argument(
                 "chunk sizes must be nonzero and min-size must not exceed max-size",
@@ -207,6 +227,7 @@ impl CommandLine {
             fixed_size,
             max_files,
             semantic_only,
+            store_root,
         })
     }
 }
@@ -230,7 +251,7 @@ fn invalid_argument(message: impl Into<String>) -> io::Error {
 
 fn print_help() {
     println!(
-        "Usage: narjar-nar-chunking --corpus PATH [--min-size BYTES] [--max-size BYTES] [--fixed-size BYTES] [--max-files COUNT] [--semantic-only]\n\nMeasures raw and semantic MinCDC, fixed-size, and whole-file CAS controls over sorted .nar files."
+        "Usage: narjar-nar-chunking --corpus PATH [--min-size BYTES] [--max-size BYTES] [--fixed-size BYTES] [--max-files COUNT] [--semantic-only] [--store-root PATH]\n\nMeasures raw and semantic MinCDC, fixed-size, and whole-file CAS controls over sorted .nar files. --store-root materializes a bounded raw MinCdcHash4 sample."
     );
 }
 
@@ -496,6 +517,120 @@ fn measure_whole_file_cas(files: &[PathBuf]) -> io::Result<ChunkMeasurements> {
         measurements.record_whole_file(hasher.finalize().into(), file_size);
     }
     Ok(measurements)
+}
+
+#[derive(Debug)]
+struct ResearchStoreResult {
+    files: u64,
+    logical_bytes: u64,
+    chunks: u64,
+    verified_ranges: u64,
+    usage: StoreUsage,
+}
+
+fn measure_research_store(
+    files: &[PathBuf],
+    root: &Path,
+    parameters: ChunkParameters,
+) -> io::Result<ResearchStoreResult> {
+    let store = ResearchChunkStore::create(root)?;
+    let mut logical_bytes = 0;
+    let mut chunks = 0;
+    let mut verified_ranges = 0;
+    for (index, path) in files.iter().enumerate() {
+        let expected_size = fs::metadata(path)?.len();
+        let manifest = chunk_reader(
+            File::open(path)?,
+            parameters,
+            ChunkAlgorithm::MinCdcHash4,
+            |descriptor, chunk| store.store_chunk(descriptor, chunk),
+        )?;
+        if manifest.total_size() != expected_size {
+            return Err(invalid_data(format!(
+                "{}: manifest size {} differs from file size {expected_size}",
+                path.display(),
+                manifest.total_size(),
+            )));
+        }
+        store.store_manifest(index as u64, &manifest)?;
+        verified_ranges += verify_stored_ranges(path, &store, &manifest)?;
+        logical_bytes += manifest.total_size();
+        chunks += manifest.chunks().len() as u64;
+    }
+    Ok(ResearchStoreResult {
+        files: files.len() as u64,
+        logical_bytes,
+        chunks,
+        verified_ranges,
+        usage: store.usage()?,
+    })
+}
+
+fn verify_stored_ranges(
+    path: &Path,
+    store: &ResearchChunkStore,
+    manifest: &ChunkManifest,
+) -> io::Result<u64> {
+    let full_range = 0..manifest.total_size();
+    verify_stored_range(path, store, manifest, full_range.clone())?;
+    let resume_start = manifest.total_size().saturating_mul(9) / 10;
+    verify_stored_range(path, store, manifest, resume_start..manifest.total_size())?;
+    Ok(2)
+}
+
+fn verify_stored_range(
+    path: &Path,
+    store: &ResearchChunkStore,
+    manifest: &ChunkManifest,
+    range: Range<u64>,
+) -> io::Result<()> {
+    let expected = hash_file_range(path, range.clone())?;
+    let actual = store.hash_range(manifest, range)?;
+    if expected != actual {
+        return Err(invalid_data(format!(
+            "{}: reconstructed range hash differs from source",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn hash_file_range(path: &Path, range: Range<u64>) -> io::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(range.start))?;
+    let mut remaining = range.end - range.start;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    while remaining > 0 {
+        let requested = remaining.min(buffer.len() as u64) as usize;
+        let bytes_read = file.read(&mut buffer[..requested])?;
+        if bytes_read == 0 {
+            return Err(invalid_data(format!(
+                "{}: source ended before requested range",
+                path.display()
+            )));
+        }
+        hasher.update(&buffer[..bytes_read]);
+        remaining -= bytes_read as u64;
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn print_store_result(root: &Path, result: &ResearchStoreResult) {
+    let chunk_files = result.usage.files().saturating_sub(result.files);
+    println!(
+        "store_root={} store_files={} store_chunk_files={} store_manifest_files={} store_directories={} logical_bytes={} chunks={} apparent_bytes={} allocated_bytes={} verified_ranges={}",
+        root.display(),
+        result.usage.files(),
+        chunk_files,
+        result.files,
+        result.usage.directories(),
+        result.logical_bytes,
+        result.chunks,
+        result.usage.apparent_bytes(),
+        result.usage.allocated_bytes(),
+        result.verified_ranges,
+    );
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
