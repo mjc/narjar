@@ -55,6 +55,7 @@ crash_server() {
 
 temp_root=$(mktemp -d "${TMPDIR:-/tmp}/narjar-nix-e2e.XXXXXX")
 temp_root=$(cd "$temp_root" && pwd -P)
+export XDG_CACHE_HOME="$temp_root/nix-cache"
 cleanup() {
   stop_server
   rm -rf -- "$temp_root"
@@ -71,8 +72,10 @@ wrong_secret_key="$temp_root/wrong-secret-key"
 wrong_public_key="$temp_root/wrong-public-key"
 
 start_server() {
+  local egress_compression=${1:-none}
   : > "$server_stdout"
   run narjar serve --data-dir "$data_dir" --listen 127.0.0.1:0 \
+    --egress-compression "$egress_compression" \
     >"$server_stdout" 2>>"$server_log" &
   server_pid=$!
 
@@ -103,7 +106,8 @@ build_path() {
   local build_nonce="$2-$1"
   # The single-quoted expression is expanded by Nix, not Bash.
   # shellcheck disable=SC2016
-  NARJAR_E2E_BUILD_NONCE="$build_nonce" run nix-build --impure --no-out-link --expr 'let
+  run env NIX_CONFIG="secret-key-files = $secret_key" \
+    NARJAR_E2E_BUILD_NONCE="$build_nonce" nix-build --impure --no-out-link --expr 'let
       nonce = builtins.getEnv "NARJAR_E2E_BUILD_NONCE";
     in
     derivation {
@@ -120,7 +124,9 @@ build_referencing_path() {
   local label=$2
   local build_nonce="$label-$nonce"
   # shellcheck disable=SC2016
-  NARJAR_E2E_BUILD_NONCE="$build_nonce" NARJAR_E2E_REFERENCE="$base" run nix-build --impure --no-out-link --expr 'let
+  run env NIX_CONFIG="secret-key-files = $secret_key" \
+    NARJAR_E2E_BUILD_NONCE="$build_nonce" NARJAR_E2E_REFERENCE="$base" \
+    nix-build --impure --no-out-link --expr 'let
       nonce = builtins.getEnv "NARJAR_E2E_BUILD_NONCE";
       reference = builtins.storePath (builtins.getEnv "NARJAR_E2E_REFERENCE");
     in
@@ -191,6 +197,28 @@ nar_url_for() {
     cut -d ' ' -f 2
 }
 
+exercise_compression_pair() {
+  local description=$1
+  local input_compression=$2
+  local expected_suffix=$3
+  scenario "$description"
+  local path
+  path=$(build_path "${description// /-}" "$nonce")
+  sign_path "$path"
+  native_push_with_compression "$input_compression" "$path"
+  local output_name=${expected_suffix#.nar}
+  output_name=${output_name#.}
+  [[ -n "$output_name" ]] || output_name=raw
+  local destination="$temp_root/${input_compression}-to-$output_name.store"
+  substitute "$destination" "$trusted_key" "$path"
+  expect_file "$destination$path"
+  run cmp "$path" "$destination$path"
+  local nar_url
+  nar_url=$(nar_url_for "$path")
+  [[ "$nar_url" == *"$expected_suffix" ]] ||
+    fail "$description produced an unexpected URL: $nar_url"
+}
+
 http_status() {
   run curl --silent --output /dev/null --write-out '%{http_code}' \
     --netrc-file "$netrc" "$1"
@@ -231,7 +259,7 @@ umask 077
 printf 'machine 127.0.0.1\nlogin narjar\npassword %s\n' "$token" > "$netrc"
 run chmod 0600 "$netrc"
 
-start_server
+start_server none
 
 scenario 'isolated destination, native push, substitution, content'
 primary_path=$(build_path primary "$nonce")
@@ -375,10 +403,12 @@ if substitute "$corrupt_root" "$trusted_key" "$primary_path"   >"$temp_root/corr
 fi
 run mv "$temp_root/primary.nar.backup" "$primary_nar_file"
 
-scenario 'default xz compression is accepted'
+scenario 'raw input is served as XZ through the same cache URL'
+stop_server
+start_server xz
 default_path=$(build_path default-compression "$nonce")
 sign_path "$default_path"
-native_push_with_compression xz "$default_path"
+native_push_with_compression none "$default_path"
 default_root="$temp_root/default-store"
 substitute "$default_root" "$trusted_key" "$default_path"
 expect_file "$default_root$default_path"
@@ -404,10 +434,12 @@ default_corrupt_status=$(run curl --silent --show-error --netrc-file "$netrc" \
   fail "truncated XZ upload returned HTTP $default_corrupt_status"
 expect_missing "$data_dir/$default_corrupt_url"
 
-scenario 'zstd compression is accepted'
+scenario 'raw input is served as Zstd through the same cache URL'
+stop_server
+start_server zstd
 zstd_path=$(build_path zstd-compression "$nonce")
 sign_path "$zstd_path"
-native_push_with_compression zstd "$zstd_path"
+native_push_with_compression none "$zstd_path"
 zstd_root="$temp_root/zstd-store"
 run nix_cli copy --refresh --option netrc-file "$netrc" \
   --option require-sigs true \
@@ -442,6 +474,45 @@ run nix_cli store verify --store "local?root=$zstd_root" \
   --sigs-needed 1 \
   --option trusted-public-keys "$trusted_key" \
   "$zstd_path"
+
+scenario 'XZ input is served as raw through the same cache URL'
+stop_server
+start_server none
+xz_input_path=$(build_path xz-input "$nonce")
+sign_path "$xz_input_path"
+native_push_with_compression xz "$xz_input_path"
+xz_input_root="$temp_root/xz-input-store"
+substitute "$xz_input_root" "$trusted_key" "$xz_input_path"
+expect_file "$xz_input_root$xz_input_path"
+run cmp "$xz_input_path" "$xz_input_root$xz_input_path"
+xz_input_nar_url=$(nar_url_for "$xz_input_path")
+[[ "$xz_input_nar_url" == *.nar ]] ||
+  fail "XZ input did not produce a raw URL: $xz_input_nar_url"
+
+scenario 'Zstd input is served as raw through the same cache URL'
+zstd_input_path=$(build_path zstd-input "$nonce")
+sign_path "$zstd_input_path"
+native_push_with_compression zstd "$zstd_input_path"
+zstd_input_root="$temp_root/zstd-input-store"
+substitute "$zstd_input_root" "$trusted_key" "$zstd_input_path"
+expect_file "$zstd_input_root$zstd_input_path"
+run cmp "$zstd_input_path" "$zstd_input_root$zstd_input_path"
+zstd_input_nar_url=$(nar_url_for "$zstd_input_path")
+[[ "$zstd_input_nar_url" == *.nar ]] ||
+  fail "zstd input did not produce a raw URL: $zstd_input_nar_url"
+
+stop_server
+start_server xz
+exercise_compression_pair 'XZ input is served as XZ' xz .nar.xz
+exercise_compression_pair 'Zstd input is served as XZ' zstd .nar.xz
+
+stop_server
+start_server zstd
+exercise_compression_pair 'XZ input is served as Zstd' xz .nar.zst
+exercise_compression_pair 'Zstd input is served as Zstd' zstd .nar.zst
+
+stop_server
+start_server none
 
 scenario 'offline GC retains a protected real-Nix closure'
 gc_base=$(build_path gc-base "$nonce")
