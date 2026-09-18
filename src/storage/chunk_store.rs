@@ -18,14 +18,16 @@ use super::{
         MANIFEST_RECORD_BYTES, ManifestError, ManifestReader, write_manifest_header,
     },
     fs::{
-        ensure_directory_at, files_equal_at, hard_link_at, open_at, open_regular_at,
-        read_dir_names, unlink_at,
+        ensure_directory_at, files_equal_at, hard_link_at, open_at, open_directory_at,
+        open_regular_at, read_dir_names, unlink_at,
     },
     publication::{StagingReservation, StorageError},
 };
 
 const CHUNK_TEMP_PREFIX: &str = "chunk";
 const MANIFEST_TEMP_PREFIX: &str = "manifest";
+const GC_MARK_DIRECTORY: &str = ".gc-marks";
+const GC_MANIFEST_MARK_DIRECTORY: &str = "manifests";
 pub(crate) const MAX_CHUNK_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -34,6 +36,12 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct ChunkStore {
     chunks: File,
     manifests: File,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChunkSweepReport {
+    pub(crate) deleted_manifests: usize,
+    pub(crate) deleted_chunks: usize,
 }
 
 impl ChunkStore {
@@ -175,6 +183,131 @@ impl ChunkStore {
         let mut reader = self.open_reader(hash, range, max_manifest_bytes)?;
         io::copy(&mut reader, destination)?;
         Ok(())
+    }
+
+    pub(crate) fn sweep_unreachable<I>(
+        &self,
+        live_manifests: I,
+    ) -> Result<ChunkSweepReport, ChunkStoreError>
+    where
+        I: IntoIterator<Item = NarHash>,
+    {
+        let marks = self.prepare_gc_marks()?;
+        let result = (|| {
+            live_manifests
+                .into_iter()
+                .try_for_each(|hash| self.mark_live_manifest(&marks, hash))?;
+            let manifests = self.delete_unmarked_manifests(&marks)?;
+            let chunks = self.delete_unmarked_chunks(&marks)?;
+            Ok(ChunkSweepReport {
+                deleted_manifests: manifests.deleted_manifests,
+                deleted_chunks: chunks.deleted_chunks,
+            })
+        })();
+        let cleanup = clear_gc_mark_files(&marks);
+        match (result, cleanup) {
+            (Ok(report), Ok(())) => Ok(report),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
+    }
+
+    fn prepare_gc_marks(&self) -> Result<File, ChunkStoreError> {
+        let marks = ensure_directory_at(
+            &self.chunks,
+            OsStr::new(GC_MARK_DIRECTORY),
+            "chunk GC mark directory",
+        )?;
+        clear_gc_mark_files(&marks)?;
+        ensure_directory_at(
+            &marks,
+            OsStr::new(GC_MANIFEST_MARK_DIRECTORY),
+            "manifest GC mark directory",
+        )?;
+        Ok(marks)
+    }
+
+    fn mark_live_manifest(&self, marks: &File, hash: NarHash) -> Result<(), ChunkStoreError> {
+        let manifest_marks = open_directory_at(marks, OsStr::new(GC_MANIFEST_MARK_DIRECTORY))?;
+        mark_gc_file(&manifest_marks, &manifest_name(hash))?;
+        let manifest_file = self
+            .open_manifest(hash)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let mut reader = ManifestReader::new(manifest_file, MAX_CHUNK_MANIFEST_BYTES)?;
+        while let Some(record) = reader.next_record()? {
+            self.mark_live_chunk(marks, record.hash())?;
+        }
+        reader.finish_remaining()?;
+        Ok(())
+    }
+
+    fn mark_live_chunk(&self, marks: &File, hash: ChunkHash) -> io::Result<()> {
+        let shard =
+            ensure_directory_at(marks, OsStr::new(&shard_name(hash)), "chunk GC mark shard")?;
+        mark_gc_file(&shard, &chunk_name(hash))
+    }
+
+    fn delete_unmarked_manifests(&self, marks: &File) -> Result<ChunkSweepReport, ChunkStoreError> {
+        let manifest_marks = open_directory_at(marks, OsStr::new(GC_MANIFEST_MARK_DIRECTORY))?;
+        let deleted_manifests =
+            read_dir_names(&self.manifests)?
+                .into_iter()
+                .try_fold(0, |deleted, name| {
+                    if !is_manifest_name(&name)
+                        || !super::fs::entry_is_regular_at(&self.manifests, &name)?
+                        || gc_marker_exists(&manifest_marks, &name)?
+                    {
+                        return Ok::<_, io::Error>(deleted);
+                    }
+                    unlink_at(&self.manifests, &name)?;
+                    Ok(deleted + 1)
+                })?;
+        if deleted_manifests > 0 {
+            self.manifests.sync_all()?;
+        }
+        Ok(ChunkSweepReport {
+            deleted_manifests,
+            deleted_chunks: 0,
+        })
+    }
+
+    fn delete_unmarked_chunks(&self, marks: &File) -> Result<ChunkSweepReport, ChunkStoreError> {
+        let deleted_chunks = read_dir_names(&self.chunks)?
+            .into_iter()
+            .filter(|name| is_chunk_shard_name(name))
+            .try_fold(0, |deleted, shard_name| {
+                let shard = open_directory_at(&self.chunks, &shard_name)?;
+                let marked_shard = match open_directory_at(marks, &shard_name) {
+                    Ok(directory) => Some(directory),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                };
+                let deleted_from_shard = read_dir_names(&shard)?.into_iter().try_fold(
+                    0,
+                    |deleted_from_shard, name| {
+                        if !is_chunk_name(&name) || !super::fs::entry_is_regular_at(&shard, &name)?
+                        {
+                            return Ok::<_, io::Error>(deleted_from_shard);
+                        }
+                        let marked = marked_shard
+                            .as_ref()
+                            .map_or(Ok(false), |directory| gc_marker_exists(directory, &name))?;
+                        if marked {
+                            return Ok(deleted_from_shard);
+                        }
+                        unlink_at(&shard, &name)?;
+                        Ok(deleted_from_shard + 1)
+                    },
+                )?;
+                if deleted_from_shard > 0 {
+                    shard.sync_all()?;
+                }
+                Ok(deleted + deleted_from_shard)
+            })?;
+        Ok(ChunkSweepReport {
+            deleted_manifests: 0,
+            deleted_chunks,
+        })
     }
 
     fn store_chunk(&self, hash: ChunkHash, bytes: &[u8]) -> io::Result<()> {
@@ -664,6 +797,54 @@ fn temporary_name(prefix: &str) -> OsString {
     .into()
 }
 
+fn mark_gc_file(directory: &File, name: &OsStr) -> io::Result<()> {
+    match open_at(
+        directory,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    ) {
+        Ok(_file) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn gc_marker_exists(directory: &File, name: &OsStr) -> io::Result<bool> {
+    match super::fs::entry_is_regular_at(directory, name) {
+        Ok(exists) => Ok(exists),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn clear_gc_mark_files(directory: &File) -> io::Result<()> {
+    read_dir_names(directory)?.into_iter().try_for_each(|name| {
+        match open_directory_at(directory, &name) {
+            Ok(child) => clear_gc_mark_files(&child),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotADirectory
+                    || error.kind() == io::ErrorKind::InvalidData =>
+            {
+                unlink_at(directory, &name)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    })
+}
+
+fn is_manifest_name(name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_suffix(".manifest"))
+        .is_some_and(|hash| NarHash::parse(hash).is_ok())
+}
+
+fn is_chunk_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 fn remove_abandoned_manifest_temps(directory: &File) -> io::Result<()> {
     let removed = read_dir_names(directory)?
         .into_iter()
@@ -916,6 +1097,38 @@ mod tests {
             .unwrap();
         let mut output = Vec::new();
         assert!(reader.read_to_end(&mut output).is_err());
+    }
+
+    #[test]
+    fn sweep_keeps_live_manifest_chunks_and_removes_unreachable_objects() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let first = vec![b'a'; 100_000];
+        let second = vec![b'b'; 100_000];
+        let first_hash = NarHash::from_digest(Sha256::digest(&first).into());
+        let second_hash = NarHash::from_digest(Sha256::digest(&second).into());
+
+        store
+            .store_nar(
+                Cursor::new(&first),
+                NarIdentity::new(first_hash, (first.len() as u64).into()),
+                ChunkProfile::MinCdcHash4V1,
+            )
+            .unwrap();
+        store
+            .store_nar(
+                Cursor::new(&second),
+                NarIdentity::new(second_hash, (second.len() as u64).into()),
+                ChunkProfile::MinCdcHash4V1,
+            )
+            .unwrap();
+
+        let report = store.sweep_unreachable([first_hash]).unwrap();
+        assert_eq!(report.deleted_manifests, 1);
+        assert!(report.deleted_chunks > 0);
+        assert!(store.open_manifest(first_hash).unwrap().is_some());
+        assert!(store.open_manifest(second_hash).unwrap().is_none());
     }
 
     #[test]
