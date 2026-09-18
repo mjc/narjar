@@ -764,8 +764,23 @@ fn print_result(result: &MeasurementResult, fixed_size: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChunkAlgorithm, ChunkMeasurements, ChunkParameters, Event, SemanticCdcSink};
+    use super::{
+        ChunkAlgorithm, ChunkMeasurements, ChunkParameters, CommandLine, Event, SemanticCdcSink,
+    };
     use narjar::nar::EventSink;
+
+    #[test]
+    fn command_line_defaults_to_the_selected_storage_window() {
+        let command_line = CommandLine::parse(
+            ["--corpus", "/tmp/narj83-corpus"]
+                .into_iter()
+                .map(String::from),
+        )
+        .expect("the minimum command line should parse");
+
+        assert_eq!(command_line.min_size, 8 * 1024);
+        assert_eq!(command_line.max_size, 24 * 1024);
+    }
 
     fn measure_segmented_file(input: &[u8], segment_size: usize) -> ChunkMeasurements {
         let mut measurements = ChunkMeasurements::default();
