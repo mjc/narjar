@@ -23,8 +23,11 @@ cargo run --release -p narjar-nar-chunking -- \
 `--store-root` refuses an unbounded run and refuses a non-empty destination.
 It uses the selected raw `MinCdcHash4` policy, writes binary manifests and
 content-addressed chunks, verifies existing duplicate chunks, and reports
-apparent bytes, allocated bytes, and file/directory counts. It is an
-experiment store, not Narjar production storage.
+apparent bytes, allocated bytes, and file/directory counts. Those are
+diagnostic measurements; the policy decision is based on the authoritative
+ZFS dataset `used` value after the complete store is materialized with the
+target ZFS compression property. Chunk payloads are not separately compressed
+by this prototype. It is an experiment store, not Narjar production storage.
 
 Run the fixed raw-Hash4 parameter sweep with:
 
@@ -57,9 +60,11 @@ by chunk payloads and `passthrough_bytes` is data retained outside the chunk
 store. `unique_bytes` is the sum of unique SHA-256-identified payloads.
 `manifest_bytes` accounts for an 8-byte per-input-file header plus either
 48-byte chunk descriptors (`offset`, `size`, digest) or 40-byte whole-file
-descriptors (`size`, digest). `physical_bytes` is their sum; filesystem
-allocation, indexes, and inode costs still need to be added to the experiment
-report separately. Store runs also report the bytes reconstructed by the full
+descriptors (`size`, digest). `physical_bytes` is their sum and is only a
+logical diagnostic; it excludes filesystem allocation, indexes, inode costs,
+and ZFS compression. The experiment report must separately record the
+post-materialization ZFS dataset `used` value, which is the storage-selection
+metric. Store runs also report the bytes reconstructed by the full
 and 90%-resume checks, their elapsed time, reconstruction throughput, and the
 Linux peak resident set (`VmHWM`). Those are cold research-store checks, not
 HTTP server latency measurements.

@@ -4,6 +4,16 @@ This is the first frozen-corpus measurement for the storage chunking
 prototype. It does not authorize or implement a production chunk store, alter
 NAR transport bytes, or change the Nix binary-cache protocol.
 
+The primary storage metric is authoritative ZFS dataset `used` after the
+candidate store has been fully materialized with the target ZFS compression
+property. This captures the candidate representation and ZFS's actual block,
+metadata, and inode costs. This prototype writes uncompressed chunk payload
+files; there is no separate user-space chunk compressor in this measurement.
+If a future candidate adds one, its output must be measured again on ZFS—the
+logical sum is not a substitute. Logical sums, apparent file bytes, and the
+prototype's per-file allocation walk are diagnostic metrics only; they do not
+choose the policy.
+
 ## Reproduction
 
 Corpus:
@@ -45,7 +55,10 @@ the Cargo.lock-selected release. `MinCdcHash4` uses the crate defaults;
 ## Results
 
 The physical estimate is unique payload bytes plus manifest bytes. It does
-not include filesystem allocation, inode/index overhead, or a serving cache.
+not include filesystem allocation, inode/index overhead, or a serving cache,
+so it is not the policy-selection metric. Policy selection requires a fully
+materialized store and a ZFS `used` measurement with the intended compression
+property.
 
 | Strategy | Logical bytes | Chunks | Unique chunks | Unique bytes | Manifest bytes | Estimated physical bytes | Elapsed | Throughput |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -120,8 +133,10 @@ hash verification and is not an HTTP TTFB or network-serving measurement.
 
 The allocated-byte result is specific to the ZFS dataset and its compression;
 it is evidence that file-backed overhead can be measured, not a portable
-promise for the eventual storage layout. The prototype rejects non-contiguous
-or reordered manifests and verifies every chunk hash while serving a range.
+promise for the eventual storage layout. For this decision, the authoritative
+number is the ZFS dataset `used` value after materialization, including ZFS
+compression and filesystem metadata. The prototype rejects non-contiguous or
+reordered manifests and verifies every chunk hash while serving a range.
 
 The full-corpus physical result above uses ZFS `used`, not the prototype's
 per-file `allocated_bytes` sum. The latter was 23,975,770,624 bytes; ZFS
