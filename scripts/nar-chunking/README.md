@@ -59,7 +59,10 @@ store. `unique_bytes` is the sum of unique SHA-256-identified payloads.
 48-byte chunk descriptors (`offset`, `size`, digest) or 40-byte whole-file
 descriptors (`size`, digest). `physical_bytes` is their sum; filesystem
 allocation, indexes, and inode costs still need to be added to the experiment
-report separately.
+report separately. Store runs also report the bytes reconstructed by the full
+and 90%-resume checks, their elapsed time, reconstruction throughput, and the
+Linux peak resident set (`VmHWM`). Those are cold research-store checks, not
+HTTP server latency measurements.
 
 Use `--max-files` for a bounded smoke run. The default raw MinCDC parameters
 are the selected fixed 8–24 KiB window and are part of the experiment identity.

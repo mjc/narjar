@@ -112,6 +112,12 @@ MinCdcHash4 chunks. The research store wrote 27,909 unique chunk files and
 | Directories | 3 |
 | Full and 90%-resume ranges verified | 200 |
 
+The selected 8–24 KiB policy was rerun on the same 100-file sample with
+range timing enabled. It reconstructed 255,491,335 bytes across those 200
+ranges in 877 ms (277.83 MiB/s), with a 10,309,632-byte peak RSS. This is a
+cold research-store reconstruction measurement; it includes source and chunk
+hash verification and is not an HTTP TTFB or network-serving measurement.
+
 The allocated-byte result is specific to the ZFS dataset and its compression;
 it is evidence that file-backed overhead can be measured, not a portable
 promise for the eventual storage layout. The prototype rejects non-contiguous
@@ -121,3 +127,8 @@ The full-corpus physical result above uses ZFS `used`, not the prototype's
 per-file `allocated_bytes` sum. The latter was 23,975,770,624 bytes; ZFS
 `used` also includes dataset-level metadata and is therefore the authoritative
 on-disk measurement for this experiment.
+
+The store command also reports reconstructed range bytes, range verification
+time and throughput, and Linux peak RSS. These measurements are deliberately
+kept separate from HTTP serving TTFB: the prototype has no production HTTP
+chunk route, so it cannot claim a network-serving result.

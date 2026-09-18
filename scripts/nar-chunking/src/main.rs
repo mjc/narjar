@@ -614,6 +614,9 @@ struct ResearchStoreResult {
     logical_bytes: u64,
     chunks: u64,
     verified_ranges: u64,
+    verified_range_bytes: u64,
+    range_elapsed: Duration,
+    peak_rss_bytes: Option<u64>,
     usage: StoreUsage,
 }
 
@@ -626,6 +629,8 @@ fn measure_research_store(
     let mut logical_bytes = 0;
     let mut chunks = 0;
     let mut verified_ranges = 0;
+    let mut verified_range_bytes = 0;
+    let mut range_elapsed = Duration::ZERO;
     for (index, path) in files.iter().enumerate() {
         let expected_size = fs::metadata(path)?.len();
         let manifest = chunk_reader(
@@ -642,7 +647,11 @@ fn measure_research_store(
             )));
         }
         store.store_manifest(index as u64, &manifest)?;
-        verified_ranges += verify_stored_ranges(path, &store, &manifest)?;
+        let verify_start = Instant::now();
+        let (ranges, bytes) = verify_stored_ranges(path, &store, &manifest)?;
+        range_elapsed += verify_start.elapsed();
+        verified_ranges += ranges;
+        verified_range_bytes += bytes;
         logical_bytes += manifest.total_size();
         chunks += manifest.chunks().len() as u64;
     }
@@ -651,6 +660,9 @@ fn measure_research_store(
         logical_bytes,
         chunks,
         verified_ranges,
+        verified_range_bytes,
+        range_elapsed,
+        peak_rss_bytes: peak_rss_bytes()?,
         usage: store.usage()?,
     })
 }
@@ -659,12 +671,13 @@ fn verify_stored_ranges(
     path: &Path,
     store: &ResearchChunkStore,
     manifest: &ChunkManifest,
-) -> io::Result<u64> {
+) -> io::Result<(u64, u64)> {
     let full_range = 0..manifest.total_size();
-    verify_stored_range(path, store, manifest, full_range.clone())?;
+    let full_bytes = verify_stored_range(path, store, manifest, full_range.clone())?;
     let resume_start = manifest.total_size().saturating_mul(9) / 10;
-    verify_stored_range(path, store, manifest, resume_start..manifest.total_size())?;
-    Ok(2)
+    let resume_bytes =
+        verify_stored_range(path, store, manifest, resume_start..manifest.total_size())?;
+    Ok((2, full_bytes + resume_bytes))
 }
 
 fn verify_stored_range(
@@ -672,7 +685,8 @@ fn verify_stored_range(
     store: &ResearchChunkStore,
     manifest: &ChunkManifest,
     range: Range<u64>,
-) -> io::Result<()> {
+) -> io::Result<u64> {
+    let range_bytes = range.end - range.start;
     let expected = hash_file_range(path, range.clone())?;
     let actual = store.hash_range(manifest, range)?;
     if expected != actual {
@@ -681,7 +695,33 @@ fn verify_stored_range(
             path.display()
         )));
     }
-    Ok(())
+    Ok(range_bytes)
+}
+
+fn peak_rss_bytes() -> io::Result<Option<u64>> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = fs::read_to_string("/proc/self/status")?;
+        let kibibytes = status.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name == "VmHWM")
+                .then(|| value.split_whitespace().next())
+                .flatten()
+                .and_then(|value| value.parse::<u64>().ok())
+        });
+        kibibytes
+            .map(|value| {
+                value
+                    .checked_mul(1024)
+                    .ok_or_else(|| invalid_data("RSS overflows u64"))
+            })
+            .transpose()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
 }
 
 fn hash_file_range(path: &Path, range: Range<u64>) -> io::Result<[u8; 32]> {
@@ -707,8 +747,17 @@ fn hash_file_range(path: &Path, range: Range<u64>) -> io::Result<[u8; 32]> {
 
 fn print_store_result(root: &Path, result: &ResearchStoreResult) {
     let chunk_files = result.usage.files().saturating_sub(result.files);
+    let range_throughput_mib_per_second = result
+        .range_elapsed
+        .as_millis()
+        .try_into()
+        .ok()
+        .filter(|millis: &u64| *millis > 0)
+        .map_or(0.0, |millis: u64| {
+            result.verified_range_bytes as f64 * 1000.0 / (millis as f64 * 1024.0 * 1024.0)
+        });
     println!(
-        "store_root={} store_files={} store_chunk_files={} store_manifest_files={} store_directories={} logical_bytes={} chunks={} apparent_bytes={} allocated_bytes={} verified_ranges={}",
+        "store_root={} store_files={} store_chunk_files={} store_manifest_files={} store_directories={} logical_bytes={} chunks={} apparent_bytes={} allocated_bytes={} verified_ranges={} verified_range_bytes={} range_elapsed_ms={} range_throughput_mib_s={range_throughput_mib_per_second:.2} peak_rss_bytes={}",
         root.display(),
         result.usage.files(),
         chunk_files,
@@ -719,6 +768,9 @@ fn print_store_result(root: &Path, result: &ResearchStoreResult) {
         result.usage.apparent_bytes(),
         result.usage.allocated_bytes(),
         result.verified_ranges,
+        result.verified_range_bytes,
+        result.range_elapsed.as_millis(),
+        result.peak_rss_bytes.unwrap_or(0),
     );
 }
 
