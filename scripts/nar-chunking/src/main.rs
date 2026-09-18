@@ -57,6 +57,7 @@ struct CommandLine {
     max_files: Option<usize>,
     selection: MeasurementSelection,
     store_root: Option<PathBuf>,
+    store_algorithm: ChunkAlgorithm,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,7 +198,12 @@ fn main() -> io::Result<()> {
         print_result(&result, command_line.fixed_size);
     }
     if let Some(store_root) = command_line.store_root {
-        let result = measure_research_store(&files, &store_root, parameters)?;
+        let result = measure_research_store(
+            &files,
+            &store_root,
+            parameters,
+            command_line.store_algorithm,
+        )?;
         print_store_result(&store_root, &result);
     }
 
@@ -213,6 +219,7 @@ impl CommandLine {
         let mut max_files = None;
         let mut selection = MeasurementSelection::All;
         let mut store_root = None;
+        let mut store_algorithm = ChunkAlgorithm::MinCdcHash4;
 
         while let Some(argument) = arguments.next() {
             if argument == "--semantic-only" {
@@ -238,6 +245,7 @@ impl CommandLine {
                 "--fixed-size" => fixed_size = parse_usize(value, option)?,
                 "--max-files" => max_files = Some(parse_usize(value, option)?),
                 "--store-root" => store_root = Some(parse_path(value, option)?),
+                "--store-algorithm" => store_algorithm = parse_store_algorithm(value, option)?,
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -254,7 +262,7 @@ impl CommandLine {
         }
         if store_root.is_some() && selection != MeasurementSelection::All {
             return Err(invalid_argument(
-                "--store-root models raw MinCdcHash4; omit benchmark-only selection flags",
+                "--store-root models raw MinCDC; omit benchmark-only selection flags",
             ));
         }
         if min_size == 0 || min_size > max_size || fixed_size == 0 {
@@ -270,6 +278,7 @@ impl CommandLine {
             max_files,
             selection,
             store_root,
+            store_algorithm,
         })
     }
 }
@@ -278,6 +287,19 @@ fn parse_path(value: Option<String>, option: &str) -> io::Result<PathBuf> {
     value
         .map(PathBuf::from)
         .ok_or_else(|| invalid_argument(format!("{option} requires a value")))
+}
+
+fn parse_store_algorithm(value: Option<String>, option: &str) -> io::Result<ChunkAlgorithm> {
+    let value = value.ok_or_else(|| invalid_argument(format!("{option} requires a value")))?;
+    if value == "hash4" {
+        return Ok(ChunkAlgorithm::MinCdcHash4);
+    }
+    if value == "mincdc4" {
+        return Ok(ChunkAlgorithm::MinCdc4);
+    }
+    Err(invalid_argument(format!(
+        "{option} must be hash4 or mincdc4"
+    )))
 }
 
 fn parse_usize(value: Option<String>, option: &str) -> io::Result<usize> {
@@ -293,7 +315,7 @@ fn invalid_argument(message: impl Into<String>) -> io::Error {
 
 fn print_help() {
     println!(
-        "Usage: narjar-nar-chunking --corpus PATH [--min-size BYTES] [--max-size BYTES] [--fixed-size BYTES] [--max-files COUNT] [--semantic-only|--hybrid-only|--raw-sweep] [--store-root PATH]\n\nMeasures raw and semantic MinCDC, a fixed hybrid policy, fixed-size, and whole-file CAS controls over sorted .nar files. --raw-sweep runs the predeclared raw Hash4 windows. --store-root materializes a bounded raw MinCdcHash4 sample."
+        "Usage: narjar-nar-chunking --corpus PATH [--min-size BYTES] [--max-size BYTES] [--fixed-size BYTES] [--max-files COUNT] [--semantic-only|--hybrid-only|--raw-sweep] [--store-root PATH] [--store-algorithm hash4|mincdc4]\n\nMeasures raw and semantic MinCDC, a fixed hybrid policy, fixed-size, and whole-file CAS controls over sorted .nar files. --raw-sweep runs the predeclared raw Hash4 windows. --store-root materializes a bounded raw sample using --store-algorithm (default: hash4)."
     );
 }
 
@@ -610,6 +632,7 @@ fn hash_file(path: &Path) -> io::Result<(u64, [u8; 32])> {
 
 #[derive(Debug)]
 struct ResearchStoreResult {
+    algorithm: ChunkAlgorithm,
     files: u64,
     logical_bytes: u64,
     chunks: u64,
@@ -624,6 +647,7 @@ fn measure_research_store(
     files: &[PathBuf],
     root: &Path,
     parameters: ChunkParameters,
+    algorithm: ChunkAlgorithm,
 ) -> io::Result<ResearchStoreResult> {
     let store = ResearchChunkStore::create(root)?;
     let mut logical_bytes = 0;
@@ -636,7 +660,7 @@ fn measure_research_store(
         let manifest = chunk_reader(
             File::open(path)?,
             parameters,
-            ChunkAlgorithm::MinCdcHash4,
+            algorithm,
             |descriptor, chunk| store.store_chunk(descriptor, chunk),
         )?;
         if manifest.total_size() != expected_size {
@@ -656,6 +680,7 @@ fn measure_research_store(
         chunks += manifest.chunks().len() as u64;
     }
     Ok(ResearchStoreResult {
+        algorithm,
         files: files.len() as u64,
         logical_bytes,
         chunks,
@@ -757,8 +782,9 @@ fn print_store_result(root: &Path, result: &ResearchStoreResult) {
             result.verified_range_bytes as f64 * 1000.0 / (millis as f64 * 1024.0 * 1024.0)
         });
     println!(
-        "store_root={} store_files={} store_chunk_files={} store_manifest_files={} store_directories={} logical_bytes={} chunks={} apparent_bytes={} allocated_bytes={} verified_ranges={} verified_range_bytes={} range_elapsed_ms={} range_throughput_mib_s={range_throughput_mib_per_second:.2} peak_rss_bytes={}",
+        "store_root={} store_algorithm={} store_files={} store_chunk_files={} store_manifest_files={} store_directories={} logical_bytes={} chunks={} apparent_bytes={} allocated_bytes={} verified_ranges={} verified_range_bytes={} range_elapsed_ms={} range_throughput_mib_s={range_throughput_mib_per_second:.2} peak_rss_bytes={}",
         root.display(),
+        store_algorithm_name(result.algorithm),
         result.usage.files(),
         chunk_files,
         result.files,
@@ -772,6 +798,13 @@ fn print_store_result(root: &Path, result: &ResearchStoreResult) {
         result.range_elapsed.as_millis(),
         result.peak_rss_bytes.unwrap_or(0),
     );
+}
+
+fn store_algorithm_name(algorithm: ChunkAlgorithm) -> &'static str {
+    match algorithm {
+        ChunkAlgorithm::MinCdcHash4 => "hash4",
+        ChunkAlgorithm::MinCdc4 => "mincdc4",
+    }
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -832,6 +865,28 @@ mod tests {
 
         assert_eq!(command_line.min_size, 8 * 1024);
         assert_eq!(command_line.max_size, 24 * 1024);
+        assert_eq!(command_line.store_algorithm, ChunkAlgorithm::MinCdcHash4);
+    }
+
+    #[test]
+    fn command_line_selects_the_requested_store_algorithm() {
+        let command_line = CommandLine::parse(
+            [
+                "--corpus",
+                "/tmp/narj83-corpus",
+                "--max-files",
+                "100",
+                "--store-root",
+                "/tmp/narj83-store",
+                "--store-algorithm",
+                "mincdc4",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .expect("the store algorithm option should parse");
+
+        assert_eq!(command_line.store_algorithm, ChunkAlgorithm::MinCdc4);
     }
 
     fn measure_segmented_file(input: &[u8], segment_size: usize) -> ChunkMeasurements {

@@ -44,7 +44,8 @@ The bounded materialization check used the first 100 sorted files:
 cargo run --release -p narjar-nar-chunking --locked -- \
   --corpus /home/mjc/narjar-corpora/narjar-real-nix-v1 \
   --max-files 100 \
-  --store-root /tmp/narj83-store-sample
+  --store-root /tmp/narj83-store-sample \
+  --store-algorithm hash4
 ```
 
 The pinned experiment parameters are `mincdc = 0.1.0`, an 8 KiB minimum,
@@ -88,13 +89,31 @@ larger window avoids enough chunk files and filesystem metadata to win on the
 metric that matters here: allocated storage.
 
 The full 8–24 KiB store was then materialized on a temporary `zstd-19` ZFS
-dataset. Its authoritative dataset usage was 24,210,921,984 bytes (22.548
-GiB), including chunk files, manifests, and ZFS metadata. The deployed
+dataset. After `zpool sync`, its authoritative dataset usage was
+24,088,626,688 bytes (22.434 GiB), with 48,524,743,168 logical bytes and a
+2.08× ZFS compression ratio, including chunk files, manifests, and ZFS
+metadata. All 14,214 full/90%-resume range checks passed. The deployed
 `/var/lib/narjar` dataset used 12,836,595,816 bytes (11.955 GiB) at the same
-time, so this full-corpus experiment store was 10.593 GiB larger (1.886×).
+time, so this full-corpus experiment store was 10.479 GiB larger (1.877×).
 That comparison is directional rather than an apples-to-apples replacement
 cost: the corpus is 78.5 GB logical while the deployed dataset is 28.3 GB
 logical.
+
+The two MinCDC implementations were also materialized in separate temporary
+`zstd-19` ZFS datasets using the same 100-file, 232,264,816-byte sample:
+
+| Algorithm | Unique chunks | Apparent bytes | ZFS `used` | ZFS logicalused | ZFS compressratio | Range verification |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `MinCdcHash4` | 14,056 | 223,075,017 | 89,745,920 (85.6 MiB) | 229,654,528 | 2.64× | 824 ms / 295.70 MiB/s |
+| `MinCdc4` | 23,156 | 223,757,583 | 98,631,168 (94.1 MiB) | 235,425,280 | 2.49× | 1,002 ms / 243.17 MiB/s |
+
+These are independent dataset `used` readings taken after `zpool sync`, and
+include ZFS metadata. Hash4 used about 9% less space in this physical
+comparison and was faster for cold range verification. Together with the
+full-corpus logical measurements and the full Hash4 materialization above,
+this selects `MinCdcHash4`; the `mincdc4` store option remains available to
+reproduce the comparison. A pre-sync `zfs list` reading is not valid evidence
+for this metric because ZFS usage accounting is asynchronous.
 
 The semantic baseline only improves the estimated physical result by about
 165 MiB over the original raw Hash4 window, before filesystem and
@@ -138,8 +157,9 @@ number is the ZFS dataset `used` value after materialization, including ZFS
 compression and filesystem metadata. The prototype rejects non-contiguous or
 reordered manifests and verifies every chunk hash while serving a range.
 
-The full-corpus physical result above uses ZFS `used`, not the prototype's
-per-file `allocated_bytes` sum. The latter was 23,975,770,624 bytes; ZFS
+The full-corpus physical result above uses post-sync ZFS `used`, not the
+prototype's per-file `allocated_bytes` sum. The latter was 23,975,653,888
+bytes; ZFS
 `used` also includes dataset-level metadata and is therefore the authoritative
 on-disk measurement for this experiment.
 

@@ -17,11 +17,13 @@ ranges with:
 cargo run --release -p narjar-nar-chunking -- \
   --corpus /home/mjc/narjar-corpora/narjar-real-nix-v1 \
   --max-files 100 \
-  --store-root /tmp/narj83-store-sample
+  --store-root /tmp/narj83-store-sample \
+  --store-algorithm hash4
 ```
 
 `--store-root` refuses an unbounded run and refuses a non-empty destination.
-It uses the selected raw `MinCdcHash4` policy, writes binary manifests and
+It uses the selected raw MinCDC policy (`hash4` by default; `mincdc4` is
+available for the physical comparison), writes binary manifests and
 content-addressed chunks, verifies existing duplicate chunks, and reports
 apparent bytes, allocated bytes, and file/directory counts. Those are
 diagnostic measurements; the policy decision is based on the authoritative
@@ -64,7 +66,9 @@ descriptors (`size`, digest). `physical_bytes` is their sum and is only a
 logical diagnostic; it excludes filesystem allocation, indexes, inode costs,
 and ZFS compression. The experiment report must separately record the
 post-materialization ZFS dataset `used` value, which is the storage-selection
-metric. Store runs also report the bytes reconstructed by the full
+metric. Before recording that value, run `zpool sync` and then read `zfs list`;
+pre-sync usage is not authoritative because ZFS accounting is asynchronous.
+Store runs also report the bytes reconstructed by the full
 and 90%-resume checks, their elapsed time, reconstruction throughput, and the
 Linux peak resident set (`VmHWM`). Those are cold research-store checks, not
 HTTP server latency measurements.
