@@ -393,6 +393,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::io::{self, Read};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{ChunkAlgorithm, ChunkManifest, ChunkParameters, ResearchChunkStore, chunk_reader};
@@ -433,6 +434,96 @@ mod tests {
         (0usize..(256 * 1024))
             .map(|index| index.wrapping_mul(37) as u8)
             .collect()
+    }
+
+    fn incompressible_test_input(length: usize) -> Vec<u8> {
+        let mut state = 0x9e3779b97f4a7c15_u64;
+        (0..length)
+            .map(|_| {
+                state ^= state << 7;
+                state ^= state >> 9;
+                state ^= state << 8;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn temporary_store_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "narj83-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        ))
+    }
+
+    fn assert_chunking_reconstructs_input(
+        input: &[u8],
+        algorithm: ChunkAlgorithm,
+        read_size: usize,
+    ) {
+        let mut reconstructed = Vec::new();
+        let manifest = chunk_reader(
+            FixedReadSize {
+                bytes: input,
+                read_size,
+            },
+            ChunkParameters::selected_window(),
+            algorithm,
+            |_, chunk| {
+                reconstructed.extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .expect("test input should be readable");
+
+        assert_eq!(manifest.total_size(), input.len() as u64);
+        assert_eq!(reconstructed, input);
+        assert!(
+            manifest
+                .chunks()
+                .windows(2)
+                .all(|chunks| { chunks[0].offset() + chunks[0].size() == chunks[1].offset() })
+        );
+    }
+
+    fn store_test_input(label: &str) -> (PathBuf, ResearchChunkStore, ChunkManifest, Vec<u8>) {
+        let root = temporary_store_root(label);
+        let store = ResearchChunkStore::create(&root).expect("store should be created");
+        let input = test_input();
+        let manifest = chunk_reader(
+            input.as_slice(),
+            ChunkParameters::selected_window(),
+            ChunkAlgorithm::MinCdcHash4,
+            |descriptor, chunk| store.store_chunk(descriptor, chunk),
+        )
+        .expect("test input should be readable");
+        store
+            .store_manifest(0, &manifest)
+            .expect("manifest should be writable");
+        (root, store, manifest, input)
+    }
+
+    #[test]
+    fn chunking_handles_empty_tiny_incompressible_and_shifted_inputs() {
+        let repeated = vec![0xa5; 3 * ChunkParameters::selected_window().max_size() + 17];
+        let incompressible = incompressible_test_input(1024 * 1024);
+        let shifted = {
+            let mut input = test_input();
+            input.splice(17..17, [0x7f]);
+            input
+        };
+        let inputs = [vec![], vec![0], repeated, incompressible, shifted];
+
+        for input in &inputs {
+            for algorithm in [ChunkAlgorithm::MinCdcHash4, ChunkAlgorithm::MinCdc4] {
+                for read_size in [1, 37, 64 * 1024] {
+                    assert_chunking_reconstructs_input(input, algorithm, read_size);
+                }
+            }
+        }
     }
 
     #[test]
@@ -530,26 +621,7 @@ mod tests {
 
     #[test]
     fn research_store_reconstructs_full_and_resumed_ranges() {
-        let root = std::env::temp_dir().join(format!(
-            "narj83-store-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after the Unix epoch")
-                .as_nanos()
-        ));
-        let store = ResearchChunkStore::create(&root).expect("store should be created");
-        let input = test_input();
-        let manifest = chunk_reader(
-            input.as_slice(),
-            ChunkParameters::selected_window(),
-            ChunkAlgorithm::MinCdcHash4,
-            |descriptor, chunk| store.store_chunk(descriptor, chunk),
-        )
-        .expect("test input should be readable");
-        store
-            .store_manifest(0, &manifest)
-            .expect("manifest should be writable");
+        let (root, store, manifest, input) = store_test_input("ranges");
 
         let mut reconstructed = Vec::new();
         store
@@ -587,5 +659,85 @@ mod tests {
                 .is_err()
         );
         fs::remove_dir_all(root).expect("test store should be removable");
+    }
+
+    #[test]
+    fn research_store_rejects_missing_corrupt_and_mismatched_chunks() {
+        let (missing_root, missing_store, missing_manifest, _) = store_test_input("missing");
+        let missing_chunk = missing_manifest
+            .chunks()
+            .first()
+            .expect("test input should have a chunk");
+        fs::remove_file(missing_store.chunk_path(missing_chunk.sha256()))
+            .expect("chunk should be removable");
+        assert!(
+            missing_store
+                .hash_range(&missing_manifest, 0..missing_manifest.total_size())
+                .is_err()
+        );
+        fs::remove_dir_all(missing_root).expect("missing test store should be removable");
+
+        let (corrupt_root, corrupt_store, corrupt_manifest, _) = store_test_input("corrupt");
+        let corrupt_chunk = corrupt_manifest
+            .chunks()
+            .first()
+            .expect("test input should have a chunk");
+        fs::write(corrupt_store.chunk_path(corrupt_chunk.sha256()), [0xa5; 32])
+            .expect("chunk should be corruptible");
+        assert!(
+            corrupt_store
+                .hash_range(&corrupt_manifest, 0..corrupt_manifest.total_size())
+                .is_err()
+        );
+        fs::remove_dir_all(corrupt_root).expect("corrupt test store should be removable");
+
+        let (duplicate_root, duplicate_store, duplicate_manifest, duplicate_input) =
+            store_test_input("duplicate");
+        let duplicate_chunk = duplicate_manifest
+            .chunks()
+            .first()
+            .expect("test input should have a chunk");
+        let start = duplicate_chunk.offset() as usize;
+        let end = start + duplicate_chunk.size() as usize;
+        assert!(
+            duplicate_store
+                .store_chunk(*duplicate_chunk, &duplicate_input[start..end])
+                .is_ok()
+        );
+        let mut different_bytes = duplicate_input[start..end].to_vec();
+        different_bytes[0] ^= 1;
+        assert!(
+            duplicate_store
+                .store_chunk(*duplicate_chunk, &different_bytes)
+                .is_err()
+        );
+        fs::remove_dir_all(duplicate_root).expect("duplicate test store should be removable");
+    }
+
+    #[test]
+    fn research_store_rejects_invalid_ranges_and_reordered_manifests() {
+        let (root, store, manifest, _) = store_test_input("invalid-ranges");
+
+        let invalid_range_start = 1;
+        let invalid_range_end = 0;
+        assert!(
+            store
+                .hash_range(&manifest, invalid_range_start..invalid_range_end)
+                .is_err()
+        );
+        assert!(
+            store
+                .hash_range(&manifest, 0..manifest.total_size() + 1)
+                .is_err()
+        );
+
+        let mut reordered = manifest.clone();
+        reordered.chunks.swap(0, 1);
+        assert!(
+            store
+                .hash_range(&reordered, 0..reordered.total_size())
+                .is_err()
+        );
+        fs::remove_dir_all(root).expect("invalid-range test store should be removable");
     }
 }
