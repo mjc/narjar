@@ -1,4 +1,6 @@
-use std::{collections::HashSet, ffi::OsStr, fs::File, io};
+use std::{collections::HashSet, ffi::OsStr, fs::File, io, io::Read};
+
+use sha2::{Digest, Sha256};
 
 use crate::{
     narinfo::{
@@ -6,7 +8,7 @@ use crate::{
         read_narinfo_file,
     },
     storage::{
-        Directory, FileHash, StoreHash, for_each_dir_name,
+        Directory, FileHash, NarFileName, NarHash, Storage, StoreHash, for_each_dir_name,
         inspection::{NarinfoCandidate, NarinfoName, PayloadEntry, ReferencedPayload},
         open_directory_at, read_dir_names,
     },
@@ -104,7 +106,7 @@ pub struct Inventory {
     entries: Vec<InventoryEntry>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerificationMode {
     /// Inspect trusted metadata and the referenced payload's existence and size.
     Availability,
@@ -127,6 +129,12 @@ enum MetadataAssessment {
     },
 }
 
+#[derive(Clone, Copy)]
+enum PayloadSource<'a> {
+    Directory(&'a File),
+    Storage(&'a Storage),
+}
+
 impl VerificationMode {
     fn inspect_referenced_payload(self, payload: ReferencedPayload) -> io::Result<InventoryClass> {
         let matches = match self {
@@ -140,7 +148,7 @@ impl VerificationMode {
     }
 }
 
-fn inspect_payload(
+fn inspect_directory_payload(
     payloads: &File,
     payload: ValidatedPayload,
     verification: VerificationMode,
@@ -148,6 +156,129 @@ fn inspect_payload(
     match ReferencedPayload::open(payloads, payload)? {
         None => Ok(InventoryClass::MissingNar),
         Some(payload) => verification.inspect_referenced_payload(payload),
+    }
+}
+
+fn inspect_storage_payload(
+    storage: &Storage,
+    payload: ValidatedPayload,
+    verification: VerificationMode,
+) -> io::Result<InventoryClass> {
+    if let ValidatedPayload::Raw(identity) = payload {
+        return inspect_storage_canonical_nar(storage, identity, verification);
+    }
+    inspect_directory_payload(
+        &storage.nar_directory().map_err(storage_error_to_io)?,
+        payload,
+        verification,
+    )
+}
+
+fn inspect_payload(
+    source: PayloadSource<'_>,
+    payload: ValidatedPayload,
+    verification: VerificationMode,
+) -> io::Result<InventoryClass> {
+    match source {
+        PayloadSource::Directory(payloads) => {
+            inspect_directory_payload(payloads, payload, verification)
+        }
+        PayloadSource::Storage(storage) => inspect_storage_payload(storage, payload, verification),
+    }
+}
+
+fn inspect_storage_canonical_nar(
+    storage: &Storage,
+    identity: crate::object::NarIdentity,
+    verification: VerificationMode,
+) -> io::Result<InventoryClass> {
+    let name = NarFileName::raw(identity.hash());
+    let size = match storage.nar_size(name) {
+        Ok(Some(size)) => size,
+        Ok(None) => return Ok(InventoryClass::MissingNar),
+        Err(error) => {
+            if let Some(class) = classify_storage_failure(&error) {
+                return Ok(class);
+            }
+            return Err(storage_error_to_io(error));
+        }
+    };
+    if size != identity.size().get() {
+        return Ok(InventoryClass::HashOrSizeMismatch);
+    }
+    let mut opened = match storage.open_nar_range(name, 0..size) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return Ok(InventoryClass::MissingNar),
+        Err(error) => {
+            if let Some(class) = classify_storage_failure(&error) {
+                return Ok(class);
+            }
+            return Err(storage_error_to_io(error));
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = match opened.body.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                if let Some(class) = classify_io_failure(&error) {
+                    return Ok(class);
+                }
+                return Err(error);
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR size overflow"))?;
+        if verification == VerificationMode::Content {
+            hasher.update(&buffer[..read]);
+        }
+    }
+    if bytes != identity.size().get() {
+        return Ok(InventoryClass::HashOrSizeMismatch);
+    }
+    if verification == VerificationMode::Content
+        && NarHash::from_digest(hasher.finalize().into()) != identity.hash()
+    {
+        return Ok(InventoryClass::HashOrSizeMismatch);
+    }
+    Ok(InventoryClass::ValidPair)
+}
+
+fn storage_error_to_io(error: crate::storage::StorageError) -> io::Error {
+    match error {
+        crate::storage::StorageError::Io(error) => error,
+        crate::storage::StorageError::MissingNar => io::Error::from(io::ErrorKind::NotFound),
+        error => io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
+    }
+}
+
+fn classify_storage_failure(error: &crate::storage::StorageError) -> Option<InventoryClass> {
+    match error {
+        crate::storage::StorageError::MissingNar => Some(InventoryClass::MissingNar),
+        crate::storage::StorageError::NarMismatch => Some(InventoryClass::HashOrSizeMismatch),
+        crate::storage::StorageError::Io(error) => classify_io_failure(error),
+        crate::storage::StorageError::Conflict
+        | crate::storage::StorageError::InsufficientSpace
+        | crate::storage::StorageError::InsufficientInodes
+        | crate::storage::StorageError::Locked
+        | crate::storage::StorageError::UploadTooLarge => None,
+    }
+}
+
+fn classify_io_failure(error: &io::Error) -> Option<InventoryClass> {
+    match error.kind() {
+        io::ErrorKind::NotFound => Some(InventoryClass::MissingNar),
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
+            Some(InventoryClass::HashOrSizeMismatch)
+        }
+        _ => None,
     }
 }
 
@@ -167,20 +298,20 @@ fn combine_payload_classes(
 }
 
 fn inspect_trusted_narinfo(
-    payloads: &File,
+    source: PayloadSource<'_>,
     store: &StoreHash,
     metadata: ValidatedNarInfo,
     verification: VerificationMode,
 ) -> io::Result<MetadataAssessment> {
     let payload = metadata.payload_name().file_hash();
     let raw_nar = FileHash::from_nar_hash(metadata.decoded_identity().hash());
-    let advertised_class = inspect_payload(payloads, metadata.payload(), verification)?;
+    let advertised_class = inspect_payload(source, metadata.payload(), verification)?;
     let class = match metadata.payload() {
         ValidatedPayload::Raw(_) => advertised_class,
         ValidatedPayload::Compressed(_) => combine_payload_classes(
             advertised_class,
             inspect_payload(
-                payloads,
+                source,
                 ValidatedPayload::Raw(metadata.decoded_identity()),
                 verification,
             )?,
@@ -208,7 +339,7 @@ fn validate_narinfo_candidate(
 fn inspect_narinfo_entry(
     name: NarinfoName<'_>,
     root: &File,
-    payloads: &File,
+    source: PayloadSource<'_>,
     trusted: &TrustedPublicKeys,
     verification: VerificationMode,
 ) -> io::Result<MetadataAssessment> {
@@ -220,7 +351,7 @@ fn inspect_narinfo_entry(
         NarinfoName::Candidate(candidate) => {
             match validate_narinfo_candidate(root, &candidate, trusted)? {
                 Ok(metadata) => {
-                    inspect_trusted_narinfo(payloads, candidate.store(), metadata, verification)
+                    inspect_trusted_narinfo(source, candidate.store(), metadata, verification)
                 }
                 Err(error) => Ok(MetadataAssessment::Rejected(InventoryEntry::new(
                     match error {
@@ -255,7 +386,7 @@ impl MetadataScan {
 
 fn inspect_narinfo_entries(
     root: &File,
-    payloads: &File,
+    source: PayloadSource<'_>,
     trusted: &TrustedPublicKeys,
     verification: VerificationMode,
 ) -> io::Result<MetadataScan> {
@@ -267,13 +398,45 @@ fn inspect_narinfo_entries(
             scan.record(inspect_narinfo_entry(
                 name,
                 root,
-                payloads,
+                source,
                 trusted,
                 verification,
             )?);
             Ok::<(), io::Error>(())
         })?;
     Ok(scan)
+}
+
+fn inspect_unreferenced_manifests(
+    storage: &Storage,
+    references: &HashSet<FileHash>,
+) -> io::Result<Vec<InventoryEntry>> {
+    let root = storage.root_directory().map_err(storage_error_to_io)?;
+    let manifests = open_directory_at(&root, OsStr::new(crate::storage::MANIFEST_DIRECTORY))?;
+    let mut entries = Vec::new();
+    read_dir_names(&manifests)?.iter().try_for_each(|name| {
+        let Some(text) = name.to_str() else {
+            return Ok::<(), io::Error>(());
+        };
+        let Some(hash_text) = text.strip_suffix(".manifest") else {
+            return Ok(());
+        };
+        let Ok(hash) = NarHash::parse(hash_text) else {
+            return Ok(());
+        };
+        if references.contains(&FileHash::from_nar_hash(hash)) {
+            return Ok(());
+        }
+        if !crate::storage::entry_is_regular_at(&manifests, name)? {
+            return Ok(());
+        }
+        entries.push(InventoryEntry::new(
+            InventoryClass::OrphanNar,
+            hash_text.to_owned(),
+        ));
+        Ok(())
+    })?;
+    Ok(entries)
 }
 
 fn classify_unreferenced_payload(
@@ -342,8 +505,37 @@ impl Inventory {
         let MetadataScan {
             mut entries,
             references,
-        } = inspect_narinfo_entries(root, &nar_directory, trusted, verification)?;
+        } = inspect_narinfo_entries(
+            root,
+            PayloadSource::Directory(&nar_directory),
+            trusted,
+            verification,
+        )?;
         entries.extend(inspect_unreferenced_payloads(&nar_directory, &references)?);
+        entries.sort();
+        Ok(Self { entries })
+    }
+
+    pub fn scan_storage(
+        storage: &Storage,
+        trusted: &TrustedPublicKeys,
+        verification: VerificationMode,
+    ) -> io::Result<Self> {
+        let root = storage.root_directory().map_err(storage_error_to_io)?;
+        let nar_directory = storage.nar_directory().map_err(storage_error_to_io)?;
+        let MetadataScan {
+            mut entries,
+            references,
+        } = inspect_narinfo_entries(
+            &root,
+            PayloadSource::Storage(storage),
+            trusted,
+            verification,
+        )?;
+        entries.extend(inspect_unreferenced_payloads(&nar_directory, &references)?);
+        if storage.backend() == crate::storage::StorageBackend::Chunked {
+            entries.extend(inspect_unreferenced_manifests(storage, &references)?);
+        }
         entries.sort();
         Ok(Self { entries })
     }
@@ -354,5 +546,68 @@ impl Inventory {
 
     pub fn can_serve(&self) -> bool {
         !self.entries.iter().any(|entry| entry.class.blocks_serve())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{NarUploadPolicy, PublishOutcome, StorageBackend};
+    use sha2::{Digest, Sha256};
+    use std::{io::Cursor, path::Path};
+    use tempfile::tempdir;
+
+    #[test]
+    fn chunked_storage_inventory_checks_the_manifest_backed_nar() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let storage = Storage::initialize_with_backend(&root, StorageBackend::Chunked).unwrap();
+        let raw = vec![b'i'; 100_000];
+        let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+        let name = NarFileName::raw(hash);
+        assert_eq!(
+            storage
+                .publish_nar(
+                    name,
+                    Cursor::new(&raw),
+                    raw.len() as u64,
+                    NarUploadPolicy::new(raw.len() as u64, 0),
+                )
+                .unwrap(),
+            PublishOutcome::Created
+        );
+
+        assert_eq!(
+            inspect_storage_canonical_nar(
+                &storage,
+                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
+                VerificationMode::Availability,
+            )
+            .unwrap(),
+            InventoryClass::ValidPair
+        );
+        assert_eq!(
+            inspect_storage_canonical_nar(
+                &storage,
+                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
+                VerificationMode::Content,
+            )
+            .unwrap(),
+            InventoryClass::ValidPair
+        );
+
+        let manifest = Path::new(directory.path())
+            .join(crate::storage::MANIFEST_DIRECTORY)
+            .join(format!("{hash}.manifest"));
+        std::fs::remove_file(manifest).unwrap();
+        assert_eq!(
+            inspect_storage_canonical_nar(
+                &storage,
+                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
+                VerificationMode::Availability,
+            )
+            .unwrap(),
+            InventoryClass::MissingNar
+        );
     }
 }

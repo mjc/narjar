@@ -32,3 +32,9 @@ pub struct Storage {
     pub(super) egress_generations: AtomicU64,
     pub(super) _lock: ProcessLock,
 }
+
+impl Storage {
+    pub(crate) const fn backend(&self) -> StorageBackend {
+        self.backend
+    }
+}

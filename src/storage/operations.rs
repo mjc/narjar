@@ -1245,11 +1245,11 @@ impl Storage {
         })
     }
 
-    pub(super) fn root_directory(&self) -> Result<File, StorageError> {
+    pub(crate) fn root_directory(&self) -> Result<File, StorageError> {
         Ok(self.root.try_clone()?)
     }
 
-    pub(super) fn nar_directory(&self) -> Result<File, StorageError> {
+    pub(crate) fn nar_directory(&self) -> Result<File, StorageError> {
         let root = self.root_directory()?;
         Ok(open_directory_at(&root, OsStr::new("nar"))?)
     }
