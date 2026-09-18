@@ -15,6 +15,7 @@ use narjar_nar_chunking::{
 use sha2::{Digest, Sha256};
 
 const DEFAULT_FIXED_CHUNK_SIZE: usize = 8 * 1024;
+const DEFAULT_HYBRID_SMALL_FILE_SIZE: u64 = 64 * 1024;
 const CHUNK_DESCRIPTOR_BYTES: u64 = 8 + 8 + 32;
 const WHOLE_FILE_DESCRIPTOR_BYTES: u64 = 8 + 32;
 const FILE_MANIFEST_HEADER_BYTES: u64 = 8;
@@ -23,6 +24,7 @@ const FILE_MANIFEST_HEADER_BYTES: u64 = 8;
 enum MeasurementStrategy {
     RawCdc(ChunkAlgorithm),
     SemanticCdc(ChunkAlgorithm),
+    HybridSmallWholeFile,
     FixedSize,
     WholeFileCas,
 }
@@ -34,6 +36,7 @@ impl MeasurementStrategy {
             Self::RawCdc(ChunkAlgorithm::MinCdc4) => "raw-mincdc4".to_owned(),
             Self::SemanticCdc(ChunkAlgorithm::MinCdcHash4) => "semantic-mincdc-hash4".to_owned(),
             Self::SemanticCdc(ChunkAlgorithm::MinCdc4) => "semantic-mincdc4".to_owned(),
+            Self::HybridSmallWholeFile => format!("hybrid-small-{DEFAULT_HYBRID_SMALL_FILE_SIZE}"),
             Self::FixedSize => format!("fixed-{fixed_size}"),
             Self::WholeFileCas => "whole-file-cas".to_owned(),
         }
@@ -47,8 +50,15 @@ struct CommandLine {
     max_size: usize,
     fixed_size: usize,
     max_files: Option<usize>,
-    semantic_only: bool,
+    selection: MeasurementSelection,
     store_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MeasurementSelection {
+    All,
+    SemanticOnly,
+    HybridOnly,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -150,13 +160,14 @@ fn main() -> io::Result<()> {
         MeasurementStrategy::RawCdc(ChunkAlgorithm::MinCdc4),
         MeasurementStrategy::SemanticCdc(ChunkAlgorithm::MinCdcHash4),
         MeasurementStrategy::SemanticCdc(ChunkAlgorithm::MinCdc4),
+        MeasurementStrategy::HybridSmallWholeFile,
         MeasurementStrategy::FixedSize,
         MeasurementStrategy::WholeFileCas,
     ];
-    let strategies = if command_line.semantic_only {
-        semantic_strategies
-    } else {
-        all_strategies
+    let strategies = match command_line.selection {
+        MeasurementSelection::All => all_strategies,
+        MeasurementSelection::SemanticOnly => semantic_strategies,
+        MeasurementSelection::HybridOnly => &[MeasurementStrategy::HybridSmallWholeFile],
     };
     for &strategy in strategies {
         let result = measure_strategy(&files, strategy, parameters, command_line.fixed_size)?;
@@ -177,12 +188,16 @@ impl CommandLine {
         let mut max_size = 12 * 1024;
         let mut fixed_size = DEFAULT_FIXED_CHUNK_SIZE;
         let mut max_files = None;
-        let mut semantic_only = false;
+        let mut selection = MeasurementSelection::All;
         let mut store_root = None;
 
         while let Some(argument) = arguments.next() {
             if argument == "--semantic-only" {
-                semantic_only = true;
+                selection = MeasurementSelection::SemanticOnly;
+                continue;
+            }
+            if argument == "--hybrid-only" {
+                selection = MeasurementSelection::HybridOnly;
                 continue;
             }
             let (option, value) = argument.split_once('=').map_or_else(
@@ -210,9 +225,9 @@ impl CommandLine {
                 "--store-root requires --max-files to keep materialization bounded",
             ));
         }
-        if store_root.is_some() && semantic_only {
+        if store_root.is_some() && selection != MeasurementSelection::All {
             return Err(invalid_argument(
-                "--store-root models raw MinCdcHash4; omit --semantic-only",
+                "--store-root models raw MinCdcHash4; omit --semantic-only or --hybrid-only",
             ));
         }
         if min_size == 0 || min_size > max_size || fixed_size == 0 {
@@ -226,7 +241,7 @@ impl CommandLine {
             max_size,
             fixed_size,
             max_files,
-            semantic_only,
+            selection,
             store_root,
         })
     }
@@ -251,7 +266,7 @@ fn invalid_argument(message: impl Into<String>) -> io::Error {
 
 fn print_help() {
     println!(
-        "Usage: narjar-nar-chunking --corpus PATH [--min-size BYTES] [--max-size BYTES] [--fixed-size BYTES] [--max-files COUNT] [--semantic-only] [--store-root PATH]\n\nMeasures raw and semantic MinCDC, fixed-size, and whole-file CAS controls over sorted .nar files. --store-root materializes a bounded raw MinCdcHash4 sample."
+        "Usage: narjar-nar-chunking --corpus PATH [--min-size BYTES] [--max-size BYTES] [--fixed-size BYTES] [--max-files COUNT] [--semantic-only|--hybrid-only] [--store-root PATH]\n\nMeasures raw and semantic MinCDC, a fixed hybrid policy, fixed-size, and whole-file CAS controls over sorted .nar files. --store-root materializes a bounded raw MinCdcHash4 sample."
     );
 }
 
@@ -292,6 +307,9 @@ fn measure_strategy(
         MeasurementStrategy::RawCdc(algorithm) => measure_raw_cdc(files, parameters, algorithm)?,
         MeasurementStrategy::SemanticCdc(algorithm) => {
             measure_semantic_cdc(files, parameters, algorithm)?
+        }
+        MeasurementStrategy::HybridSmallWholeFile => {
+            measure_hybrid_small_whole_file(files, parameters)?
         }
         MeasurementStrategy::FixedSize => measure_fixed_size(files, fixed_size)?,
         MeasurementStrategy::WholeFileCas => measure_whole_file_cas(files)?,
@@ -501,22 +519,54 @@ fn measure_fixed_size(files: &[PathBuf], fixed_size: usize) -> io::Result<ChunkM
 fn measure_whole_file_cas(files: &[PathBuf]) -> io::Result<ChunkMeasurements> {
     let mut measurements = ChunkMeasurements::default();
     for path in files {
-        let mut file = File::open(path)?;
-        let mut hasher = Sha256::new();
-        let mut file_size = 0;
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            let bytes_read = file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes_read]);
-            file_size += u64::try_from(bytes_read).expect("read size fits in u64");
-        }
+        let (file_size, file_hash) = hash_file(path)?;
         measurements.record_input(file_size);
-        measurements.record_whole_file(hasher.finalize().into(), file_size);
+        measurements.record_whole_file(file_hash, file_size);
     }
     Ok(measurements)
+}
+
+fn measure_hybrid_small_whole_file(
+    files: &[PathBuf],
+    parameters: ChunkParameters,
+) -> io::Result<ChunkMeasurements> {
+    let mut measurements = ChunkMeasurements::default();
+    for path in files {
+        let file_size = fs::metadata(path)?.len();
+        if file_size <= DEFAULT_HYBRID_SMALL_FILE_SIZE {
+            let (file_size, file_hash) = hash_file(path)?;
+            measurements.record_input(file_size);
+            measurements.record_whole_file(file_hash, file_size);
+            continue;
+        }
+        let manifest = chunk_reader(
+            File::open(path)?,
+            parameters,
+            ChunkAlgorithm::MinCdcHash4,
+            |_, chunk| {
+                measurements.record_chunk(chunk);
+                Ok(())
+            },
+        )?;
+        measurements.record_input(manifest.total_size());
+    }
+    Ok(measurements)
+}
+
+fn hash_file(path: &Path) -> io::Result<(u64, [u8; 32])> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut file_size = 0;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+        file_size += u64::try_from(bytes_read).expect("read size fits in u64");
+    }
+    Ok((file_size, hasher.finalize().into()))
 }
 
 #[derive(Debug)]

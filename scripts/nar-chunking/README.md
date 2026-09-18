@@ -31,6 +31,8 @@ The command walks `.nar` files in sorted path order and prints one stable
 
 - `raw-mincdc-hash4`: the recommended robust MinCDC implementation;
 - `raw-mincdc4`: the faster academic MinCDC implementation;
+- `hybrid-small-65536`: whole-file CAS for NARs up to 64 KiB, raw
+  MinCdcHash4 for larger NARs;
 - `fixed-BYTES`: fixed-size chunks, defaulting to 8 KiB;
 - `whole-file-cas`: exact whole-file content-addressed storage.
 

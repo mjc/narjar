@@ -55,6 +55,7 @@ not include filesystem allocation, inode/index overhead, or a serving cache.
 | Whole-file CAS | 78,503,939,680 | 7,107 | 6,600 | 75,983,475,064 | 341,136 | 75,983,816,200 | 104.9 s | 714 MiB/s |
 | Semantic MinCdcHash4 | 78,503,939,680 | 11,007,910 | 6,015,943 | 44,690,362,256 | 536,908,072 | 45,591,458,049 | 197.8 s | 379 MiB/s |
 | Semantic MinCdc4 | 78,503,939,680 | 15,196,307 | 8,479,439 | 44,743,177,102 | 737,951,128 | 45,845,315,951 | 319.7 s | 234 MiB/s |
+| Hybrid 64 KiB + MinCdcHash4 | 78,503,939,680 | 10,076,365 | 5,690,494 | 45,285,948,702 | 483,697,216 | 45,769,645,918 | 212.1 s | 353 MiB/s |
 
 ## Decision
 
@@ -62,9 +63,10 @@ Select `MinCdcHash4` for the next experiment slice. It is smaller than
 `MinCdc4` in both raw and semantic baselines, slightly faster on raw input,
 and avoids the severe chunk-count skew visible in `MinCdc4` (average raw
 chunk size 5,450 bytes versus 7,788 bytes for Hash4). The semantic baseline
-only improves the estimated physical result by about 173 MiB over raw
-Hash4, before filesystem and semantic-index costs, so it is not evidence that
-semantic storage is worth its added machinery.
+only improves the estimated physical result by about 165 MiB over raw
+Hash4, before filesystem and semantic-index costs. The fixed 64 KiB
+whole-small/chunk-large hybrid is also about 5.2 MiB worse than raw Hash4, so
+there is no measured reason to add that policy.
 
 The semantic rows are deliberately limited evidence: they chunk regular-file
 contents independently and retain all other NAR bytes as passthrough. They do
