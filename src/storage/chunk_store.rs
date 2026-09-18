@@ -44,10 +44,9 @@ impl ChunkStore {
             "chunk manifest directory",
         )?;
         remove_abandoned_manifest_temps(&manifests)?;
-        Ok(Self {
-            chunks: ensure_directory_at(root, OsStr::new(CHUNK_DIRECTORY), "chunk directory")?,
-            manifests,
-        })
+        let chunks = ensure_directory_at(root, OsStr::new(CHUNK_DIRECTORY), "chunk directory")?;
+        remove_abandoned_chunk_temps(&chunks)?;
+        Ok(Self { chunks, manifests })
     }
 
     pub(crate) fn store_nar<R: Read>(
@@ -671,7 +670,7 @@ fn remove_abandoned_manifest_temps(directory: &File) -> io::Result<()> {
         .try_fold(false, |removed, name| {
             let is_temporary = name
                 .to_str()
-                .is_some_and(|name| name.starts_with("manifest-"));
+                .is_some_and(|name| name.starts_with(".manifest-"));
             if is_temporary {
                 unlink_at(directory, &name)?;
             }
@@ -681,6 +680,47 @@ fn remove_abandoned_manifest_temps(directory: &File) -> io::Result<()> {
         directory.sync_all()?;
     }
     Ok(())
+}
+
+fn remove_abandoned_chunk_temps(directory: &File) -> io::Result<()> {
+    let removed =
+        read_dir_names(directory)?
+            .into_iter()
+            .try_fold(false, |removed, shard_name| {
+                if !is_chunk_shard_name(&shard_name) {
+                    return Ok::<_, io::Error>(removed);
+                }
+                let shard = super::fs::open_directory_at(directory, &shard_name)?;
+                let removed_from_shard = remove_abandoned_temps(&shard, ".chunk-")?;
+                Ok(removed || removed_from_shard)
+            })?;
+    if removed {
+        directory.sync_all()?;
+    }
+    Ok(())
+}
+
+fn remove_abandoned_temps(directory: &File, prefix: &str) -> io::Result<bool> {
+    let removed = read_dir_names(directory)?
+        .into_iter()
+        .try_fold(false, |removed, name| {
+            let is_temporary = name.to_str().is_some_and(|name| name.starts_with(prefix));
+            if is_temporary {
+                unlink_at(directory, &name)?;
+            }
+            Ok::<_, io::Error>(removed || is_temporary)
+        })?;
+    if removed {
+        directory.sync_all()?;
+    }
+    Ok(removed)
+}
+
+fn is_chunk_shard_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.len() == 2 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn io_for_storage_error(error: StorageError) -> io::Error {
@@ -766,7 +806,7 @@ impl std::error::Error for ChunkStoreError {
 mod tests {
     use std::{
         fs,
-        io::{Cursor, Read},
+        io::{Cursor, Read, Write},
     };
 
     use sha2::{Digest, Sha256};
@@ -775,7 +815,10 @@ mod tests {
     use super::{ChunkStore, ChunkStoreError};
     use crate::{
         object::{NarHash, NarIdentity, NarSize},
-        storage::{chunked::ChunkProfile, directory::Directory},
+        storage::{
+            chunked::{ChunkHash, ChunkProfile},
+            directory::Directory,
+        },
     };
 
     #[test]
@@ -873,5 +916,41 @@ mod tests {
             .unwrap();
         let mut output = Vec::new();
         assert!(reader.read_to_end(&mut output).is_err());
+    }
+
+    #[test]
+    fn restart_removes_abandoned_chunk_and_manifest_temps() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let shard = store
+            .open_or_create_shard(ChunkHash::from_digest([0; 32]))
+            .unwrap();
+        let chunk_temp = std::ffi::OsStr::new(".chunk-crashed");
+        let manifest_temp = std::ffi::OsStr::new(".manifest-crashed");
+        let mut chunk = super::super::fs::open_at(
+            &shard,
+            chunk_temp,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
+        )
+        .unwrap();
+        chunk.write_all(b"abandoned").unwrap();
+        let mut manifest = super::super::fs::open_at(
+            &store.manifests,
+            manifest_temp,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
+        )
+        .unwrap();
+        manifest.write_all(b"abandoned").unwrap();
+        drop(store);
+
+        let restarted = ChunkStore::initialize(root.file()).unwrap();
+        let shard = restarted
+            .open_shard(ChunkHash::from_digest([0; 32]))
+            .unwrap();
+        assert!(super::super::fs::open_regular_at(&shard, chunk_temp).is_err());
+        assert!(super::super::fs::open_regular_at(&restarted.manifests, manifest_temp).is_err());
     }
 }
