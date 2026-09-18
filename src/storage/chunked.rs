@@ -1,15 +1,15 @@
-use std::{fmt, io, io::Read};
+use std::{fmt, io, io::Read, io::Seek, io::SeekFrom, io::Write};
 
 use mincdc::{MinCdcHash4, ReadChunker};
 use sha2::{Digest, Sha256};
 
 use crate::object::{NarHash, NarIdentity, NarSize};
 
-const MANIFEST_MAGIC: &[u8; 8] = b"NARJCHNK";
-const MANIFEST_VERSION: u8 = 1;
-const MANIFEST_HEADER_BYTES: usize = 60;
-const MANIFEST_RECORD_BYTES: usize = 40;
-const MANIFEST_CHECKSUM_BYTES: usize = 32;
+pub(crate) const MANIFEST_MAGIC: &[u8; 8] = b"NARJCHNK";
+pub(crate) const MANIFEST_VERSION: u8 = 1;
+pub(crate) const MANIFEST_HEADER_BYTES: usize = 60;
+pub(crate) const MANIFEST_RECORD_BYTES: usize = 40;
+pub(crate) const MANIFEST_CHECKSUM_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ChunkHash([u8; 32]);
@@ -18,7 +18,6 @@ impl ChunkHash {
     pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
         Self(digest)
     }
-
     pub(crate) const fn bytes(self) -> [u8; 32] {
         self.0
     }
@@ -35,13 +34,11 @@ impl ChunkProfile {
             Self::MinCdcHash4V1 => 1,
         }
     }
-
     pub(crate) const fn min_size(self) -> u64 {
         match self {
             Self::MinCdcHash4V1 => 8 * 1024,
         }
     }
-
     pub(crate) const fn max_size(self) -> u64 {
         match self {
             Self::MinCdcHash4V1 => 24 * 1024,
@@ -63,134 +60,48 @@ pub(crate) struct ChunkDescriptor {
 }
 
 impl ChunkDescriptor {
+    pub(crate) const fn new(end: u64, hash: ChunkHash) -> Self {
+        Self { end, hash }
+    }
     pub(crate) const fn end(self) -> u64 {
         self.end
     }
-
     pub(crate) const fn hash(self) -> ChunkHash {
         self.hash
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChunkManifest {
     identity: NarIdentity,
     profile: ChunkProfile,
-    chunks: Vec<ChunkDescriptor>,
+    chunk_count: u64,
 }
 
 impl ChunkManifest {
-    pub(crate) fn new(identity: NarIdentity, profile: ChunkProfile) -> Self {
+    pub(crate) const fn new(
+        identity: NarIdentity,
+        profile: ChunkProfile,
+        chunk_count: u64,
+    ) -> Self {
         Self {
             identity,
             profile,
-            chunks: Vec::new(),
+            chunk_count,
         }
     }
-
-    pub(crate) fn push_chunk(&mut self, end: u64, hash: ChunkHash) -> Result<(), ManifestError> {
-        let previous_end = self.chunks.last().map_or(0, |chunk| chunk.end);
-        let length = end
-            .checked_sub(previous_end)
-            .ok_or(ManifestError::NonMonotonicEnds)?;
-        if length == 0 || length > self.profile.max_size() || end > self.identity.size().get() {
-            return Err(ManifestError::InvalidChunkLength);
-        }
-        self.chunks.push(ChunkDescriptor { end, hash });
-        Ok(())
-    }
-
-    pub(crate) fn finish(self) -> Result<Self, ManifestError> {
-        let final_end = self.chunks.last().map_or(0, |chunk| chunk.end);
-        if final_end != self.identity.size().get() {
-            return Err(ManifestError::FinalSizeMismatch {
-                expected: self.identity.size().get(),
-                actual: final_end,
-            });
-        }
-        let non_final_chunk_is_too_small = self
-            .chunks
-            .iter()
-            .scan(0_u64, |previous_end, chunk| {
-                let length = chunk.end - *previous_end;
-                *previous_end = chunk.end;
-                Some(length)
-            })
-            .take(self.chunks.len().saturating_sub(1))
-            .any(|length| length < self.profile.min_size());
-        if non_final_chunk_is_too_small {
-            return Err(ManifestError::InvalidChunkLength);
-        }
-        Ok(self)
-    }
-
-    pub(crate) const fn identity(&self) -> NarIdentity {
+    pub(crate) const fn identity(self) -> NarIdentity {
         self.identity
     }
-
-    pub(crate) const fn profile(&self) -> ChunkProfile {
+    pub(crate) const fn profile(self) -> ChunkProfile {
         self.profile
     }
-
-    pub(crate) fn chunks(&self) -> &[ChunkDescriptor] {
-        &self.chunks
-    }
-
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, ManifestError> {
-        let mut bytes = Vec::with_capacity(
-            MANIFEST_HEADER_BYTES
-                .checked_add(
-                    self.chunks
-                        .len()
-                        .checked_mul(MANIFEST_RECORD_BYTES)
-                        .ok_or(ManifestError::LengthOverflow)?,
-                )
-                .and_then(|length| length.checked_add(MANIFEST_CHECKSUM_BYTES))
-                .ok_or(ManifestError::LengthOverflow)?,
-        );
-        bytes.extend_from_slice(MANIFEST_MAGIC);
-        bytes.push(MANIFEST_VERSION);
-        bytes.push(self.profile.id());
-        bytes.extend_from_slice(&[0, 0]);
-        bytes.extend_from_slice(&self.identity.hash().bytes_for_storage());
-        bytes.extend_from_slice(&self.identity.size().get().to_le_bytes());
-        let chunk_count =
-            u64::try_from(self.chunks.len()).map_err(|_| ManifestError::LengthOverflow)?;
-        bytes.extend_from_slice(&chunk_count.to_le_bytes());
-        for chunk in &self.chunks {
-            bytes.extend_from_slice(&chunk.end.to_le_bytes());
-            bytes.extend_from_slice(&chunk.hash.bytes());
-        }
-        bytes.extend_from_slice(&Sha256::digest(&bytes));
-        Ok(bytes)
+    pub(crate) const fn chunk_count(self) -> u64 {
+        self.chunk_count
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ManifestError> {
-        if bytes.len() < MANIFEST_HEADER_BYTES + MANIFEST_CHECKSUM_BYTES {
-            return Err(ManifestError::Truncated);
-        }
-        if &bytes[..MANIFEST_MAGIC.len()] != MANIFEST_MAGIC {
-            return Err(ManifestError::InvalidMagic);
-        }
-        if bytes[8] != MANIFEST_VERSION {
-            return Err(ManifestError::UnsupportedVersion(bytes[8]));
-        }
-        if bytes[10..12] != [0, 0] {
-            return Err(ManifestError::InvalidHeader);
-        }
-
-        let profile = ChunkProfile::from_id(bytes[9])?;
-        let nar_hash = NarHash::from_storage_bytes(bytes[12..44].try_into().unwrap());
-        let nar_size = u64::from_le_bytes(bytes[44..52].try_into().unwrap());
-        let chunk_count = u64::from_le_bytes(bytes[52..60].try_into().unwrap());
-        let chunk_count =
-            usize::try_from(chunk_count).map_err(|_| ManifestError::LengthOverflow)?;
-        let records_bytes = chunk_count
-            .checked_mul(MANIFEST_RECORD_BYTES)
-            .ok_or(ManifestError::LengthOverflow)?;
-        let content_bytes = MANIFEST_HEADER_BYTES
-            .checked_add(records_bytes)
-            .ok_or(ManifestError::LengthOverflow)?;
+        let (manifest, content_bytes) = parse_header(bytes)?;
         let expected_length = content_bytes
             .checked_add(MANIFEST_CHECKSUM_BYTES)
             .ok_or(ManifestError::LengthOverflow)?;
@@ -201,63 +112,279 @@ impl ChunkManifest {
                 ManifestError::TrailingBytes
             });
         }
-        let expected_checksum = Sha256::digest(&bytes[..content_bytes]);
-        if bytes[content_bytes..] != expected_checksum[..] {
-            return Err(ManifestError::ChecksumMismatch);
-        }
-
-        let identity = NarIdentity::new(nar_hash, NarSize::new(nar_size));
-        let mut manifest = Self::new(identity, profile);
+        verify_checksum(&bytes[..content_bytes], &bytes[content_bytes..])?;
+        let mut builder = ManifestBuilder::new(manifest.identity, manifest.profile, io::sink());
         let (records, remainder) =
             bytes[MANIFEST_HEADER_BYTES..content_bytes].as_chunks::<MANIFEST_RECORD_BYTES>();
         debug_assert!(remainder.is_empty());
-        for record in records {
-            let end = u64::from_le_bytes(record[..8].try_into().unwrap());
-            let hash = ChunkHash::from_digest(record[8..].try_into().unwrap());
-            manifest.push_chunk(end, hash)?;
+        records
+            .iter()
+            .try_for_each(|record| builder.append(parse_record(record)?))?;
+        let (_, decoded) = builder.finish()?;
+        (decoded == manifest)
+            .then_some(decoded)
+            .ok_or(ManifestError::InvalidHeader)
+    }
+}
+
+pub(crate) struct ManifestReader<R> {
+    reader: R,
+    manifest: ChunkManifest,
+    record_count: u64,
+    previous_end: u64,
+    previous_length: Option<u64>,
+    content_hasher: Sha256,
+}
+
+impl<R: Read + Seek> ManifestReader<R> {
+    pub(crate) fn new(mut reader: R, max_bytes: u64) -> Result<Self, ManifestError> {
+        let file_length = reader.seek(SeekFrom::End(0))?;
+        if file_length > max_bytes {
+            return Err(ManifestError::LengthOverflow);
         }
-        manifest.finish()
+        reader.seek(SeekFrom::Start(0))?;
+
+        let mut header = [0_u8; MANIFEST_HEADER_BYTES];
+        reader.read_exact(&mut header)?;
+        let (manifest, content_bytes) = parse_header(&header)?;
+        let expected_length = content_bytes
+            .checked_add(MANIFEST_CHECKSUM_BYTES)
+            .ok_or(ManifestError::LengthOverflow)?;
+        let expected_length =
+            u64::try_from(expected_length).map_err(|_| ManifestError::LengthOverflow)?;
+        if file_length != expected_length {
+            return Err(if file_length < expected_length {
+                ManifestError::Truncated
+            } else {
+                ManifestError::TrailingBytes
+            });
+        }
+
+        Ok(Self {
+            reader,
+            manifest,
+            record_count: manifest.chunk_count(),
+            previous_end: 0,
+            previous_length: None,
+            content_hasher: Sha256::new_with_prefix(header),
+        })
+    }
+
+    pub(crate) const fn manifest(&self) -> ChunkManifest {
+        self.manifest
+    }
+
+    pub(crate) fn read_records<F>(mut self, mut visit: F) -> Result<(), ManifestError>
+    where
+        F: FnMut(ChunkDescriptor) -> Result<(), ManifestError>,
+    {
+        (0..self.record_count).try_for_each(|_| {
+            let mut bytes = [0_u8; MANIFEST_RECORD_BYTES];
+            self.reader.read_exact(&mut bytes)?;
+            self.content_hasher.update(bytes);
+            let descriptor = parse_record(&bytes)?;
+            self.validate_descriptor(descriptor)?;
+            visit(descriptor)
+        })?;
+
+        if self.previous_end != self.manifest.identity().size().get() {
+            return Err(ManifestError::FinalSizeMismatch {
+                expected: self.manifest.identity().size().get(),
+                actual: self.previous_end,
+            });
+        }
+
+        let mut expected_checksum = [0_u8; MANIFEST_CHECKSUM_BYTES];
+        self.reader.read_exact(&mut expected_checksum)?;
+        (self.content_hasher.finalize().as_slice() == expected_checksum)
+            .then_some(())
+            .ok_or(ManifestError::ChecksumMismatch)
+    }
+
+    fn validate_descriptor(&mut self, descriptor: ChunkDescriptor) -> Result<(), ManifestError> {
+        let length = descriptor
+            .end()
+            .checked_sub(self.previous_end)
+            .ok_or(ManifestError::NonMonotonicEnds)?;
+        if length == 0
+            || length > self.manifest.profile().max_size()
+            || descriptor.end() > self.manifest.identity().size().get()
+        {
+            return Err(ManifestError::InvalidChunkLength);
+        }
+        if self
+            .previous_length
+            .is_some_and(|previous| previous < self.manifest.profile().min_size())
+        {
+            return Err(ManifestError::InvalidChunkLength);
+        }
+        self.previous_end = descriptor.end();
+        self.previous_length = Some(length);
+        Ok(())
     }
 }
 
-pub(crate) fn chunk_stream<R, F>(source: R, profile: ChunkProfile, on_chunk: F) -> io::Result<u64>
+pub(crate) struct ManifestBuilder<W> {
+    writer: W,
+    identity: NarIdentity,
+    profile: ChunkProfile,
+    previous_end: u64,
+    previous_length: Option<u64>,
+    chunk_count: u64,
+}
+
+impl<W: Write> ManifestBuilder<W> {
+    pub(crate) fn new(identity: NarIdentity, profile: ChunkProfile, writer: W) -> Self {
+        Self {
+            writer,
+            identity,
+            profile,
+            previous_end: 0,
+            previous_length: None,
+            chunk_count: 0,
+        }
+    }
+
+    pub(crate) fn append(&mut self, descriptor: ChunkDescriptor) -> Result<(), ManifestError> {
+        let length = descriptor
+            .end
+            .checked_sub(self.previous_end)
+            .ok_or(ManifestError::NonMonotonicEnds)?;
+        if length == 0
+            || length > self.profile.max_size()
+            || descriptor.end > self.identity.size().get()
+        {
+            return Err(ManifestError::InvalidChunkLength);
+        }
+        if self
+            .previous_length
+            .is_some_and(|previous| previous < self.profile.min_size())
+        {
+            return Err(ManifestError::InvalidChunkLength);
+        }
+        self.writer.write_all(&descriptor.end.to_le_bytes())?;
+        self.writer.write_all(&descriptor.hash.bytes())?;
+        self.previous_end = descriptor.end;
+        self.previous_length = Some(length);
+        self.chunk_count = self
+            .chunk_count
+            .checked_add(1)
+            .ok_or(ManifestError::LengthOverflow)?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<(W, ChunkManifest), ManifestError> {
+        if self.previous_end != self.identity.size().get() {
+            return Err(ManifestError::FinalSizeMismatch {
+                expected: self.identity.size().get(),
+                actual: self.previous_end,
+            });
+        }
+        Ok((
+            self.writer,
+            ChunkManifest::new(self.identity, self.profile, self.chunk_count),
+        ))
+    }
+}
+
+pub(crate) fn chunk_stream<R, F>(
+    source: R,
+    profile: ChunkProfile,
+    mut on_chunk: F,
+) -> io::Result<u64>
 where
     R: Read,
     F: FnMut(u64, ChunkHash, &[u8]) -> io::Result<()>,
 {
-    match profile {
-        ChunkProfile::MinCdcHash4V1 => chunk_stream_with(source, MinCdcHash4::new(), on_chunk),
-    }
-}
-
-fn chunk_stream_with<R, C, F>(source: R, cdc: C, mut on_chunk: F) -> io::Result<u64>
-where
-    R: Read,
-    C: mincdc::Cdc,
-    F: FnMut(u64, ChunkHash, &[u8]) -> io::Result<()>,
-{
-    let mut chunker = ReadChunker::new(source, 8 * 1024, 24 * 1024, cdc);
+    let mut chunker = ReadChunker::new(
+        source,
+        profile.min_size() as usize,
+        profile.max_size() as usize,
+        MinCdcHash4::new(),
+    );
     let mut end = 0_u64;
     while let Some(chunk) = chunker.next()? {
-        let chunk_bytes: &[u8] = &chunk;
-        let chunk_length = u64::try_from(chunk_bytes.len())
+        let bytes: &[u8] = &chunk;
+        let length = u64::try_from(bytes.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk is too large"))?;
         end = end
-            .checked_add(chunk_length)
+            .checked_add(length)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?;
-        let hash = ChunkHash::from_digest(Sha256::digest(chunk_bytes).into());
-        on_chunk(end, hash, chunk_bytes)?;
+        on_chunk(
+            end,
+            ChunkHash::from_digest(Sha256::digest(bytes).into()),
+            bytes,
+        )?;
     }
     Ok(end)
 }
 
-#[derive(Debug, Eq, PartialEq)]
+fn parse_header(bytes: &[u8]) -> Result<(ChunkManifest, usize), ManifestError> {
+    if bytes.len() < MANIFEST_HEADER_BYTES {
+        return Err(ManifestError::Truncated);
+    }
+    if &bytes[..MANIFEST_MAGIC.len()] != MANIFEST_MAGIC {
+        return Err(ManifestError::InvalidMagic);
+    }
+    if bytes[8] != MANIFEST_VERSION {
+        return Err(ManifestError::UnsupportedVersion(bytes[8]));
+    }
+    if bytes[10..12] != [0, 0] {
+        return Err(ManifestError::InvalidHeader);
+    }
+    let profile = ChunkProfile::from_id(bytes[9])?;
+    let hash = NarHash::from_storage_bytes(bytes[12..44].try_into().unwrap());
+    let size = u64::from_le_bytes(bytes[44..52].try_into().unwrap());
+    let count = u64::from_le_bytes(bytes[52..60].try_into().unwrap());
+    let records = usize::try_from(count)
+        .map_err(|_| ManifestError::LengthOverflow)?
+        .checked_mul(MANIFEST_RECORD_BYTES)
+        .ok_or(ManifestError::LengthOverflow)?;
+    let content_bytes = MANIFEST_HEADER_BYTES
+        .checked_add(records)
+        .ok_or(ManifestError::LengthOverflow)?;
+    Ok((
+        ChunkManifest::new(NarIdentity::new(hash, NarSize::new(size)), profile, count),
+        content_bytes,
+    ))
+}
+
+pub(crate) fn parse_record(bytes: &[u8]) -> Result<ChunkDescriptor, ManifestError> {
+    if bytes.len() != MANIFEST_RECORD_BYTES {
+        return Err(ManifestError::Truncated);
+    }
+    Ok(ChunkDescriptor::new(
+        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        ChunkHash::from_digest(bytes[8..].try_into().unwrap()),
+    ))
+}
+
+fn verify_checksum(content: &[u8], checksum: &[u8]) -> Result<(), ManifestError> {
+    (checksum == Sha256::digest(content).as_slice())
+        .then_some(())
+        .ok_or(ManifestError::ChecksumMismatch)
+}
+
+pub(crate) fn write_manifest_header<W: Write>(
+    writer: &mut W,
+    manifest: ChunkManifest,
+) -> Result<(), ManifestError> {
+    writer.write_all(MANIFEST_MAGIC)?;
+    writer.write_all(&[MANIFEST_VERSION, manifest.profile.id(), 0, 0])?;
+    writer.write_all(&manifest.identity.hash().bytes_for_storage())?;
+    writer.write_all(&manifest.identity.size().get().to_le_bytes())?;
+    writer.write_all(&manifest.chunk_count.to_le_bytes())?;
+    Ok(())
+}
+
+#[derive(Debug)]
 pub(crate) enum ManifestError {
     ChecksumMismatch,
     FinalSizeMismatch { expected: u64, actual: u64 },
     InvalidChunkLength,
     InvalidHeader,
     InvalidMagic,
+    Io(io::Error),
     LengthOverflow,
     NonMonotonicEnds,
     TrailingBytes,
@@ -267,70 +394,130 @@ pub(crate) enum ManifestError {
 }
 
 impl fmt::Display for ManifestError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ChecksumMismatch => formatter.write_str("chunk manifest checksum mismatch"),
+            Self::ChecksumMismatch => f.write_str("chunk manifest checksum mismatch"),
             Self::FinalSizeMismatch { expected, actual } => write!(
-                formatter,
+                f,
                 "chunk manifest ends at {actual} bytes, expected {expected}"
             ),
-            Self::InvalidChunkLength => formatter.write_str("invalid chunk length"),
-            Self::InvalidHeader => formatter.write_str("invalid chunk manifest header"),
-            Self::InvalidMagic => formatter.write_str("invalid chunk manifest magic"),
-            Self::LengthOverflow => formatter.write_str("chunk manifest length overflow"),
-            Self::NonMonotonicEnds => formatter.write_str("chunk manifest ends are not increasing"),
-            Self::TrailingBytes => formatter.write_str("trailing bytes after chunk manifest"),
-            Self::Truncated => formatter.write_str("truncated chunk manifest"),
-            Self::UnsupportedProfile(profile) => {
-                write!(formatter, "unsupported chunk profile {profile}")
-            }
+            Self::InvalidChunkLength => f.write_str("invalid chunk length"),
+            Self::InvalidHeader => f.write_str("invalid chunk manifest header"),
+            Self::InvalidMagic => f.write_str("invalid chunk manifest magic"),
+            Self::Io(error) => error.fmt(f),
+            Self::LengthOverflow => f.write_str("chunk manifest length overflow"),
+            Self::NonMonotonicEnds => f.write_str("chunk manifest ends are not increasing"),
+            Self::TrailingBytes => f.write_str("trailing bytes after chunk manifest"),
+            Self::Truncated => f.write_str("truncated chunk manifest"),
+            Self::UnsupportedProfile(id) => write!(f, "unsupported chunk profile {id}"),
             Self::UnsupportedVersion(version) => {
-                write!(formatter, "unsupported chunk manifest version {version}")
+                write!(f, "unsupported chunk manifest version {version}")
             }
         }
     }
 }
 
-impl std::error::Error for ManifestError {}
+impl std::error::Error for ManifestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for ManifestError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Io(left), Self::Io(right)) => left.kind() == right.kind(),
+            (
+                Self::FinalSizeMismatch {
+                    expected: left_expected,
+                    actual: left_actual,
+                },
+                Self::FinalSizeMismatch {
+                    expected: right_expected,
+                    actual: right_actual,
+                },
+            ) => left_expected == right_expected && left_actual == right_actual,
+            (Self::UnsupportedProfile(left), Self::UnsupportedProfile(right)) => left == right,
+            (Self::UnsupportedVersion(left), Self::UnsupportedVersion(right)) => left == right,
+            (Self::ChecksumMismatch, Self::ChecksumMismatch)
+            | (Self::InvalidChunkLength, Self::InvalidChunkLength)
+            | (Self::InvalidHeader, Self::InvalidHeader)
+            | (Self::InvalidMagic, Self::InvalidMagic)
+            | (Self::LengthOverflow, Self::LengthOverflow)
+            | (Self::NonMonotonicEnds, Self::NonMonotonicEnds)
+            | (Self::TrailingBytes, Self::TrailingBytes)
+            | (Self::Truncated, Self::Truncated) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ManifestError {}
+impl From<io::Error> for ManifestError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        ChunkHash, ChunkManifest, ChunkProfile, ManifestBuilder, ManifestError, chunk_stream,
+        write_manifest_header,
+    };
+    use crate::object::{NarHash, NarIdentity, NarSize};
+    use sha2::{Digest, Sha256};
     use std::io::Cursor;
 
-    use super::{ChunkHash, ChunkManifest, ChunkProfile, ManifestError, chunk_stream};
-    use crate::object::{NarHash, NarIdentity, NarSize};
-
     const HASH: NarHash = NarHash::from_digest([7; 32]);
+    fn identity(size: u64) -> NarIdentity {
+        NarIdentity::new(HASH, NarSize::new(size))
+    }
 
-    fn manifest(size: u64) -> ChunkManifest {
-        ChunkManifest::new(
-            NarIdentity::new(HASH, NarSize::new(size)),
-            ChunkProfile::MinCdcHash4V1,
-        )
+    fn encoded_manifest(manifest: ChunkManifest, records: &[ChunkHash]) -> Vec<u8> {
+        let mut content = Vec::new();
+        write_manifest_header(&mut content, manifest).unwrap();
+        let mut end = 0_u64;
+        records.iter().enumerate().for_each(|(index, hash)| {
+            end += if index + 1 == records.len() {
+                manifest.identity().size().get() - end
+            } else {
+                manifest.profile().min_size()
+            };
+            content.extend_from_slice(&end.to_le_bytes());
+            content.extend_from_slice(&hash.bytes());
+        });
+        let checksum = Sha256::digest(&content);
+        content.extend_from_slice(&checksum);
+        content
     }
 
     #[test]
-    fn manifest_round_trips_repeated_chunk_hashes() {
+    fn manifest_round_trips_without_retaining_records() {
         let hash = ChunkHash::from_digest([9; 32]);
-        let mut manifest = manifest(8_200);
-        manifest.push_chunk(8_192, hash).unwrap();
-        manifest.push_chunk(8_200, hash).unwrap();
-        let manifest = manifest.finish().unwrap();
-        let decoded = ChunkManifest::decode(&manifest.encode().unwrap()).unwrap();
+        let mut records = Vec::new();
+        let mut builder =
+            ManifestBuilder::new(identity(8_200), ChunkProfile::MinCdcHash4V1, &mut records);
+        builder
+            .append(super::ChunkDescriptor::new(8_192, hash))
+            .unwrap();
+        builder
+            .append(super::ChunkDescriptor::new(8_200, hash))
+            .unwrap();
+        let (_, manifest) = builder.finish().unwrap();
+        let decoded = ChunkManifest::decode(&encoded_manifest(manifest, &[hash, hash])).unwrap();
         assert_eq!(decoded, manifest);
-        assert_eq!(decoded.identity(), manifest.identity());
-        assert_eq!(decoded.profile(), ChunkProfile::MinCdcHash4V1);
-        assert_eq!(decoded.chunks()[0].end(), 8_192);
-        assert_eq!(decoded.chunks()[0].hash(), hash);
+        assert_eq!(decoded.chunk_count(), 2);
     }
 
     #[test]
     fn manifest_rejects_bad_checksum_and_trailing_bytes() {
         let hash = ChunkHash::from_digest([9; 32]);
-        let mut manifest = manifest(8);
-        manifest.push_chunk(8, hash).unwrap();
-        let manifest = manifest.finish().unwrap();
-        let encoded = manifest.encode().unwrap();
+        let manifest = ChunkManifest::new(identity(8), ChunkProfile::MinCdcHash4V1, 1);
+        let encoded = encoded_manifest(manifest, &[hash]);
         let mut corrupt = encoded.clone();
         corrupt[20] ^= 1;
         assert_eq!(
@@ -376,7 +563,6 @@ mod tests {
         position: usize,
         fragment: usize,
     }
-
     impl<'a> FragmentedReader<'a> {
         fn new(input: &'a [u8], fragment: usize) -> Self {
             Self {
@@ -386,7 +572,6 @@ mod tests {
             }
         }
     }
-
     impl std::io::Read for FragmentedReader<'_> {
         fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
             if self.position == self.input.len() {

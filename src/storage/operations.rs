@@ -511,11 +511,14 @@ impl Storage {
             return Err(StorageError::UploadTooLarge);
         }
         let reservation = self.empty_staging_reservation(policy.min_free_bytes)?;
-        let mut destination: ChunkingWriter<'_> = self.chunk_store.begin_ingest_with_reservation(
-            ChunkProfile::MinCdcHash4V1,
-            reservation,
-            policy.min_free_bytes,
-        );
+        let mut destination: ChunkingWriter<'_> = self
+            .chunk_store
+            .begin_ingest_with_reservation(
+                ChunkProfile::MinCdcHash4V1,
+                reservation,
+                policy.min_free_bytes,
+            )
+            .map_err(storage_error_for_chunk_store)?;
         let received = receive_uploaded_nar(
             source,
             name,
