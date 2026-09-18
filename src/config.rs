@@ -6,7 +6,7 @@ use std::{
 
 use clap::Args;
 use clap::ValueEnum;
-use narjar::object::WireEncoding;
+use narjar::{object::WireEncoding, storage::StorageBackend};
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
@@ -19,6 +19,7 @@ pub(crate) struct ServeConfig {
     pub(crate) shutdown_grace_seconds: NonZeroU64,
     pub(crate) io_timeout_seconds: NonZeroU64,
     pub(crate) egress_compression: WireEncoding,
+    pub(crate) storage_backend: StorageBackend,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -26,6 +27,21 @@ enum EgressCompression {
     None,
     Zstd,
     Xz,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum StorageBackendOption {
+    Flat,
+    Chunked,
+}
+
+impl From<StorageBackendOption> for StorageBackend {
+    fn from(backend: StorageBackendOption) -> Self {
+        match backend {
+            StorageBackendOption::Flat => Self::Flat,
+            StorageBackendOption::Chunked => Self::Chunked,
+        }
+    }
 }
 
 impl From<EgressCompression> for WireEncoding {
@@ -71,6 +87,13 @@ pub(crate) struct ServeArgs {
         default_value = "none"
     )]
     egress_compression: EgressCompression,
+    #[arg(
+        long,
+        env = "NARJAR_STORAGE_BACKEND",
+        value_enum,
+        default_value = "flat"
+    )]
+    storage_backend: StorageBackendOption,
 }
 
 impl From<ServeArgs> for ServeConfig {
@@ -85,6 +108,7 @@ impl From<ServeArgs> for ServeConfig {
             shutdown_grace_seconds: args.shutdown_grace_seconds,
             io_timeout_seconds: args.io_timeout_seconds,
             egress_compression: args.egress_compression.into(),
+            storage_backend: args.storage_backend.into(),
         }
     }
 }

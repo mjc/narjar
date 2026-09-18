@@ -17,12 +17,16 @@ use super::{
         ChunkHash, ChunkManifest, ChunkProfile, MANIFEST_CHECKSUM_BYTES, MANIFEST_HEADER_BYTES,
         MANIFEST_RECORD_BYTES, ManifestError, ManifestReader, write_manifest_header,
     },
-    fs::{ensure_directory_at, files_equal_at, hard_link_at, open_at, open_regular_at, unlink_at},
+    fs::{
+        ensure_directory_at, files_equal_at, hard_link_at, open_at, open_regular_at,
+        read_dir_names, unlink_at,
+    },
     publication::{StagingReservation, StorageError},
 };
 
 const CHUNK_TEMP_PREFIX: &str = "chunk";
 const MANIFEST_TEMP_PREFIX: &str = "manifest";
+pub(crate) const MAX_CHUNK_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -34,13 +38,15 @@ pub(crate) struct ChunkStore {
 
 impl ChunkStore {
     pub(crate) fn initialize(root: &File) -> io::Result<Self> {
+        let manifests = ensure_directory_at(
+            root,
+            OsStr::new(MANIFEST_DIRECTORY),
+            "chunk manifest directory",
+        )?;
+        remove_abandoned_manifest_temps(&manifests)?;
         Ok(Self {
             chunks: ensure_directory_at(root, OsStr::new(CHUNK_DIRECTORY), "chunk directory")?,
-            manifests: ensure_directory_at(
-                root,
-                OsStr::new(MANIFEST_DIRECTORY),
-                "chunk manifest directory",
-            )?,
+            manifests,
         })
     }
 
@@ -52,7 +58,9 @@ impl ChunkStore {
     ) -> Result<ChunkManifest, ChunkStoreError> {
         let mut writer = self.begin_ingest(profile)?;
         io::copy(&mut source, &mut writer)?;
-        writer.finish(identity)
+        writer
+            .finish(identity)
+            .map(|completed| completed.manifest())
     }
 
     pub(crate) fn begin_ingest(
@@ -121,6 +129,43 @@ impl ChunkStore {
         }
     }
 
+    pub(crate) fn manifest_identity(
+        &self,
+        hash: NarHash,
+    ) -> Result<Option<super::chunked::ChunkManifest>, ChunkStoreError> {
+        let Some(file) = self.open_manifest(hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            ManifestReader::new(file, MAX_CHUNK_MANIFEST_BYTES)?.manifest(),
+        ))
+    }
+
+    pub(crate) fn open_reader(
+        &self,
+        hash: NarHash,
+        range: Range<u64>,
+        max_manifest_bytes: u64,
+    ) -> Result<ChunkedNarReader<'_>, ChunkStoreError> {
+        let manifest_file = self
+            .open_manifest(hash)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let manifest = ManifestReader::new(manifest_file, max_manifest_bytes)?;
+        let identity = manifest.manifest().identity();
+        if identity.hash() != hash {
+            return Err(ChunkStoreError::Manifest(ManifestError::InvalidHeader));
+        }
+        validate_range(&manifest.manifest(), &range)?;
+        Ok(ChunkedNarReader {
+            store: self,
+            manifest: Some(manifest),
+            range_cursor: range.start,
+            range_end: range.end,
+            next_chunk_start: 0,
+            current_chunk: None,
+        })
+    }
+
     pub(crate) fn read_range<W: Write>(
         &self,
         hash: NarHash,
@@ -128,15 +173,9 @@ impl ChunkStore {
         max_manifest_bytes: u64,
         destination: &mut W,
     ) -> Result<(), ChunkStoreError> {
-        let manifest_file = self
-            .open_manifest(hash)?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        let reader = ManifestReader::new(manifest_file, max_manifest_bytes)?;
-        let manifest = reader.manifest();
-        if manifest.identity().hash() != hash {
-            return Err(ChunkStoreError::Manifest(ManifestError::InvalidHeader));
-        }
-        write_manifest_range(self, reader, range, destination)
+        let mut reader = self.open_reader(hash, range, max_manifest_bytes)?;
+        io::copy(&mut reader, destination)?;
+        Ok(())
     }
 
     fn store_chunk(&self, hash: ChunkHash, bytes: &[u8]) -> io::Result<()> {
@@ -153,32 +192,140 @@ impl ChunkStore {
     }
 }
 
-fn write_manifest_range<W: Write>(
-    store: &ChunkStore,
-    reader: ManifestReader<File>,
-    range: Range<u64>,
-    destination: &mut W,
-) -> Result<(), ChunkStoreError> {
-    validate_range(&reader.manifest(), &range)?;
-    let mut chunk_start = 0_u64;
-    reader.read_records(|chunk| {
-        let current_start = chunk_start;
-        chunk_start = chunk.end();
-        if !(range.start < chunk.end() && range.end > current_start) {
-            return Ok(());
+pub(crate) struct ChunkedNarReader<'store> {
+    store: &'store ChunkStore,
+    manifest: Option<ManifestReader<File>>,
+    range_cursor: u64,
+    range_end: u64,
+    next_chunk_start: u64,
+    current_chunk: Option<LoadedChunk>,
+}
+
+struct LoadedChunk {
+    bytes: Vec<u8>,
+    position: usize,
+    end: u64,
+}
+
+impl ChunkedNarReader<'_> {
+    fn load_next_overlapping_chunk(&mut self) -> io::Result<bool> {
+        loop {
+            let Some(manifest) = self.manifest.as_mut() else {
+                return Ok(false);
+            };
+            let Some(descriptor) = manifest.next_record().map_err(io_for_manifest_error)? else {
+                let manifest = self.manifest.take().expect("manifest reader is present");
+                manifest.finish_remaining().map_err(io_for_manifest_error)?;
+                return Ok(false);
+            };
+            let chunk_start = self.next_chunk_start;
+            self.next_chunk_start = descriptor.end();
+            if self.range_cursor >= descriptor.end() || self.range_end <= chunk_start {
+                continue;
+            }
+            let bytes = read_verified_chunk(
+                self.store,
+                descriptor,
+                chunk_start,
+                self.range_cursor,
+                self.range_end,
+            )?;
+            self.current_chunk = Some(LoadedChunk {
+                bytes,
+                position: 0,
+                end: self.range_end.min(descriptor.end()),
+            });
+            return Ok(true);
         }
-        let chunk_start = current_start;
-        let chunk_end = chunk.end();
-        let read_start = range.start.max(chunk_start);
-        let read_end = range.end.min(chunk_end);
-        let mut file = store
-            .open_chunk(chunk.hash())?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        file.seek(SeekFrom::Start(read_start - chunk_start))?;
-        io::copy(&mut file.take(read_end - read_start), destination)?;
-        Ok(())
-    })?;
-    Ok(())
+    }
+
+    fn finish_manifest(&mut self) -> io::Result<()> {
+        let Some(manifest) = self.manifest.take() else {
+            return Ok(());
+        };
+        manifest.finish_remaining().map_err(io_for_manifest_error)
+    }
+}
+
+impl Read for ChunkedNarReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if let Some(chunk) = self.current_chunk.as_mut() {
+                let remaining = &chunk.bytes[chunk.position..];
+                let copied = remaining.len().min(output.len());
+                output[..copied].copy_from_slice(&remaining[..copied]);
+                chunk.position += copied;
+                if chunk.position == chunk.bytes.len() {
+                    self.range_cursor = chunk.end;
+                    self.current_chunk = None;
+                }
+                return Ok(copied);
+            }
+            if self.range_cursor == self.range_end {
+                self.finish_manifest()?;
+                return Ok(0);
+            }
+            if !self.load_next_overlapping_chunk()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "chunk manifest ended before the requested range",
+                ));
+            }
+        }
+    }
+}
+
+fn read_verified_chunk(
+    store: &ChunkStore,
+    descriptor: super::chunked::ChunkDescriptor,
+    chunk_start: u64,
+    range_start: u64,
+    range_end: u64,
+) -> io::Result<Vec<u8>> {
+    let chunk_length = descriptor
+        .end()
+        .checked_sub(chunk_start)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end moved backwards"))?;
+    let mut file = store
+        .open_chunk(descriptor.hash())?
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+    let mut chunk = Vec::new();
+    (&mut file).take(chunk_length).read_to_end(&mut chunk)?;
+    if chunk.len() as u64 != chunk_length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "chunk ended before its manifest length",
+        ));
+    }
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk contains bytes beyond its manifest length",
+        ));
+    }
+    let actual_hash = ChunkHash::from_digest(Sha256::digest(&chunk).into());
+    if actual_hash != descriptor.hash() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk hash does not match its manifest record",
+        ));
+    }
+    let start = usize::try_from(range_start.max(chunk_start) - chunk_start)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "chunk offset is too large"))?;
+    let end = usize::try_from(range_end.min(descriptor.end()) - chunk_start)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "chunk offset is too large"))?;
+    Ok(chunk[start..end].to_vec())
+}
+
+fn io_for_manifest_error(error: ManifestError) -> io::Error {
+    match error {
+        ManifestError::Io(error) => error,
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
+    }
 }
 
 fn validate_range(manifest: &ChunkManifest, range: &Range<u64>) -> Result<(), ChunkStoreError> {
@@ -207,11 +354,31 @@ pub(crate) struct ChunkingWriter<'store> {
     min_free_bytes: u64,
 }
 
+pub(crate) struct CompletedChunkedIngest {
+    manifest: ChunkManifest,
+    outcome: super::publication::PublishOutcome,
+    reservation: Option<StagingReservation>,
+}
+
+impl CompletedChunkedIngest {
+    pub(crate) const fn manifest(&self) -> ChunkManifest {
+        self.manifest
+    }
+
+    pub(crate) const fn outcome(&self) -> super::publication::PublishOutcome {
+        self.outcome
+    }
+
+    pub(crate) fn release_reservation(self) {
+        drop(self.reservation);
+    }
+}
+
 impl ChunkingWriter<'_> {
     pub(crate) fn finish(
         mut self,
         expected: NarIdentity,
-    ) -> Result<ChunkManifest, ChunkStoreError> {
+    ) -> Result<CompletedChunkedIngest, ChunkStoreError> {
         self.publish_pending_chunk()?;
         let actual = NarIdentity::new(
             NarHash::from_digest(self.hasher.clone().finalize().into()),
@@ -247,15 +414,19 @@ impl ChunkingWriter<'_> {
             .and_then(|bytes| bytes.checked_add(MANIFEST_CHECKSUM_BYTES))
             .ok_or(ChunkStoreError::Manifest(ManifestError::LengthOverflow))?;
         self.reserve_before_materialization(&self.store.manifests, manifest_bytes as u64)?;
-        self.publish_manifest_from_records(&manifest)?;
+        let outcome = self.publish_manifest_from_records(&manifest)?;
         self.release_materialized_bytes(manifest_bytes as u64);
-        Ok(manifest)
+        Ok(CompletedChunkedIngest {
+            manifest,
+            outcome,
+            reservation: self.reservation.take(),
+        })
     }
 
     fn publish_manifest_from_records(
         &mut self,
         manifest: &ChunkManifest,
-    ) -> Result<(), ChunkStoreError> {
+    ) -> Result<super::publication::PublishOutcome, ChunkStoreError> {
         self.record_file.sync_all()?;
         self.record_file.seek(SeekFrom::Start(0))?;
         let temporary_name = temporary_name(MANIFEST_TEMP_PREFIX);
@@ -273,12 +444,12 @@ impl ChunkingWriter<'_> {
         };
         temporary.write_all(&checksum)?;
         temporary.sync_all()?;
-        publish_temporary_file(
+        let outcome = publish_temporary_file(
             &self.store.manifests,
             &temporary_name,
             &manifest_name(manifest.identity().hash()),
         )?;
-        Ok(())
+        Ok(outcome)
     }
 
     fn publish_complete_chunks(&mut self) -> io::Result<()> {
@@ -449,12 +620,14 @@ fn publish_temporary_file(
     directory: &File,
     temporary_name: &OsStr,
     name: &OsStr,
-) -> io::Result<()> {
+) -> io::Result<super::publication::PublishOutcome> {
     let result = match hard_link_at(directory, temporary_name, directory, name) {
-        Ok(()) => directory.sync_all(),
+        Ok(()) => directory
+            .sync_all()
+            .map(|()| super::publication::PublishOutcome::Created),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             if files_equal_at(directory, temporary_name, directory, name)? {
-                Ok(())
+                Ok(super::publication::PublishOutcome::Identical)
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -466,9 +639,9 @@ fn publish_temporary_file(
     };
     let cleanup = unlink_at(directory, temporary_name);
     match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(outcome), Ok(())) => Ok(outcome),
         (Err(error), Ok(())) | (Err(error), Err(_)) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
     }
 }
 
@@ -490,6 +663,24 @@ fn temporary_name(prefix: &str) -> OsString {
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     )
     .into()
+}
+
+fn remove_abandoned_manifest_temps(directory: &File) -> io::Result<()> {
+    let removed = read_dir_names(directory)?
+        .into_iter()
+        .try_fold(false, |removed, name| {
+            let is_temporary = name
+                .to_str()
+                .is_some_and(|name| name.starts_with("manifest-"));
+            if is_temporary {
+                unlink_at(directory, &name)?;
+            }
+            Ok::<_, io::Error>(removed || is_temporary)
+        })?;
+    if removed {
+        directory.sync_all()?;
+    }
+    Ok(())
 }
 
 fn io_for_storage_error(error: StorageError) -> io::Error {
@@ -545,9 +736,38 @@ impl From<ManifestError> for ChunkStoreError {
     }
 }
 
+impl std::fmt::Display for ChunkStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRange { start, end, size } => {
+                write!(formatter, "range {start}..{end} is outside NAR size {size}")
+            }
+            Self::Io(error) => error.fmt(formatter),
+            Self::Manifest(error) => error.fmt(formatter),
+            Self::NarHashMismatch { .. } => formatter.write_str("chunked NAR hash mismatch"),
+            Self::NarSizeMismatch { .. } => formatter.write_str("chunked NAR size mismatch"),
+        }
+    }
+}
+
+impl std::error::Error for ChunkStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Manifest(error) => Some(error),
+            Self::InvalidRange { .. }
+            | Self::NarHashMismatch { .. }
+            | Self::NarSizeMismatch { .. } => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{
+        fs,
+        io::{Cursor, Read},
+    };
 
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
@@ -623,5 +843,35 @@ mod tests {
             store.store_nar(Cursor::new(input), identity, ChunkProfile::MinCdcHash4V1),
             Err(ChunkStoreError::NarHashMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn chunk_reader_rejects_a_corrupt_chunk() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let hash = NarHash::from_digest(Sha256::digest(&input).into());
+        let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
+        store
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V1)
+            .unwrap();
+
+        let shard = fs::read_dir(directory.path().join(super::super::CHUNK_DIRECTORY))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let chunk = fs::read_dir(shard).unwrap().next().unwrap().unwrap().path();
+        let mut bytes = fs::read(&chunk).unwrap();
+        bytes[0] ^= 1;
+        fs::write(chunk, bytes).unwrap();
+
+        let mut reader = store
+            .open_reader(hash, 0..identity.size().get(), 1_000_000)
+            .unwrap();
+        let mut output = Vec::new();
+        assert!(reader.read_to_end(&mut output).is_err());
     }
 }

@@ -18,8 +18,8 @@ use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sy
 use super::ids::nix32_sha256;
 use super::publication::{Layout, PublishBoundary, PublishTarget};
 use super::{
-    CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageError, StoreHash,
-    capacity_error_kind,
+    CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageBackend,
+    StorageError, StoreHash, capacity_error_kind,
 };
 use crate::narinfo::{CompressedNarExpectation, NarEncoding};
 use crate::object::{
@@ -79,6 +79,64 @@ fn chunked_ingestion_publishes_a_verified_manifest() {
     );
     assert!(storage.chunk_store.open_manifest(hash).unwrap().is_some());
     assert!(manifest.chunk_count() > 0);
+}
+
+#[test]
+fn chunked_backend_routes_the_complete_nar_publication() {
+    let directory = TestDir::new();
+    let storage = Storage::initialize_with_backend(
+        &Directory::open(directory.path()).unwrap(),
+        StorageBackend::Chunked,
+    )
+    .unwrap();
+    let raw = vec![b'c'; 100_000];
+    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    let name = NarFileName::raw(hash);
+    let policy = super::NarUploadPolicy::new(raw.len() as u64, 0);
+
+    assert_eq!(
+        storage
+            .publish_nar(name, Cursor::new(&raw), raw.len() as u64, policy)
+            .unwrap(),
+        PublishOutcome::Created
+    );
+
+    let opened = storage
+        .open_nar_range(name, 12_345..54_321)
+        .unwrap()
+        .unwrap();
+    let mut reconstructed = Vec::new();
+    opened
+        .body
+        .take(54_321 - 12_345)
+        .read_to_end(&mut reconstructed)
+        .unwrap();
+    assert_eq!(reconstructed, raw[12_345..54_321]);
+
+    let (compressed_name, compressed_size) = storage
+        .compressed_representation_for_test(
+            NarIdentity::new(hash, (raw.len() as u64).into()),
+            CompressionCodec::Zstd,
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .open_nar_encoded(compressed_name)
+            .unwrap()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len(),
+        compressed_size.get()
+    );
+
+    assert_eq!(
+        storage
+            .publish_nar(name, Cursor::new(&raw), raw.len() as u64, policy)
+            .unwrap(),
+        PublishOutcome::Identical
+    );
 }
 
 fn compressed_bytes(encoding: NarEncoding, raw: &[u8]) -> Vec<u8> {

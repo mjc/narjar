@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
-    io::{Cursor, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
 };
 
@@ -17,6 +17,7 @@ use crate::object::{
 };
 
 use super::EGRESS_RECEIPT_DIRECTORY;
+use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
 use super::compression::{
     CapacityCheckedStagingWriter, encode_raw_nar, encoded_file_matches, nar_file_size_matches,
 };
@@ -27,24 +28,62 @@ use super::publication::{
     NarUploadPolicy, PublishOutcome, PublishTarget, StorageError, TemporaryFile,
 };
 use super::recovery::PublicationState;
-use super::state::Storage;
+use super::state::{Storage, StorageBackend};
 
 const EGRESS_RECEIPT_VERSION: u8 = 1;
 pub(super) const MAX_EGRESS_RECEIPT_BYTES: u64 = 256;
 
 pub(crate) struct StoredNar<'storage> {
     storage: &'storage Storage,
-    pub(super) file: File,
+    source: StoredNarSource<'storage>,
     identity: NarIdentity,
 }
 
-impl StoredNar<'_> {
+enum StoredNarSource<'storage> {
+    Flat(File),
+    Chunked(&'storage ChunkStore),
+}
+
+enum StoredNarReader<'storage> {
+    Flat(File),
+    Chunked(Box<ChunkedNarReader<'storage>>),
+}
+
+impl Read for StoredNarReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Flat(file) => file.read(buffer),
+            Self::Chunked(reader) => reader.read(buffer),
+        }
+    }
+}
+
+impl<'storage> StoredNar<'storage> {
     pub(crate) fn identity(&self) -> NarIdentity {
         self.identity
     }
 
     pub(super) fn storage(&self) -> &Storage {
         self.storage
+    }
+
+    fn reader(&self) -> Result<StoredNarReader<'storage>, StorageError> {
+        match &self.source {
+            StoredNarSource::Flat(file) => {
+                let mut file = file.try_clone()?;
+                file.seek(SeekFrom::Start(0))?;
+                Ok(StoredNarReader::Flat(file))
+            }
+            StoredNarSource::Chunked(store) => Ok(StoredNarReader::Chunked(Box::new(
+                store
+                    .open_reader(
+                        self.identity.hash(),
+                        0..self.identity.size().get(),
+                        MAX_CHUNK_MANIFEST_BYTES,
+                    )
+                    .map_err(|error| StorageError::Io(io::Error::other(error)))?,
+            ))),
+        }
     }
 }
 
@@ -243,7 +282,7 @@ impl<'storage> StreamingDerivative<'storage> {
         #[cfg(test)]
         storage.egress_generations.fetch_add(1, Ordering::Relaxed);
         let output = encode_canonical_raw_nar_into_capacity_checked_staging_file(
-            &raw.file,
+            raw,
             slot.codec(),
             temporary.writer(),
             &mut reservation,
@@ -261,14 +300,15 @@ impl<'storage> StreamingDerivative<'storage> {
 }
 
 fn encode_canonical_raw_nar_into_capacity_checked_staging_file(
-    raw: &File,
+    raw: &StoredNar<'_>,
     codec: CompressionCodec,
     temporary: &mut File,
     reservation: &mut super::publication::StagingReservation,
     min_free_bytes: u64,
 ) -> Result<EncodedIdentity, StorageError> {
     let mut destination = CapacityCheckedStagingWriter::new(temporary, reservation, min_free_bytes);
-    let output = encode_raw_nar(raw, codec, &mut destination)?;
+    let source = raw.reader()?;
+    let output = encode_raw_nar(source, codec, &mut destination)?;
     destination.flush()?;
     Ok(EncodedIdentity::new(codec, output.hash, output.size))
 }
@@ -377,15 +417,33 @@ impl Storage {
                 .ok_or(StorageError::NarMismatch)?
                 .decoded_identity(),
         };
-        let file = self
-            .open_nar(identity.hash())?
-            .ok_or(StorageError::MissingNar)?;
-        if !nar_file_size_matches(&file, identity.size().get())? {
-            return Err(StorageError::NarMismatch);
-        }
+        let source = match self.backend {
+            StorageBackend::Flat => {
+                let file = self
+                    .open_nar(identity.hash())?
+                    .ok_or(StorageError::MissingNar)?;
+                if !nar_file_size_matches(&file, identity.size().get())? {
+                    return Err(StorageError::NarMismatch);
+                }
+                StoredNarSource::Flat(file)
+            }
+            StorageBackend::Chunked => {
+                let Some(manifest) = self
+                    .chunk_store
+                    .manifest_identity(identity.hash())
+                    .map_err(|error| StorageError::Io(io::Error::other(error)))?
+                else {
+                    return Err(StorageError::MissingNar);
+                };
+                if manifest.identity() != identity {
+                    return Err(StorageError::NarMismatch);
+                }
+                StoredNarSource::Chunked(&self.chunk_store)
+            }
+        };
         Ok(StoredNar {
             storage: self,
-            file,
+            source,
             identity,
         })
     }
@@ -608,7 +666,7 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let stored = StoredNar {
             storage: self,
-            file: raw.try_clone()?,
+            source: StoredNarSource::Flat(raw.try_clone()?),
             identity,
         };
         self.materialize_compressed_nar(

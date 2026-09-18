@@ -31,8 +31,9 @@ pub use ids::{InvalidObjectId, StoreHash};
 pub use publication::{
     NarUploadPolicy, PublishOutcome, PublishedPair, StagingReservation, StorageError,
 };
-pub use state::Storage;
+pub use state::{Storage, StorageBackend};
 
+pub(crate) use operations::NarReadBody;
 pub use operations::{NarInfoDeletion, NarMatch, StorageReadiness};
 pub use reconcile::{CleanupOutcome, ReconcileClass, ReconcileEntry, ReconcileReport};
 

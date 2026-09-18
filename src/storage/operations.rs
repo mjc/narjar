@@ -20,7 +20,7 @@ use crate::object::{EncodedIdentity, NarFileName, NarHash, WireEncoding};
 use super::{
     EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY,
     TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
-    chunk_store::{ChunkStoreError, ChunkingWriter},
+    chunk_store::{ChunkStoreError, ChunkedNarReader, ChunkingWriter, MAX_CHUNK_MANIFEST_BYTES},
     chunked::{ChunkManifest, ChunkProfile},
     compression::{
         IngestionReceipt, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
@@ -43,7 +43,7 @@ use super::{
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction, RecoveryState},
-    state::Storage,
+    state::{Storage, StorageBackend},
 };
 
 #[cfg(test)]
@@ -184,6 +184,24 @@ impl StorageReadiness {
 pub enum NarInfoDeletion {
     Deleted,
     Absent,
+}
+
+pub(crate) enum NarReadBody<'storage> {
+    File(File),
+    Chunked(Box<ChunkedNarReader<'storage>>),
+}
+
+pub(crate) struct OpenedNar<'storage> {
+    pub(crate) body: NarReadBody<'storage>,
+}
+
+impl Read for NarReadBody<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buffer),
+            Self::Chunked(reader) => reader.read(buffer),
+        }
+    }
 }
 
 pub(super) struct OwnedTemporary<'storage> {
@@ -351,6 +369,13 @@ impl CacheInfoFields {
 
 impl Storage {
     pub fn initialize(root: &Directory) -> Result<Self, StorageError> {
+        Self::initialize_with_backend(root, StorageBackend::Flat)
+    }
+
+    pub fn initialize_with_backend(
+        root: &Directory,
+        backend: StorageBackend,
+    ) -> Result<Self, StorageError> {
         #[cfg(test)]
         let layout = Layout::new(root.path.clone());
         let root_directory = root.file.try_clone()?;
@@ -415,6 +440,7 @@ impl Storage {
             layout,
             root: root_directory,
             chunk_store,
+            backend,
             recovery,
             publication_locks: Mutex::new(HashMap::new()),
             staging_budget: Arc::new(Mutex::new(Default::default())),
@@ -526,9 +552,15 @@ impl Storage {
             policy.max_bytes,
             &mut destination,
         )?;
-        destination
+        let completed = destination
             .finish(received.identity())
-            .map_err(storage_error_for_chunk_store)
+            .map_err(storage_error_for_chunk_store)?;
+        if let Some(receipt) = received.ingestion_receipt() {
+            self.publish_ingestion_receipt(receipt)?;
+        }
+        let manifest = completed.manifest();
+        completed.release_reservation();
+        Ok(manifest)
     }
 
     pub fn publish_nar_with_staging(
@@ -539,9 +571,54 @@ impl Storage {
         policy: NarUploadPolicy,
         staging: StagingReservation,
     ) -> Result<PublishOutcome, StorageError> {
-        let receiving = self.begin_upload(name, expected_length, policy, staging)?;
-        let complete = receiving.receive(source)?;
-        complete.commit()
+        match self.backend {
+            StorageBackend::Flat => {
+                let receiving = self.begin_upload(name, expected_length, policy, staging)?;
+                let complete = receiving.receive(source)?;
+                complete.commit()
+            }
+            StorageBackend::Chunked => self.publish_chunked_nar_with_staging(
+                name,
+                source,
+                expected_length,
+                policy,
+                staging,
+            ),
+        }
+    }
+
+    fn publish_chunked_nar_with_staging(
+        &self,
+        name: NarFileName,
+        source: impl Read,
+        expected_length: u64,
+        policy: NarUploadPolicy,
+        reservation: StagingReservation,
+    ) -> Result<PublishOutcome, StorageError> {
+        let mut destination = self
+            .chunk_store
+            .begin_ingest_with_reservation(
+                ChunkProfile::MinCdcHash4V1,
+                reservation,
+                policy.min_free_bytes,
+            )
+            .map_err(storage_error_for_chunk_store)?;
+        let received = receive_uploaded_nar(
+            source,
+            name,
+            expected_length,
+            policy.max_bytes,
+            &mut destination,
+        )?;
+        let completed = destination
+            .finish(received.identity())
+            .map_err(storage_error_for_chunk_store)?;
+        if let Some(receipt) = received.ingestion_receipt() {
+            self.publish_ingestion_receipt(receipt)?;
+        }
+        let outcome = completed.outcome();
+        completed.release_reservation();
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -639,6 +716,50 @@ impl Storage {
     pub fn open_nar_encoded(&self, name: NarFileName) -> Result<Option<File>, StorageError> {
         let directory = self.nar_directory()?;
         open_optional_at(&directory, &name.os_string())
+    }
+
+    pub(crate) fn nar_size(&self, name: NarFileName) -> Result<Option<u64>, StorageError> {
+        if let (StorageBackend::Chunked, Some(hash)) = (self.backend, name.raw_hash()) {
+            return Ok(self
+                .chunk_store
+                .manifest_identity(hash)
+                .map_err(storage_error_for_chunk_store)?
+                .map(|manifest| manifest.identity().size().get()));
+        }
+        let Some(file) = self.open_nar_encoded(name)? else {
+            return Ok(None);
+        };
+        Ok(Some(file.metadata()?.len()))
+    }
+
+    pub(crate) fn open_nar_range(
+        &self,
+        name: NarFileName,
+        range: std::ops::Range<u64>,
+    ) -> Result<Option<OpenedNar<'_>>, StorageError> {
+        if let (StorageBackend::Chunked, Some(hash)) = (self.backend, name.raw_hash()) {
+            if self
+                .chunk_store
+                .manifest_identity(hash)
+                .map_err(storage_error_for_chunk_store)?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let reader = self
+                .chunk_store
+                .open_reader(hash, range, MAX_CHUNK_MANIFEST_BYTES)
+                .map_err(storage_error_for_chunk_store)?;
+            return Ok(Some(OpenedNar {
+                body: NarReadBody::Chunked(Box::new(reader)),
+            }));
+        }
+        let Some(file) = self.open_nar_encoded(name)? else {
+            return Ok(None);
+        };
+        Ok(Some(OpenedNar {
+            body: NarReadBody::File(file),
+        }))
     }
 
     pub fn open_narinfo(&self, store: &StoreHash) -> Result<Option<File>, StorageError> {

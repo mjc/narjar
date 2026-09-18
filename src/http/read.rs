@@ -9,7 +9,7 @@ use crate::{
     metrics::{Metrics, RequestGuard, RequestMethod, RequestRoute},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::NarFileName,
-    storage::{NarMatch, Storage, StorageReadiness, StoreHash},
+    storage::{NarMatch, NarReadBody, Storage, StorageReadiness, StoreHash},
 };
 
 use super::write::unauthorized;
@@ -39,13 +39,14 @@ pub(super) fn internal_error(guard: &RequestGuard<'_>, request: Request) -> Opti
     send_response(guard, request, 500, Response::empty(StatusCode(500)), 0)
 }
 
-fn nar_response(
+fn nar_response<R>(
     status: StatusCode,
     content_length: usize,
     visibility: ReadVisibility,
-) -> Response<io::Empty> {
+    body: R,
+) -> Response<R> {
     cache_policy(
-        Response::new(status, io::empty(), content_length)
+        Response::new(status, body, content_length)
             .with_header(header("Content-Type", "application/x-nix-nar")),
         visibility,
         IMMUTABLE_CACHE_CONTROL,
@@ -194,13 +195,10 @@ fn respond_nar(
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
-    let file = match storage.open_nar_encoded(name) {
-        Ok(Some(file)) => file,
+    let length = match storage.nar_size(name) {
+        Ok(Some(length)) => length,
         Ok(None) => return not_found(guard, request),
         Err(_) => return internal_error(guard, request),
-    };
-    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
-        return internal_error(guard, request);
     };
 
     match requested_range(&request, length) {
@@ -208,26 +206,62 @@ fn respond_nar(
             let Ok(content_length) = usize::try_from(length) else {
                 return internal_error(guard, request);
             };
-            let response = nar_response(StatusCode(200), content_length, visibility);
-            send_file_response(
-                guard,
-                request,
-                200,
-                response,
-                file,
-                0,
-                content_length as u64,
-            )
+            let opened = match storage.open_nar_range(name, 0..length) {
+                Ok(Some(opened)) => opened,
+                Ok(None) => return not_found(guard, request),
+                Err(_) => return internal_error(guard, request),
+            };
+            match opened.body {
+                NarReadBody::File(file) => {
+                    let response =
+                        nar_response(StatusCode(200), content_length, visibility, io::empty());
+                    send_file_response(
+                        guard,
+                        request,
+                        200,
+                        response,
+                        file,
+                        0,
+                        content_length as u64,
+                    )
+                }
+                NarReadBody::Chunked(reader) => {
+                    let response =
+                        nar_response(StatusCode(200), content_length, visibility, reader);
+                    send_response(guard, request, 200, response, length)
+                }
+            }
         }
         RequestedRange::Partial { start, end } => {
             let response_length = end - start + 1;
             let Ok(content_length) = usize::try_from(response_length) else {
                 return internal_error(guard, request);
             };
-            let response = nar_response(StatusCode(206), content_length, visibility).with_header(
-                Header::owned("Content-Range", format!("bytes {start}-{end}/{length}")),
-            );
-            send_file_response(guard, request, 206, response, file, start, response_length)
+            let opened = match storage.open_nar_range(name, start..end + 1) {
+                Ok(Some(opened)) => opened,
+                Ok(None) => return not_found(guard, request),
+                Err(_) => return internal_error(guard, request),
+            };
+            match opened.body {
+                NarReadBody::File(file) => {
+                    let response =
+                        nar_response(StatusCode(206), content_length, visibility, io::empty())
+                            .with_header(Header::owned(
+                                "Content-Range",
+                                format!("bytes {start}-{end}/{length}"),
+                            ));
+                    send_file_response(guard, request, 206, response, file, start, response_length)
+                }
+                NarReadBody::Chunked(reader) => {
+                    let response =
+                        nar_response(StatusCode(206), content_length, visibility, reader)
+                            .with_header(Header::owned(
+                                "Content-Range",
+                                format!("bytes {start}-{end}/{length}"),
+                            ));
+                    send_response(guard, request, 206, response, response_length)
+                }
+            }
         }
         RequestedRange::Unsatisfiable => {
             let response = Response::empty(StatusCode(416))

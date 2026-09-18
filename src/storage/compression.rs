@@ -267,12 +267,10 @@ impl<W: Write + ?Sized> Write for EncodedOutputHasher<'_, W> {
 }
 
 pub(super) fn encode_raw_nar(
-    source: &File,
+    mut source: impl Read,
     codec: CompressionCodec,
     destination: &mut impl Write,
 ) -> io::Result<EncodedOutput> {
-    let mut source = source.try_clone()?;
-    source.seek(SeekFrom::Start(0))?;
     let mut output = EncodedOutputHasher::new(destination);
     match codec {
         CompressionCodec::Zstd => {
@@ -342,6 +340,13 @@ impl ReceivedNar {
         match self {
             Self::Raw(identity) => *identity,
             Self::Compressed(receipt) => receipt.decoded_identity(),
+        }
+    }
+
+    pub(super) fn ingestion_receipt(&self) -> Option<IngestionReceipt> {
+        match self {
+            Self::Raw(_) => None,
+            Self::Compressed(receipt) => Some(receipt.clone()),
         }
     }
 }

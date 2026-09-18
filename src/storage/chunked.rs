@@ -130,7 +130,7 @@ impl ChunkManifest {
 pub(crate) struct ManifestReader<R> {
     reader: R,
     manifest: ChunkManifest,
-    record_count: u64,
+    records_remaining: u64,
     previous_end: u64,
     previous_length: Option<u64>,
     content_hasher: Sha256,
@@ -163,7 +163,7 @@ impl<R: Read + Seek> ManifestReader<R> {
         Ok(Self {
             reader,
             manifest,
-            record_count: manifest.chunk_count(),
+            records_remaining: manifest.chunk_count(),
             previous_end: 0,
             previous_length: None,
             content_hasher: Sha256::new_with_prefix(header),
@@ -174,29 +174,49 @@ impl<R: Read + Seek> ManifestReader<R> {
         self.manifest
     }
 
-    pub(crate) fn read_records<F>(mut self, mut visit: F) -> Result<(), ManifestError>
-    where
-        F: FnMut(ChunkDescriptor) -> Result<(), ManifestError>,
-    {
-        (0..self.record_count).try_for_each(|_| {
-            let mut bytes = [0_u8; MANIFEST_RECORD_BYTES];
-            self.reader.read_exact(&mut bytes)?;
-            self.content_hasher.update(bytes);
-            let descriptor = parse_record(&bytes)?;
-            self.validate_descriptor(descriptor)?;
-            visit(descriptor)
-        })?;
+    pub(crate) fn next_record(&mut self) -> Result<Option<ChunkDescriptor>, ManifestError> {
+        if self.records_remaining == 0 {
+            return Ok(None);
+        }
+        let mut bytes = [0_u8; MANIFEST_RECORD_BYTES];
+        self.reader.read_exact(&mut bytes)?;
+        self.content_hasher.update(bytes);
+        let descriptor = parse_record(&bytes)?;
+        self.validate_descriptor(descriptor)?;
+        self.records_remaining -= 1;
+        Ok(Some(descriptor))
+    }
 
-        if self.previous_end != self.manifest.identity().size().get() {
+    pub(crate) fn finish_remaining(self) -> Result<(), ManifestError> {
+        let mut reader = self;
+        let records_remaining = reader.records_remaining;
+        (0..records_remaining).try_for_each(|_| reader.next_record().map(|_| ()))?;
+        reader.finish()
+    }
+
+    fn finish(self) -> Result<(), ManifestError> {
+        let Self {
+            mut reader,
+            manifest,
+            records_remaining,
+            previous_end,
+            content_hasher,
+            ..
+        } = self;
+        if records_remaining != 0 {
+            return Err(ManifestError::InvalidHeader);
+        }
+
+        if previous_end != manifest.identity().size().get() {
             return Err(ManifestError::FinalSizeMismatch {
-                expected: self.manifest.identity().size().get(),
-                actual: self.previous_end,
+                expected: manifest.identity().size().get(),
+                actual: previous_end,
             });
         }
 
         let mut expected_checksum = [0_u8; MANIFEST_CHECKSUM_BYTES];
-        self.reader.read_exact(&mut expected_checksum)?;
-        (self.content_hasher.finalize().as_slice() == expected_checksum)
+        reader.read_exact(&mut expected_checksum)?;
+        (content_hasher.finalize().as_slice() == expected_checksum)
             .then_some(())
             .ok_or(ManifestError::ChecksumMismatch)
     }

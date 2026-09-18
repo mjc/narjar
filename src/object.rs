@@ -64,6 +64,10 @@ impl FileHash {
     pub(crate) const fn from_nar_hash(hash: NarHash) -> Self {
         Self(hash.0)
     }
+
+    pub(crate) const fn as_nar_hash(self) -> NarHash {
+        NarHash(self.0)
+    }
 }
 
 impl fmt::Display for FileHash {
@@ -211,6 +215,13 @@ impl NarFileName {
 
     pub const fn encoding(self) -> WireEncoding {
         self.encoding
+    }
+
+    pub(crate) const fn raw_hash(self) -> Option<NarHash> {
+        match self.encoding {
+            WireEncoding::Raw => Some(self.file_hash.as_nar_hash()),
+            WireEncoding::Xz | WireEncoding::Zstd => None,
+        }
     }
 
     pub(crate) fn os_string(self) -> OsString {

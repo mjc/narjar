@@ -11,13 +11,19 @@ use super::publication::Layout;
 use super::publication::{ProcessLock, StagingBudget};
 use super::recovery::RecoveryState;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageBackend {
+    Flat,
+    Chunked,
+}
+
 #[derive(Debug)]
 pub struct Storage {
     #[cfg(test)]
     pub(super) layout: Layout,
     pub(super) root: File,
-    #[allow(dead_code)]
     pub(super) chunk_store: ChunkStore,
+    pub(super) backend: StorageBackend,
     pub(super) recovery: RecoveryState,
     pub(super) publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     pub(super) staging_budget: Arc<Mutex<StagingBudget>>,

@@ -115,12 +115,16 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             config.data_dir.display()
         ))
     })?;
-    let storage = Arc::new(Storage::initialize(&root_directory).map_err(|error| {
-        Error::runtime(format!(
-            "cannot initialize data directory {}: {error}",
-            config.data_dir.display()
-        ))
-    })?);
+    let storage = Arc::new(
+        Storage::initialize_with_backend(&root_directory, config.storage_backend).map_err(
+            |error| {
+                Error::runtime(format!(
+                    "cannot initialize data directory {}: {error}",
+                    config.data_dir.display()
+                ))
+            },
+        )?,
+    );
     let authorizer =
         Arc::new(Authorizer::load(&root_directory).map_err(|error| {
             Error::runtime(format!("cannot load authorization policy: {error}"))

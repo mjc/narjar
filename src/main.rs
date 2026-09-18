@@ -196,6 +196,21 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_the_chunked_storage_backend() {
+        let cli = Cli::try_parse_from([
+            "narjar",
+            "serve",
+            "--data-dir",
+            "/cache",
+            "--storage-backend",
+            "chunked",
+        ])
+        .expect("chunked storage backend should parse");
+
+        assert!(matches!(cli.command, Command::Serve(_)));
+    }
+
+    #[test]
     fn push_command_accepts_parallel_copy_options() {
         let cli = Cli::try_parse_from([
             "narjar",
