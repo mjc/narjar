@@ -154,6 +154,19 @@ impl ChunkStore {
         ))
     }
 
+    pub(crate) fn validate_manifest(
+        &self,
+        hash: NarHash,
+    ) -> Result<Option<super::chunked::ChunkManifest>, ChunkStoreError> {
+        let Some(file) = self.open_manifest(hash)? else {
+            return Ok(None);
+        };
+        let reader = ManifestReader::new(file, MAX_CHUNK_MANIFEST_BYTES)?;
+        let manifest = reader.manifest();
+        reader.finish_remaining()?;
+        Ok(Some(manifest))
+    }
+
     pub(crate) fn open_reader(
         &self,
         hash: NarHash,
@@ -1178,6 +1191,35 @@ mod tests {
             .unwrap();
         let mut output = Vec::new();
         assert!(reader.read_to_end(&mut output).is_err());
+    }
+
+    #[test]
+    fn manifest_validation_rejects_a_corrupt_checksum() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let hash = NarHash::from_digest(Sha256::digest(&input).into());
+        let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
+        store
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V1)
+            .unwrap();
+
+        let manifest_path = directory
+            .path()
+            .join(super::super::MANIFEST_DIRECTORY)
+            .join(format!("{hash}.manifest"));
+        let mut bytes = fs::read(&manifest_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&manifest_path, bytes).unwrap();
+
+        assert!(matches!(
+            store.validate_manifest(hash),
+            Err(ChunkStoreError::Manifest(
+                super::super::chunked::ManifestError::ChecksumMismatch
+            ))
+        ));
     }
 
     #[test]

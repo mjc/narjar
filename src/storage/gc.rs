@@ -408,7 +408,7 @@ fn scan_chunked(
         let raw_hash = validated.decoded_identity().hash();
         let manifest = storage
             .chunk_store
-            .manifest_identity(raw_hash)
+            .validate_manifest(raw_hash)
             .map_err(chunk_store_error)?
             .ok_or_else(|| invalid(format!("missing chunk manifest for narinfo: {name_str}")))?;
         if manifest.identity() != validated.decoded_identity() {
