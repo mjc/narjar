@@ -765,7 +765,7 @@ impl Storage {
         if let (StorageBackend::Chunked, Some(hash)) = (self.backend, name.raw_hash()) {
             return Ok(self
                 .chunk_store
-                .validate_manifest(hash)
+                .manifest_identity(hash)
                 .map_err(storage_error_for_chunk_store)?
                 .map(|manifest| manifest.identity().size().get()));
         }
