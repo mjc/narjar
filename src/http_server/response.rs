@@ -5,15 +5,50 @@ use std::{
     net::TcpStream,
 };
 
-const RESPONSE_HEADERS: usize = 8;
-
 #[cfg(test)]
 thread_local! {
     pub(crate) static FORCE_PORTABLE_FILE_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct StatusCode(pub u16);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatusCode(u16);
+
+impl StatusCode {
+    pub const OK: Self = Self(200);
+    pub const CREATED: Self = Self(201);
+    pub const PARTIAL_CONTENT: Self = Self(206);
+    pub const BAD_REQUEST: Self = Self(400);
+    pub const UNAUTHORIZED: Self = Self(401);
+    pub const NOT_FOUND: Self = Self(404);
+    pub const METHOD_NOT_ALLOWED: Self = Self(405);
+    pub const LENGTH_REQUIRED: Self = Self(411);
+    pub const PAYLOAD_TOO_LARGE: Self = Self(413);
+    pub const UNSUPPORTED_MEDIA_TYPE: Self = Self(415);
+    pub const RANGE_NOT_SATISFIABLE: Self = Self(416);
+    pub const UNPROCESSABLE_ENTITY: Self = Self(422);
+    pub const TOO_MANY_REQUESTS: Self = Self(429);
+    pub const INTERNAL_SERVER_ERROR: Self = Self(500);
+    pub const SERVICE_UNAVAILABLE: Self = Self(503);
+    pub const INSUFFICIENT_STORAGE: Self = Self(507);
+
+    pub const fn new(code: u16) -> Option<Self> {
+        if code >= 100 && code <= 599 {
+            Some(Self(code))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeaderError {
+    InvalidName,
+    InvalidValue,
+}
 
 #[derive(Debug)]
 pub struct ResponseHeader {
@@ -28,18 +63,18 @@ enum HeaderValueOwned {
 }
 
 impl ResponseHeader {
-    pub fn owned(name: &'static str, value: String) -> Self {
-        Self {
+    pub fn owned(name: &'static str, value: String) -> Result<Self, HeaderError> {
+        validate_header(name, &value)?;
+        Ok(Self {
             name,
             value: HeaderValueOwned::Owned(value),
-        }
+        })
     }
 }
 
 pub struct Response<R> {
     status: StatusCode,
-    headers: [Option<ResponseHeader>; RESPONSE_HEADERS],
-    header_count: usize,
+    headers: Vec<ResponseHeader>,
     body: R,
     content_length: usize,
 }
@@ -53,7 +88,7 @@ impl Response<io::Empty> {
 impl Response<Cursor<Vec<u8>>> {
     pub fn from_data(data: Vec<u8>) -> Self {
         let content_length = data.len();
-        Self::new(status(200), Cursor::new(data), content_length)
+        Self::new(StatusCode::OK, Cursor::new(data), content_length)
     }
 
     pub fn from_string(data: impl Into<String>) -> Self {
@@ -62,11 +97,10 @@ impl Response<Cursor<Vec<u8>>> {
 }
 
 impl<R> Response<R> {
-    pub fn new(status: StatusCode, body: R, content_length: usize) -> Self {
+    pub(crate) fn new(status: StatusCode, body: R, content_length: usize) -> Self {
         Self {
             status,
-            headers: [const { None }; RESPONSE_HEADERS],
-            header_count: 0,
+            headers: Vec::new(),
             body,
             content_length,
         }
@@ -78,12 +112,7 @@ impl<R> Response<R> {
     }
 
     pub fn with_header(mut self, header: ResponseHeader) -> Self {
-        assert!(
-            self.header_count < RESPONSE_HEADERS,
-            "too many response headers"
-        );
-        self.headers[self.header_count] = Some(header);
-        self.header_count += 1;
+        self.headers.push(header);
         self
     }
 
@@ -92,11 +121,11 @@ impl<R> Response<R> {
         write!(
             &mut headers,
             "HTTP/1.1 {} {}\r\n",
-            self.status.0,
-            reason(self.status.0)
+            self.status.get(),
+            reason(self.status.get())
         )
         .expect("writing response status to String cannot fail");
-        for header in self.headers[..self.header_count].iter().flatten() {
+        for header in &self.headers {
             write!(&mut headers, "{}: ", header.name)
                 .expect("writing response header to String cannot fail");
             match &header.value {
@@ -215,19 +244,19 @@ fn copy_file_to_stream_portable(
     }
 }
 
-pub fn static_header(name: &'static str, value: &'static str) -> ResponseHeader {
-    ResponseHeader {
+pub fn static_header(
+    name: &'static str,
+    value: &'static str,
+) -> Result<ResponseHeader, HeaderError> {
+    validate_header(name, value)?;
+    Ok(ResponseHeader {
         name,
         value: HeaderValueOwned::Static(value),
-    }
+    })
 }
 
 pub fn write_status(stream: &mut TcpStream, status: StatusCode) -> io::Result<()> {
     Response::empty(status).write_to(stream, false, false)
-}
-
-fn status(code: u16) -> StatusCode {
-    StatusCode(code)
 }
 
 fn reason(code: u16) -> &'static str {
@@ -253,6 +282,51 @@ fn reason(code: u16) -> &'static str {
     }
 }
 
+fn validate_header(name: &str, value: &str) -> Result<(), HeaderError> {
+    if name.is_empty()
+        || name
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)))
+    {
+        return Err(HeaderError::InvalidName);
+    }
+    if value
+        .bytes()
+        .any(|byte| byte < 0x20 && byte != b'\t' || byte == 0x7f)
+    {
+        return Err(HeaderError::InvalidValue);
+    }
+    Ok(())
+}
+
 pub(super) fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Response, ResponseHeader, StatusCode, static_header};
+
+    #[test]
+    fn status_codes_are_validated_at_construction() {
+        assert_eq!(StatusCode::new(99), None);
+        assert_eq!(StatusCode::new(600), None);
+        assert_eq!(StatusCode::new(599).map(StatusCode::get), Some(599));
+    }
+
+    #[test]
+    fn response_headers_reject_invalid_wire_data() {
+        assert!(static_header("Bad Name", "value").is_err());
+        assert!(static_header("X-Test", "value\r\nInjected: yes").is_err());
+        assert!(ResponseHeader::owned("X-Test", "value\n".to_owned()).is_err());
+    }
+
+    #[test]
+    fn response_header_builder_does_not_panic_at_a_fixed_count() {
+        let mut response = Response::empty(StatusCode::OK);
+        for _ in 0..9 {
+            response = response.with_header(static_header("X-Test", "ok").expect("valid header"));
+        }
+        assert_eq!(response.headers.len(), 9);
+    }
 }

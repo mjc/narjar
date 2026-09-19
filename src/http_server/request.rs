@@ -629,7 +629,7 @@ mod tests {
         let file = fs::File::open(path).expect("open NAR fixture");
         request
             .respond_file(
-                Response::new(StatusCode(206), std::io::empty(), 4),
+                Response::new(StatusCode::PARTIAL_CONTENT, std::io::empty(), 4),
                 file,
                 2,
                 4,
@@ -663,7 +663,7 @@ mod tests {
         FORCE_PORTABLE_FILE_COPY.with(|force| force.set(true));
         request
             .respond_file(
-                Response::new(StatusCode(206), std::io::empty(), 4),
+                Response::new(StatusCode::PARTIAL_CONTENT, std::io::empty(), 4),
                 fs::File::open(path).expect("open NAR fixture"),
                 2,
                 4,

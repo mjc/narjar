@@ -17,7 +17,7 @@ use super::write::unauthorized;
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 pub(super) fn header(name: &'static str, value: &'static str) -> Header {
-    static_header(name, value)
+    static_header(name, value).expect("static response header is valid")
 }
 
 pub(super) fn send_response<R: Read>(
@@ -32,11 +32,23 @@ pub(super) fn send_response<R: Read>(
 }
 
 pub(super) fn not_found(guard: &RequestGuard<'_>, request: Request) -> Option<TcpStream> {
-    send_response(guard, request, 404, Response::empty(StatusCode(404)), 0)
+    send_response(
+        guard,
+        request,
+        404,
+        Response::empty(StatusCode::NOT_FOUND),
+        0,
+    )
 }
 
 pub(super) fn internal_error(guard: &RequestGuard<'_>, request: Request) -> Option<TcpStream> {
-    send_response(guard, request, 500, Response::empty(StatusCode(500)), 0)
+    send_response(
+        guard,
+        request,
+        500,
+        Response::empty(StatusCode::INTERNAL_SERVER_ERROR),
+        0,
+    )
 }
 
 fn nar_response<R>(
@@ -217,7 +229,7 @@ fn respond_nar(
             match opened.body {
                 NarReadBody::File(file) => {
                     let response =
-                        nar_response(StatusCode(200), content_length, visibility, io::empty());
+                        nar_response(StatusCode::OK, content_length, visibility, io::empty());
                     send_file_response(
                         guard,
                         request,
@@ -229,8 +241,7 @@ fn respond_nar(
                     )
                 }
                 NarReadBody::Chunked(reader) => {
-                    let response =
-                        nar_response(StatusCode(200), content_length, visibility, reader);
+                    let response = nar_response(StatusCode::OK, content_length, visibility, reader);
                     send_response(guard, request, 200, response, length)
                 }
             }
@@ -247,33 +258,47 @@ fn respond_nar(
             };
             match opened.body {
                 NarReadBody::File(file) => {
-                    let response =
-                        nar_response(StatusCode(206), content_length, visibility, io::empty())
-                            .with_header(Header::owned(
-                                "Content-Range",
-                                format!("bytes {start}-{end}/{length}"),
-                            ));
+                    let response = nar_response(
+                        StatusCode::PARTIAL_CONTENT,
+                        content_length,
+                        visibility,
+                        io::empty(),
+                    )
+                    .with_header(
+                        Header::owned("Content-Range", format!("bytes {start}-{end}/{length}"))
+                            .expect("range response header is valid"),
+                    );
                     send_file_response(guard, request, 206, response, file, start, response_length)
                 }
                 NarReadBody::Chunked(reader) => {
-                    let response =
-                        nar_response(StatusCode(206), content_length, visibility, reader)
-                            .with_header(Header::owned(
-                                "Content-Range",
-                                format!("bytes {start}-{end}/{length}"),
-                            ));
+                    let response = nar_response(
+                        StatusCode::PARTIAL_CONTENT,
+                        content_length,
+                        visibility,
+                        reader,
+                    )
+                    .with_header(
+                        Header::owned("Content-Range", format!("bytes {start}-{end}/{length}"))
+                            .expect("range response header is valid"),
+                    );
                     send_response(guard, request, 206, response, response_length)
                 }
             }
         }
         RequestedRange::Unsatisfiable => {
-            let response = Response::empty(StatusCode(416))
-                .with_header(Header::owned("Content-Range", format!("bytes */{length}")));
+            let response = Response::empty(StatusCode::RANGE_NOT_SATISFIABLE).with_header(
+                Header::owned("Content-Range", format!("bytes */{length}"))
+                    .expect("range response header is valid"),
+            );
             send_response(guard, request, 416, response, 0)
         }
-        RequestedRange::Invalid => {
-            send_response(guard, request, 400, Response::empty(StatusCode(400)), 0)
-        }
+        RequestedRange::Invalid => send_response(
+            guard,
+            request,
+            400,
+            Response::empty(StatusCode::BAD_REQUEST),
+            0,
+        ),
     }
 }
 
@@ -336,7 +361,8 @@ fn method_not_allowed(
     request: Request,
     allow: &'static str,
 ) -> Option<TcpStream> {
-    let response = Response::empty(StatusCode(405)).with_header(header("Allow", allow));
+    let response =
+        Response::empty(StatusCode::METHOD_NOT_ALLOWED).with_header(header("Allow", allow));
     send_response(guard, request, 405, response, 0)
 }
 
@@ -380,7 +406,7 @@ pub fn respond(
             request,
             200,
             Response::from_string("ok\n")
-                .with_status_code(StatusCode(200))
+                .with_status_code(StatusCode::OK)
                 .with_header(header("Content-Type", "text/plain; charset=utf-8")),
             3,
         );
@@ -406,7 +432,9 @@ pub fn respond(
                 request,
                 status,
                 Response::from_string(body)
-                    .with_status_code(StatusCode(status))
+                    .with_status_code(
+                        StatusCode::new(status).expect("ready response status is valid"),
+                    )
                     .with_header(header("Content-Type", "text/plain; charset=utf-8")),
                 body.len() as u64,
             );
@@ -418,7 +446,7 @@ pub fn respond(
                 request,
                 200,
                 Response::from_string(body.clone())
-                    .with_status_code(StatusCode(200))
+                    .with_status_code(StatusCode::OK)
                     .with_header(header(
                         "Content-Type",
                         "text/plain; version=0.0.4; charset=utf-8",
@@ -442,7 +470,13 @@ pub fn respond(
     let route = match CacheRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
-            return send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
+            return send_response(
+                &guard,
+                request,
+                400,
+                Response::empty(StatusCode::BAD_REQUEST),
+                0,
+            );
         }
         RouteMatch::Missing => return not_found(&guard, request),
     };

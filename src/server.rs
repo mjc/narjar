@@ -301,7 +301,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                                 break;
                             }
                             Err((mut stream, _error)) => {
-                                let _ = write_status(&mut stream, StatusCode(400));
+                                let _ = write_status(&mut stream, StatusCode::BAD_REQUEST);
                                 break;
                             }
                         }
@@ -327,7 +327,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                     Error::runtime(format!("cannot configure socket timeouts: {error}"))
                 })?;
                 if let Some(mut stream) = try_dispatch(&sender, &admissions, stream) {
-                    let _ = write_status(&mut stream, StatusCode(429));
+                    let _ = write_status(&mut stream, StatusCode::TOO_MANY_REQUESTS);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {

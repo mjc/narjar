@@ -110,7 +110,13 @@ pub fn prepare_publication(
         RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
             let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-            let _ = send_response(&guard, request, 400, Response::empty(StatusCode(400)), 0);
+            let _ = send_response(
+                &guard,
+                request,
+                400,
+                Response::empty(StatusCode::BAD_REQUEST),
+                0,
+            );
             return None;
         }
         RouteMatch::Missing => {
@@ -135,7 +141,9 @@ impl UploadRequest {
                     &guard,
                     request,
                     status,
-                    Response::empty(StatusCode(status)),
+                    Response::empty(
+                        StatusCode::new(status).expect("upload response status is valid"),
+                    ),
                     0,
                 );
                 None
@@ -187,7 +195,7 @@ impl UploadRequest {
             guard,
             self.request,
             status,
-            Response::empty(StatusCode(status)),
+            Response::empty(StatusCode::new(status).expect("upload response status is valid")),
             0,
         )
     }
@@ -375,7 +383,7 @@ pub(super) fn unauthorized(guard: &RequestGuard<'_>, request: Request) -> Option
         guard,
         request,
         401,
-        Response::empty(StatusCode(401)).with_header(challenge),
+        Response::empty(StatusCode::UNAUTHORIZED).with_header(challenge),
         0,
     )
 }
