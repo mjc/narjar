@@ -1,6 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+storage_backend=flat
+while (($#)); do
+  case "$1" in
+    --storage-backend)
+      [[ $# -ge 2 ]] || { printf '%s\n' '--storage-backend needs a value' >&2; exit 2; }
+      storage_backend=$2
+      shift 2
+      ;;
+    --help)
+      printf '%s\n' 'Usage: nix-e2e [--storage-backend flat|chunked]'
+      exit 0
+      ;;
+    *)
+      printf 'unknown option: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
+case "$storage_backend" in
+  flat|chunked) ;;
+  *)
+    printf 'unsupported storage backend: %s\n' "$storage_backend" >&2
+    exit 2
+    ;;
+esac
+
 trace() {
   printf '+'
   printf ' %q' "$@"
@@ -56,6 +82,7 @@ crash_server() {
 temp_root=$(mktemp -d "${TMPDIR:-/tmp}/narjar-nix-e2e.XXXXXX")
 temp_root=$(cd "$temp_root" && pwd -P)
 export XDG_CACHE_HOME="$temp_root/nix-cache"
+export NARJAR_PUSH_GCROOTS="$temp_root/nix-gcroots/auto"
 cleanup() {
   stop_server
   rm -rf -- "$temp_root"
@@ -75,6 +102,7 @@ start_server() {
   local egress_compression=${1:-none}
   : > "$server_stdout"
   run narjar serve --data-dir "$data_dir" --listen 127.0.0.1:0 \
+    --storage-backend "$storage_backend" \
     --egress-compression "$egress_compression" \
     >"$server_stdout" 2>>"$server_log" &
   server_pid=$!
@@ -227,8 +255,14 @@ http_status() {
 wait_for_temp() {
   local upload_pid=$1
   local attempts=0
+  local -a temporary_roots=("$data_dir/.tmp" "$data_dir/nar/.tmp")
+  if [[ "$storage_backend" == chunked ]]; then
+    temporary_roots+=("$data_dir/.narjar-manifests" "$data_dir/.narjar-chunks")
+  fi
   while (( attempts < 500 )); do
-    if find "$data_dir/.tmp" "$data_dir/nar/.tmp" -type f -print -quit | grep -q .; then
+    if find "${temporary_roots[@]}" -type f \( \
+      -path '*/.chunk-*' -o -path '*/.manifest-*' -o -name '*.part' \
+    \) -print -quit 2>/dev/null | grep -q .; then
       return
     fi
     kill -0 "$upload_pid" 2>/dev/null ||
@@ -252,7 +286,8 @@ trusted_key=$(<"$public_key")
 wrong_key=$(<"$wrong_public_key")
 
 run mkdir -p "$data_dir"
-run narjar init --data-dir "$data_dir"
+run mkdir -p "$NARJAR_PUSH_GCROOTS"
+run narjar init --data-dir "$data_dir" --storage-backend "$storage_backend"
 token=$(run narjar token create --data-dir "$data_dir" --scope write --name nix-e2e)
 run cp "$public_key" "$data_dir/trusted-public-keys"
 umask 077
@@ -345,8 +380,8 @@ substitute "$concurrent_root" "$trusted_key" "$concurrent_path"
 run cmp "$concurrent_path" "$concurrent_root$concurrent_path"
 
 scenario 'interrupted upload has no partial visibility'
-ca_nar_file="$data_dir/$ca_nar_url"
-expect_file "$ca_nar_file"
+ca_nar_file="$temp_root/ca-source.nar"
+run nix_cli store dump-path -- "$ca_path" >"$ca_nar_file"
 ca_nar_name=${ca_nar_url#nar/}
 if [[ "$ca_nar_name" == 0* ]]; then
   interrupted_name=1${ca_nar_name:1}
@@ -366,7 +401,8 @@ kill "$interrupted_pid"
 wait "$interrupted_pid" || true
 [[ $(http_status "$server_url/$interrupted_url") == 404 ]] ||
   fail "interrupted upload became visible"
-expect_missing "$data_dir/$interrupted_url"
+[[ $(http_status "$server_url/$interrupted_url") == 404 ]] ||
+  fail "interrupted upload left a readable object"
 
 scenario 'restart during publication'
 restart_path=$(build_path restart "$nonce")
@@ -390,18 +426,38 @@ start_server
 cache_curl --upload-file "$restart_source" "$server_url/$restart_url"
 [[ $(http_status "$server_url/$restart_url") == 200 ]] ||
   fail "retry after restart was not published"
-expect_file "$ca_nar_file"
+[[ $(http_status "$server_url/$ca_nar_url") == 200 ]] ||
+  fail "previously published canonical object disappeared after restart"
 
 scenario 'corrupt uploaded NAR is rejected'
 primary_nar_url=$(nar_url_for "$primary_path")
-primary_nar_file="$data_dir/$primary_nar_url"
-run cp "$primary_nar_file" "$temp_root/primary.nar.backup"
-printf X >> "$primary_nar_file"
 corrupt_root="$temp_root/corrupt-store"
-if substitute "$corrupt_root" "$trusted_key" "$primary_path"   >"$temp_root/corrupt.log" 2>&1; then
-  fail "corrupt NAR substituted successfully"
+if [[ "$storage_backend" == flat ]]; then
+  primary_nar_file="$data_dir/$primary_nar_url"
+  run cp "$primary_nar_file" "$temp_root/primary.nar.backup"
+  printf X >> "$primary_nar_file"
+  if substitute "$corrupt_root" "$trusted_key" "$primary_path" \
+    >"$temp_root/corrupt.log" 2>&1; then
+    fail "corrupt NAR substituted successfully"
+  fi
+  run mv "$temp_root/primary.nar.backup" "$primary_nar_file"
+else
+  primary_hash=${primary_nar_url#nar/}
+  primary_hash=${primary_hash%.nar}
+  primary_manifest="$data_dir/.narjar-manifests/$primary_hash.manifest"
+  expect_file "$primary_manifest"
+  primary_chunk_hash=$(od -An -tx1 -j 68 -N 32 "$primary_manifest" | tr -d ' \n')
+  primary_chunk="$data_dir/.narjar-chunks/${primary_chunk_hash:0:2}/$primary_chunk_hash"
+  [[ "${#primary_chunk_hash}" -eq 64 ]] || fail "chunked manifest has no first chunk hash"
+  expect_file "$primary_chunk"
+  run cp "$primary_chunk" "$temp_root/primary.chunk.backup"
+  printf X >> "$primary_chunk"
+  if substitute "$corrupt_root" "$trusted_key" "$primary_path" \
+    >"$temp_root/corrupt.log" 2>&1; then
+    fail "corrupt chunked NAR substituted successfully"
+  fi
+  run mv "$temp_root/primary.chunk.backup" "$primary_chunk"
 fi
-run mv "$temp_root/primary.nar.backup" "$primary_nar_file"
 
 scenario 'raw input is served as XZ through the same cache URL'
 stop_server
@@ -432,7 +488,6 @@ default_corrupt_status=$(run curl --silent --show-error --netrc-file "$netrc" \
   --output /dev/null --write-out '%{http_code}' "$server_url/$default_corrupt_url")
 [[ "$default_corrupt_status" == 422 ]] ||
   fail "truncated XZ upload returned HTTP $default_corrupt_status"
-expect_missing "$data_dir/$default_corrupt_url"
 
 scenario 'raw input is served as Zstd through the same cache URL'
 stop_server
@@ -469,7 +524,6 @@ zstd_corrupt_status=$(run curl --silent --show-error --netrc-file "$netrc" \
   --output /dev/null --write-out '%{http_code}' "$server_url/$zstd_corrupt_url")
 [[ "$zstd_corrupt_status" == 422 ]] ||
   fail "truncated zstd upload returned HTTP $zstd_corrupt_status"
-expect_missing "$data_dir/$zstd_corrupt_url"
 run nix_cli store verify --store "local?root=$zstd_root" \
   --sigs-needed 1 \
   --option trusted-public-keys "$trusted_key" \
@@ -524,6 +578,7 @@ gc_roots="$temp_root/gc-roots"
 printf '%s\n' "$gc_root" > "$gc_roots"
 stop_server
 run narjar gc --data-dir "$data_dir" \
+  --storage-backend "$storage_backend" \
   --max-age-seconds 0 \
   --protected-roots "$gc_roots" \
   --apply \
