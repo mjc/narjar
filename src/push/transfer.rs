@@ -17,6 +17,13 @@ const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 const RETRYABLE_STATUSES: &[u16] = &[408, 429, 500, 502, 503, 504];
 const GET_REDIRECT_STATUSES: &[u16] = &[301, 302, 303, 307, 308];
 const PUT_REDIRECT_STATUSES: &[u16] = &[307, 308];
+const MAX_IGNORED_GET_BODY_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug)]
+pub(super) struct GetResponse {
+    pub(super) status: u16,
+    pub(super) body: Vec<u8>,
+}
 
 pub(super) fn is_retryable_status(status: u16) -> bool {
     RETRYABLE_STATUSES.contains(&status)
@@ -45,6 +52,16 @@ pub(super) fn request_status(
     url: &HttpUrl,
     authorization: Option<&str>,
 ) -> Result<u16, String> {
+    get_bounded(agent, url, authorization, MAX_IGNORED_GET_BODY_BYTES)
+        .map(|response| response.status)
+}
+
+pub(super) fn get_bounded(
+    agent: &Agent,
+    url: &HttpUrl,
+    authorization: Option<&str>,
+    max_body_bytes: u64,
+) -> Result<GetResponse, String> {
     'attempts: for attempt in 0..MAX_ATTEMPTS {
         let mut request_url = url.clone();
         for redirect in 0..=MAX_REDIRECTS {
@@ -71,9 +88,18 @@ pub(super) fn request_status(
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned);
                     let mut body = response.into_body().into_reader();
-                    io::copy(&mut body, &mut io::sink()).map_err(|error| {
-                        format!("reading GET {request_url} response failed: {error}")
-                    })?;
+                    let mut bytes = Vec::new();
+                    (&mut body)
+                        .take(max_body_bytes.saturating_add(1))
+                        .read_to_end(&mut bytes)
+                        .map_err(|error| {
+                            format!("reading GET {request_url} response failed: {error}")
+                        })?;
+                    if bytes.len() as u64 > max_body_bytes {
+                        return Err(format!(
+                            "GET {request_url} response exceeded {max_body_bytes} bytes"
+                        ));
+                    }
 
                     if is_get_redirect_status(status) {
                         if redirect == MAX_REDIRECTS {
@@ -90,7 +116,10 @@ pub(super) fn request_status(
                         retry_sleep(attempt, retry_after);
                         continue 'attempts;
                     }
-                    return Ok(status);
+                    return Ok(GetResponse {
+                        status,
+                        body: bytes,
+                    });
                 }
                 Err(_error) if attempt + 1 < MAX_ATTEMPTS => {
                     retry_sleep(attempt, None);

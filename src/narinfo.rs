@@ -10,6 +10,7 @@ use crate::object::{
 use crate::storage::{StoreHash, StoredNar};
 use data_encoding::BASE64;
 use ed25519_dalek::Signature;
+use fluent_uri::UriRef;
 
 mod trust;
 
@@ -99,6 +100,12 @@ pub struct NarInfoClaims {
     identity: NarIdentity,
 }
 
+#[derive(Clone, Copy)]
+enum ReferencesFieldHandling {
+    Required,
+    MissingMeansEmpty,
+}
+
 impl NarInfoClaims {
     pub fn new(
         store_path: String,
@@ -166,6 +173,25 @@ impl NarInfoClaims {
         route: &StoreHash,
         document: &NarInfoDocument<'_>,
     ) -> Result<Self, NarInfoError> {
+        Self::from_document_with_references(route, document, ReferencesFieldHandling::Required)
+    }
+
+    fn from_external_document(
+        route: &StoreHash,
+        document: &NarInfoDocument<'_>,
+    ) -> Result<Self, NarInfoError> {
+        Self::from_document_with_references(
+            route,
+            document,
+            ReferencesFieldHandling::MissingMeansEmpty,
+        )
+    }
+
+    fn from_document_with_references(
+        route: &StoreHash,
+        document: &NarInfoDocument<'_>,
+        references_handling: ReferencesFieldHandling,
+    ) -> Result<Self, NarInfoError> {
         let store_path =
             NixStorePath::parse(document.required(NarInfoField::StorePath)?.to_owned())?;
         if store_path.store() != route {
@@ -185,9 +211,20 @@ impl NarInfoClaims {
             .map(NarSize::new)
             .ok_or(NarInfoError)?;
 
+        let references = match references_handling {
+            ReferencesFieldHandling::Required => {
+                parse_references(document.required(NarInfoField::References)?)?
+            }
+            ReferencesFieldHandling::MissingMeansEmpty => document
+                .field(NarInfoField::References)
+                .map(parse_references)
+                .transpose()?
+                .unwrap_or_default(),
+        };
+
         Ok(Self {
             store_path,
-            references: parse_references(document.required(NarInfoField::References)?)?,
+            references,
             identity: NarIdentity::new(nar_hash, nar_size),
         })
     }
@@ -319,22 +356,28 @@ enum NarInfoLineField {
     Signature,
 }
 
+#[derive(Clone, Copy)]
+enum UnknownFieldHandling {
+    Reject,
+    Ignore,
+}
+
 impl NarInfoLineField {
-    fn parse(name: &str) -> Result<Self, NarInfoError> {
+    fn parse(name: &str) -> Option<Self> {
         match name {
-            "StorePath" => Ok(Self::Unique(NarInfoField::StorePath)),
-            "URL" => Ok(Self::Unique(NarInfoField::Url)),
-            "Compression" => Ok(Self::Unique(NarInfoField::Compression)),
-            "FileHash" => Ok(Self::Unique(NarInfoField::FileHash)),
-            "FileSize" => Ok(Self::Unique(NarInfoField::FileSize)),
-            "NarHash" => Ok(Self::Unique(NarInfoField::NarHash)),
-            "NarSize" => Ok(Self::Unique(NarInfoField::NarSize)),
-            "References" => Ok(Self::Unique(NarInfoField::References)),
-            "Deriver" => Ok(Self::Unique(NarInfoField::Deriver)),
-            "System" => Ok(Self::Unique(NarInfoField::System)),
-            "CA" => Ok(Self::Unique(NarInfoField::ContentAddress)),
-            "Sig" => Ok(Self::Signature),
-            _ => Err(NarInfoError),
+            "StorePath" => Some(Self::Unique(NarInfoField::StorePath)),
+            "URL" => Some(Self::Unique(NarInfoField::Url)),
+            "Compression" => Some(Self::Unique(NarInfoField::Compression)),
+            "FileHash" => Some(Self::Unique(NarInfoField::FileHash)),
+            "FileSize" => Some(Self::Unique(NarInfoField::FileSize)),
+            "NarHash" => Some(Self::Unique(NarInfoField::NarHash)),
+            "NarSize" => Some(Self::Unique(NarInfoField::NarSize)),
+            "References" => Some(Self::Unique(NarInfoField::References)),
+            "Deriver" => Some(Self::Unique(NarInfoField::Deriver)),
+            "System" => Some(Self::Unique(NarInfoField::System)),
+            "CA" => Some(Self::Unique(NarInfoField::ContentAddress)),
+            "Sig" => Some(Self::Signature),
+            _ => None,
         }
     }
 }
@@ -346,6 +389,17 @@ struct NarInfoDocument<'text> {
 
 impl<'text> NarInfoDocument<'text> {
     fn parse(text: &'text str) -> Result<Self, NarInfoError> {
+        Self::parse_with_unknown_fields(text, UnknownFieldHandling::Reject)
+    }
+
+    fn parse_external(text: &'text str) -> Result<Self, NarInfoError> {
+        Self::parse_with_unknown_fields(text, UnknownFieldHandling::Ignore)
+    }
+
+    fn parse_with_unknown_fields(
+        text: &'text str,
+        unknown_fields: UnknownFieldHandling,
+    ) -> Result<Self, NarInfoError> {
         text.strip_suffix('\n')
             .ok_or(NarInfoError)?
             .split('\n')
@@ -354,13 +408,23 @@ impl<'text> NarInfoDocument<'text> {
                     fields: [None; NarInfoField::COUNT],
                     signature_values: Vec::new(),
                 },
-                Self::record_line,
+                |document, line| document.record_line(line, unknown_fields),
             )
     }
 
-    fn record_line(mut self, line: &'text str) -> Result<Self, NarInfoError> {
+    fn record_line(
+        mut self,
+        line: &'text str,
+        unknown_fields: UnknownFieldHandling,
+    ) -> Result<Self, NarInfoError> {
         let (name, value) = line.split_once(": ").ok_or(NarInfoError)?;
-        self.record_field(NarInfoLineField::parse(name)?, value)?;
+        let Some(field) = NarInfoLineField::parse(name) else {
+            return match unknown_fields {
+                UnknownFieldHandling::Reject => Err(NarInfoError),
+                UnknownFieldHandling::Ignore => Ok(self),
+            };
+        };
+        self.record_field(field, value)?;
         Ok(self)
     }
 
@@ -423,6 +487,45 @@ impl<'text> NarInfoDocument<'text> {
             .map(EncodedSize::new)
             .map_err(|_| NarInfoError)?;
         NarRepresentation::from_narinfo(file_name, file_hash, file_size, identity)
+    }
+
+    fn validate_external_transport(&self) -> Result<(), NarInfoError> {
+        let url = self.required(NarInfoField::Url)?;
+        if url.is_empty() {
+            return Err(NarInfoError);
+        }
+        let uri = UriRef::parse(url).map_err(|_| NarInfoError)?;
+        if uri.has_fragment()
+            || uri
+                .scheme()
+                .is_some_and(|scheme| !["http", "https"].contains(&scheme.as_str()))
+            || uri.scheme().is_some_and(|_| {
+                uri.authority()
+                    .is_none_or(|authority| authority.host().is_empty())
+            })
+        {
+            return Err(NarInfoError);
+        }
+        self.required(NarInfoField::Compression)?
+            .parse::<WireEncoding>()
+            .map_err(|_| NarInfoError)?;
+        match (
+            self.field(NarInfoField::FileHash),
+            self.field(NarInfoField::FileSize),
+        ) {
+            (None, None) => Ok(()),
+            (Some(hash), Some(size)) => {
+                hash.strip_prefix("sha256:")
+                    .ok_or(NarInfoError)
+                    .and_then(|value| FileHash::parse(value).map_err(|_| NarInfoError))?;
+                size.parse::<u64>()
+                    .ok()
+                    .filter(|size| *size != 0)
+                    .ok_or(NarInfoError)?;
+                Ok(())
+            }
+            _ => Err(NarInfoError),
+        }
     }
 }
 
@@ -522,6 +625,16 @@ impl UnverifiedPublicationNarInfo {
 #[derive(Debug)]
 pub struct ValidatedNarInfo(PublicationNarInfo);
 
+/// Logical NAR claims proven by a configured trusted signature.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedNarInfoClaims(NarInfoClaims);
+
+impl TrustedNarInfoClaims {
+    pub fn claims(&self) -> &NarInfoClaims {
+        &self.0
+    }
+}
+
 impl NarRepresentation {
     fn from_narinfo(
         file_name: NarFileName,
@@ -561,7 +674,6 @@ impl ValidatedNarInfo {
     pub(crate) const fn payload(&self) -> NarRepresentation {
         self.0.payload
     }
-
     pub(crate) fn into_bytes(self) -> Result<Vec<u8>, NarInfoError> {
         self.0.metadata.serialize(self.0.payload)
     }
@@ -870,6 +982,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             [format!("{STORE_HASH}-alpha"), format!("{STORE_HASH}-zulu")]
         );
+    }
+
+    #[test]
+    fn external_parser_ignores_unknown_fields_but_rejects_duplicate_known_fields() {
+        let text = "StorePath: /nix/store/example\nX-Cache-Extension: stable\n";
+        assert!(NarInfoDocument::parse(text).is_err());
+        assert!(NarInfoDocument::parse_external(text).is_ok());
+
+        let duplicate = "StorePath: /nix/store/first\nStorePath: /nix/store/second\n";
+        assert!(NarInfoDocument::parse_external(duplicate).is_err());
+    }
+
+    #[test]
+    fn external_transport_requires_an_authority_for_absolute_http_urls() {
+        let without_authority =
+            NarInfoDocument::parse_external("URL: https:path\nCompression: none\n")
+                .expect("the URI syntax is valid");
+        assert!(without_authority.validate_external_transport().is_err());
+
+        let with_authority =
+            NarInfoDocument::parse_external("URL: https://cache.example/path\nCompression: none\n")
+                .expect("the URI syntax is valid");
+        assert!(with_authority.validate_external_transport().is_ok());
+    }
+
+    #[test]
+    fn external_claims_treat_missing_references_as_empty() {
+        let route = StoreHash::parse(STORE_HASH).expect("valid store hash");
+        let text = format!(
+            "StorePath: /nix/store/{STORE_HASH}-package\nNarHash: sha256:{NAR_HASH}\nNarSize: 1\n"
+        );
+        let document = NarInfoDocument::parse_external(&text).expect("valid external metadata");
+
+        assert!(NarInfoClaims::from_document(&route, &document).is_err());
+        let claims = NarInfoClaims::from_external_document(&route, &document)
+            .expect("missing references should mean an empty set");
+        assert_eq!(claims.reference_paths().len(), 0);
     }
 
     #[test]
