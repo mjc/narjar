@@ -61,6 +61,7 @@ narjar delete
   --data-dir PATH
   --store-hash HASH
   [--json]
+  [--storage-backend flat|chunked]
 
 narjar gc
   --data-dir PATH

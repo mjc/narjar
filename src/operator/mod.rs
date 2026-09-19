@@ -398,6 +398,8 @@ pub(crate) struct Delete {
     store_hash: String,
     #[arg(long)]
     json: bool,
+    #[arg(long, value_enum, default_value = "flat")]
+    storage_backend: StorageBackendOption,
 }
 
 pub(crate) fn delete(options: Delete) -> Result<(), Error> {
@@ -405,10 +407,12 @@ pub(crate) fn delete(options: Delete) -> Result<(), Error> {
         data_dir: root,
         store_hash: route,
         json,
+        storage_backend,
     } = options;
     let store = StoreHash::parse(&route).map_err(|_| Error::usage("--store-hash is invalid"))?;
     let root = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize(&root).map_err(runtime)?;
+    let storage =
+        Storage::initialize_with_backend(&root, storage_backend.backend()).map_err(runtime)?;
     let trusted = TrustedPublicKeys::load(&root).map_err(runtime)?;
     let file = storage
         .open_narinfo(&store)
