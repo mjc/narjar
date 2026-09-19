@@ -9,11 +9,13 @@ Usage: scripts/casync-zfs-experiment \
   --flat-data DIR \
   --chunked-data DIR \
   --output DIR \
+  [--compression zstd-N] \
   [--port-base N] \
   [--jobs N]
 
 The two DATA directories must already be empty mountpoints on distinct fresh
-ZFS datasets configured with the same properties and compression=zstd-19.
+ZFS datasets configured with the same properties and the requested ZFS
+compression (default: zstd-19).
 The script never creates, destroys, mounts, unmounts, or changes a dataset.
 It uploads every <NixHash>.nar file below --input-dir, or every NAR in the
 closure of --store-root, to both backends through the standard HTTP protocol,
@@ -31,6 +33,7 @@ STORE_ROOT=
 FLAT_DATA=
 CHUNKED_DATA=
 OUTPUT=
+COMPRESSION=zstd-19
 PORT_BASE=45100
 JOBS=8
 
@@ -60,6 +63,10 @@ while (($#)); do
             OUTPUT=$2
             shift 2
             ;;
+        --compression)
+            COMPRESSION=$2
+            shift 2
+            ;;
         --port-base)
             PORT_BASE=$2
             shift 2
@@ -82,6 +89,10 @@ done
 
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || {
     printf '%s\n' '--jobs must be a positive integer' >&2
+    exit 2
+}
+[[ "$COMPRESSION" =~ ^zstd-[0-9]+$ ]] || {
+    printf '%s\n' '--compression must be a zstd level such as zstd-1 or zstd-19' >&2
     exit 2
 }
 
@@ -242,9 +253,10 @@ assert_matching_datasets() {
         printf '%s\n' 'flat and chunked dataset properties differ' >&2
         exit 1
     }
-    awk -F '\t' '$1 == "compression" && $2 != "zstd-19" { exit 1 }' \
+    awk -F '\t' -v expected="$COMPRESSION" \
+        '$1 == "compression" && $2 != expected { exit 1 }' \
         "$flat_properties" || {
-        printf '%s\n' 'flat dataset is not configured with compression=zstd-19' >&2
+        printf 'flat dataset is not configured with compression=%s\n' "$COMPRESSION" >&2
         exit 1
     }
 }

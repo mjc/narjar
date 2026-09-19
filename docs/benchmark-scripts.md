@@ -17,7 +17,9 @@ The active helpers are:
 - `scripts/nar-report` for NAR manifest reporting and vector validation.
 - `scripts/casync-zfs-experiment` for a matched flat-versus-chunked storage
   experiment. It accepts two already-created, empty ZFS dataset mountpoints,
-  requires matching properties including `compression=zstd-19`, and accepts
+  requires matching properties including `compression=zstd-19` by default;
+  pass `--compression zstd-N` for a controlled compression-level diagnostic,
+  and accepts
   either a directory of `.nar` files or `--store-root PATH`. Store-root mode
   queries that path's Nix closure for the authoritative `narHash`/`narSize`
   metadata and streams `nix-store --dump` directly into each HTTP upload; it
