@@ -100,6 +100,12 @@ pub struct NarInfoClaims {
     identity: NarIdentity,
 }
 
+#[derive(Clone, Copy)]
+enum ReferencesFieldHandling {
+    Required,
+    MissingMeansEmpty,
+}
+
 impl NarInfoClaims {
     pub fn new(
         store_path: String,
@@ -167,6 +173,25 @@ impl NarInfoClaims {
         route: &StoreHash,
         document: &NarInfoDocument<'_>,
     ) -> Result<Self, NarInfoError> {
+        Self::from_document_with_references(route, document, ReferencesFieldHandling::Required)
+    }
+
+    fn from_external_document(
+        route: &StoreHash,
+        document: &NarInfoDocument<'_>,
+    ) -> Result<Self, NarInfoError> {
+        Self::from_document_with_references(
+            route,
+            document,
+            ReferencesFieldHandling::MissingMeansEmpty,
+        )
+    }
+
+    fn from_document_with_references(
+        route: &StoreHash,
+        document: &NarInfoDocument<'_>,
+        references_handling: ReferencesFieldHandling,
+    ) -> Result<Self, NarInfoError> {
         let store_path =
             NixStorePath::parse(document.required(NarInfoField::StorePath)?.to_owned())?;
         if store_path.store() != route {
@@ -186,9 +211,20 @@ impl NarInfoClaims {
             .map(NarSize::new)
             .ok_or(NarInfoError)?;
 
+        let references = match references_handling {
+            ReferencesFieldHandling::Required => {
+                parse_references(document.required(NarInfoField::References)?)?
+            }
+            ReferencesFieldHandling::MissingMeansEmpty => document
+                .field(NarInfoField::References)
+                .map(parse_references)
+                .transpose()?
+                .unwrap_or_default(),
+        };
+
         Ok(Self {
             store_path,
-            references: parse_references(document.required(NarInfoField::References)?)?,
+            references,
             identity: NarIdentity::new(nar_hash, nar_size),
         })
     }
@@ -356,7 +392,7 @@ impl<'text> NarInfoDocument<'text> {
         Self::parse_with_unknown_fields(text, UnknownFieldHandling::Reject)
     }
 
-    pub(super) fn parse_external(text: &'text str) -> Result<Self, NarInfoError> {
+    fn parse_external(text: &'text str) -> Result<Self, NarInfoError> {
         Self::parse_with_unknown_fields(text, UnknownFieldHandling::Ignore)
     }
 
@@ -463,6 +499,10 @@ impl<'text> NarInfoDocument<'text> {
             || uri
                 .scheme()
                 .is_some_and(|scheme| !["http", "https"].contains(&scheme.as_str()))
+            || uri.scheme().is_some_and(|_| {
+                uri.authority()
+                    .is_none_or(|authority| authority.host().is_empty())
+            })
         {
             return Err(NarInfoError);
         }
@@ -952,6 +992,33 @@ mod tests {
 
         let duplicate = "StorePath: /nix/store/first\nStorePath: /nix/store/second\n";
         assert!(NarInfoDocument::parse_external(duplicate).is_err());
+    }
+
+    #[test]
+    fn external_transport_requires_an_authority_for_absolute_http_urls() {
+        let without_authority =
+            NarInfoDocument::parse_external("URL: https:path\nCompression: none\n")
+                .expect("the URI syntax is valid");
+        assert!(without_authority.validate_external_transport().is_err());
+
+        let with_authority =
+            NarInfoDocument::parse_external("URL: https://cache.example/path\nCompression: none\n")
+                .expect("the URI syntax is valid");
+        assert!(with_authority.validate_external_transport().is_ok());
+    }
+
+    #[test]
+    fn external_claims_treat_missing_references_as_empty() {
+        let route = StoreHash::parse(STORE_HASH).expect("valid store hash");
+        let text = format!(
+            "StorePath: /nix/store/{STORE_HASH}-package\nNarHash: sha256:{NAR_HASH}\nNarSize: 1\n"
+        );
+        let document = NarInfoDocument::parse_external(&text).expect("valid external metadata");
+
+        assert!(NarInfoClaims::from_document(&route, &document).is_err());
+        let claims = NarInfoClaims::from_external_document(&route, &document)
+            .expect("missing references should mean an empty set");
+        assert_eq!(claims.reference_paths().len(), 0);
     }
 
     #[test]

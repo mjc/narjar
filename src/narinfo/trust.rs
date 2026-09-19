@@ -94,7 +94,7 @@ impl TrustedPublicKeys {
         let text = parse_narinfo_text(bytes)?;
         let document = NarInfoDocument::parse_external(&text)?;
         document.validate_external_transport()?;
-        let claims = NarInfoClaims::from_document(route, &document)?;
+        let claims = NarInfoClaims::from_external_document(route, &document)?;
         let signatures = document.named_signatures()?;
         self.verifies(claims.fingerprint().as_bytes(), &signatures)
             .then_some(TrustedNarInfoClaims(claims))
