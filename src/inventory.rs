@@ -476,12 +476,13 @@ impl Inventory {
         let root = root.file();
         let mut can_serve = true;
         for_each_dir_name(root, |name| {
-            can_serve = match NarinfoName::classify(name) {
+            let entry_can_serve = match NarinfoName::classify(name) {
                 None | Some(NarinfoName::Invalid(_)) => true,
                 Some(NarinfoName::Candidate(candidate)) => {
                     validate_narinfo_candidate(root, &candidate, trusted)?.is_ok()
                 }
             };
+            can_serve = can_serve && entry_can_serve;
             Ok(can_serve)
         })?;
         Ok(can_serve)

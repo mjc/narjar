@@ -1,12 +1,9 @@
 use std::{fmt, sync::Arc};
 
-use narjar::narinfo::{MAX_NARINFO_BYTES, TrustedNarInfoClaims, TrustedPublicKeys};
+use narjar::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, TrustedNarInfoClaims, TrustedPublicKeys};
 use ureq::Agent;
 
-use super::{
-    DestinationNarinfoPolicy, NarInfoMetadata,
-    transfer::{get_bounded, request_status},
-};
+use super::{DestinationNarinfoPolicy, NarInfoMetadata, transfer::get_bounded};
 use crate::http_url::HttpUrl;
 
 #[derive(Clone)]
@@ -109,8 +106,20 @@ impl<'a> CacheLookup<'a> {
         let route = info.claims().store();
         let narinfo_name = format!("{}.narinfo", route.as_str());
         let destination_url = self.destination.endpoint(&[&narinfo_name]);
-        match request_status(self.agent, &destination_url, self.destination_authorization)? {
-            200 => return Ok(PushDisposition::DestinationPresent),
+        let response = get_bounded(
+            self.agent,
+            &destination_url,
+            self.destination_authorization,
+            MAX_NARINFO_BYTES,
+        )?;
+        match response.status {
+            200 => {
+                let matches_expected = NarInfoClaims::parse_external_narinfo(route, response.body)
+                    .is_ok_and(|claims| claims == *info.claims());
+                if matches_expected {
+                    return Ok(PushDisposition::DestinationPresent);
+                }
+            }
             404 => {}
             status => {
                 return Err(format!(

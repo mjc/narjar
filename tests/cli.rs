@@ -432,7 +432,13 @@ fn signed_narinfo_with_store_path(
 
 #[test]
 fn native_push_skips_payload_generation_when_the_destination_is_present() {
-    let (destination, server) = one_response_cache(200, "OK", String::new());
+    let native_nar = native_nar_bytes();
+    let narinfo = signed_narinfo_for(
+        STORE_HASH,
+        &nix32_sha256(&native_nar),
+        native_nar.len() as u64,
+    );
+    let (destination, server) = one_response_cache(200, "OK", narinfo);
     let fixture = native_push_fixture();
     fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
         .expect("remove local payload so generation would fail");
@@ -1299,6 +1305,70 @@ fn native_push_honors_configured_http_timeout() {
         String::from_utf8_lossy(&output.stderr).contains("narinfo lookup"),
         "failure should identify the failed lookup: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn native_push_does_not_treat_a_malformed_200_narinfo_as_present() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind malformed narinfo listener");
+    let address = listener
+        .local_addr()
+        .expect("inspect malformed narinfo listener");
+    let expected_nar = native_nar_bytes();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept narinfo lookup");
+        let request = read_http_request(&mut stream);
+        assert!(
+            String::from_utf8_lossy(&request).starts_with("GET /")
+                && String::from_utf8_lossy(&request).contains(".narinfo"),
+            "first request should look up the narinfo"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write malformed narinfo response");
+
+        let (mut stream, _) = listener.accept().expect("accept NAR upload");
+        let request = read_http_request(&mut stream);
+        assert!(
+            String::from_utf8_lossy(&request).starts_with("PUT /nar/"),
+            "malformed destination metadata must not suppress the NAR upload"
+        );
+        assert_eq!(&request[http_request_body_start(&request)..], expected_nar);
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write NAR upload response");
+
+        let (mut stream, _) = listener.accept().expect("accept narinfo upload");
+        let request = read_http_request(&mut stream);
+        assert!(
+            String::from_utf8_lossy(&request).starts_with("PUT /")
+                && String::from_utf8_lossy(&request).contains(".narinfo"),
+            "malformed destination metadata must still publish narinfo"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write narinfo upload response");
+    });
+
+    let fixture = native_push_fixture();
+    let output = run_native_push_fixture(&fixture, &format!("http://{address}"), "none", false);
+    server.join().expect("malformed narinfo server should exit");
+
+    assert!(
+        output.status.success(),
+        "push should recover from malformed destination metadata: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("uploaded 1, destination-present 0"),
+        "malformed destination metadata must not be reported as present: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
@@ -2522,7 +2592,8 @@ fn http11_connection_serves_two_sequential_requests() {
 fn published_narinfo_and_nar_get_head_are_pair_gated() {
     let server = RunningServer::start("published-pair");
     let nar_bytes = b"known NAR bytes";
-    let narinfo = signed_narinfo(NAR_ID, nar_bytes.len() as u64);
+    let nar_hash = nix32_sha256(nar_bytes);
+    let narinfo = signed_narinfo(&nar_hash, nar_bytes.len() as u64);
     fs::write(
         server.data_dir.join(format!("{STORE_HASH}.narinfo")),
         &narinfo,
@@ -2536,13 +2607,16 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
         "{missing:?}"
     );
 
-    fs::write(server.data_dir.join(format!("nar/{NAR_ID}.nar")), nar_bytes)
-        .expect("write NAR fixture");
+    fs::write(
+        server.data_dir.join(format!("nar/{nar_hash}.nar")),
+        nar_bytes,
+    )
+    .expect("write NAR fixture");
 
     let narinfo_get = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
     let narinfo_head = server.request("HEAD", &format!("/{STORE_HASH}.narinfo"));
-    let nar_get = server.request("GET", &format!("/nar/{NAR_ID}.nar"));
-    let nar_head = server.request("HEAD", &format!("/nar/{NAR_ID}.nar"));
+    let nar_get = server.request("GET", &format!("/nar/{nar_hash}.nar"));
+    let nar_head = server.request("HEAD", &format!("/nar/{nar_hash}.nar"));
     let (signal, status) = server.stop();
 
     assert!(signal.success(), "SIGTERM should be sent");
@@ -2698,9 +2772,13 @@ fn run_conformance_trace(server: &RunningServer, fixture: &str) -> String {
 fn nar_get_and_head_support_one_byte_range() {
     let server = RunningServer::start("nar-ranges");
     let nar_bytes = b"0123456789";
-    fs::write(server.data_dir.join(format!("nar/{NAR_ID}.nar")), nar_bytes)
-        .expect("write NAR fixture");
-    let path = format!("/nar/{NAR_ID}.nar");
+    let nar_hash = nix32_sha256(nar_bytes);
+    fs::write(
+        server.data_dir.join(format!("nar/{nar_hash}.nar")),
+        nar_bytes,
+    )
+    .expect("write NAR fixture");
+    let path = format!("/nar/{nar_hash}.nar");
     let request = |method, range| server.request_with_headers(method, &path, &[("Range", range)]);
 
     let closed = request("GET", "bytes=2-5");
@@ -2852,10 +2930,11 @@ fn read_routes_distinguish_bad_methods_names_and_unsupported_surfaces() {
 #[test]
 fn nar_reads_survive_unlink_and_aborted_slow_clients_without_exposing_temps() {
     let server = RunningServer::start("nar-read-races");
-    let nar_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));
     let nar_bytes = vec![0x5a; 128 * 1024];
+    let nar_hash = nix32_sha256(&nar_bytes);
+    let nar_path = server.data_dir.join(format!("nar/{nar_hash}.nar"));
     fs::write(&nar_path, &nar_bytes).expect("write large NAR fixture");
-    let path = format!("/nar/{NAR_ID}.nar");
+    let path = format!("/nar/{nar_hash}.nar");
 
     let range = format!("bytes=0-{}", nar_bytes.len() - 1);
     let mut deleting_stream = server.open_request("GET", &path, &[("Range", &range)]);
@@ -2902,7 +2981,7 @@ fn nar_reads_survive_unlink_and_aborted_slow_clients_without_exposing_temps() {
     .expect("write temporary fixture");
     for temp_path in [
         "/.tmp/read-race-unvalidated",
-        &format!("/nar/{NAR_ID}.nar.tmp"),
+        &format!("/nar/{nar_hash}.nar.tmp"),
     ] {
         let response = server.request("GET", temp_path);
         let (headers, _) = response_parts(&response);
@@ -2917,11 +2996,7 @@ fn nar_reads_survive_unlink_and_aborted_slow_clients_without_exposing_temps() {
     let head = server.request("HEAD", &path);
     let (head_headers, head_body) = response_parts(&head);
     assert!(
-        head_headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "{head_headers:?}"
-    );
-    assert!(
-        head_headers.contains(&format!("Content-Length: {sparse_length}\r\n")),
+        head_headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
         "{head_headers:?}"
     );
     assert!(head_body.is_empty());
@@ -4247,10 +4322,12 @@ fn saturated_request_limit_rejects_excess_work() {
 #[test]
 fn reads_continue_while_a_publication_waits_for_its_body() {
     let server = RunningServer::start_with_args("publication-lane", &["--max-in-flight", "2"]);
-    let path = format!("/nar/{NAR_ID}.nar");
+    let nar_bytes = b"0123456789";
+    let nar_hash = nix32_sha256(nar_bytes);
+    let path = format!("/nar/{nar_hash}.nar");
     fs::write(
-        server.data_dir.join(format!("nar/{NAR_ID}.nar")),
-        b"0123456789",
+        server.data_dir.join(format!("nar/{nar_hash}.nar")),
+        nar_bytes,
     )
     .expect("write NAR fixture");
     let stalled = server.open_request("PUT", &path, &[("Content-Length", "1")]);
@@ -4783,6 +4860,37 @@ fn metadata_readiness_ignores_unrelated_names_without_opening_payload_directory(
     fs::remove_dir(&metadata).unwrap();
     symlink(root.join("unrelated"), &metadata).unwrap();
     assert!(!Inventory::can_serve_streaming(&root_directory, &trusted).unwrap());
+}
+
+#[test]
+fn metadata_readiness_remains_false_after_any_invalid_narinfo() {
+    use narjar::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
+
+    const OTHER_STORE_HASH: &str = "11111111111111111111111111111111";
+    let trusted = TrustedPublicKeys::parse(&format!(
+        "narjar-test:{}\n",
+        BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+    ))
+    .unwrap();
+    let valid = signed_narinfo_for(OTHER_STORE_HASH, NARJAR_HASH, NAR_BYTES.len() as u64);
+
+    for entries in [
+        [
+            (format!("{STORE_HASH}.narinfo"), "malformed\n".to_owned()),
+            (format!("{OTHER_STORE_HASH}.narinfo"), valid.clone()),
+        ],
+        [
+            (format!("{OTHER_STORE_HASH}.narinfo"), valid.clone()),
+            (format!("{STORE_HASH}.narinfo"), "malformed\n".to_owned()),
+        ],
+    ] {
+        let directory = TempDir::new().unwrap();
+        for (name, contents) in entries {
+            fs::write(directory.path().join(name), contents).unwrap();
+        }
+        let root = Directory::open(directory.path()).unwrap();
+        assert!(!Inventory::can_serve_streaming(&root, &trusted).unwrap());
+    }
 }
 
 #[test]

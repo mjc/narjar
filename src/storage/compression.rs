@@ -609,11 +609,16 @@ fn measure_decoded_nar<R: Read>(reader: &mut R, max_bytes: u64) -> io::Result<Na
 
 fn sha256_file(file: &File) -> io::Result<NarHash> {
     let mut file = file.try_clone()?;
+    let position = file.stream_position()?;
     file.seek(SeekFrom::Start(0))?;
     let mut sink = io::sink();
     let mut measured = HashingWriter::new(&mut sink, u64::MAX);
-    io::copy(&mut file, &mut measured)?;
-    Ok(measured.finish().hash())
+    let copy_result = io::copy(&mut file, &mut measured);
+    let hash = measured.finish().hash();
+    let restore_result = file.seek(SeekFrom::Start(position));
+    copy_result?;
+    restore_result?;
+    Ok(hash)
 }
 
 pub(super) fn encoded_file_matches(file: &File, identity: EncodedIdentity) -> io::Result<bool> {

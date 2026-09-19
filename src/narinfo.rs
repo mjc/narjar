@@ -169,6 +169,17 @@ impl NarInfoClaims {
         )
     }
 
+    /// Parse and validate the logical claims and transport fields in an
+    /// external narinfo before using its existence as a cache result.
+    pub fn parse_external_narinfo(route: &StoreHash, bytes: Vec<u8>) -> Result<Self, NarInfoError> {
+        let text = parse_narinfo_text(bytes)?;
+        let document = NarInfoDocument::parse_external(&text)?;
+        document.validate_external_transport()?;
+        let claims = Self::from_external_document(route, &document)?;
+        document.publication_payload(claims.identity())?;
+        Ok(claims)
+    }
+
     fn from_document(
         route: &StoreHash,
         document: &NarInfoDocument<'_>,

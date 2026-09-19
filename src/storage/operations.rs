@@ -24,8 +24,8 @@ use super::{
     chunk_store::{ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
     chunked::ChunkProfile,
     compression::{
-        IngestionReceipt, ReceivedNar, encoded_file_matches, nar_file_size_matches,
-        receive_uploaded_nar,
+        IngestionReceipt, ReceivedNar, encoded_file_matches, nar_file_matches,
+        nar_file_size_matches, receive_uploaded_nar,
     },
     egress::{CanonicalRawStatus, NarReadBody},
     fs::{
@@ -465,7 +465,7 @@ impl Storage {
                 open_optional_at(&nar_directory, &name.os_string())?.map_or(
                     Ok(NarMatch::Missing),
                     |file| {
-                        nar_file_size_matches(&file, identity.size().get())
+                        nar_file_matches(&file, NarRepresentation::Raw(identity))
                             .map(NarMatch::from_content_match)
                             .map_err(Into::into)
                     },
@@ -557,7 +557,7 @@ impl Storage {
                     return Ok(None);
                 }
                 let reader = store
-                    .open_reader(hash, range, MAX_CHUNK_MANIFEST_BYTES)
+                    .open_verified_reader(hash, range, MAX_CHUNK_MANIFEST_BYTES)
                     .map_err(storage_error_for_chunk_store)?;
                 Ok(Some(OpenedNar {
                     body: NarReadBody::Chunked(Box::new(reader)),
@@ -565,6 +565,12 @@ impl Storage {
             }
             (PayloadStorage::Flat | PayloadStorage::Chunked(_), None)
             | (PayloadStorage::Flat, Some(_)) => self.open_nar(name)?.map_or(Ok(None), |file| {
+                if let Some(hash) = name.raw_hash() {
+                    let identity = NarIdentity::new(hash, file.metadata()?.len().into());
+                    if !nar_file_matches(&file, NarRepresentation::Raw(identity))? {
+                        return Err(StorageError::NarMismatch);
+                    }
+                }
                 Ok(Some(OpenedNar {
                     body: NarReadBody::File(file),
                 }))

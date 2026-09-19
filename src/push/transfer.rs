@@ -17,6 +17,7 @@ const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 const RETRYABLE_STATUSES: &[u16] = &[408, 429, 500, 502, 503, 504];
 const GET_REDIRECT_STATUSES: &[u16] = &[301, 302, 303, 307, 308];
 const PUT_REDIRECT_STATUSES: &[u16] = &[307, 308];
+#[cfg(test)]
 const MAX_IGNORED_GET_BODY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
@@ -47,6 +48,7 @@ fn retry_sleep(attempt: usize, retry_after: Option<Duration>) {
     thread::sleep(retry_after.unwrap_or_else(|| Duration::from_millis(100 * multiplier)));
 }
 
+#[cfg(test)]
 pub(super) fn request_status(
     agent: &Agent,
     url: &HttpUrl,

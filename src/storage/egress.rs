@@ -15,7 +15,8 @@ use crate::object::{
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
 use super::compression::{
-    CapacityCheckedStagingWriter, encode_raw_nar, encoded_file_matches, nar_file_size_matches,
+    CapacityCheckedStagingWriter, encode_raw_nar, encoded_file_matches, nar_file_matches,
+    nar_file_size_matches,
 };
 use super::fs::{
     BoundedRegularFile, open_optional_at, read_bounded_regular_file, read_dir_names, unlink_at,
@@ -303,7 +304,7 @@ impl Storage {
                 let file = self
                     .open_nar(NarFileName::raw(identity.hash()))?
                     .ok_or(StorageError::MissingNar)?;
-                if !nar_file_size_matches(&file, identity.size().get())? {
+                if !nar_file_matches(&file, NarRepresentation::Raw(identity))? {
                     return Err(StorageError::NarMismatch);
                 }
                 StoredNarSource::Flat(file)

@@ -192,6 +192,86 @@ fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     ));
 }
 
+#[test]
+fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
+    let directory = TestDir::new();
+    let storage = Storage::initialize(
+        &Directory::open(directory.path()).unwrap(),
+        StorageBackend::Chunked,
+    )
+    .unwrap();
+    let raw = vec![b's'; 100_000];
+    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    let name = NarFileName::raw(hash);
+    storage
+        .publish_nar(
+            name,
+            Cursor::new(&raw),
+            raw.len() as u64,
+            super::NarUploadPolicy::new(raw.len() as u64, 0),
+        )
+        .unwrap();
+
+    let chunks = directory.path().join(super::CHUNK_DIRECTORY);
+    let shard = fs::read_dir(&chunks)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let chunk = fs::read_dir(shard)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_file())
+        .unwrap();
+    let mut bytes = fs::read(&chunk).unwrap();
+    bytes[0] ^= 1;
+    fs::write(chunk, bytes).unwrap();
+
+    let mut opened = storage
+        .open_nar_range(name, 0..raw.len() as u64)
+        .unwrap()
+        .unwrap()
+        .body;
+    let error = io::copy(&mut opened, &mut io::sink()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn flat_canonical_nar_rejects_same_size_corruption() {
+    let directory = TestDir::new();
+    let storage = Storage::initialize(
+        &Directory::open(directory.path()).unwrap(),
+        StorageBackend::Flat,
+    )
+    .unwrap();
+    let raw = vec![b'f'; 4096];
+    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    let identity = NarIdentity::new(hash, NarSize::new(raw.len() as u64));
+    let name = NarFileName::raw(hash);
+    storage
+        .publish_nar(
+            name,
+            Cursor::new(&raw),
+            raw.len() as u64,
+            super::NarUploadPolicy::new(raw.len() as u64, 0),
+        )
+        .unwrap();
+
+    let payload = directory.path().join("nar").join(format!("{hash}.nar"));
+    let mut corrupted = fs::read(&payload).unwrap();
+    corrupted[0] ^= 1;
+    fs::write(payload, corrupted).unwrap();
+
+    assert!(matches!(
+        storage.open_verified_canonical_nar(NarRepresentation::Raw(identity)),
+        Err(StorageError::NarMismatch)
+    ));
+    assert!(matches!(
+        storage.open_nar_range(name, 0..raw.len() as u64),
+        Err(StorageError::NarMismatch)
+    ));
+}
+
 fn compressed_bytes(encoding: WireEncoding, raw: &[u8]) -> Vec<u8> {
     match encoding {
         WireEncoding::Compressed(CompressionCodec::Xz) => {
