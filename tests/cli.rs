@@ -283,6 +283,517 @@ fn native_push_signs_metadata_without_invoking_nix() {
     );
 }
 
+#[test]
+fn native_push_skips_payload_generation_for_a_matching_trusted_upstream() {
+    let destination = TcpListener::bind("127.0.0.1:0").expect("bind destination listener");
+    let destination_address = destination
+        .local_addr()
+        .expect("inspect destination listener");
+    let destination_server = thread::spawn(move || {
+        let (mut stream, _) = destination.accept().expect("accept destination lookup");
+        let request = read_http_request(&mut stream);
+        assert!(
+            String::from_utf8_lossy(&request)
+                .starts_with("GET /00000000000000000000000000000000.narinfo")
+        );
+        write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write destination miss");
+    });
+
+    let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream listener");
+    let upstream_address = upstream.local_addr().expect("inspect upstream listener");
+    let nar_bytes = native_nar_bytes();
+    let narinfo = signed_narinfo_for(
+        STORE_HASH,
+        &nix32_sha256(&nar_bytes),
+        nar_bytes.len() as u64,
+    );
+    let upstream_server = thread::spawn(move || {
+        let (mut stream, _) = upstream.accept().expect("accept upstream lookup");
+        let request = read_http_request(&mut stream);
+        assert!(
+            String::from_utf8_lossy(&request)
+                .starts_with("GET /00000000000000000000000000000000.narinfo")
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            narinfo.len(),
+            narinfo,
+        )
+        .expect("write trusted upstream narinfo");
+    });
+
+    let fixture = native_push_fixture();
+    fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
+        .expect("remove local payload so generation would fail");
+    let upstream_url = format!("http://{upstream_address}");
+    let upstream_key = format!(
+        "narjar-test:{}",
+        BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+    );
+    let output = run_native_push_fixture_with_options(
+        &fixture,
+        &format!("http://{destination_address}"),
+        "none",
+        NativePushRunOptions {
+            extra_args: &[
+                "--trusted-upstream",
+                &upstream_url,
+                "--trusted-upstream-key",
+                &upstream_key,
+            ],
+            ..NativePushRunOptions::default()
+        },
+    );
+
+    assert!(
+        output.status.success(),
+        "trusted upstream push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    destination_server
+        .join()
+        .expect("destination server should exit");
+    upstream_server.join().expect("upstream server should exit");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("trusted-upstream-present 1"),
+        "push summary should distinguish the trusted upstream skip: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !fixture.invocation_log.exists(),
+        "trusted upstream lookup must not invoke Nix"
+    );
+}
+
+fn one_response_cache(
+    status: u16,
+    reason: &'static str,
+    body: String,
+) -> (String, thread::JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind one-response cache");
+    let address = listener.local_addr().expect("inspect one-response cache");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept cache lookup");
+        let request = read_http_request(&mut stream);
+        write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        )
+        .expect("write cache lookup response");
+        request
+    });
+    (format!("http://{address}"), server)
+}
+
+fn trusted_upstream_key(seed: u8) -> String {
+    format!(
+        "narjar-test:{}",
+        BASE64.encode(
+            SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .as_bytes()
+        )
+    )
+}
+
+fn signed_narinfo_with_store_path(
+    store_path: &str,
+    nar_hash: &str,
+    nar_size: u64,
+    references: &[&str],
+) -> String {
+    let reference_basenames = references
+        .iter()
+        .map(|reference| {
+            reference
+                .strip_prefix("/nix/store/")
+                .expect("test reference should be a store path")
+        })
+        .collect::<Vec<_>>();
+    let fingerprint = format!(
+        "1;{store_path};sha256:{nar_hash};{nar_size};{}",
+        references.join(",")
+    );
+    let signature = SigningKey::from_bytes(&[7; 32]).sign(fingerprint.as_bytes());
+    format!(
+        "StorePath: {store_path}\nURL: nar/{nar_hash}.nar\nCompression: none\nFileHash: sha256:{nar_hash}\nFileSize: {nar_size}\nNarHash: sha256:{nar_hash}\nNarSize: {nar_size}\nReferences: {}\nSig: narjar-test:{}\n",
+        reference_basenames.join(" "),
+        BASE64.encode(&signature.to_bytes())
+    )
+}
+
+#[test]
+fn native_push_skips_payload_generation_when_the_destination_is_present() {
+    let (destination, server) = one_response_cache(200, "OK", String::new());
+    let fixture = native_push_fixture();
+    fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
+        .expect("remove local payload so generation would fail");
+
+    let output = run_native_push_fixture(&fixture, &destination, "none", false);
+
+    assert!(
+        output.status.success(),
+        "destination-present push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = server.join().expect("destination server should exit");
+    assert!(String::from_utf8_lossy(&request).starts_with("GET /"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "push complete: uploaded 0, destination-present 1, trusted-upstream-present 0; 1 workers\n"
+    );
+}
+
+#[test]
+fn native_push_uploads_when_upstream_metadata_is_not_an_exact_trusted_match() {
+    let nar_bytes = native_nar_bytes();
+    let nar_hash = nix32_sha256(&nar_bytes);
+    let nar_size = nar_bytes.len() as u64;
+    let store_path = format!("/nix/store/{STORE_HASH}-narjar");
+    let different_hash = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
+    let reference = "/nix/store/11111111111111111111111111111111-dependency";
+    let cases = [
+        (
+            "untrusted-signature",
+            signed_narinfo_with_store_path(&store_path, &nar_hash, nar_size, &[]),
+            trusted_upstream_key(8),
+            "invalid or untrusted narinfo",
+        ),
+        (
+            "nar-hash",
+            signed_narinfo_with_store_path(&store_path, different_hash, nar_size, &[]),
+            trusted_upstream_key(7),
+            "NAR hash or size differs",
+        ),
+        (
+            "nar-size",
+            signed_narinfo_with_store_path(&store_path, &nar_hash, nar_size + 1, &[]),
+            trusted_upstream_key(7),
+            "NAR hash or size differs",
+        ),
+        (
+            "store-path",
+            signed_narinfo_with_store_path(
+                &format!("/nix/store/{STORE_HASH}-different-name"),
+                &nar_hash,
+                nar_size,
+                &[],
+            ),
+            trusted_upstream_key(7),
+            "store path differs",
+        ),
+        (
+            "references",
+            signed_narinfo_with_store_path(&store_path, &nar_hash, nar_size, &[reference]),
+            trusted_upstream_key(7),
+            "references differ",
+        ),
+    ];
+
+    for (name, narinfo, key, expected_diagnostic) in cases {
+        let destination = RunningServer::start(&format!("upstream-mismatch-{name}"));
+        let (upstream, upstream_server) = one_response_cache(200, "OK", narinfo);
+        let fixture = native_push_fixture();
+        let output = run_native_push_fixture_with_options(
+            &fixture,
+            &format!("http://{}", destination.address),
+            "none",
+            NativePushRunOptions {
+                signing: true,
+                insecure_http: true,
+                extra_args: &[
+                    "--trusted-upstream",
+                    &upstream,
+                    "--trusted-upstream-key",
+                    &key,
+                ],
+                ..NativePushRunOptions::default()
+            },
+        );
+
+        assert!(
+            output.status.success(),
+            "{name} should fall back to upload: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_diagnostic),
+            "{name} should explain why it uploaded: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("uploaded 1"),
+            "{name} should be reported as uploaded"
+        );
+        upstream_server.join().expect("upstream server should exit");
+        let (signal, status) = destination.stop();
+        assert!(signal.success());
+        assert!(status.success());
+    }
+}
+
+#[test]
+fn native_push_uses_the_first_matching_trusted_upstream_in_configured_order() {
+    let nar_bytes = native_nar_bytes();
+    let nar_hash = nix32_sha256(&nar_bytes);
+    let nar_size = nar_bytes.len() as u64;
+    let mismatched = signed_narinfo_for(STORE_HASH, &nar_hash, nar_size + 1);
+    let matching = signed_narinfo_for(STORE_HASH, &nar_hash, nar_size);
+    let (first, first_server) = one_response_cache(200, "OK", mismatched);
+    let (second, second_server) = one_response_cache(200, "OK", matching);
+    let (destination, destination_server) = one_response_cache(404, "Not Found", String::new());
+    let fixture = native_push_fixture();
+    fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
+        .expect("remove local payload so generation would fail");
+    let key = trusted_upstream_key(7);
+
+    let output = run_native_push_fixture_with_options(
+        &fixture,
+        &destination,
+        "none",
+        NativePushRunOptions {
+            extra_args: &[
+                "--trusted-upstream",
+                &first,
+                "--trusted-upstream",
+                &second,
+                "--trusted-upstream-key",
+                &key,
+            ],
+            ..NativePushRunOptions::default()
+        },
+    );
+
+    assert!(
+        output.status.success(),
+        "ordered upstream lookup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    destination_server.join().expect("destination should exit");
+    first_server.join().expect("first upstream should exit");
+    second_server.join().expect("second upstream should exit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("trusted upstream {second}")));
+    assert!(stdout.contains("trusted-upstream-present 1"));
+}
+
+#[test]
+fn native_push_treats_upstream_misses_and_outages_as_upload_required() {
+    #[derive(Clone, Copy)]
+    enum UpstreamFailure {
+        Missing,
+        ServerError,
+        Unavailable,
+    }
+
+    for failure in [
+        UpstreamFailure::Missing,
+        UpstreamFailure::ServerError,
+        UpstreamFailure::Unavailable,
+    ] {
+        let (name, upstream, upstream_server) = match failure {
+            UpstreamFailure::Missing => {
+                let (upstream, server) = one_response_cache(404, "Not Found", String::new());
+                ("upstream-miss", upstream, Some(server))
+            }
+            UpstreamFailure::ServerError => {
+                let (upstream, server) =
+                    one_response_cache(503, "Service Unavailable", String::new());
+                ("upstream-server-error", upstream, Some(server))
+            }
+            UpstreamFailure::Unavailable => {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind unavailable upstream");
+                let address = listener.local_addr().expect("inspect unavailable upstream");
+                drop(listener);
+                ("upstream-outage", format!("http://{address}"), None)
+            }
+        };
+        let destination = RunningServer::start(name);
+        let fixture = native_push_fixture();
+        let key = trusted_upstream_key(7);
+        let output = run_native_push_fixture_with_options(
+            &fixture,
+            &format!("http://{}", destination.address),
+            "none",
+            NativePushRunOptions {
+                signing: true,
+                insecure_http: true,
+                extra_args: &[
+                    "--trusted-upstream",
+                    &upstream,
+                    "--trusted-upstream-key",
+                    &key,
+                ],
+                ..NativePushRunOptions::default()
+            },
+        );
+
+        assert!(
+            output.status.success(),
+            "upstream miss/outage should fall back to upload: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("uploaded 1"));
+        if !matches!(failure, UpstreamFailure::Missing) {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("uploading instead"),
+                "upstream failure fallback should be diagnosed"
+            );
+        }
+        if let Some(server) = upstream_server {
+            server.join().expect("upstream server should exit");
+        }
+        let (signal, status) = destination.stop();
+        assert!(signal.success());
+        assert!(status.success());
+    }
+}
+
+fn add_dependency_to_native_push_fixture(fixture: &NativePushFixture) -> String {
+    const DEPENDENCY_HASH: &str = "11111111111111111111111111111111";
+    let dependency = format!("/nix/store/{DEPENDENCY_HASH}-dependency");
+    fs::write(
+        fixture
+            .store_dir
+            .join(format!("{DEPENDENCY_HASH}-dependency")),
+        NAR_BYTES,
+    )
+    .expect("write dependency store object");
+    let native_nar = native_nar_bytes();
+    let database = sqlite::open(fixture.state_dir.join("db/db.sqlite"))
+        .expect("open native metadata database");
+    let hash = format!("sha256:{}", hex_sha256(&Sha256::digest(&native_nar)));
+    let mut insert = database
+        .prepare(
+            "INSERT INTO ValidPaths
+             (id, path, hash, registrationTime, narSize, sigs)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .expect("prepare dependency metadata insert");
+    insert.bind((1, 2_i64)).expect("bind dependency id");
+    insert
+        .bind((2, dependency.as_str()))
+        .expect("bind dependency path");
+    insert
+        .bind((3, hash.as_str()))
+        .expect("bind dependency NAR hash");
+    insert
+        .bind((4, 1_i64))
+        .expect("bind dependency registration time");
+    insert
+        .bind((5, native_nar.len() as i64))
+        .expect("bind dependency NAR size");
+    insert.bind((6, "")).expect("bind dependency signatures");
+    insert.next().expect("insert dependency metadata");
+    database
+        .execute("INSERT INTO Refs (referrer, reference) VALUES (1, 2)")
+        .expect("link root to dependency");
+    dependency
+}
+
+#[test]
+fn native_push_classifies_each_closure_member_independently() {
+    const DEPENDENCY_HASH: &str = "11111111111111111111111111111111";
+    let destination = RunningServer::start("upstream-closure");
+    let fixture = native_push_fixture();
+    let dependency = add_dependency_to_native_push_fixture(&fixture);
+    fs::remove_file(
+        fixture
+            .store_dir
+            .join(format!("{DEPENDENCY_HASH}-dependency")),
+    )
+    .expect("remove dependency payload so uploading it would fail");
+    let nar_bytes = native_nar_bytes();
+    let dependency_narinfo = signed_narinfo_with_store_path(
+        &dependency,
+        &nix32_sha256(&nar_bytes),
+        nar_bytes.len() as u64,
+        &[],
+    );
+    let upstream = TcpListener::bind("127.0.0.1:0").expect("bind closure upstream");
+    let upstream_address = upstream.local_addr().expect("inspect closure upstream");
+    let upstream_server = thread::spawn(move || {
+        let (mut dependency_stream, _) = upstream.accept().expect("accept dependency lookup");
+        let dependency_request = read_http_request(&mut dependency_stream);
+        assert!(
+            String::from_utf8_lossy(&dependency_request)
+                .starts_with(&format!("GET /{DEPENDENCY_HASH}.narinfo"))
+        );
+        write!(
+            dependency_stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            dependency_narinfo.len(),
+            dependency_narinfo,
+        )
+        .expect("write dependency hit");
+
+        let (mut root_stream, _) = upstream.accept().expect("accept root lookup");
+        let root_request = read_http_request(&mut root_stream);
+        assert!(
+            String::from_utf8_lossy(&root_request)
+                .starts_with(&format!("GET /{STORE_HASH}.narinfo"))
+        );
+        write!(
+            root_stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write root miss");
+    });
+    let upstream_url = format!("http://{upstream_address}");
+    let key = trusted_upstream_key(7);
+
+    let output = run_native_push_fixture_with_options(
+        &fixture,
+        &format!("http://{}", destination.address),
+        "none",
+        NativePushRunOptions {
+            signing: true,
+            insecure_http: true,
+            extra_args: &[
+                "--trusted-upstream",
+                &upstream_url,
+                "--trusted-upstream-key",
+                &key,
+            ],
+            ..NativePushRunOptions::default()
+        },
+    );
+
+    assert!(
+        output.status.success(),
+        "closure push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    upstream_server.join().expect("upstream server should exit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("skipped {dependency}: trusted upstream")));
+    assert!(stdout.contains("uploaded 1, destination-present 0, trusted-upstream-present 1"));
+    assert!(
+        destination
+            .data_dir
+            .join(format!("{STORE_HASH}.narinfo"))
+            .is_file(),
+        "the dependent root should be uploaded"
+    );
+    assert!(
+        !destination
+            .data_dir
+            .join(format!("{DEPENDENCY_HASH}.narinfo"))
+            .exists(),
+        "the upstream dependency should not be copied to the destination"
+    );
+    let (signal, status) = destination.stop();
+    assert!(signal.success());
+    assert!(status.success());
+}
+
 struct NativePushFixture {
     tools: TempDir,
     invocation_log: PathBuf,
@@ -432,13 +943,30 @@ fn hex_sha256(digest: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[derive(Default)]
+struct NativePushRunOptions<'a> {
+    refresh: bool,
+    timeout_seconds: Option<u64>,
+    signing: bool,
+    insecure_http: bool,
+    extra_args: &'a [&'a str],
+}
+
 fn run_native_push_fixture(
     fixture: &NativePushFixture,
     target: &str,
     compression: &str,
     refresh: bool,
 ) -> Output {
-    run_native_push_fixture_with_options(fixture, target, compression, refresh, None, false, false)
+    run_native_push_fixture_with_options(
+        fixture,
+        target,
+        compression,
+        NativePushRunOptions {
+            refresh,
+            ..NativePushRunOptions::default()
+        },
+    )
 }
 
 fn run_native_push_fixture_with_signing(
@@ -447,7 +975,16 @@ fn run_native_push_fixture_with_signing(
     compression: &str,
     refresh: bool,
 ) -> Output {
-    run_native_push_fixture_with_options(fixture, target, compression, refresh, None, true, false)
+    run_native_push_fixture_with_options(
+        fixture,
+        target,
+        compression,
+        NativePushRunOptions {
+            refresh,
+            signing: true,
+            ..NativePushRunOptions::default()
+        },
+    )
 }
 
 fn run_native_push_fixture_with_timeout(
@@ -461,10 +998,11 @@ fn run_native_push_fixture_with_timeout(
         fixture,
         target,
         compression,
-        refresh,
-        timeout_seconds,
-        false,
-        false,
+        NativePushRunOptions {
+            refresh,
+            timeout_seconds,
+            ..NativePushRunOptions::default()
+        },
     )
 }
 
@@ -472,10 +1010,7 @@ fn run_native_push_fixture_with_options(
     fixture: &NativePushFixture,
     target: &str,
     compression: &str,
-    refresh: bool,
-    timeout_seconds: Option<u64>,
-    signing: bool,
-    insecure_http: bool,
+    options: NativePushRunOptions<'_>,
 ) -> Output {
     let original_path = std::env::var_os("PATH").expect("test PATH should be set");
     let path = format!(
@@ -496,17 +1031,17 @@ fn run_native_push_fixture_with_options(
             .expect("netrc path should be UTF-8")
             .to_owned(),
     ];
-    if let Some(timeout_seconds) = timeout_seconds {
+    if let Some(timeout_seconds) = options.timeout_seconds {
         args.push("--timeout-seconds".to_owned());
         args.push(timeout_seconds.to_string());
     }
-    if refresh {
+    if options.refresh {
         args.push("--refresh".to_owned());
     }
-    if insecure_http {
+    if options.insecure_http {
         args.push("--insecure-http".to_owned());
     }
-    if signing {
+    if options.signing {
         args.push("--signing-key-file".to_owned());
         args.push(
             fixture
@@ -516,6 +1051,12 @@ fn run_native_push_fixture_with_options(
                 .to_owned(),
         );
     }
+    args.extend(
+        options
+            .extra_args
+            .iter()
+            .map(|argument| (*argument).to_owned()),
+    );
     args.push(fixture.store_path.clone());
     command()
         .args(&args)
@@ -884,7 +1425,7 @@ fn assert_native_push_process_boundary(compression: &str, suffix: &str) {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "pushed 1 paths with 1 workers\n"
+        "push complete: uploaded 1, destination-present 0, trusted-upstream-present 0; 1 workers\n"
     );
 
     assert!(
@@ -2504,10 +3045,11 @@ fn native_push_and_raw_read_share_one_chunked_cache_url() {
             &fixture,
             &format!("http://{}", server.address),
             compression,
-            false,
-            None,
-            true,
-            true,
+            NativePushRunOptions {
+                signing: true,
+                insecure_http: true,
+                ..NativePushRunOptions::default()
+            },
         );
         assert!(
             output.status.success(),

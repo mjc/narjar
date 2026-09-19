@@ -219,6 +219,10 @@ mod tests {
             "--insecure-http",
             "--signing-key-file",
             "/tmp/narjar-secret-key",
+            "--trusted-upstream",
+            "https://cache.nixos.org",
+            "--trusted-upstream-key",
+            "cache.nixos.org-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             "/run/current-system",
         ])
         .expect("push options should parse");

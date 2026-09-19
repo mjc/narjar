@@ -561,7 +561,6 @@ impl ValidatedNarInfo {
     pub(crate) const fn payload(&self) -> NarRepresentation {
         self.0.payload
     }
-
     pub(crate) fn into_bytes(self) -> Result<Vec<u8>, NarInfoError> {
         self.0.metadata.serialize(self.0.payload)
     }
