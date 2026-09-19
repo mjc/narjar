@@ -437,14 +437,7 @@ fn run_native_push_fixture(
     compression: &str,
     refresh: bool,
 ) -> Output {
-    run_native_push_fixture_with_timeout_and_signing(
-        fixture,
-        target,
-        compression,
-        refresh,
-        None,
-        false,
-    )
+    run_native_push_fixture_with_options(fixture, target, compression, refresh, None, false, false)
 }
 
 fn run_native_push_fixture_with_signing(
@@ -453,14 +446,7 @@ fn run_native_push_fixture_with_signing(
     compression: &str,
     refresh: bool,
 ) -> Output {
-    run_native_push_fixture_with_timeout_and_signing(
-        fixture,
-        target,
-        compression,
-        refresh,
-        None,
-        true,
-    )
+    run_native_push_fixture_with_options(fixture, target, compression, refresh, None, true, false)
 }
 
 fn run_native_push_fixture_with_timeout(
@@ -470,23 +456,25 @@ fn run_native_push_fixture_with_timeout(
     refresh: bool,
     timeout_seconds: Option<u64>,
 ) -> Output {
-    run_native_push_fixture_with_timeout_and_signing(
+    run_native_push_fixture_with_options(
         fixture,
         target,
         compression,
         refresh,
         timeout_seconds,
         false,
+        false,
     )
 }
 
-fn run_native_push_fixture_with_timeout_and_signing(
+fn run_native_push_fixture_with_options(
     fixture: &NativePushFixture,
     target: &str,
     compression: &str,
     refresh: bool,
     timeout_seconds: Option<u64>,
     signing: bool,
+    insecure_http: bool,
 ) -> Output {
     let original_path = std::env::var_os("PATH").expect("test PATH should be set");
     let path = format!(
@@ -513,6 +501,9 @@ fn run_native_push_fixture_with_timeout_and_signing(
     }
     if refresh {
         args.push("--refresh".to_owned());
+    }
+    if insecure_http {
+        args.push("--insecure-http".to_owned());
     }
     if signing {
         args.push("--signing-key-file".to_owned());
@@ -2497,6 +2488,48 @@ fn chunked_backend_serves_the_reconstructed_raw_nar() {
     let (signal, status) = server.stop();
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn native_push_and_raw_read_share_one_chunked_cache_url() {
+    for compression in ["none", "zstd", "xz"] {
+        let server = RunningServer::start_with_workers(
+            &format!("chunked-native-push-{compression}"),
+            2,
+            &["--storage-backend", "chunked"],
+        );
+        let fixture = native_push_fixture();
+        let output = run_native_push_fixture_with_options(
+            &fixture,
+            &format!("http://{}", server.address),
+            compression,
+            false,
+            None,
+            true,
+            true,
+        );
+        assert!(
+            output.status.success(),
+            "{compression} native push failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let nar_hash = nix32_sha256(&native_nar_bytes());
+        let response = server.request("GET", &format!("/nar/{nar_hash}.nar"));
+        let (headers, body) = response_parts(&response);
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+        assert_eq!(body, native_nar_bytes());
+        assert!(
+            fs::read_dir(server.data_dir.join(".narjar-manifests"))
+                .expect("chunk manifest directory should be readable")
+                .any(|entry| entry.is_ok()),
+            "native push should publish a chunk manifest"
+        );
+
+        let (signal, status) = server.stop();
+        assert!(signal.success(), "SIGTERM should be sent");
+        assert!(status.success(), "narjar should shut down cleanly");
+    }
 }
 
 #[test]
