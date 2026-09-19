@@ -44,7 +44,10 @@ fn create(options: Create) -> Result<(), Error> {
         .and_then(|mut source| source.read_exact(&mut random))
         .map_err(runtime)?;
     let secret = HEXLOWER.encode(&random);
-    if !tokens.insert(name, Sha256::digest(secret.as_bytes()).into()) {
+    if !tokens
+        .insert(name, Sha256::digest(secret.as_bytes()).into())
+        .map_err(runtime)?
+    {
         return Err(Error::runtime(format!(
             "token label already exists: {name}"
         )));

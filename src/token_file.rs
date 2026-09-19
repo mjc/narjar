@@ -70,16 +70,18 @@ impl TokenFile {
         self.0.iter().map(|record| &record.digest)
     }
 
-    pub fn insert(&mut self, label: &str, digest: [u8; TOKEN_BYTES]) -> bool {
-        debug_assert!(valid_label(label));
+    pub fn insert(&mut self, label: &str, digest: [u8; TOKEN_BYTES]) -> Result<bool, Error> {
+        if !valid_label(label) {
+            return Err(Error::InvalidLabel);
+        }
         if self.0.iter().any(|record| record.label == label) {
-            return false;
+            return Ok(false);
         }
         self.0.push(Record {
             label: label.to_owned(),
             digest,
         });
-        true
+        Ok(true)
     }
 
     pub fn remove(&mut self, label: &str) -> bool {
@@ -139,6 +141,7 @@ pub fn valid_label(label: &str) -> bool {
 pub enum Error {
     InsecurePermissions,
     Invalid,
+    InvalidLabel,
     Io(io::Error),
 }
 
@@ -155,6 +158,7 @@ impl fmt::Display for Error {
                 formatter.write_str("token hash file permissions must be 0600")
             }
             Self::Invalid => formatter.write_str("invalid token hash file"),
+            Self::InvalidLabel => formatter.write_str("invalid token label"),
             Self::Io(error) => error.fmt(formatter),
         }
     }
@@ -164,7 +168,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InsecurePermissions | Self::Invalid => None,
+            Self::InsecurePermissions | Self::Invalid | Self::InvalidLabel => None,
         }
     }
 }
@@ -177,7 +181,18 @@ mod tests {
         process,
     };
 
-    use super::TokenFile;
+    use super::{Error, TokenFile};
+
+    #[test]
+    fn insert_rejects_invalid_labels_without_mutating_the_file() {
+        let mut tokens = TokenFile::default();
+
+        assert!(matches!(
+            tokens.insert("not a label", [0; super::TOKEN_BYTES]),
+            Err(Error::InvalidLabel)
+        ));
+        assert_eq!(tokens.hashes().count(), 0);
+    }
 
     #[test]
     fn store_uses_unpredictable_private_temporary_file() {
