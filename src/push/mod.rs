@@ -140,69 +140,110 @@ struct PathInfo {
 }
 
 pub(crate) fn run(args: Push) -> Result<(), Error> {
+    let copy_options = build_native_copy_options(&args)?;
+    let (_roots, waves) = prepare_push_waves(&args)?;
+    let total_paths = waves.iter().map(Vec::len).sum::<usize>();
+    let worker_count = args.jobs.get().min(total_paths);
+    let report = run_dependency_waves(waves, &copy_options, args.jobs)?;
+    print_push_summary(report, worker_count);
+    Ok(())
+}
+
+fn build_native_copy_options(args: &Push) -> Result<NativeCopyOptions, Error> {
     let trusted_upstreams =
         TrustedUpstreams::from_configuration(&args.trusted_upstreams, &args.trusted_upstream_keys)
             .map_err(Error::runtime)?;
-    let mut metadata = closure_paths(&args.paths).map_err(Error::runtime)?;
-    let _roots = StoreRoots::hold(&args.paths).map_err(Error::runtime)?;
-    if let Some(key_file) = args.signing_key_file.as_deref() {
-        sign_metadata(key_file, &mut metadata).map_err(Error::runtime)?;
-    }
-    let waves = dependency_waves(metadata)?;
-    let total_paths = waves.iter().map(Vec::len).sum::<usize>();
-    let worker_count = args.jobs.get().min(total_paths);
-    let copy_options = NativeCopyOptions {
-        target: args.to,
-        netrc_file: args.netrc_file,
+    Ok(NativeCopyOptions {
+        target: args.to.clone(),
+        netrc_file: args.netrc_file.clone(),
         insecure_http: args.insecure_http,
         existing_narinfo: ExistingNarinfo::from(args.refresh),
         compression: args.compression,
         timeout_seconds: args.timeout_seconds,
         trusted_upstreams,
-    };
+    })
+}
 
-    let mut failures = 0;
+fn prepare_push_waves(args: &Push) -> Result<(StoreRoots, Vec<Vec<PathInfo>>), Error> {
+    let mut metadata = closure_paths(&args.paths).map_err(Error::runtime)?;
+    let roots = StoreRoots::hold(&args.paths).map_err(Error::runtime)?;
+    if let Some(key_file) = args.signing_key_file.as_deref() {
+        sign_metadata(key_file, &mut metadata).map_err(Error::runtime)?;
+    }
+    Ok((roots, dependency_waves(metadata)?))
+}
+
+fn run_dependency_waves(
+    waves: Vec<Vec<PathInfo>>,
+    copy_options: &NativeCopyOptions,
+    jobs: NonZeroUsize,
+) -> Result<PushReport, Error> {
     let mut report = PushReport::default();
+    let mut failures = 0;
     for wave in waves {
-        let wave_worker_count = args.jobs.get().min(wave.len());
-        let chunk_size = wave.len().div_ceil(wave_worker_count);
-        let mut workers = Vec::with_capacity(wave_worker_count);
-
-        for chunk in wave.chunks(chunk_size) {
-            let copy_options = copy_options.clone();
-            let metadata = chunk.to_vec();
-            workers.push(thread::spawn(move || {
-                native_copy_paths(&copy_options, &metadata)
-            }));
-        }
-
-        for worker in workers {
-            match worker.join() {
-                Ok(Ok(worker_report)) => report.merge(worker_report),
-                Ok(Err(message)) => {
-                    eprintln!("narjar push: {message}");
-                    failures += 1;
-                }
-                Err(_) => {
-                    eprintln!("narjar push: worker panicked");
-                    failures += 1;
-                }
-            }
-        }
-        if failures != 0 {
+        let (wave_report, wave_failures) = run_dependency_wave(&wave, copy_options, jobs);
+        report.merge(wave_report);
+        failures += wave_failures;
+        if wave_failures != 0 {
             break;
         }
     }
-
     if failures == 0 {
-        println!(
-            "push complete: uploaded {}, destination-present {}, trusted-upstream-present {}; {worker_count} workers",
-            report.uploaded, report.destination_present, report.trusted_upstream_present
-        );
-        Ok(())
+        Ok(report)
     } else {
         Err(Error::runtime(format!("{failures} push workers failed")))
     }
+}
+
+fn run_dependency_wave(
+    wave: &[PathInfo],
+    copy_options: &NativeCopyOptions,
+    jobs: NonZeroUsize,
+) -> (PushReport, usize) {
+    let worker_count = jobs.get().min(wave.len());
+    let chunk_size = wave.len().div_ceil(worker_count);
+    let workers = wave
+        .chunks(chunk_size)
+        .map(|metadata| spawn_copy_worker(copy_options, metadata))
+        .collect::<Vec<_>>();
+    collect_copy_worker_results(workers)
+}
+
+fn spawn_copy_worker(
+    copy_options: &NativeCopyOptions,
+    metadata: &[PathInfo],
+) -> thread::JoinHandle<Result<PushReport, String>> {
+    let copy_options = copy_options.clone();
+    let metadata = metadata.to_vec();
+    thread::spawn(move || native_copy_paths(&copy_options, &metadata))
+}
+
+fn collect_copy_worker_results(
+    workers: Vec<thread::JoinHandle<Result<PushReport, String>>>,
+) -> (PushReport, usize) {
+    let mut report = PushReport::default();
+    let mut failures = 0;
+    for worker in workers {
+        match worker.join() {
+            Ok(Ok(worker_report)) => report.merge(worker_report),
+            Ok(Err(message)) => {
+                eprintln!("narjar push: {message}");
+                failures += 1;
+            }
+            Err(_) => {
+                eprintln!("narjar push: worker panicked");
+                failures += 1;
+            }
+        }
+    }
+    (report, failures)
+}
+
+fn print_push_summary(report: PushReport, worker_count: usize) {
+    println!(
+        "push complete: uploaded {}, destination-present {}, trusted-upstream-present {}; {worker_count} workers",
+        report.uploaded, report.destination_present, report.trusted_upstream_present
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -234,6 +275,30 @@ fn native_copy_paths(
     options: &NativeCopyOptions,
     metadata: &[PathInfo],
 ) -> Result<PushReport, String> {
+    let (agent, authorization) = build_upload_client(options)?;
+    let lookup = CacheLookup::new(
+        &agent,
+        &options.target,
+        authorization.as_deref(),
+        options.existing_narinfo,
+        &options.trusted_upstreams,
+    );
+
+    let mut report = PushReport::default();
+    for info in metadata {
+        process_native_copy_path(
+            &lookup,
+            &agent,
+            authorization.as_deref(),
+            options,
+            info,
+            &mut report,
+        )?;
+    }
+    Ok(report)
+}
+
+fn build_upload_client(options: &NativeCopyOptions) -> Result<(Agent, Option<String>), String> {
     let authorization = options
         .netrc_file
         .as_deref()
@@ -248,39 +313,42 @@ fn native_copy_paths(
         .timeout_global(Some(Duration::from_secs(options.timeout_seconds.get())))
         .build()
         .into();
-    let lookup = CacheLookup::new(
-        &agent,
-        &options.target,
-        authorization.as_deref(),
-        options.existing_narinfo,
-        &options.trusted_upstreams,
-    );
+    Ok((agent, authorization))
+}
 
-    let mut report = PushReport::default();
-    for info in metadata {
-        match lookup.classify(info)? {
-            PushDisposition::DestinationPresent => report.destination_present += 1,
-            PushDisposition::TrustedUpstreamPresent(upstream) => {
-                println!(
-                    "skipped {}: trusted upstream {}",
-                    info.path,
-                    upstream.identity()
-                );
-                report.trusted_upstream_present += 1;
-            }
-            PushDisposition::UploadRequired => {
-                upload_path(
-                    &agent,
-                    &options.target,
-                    authorization.as_deref(),
-                    options.compression,
-                    info,
-                )?;
-                report.uploaded += 1;
-            }
+fn process_native_copy_path(
+    lookup: &CacheLookup<'_>,
+    agent: &Agent,
+    authorization: Option<&str>,
+    options: &NativeCopyOptions,
+    info: &PathInfo,
+    report: &mut PushReport,
+) -> Result<(), String> {
+    match lookup.classify(info)? {
+        PushDisposition::DestinationPresent => report.destination_present += 1,
+        PushDisposition::TrustedUpstreamPresent(upstream) => {
+            print_trusted_upstream_skip(info, upstream.identity());
+            report.trusted_upstream_present += 1;
+        }
+        PushDisposition::UploadRequired => {
+            upload_path(
+                agent,
+                &options.target,
+                authorization,
+                options.compression,
+                info,
+            )?;
+            report.uploaded += 1;
         }
     }
-    Ok(report)
+    Ok(())
+}
+
+fn print_trusted_upstream_skip(info: &PathInfo, upstream_identity: impl std::fmt::Display) {
+    println!(
+        "skipped {}: trusted upstream {}",
+        info.path, upstream_identity
+    );
 }
 
 fn upload_path(
@@ -290,29 +358,49 @@ fn upload_path(
     compression: Compression,
     info: &PathInfo,
 ) -> Result<(), String> {
-    let store_hash = store_hash_for_path(&info.path)?;
-    let narinfo_url = target.endpoint(&[&format!("{store_hash}.narinfo")]);
-    if compression == Compression::None {
-        let nar_name = format!("{}{}", info.nar.hash(), Compression::None.suffix());
-        let nar_url = target.endpoint(&["nar", &nar_name]);
-        let nar_status = put_reader(
-            agent,
-            &nar_url,
-            info.nar.size().get(),
-            "application/x-nix-nar",
-            authorization,
-            || open_verified_nar_reader(info),
-        )?;
-        require_successful_upload("NAR", info, nar_status)?;
-        let narinfo = serialize_narinfo(
-            info,
-            FileHash::from_nar_hash(info.nar.hash()),
-            EncodedSize::new(info.nar.size().get()),
-            compression,
-        )?;
-        return upload_narinfo(agent, &narinfo_url, authorization, info, &narinfo);
+    match compression {
+        Compression::None => upload_raw_nar(agent, target, authorization, info),
+        Compression::Zstd | Compression::Xz => {
+            upload_compressed_nar(agent, target, authorization, compression, info)
+        }
     }
+}
 
+fn upload_raw_nar(
+    agent: &Agent,
+    target: &HttpUrl,
+    authorization: Option<&str>,
+    info: &PathInfo,
+) -> Result<(), String> {
+    let narinfo_url = narinfo_url_for_path(target, info)?;
+    let nar_name = format!("{}{}", info.nar.hash(), Compression::None.suffix());
+    let nar_url = target.endpoint(&["nar", &nar_name]);
+    let nar_status = put_reader(
+        agent,
+        &nar_url,
+        info.nar.size().get(),
+        "application/x-nix-nar",
+        authorization,
+        || open_verified_nar_reader(info),
+    )?;
+    require_successful_upload(UploadArtifact::Nar, info, nar_status)?;
+    let narinfo = serialize_narinfo(
+        info,
+        FileHash::from_nar_hash(info.nar.hash()),
+        EncodedSize::new(info.nar.size().get()),
+        Compression::None,
+    )?;
+    upload_narinfo(agent, &narinfo_url, authorization, info, &narinfo)
+}
+
+fn upload_compressed_nar(
+    agent: &Agent,
+    target: &HttpUrl,
+    authorization: Option<&str>,
+    compression: Compression,
+    info: &PathInfo,
+) -> Result<(), String> {
+    let narinfo_url = narinfo_url_for_path(target, info)?;
     let prepared = prepare_nar(info, compression)?;
     let nar_name = format!("{}{}", prepared.identity.hash(), compression.suffix());
     let nar_url = target.endpoint(&["nar", &nar_name]);
@@ -324,8 +412,7 @@ fn upload_path(
         authorization,
         || open_verified_encoded_nar_reader(info, compression, prepared.identity),
     )?;
-    require_successful_upload("NAR", info, nar_status)?;
-
+    require_successful_upload(UploadArtifact::Nar, info, nar_status)?;
     let narinfo = serialize_narinfo(
         info,
         prepared.identity.hash(),
@@ -333,6 +420,11 @@ fn upload_path(
         compression,
     )?;
     upload_narinfo(agent, &narinfo_url, authorization, info, &narinfo)
+}
+
+fn narinfo_url_for_path(target: &HttpUrl, info: &PathInfo) -> Result<HttpUrl, String> {
+    let store_hash = store_hash_for_path(&info.path)?;
+    Ok(target.endpoint(&[&format!("{store_hash}.narinfo")]))
 }
 
 fn upload_narinfo(
@@ -349,15 +441,35 @@ fn upload_narinfo(
         "text/x-nix-narinfo",
         authorization,
     )?;
-    require_successful_upload("narinfo", info, status)
+    require_successful_upload(UploadArtifact::Narinfo, info, status)
 }
 
-fn require_successful_upload(kind: &str, info: &PathInfo, status: u16) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UploadArtifact {
+    Nar,
+    Narinfo,
+}
+
+impl UploadArtifact {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Nar => "NAR",
+            Self::Narinfo => "narinfo",
+        }
+    }
+}
+
+fn require_successful_upload(
+    artifact: UploadArtifact,
+    info: &PathInfo,
+    status: u16,
+) -> Result<(), String> {
     match status {
         200 | 201 => Ok(()),
         _ => Err(format!(
-            "{kind} upload for {} returned HTTP {status}",
-            info.path
+            "{} upload for {} returned HTTP {status}",
+            artifact.label(),
+            info.path,
         )),
     }
 }
