@@ -72,7 +72,7 @@ pub(crate) struct ReferencedPayload {
 
 impl ReferencedPayload {
     pub(crate) fn open(directory: &File, payload: ValidatedPayload) -> io::Result<Option<Self>> {
-        let name = payload.payload_name();
+        let name = payload.representation().file_name();
         match open_regular_at(directory, &name.os_string()) {
             Ok(file) => Ok(Some(Self { file, payload })),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -81,7 +81,10 @@ impl ReferencedPayload {
     }
 
     pub(crate) fn has_expected_size(&self) -> io::Result<bool> {
-        nar_file_size_matches(&self.file, self.payload.encoded_size().get())
+        nar_file_size_matches(
+            &self.file,
+            self.payload.representation().encoded_size().get(),
+        )
     }
 
     pub(crate) fn verify_content(self) -> io::Result<bool> {

@@ -6,14 +6,14 @@ use std::{
     os::unix::fs::MetadataExt,
 };
 
-use data_encoding::BASE64;
-use ed25519_dalek::{Signature, VerifyingKey};
 pub use crate::object::WireEncoding as NarEncoding;
 use crate::object::{
     CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
     NarRepresentation, NarSize,
 };
 use crate::storage::{Directory, StoreHash, StoredNar, open_regular_at};
+use data_encoding::BASE64;
+use ed25519_dalek::{Signature, VerifyingKey};
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
@@ -433,7 +433,6 @@ impl<'text> NarInfoDocument<'text> {
             .map_err(|_| NarInfoError)?;
         ValidatedPayload::from_narinfo(file_name, file_hash, file_size, identity)
     }
-
 }
 
 fn validate_optional_deriver(deriver: Option<&str>) -> Result<(), NarInfoError> {

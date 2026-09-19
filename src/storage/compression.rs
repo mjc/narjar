@@ -727,10 +727,7 @@ pub(super) fn verify_decoded_compressed_file(
     verified: VerifiedCompressedNar<'_>,
 ) -> io::Result<Option<NarIdentity>> {
     match decode_verified_compressed_payload(&verified) {
-        Ok(decoded) => Ok(decoded_nar_matches_expected_identity(
-            decoded,
-            verified.expectation.decoded(),
-        )),
+        Ok(decoded) => Ok((decoded == verified.expectation.decoded()).then_some(decoded)),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
         Err(error) => Err(error),
     }
@@ -743,13 +740,6 @@ fn decode_verified_compressed_payload(
         CompressionCodec::Zstd => decode_verified_zstd_payload(verified),
         CompressionCodec::Xz => decode_verified_xz_payload(verified),
     }
-}
-
-fn decoded_nar_matches_expected_identity(
-    decoded: NarIdentity,
-    expected: NarIdentity,
-) -> Option<NarIdentity> {
-    (decoded == expected).then_some(decoded)
 }
 
 fn decode_verified_xz_payload(verified: &VerifiedCompressedNar<'_>) -> io::Result<NarIdentity> {
@@ -805,17 +795,12 @@ pub(super) fn validate_compressed_nar(
     verify_decoded_compressed_file(verified)
 }
 
-pub(super) fn compressed_nar_matches(
-    file: &File,
-    expectation: CompressedNarIdentity,
-) -> io::Result<bool> {
-    Ok(validate_compressed_nar(file, expectation)?.is_some())
-}
-
 pub(crate) fn nar_file_matches(file: &File, payload: ValidatedPayload) -> io::Result<bool> {
     match payload.representation() {
         NarRepresentation::Raw(identity) => raw_nar_file_matches(file, identity),
-        NarRepresentation::Compressed(expectation) => compressed_nar_matches(file, expectation),
+        NarRepresentation::Compressed(expectation) => {
+            Ok(validate_compressed_nar(file, expectation)?.is_some())
+        }
     }
 }
 

@@ -54,7 +54,7 @@ fn egress_receipt_round_trips_through_compact_binary_serialization() {
 }
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
-    Storage::initialize(&Directory::open(path)?)
+    Storage::initialize(&Directory::open(path)?, StorageBackend::Flat)
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn chunked_ingestion_publishes_a_verified_manifest() {
 #[test]
 fn chunked_backend_routes_the_complete_nar_publication() {
     let directory = TestDir::new();
-    let storage = Storage::initialize_with_backend(
+    let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked,
     )
@@ -123,7 +123,7 @@ fn chunked_backend_routes_the_complete_nar_publication() {
         .unwrap();
     assert_eq!(
         storage
-            .open_nar_encoded(compressed_name)
+            .open_nar(compressed_name)
             .unwrap()
             .unwrap()
             .metadata()
@@ -143,7 +143,7 @@ fn chunked_backend_routes_the_complete_nar_publication() {
 #[test]
 fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     let directory = TestDir::new();
-    let storage = Storage::initialize_with_backend(
+    let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked,
     )
@@ -258,7 +258,7 @@ fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
         .unwrap();
     let hash = NarHash::from_digest(Sha256::digest(bytes).into());
     assert!(
-        storage.open_nar(hash).unwrap().is_none(),
+        storage.open_nar(NarFileName::raw(hash)).unwrap().is_none(),
         "receive must not publish"
     );
     assert_eq!(
@@ -273,7 +273,7 @@ fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
     );
     drop(complete);
     assert_upload_resources_released(&storage);
-    assert!(storage.open_nar(hash).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(hash)).unwrap().is_none());
 }
 
 #[test]
@@ -286,12 +286,12 @@ fn generic_publication_commits_only_after_finishing_its_stream() {
     let streaming = storage
         .begin_publication(target, |_| Ok(()))
         .expect("begin publication");
-    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
     assert_eq!(storage.temporary_objects(), 1);
     let validated = streaming
         .finish_and_sync(Cursor::new(b"nar bytes"))
         .expect("finish publication stream");
-    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
     assert_eq!(storage.temporary_objects(), 1);
 
     assert_eq!(
@@ -330,7 +330,7 @@ fn abandoned_generic_publication_cleans_up_staging() {
 
     assert_eq!(storage.temporary_objects(), 0);
     assert!(!storage.recovery_required().unwrap());
-    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
     assert!(
         fs::read_dir(storage.layout().nar_temp_dir())
             .unwrap()
@@ -379,7 +379,7 @@ fn failed_generic_publication_stream_cleans_up_staging() {
         matches!(result, Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EIO))
     );
     assert_eq!(storage.temporary_objects(), 0);
-    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
     assert!(
         fs::read_dir(storage.layout().nar_temp_dir())
             .unwrap()
@@ -817,7 +817,7 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     let output = {
-        let storage = Storage::initialize_with_backend(
+        let storage = Storage::initialize(
             &Directory::open(directory.path()).unwrap(),
             StorageBackend::Chunked,
         )
@@ -837,7 +837,7 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
         output
     };
 
-    let restarted = Storage::initialize_with_backend(
+    let restarted = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked,
     )
@@ -917,10 +917,13 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
         .collect::<Vec<_>>();
     let raw_hash = NarHash::from_digest(Sha256::digest(&raw).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(&raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(&raw),
+        )
         .expect("raw NAR should be stored");
     let raw_file = storage
-        .open_nar(raw_hash)
+        .open_nar(NarFileName::raw(raw_hash))
         .expect("raw NAR should open")
         .expect("raw NAR should exist");
     let min_free_bytes = u64::MAX;
@@ -953,7 +956,10 @@ fn repeated_compressed_egress_reuses_its_durable_derivative() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let first = storage
@@ -984,7 +990,10 @@ fn restarting_storage_reuses_a_durable_compressed_derivative() {
     let (first, initial_generations) = {
         let storage = initialize_storage(directory.path()).expect("storage should initialize");
         storage
-            .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(raw_hash)),
+                Cursor::new(raw),
+            )
             .expect("raw NAR should be stored");
         let output = storage
             .compressed_representation_for_test(identity, CompressionCodec::Xz, 0)
@@ -1010,7 +1019,10 @@ fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let first = storage
@@ -1035,7 +1047,10 @@ fn missing_compressed_derivative_must_reproduce_its_receipt_identity() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let output = storage
@@ -1085,7 +1100,10 @@ fn assert_egress_derivative_is_repaired(
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let output = storage
@@ -1138,7 +1156,10 @@ fn concurrent_requests_coalesce_compressed_derivative_generation() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let barrier = Arc::new(std::sync::Barrier::new(4));
@@ -1334,10 +1355,10 @@ fn initialization_creates_only_the_fixed_layout() {
 fn initialization_rejects_a_different_storage_backend() {
     let directory = TestDir::new();
     let root = Directory::open(directory.path()).unwrap();
-    let storage = Storage::initialize_with_backend(&root, StorageBackend::Flat).unwrap();
+    let storage = Storage::initialize(&root, StorageBackend::Flat).unwrap();
     drop(storage);
 
-    let error = Storage::initialize_with_backend(&root, StorageBackend::Chunked)
+    let error = Storage::initialize(&root, StorageBackend::Chunked)
         .expect_err("a populated root must retain its selected backend");
     assert!(error.to_string().contains("different storage backend"));
 }
@@ -1457,7 +1478,10 @@ fn publication_rejects_a_symlinked_temporary_directory() {
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     assert!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"must not escape"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"must not escape"),
+            )
             .is_err()
     );
     assert!(!storage.layout.nar_path(nar).exists());
@@ -1485,7 +1509,10 @@ fn publication_rejects_a_symlinked_destination_directory() {
 
     assert!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"must not be compared"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"must not be compared"),
+            )
             .is_err()
     );
     assert_eq!(
@@ -1691,27 +1718,30 @@ fn publication_is_immutable_idempotent_and_pair_gated() {
 
     assert_eq!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"nar bytes"),
+            )
             .expect("publish NAR"),
         PublishOutcome::Created
     );
     assert_eq!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"nar bytes"),
+            )
             .expect("retry identical NAR"),
         PublishOutcome::Identical
     );
     assert!(matches!(
-        storage.publish_nar_unchecked(&nar, Cursor::new(b"different")),
+        storage.publish(
+            PublishTarget::Nar(NarFileName::raw(nar)),
+            Cursor::new(b"different"),
+        ),
         Err(StorageError::Conflict)
     ));
-    assert!(
-        storage
-            .open_pair(&store, nar)
-            .expect("check incomplete pair")
-            .is_none(),
-        "an orphan NAR must not make a store path visible"
-    );
+    assert!(storage.open_narinfo(&store).unwrap().is_none());
 
     assert_eq!(
         storage
@@ -1730,14 +1760,18 @@ fn publication_is_immutable_idempotent_and_pair_gated() {
         Err(StorageError::Conflict)
     ));
 
-    let mut pair = storage
-        .open_pair(&store, nar)
-        .expect("open durable pair")
-        .expect("pair should be visible");
+    let mut nar_file = storage
+        .open_nar(NarFileName::raw(nar))
+        .expect("open durable NAR")
+        .expect("NAR should be visible");
+    let mut narinfo_file = storage
+        .open_narinfo(&store)
+        .expect("open durable narinfo")
+        .expect("narinfo should be visible");
     let mut nar_bytes = Vec::new();
     let mut narinfo_bytes = Vec::new();
-    pair.nar.read_to_end(&mut nar_bytes).expect("read NAR");
-    pair.narinfo
+    nar_file.read_to_end(&mut nar_bytes).expect("read NAR");
+    narinfo_file
         .read_to_end(&mut narinfo_bytes)
         .expect("read narinfo");
     assert_eq!(nar_bytes, b"nar bytes");
@@ -1785,7 +1819,10 @@ fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
         std::thread::spawn(move || {
             let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
             started_tx.send(()).expect("signal contender start");
-            let outcome = storage.publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"));
+            let outcome = storage.publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"nar bytes"),
+            );
             outcome_tx.send(outcome).expect("send contender outcome");
         })
     };
@@ -1885,7 +1922,10 @@ fn response_loss_after_parent_sync_is_visible_and_idempotent() {
     );
     assert_eq!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"nar bytes"),
+            )
             .expect("retry durable NAR"),
         PublishOutcome::Identical
     );
@@ -1900,13 +1940,8 @@ fn response_loss_after_parent_sync_is_visible_and_idempotent() {
             )
             .is_err()
     );
-    assert!(
-        storage
-            .open_pair(&store, nar)
-            .expect("open durable pair")
-            .is_some(),
-        "a parent-synced pair must remain visible after response loss"
-    );
+    assert!(storage.open_narinfo(&store).unwrap().is_some());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_some());
     assert_eq!(
         storage
             .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
@@ -1923,7 +1958,10 @@ fn stream_resource_failures_leave_no_false_publication_state() {
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
         let error = storage
-            .publish_nar_unchecked(&nar, BrokenReader::new(raw_error))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                BrokenReader::new(raw_error),
+            )
             .expect_err("stream failure must reject publication");
         let StorageError::Io(error) = error else {
             panic!("stream failure returned a non-I/O error");
@@ -2161,7 +2199,10 @@ fn independent_publications_do_not_wait_for_another_body() {
     let contender = {
         let storage = Arc::clone(&storage);
         std::thread::spawn(move || {
-            let outcome = storage.publish_nar_unchecked(&second, Cursor::new(b"nar"));
+            let outcome = storage.publish(
+                PublishTarget::Nar(NarFileName::raw(second)),
+                Cursor::new(b"nar"),
+            );
             outcome_tx
                 .send(outcome)
                 .expect("send second publication outcome");
@@ -2433,7 +2474,10 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
     storage
-        .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(nar)),
+            Cursor::new(b"nar bytes"),
+        )
         .expect("publish NAR");
     storage
         .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
@@ -2443,12 +2487,7 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
         storage.delete_narinfo(&store).expect("delete narinfo"),
         super::operations::NarInfoDeletion::Deleted
     );
-    assert!(
-        storage
-            .open_pair(&store, nar)
-            .expect("open deleted pair")
-            .is_none()
-    );
+    assert!(storage.open_narinfo(&store).unwrap().is_none());
     assert!(storage.layout().nar_path(nar).is_file());
     assert_eq!(
         storage.delete_narinfo(&store).expect("repeat delete"),

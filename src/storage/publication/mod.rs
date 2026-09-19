@@ -301,6 +301,7 @@ pub struct StagingReservation {
 }
 
 impl StagingReservation {
+    #[cfg(test)]
     pub(super) fn empty(budget: Arc<Mutex<StagingBudget>>) -> Self {
         Self { budget, bytes: 0 }
     }
@@ -354,12 +355,6 @@ impl Drop for StagingReservation {
             budget.release(self.bytes);
         }
     }
-}
-
-#[derive(Debug)]
-pub struct PublishedPair {
-    pub nar: File,
-    pub narinfo: File,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

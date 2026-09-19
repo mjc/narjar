@@ -15,8 +15,10 @@ use std::{
 };
 
 use crate::narinfo::{BoundNarInfo, ValidatedNarInfo};
+#[cfg(test)]
+use crate::object::NarHash;
 use crate::object::{
-    CompressedNarIdentity, EncodedIdentity, NarFileName, NarHash, NarIdentity, NarRepresentation,
+    CompressedNarIdentity, EncodedIdentity, NarFileName, NarIdentity, NarRepresentation,
     WireEncoding,
 };
 
@@ -40,8 +42,8 @@ use super::{
     ids::StoreHash,
     publication::{
         DestinationPublication, NEXT_TEMP, NarUploadPolicy, ProcessLock, PublicationDestination,
-        PublicationDirectory, PublishBoundary, PublishOutcome, PublishTarget, PublishedPair,
-        StagedPublication, StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
+        PublicationDirectory, PublishBoundary, PublishOutcome, PublishTarget, StagedPublication,
+        StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction, RecoveryState},
@@ -342,14 +344,7 @@ impl CacheInfoFields {
 }
 
 impl Storage {
-    pub fn initialize(root: &Directory) -> Result<Self, StorageError> {
-        Self::initialize_with_backend(root, StorageBackend::Flat)
-    }
-
-    pub fn initialize_with_backend(
-        root: &Directory,
-        backend: StorageBackend,
-    ) -> Result<Self, StorageError> {
+    pub fn initialize(root: &Directory, backend: StorageBackend) -> Result<Self, StorageError> {
         #[cfg(test)]
         let layout = Layout::new(root.path.clone());
         let root_directory = root.file.try_clone()?;
@@ -456,19 +451,8 @@ impl Storage {
         bytes: u64,
         min_free_bytes: u64,
     ) -> Result<StagingReservation, StorageError> {
-        if bytes == 0 {
-            return Ok(StagingReservation::empty(Arc::clone(&self.staging_budget)));
-        }
         let directory = self.nar_temp_directory()?;
         reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, bytes)
-    }
-
-    pub(super) fn empty_staging_reservation(
-        &self,
-        min_free_bytes: u64,
-    ) -> Result<StagingReservation, StorageError> {
-        let directory = self.nar_temp_directory()?;
-        reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, 0)
     }
 
     pub fn publish_cache_info(&self, source: impl Read) -> Result<PublishOutcome, StorageError> {
@@ -511,7 +495,7 @@ impl Storage {
         if expected_length > policy.max_bytes {
             return Err(StorageError::UploadTooLarge);
         }
-        let reservation = self.empty_staging_reservation(policy.min_free_bytes)?;
+        let reservation = self.reserve_staging(0, policy.min_free_bytes)?;
         let mut destination: ChunkingWriter<'_> = self
             .chunk_store
             .begin_ingest_with_reservation(
@@ -597,15 +581,6 @@ impl Storage {
     }
 
     #[cfg(test)]
-    pub(super) fn publish_nar_unchecked(
-        &self,
-        hash: &NarHash,
-        source: impl Read,
-    ) -> Result<PublishOutcome, StorageError> {
-        self.publish(PublishTarget::Nar(NarFileName::raw(*hash)), source)
-    }
-
-    #[cfg(test)]
     pub(super) fn publish_nar_fault(
         &self,
         hash: &NarHash,
@@ -636,12 +611,13 @@ impl Storage {
         if let NarRepresentation::Raw(identity) = narinfo.payload().representation() {
             return self.canonical_nar_matches(identity);
         }
+        let representation = narinfo.payload().representation();
         let nar_directory = self.nar_directory()?;
-        let payload_name = narinfo.payload_name();
+        let payload_name = representation.file_name();
         open_optional_at(&nar_directory, &payload_name.os_string())?.map_or(
             Ok(NarMatch::Missing),
             |file| {
-                nar_file_size_matches(&file, narinfo.file_size().get())
+                nar_file_size_matches(&file, representation.encoded_size().get())
                     .map(|matches| match matches {
                         true => NarMatch::Match,
                         false => NarMatch::Mismatch,
@@ -726,11 +702,7 @@ impl Storage {
         }
     }
 
-    pub fn open_nar(&self, nar: NarHash) -> Result<Option<File>, StorageError> {
-        self.open_nar_encoded(NarFileName::raw(nar))
-    }
-
-    pub fn open_nar_encoded(&self, name: NarFileName) -> Result<Option<File>, StorageError> {
+    pub fn open_nar(&self, name: NarFileName) -> Result<Option<File>, StorageError> {
         let directory = self.nar_directory()?;
         open_optional_at(&directory, &name.os_string())
     }
@@ -743,7 +715,7 @@ impl Storage {
                 .map_err(storage_error_for_chunk_store)?
                 .map(|manifest| manifest.identity().size().get()));
         }
-        let Some(file) = self.open_nar_encoded(name)? else {
+        let Some(file) = self.open_nar(name)? else {
             return Ok(None);
         };
         Ok(Some(file.metadata()?.len()))
@@ -771,7 +743,7 @@ impl Storage {
                 body: NarReadBody::Chunked(Box::new(reader)),
             }));
         }
-        let Some(file) = self.open_nar_encoded(name)? else {
+        let Some(file) = self.open_nar(name)? else {
             return Ok(None);
         };
         Ok(Some(OpenedNar {
@@ -783,17 +755,6 @@ impl Storage {
         let directory = self.root_directory()?;
         let name = format!("{}.narinfo", store.as_str());
         open_optional_at(&directory, OsStr::new(&name))
-    }
-
-    pub fn open_pair(
-        &self,
-        store: &StoreHash,
-        nar: NarHash,
-    ) -> Result<Option<PublishedPair>, StorageError> {
-        Ok(self
-            .open_narinfo(store)?
-            .zip(self.open_nar(nar)?)
-            .map(|(narinfo, nar)| PublishedPair { nar, narinfo }))
     }
 
     pub fn is_ready(&self, min_free_bytes: u64) -> Result<StorageReadiness, StorageError> {
@@ -1187,14 +1148,7 @@ impl Storage {
         self.create_temp_in_directory(directory, name)
     }
 
-    pub(super) fn create_nar_temp_named(
-        &self,
-        name: OsString,
-    ) -> Result<TemporaryFile, StorageError> {
-        self.create_temp_in_directory(self.nar_temp_directory()?, name)
-    }
-
-    fn create_temp_in_directory(
+    pub(super) fn create_temp_in_directory(
         &self,
         directory: File,
         name: OsString,

@@ -12,12 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::narinfo::ValidatedPayload;
 use crate::object::{
-    CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarHash,
-    NarIdentity, NarRepresentation, NarSize, WireEncoding,
+    CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
+    NarHash, NarIdentity, NarRepresentation, NarSize, WireEncoding,
 };
-
-#[cfg(test)]
-use crate::object::NarFileName;
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
 use super::compression::{
@@ -205,7 +202,7 @@ impl<'storage> Derivative<'storage, Prepared> {
         let temp_name = storage.next_temp_name_with_prefix("nar");
         let temporary_path = PathBuf::from("nar/.tmp").join(&temp_name);
         let transaction = storage.recovery.begin(&temporary_path)?;
-        let file = storage.create_nar_temp_named(temp_name)?;
+        let file = storage.create_temp_in_directory(storage.nar_temp_directory()?, temp_name)?;
         Ok(Self {
             temporary: TemporaryDerivative {
                 storage,
@@ -240,7 +237,7 @@ impl<'storage> Derivative<'storage, Streaming> {
             state: _,
         } = self;
         let storage = temporary.storage;
-        let mut reservation = storage.empty_staging_reservation(policy.min_free_bytes())?;
+        let mut reservation = storage.reserve_staging(0, policy.min_free_bytes())?;
         #[cfg(test)]
         storage.egress_generations.fetch_add(1, Ordering::Relaxed);
         let output = encode_canonical_raw_nar_into_capacity_checked_staging_file(
@@ -382,7 +379,7 @@ impl Storage {
         let source = match self.backend {
             StorageBackend::Flat => {
                 let file = self
-                    .open_nar(identity.hash())?
+                    .open_nar(NarFileName::raw(identity.hash()))?
                     .ok_or(StorageError::MissingNar)?;
                 if !nar_file_size_matches(&file, identity.size().get())? {
                     return Err(StorageError::NarMismatch);
@@ -568,18 +565,10 @@ impl Storage {
         match self.canonical_raw_status(receipt.slot().raw())? {
             CanonicalRawStatus::Present => Ok(CleanupAction::Keep),
             CanonicalRawStatus::Missing | CanonicalRawStatus::WrongSize => {
-                self.remove_egress_receipt(directory, name)
+                unlink_at(directory, name)?;
+                Ok(CleanupAction::Remove)
             }
         }
-    }
-
-    fn remove_egress_receipt(
-        &self,
-        directory: &File,
-        name: &OsStr,
-    ) -> Result<CleanupAction, StorageError> {
-        unlink_at(directory, name)?;
-        Ok(CleanupAction::Remove)
     }
 
     pub(super) fn canonical_raw_status(
@@ -601,15 +590,17 @@ impl Storage {
                 },
             );
         }
-        self.open_nar(identity.hash())?
-            .map_or(Ok(CanonicalRawStatus::Missing), |file| {
+        self.open_nar(NarFileName::raw(identity.hash()))?.map_or(
+            Ok(CanonicalRawStatus::Missing),
+            |file| {
                 Ok(nar_file_size_matches(&file, identity.size().get()).map(
                     |matches| match matches {
                         true => CanonicalRawStatus::Present,
                         false => CanonicalRawStatus::WrongSize,
                     },
                 )?)
-            })
+            },
+        )
     }
 
     pub(super) fn egress_receipt_directory(&self) -> Result<File, StorageError> {

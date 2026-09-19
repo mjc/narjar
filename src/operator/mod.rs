@@ -53,7 +53,7 @@ pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
             options.limit,
             options.min_age_seconds,
             options.json,
-            options.storage_backend.backend(),
+            options.storage_backend.into(),
         );
     }
     report(
@@ -61,7 +61,7 @@ pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
         ReportMode::Reconcile,
         options.verify_hashes,
         options.json,
-        options.storage_backend.backend(),
+        options.storage_backend.into(),
     )
 }
 
@@ -85,7 +85,7 @@ pub(crate) fn cleanup(options: Cleanup) -> Result<(), Error> {
         options.limit,
         options.min_age_seconds,
         options.json,
-        options.storage_backend.backend(),
+        options.storage_backend.into(),
         StructuralAction::Cleanup,
     )
 }
@@ -106,7 +106,7 @@ pub(crate) fn verify(options: Verify) -> Result<(), Error> {
         ReportMode::Verify,
         false,
         options.json,
-        options.storage_backend.backend(),
+        options.storage_backend.into(),
     )
 }
 
@@ -128,7 +128,7 @@ pub(crate) fn list_orphans(options: ListOrphans) -> Result<(), Error> {
         ReportMode::Orphans,
         options.verify_hashes,
         options.json,
-        options.storage_backend.backend(),
+        options.storage_backend.into(),
     )
 }
 
@@ -168,7 +168,7 @@ fn report(
             false => VerificationMode::Availability,
         },
     };
-    let storage = Storage::initialize_with_backend(&root, backend).map_err(runtime)?;
+    let storage = Storage::initialize(&root, backend).map_err(runtime)?;
     let inventory = Inventory::scan_storage(&storage, &trusted, verification).map_err(runtime)?;
 
     for finding in inventory
@@ -241,7 +241,7 @@ fn structural_scan(
         .checked_sub(Duration::from_secs(min_age_seconds))
         .ok_or_else(|| Error::usage("minimum age is out of range"))?;
     let root = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize_with_backend(&root, backend).map_err(runtime)?;
+    let storage = Storage::initialize(&root, backend).map_err(runtime)?;
     let report = storage.reconcile(limit, stale_before).map_err(runtime)?;
 
     for entry in report.entries() {
@@ -324,7 +324,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         min_age: std::time::Duration::from_secs(min_age_seconds),
         protected_roots,
         apply,
-        backend: storage_backend.backend(),
+        backend: storage_backend.into(),
     })
     .map_err(runtime)?;
 
@@ -411,8 +411,7 @@ pub(crate) fn delete(options: Delete) -> Result<(), Error> {
     } = options;
     let store = StoreHash::parse(&route).map_err(|_| Error::usage("--store-hash is invalid"))?;
     let root = Directory::open(&root).map_err(runtime)?;
-    let storage =
-        Storage::initialize_with_backend(&root, storage_backend.backend()).map_err(runtime)?;
+    let storage = Storage::initialize(&root, storage_backend.into()).map_err(runtime)?;
     let trusted = TrustedPublicKeys::load(&root).map_err(runtime)?;
     let file = storage
         .open_narinfo(&store)

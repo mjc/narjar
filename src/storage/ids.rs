@@ -17,7 +17,7 @@ impl StoreHash {
         valid_nix32(value, 32).then_some(()).ok_or(InvalidObjectId)
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }

@@ -44,9 +44,7 @@ pub use crate::object::{
 pub use directory::Directory;
 pub(crate) use egress::{NarReadBody, StoredNar};
 pub use ids::{InvalidObjectId, StoreHash};
-pub use publication::{
-    NarUploadPolicy, PublishOutcome, PublishedPair, StagingReservation, StorageError,
-};
+pub use publication::{NarUploadPolicy, PublishOutcome, StagingReservation, StorageError};
 pub use state::{Storage, StorageBackend};
 
 pub use operations::{NarInfoDeletion, NarMatch, StorageReadiness};

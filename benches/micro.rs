@@ -14,7 +14,7 @@ use narjar::{
     nar::{Decoder, Event},
     nar_encode::{self, Encoder},
     narinfo::TrustedPublicKeys,
-    storage::{Directory, NarFileName, NarHash, Storage},
+    storage::{Directory, NarFileName, NarHash, Storage, StorageBackend},
 };
 
 const OBJECT_ID: &str = "19rci548pgfshmx7rd3wzw2mhkq2dg8x3mq4q1kfkikgb2raqzxd";
@@ -39,8 +39,11 @@ fn run(name: &str, iterations: usize, mut operation: impl FnMut()) {
 
 fn initialized_storage(root: &Path) -> Storage {
     fs::create_dir_all(root).expect("create storage directory");
-    Storage::initialize(&Directory::open(root).expect("open storage directory"))
-        .expect("initialize storage")
+    Storage::initialize(
+        &Directory::open(root).expect("open storage directory"),
+        StorageBackend::Flat,
+    )
+    .expect("initialize storage")
 }
 
 fn bench_request_parse() {
@@ -82,10 +85,14 @@ fn bench_storage() {
     .expect("write benchmark NAR");
 
     run("open existing NAR", 10_000, || {
-        black_box(storage.open_nar(id).expect("open NAR"));
+        black_box(storage.open_nar(NarFileName::raw(id)).expect("open NAR"));
     });
     run("open missing NAR", 10_000, || {
-        black_box(storage.open_nar(missing_id).expect("open missing NAR"));
+        black_box(
+            storage
+                .open_nar(NarFileName::raw(missing_id))
+                .expect("open missing NAR"),
+        );
     });
 }
 

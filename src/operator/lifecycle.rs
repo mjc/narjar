@@ -12,7 +12,7 @@ use ed25519_dalek::SigningKey;
 use narjar::storage::{
     CHUNK_DIRECTORY, Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY,
     LAYOUT_DESCRIPTOR, MANIFEST_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY, Storage,
-    TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+    StorageBackend, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
 };
 
 use crate::error::Error;
@@ -50,13 +50,12 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
     create_recovery_marker(&root)?;
     create_file(
         &root.join(LAYOUT_DESCRIPTOR),
-        storage_backend.backend().layout_descriptor(),
+        StorageBackend::from(storage_backend).layout_descriptor(),
         0o600,
         true,
     )?;
     let directory = Directory::open(&root).map_err(runtime)?;
-    let storage =
-        Storage::initialize_with_backend(&directory, storage_backend.backend()).map_err(runtime)?;
+    let storage = Storage::initialize(&directory, storage_backend.into()).map_err(runtime)?;
     for directory in [
         NAR_DIRECTORY,
         TEMPORARY_DIRECTORY,

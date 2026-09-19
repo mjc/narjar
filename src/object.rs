@@ -1,4 +1,4 @@
-use std::{ffi::OsString, fmt, sync::OnceLock};
+use std::{ffi::OsString, fmt, str::FromStr, sync::OnceLock};
 
 use data_encoding::{BitOrder, Encoding, Specification};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,26 @@ pub(crate) struct EncodedIdentity {
     codec: CompressionCodec,
     hash: FileHash,
     size: EncodedSize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CompressedNarIdentity {
+    encoded: EncodedIdentity,
+    decoded: NarIdentity,
+}
+
+impl CompressedNarIdentity {
+    pub(crate) const fn new(encoded: EncodedIdentity, decoded: NarIdentity) -> Self {
+        Self { encoded, decoded }
+    }
+
+    pub(crate) const fn encoded(self) -> EncodedIdentity {
+        self.encoded
+    }
+
+    pub(crate) const fn decoded(self) -> NarIdentity {
+        self.decoded
+    }
 }
 
 impl EncodedIdentity {
@@ -205,7 +225,7 @@ impl NarFileName {
             .ok_or(InvalidObjectId)?
     }
 
-    pub(crate) const fn raw(hash: NarHash) -> Self {
+    pub const fn raw(hash: NarHash) -> Self {
         Self::new(FileHash::from_nar_hash(hash), WireEncoding::Raw)
     }
 
@@ -242,6 +262,30 @@ pub enum WireEncoding {
     Xz,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidWireEncoding;
+
+impl fmt::Display for InvalidWireEncoding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("expected one of: none, zstd, xz")
+    }
+}
+
+impl std::error::Error for InvalidWireEncoding {}
+
+impl FromStr for WireEncoding {
+    type Err = InvalidWireEncoding;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::Raw),
+            "zstd" => Ok(Self::Zstd),
+            "xz" => Ok(Self::Xz),
+            _ => Err(InvalidWireEncoding),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) enum CompressionCodec {
     Zstd,
@@ -262,23 +306,34 @@ impl CompressionCodec {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum NarRepresentation {
+pub(crate) enum NarRepresentation<Compressed = CompressedNarIdentity> {
     Raw(NarIdentity),
-    Compressed(EncodedIdentity),
+    Compressed(Compressed),
 }
 
-impl NarRepresentation {
+impl NarRepresentation<CompressedNarIdentity> {
+    pub(crate) const fn compressed(encoded: EncodedIdentity, decoded: NarIdentity) -> Self {
+        Self::Compressed(CompressedNarIdentity::new(encoded, decoded))
+    }
+
+    pub(crate) const fn identity(self) -> NarIdentity {
+        match self {
+            Self::Raw(identity) => identity,
+            Self::Compressed(identity) => identity.decoded(),
+        }
+    }
+
     pub(crate) const fn file_name(self) -> NarFileName {
         match self {
             Self::Raw(identity) => NarFileName::raw(identity.hash()),
-            Self::Compressed(identity) => identity.file_name(),
+            Self::Compressed(identity) => identity.encoded().file_name(),
         }
     }
 
     pub(crate) const fn encoded_size(self) -> EncodedSize {
         match self {
             Self::Raw(identity) => EncodedSize::new(identity.size().get()),
-            Self::Compressed(identity) => identity.size(),
+            Self::Compressed(identity) => identity.encoded().size(),
         }
     }
 }

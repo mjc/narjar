@@ -130,7 +130,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     }
 
     let root = Directory::open(&options.data_dir)?;
-    let storage = Storage::initialize_with_backend(&root, options.backend)?;
+    let storage = Storage::initialize(&root, options.backend)?;
     let trusted = TrustedPublicKeys::load(&root).map_err(|error| invalid(error.to_string()))?;
     if options.backend == StorageBackend::Chunked {
         return run_chunked(options, storage, trusted, target_bytes);
@@ -259,22 +259,22 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
                     invalid(format!("untrusted narinfo: {name_str}"))
                 }
             })?;
-        let nar_name = OsString::from(validated.payload_name().to_string());
+        let representation = validated.payload().representation();
+        let nar_name = OsString::from(representation.file_name().to_string());
         let nar_metadata = open_regular_at(&nar_directory, &nar_name)
             .and_then(|file| file.metadata())
             .map_err(|error| match error.kind() {
                 io::ErrorKind::NotFound => invalid(format!("missing NAR for narinfo: {name_str}")),
                 _ => error.into(),
             })?;
-        if nar_metadata.len() != validated.file_size().get() {
+        if nar_metadata.len() != representation.encoded_size().get() {
             return Err(invalid(format!(
                 "NAR size mismatch for narinfo: {name_str}"
             )));
         }
 
-        let canonical_raw_name = OsString::from(
-            super::NarFileName::raw(validated.decoded_identity().hash()).to_string(),
-        );
+        let canonical_raw_name =
+            OsString::from(super::NarFileName::raw(representation.identity().hash()).to_string());
         let (raw_nar_name, raw_nar_bytes) =
             match open_regular_at(&nar_directory, &canonical_raw_name) {
                 Ok(file) => (canonical_raw_name, file.metadata()?.len()),
@@ -286,11 +286,11 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
 
         entries.push(Entry {
             store,
-            store_path: validated.store_path().to_owned(),
+            store_path: validated.claims().store_path().to_owned(),
             references: validated
-                .references()
-                .split_ascii_whitespace()
-                .map(|reference| format!("/nix/store/{reference}"))
+                .claims()
+                .reference_paths()
+                .map(str::to_owned)
                 .collect(),
             narinfo_name: name,
             nar_name,
@@ -405,13 +405,14 @@ fn scan_chunked(
                     invalid(format!("untrusted narinfo: {name_str}"))
                 }
             })?;
-        let raw_hash = validated.decoded_identity().hash();
+        let representation = validated.payload().representation();
+        let raw_hash = representation.identity().hash();
         let manifest = storage
             .chunk_store
             .validate_manifest(raw_hash)
             .map_err(chunk_store_error)?
             .ok_or_else(|| invalid(format!("missing chunk manifest for narinfo: {name_str}")))?;
-        if manifest.identity() != validated.decoded_identity() {
+        if manifest.identity() != representation.identity() {
             return Err(invalid(format!(
                 "chunk manifest identity mismatch for narinfo: {name_str}"
             )));
@@ -422,10 +423,10 @@ fn scan_chunked(
             .ok_or_else(|| invalid(format!("chunk manifest disappeared: {name_str}")))?
             .metadata()?
             .len();
-        let (output_name, output_bytes) = match validated.payload().representation() {
+        let (output_name, output_bytes) = match representation {
             NarRepresentation::Raw(_) => (None, 0),
             NarRepresentation::Compressed(_) => {
-                let output_name = validated.payload_name().os_string();
+                let output_name = representation.file_name().os_string();
                 let output = open_regular_at(&nar_directory, &output_name).map_err(|error| {
                     match error.kind() {
                         io::ErrorKind::NotFound => {
@@ -435,7 +436,7 @@ fn scan_chunked(
                     }
                 })?;
                 let output_bytes = output.metadata()?.len();
-                if output_bytes != validated.file_size().get() {
+                if output_bytes != representation.encoded_size().get() {
                     return Err(invalid(format!(
                         "compressed output size mismatch for narinfo: {name_str}"
                     )));
@@ -445,11 +446,11 @@ fn scan_chunked(
         };
         entries.push(ChunkedEntry {
             store,
-            store_path: validated.store_path().to_owned(),
+            store_path: validated.claims().store_path().to_owned(),
             references: validated
-                .references()
-                .split_ascii_whitespace()
-                .map(|reference| format!("/nix/store/{reference}"))
+                .claims()
+                .reference_paths()
+                .map(str::to_owned)
                 .collect(),
             narinfo_name: name,
             output_name,
@@ -1276,11 +1277,11 @@ mod tests {
     }
 
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
-        Storage::initialize(&Directory::open(path)?)
+        Storage::initialize(&Directory::open(path)?, StorageBackend::Flat)
     }
 
     fn initialize_chunked_storage(path: &Path) -> Result<Storage, StorageError> {
-        Storage::initialize_with_backend(&Directory::open(path)?, StorageBackend::Chunked)
+        Storage::initialize(&Directory::open(path)?, StorageBackend::Chunked)
     }
 
     fn select_candidates(

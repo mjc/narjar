@@ -304,16 +304,17 @@ fn inspect_trusted_narinfo(
     metadata: ValidatedNarInfo,
     verification: VerificationMode,
 ) -> io::Result<MetadataAssessment> {
-    let payload = metadata.payload_name().file_hash();
-    let raw_nar = FileHash::from_nar_hash(metadata.decoded_identity().hash());
+    let representation = metadata.payload().representation();
+    let payload = representation.file_name().file_hash();
+    let raw_nar = FileHash::from_nar_hash(representation.identity().hash());
     let advertised_class = inspect_payload(source, metadata.payload(), verification)?;
-    let class = match metadata.payload().representation() {
+    let class = match representation {
         NarRepresentation::Raw(_) => advertised_class,
         NarRepresentation::Compressed(_) => combine_payload_classes(
             advertised_class,
             inspect_payload(
                 source,
-                ValidatedPayload::raw(metadata.decoded_identity()),
+                ValidatedPayload::raw(representation.identity()),
                 verification,
             )?,
         ),
@@ -564,7 +565,7 @@ mod tests {
     fn chunked_storage_inventory_checks_the_manifest_backed_nar() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
-        let storage = Storage::initialize_with_backend(&root, StorageBackend::Chunked).unwrap();
+        let storage = Storage::initialize(&root, StorageBackend::Chunked).unwrap();
         let raw = vec![b'i'; 100_000];
         let hash = NarHash::from_digest(Sha256::digest(&raw).into());
         let name = NarFileName::raw(hash);
