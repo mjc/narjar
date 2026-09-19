@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     auth::{Authorizer, Permission},
-    http_server::{Request, Response, StatusCode},
+    http_server::{BodyReaderError, Request, Response, StatusCode},
     metrics::{Metrics, RequestGuard, RequestMethod, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::{NarFileName, WireEncoding},
@@ -161,7 +161,7 @@ impl UploadRequest {
         self.request.body_complete()
     }
 
-    fn reader(&mut self) -> impl Read + '_ {
+    fn reader(&mut self) -> Result<impl Read + '_, BodyReaderError> {
         self.request.as_reader()
     }
 
@@ -173,6 +173,7 @@ impl UploadRequest {
         let mut bytes = Vec::with_capacity(length);
         let read = self
             .reader()
+            .map_err(|_| 422u16)?
             .take(length as u64 + 1)
             .read_to_end(&mut bytes);
         if read.is_err() || bytes.len() != length {
@@ -277,8 +278,15 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
     let length = upload.length();
     let _upload = metrics.upload(length as u64);
     let started = Instant::now();
-    let result =
-        storage.publish_nar_with_staging(name, upload.reader(), length as u64, policy, staging);
+    let reader = match upload.reader() {
+        Ok(reader) => reader,
+        Err(_) => {
+            metrics.validation_failure(ValidationClass::Nar);
+            guard.record_response(0, 0);
+            return None;
+        }
+    };
+    let result = storage.publish_nar_with_staging(name, reader, length as u64, policy, staging);
     metrics.publication(started.elapsed());
     if !upload.body_complete() {
         metrics.validation_failure(ValidationClass::Nar);

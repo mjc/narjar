@@ -194,8 +194,16 @@ pub struct Request {
     url: RequestTargetRange,
     headers: HeaderRanges,
     body_length: Option<usize>,
-    body_complete: bool,
+    body_state: BodyState,
     keep_alive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodyState {
+    Unread,
+    Reading,
+    Complete,
+    Failed,
 }
 
 impl BufferedHead {
@@ -256,7 +264,10 @@ impl BufferedHead {
             url: parsed.url,
             headers: parsed.headers,
             body_length: parsed.body_length,
-            body_complete: true,
+            body_state: match parsed.body_length.unwrap_or(0) {
+                0 => BodyState::Complete,
+                _ => BodyState::Unread,
+            },
             keep_alive: parsed.keep_alive,
         })
     }
@@ -358,8 +369,12 @@ impl Request {
         self.body_length
     }
 
-    pub fn as_reader(&mut self) -> BodyReader<'_> {
-        BodyReader {
+    pub fn as_reader(&mut self) -> Result<BodyReader<'_>, BodyReaderError> {
+        if self.body_state != BodyState::Unread {
+            return Err(BodyReaderError::AlreadyConsumed);
+        }
+        self.body_state = BodyState::Reading;
+        Ok(BodyReader {
             stream: &mut self.stream,
             prefix: self
                 .buffer
@@ -367,12 +382,12 @@ impl Request {
                 .expect("validated body prefix range"),
             prefix_offset: 0,
             remaining: self.body_length.unwrap_or(0),
-            complete: &mut self.body_complete,
-        }
+            state: &mut self.body_state,
+        })
     }
 
     pub fn body_complete(&self) -> bool {
-        self.body_complete
+        self.body_state == BodyState::Complete
     }
 
     pub fn close_after_response(&mut self) {
@@ -403,12 +418,35 @@ impl Request {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BodyReaderError {
+    AlreadyConsumed,
+}
+
+impl std::fmt::Display for BodyReaderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyConsumed => formatter.write_str("request body was already consumed"),
+        }
+    }
+}
+
+impl std::error::Error for BodyReaderError {}
+
 pub struct BodyReader<'a> {
     stream: &'a mut TcpStream,
     prefix: &'a [u8],
     prefix_offset: usize,
     remaining: usize,
-    complete: &'a mut bool,
+    state: &'a mut BodyState,
+}
+
+impl Drop for BodyReader<'_> {
+    fn drop(&mut self) {
+        if *self.state == BodyState::Reading {
+            *self.state = BodyState::Failed;
+        }
+    }
 }
 
 impl Read for BodyReader<'_> {
@@ -423,20 +461,26 @@ impl Read for BodyReader<'_> {
                 .copy_from_slice(&self.prefix[self.prefix_offset..self.prefix_offset + count]);
             self.prefix_offset += count;
             self.remaining -= count;
+            if self.remaining == 0 {
+                *self.state = BodyState::Complete;
+            }
             return Ok(count);
         }
         let output_length = output.len().min(self.remaining);
         let count = match self.stream.read(&mut output[..output_length]) {
             Ok(count) => count,
             Err(error) => {
-                *self.complete = false;
+                *self.state = BodyState::Failed;
                 return Err(error);
             }
         };
         if count == 0 {
-            *self.complete = false;
+            *self.state = BodyState::Failed;
         }
         self.remaining -= count;
+        if self.remaining == 0 {
+            *self.state = BodyState::Complete;
+        }
         Ok(count)
     }
 }
@@ -477,8 +521,42 @@ mod tests {
                 .any(|header| header.field.equiv("X-Test"))
         );
         let mut body = Vec::new();
-        std::io::Read::read_to_end(&mut request.as_reader(), &mut body).expect("read body");
+        std::io::Read::read_to_end(
+            &mut request.as_reader().expect("body is available"),
+            &mut body,
+        )
+        .expect("read body");
         assert_eq!(body, b"body");
+        assert!(matches!(
+            request.as_reader(),
+            Err(super::BodyReaderError::AlreadyConsumed)
+        ));
+        sender.join().expect("sender should finish");
+    }
+
+    #[test]
+    fn dropping_a_partial_body_reader_marks_the_body_failed() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let sender = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            stream
+                .write_all(b"PUT /nar/example.nar HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody")
+                .expect("write request");
+        });
+        let (stream, _) = listener.accept().expect("accept test request");
+        let mut request = Request::read(stream).expect("parse request");
+        let mut reader = request.as_reader().expect("body is available");
+        let mut byte = [0; 1];
+        reader.read_exact(&mut byte).expect("read body prefix");
+        drop(reader);
+
+        assert_eq!(byte, [b'b']);
+        assert!(!request.body_complete());
+        assert!(matches!(
+            request.as_reader(),
+            Err(super::BodyReaderError::AlreadyConsumed)
+        ));
         sender.join().expect("sender should finish");
     }
 
