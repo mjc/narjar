@@ -17,6 +17,12 @@ use crate::{
     },
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GcMode {
+    DryRun,
+    Apply,
+}
+
 pub struct GcOptions {
     pub data_dir: PathBuf,
     pub max_bytes: Option<u64>,
@@ -24,7 +30,7 @@ pub struct GcOptions {
     pub max_age: Option<Duration>,
     pub min_age: Duration,
     pub protected_roots: Option<PathBuf>,
-    pub apply: bool,
+    pub mode: GcMode,
     pub backend: StorageBackend,
 }
 
@@ -169,7 +175,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     let projected_after_bytes =
         logical_after_bytes(&entries, &selected, &orphans, &selected_orphans);
     let mut after_bytes = projected_after_bytes;
-    let dry_run = !options.apply;
+    let dry_run = options.mode == GcMode::DryRun;
     let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
         (0, 0, 0)
     } else {
@@ -332,7 +338,7 @@ fn run_chunked(
         now,
     )?;
     let after_bytes = chunked_projected_bytes(chunk_store, &entries, &selected)?;
-    let dry_run = !options.apply;
+    let dry_run = options.mode == GcMode::DryRun;
     let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
         (0, 0, 0)
     } else {
@@ -1589,7 +1595,7 @@ mod tests {
             max_age: None,
             min_age: Duration::ZERO,
             protected_roots: None,
-            apply: true,
+            mode: GcMode::Apply,
             backend: StorageBackend::Chunked,
         })
         .expect("chunked GC should complete");

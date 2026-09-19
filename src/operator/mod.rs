@@ -18,7 +18,7 @@ use narjar::{
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
         CleanupOutcome, Directory, ReconcileClass, Storage, StorageBackend, StoreHash,
-        gc::{self, GcOptions},
+        gc::{self, GcMode, GcOptions},
     },
 };
 use ureq::Agent;
@@ -323,7 +323,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         max_age: max_age_seconds.map(std::time::Duration::from_secs),
         min_age: std::time::Duration::from_secs(min_age_seconds),
         protected_roots,
-        apply,
+        mode: if apply { GcMode::Apply } else { GcMode::DryRun },
         backend: storage_backend,
     })
     .map_err(runtime)?;
