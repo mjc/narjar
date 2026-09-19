@@ -556,6 +556,26 @@ pub(super) fn lock_exclusive(file: &File) -> Result<(), StorageError> {
     }
 }
 
+/// Flush every dirty object and metadata change on the filesystem containing
+/// `file`. Chunk batches use this after linking their immutable files and
+/// before recording the corresponding manifest records.
+#[cfg(target_os = "linux")]
+pub(super) fn sync_filesystem(file: &File) -> io::Result<()> {
+    // SAFETY: `file` owns a live descriptor for the duration of this call.
+    // `syncfs` only reads that descriptor, does not retain it, and does not
+    // dereference any Rust-managed memory.
+    if unsafe { libc::syncfs(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn sync_filesystem(file: &File) -> io::Result<()> {
+    file.sync_all()
+}
+
 #[cfg(test)]
 pub(super) fn sync_dir(path: &Path) -> io::Result<()> {
     open_directory(path)?.sync_all()

@@ -19,7 +19,7 @@ use super::{
     },
     fs::{
         ensure_directory_at, files_equal_at, hard_link_at, open_at, open_directory_at,
-        open_regular_at, read_dir_names, unlink_at,
+        open_regular_at, read_dir_names, sync_filesystem, unlink_at,
     },
     publication::{StagingReservation, StorageError},
 };
@@ -28,6 +28,9 @@ const CHUNK_TEMP_PREFIX: &str = "chunk";
 const MANIFEST_TEMP_PREFIX: &str = "manifest";
 const GC_MARK_DIRECTORY: &str = ".gc-marks";
 const GC_MANIFEST_MARK_DIRECTORY: &str = "manifests";
+// 32 * 24 KiB bounds the pending raw tail below 768 KiB while amortizing
+// filesystem durability over enough chunks to avoid one sync per chunk.
+const CHUNK_PUBLICATION_BATCH_SIZE: usize = 32;
 pub(crate) const MAX_CHUNK_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -390,9 +393,15 @@ impl ChunkStore {
             })?)
     }
 
-    fn store_chunk(&self, hash: ChunkHash, bytes: &[u8]) -> io::Result<()> {
+    fn store_chunk(&self, hash: ChunkHash, bytes: &[u8]) -> io::Result<ChunkPublication> {
         let shard = self.open_or_create_shard(hash)?;
-        publish_immutable_bytes(&shard, &chunk_name(hash), CHUNK_TEMP_PREFIX, bytes)
+        let outcome = publish_immutable_bytes_without_directory_sync(
+            &shard,
+            &chunk_name(hash),
+            CHUNK_TEMP_PREFIX,
+            bytes,
+        )?;
+        Ok(ChunkPublication { outcome })
     }
 
     fn open_or_create_shard(&self, hash: ChunkHash) -> io::Result<File> {
@@ -566,6 +575,25 @@ pub(crate) struct ChunkingWriter<'store> {
     min_free_bytes: u64,
 }
 
+struct ChunkSpecification {
+    start: usize,
+    end: usize,
+    hash: ChunkHash,
+    nar_end: u64,
+    length: u64,
+}
+
+struct PendingChunk<'a> {
+    bytes: &'a [u8],
+    hash: ChunkHash,
+    end: u64,
+    length: u64,
+}
+
+struct ChunkPublication {
+    outcome: super::publication::PublishOutcome,
+}
+
 pub(crate) struct CompletedChunkedIngest {
     manifest: ChunkManifest,
     outcome: super::publication::PublishOutcome,
@@ -672,59 +700,148 @@ impl ChunkingWriter<'_> {
     }
 
     fn publish_complete_chunks(&mut self) -> io::Result<()> {
-        while self.pending.len() >= self.profile.max_size() as usize {
-            self.publish_next_chunk()?;
+        let batch_bytes = self
+            .profile
+            .max_size()
+            .checked_mul(CHUNK_PUBLICATION_BATCH_SIZE as u64)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "chunk batch is too large")
+            })?;
+        while self.pending.len() >= batch_bytes {
+            self.publish_next_batch(false)?;
         }
         Ok(())
     }
 
     fn publish_pending_chunk(&mut self) -> Result<(), ChunkStoreError> {
         while !self.pending.is_empty() {
-            self.publish_next_chunk().map_err(ChunkStoreError::from)?;
+            self.publish_next_batch(true)
+                .map_err(ChunkStoreError::from)?;
         }
         Ok(())
     }
 
-    fn publish_next_chunk(&mut self) -> io::Result<()> {
-        let chunk_length = SliceChunker::new(
-            &self.pending,
-            self.profile.min_size() as usize,
-            self.profile.max_size() as usize,
-            MinCdcHash4::new(),
-        )
-        .next()
-        .expect("a non-empty pending buffer produces a chunk")
-        .len();
-        let hash = ChunkHash::from_digest(Sha256::digest(&self.pending[..chunk_length]).into());
-        self.reserve_before_materialization(&self.store.chunks, chunk_length as u64)?;
-        self.store
-            .store_chunk(hash, &self.pending[..chunk_length])?;
-        self.release_materialized_bytes(chunk_length as u64);
-        let remaining = u64::try_from(self.pending.len() - chunk_length)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk buffer is too large"))?;
-        let end = self
-            .size
-            .checked_sub(remaining)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end underflow"))?;
-        let length = end - self.previous_end;
-        if self
-            .previous_length
-            .is_some_and(|previous| previous < self.profile.min_size())
-        {
+    fn publish_next_batch(&mut self, final_batch: bool) -> io::Result<()> {
+        let specifications = self.next_chunk_specifications(final_batch)?;
+        for specification in &specifications {
+            self.reserve_before_materialization(&self.store.chunks, specification.length)?;
+        }
+        let batch = specifications
+            .iter()
+            .map(|specification| PendingChunk {
+                bytes: &self.pending[specification.start..specification.end],
+                hash: specification.hash,
+                end: specification.nar_end,
+                length: specification.length,
+            })
+            .collect::<Vec<_>>();
+
+        let publications = self.publish_chunk_batch(&batch)?;
+        self.sync_new_chunk_filesystem(&publications)?;
+        drop(batch);
+        for specification in &specifications {
+            self.release_materialized_bytes(specification.length);
+            self.record_published_chunk(specification)?;
+        }
+        let drained = specifications
+            .last()
+            .map_or(0, |specification| specification.end);
+        self.pending.drain(..drained);
+        Ok(())
+    }
+
+    fn next_chunk_specifications(&self, final_batch: bool) -> io::Result<Vec<ChunkSpecification>> {
+        let mut specifications = Vec::with_capacity(CHUNK_PUBLICATION_BATCH_SIZE);
+        let mut start = 0;
+        let mut previous_length = self.previous_length;
+        while start < self.pending.len() && specifications.len() < CHUNK_PUBLICATION_BATCH_SIZE {
+            let remaining = self.pending.len() - start;
+            if !final_batch && remaining < self.profile.max_size() as usize {
+                break;
+            }
+            let chunk_length = SliceChunker::new(
+                &self.pending[start..],
+                self.profile.min_size() as usize,
+                self.profile.max_size() as usize,
+                MinCdcHash4::new(),
+            )
+            .next()
+            .expect("a non-empty pending buffer produces a chunk")
+            .len();
+            if previous_length.is_some_and(|previous| previous < self.profile.min_size()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "non-final chunk is too small",
+                ));
+            }
+            let end = start
+                .checked_add(chunk_length)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end overflow"))?;
+            let remaining_after_chunk = self.pending.len() - end;
+            let nar_end = self
+                .size
+                .checked_sub(remaining_after_chunk as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end underflow"))?;
+            let length = nar_end.checked_sub(self.previous_end).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "chunk length underflow")
+            })?;
+            specifications.push(ChunkSpecification {
+                start,
+                end,
+                hash: ChunkHash::from_digest(Sha256::digest(&self.pending[start..end]).into()),
+                nar_end,
+                length,
+            });
+            previous_length = Some(length);
+            start = end;
+        }
+        if specifications.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "non-final chunk is too small",
+                "chunk batch has no complete chunk",
             ));
         }
-        self.record_file.write_all(&end.to_le_bytes())?;
-        self.record_file.write_all(&hash.bytes())?;
-        self.previous_end = end;
-        self.previous_length = Some(length);
+        Ok(specifications)
+    }
+
+    fn publish_chunk_batch(&self, batch: &[PendingChunk<'_>]) -> io::Result<Vec<ChunkPublication>> {
+        std::thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .map(|chunk| scope.spawn(|| self.store.store_chunk(chunk.hash, chunk.bytes)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| io::Error::other("chunk publication thread panicked"))?
+                })
+                .collect()
+        })
+    }
+
+    fn sync_new_chunk_filesystem(&self, publications: &[ChunkPublication]) -> io::Result<()> {
+        let has_new_chunk = publications
+            .iter()
+            .any(|publication| publication.outcome == super::publication::PublishOutcome::Created);
+        if has_new_chunk {
+            sync_filesystem(&self.store.chunks)?;
+        }
+        Ok(())
+    }
+
+    fn record_published_chunk(&mut self, specification: &ChunkSpecification) -> io::Result<()> {
+        self.record_file
+            .write_all(&specification.nar_end.to_le_bytes())?;
+        self.record_file.write_all(&specification.hash.bytes())?;
+        self.previous_end = specification.nar_end;
+        self.previous_length = Some(specification.length);
         self.chunk_count = self
             .chunk_count
             .checked_add(1)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "too many chunks"))?;
-        self.pending.drain(..chunk_length);
         Ok(())
     }
 
@@ -803,35 +920,43 @@ impl<W: Write> Write for DigestingWriter<'_, W> {
     }
 }
 
-fn publish_immutable_bytes(
+fn publish_immutable_bytes_without_directory_sync(
     directory: &File,
     name: &OsStr,
     temp_prefix: &str,
     bytes: &[u8],
-) -> io::Result<()> {
+) -> io::Result<super::publication::PublishOutcome> {
     let temporary_name = temporary_name(temp_prefix);
     let result = write_temporary_file(directory, &temporary_name, bytes).and_then(|()| {
-        match hard_link_at(directory, &temporary_name, directory, name) {
-            Ok(()) => directory.sync_all(),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if files_equal_at(directory, &temporary_name, directory, name)? {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "content-addressed storage collision",
-                    ))
-                }
-            }
-            Err(error) => Err(error),
-        }
+        publish_temporary_file_without_directory_sync(directory, &temporary_name, name)
     });
     let cleanup = unlink_at(directory, &temporary_name);
     match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(outcome), Ok(())) => Ok(outcome),
         (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
+        (Ok(_outcome), Err(error)) => Err(error),
         (Err(error), Err(_cleanup_error)) => Err(error),
+    }
+}
+
+fn publish_temporary_file_without_directory_sync(
+    directory: &File,
+    temporary_name: &OsStr,
+    name: &OsStr,
+) -> io::Result<super::publication::PublishOutcome> {
+    match hard_link_at(directory, temporary_name, directory, name) {
+        Ok(()) => Ok(super::publication::PublishOutcome::Created),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if files_equal_at(directory, temporary_name, directory, name)? {
+                Ok(super::publication::PublishOutcome::Identical)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "content-addressed storage collision",
+                ))
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -871,8 +996,7 @@ fn write_temporary_file(directory: &File, name: &OsStr, bytes: &[u8]) -> io::Res
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o600,
     )?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    file.write_all(bytes)
 }
 
 fn remove_temporary_file(directory: &File, name: &OsStr) -> io::Result<()> {
