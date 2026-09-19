@@ -134,7 +134,10 @@ serialization. `--netrc-file` is parsed by Narjar and its matching credential
 is sent as HTTP Basic authentication only when the target URL uses HTTPS. Plain
 HTTP requests never receive an Authorization header, and an HTTP-to-HTTPS
 redirect does not upgrade credentials; use an HTTPS target from the start. The
-file must already have restrictive permissions.
+file must already have restrictive permissions. `NARJAR_PUSH_GCROOTS` may point
+to an operator-owned existing `gcroots/auto` directory when the normal Nix
+state directory is not writable; it changes only where Narjar places its
+temporary reachability symlinks, not Nix's store or state database.
 
 The native client transfers store-path NARs and narinfos only. Realisations,
 build logs, `.ls` listings, and other store-daemon metadata are outside this

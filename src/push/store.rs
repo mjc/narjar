@@ -39,6 +39,9 @@ impl LocalStore {
         let database =
             Connection::open_with_flags(database_path, OpenFlags::new().with_read_only())
                 .map_err(|error| format!("opening the Nix store database: {error}"))?;
+        database
+            .execute("PRAGMA busy_timeout = 30000")
+            .map_err(|error| format!("configuring the Nix store database wait: {error}"))?;
         validate_supported_schema(&database)?;
         database
             .execute("BEGIN")

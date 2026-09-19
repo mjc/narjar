@@ -21,14 +21,19 @@ pub(super) struct StoreRoots {
 
 impl StoreRoots {
     pub(super) fn hold(store_paths: &[String]) -> Result<Self, String> {
-        let state_dir = std::env::var_os("NIX_STATE_DIR")
+        let automatic_roots = std::env::var_os("NARJAR_PUSH_GCROOTS")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/nix/var/nix"));
+            .unwrap_or_else(|| {
+                let state_dir = std::env::var_os("NIX_STATE_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/nix/var/nix"));
+                state_dir.join("gcroots/auto")
+            });
         let targets = store_paths
             .iter()
             .map(|path| local_store_path(path))
             .collect::<Result<Vec<_>, _>>()?;
-        Self::hold_in(&state_dir.join("gcroots/auto"), targets)
+        Self::hold_in(&automatic_roots, targets)
     }
 
     fn hold_in(
