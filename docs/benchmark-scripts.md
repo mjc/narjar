@@ -27,8 +27,9 @@ The active helpers are:
   closure are recorded as path inputs but uploaded once, with their sizes
   checked for consistency. Both modes verify byte-for-byte reads, stop the
   writers, synchronize the pool, and record logical and physical counters plus
-  the commands and server logs. It never creates, destroys, mounts, unmounts,
-  or changes datasets, and it refuses non-empty data roots.
+  upload/verification timings, the commands, and server logs. It never creates,
+  destroys, mounts, unmounts, or changes datasets, and it refuses non-empty
+  data roots.
 
 `tests/measurement-scripts.sh` continues to exercise the older streaming
 helpers with small fake binaries; it does not require a large corpus.
