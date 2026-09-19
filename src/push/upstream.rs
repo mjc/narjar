@@ -10,7 +10,7 @@ use narjar::{
 use ureq::Agent;
 
 use super::{
-    ExistingNarinfo, PathInfo,
+    DestinationNarinfoPolicy, PathInfo,
     narinfo::normalized_references,
     store_hash_for_path,
     transfer::{get_bounded, request_status},
@@ -100,7 +100,7 @@ pub(super) struct CacheLookup<'a> {
     agent: &'a Agent,
     destination: &'a HttpUrl,
     destination_authorization: Option<&'a str>,
-    existing_narinfo: ExistingNarinfo,
+    destination_narinfo: DestinationNarinfoPolicy,
     upstreams: &'a TrustedUpstreams,
 }
 
@@ -109,22 +109,22 @@ impl<'a> CacheLookup<'a> {
         agent: &'a Agent,
         destination: &'a HttpUrl,
         destination_authorization: Option<&'a str>,
-        existing_narinfo: ExistingNarinfo,
+        destination_narinfo: DestinationNarinfoPolicy,
         upstreams: &'a TrustedUpstreams,
     ) -> Self {
         Self {
             agent,
             destination,
             destination_authorization,
-            existing_narinfo,
+            destination_narinfo,
             upstreams,
         }
     }
 
     pub(super) fn classify(&self, info: &PathInfo) -> Result<PushDisposition, String> {
-        match self.existing_narinfo {
-            ExistingNarinfo::Refresh => return Ok(PushDisposition::UploadRequired),
-            ExistingNarinfo::Skip => {}
+        match self.destination_narinfo {
+            DestinationNarinfoPolicy::Refresh => return Ok(PushDisposition::UploadRequired),
+            DestinationNarinfoPolicy::ReuseExisting => {}
         }
 
         let store_hash = store_hash_for_path(&info.path)?;

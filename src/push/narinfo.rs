@@ -1,11 +1,11 @@
-use super::{Compression, PathInfo};
-use crate::object::{EncodedSize, FileHash};
+use super::PathInfo;
+use crate::object::{EncodedSize, FileHash, WireEncoding};
 
 pub(super) fn serialize_narinfo(
     info: &PathInfo,
     file_hash: FileHash,
     file_size: EncodedSize,
-    compression: Compression,
+    encoding: WireEncoding,
 ) -> Result<Vec<u8>, String> {
     info.path
         .strip_prefix("/nix/store/")
@@ -16,8 +16,8 @@ pub(super) fn serialize_narinfo(
         "StorePath: {}\nURL: nar/{}{}\nCompression: {}\nFileHash: sha256:{}\nFileSize: {}\nNarHash: sha256:{}\nNarSize: {}\nReferences: {}\n",
         info.path,
         file_hash,
-        compression.suffix(),
-        compression.query_value(),
+        encoding.suffix(),
+        encoding.compression(),
         file_hash,
         file_size,
         info.nar.hash(),

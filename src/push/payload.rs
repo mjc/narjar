@@ -4,37 +4,47 @@ use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
+use super::PathInfo;
 use super::nar_stream::{local_store_path, verify_nar_summary, write_nar};
-use narjar::narinfo::NarInfoMetadata;
-use narjar::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
+use crate::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
 
-pub(super) fn prepare_nar(
-    info: &NarInfoMetadata,
+pub(super) fn measure_encoded_nar(
+    info: &PathInfo,
     codec: CompressionCodec,
 ) -> Result<EncodedIdentity, String> {
     let mut measured = MeasuredWriter::new(io::sink());
-    let path = local_store_path(info.claims().store_path())?;
-    match codec {
+    let path = local_store_path(&info.path)?;
+    write_encoded_nar(&path, info, codec, &mut measured)?;
+    let (_, file_hash, file_size) = measured.finish();
+    Ok(EncodedIdentity::new(codec, file_hash, file_size))
+}
+
+pub(super) fn write_encoded_nar<W: Write>(
+    path: &std::path::Path,
+    info: &PathInfo,
+    codec: CompressionCodec,
+    mut output: W,
+) -> Result<(), String> {
+    let summary = match codec {
         CompressionCodec::Zstd => {
-            let mut encoder = StreamingEncoder::new(&mut measured, CompressionLevel::Fastest);
-            let summary = write_nar(&path, &mut encoder)?;
+            let mut encoder = StreamingEncoder::new(&mut output, CompressionLevel::Fastest);
+            let summary = write_nar(path, &mut encoder)?;
             encoder
                 .finish()
                 .map_err(|error| format!("finishing zstd NAR: {error}"))?;
-            verify_nar_summary(info, &summary)?;
+            summary
         }
         CompressionCodec::Xz => {
-            let mut encoder = XzWriter::new(&mut measured, XzOptions::with_preset(1))
+            let mut encoder = XzWriter::new(&mut output, XzOptions::with_preset(1))
                 .map_err(|error| format!("creating XZ encoder: {error}"))?;
-            let summary = write_nar(&path, &mut encoder)?;
+            let summary = write_nar(path, &mut encoder)?;
             encoder
                 .finish()
                 .map_err(|error| format!("finishing XZ NAR: {error}"))?;
-            verify_nar_summary(info, &summary)?;
+            summary
         }
-    }
-    let (_, file_hash, file_size) = measured.finish();
-    Ok(EncodedIdentity::new(codec, file_hash, file_size))
+    };
+    verify_nar_summary(info, &summary)
 }
 
 struct MeasuredWriter<W> {
