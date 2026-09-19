@@ -9,8 +9,8 @@ use std::{
 
 use super::fs::unlink_at;
 use crate::{
-    narinfo::{PublishedNarInfoError, TrustedPublicKeys, ValidatedPayload, read_narinfo_file},
-    object::NarHash,
+    narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
+    object::{NarHash, NarRepresentation},
     storage::{
         Directory, FileHash, Storage, StorageBackend, StorageError, StoreHash, open_regular_at,
         read_dir_names,
@@ -422,9 +422,9 @@ fn scan_chunked(
             .ok_or_else(|| invalid(format!("chunk manifest disappeared: {name_str}")))?
             .metadata()?
             .len();
-        let (output_name, output_bytes) = match validated.payload() {
-            ValidatedPayload::Raw(_) => (None, 0),
-            ValidatedPayload::Compressed(_) => {
+        let (output_name, output_bytes) = match validated.payload().representation() {
+            NarRepresentation::Raw(_) => (None, 0),
+            NarRepresentation::Compressed(_) => {
                 let output_name = validated.payload_name().os_string();
                 let output = open_regular_at(&nar_directory, &output_name).map_err(|error| {
                     match error.kind() {

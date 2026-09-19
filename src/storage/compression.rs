@@ -14,19 +14,19 @@ use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
-use crate::narinfo::{CompressedNarExpectation, NarEncoding, ValidatedPayload};
+use crate::narinfo::{NarEncoding, ValidatedPayload};
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
-    NarSize,
+    CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
+    NarHash, NarIdentity, NarRepresentation, NarSize,
 };
 
 use super::publication::{StagingReservation, StorageError};
 const INGESTION_RECEIPT_VERSION: u8 = 1;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
-pub(super) struct CheckedUploadReader<'a, R> {
+pub(super) struct CheckedUploadReader<R> {
     inner: R,
-    expected_hash: &'a FileHash,
+    expected_hash: FileHash,
     expected_length: u64,
     bytes_read: u64,
     hasher: Sha256,
@@ -42,8 +42,8 @@ pub(super) struct CompleteUpload<R> {
     inner: R,
 }
 
-impl<'a, R> CheckedUploadReader<'a, R> {
-    pub(super) fn new(inner: R, expected_hash: &'a FileHash, expected_length: u64) -> Self {
+impl<R> CheckedUploadReader<R> {
+    pub(super) fn new(inner: R, expected_hash: FileHash, expected_length: u64) -> Self {
         Self {
             inner,
             expected_hash,
@@ -56,7 +56,7 @@ impl<'a, R> CheckedUploadReader<'a, R> {
 
     fn validate_observed_upload_hash_and_length(&self) -> io::Result<()> {
         let actual_hash = FileHash::from_digest(self.hasher.clone().finalize().into());
-        if self.bytes_read != self.expected_length || actual_hash != *self.expected_hash {
+        if self.bytes_read != self.expected_length || actual_hash != self.expected_hash {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "NAR hash or size mismatch",
@@ -108,7 +108,7 @@ impl<R> CompleteUpload<R> {
     }
 }
 
-impl<R: Read> Read for CheckedUploadReader<'_, R> {
+impl<R: Read> Read for CheckedUploadReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self.phase {
             UploadReadPhase::EndValidated => Ok(0),
@@ -298,11 +298,11 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
         }
     }
 
-    fn finish(self) -> DecodedValidation {
-        DecodedValidation {
-            hash: NarHash::from_digest(self.hasher.finalize().into()),
-            size: NarSize::new(self.bytes_written),
-        }
+    fn finish(self) -> NarIdentity {
+        NarIdentity::new(
+            NarHash::from_digest(self.hasher.finalize().into()),
+            NarSize::new(self.bytes_written),
+        )
     }
 }
 
@@ -329,13 +329,9 @@ impl<W: Write + ?Sized> Write for HashingWriter<'_, W> {
     }
 }
 
-#[derive(Debug)]
-pub(super) enum ReceivedNar {
-    Raw(NarIdentity),
-    Compressed(IngestionReceipt),
-}
+pub(super) type ReceivedNar = NarRepresentation<IngestionReceipt>;
 
-impl ReceivedNar {
+impl NarRepresentation<IngestionReceipt> {
     pub(super) fn identity(&self) -> NarIdentity {
         match self {
             Self::Raw(identity) => *identity,
@@ -358,19 +354,15 @@ pub(super) fn receive_uploaded_nar<W: Write>(
     max_nar_size: u64,
     destination: &mut W,
 ) -> io::Result<ReceivedNar> {
-    let file_hash = name.file_hash();
-    let expectation = EncodedUploadExpectation {
-        expected_file_hash: &file_hash,
-        expected_file_size: length.into(),
+    let expectation = UploadExpectation {
+        name,
+        size: length.into(),
         max_nar_size,
     };
     let codec = match name.encoding() {
         NarEncoding::Raw => {
             let decoded = copy_raw_upload_to_raw_staging(source, expectation, destination)?;
-            return Ok(ReceivedNar::Raw(NarIdentity::new(
-                decoded.hash,
-                decoded.size,
-            )));
+            return Ok(ReceivedNar::Raw(decoded));
         }
         NarEncoding::Xz => CompressionCodec::Xz,
         NarEncoding::Zstd => CompressionCodec::Zstd,
@@ -381,20 +373,18 @@ pub(super) fn receive_uploaded_nar<W: Write>(
             decode_zstd_upload_to_raw_staging(source, expectation, destination)?
         }
     };
-    Ok(ReceivedNar::Compressed(IngestionReceipt::from_decoded(
-        EncodedIdentity::new(codec, file_hash, length.into()),
+    Ok(ReceivedNar::Compressed(IngestionReceipt::new(
+        expectation.compressed_identity(codec),
         decoded,
     )))
 }
 
 fn copy_raw_upload_to_raw_staging<W: Write>(
     mut source: impl Read,
-    expectation: EncodedUploadExpectation<'_>,
+    expectation: UploadExpectation,
     destination: &mut W,
-) -> io::Result<DecodedValidation> {
-    let max_bytes = expectation
-        .max_nar_size
-        .min(expectation.expected_file_size.get());
+) -> io::Result<NarIdentity> {
+    let max_bytes = expectation.max_nar_size.min(expectation.size.get());
     let mut output = HashingWriter::new(destination, max_bytes);
     io::copy(&mut source, &mut output)?;
     validate_raw_upload_identity(output.finish(), expectation)
@@ -402,14 +392,11 @@ fn copy_raw_upload_to_raw_staging<W: Write>(
 
 fn decode_xz_upload_to_raw_staging<W: Write>(
     source: impl Read,
-    expectation: EncodedUploadExpectation<'_>,
+    expectation: UploadExpectation,
     destination: &mut W,
-) -> io::Result<DecodedValidation> {
-    let input = CheckedUploadReader::new(
-        source,
-        expectation.expected_file_hash,
-        expectation.expected_file_size.get(),
-    );
+) -> io::Result<NarIdentity> {
+    let input =
+        CheckedUploadReader::new(source, expectation.name.file_hash(), expectation.size.get());
     let source_error = Rc::new(RefCell::new(None));
     let mut decoder = XzReader::new(
         UploadCompressedSourceReader::new(input, Rc::clone(&source_error)),
@@ -426,14 +413,11 @@ fn decode_xz_upload_to_raw_staging<W: Write>(
 
 fn decode_zstd_upload_to_raw_staging<W: Write>(
     source: impl Read,
-    expectation: EncodedUploadExpectation<'_>,
+    expectation: UploadExpectation,
     destination: &mut W,
-) -> io::Result<DecodedValidation> {
-    let input = CheckedUploadReader::new(
-        source,
-        expectation.expected_file_hash,
-        expectation.expected_file_size.get(),
-    );
+) -> io::Result<NarIdentity> {
+    let input =
+        CheckedUploadReader::new(source, expectation.name.file_hash(), expectation.size.get());
     let source_error = Rc::new(RefCell::new(None));
     let mut decoder = StructuredZstdDecoder::new(UploadCompressedSourceReader::new(
         input,
@@ -450,20 +434,27 @@ fn decode_zstd_upload_to_raw_staging<W: Write>(
 }
 
 #[derive(Clone, Copy)]
-struct EncodedUploadExpectation<'a> {
-    expected_file_hash: &'a FileHash,
-    expected_file_size: EncodedSize,
+struct UploadExpectation {
+    name: NarFileName,
+    size: EncodedSize,
     max_nar_size: u64,
 }
 
+impl UploadExpectation {
+    const fn compressed_identity(self, codec: CompressionCodec) -> EncodedIdentity {
+        EncodedIdentity::new(codec, self.name.file_hash(), self.size)
+    }
+}
+
 fn validate_raw_upload_identity(
-    decoded: DecodedValidation,
-    expectation: EncodedUploadExpectation<'_>,
-) -> io::Result<DecodedValidation> {
-    if decoded.size.get() == expectation.expected_file_size.get()
+    decoded: NarIdentity,
+    expectation: UploadExpectation,
+) -> io::Result<NarIdentity> {
+    if decoded.size().get() == expectation.size.get()
         && expectation
-            .expected_file_hash
-            .matches_nar_hash(decoded.hash)
+            .name
+            .file_hash()
+            .matches_nar_hash(decoded.hash())
     {
         return Ok(decoded);
     }
@@ -477,14 +468,14 @@ fn copy_decoded_bytes_to_raw_staging<R: Read, W: Write>(
     decoder: &mut R,
     destination: &mut W,
     max_nar_size: u64,
-) -> io::Result<DecodedValidation> {
+) -> io::Result<NarIdentity> {
     let mut output = HashingWriter::new(destination, max_nar_size);
     io::copy(decoder, &mut output)?;
     Ok(output.finish())
 }
 
 fn finish_encoded_upload_after_decoding<R: Read>(
-    input: CheckedUploadReader<'_, R>,
+    input: CheckedUploadReader<R>,
     source_error: &RefCell<Option<io::Error>>,
 ) -> io::Result<()> {
     input
@@ -525,17 +516,8 @@ impl<R> UploadCompressedSourceReader<R> {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct DecodedValidation {
-    pub(super) hash: NarHash,
-    pub(super) size: NarSize,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct IngestionReceipt {
-    encoded: EncodedIdentity,
-    decoded: NarIdentity,
-}
+pub(super) struct IngestionReceipt(CompressedNarIdentity);
 
 #[derive(Deserialize, Serialize)]
 struct IngestionReceiptRecord {
@@ -549,38 +531,37 @@ struct IngestionReceiptRecord {
 
 impl IngestionReceiptRecord {
     fn from_receipt(receipt: &IngestionReceipt) -> Self {
+        let encoded = receipt.0.encoded();
+        let decoded = receipt.0.decoded();
         Self {
             version: INGESTION_RECEIPT_VERSION,
-            encoding: receipt.encoded.codec(),
-            encoded_hash: receipt.encoded.hash(),
-            encoded_size: receipt.encoded.size(),
-            decoded_hash: receipt.decoded.hash(),
-            decoded_size: receipt.decoded.size(),
+            encoding: encoded.codec(),
+            encoded_hash: encoded.hash(),
+            encoded_size: encoded.size(),
+            decoded_hash: decoded.hash(),
+            decoded_size: decoded.size(),
         }
     }
 
     fn into_receipt(self) -> Option<IngestionReceipt> {
         (self.version == INGESTION_RECEIPT_VERSION).then_some(())?;
-        Some(IngestionReceipt {
-            encoded: EncodedIdentity::new(self.encoding, self.encoded_hash, self.encoded_size),
-            decoded: NarIdentity::new(self.decoded_hash, self.decoded_size),
-        })
+        Some(IngestionReceipt(CompressedNarIdentity::new(
+            EncodedIdentity::new(self.encoding, self.encoded_hash, self.encoded_size),
+            NarIdentity::new(self.decoded_hash, self.decoded_size),
+        )))
     }
 }
 
 impl IngestionReceipt {
-    fn from_decoded(encoded: EncodedIdentity, decoded: DecodedValidation) -> Self {
-        Self {
-            encoded,
-            decoded: NarIdentity::new(decoded.hash, decoded.size),
-        }
+    fn new(encoded: EncodedIdentity, decoded: NarIdentity) -> Self {
+        Self(CompressedNarIdentity::new(encoded, decoded))
     }
 
     pub(super) fn file_name(&self) -> OsString {
         OsString::from(format!(
             "{}{}.validation",
-            self.encoded.hash(),
-            self.encoded.codec().suffix()
+            self.0.encoded().hash(),
+            self.0.encoded().codec().suffix()
         ))
     }
 
@@ -595,20 +576,20 @@ impl IngestionReceipt {
             .and_then(IngestionReceiptRecord::into_receipt)
     }
 
-    pub(super) fn matches(&self, expectation: CompressedNarExpectation) -> bool {
-        self.encoded == expectation.encoded && self.decoded == expectation.decoded
+    pub(super) fn matches(&self, expectation: CompressedNarIdentity) -> bool {
+        self.0 == expectation
     }
 
     pub(super) fn decoded_identity(&self) -> NarIdentity {
-        self.decoded
+        self.0.decoded()
     }
 }
 
-pub(super) fn ingestion_receipt_file_name(expectation: CompressedNarExpectation) -> OsString {
+pub(super) fn ingestion_receipt_file_name(expectation: CompressedNarIdentity) -> OsString {
     OsString::from(format!(
         "{}{}.validation",
-        expectation.encoded.hash(),
-        expectation.encoded.codec().suffix()
+        expectation.encoded().hash(),
+        expectation.encoded().codec().suffix()
     ))
 }
 
@@ -688,7 +669,7 @@ fn take_upload_source_error(
     source_error.borrow_mut().take().unwrap_or(fallback)
 }
 
-fn measure_decoded_nar<R: Read>(reader: &mut R, max_bytes: u64) -> io::Result<DecodedValidation> {
+fn measure_decoded_nar<R: Read>(reader: &mut R, max_bytes: u64) -> io::Result<NarIdentity> {
     let mut hasher = Sha256::new();
     let mut bytes_read = 0u64;
     let mut buffer = [0; 64 * 1024];
@@ -708,10 +689,10 @@ fn measure_decoded_nar<R: Read>(reader: &mut R, max_bytes: u64) -> io::Result<De
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(DecodedValidation {
-        hash: NarHash::from_digest(hasher.finalize().into()),
-        size: NarSize::new(bytes_read),
-    })
+    Ok(NarIdentity::new(
+        NarHash::from_digest(hasher.finalize().into()),
+        NarSize::new(bytes_read),
+    ))
 }
 
 fn sha256_file(file: &File) -> io::Result<[u8; 32]> {
@@ -738,14 +719,14 @@ pub(super) fn encoded_file_matches(file: &File, identity: EncodedIdentity) -> io
 
 pub(super) struct VerifiedCompressedNar<'file> {
     file: &'file File,
-    expectation: CompressedNarExpectation,
+    expectation: CompressedNarIdentity,
 }
 
 pub(super) fn verify_encoded_compressed_file<'file>(
     file: &'file File,
-    expectation: CompressedNarExpectation,
+    expectation: CompressedNarIdentity,
 ) -> io::Result<Option<VerifiedCompressedNar<'file>>> {
-    if !encoded_file_matches(file, expectation.encoded)? {
+    if !encoded_file_matches(file, expectation.encoded())? {
         return Ok(None);
     }
     Ok(Some(VerifiedCompressedNar { file, expectation }))
@@ -753,11 +734,11 @@ pub(super) fn verify_encoded_compressed_file<'file>(
 
 pub(super) fn verify_decoded_compressed_file(
     verified: VerifiedCompressedNar<'_>,
-) -> io::Result<Option<DecodedValidation>> {
+) -> io::Result<Option<NarIdentity>> {
     match decode_verified_compressed_payload(&verified) {
         Ok(decoded) => Ok(decoded_nar_matches_expected_identity(
             decoded,
-            verified.expectation.decoded,
+            verified.expectation.decoded(),
         )),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
         Err(error) => Err(error),
@@ -766,26 +747,24 @@ pub(super) fn verify_decoded_compressed_file(
 
 fn decode_verified_compressed_payload(
     verified: &VerifiedCompressedNar<'_>,
-) -> io::Result<DecodedValidation> {
-    match verified.expectation.encoded.codec() {
+) -> io::Result<NarIdentity> {
+    match verified.expectation.encoded().codec() {
         CompressionCodec::Zstd => decode_verified_zstd_payload(verified),
         CompressionCodec::Xz => decode_verified_xz_payload(verified),
     }
 }
 
 fn decoded_nar_matches_expected_identity(
-    decoded: DecodedValidation,
+    decoded: NarIdentity,
     expected: NarIdentity,
-) -> Option<DecodedValidation> {
-    (decoded.hash == expected.hash() && decoded.size == expected.size()).then_some(decoded)
+) -> Option<NarIdentity> {
+    (decoded == expected).then_some(decoded)
 }
 
-fn decode_verified_xz_payload(
-    verified: &VerifiedCompressedNar<'_>,
-) -> io::Result<DecodedValidation> {
+fn decode_verified_xz_payload(verified: &VerifiedCompressedNar<'_>) -> io::Result<NarIdentity> {
     let input = rewound_compressed_file(verified.file)?;
     let mut decoder = XzReader::new(StoredCompressedSourceReader::new(input), false);
-    let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded.size().get())?;
+    let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded().size().get())?;
     ensure_decoder_consumed_complete_compressed_file(
         &mut decoder.into_inner().into_inner(),
         CompressionCodec::Xz,
@@ -793,13 +772,11 @@ fn decode_verified_xz_payload(
     Ok(decoded)
 }
 
-fn decode_verified_zstd_payload(
-    verified: &VerifiedCompressedNar<'_>,
-) -> io::Result<DecodedValidation> {
+fn decode_verified_zstd_payload(verified: &VerifiedCompressedNar<'_>) -> io::Result<NarIdentity> {
     let input = rewound_compressed_file(verified.file)?;
     let mut decoder = StructuredZstdDecoder::new(StoredCompressedSourceReader::new(input))
         .map_err(compressed_decoder_error)?;
-    let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded.size().get())?;
+    let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded().size().get())?;
     ensure_decoder_consumed_complete_compressed_file(
         &mut decoder.into_inner().into_inner(),
         CompressionCodec::Zstd,
@@ -829,8 +806,8 @@ fn ensure_decoder_consumed_complete_compressed_file(
 
 pub(super) fn validate_compressed_nar(
     file: &File,
-    expectation: CompressedNarExpectation,
-) -> io::Result<Option<DecodedValidation>> {
+    expectation: CompressedNarIdentity,
+) -> io::Result<Option<NarIdentity>> {
     let Some(verified) = verify_encoded_compressed_file(file, expectation)? else {
         return Ok(None);
     };
@@ -839,15 +816,15 @@ pub(super) fn validate_compressed_nar(
 
 pub(super) fn compressed_nar_matches(
     file: &File,
-    expectation: CompressedNarExpectation,
+    expectation: CompressedNarIdentity,
 ) -> io::Result<bool> {
     Ok(validate_compressed_nar(file, expectation)?.is_some())
 }
 
 pub(crate) fn nar_file_matches(file: &File, payload: ValidatedPayload) -> io::Result<bool> {
-    match payload {
-        ValidatedPayload::Raw(identity) => raw_nar_file_matches(file, identity),
-        ValidatedPayload::Compressed(expectation) => compressed_nar_matches(file, expectation),
+    match payload.representation() {
+        NarRepresentation::Raw(identity) => raw_nar_file_matches(file, identity),
+        NarRepresentation::Compressed(expectation) => compressed_nar_matches(file, expectation),
     }
 }
 
@@ -874,9 +851,8 @@ mod tests {
     };
 
     use super::{
-        DecodedValidation, EncodedIdentity, EncodedSize, FileHash, IngestionReceipt, NarHash,
-        NarIdentity, NarSize, StagingReservation, encode_raw_nar,
-        reserve_preferred_or_exact_staging_growth,
+        EncodedIdentity, EncodedSize, FileHash, IngestionReceipt, NarHash, NarIdentity, NarSize,
+        StagingReservation, encode_raw_nar, reserve_preferred_or_exact_staging_growth,
     };
     use crate::object::CompressionCodec;
     use crate::storage::fs::filesystem_space;
@@ -914,12 +890,9 @@ mod tests {
         let encoded_hash = FileHash::from_digest([0; 32]);
         let decoded_hash = NarHash::from_digest([1; 32]);
         let decoded_identity = NarIdentity::new(decoded_hash, NarSize::new(17));
-        let receipt = IngestionReceipt::from_decoded(
+        let receipt = IngestionReceipt::new(
             EncodedIdentity::new(CompressionCodec::Zstd, encoded_hash, EncodedSize::new(23)),
-            DecodedValidation {
-                hash: decoded_hash,
-                size: decoded_identity.size(),
-            },
+            decoded_identity,
         );
         let bytes = receipt.bytes();
         assert_eq!(

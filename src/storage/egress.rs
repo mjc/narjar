@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::narinfo::ValidatedPayload;
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity,
-    NarRepresentation, NarSize, WireEncoding,
+    CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarHash,
+    NarIdentity, NarRepresentation, NarSize, WireEncoding,
 };
 
 #[cfg(test)]
@@ -299,11 +299,7 @@ impl ReadyDerivative<'_> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct EgressReceipt {
-    slot: EgressSlot,
-    encoded_hash: FileHash,
-    encoded_size: EncodedSize,
-}
+pub(super) struct EgressReceipt(CompressedNarIdentity);
 
 #[derive(Deserialize, Serialize)]
 struct EgressReceiptRecord {
@@ -317,38 +313,37 @@ struct EgressReceiptRecord {
 
 impl EgressReceiptRecord {
     fn from_receipt(receipt: &EgressReceipt) -> Self {
+        let output = receipt.output();
+        let raw = receipt.raw();
         Self {
             version: EGRESS_RECEIPT_VERSION,
-            raw_hash: receipt.slot.raw().hash(),
-            raw_size: receipt.slot.raw().size(),
-            encoding: receipt.slot.codec(),
-            encoded_hash: receipt.encoded_hash,
-            encoded_size: receipt.encoded_size,
+            raw_hash: raw.hash(),
+            raw_size: raw.size(),
+            encoding: output.codec(),
+            encoded_hash: output.hash(),
+            encoded_size: output.size(),
         }
     }
 
     fn into_receipt(self) -> Option<EgressReceipt> {
         (self.version == EGRESS_RECEIPT_VERSION).then_some(())?;
-        let raw = NarIdentity::new(self.raw_hash, self.raw_size);
-        Some(EgressReceipt::new(
-            EgressSlot::new(raw, self.encoding),
-            self.encoded_hash,
-            self.encoded_size,
-        ))
+        Some(EgressReceipt(CompressedNarIdentity::new(
+            EncodedIdentity::new(self.encoding, self.encoded_hash, self.encoded_size),
+            NarIdentity::new(self.raw_hash, self.raw_size),
+        )))
     }
 }
 
 impl EgressReceipt {
     pub(super) fn new(slot: EgressSlot, encoded_hash: FileHash, encoded_size: EncodedSize) -> Self {
-        Self {
-            slot,
-            encoded_hash,
-            encoded_size,
-        }
+        Self(CompressedNarIdentity::new(
+            EncodedIdentity::new(slot.codec(), encoded_hash, encoded_size),
+            slot.raw(),
+        ))
     }
 
     pub(super) fn file_name(&self) -> OsString {
-        self.slot.receipt_name()
+        self.slot().receipt_name()
     }
 
     pub(super) fn bytes(&self) -> Vec<u8> {
@@ -363,15 +358,19 @@ impl EgressReceipt {
     }
 
     pub(super) fn matches(&self, slot: EgressSlot) -> bool {
-        self.slot == slot
+        self.slot() == slot
     }
 
     pub(super) const fn output(&self) -> EncodedIdentity {
-        EncodedIdentity::new(self.slot.codec(), self.encoded_hash, self.encoded_size)
+        self.0.encoded()
     }
 
     pub(super) const fn slot(&self) -> EgressSlot {
-        self.slot
+        EgressSlot::new(self.raw(), self.output().codec())
+    }
+
+    const fn raw(&self) -> NarIdentity {
+        self.0.decoded()
     }
 }
 
@@ -380,9 +379,9 @@ impl Storage {
         &self,
         payload: ValidatedPayload,
     ) -> Result<StoredNar<'_>, StorageError> {
-        let identity = match payload {
-            ValidatedPayload::Raw(identity) => identity,
-            ValidatedPayload::Compressed(expectation) => self
+        let identity = match payload.representation() {
+            NarRepresentation::Raw(identity) => identity,
+            NarRepresentation::Compressed(expectation) => self
                 .read_ingestion_receipt(expectation)?
                 .ok_or(StorageError::NarMismatch)?
                 .decoded_identity(),
@@ -455,7 +454,10 @@ impl Storage {
             }
         };
         self.publish_egress_receipt(EgressReceipt::new(slot, output.hash(), output.size()))?;
-        Ok(NarRepresentation::Compressed(output))
+        Ok(NarRepresentation::Compressed(CompressedNarIdentity::new(
+            output,
+            raw.identity(),
+        )))
     }
 
     fn resolve_derivative_work(&self, slot: EgressSlot) -> Result<DerivativeWork, StorageError> {
@@ -632,7 +634,7 @@ impl Storage {
         codec: CompressionCodec,
         min_free_bytes: u64,
     ) -> Result<(NarFileName, EncodedSize), StorageError> {
-        let raw = self.open_verified_canonical_nar(ValidatedPayload::Raw(identity))?;
+        let raw = self.open_verified_canonical_nar(ValidatedPayload::raw(identity))?;
         self.select_compressed(
             &raw,
             EgressSlot::new(identity, codec),

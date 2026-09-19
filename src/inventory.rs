@@ -7,6 +7,7 @@ use crate::{
         PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, ValidatedPayload,
         read_narinfo_file,
     },
+    object::NarRepresentation,
     storage::{
         Directory, FileHash, NarFileName, NarHash, Storage, StoreHash, for_each_dir_name,
         inspection::{NarinfoCandidate, NarinfoName, PayloadEntry, ReferencedPayload},
@@ -164,7 +165,7 @@ fn inspect_storage_payload(
     payload: ValidatedPayload,
     verification: VerificationMode,
 ) -> io::Result<InventoryClass> {
-    if let ValidatedPayload::Raw(identity) = payload {
+    if let NarRepresentation::Raw(identity) = payload.representation() {
         return inspect_storage_canonical_nar(storage, identity, verification);
     }
     inspect_directory_payload(
@@ -306,13 +307,13 @@ fn inspect_trusted_narinfo(
     let payload = metadata.payload_name().file_hash();
     let raw_nar = FileHash::from_nar_hash(metadata.decoded_identity().hash());
     let advertised_class = inspect_payload(source, metadata.payload(), verification)?;
-    let class = match metadata.payload() {
-        ValidatedPayload::Raw(_) => advertised_class,
-        ValidatedPayload::Compressed(_) => combine_payload_classes(
+    let class = match metadata.payload().representation() {
+        NarRepresentation::Raw(_) => advertised_class,
+        NarRepresentation::Compressed(_) => combine_payload_classes(
             advertised_class,
             inspect_payload(
                 source,
-                ValidatedPayload::Raw(metadata.decoded_identity()),
+                ValidatedPayload::raw(metadata.decoded_identity()),
                 verification,
             )?,
         ),

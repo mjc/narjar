@@ -10,7 +10,7 @@ use std::{
 };
 
 use super::compression::{
-    CheckedUploadReader, DecodedValidation, nar_file_size_matches, receive_uploaded_nar,
+    CheckedUploadReader, nar_file_size_matches, receive_uploaded_nar,
     verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
 use super::egress::{EgressReceipt, EgressSlot};
@@ -21,10 +21,10 @@ use super::{
     CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageBackend,
     StorageError, StoreHash, capacity_error_kind,
 };
-use crate::narinfo::{CompressedNarExpectation, NarEncoding, ValidatedPayload};
+use crate::narinfo::{NarEncoding, ValidatedPayload};
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
-    NarSize,
+    CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
+    NarHash, NarIdentity, NarSize,
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
@@ -169,7 +169,7 @@ fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     manifest[checksum] ^= 1;
     fs::write(manifest_path, manifest).unwrap();
 
-    let result = storage.open_verified_canonical_nar(ValidatedPayload::Raw(identity));
+    let result = storage.open_verified_canonical_nar(ValidatedPayload::raw(identity));
     assert!(matches!(
         result,
         Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
@@ -452,7 +452,7 @@ fn upload_reader_checks_encoded_hash_and_length() {
     let bytes = b"encoded NAR bytes";
     let expected =
         FileHash::parse(&nix32_sha256(&Sha256::digest(bytes))).expect("file hash is valid");
-    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), &expected, bytes.len() as u64);
+    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), expected, bytes.len() as u64);
     let mut received = [0; 17];
     reader
         .read_exact(&mut received)
@@ -463,7 +463,7 @@ fn upload_reader_checks_encoded_hash_and_length() {
         .expect("matching upload should complete successfully");
 
     let wrong_hash = FileHash::parse(NAR_ID).expect("file hash is valid");
-    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), &wrong_hash, bytes.len() as u64);
+    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), wrong_hash, bytes.len() as u64);
     reader
         .read_exact(&mut [0; 17])
         .expect("reading the upload body should succeed before completion");
@@ -481,7 +481,7 @@ fn upload_reader_finish_does_not_read_after_validating_eof() {
         FileHash::parse(&nix32_sha256(&Sha256::digest(bytes))).expect("file hash is valid");
     let mut reader = CheckedUploadReader::new(
         FailsIfReadAfterEof::new(bytes),
-        &expected,
+        expected,
         bytes.len() as u64,
     );
     let mut received = Vec::new();
@@ -593,10 +593,12 @@ fn encoded_verification_precedes_xz_nar_identity_verification() {
     let file_hash =
         FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).expect("file hash is valid");
 
-    let expectation = CompressedNarExpectation::new(
-        CompressionCodec::Xz,
-        file_hash,
-        EncodedSize::new(compressed.len() as u64),
+    let expectation = CompressedNarIdentity::new(
+        EncodedIdentity::new(
+            CompressionCodec::Xz,
+            file_hash,
+            EncodedSize::new(compressed.len() as u64),
+        ),
         NarIdentity::new(nar_hash, NarSize::new(raw.len() as u64)),
     );
     let verified = verify_encoded_compressed_file(&file, expectation)
@@ -607,10 +609,7 @@ fn encoded_verification_precedes_xz_nar_identity_verification() {
         verify_decoded_compressed_file(verified)
             .expect("verify decoded XZ NAR")
             .expect("decoded XZ NAR matches"),
-        DecodedValidation {
-            hash: nar_hash,
-            size: NarSize::new(raw.len() as u64),
-        }
+        NarIdentity::new(nar_hash, NarSize::new(raw.len() as u64))
     );
 }
 
@@ -638,14 +637,18 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
                        decoded_hash: &NarHash,
                        encoded_size: EncodedSize,
                        decoded_size: NarSize| {
-            let expectation = CompressedNarExpectation::new(
-                match encoding {
-                    NarEncoding::Xz => CompressionCodec::Xz,
-                    NarEncoding::Zstd => CompressionCodec::Zstd,
-                    NarEncoding::Raw => unreachable!("test only supplies compressed encodings"),
-                },
-                *encoded_hash,
-                encoded_size,
+            let expectation = CompressedNarIdentity::new(
+                EncodedIdentity::new(
+                    match encoding {
+                        NarEncoding::Xz => CompressionCodec::Xz,
+                        NarEncoding::Zstd => CompressionCodec::Zstd,
+                        NarEncoding::Raw => {
+                            unreachable!("test only supplies compressed encodings")
+                        }
+                    },
+                    *encoded_hash,
+                    encoded_size,
+                ),
                 NarIdentity::new(*decoded_hash, decoded_size),
             );
             let file = fs::File::open(&path).unwrap();

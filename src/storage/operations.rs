@@ -14,8 +14,11 @@ use std::{
     time::SystemTime,
 };
 
-use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo, ValidatedPayload};
-use crate::object::{EncodedIdentity, NarFileName, NarHash, NarIdentity, WireEncoding};
+use crate::narinfo::{BoundNarInfo, ValidatedNarInfo};
+use crate::object::{
+    CompressedNarIdentity, EncodedIdentity, NarFileName, NarHash, NarIdentity, NarRepresentation,
+    WireEncoding,
+};
 
 use super::{
     CleanupAction, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, LAYOUT_DESCRIPTOR,
@@ -625,12 +628,12 @@ impl Storage {
         let stored = self.open_verified_canonical_nar(narinfo.payload())?;
         let output = self.select_egress(&stored, output_encoding, policy)?;
         narinfo
-            .bind_raw(stored, output.file_name(), output.encoded_size())
+            .bind_to_stored_nar(stored, output)
             .map_err(|_| StorageError::NarMismatch)
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<NarMatch, StorageError> {
-        if let ValidatedPayload::Raw(identity) = narinfo.payload() {
+        if let NarRepresentation::Raw(identity) = narinfo.payload().representation() {
             return self.canonical_nar_matches(identity);
         }
         let nar_directory = self.nar_directory()?;
@@ -1311,7 +1314,7 @@ impl Storage {
 
     pub(super) fn read_ingestion_receipt(
         &self,
-        expectation: CompressedNarExpectation,
+        expectation: CompressedNarIdentity,
     ) -> Result<Option<IngestionReceipt>, StorageError> {
         let directory = self.ingestion_receipt_directory()?;
         let name = ingestion_receipt_file_name(expectation);
