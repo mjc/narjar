@@ -2,7 +2,6 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read},
-    marker::PhantomData,
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
@@ -12,6 +11,7 @@ use super::{
     operations::OwnedTemporary,
     recovery::{PublicationState, PublicationTransaction},
     state::Storage,
+    typestate::{Streaming, Validated},
 };
 
 mod target;
@@ -28,9 +28,6 @@ pub(super) struct TemporaryFile {
     pub(super) directory: File,
     pub(super) file: File,
 }
-
-pub(super) struct Streaming;
-pub(super) struct Validated;
 
 struct OwnedPublication<'storage> {
     temporary: Option<OwnedTemporary<'storage>>,
@@ -101,7 +98,7 @@ pub(super) struct StagedPublication<'storage, Checkpoint, State> {
     pub(super) destination: PublicationDestination,
     publication: OwnedPublication<'storage>,
     checkpoint: Checkpoint,
-    _state: PhantomData<State>,
+    _state: State,
 }
 
 impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
@@ -117,7 +114,7 @@ impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
             destination,
             publication: OwnedPublication::new(temporary, transaction),
             checkpoint,
-            _state: PhantomData,
+            _state: Streaming::new(()),
         }
     }
 }
@@ -158,7 +155,7 @@ where
             destination,
             publication,
             checkpoint,
-            _state: PhantomData,
+            _state: Validated::new(()),
         })
     }
 }

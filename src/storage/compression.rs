@@ -20,7 +20,10 @@ use crate::object::{
     NarHash, NarIdentity, NarRepresentation, NarSize,
 };
 
-use super::publication::{StagingReservation, StorageError};
+use super::{
+    publication::{StagingReservation, StorageError},
+    typestate::Validated,
+};
 const INGESTION_RECEIPT_VERSION: u8 = 1;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -36,10 +39,6 @@ pub(super) struct CheckedUploadReader<R> {
 enum UploadReadPhase {
     Reading,
     EndValidated,
-}
-
-pub(super) struct CompleteUpload<R> {
-    inner: R,
 }
 
 impl<R> CheckedUploadReader<R> {
@@ -65,15 +64,13 @@ impl<R> CheckedUploadReader<R> {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> io::Result<CompleteUpload<R>>
+    pub(super) fn finish(self) -> io::Result<Validated<R>>
     where
         R: Read,
     {
         let mut receiving = self;
         receiving.ensure_upload_end_was_consumed()?;
-        Ok(CompleteUpload {
-            inner: receiving.inner,
-        })
+        Ok(Validated::new(receiving.inner))
     }
 
     fn ensure_upload_end_was_consumed(&mut self) -> io::Result<()>
@@ -99,12 +96,6 @@ impl<R> CheckedUploadReader<R> {
         self.validate_observed_upload_hash_and_length()?;
         self.phase = UploadReadPhase::EndValidated;
         Ok(())
-    }
-}
-
-impl<R> CompleteUpload<R> {
-    fn into_inner(self) -> R {
-        self.inner
     }
 }
 

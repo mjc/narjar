@@ -31,6 +31,7 @@ use super::publication::{
 };
 use super::recovery::PublicationState;
 use super::state::{Storage, StorageBackend};
+use super::typestate::{Streaming, Validated};
 use super::{CleanupAction, EGRESS_RECEIPT_DIRECTORY};
 
 const EGRESS_RECEIPT_VERSION: u8 = 1;
@@ -125,18 +126,10 @@ impl EgressSlot {
     }
 }
 
-struct VerifiedDerivative(EncodedIdentity);
-
-impl VerifiedDerivative {
-    fn identity(&self) -> EncodedIdentity {
-        self.0
-    }
-}
-
 enum ExistingDerivative {
     Missing,
     Corrupt,
-    Usable(VerifiedDerivative),
+    Usable(Validated<EncodedIdentity>),
 }
 
 #[derive(Debug)]
@@ -147,7 +140,7 @@ pub(super) enum CanonicalRawStatus {
 }
 
 enum DerivativeWork {
-    Reuse(VerifiedDerivative),
+    Reuse(Validated<EncodedIdentity>),
     Generate(GenerationContract),
 }
 
@@ -195,23 +188,19 @@ impl Drop for TemporaryDerivative<'_> {
     }
 }
 
-struct StagedDerivative<'storage> {
+struct Prepared;
+
+struct Derivative<'storage, State> {
     temporary: TemporaryDerivative<'storage>,
     transaction: super::recovery::PublicationTransaction,
+    state: State,
 }
 
-struct StreamingDerivative<'storage> {
-    temporary: TemporaryDerivative<'storage>,
-    transaction: super::recovery::PublicationTransaction,
-}
+type StagedDerivative<'storage> = Derivative<'storage, Prepared>;
+type StreamingDerivative<'storage> = Derivative<'storage, Streaming>;
+type ReadyDerivative<'storage> = Derivative<'storage, Validated<EncodedIdentity>>;
 
-struct ReadyDerivative<'storage> {
-    temporary: TemporaryDerivative<'storage>,
-    transaction: super::recovery::PublicationTransaction,
-    output: EncodedIdentity,
-}
-
-impl<'storage> StagedDerivative<'storage> {
+impl<'storage> Derivative<'storage, Prepared> {
     fn begin(storage: &'storage Storage) -> Result<Self, StorageError> {
         let temp_name = storage.next_temp_name_with_prefix("nar");
         let temporary_path = PathBuf::from("nar/.tmp").join(&temp_name);
@@ -223,19 +212,21 @@ impl<'storage> StagedDerivative<'storage> {
                 temporary: Some(file),
             },
             transaction,
+            state: Prepared,
         })
     }
 
     fn start_streaming(mut self) -> Result<StreamingDerivative<'storage>, StorageError> {
         self.transaction.transition(PublicationState::Streaming)?;
-        Ok(StreamingDerivative {
+        Ok(Derivative {
             temporary: self.temporary,
             transaction: self.transaction,
+            state: Streaming::new(()),
         })
     }
 }
 
-impl<'storage> StreamingDerivative<'storage> {
+impl<'storage> Derivative<'storage, Streaming> {
     fn encode_canonical_raw_nar(
         self,
         raw: &StoredNar<'_>,
@@ -246,6 +237,7 @@ impl<'storage> StreamingDerivative<'storage> {
         let Self {
             mut temporary,
             mut transaction,
+            state: _,
         } = self;
         let storage = temporary.storage;
         let mut reservation = storage.empty_staging_reservation(policy.min_free_bytes())?;
@@ -261,10 +253,10 @@ impl<'storage> StreamingDerivative<'storage> {
         contract.verify_generated_output(output)?;
         temporary.writer().sync_all()?;
         transaction.transition(PublicationState::Validated)?;
-        Ok(ReadyDerivative {
+        Ok(Derivative {
             temporary,
             transaction,
-            output,
+            state: Validated::new(output),
         })
     }
 }
@@ -283,10 +275,11 @@ fn encode_canonical_raw_nar_into_capacity_checked_staging_file(
     Ok(EncodedIdentity::new(codec, output.hash, output.size))
 }
 
-impl ReadyDerivative<'_> {
+impl Derivative<'_, Validated<EncodedIdentity>> {
     fn commit(mut self) -> Result<EncodedIdentity, StorageError> {
+        let output = self.state.into_inner();
         let temporary = self.temporary.take_temporary();
-        let target = PublishTarget::RepairEgressNar(self.output);
+        let target = PublishTarget::RepairEgressNar(output);
         let destination = target.destination();
         self.temporary.storage.commit_temporary(
             destination,
@@ -294,7 +287,7 @@ impl ReadyDerivative<'_> {
             self.transaction,
             |_| Ok(()),
         )?;
-        Ok(self.output)
+        Ok(output)
     }
 }
 
@@ -448,7 +441,7 @@ impl Storage {
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let decision = self.resolve_derivative_work(slot)?;
         let output = match decision {
-            DerivativeWork::Reuse(output) => output.identity(),
+            DerivativeWork::Reuse(output) => output.into_inner(),
             DerivativeWork::Generate(contract) => {
                 self.materialize_compressed_nar(raw, slot, policy, contract)?
             }
@@ -499,7 +492,7 @@ impl Storage {
             |file| {
                 Ok(
                     encoded_file_matches(&file, output).map(|matches| match matches {
-                        true => ExistingDerivative::Usable(VerifiedDerivative(output)),
+                        true => ExistingDerivative::Usable(Validated::new(output)),
                         false => ExistingDerivative::Corrupt,
                     })?,
                 )

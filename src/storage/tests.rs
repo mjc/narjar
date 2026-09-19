@@ -197,7 +197,7 @@ fn compressed_bytes(encoding: NarEncoding, raw: &[u8]) -> Vec<u8> {
 fn begin_raw_upload<'storage>(
     storage: &'storage Storage,
     bytes: &[u8],
-) -> super::ingest::Staged<'storage, super::ingest::Receiving> {
+) -> super::ingest::Staged<'storage, super::typestate::Streaming<super::ingest::UploadRequest>> {
     let name = NarFileName::new(
         FileHash::from_digest(Sha256::digest(bytes).into()),
         NarEncoding::Raw,

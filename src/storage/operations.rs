@@ -41,12 +41,12 @@ use super::{
     publication::{
         DestinationPublication, NEXT_TEMP, NarUploadPolicy, ProcessLock, PublicationDestination,
         PublicationDirectory, PublishBoundary, PublishOutcome, PublishTarget, PublishedPair,
-        StagedPublication, StagingReservation, StorageError, Streaming, TemporaryDirectory,
-        TemporaryFile,
+        StagedPublication, StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction, RecoveryState},
     state::{Storage, StorageBackend},
+    typestate::Streaming,
 };
 
 #[cfg(test)]

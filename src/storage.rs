@@ -15,6 +15,7 @@ mod publication;
 mod reconcile;
 mod recovery;
 mod state;
+mod typestate;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CleanupAction {
