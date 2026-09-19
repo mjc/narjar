@@ -352,6 +352,10 @@ wait_for_upload_batch() {
     return "$failed"
 }
 
+monotonic_nanoseconds() {
+    date +%s%N
+}
+
 stop_servers() {
     local pid
     for pid in $SERVER_PIDS; do
@@ -521,10 +525,18 @@ start_server flat "$FLAT_DATA" flat "$flat_port" >"$WORK/flat-server"
 start_server chunked "$CHUNKED_DATA" chunked "$chunked_port" >"$WORK/chunked-server"
 flat_netrc=$(awk -F '\t' '$1 == "flat" { print $2 }' "$WORK/flat-server")
 chunked_netrc=$(awk -F '\t' '$1 == "chunked" { print $2 }' "$WORK/chunked-server")
+flat_upload_start=$(monotonic_nanoseconds)
 upload_inputs "$flat_port" "$flat_netrc"
+flat_upload_elapsed=$(( $(monotonic_nanoseconds) - flat_upload_start ))
+chunked_upload_start=$(monotonic_nanoseconds)
 upload_inputs "$chunked_port" "$chunked_netrc"
+chunked_upload_elapsed=$(( $(monotonic_nanoseconds) - chunked_upload_start ))
+flat_verify_start=$(monotonic_nanoseconds)
 verify_inputs flat "$flat_port"
+flat_verify_elapsed=$(( $(monotonic_nanoseconds) - flat_verify_start ))
+chunked_verify_start=$(monotonic_nanoseconds)
 verify_inputs chunked "$chunked_port"
+chunked_verify_elapsed=$(( $(monotonic_nanoseconds) - chunked_verify_start ))
 
 stop_servers
 run_logged sync
@@ -549,5 +561,7 @@ printf 'input_paths\t%s\t%s\n' "$input_path_count" "$input_path_count" >>"$RESUL
 printf 'unique_nar_objects\t%s\t%s\n' "$input_count" "$input_count" >>"$RESULTS"
 printf 'logical_closure_nar_bytes\t%s\t%s\n' "$logical_closure_bytes" "$logical_closure_bytes" >>"$RESULTS"
 printf 'logical_unique_nar_bytes\t%s\t%s\n' "$logical_input_bytes" "$logical_input_bytes" >>"$RESULTS"
+printf 'upload_elapsed_ns\t%s\t%s\n' "$flat_upload_elapsed" "$chunked_upload_elapsed" >>"$RESULTS"
+printf 'verify_elapsed_ns\t%s\t%s\n' "$flat_verify_elapsed" "$chunked_verify_elapsed" >>"$RESULTS"
 
 printf 'results: %s\n' "$RESULTS"
