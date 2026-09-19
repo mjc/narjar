@@ -53,7 +53,7 @@ const MAX_CACHE_INFO_BYTES: u64 = 1024;
 pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
 
 #[allow(dead_code)]
-fn storage_error_for_chunk_store(error: ChunkStoreError) -> StorageError {
+pub(super) fn storage_error_for_chunk_store(error: ChunkStoreError) -> StorageError {
     match error {
         ChunkStoreError::InvalidRange { .. } => StorageError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -682,7 +682,7 @@ impl Storage {
             return Ok(
                 match self
                     .chunk_store
-                    .manifest_identity(identity.hash())
+                    .validate_manifest(identity.hash())
                     .map_err(storage_error_for_chunk_store)?
                 {
                     None => NarMatch::Missing,
@@ -734,7 +734,7 @@ impl Storage {
         if self.backend == StorageBackend::Chunked {
             return match self
                 .chunk_store
-                .manifest_identity(*nar)
+                .validate_manifest(*nar)
                 .map_err(storage_error_for_chunk_store)?
             {
                 Some(manifest) if manifest.identity().hash() == *nar => Ok(()),
@@ -765,7 +765,7 @@ impl Storage {
         if let (StorageBackend::Chunked, Some(hash)) = (self.backend, name.raw_hash()) {
             return Ok(self
                 .chunk_store
-                .manifest_identity(hash)
+                .validate_manifest(hash)
                 .map_err(storage_error_for_chunk_store)?
                 .map(|manifest| manifest.identity().size().get()));
         }
@@ -783,7 +783,7 @@ impl Storage {
         if let (StorageBackend::Chunked, Some(hash)) = (self.backend, name.raw_hash()) {
             if self
                 .chunk_store
-                .manifest_identity(hash)
+                .validate_manifest(hash)
                 .map_err(storage_error_for_chunk_store)?
                 .is_none()
             {

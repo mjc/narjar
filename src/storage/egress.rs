@@ -430,8 +430,8 @@ impl Storage {
             StorageBackend::Chunked => {
                 let Some(manifest) = self
                     .chunk_store
-                    .manifest_identity(identity.hash())
-                    .map_err(|error| StorageError::Io(io::Error::other(error)))?
+                    .validate_manifest(identity.hash())
+                    .map_err(super::operations::storage_error_for_chunk_store)?
                 else {
                     return Err(StorageError::MissingNar);
                 };

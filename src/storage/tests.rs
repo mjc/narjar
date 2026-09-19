@@ -21,7 +21,7 @@ use super::{
     CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageBackend,
     StorageError, StoreHash, capacity_error_kind,
 };
-use crate::narinfo::{CompressedNarExpectation, NarEncoding};
+use crate::narinfo::{CompressedNarExpectation, NarEncoding, ValidatedPayload};
 use crate::object::{
     CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
     NarSize,
@@ -138,6 +138,42 @@ fn chunked_backend_routes_the_complete_nar_publication() {
             .unwrap(),
         PublishOutcome::Identical
     );
+}
+
+#[test]
+fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
+    let directory = TestDir::new();
+    let storage = Storage::initialize_with_backend(
+        &Directory::open(directory.path()).unwrap(),
+        StorageBackend::Chunked,
+    )
+    .unwrap();
+    let raw = vec![b'm'; 100_000];
+    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    let identity = NarIdentity::new(hash, NarSize::new(raw.len() as u64));
+    storage
+        .publish_nar(
+            NarFileName::raw(hash),
+            Cursor::new(&raw),
+            raw.len() as u64,
+            super::NarUploadPolicy::new(raw.len() as u64, 0),
+        )
+        .unwrap();
+
+    let manifest_path = directory
+        .path()
+        .join(super::MANIFEST_DIRECTORY)
+        .join(format!("{hash}.manifest"));
+    let mut manifest = fs::read(&manifest_path).unwrap();
+    let checksum = manifest.len() - 1;
+    manifest[checksum] ^= 1;
+    fs::write(manifest_path, manifest).unwrap();
+
+    let result = storage.open_verified_canonical_nar(ValidatedPayload::Raw(identity));
+    assert!(matches!(
+        result,
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+    ));
 }
 
 fn compressed_bytes(encoding: NarEncoding, raw: &[u8]) -> Vec<u8> {
