@@ -206,11 +206,23 @@ fn nar_hash_from_base16(value: &str) -> Result<NarHash, String> {
         return Err(format!("invalid Nix SHA-256 length: {}", value.len()));
     }
     let mut digest = [0; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| "invalid Nix base16 SHA-256".to_owned())?;
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (byte, pair) in digest.iter_mut().zip(pairs) {
+        let high = hex_nibble(pair[0]).ok_or_else(|| "invalid Nix base16 SHA-256".to_owned())?;
+        let low = hex_nibble(pair[1]).ok_or_else(|| "invalid Nix base16 SHA-256".to_owned())?;
+        *byte = (high << 4) | low;
     }
     Ok(NarHash::from_digest(digest))
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +244,12 @@ mod tests {
                 23, 24, 25, 26, 27, 28, 29, 30, 31,
             ])
         );
+    }
+
+    #[test]
+    fn rejects_non_hex_bytes_without_slicing_utf8() {
+        let value = format!("sha256:0é{}", "0".repeat(61));
+        assert!(nar_hash_from_base16(&value).is_err());
     }
 
     #[test]
