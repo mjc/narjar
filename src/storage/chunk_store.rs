@@ -451,11 +451,18 @@ enum ChunkReadMode {
     Verified,
 }
 
-struct LoadedChunk {
-    bytes: Vec<u8>,
-    position: usize,
-    end_position: usize,
-    nar_end: u64,
+enum LoadedChunk {
+    Serving {
+        file: File,
+        remaining: u64,
+        nar_end: u64,
+    },
+    Verified {
+        bytes: Vec<u8>,
+        position: usize,
+        end_position: usize,
+        nar_end: u64,
+    },
 }
 
 impl ChunkedNarReader<'_> {
@@ -474,18 +481,27 @@ impl ChunkedNarReader<'_> {
             if self.range_cursor >= descriptor.end() || self.range_end <= chunk_start {
                 continue;
             }
-            let chunk = read_chunk(self.store, descriptor, chunk_start, self.mode)?;
             let start = usize::try_from(self.range_cursor.max(chunk_start) - chunk_start).map_err(
                 |_| io::Error::new(io::ErrorKind::InvalidInput, "chunk offset is too large"),
             )?;
             let end = usize::try_from(self.range_end.min(descriptor.end()) - chunk_start).map_err(
                 |_| io::Error::new(io::ErrorKind::InvalidInput, "chunk offset is too large"),
             )?;
-            self.current_chunk = Some(LoadedChunk {
-                bytes: chunk,
-                position: start,
-                end_position: end,
-                nar_end: self.range_end.min(descriptor.end()),
+            self.current_chunk = Some(match self.mode {
+                ChunkReadMode::Serving => open_serving_chunk(
+                    self.store,
+                    descriptor,
+                    chunk_start,
+                    start,
+                    end,
+                    self.range_end.min(descriptor.end()),
+                )?,
+                ChunkReadMode::Verified => LoadedChunk::Verified {
+                    bytes: read_verified_chunk(self.store, descriptor, chunk_start)?,
+                    position: start,
+                    end_position: end,
+                    nar_end: self.range_end.min(descriptor.end()),
+                },
             });
             return Ok(true);
         }
@@ -506,15 +522,46 @@ impl Read for ChunkedNarReader<'_> {
         }
         loop {
             if let Some(chunk) = self.current_chunk.as_mut() {
-                let remaining = &chunk.bytes[chunk.position..chunk.end_position];
-                let copied = remaining.len().min(output.len());
-                output[..copied].copy_from_slice(&remaining[..copied]);
-                chunk.position += copied;
-                if chunk.position == chunk.end_position {
-                    self.range_cursor = chunk.nar_end;
-                    self.current_chunk = None;
+                match chunk {
+                    LoadedChunk::Serving {
+                        file,
+                        remaining,
+                        nar_end,
+                    } => {
+                        let requested = usize::try_from(*remaining)
+                            .unwrap_or(output.len())
+                            .min(output.len());
+                        let read = file.read(&mut output[..requested])?;
+                        if read == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "chunk ended before its manifest length",
+                            ));
+                        }
+                        *remaining -= read as u64;
+                        if *remaining == 0 {
+                            self.range_cursor = *nar_end;
+                            self.current_chunk = None;
+                        }
+                        return Ok(read);
+                    }
+                    LoadedChunk::Verified {
+                        bytes,
+                        position,
+                        end_position,
+                        nar_end,
+                    } => {
+                        let remaining = &bytes[*position..*end_position];
+                        let copied = remaining.len().min(output.len());
+                        output[..copied].copy_from_slice(&remaining[..copied]);
+                        *position += copied;
+                        if *position == *end_position {
+                            self.range_cursor = *nar_end;
+                            self.current_chunk = None;
+                        }
+                        return Ok(copied);
+                    }
                 }
-                return Ok(copied);
             }
             if self.range_cursor == self.range_end {
                 self.finish_manifest()?;
@@ -530,11 +577,39 @@ impl Read for ChunkedNarReader<'_> {
     }
 }
 
-fn read_chunk(
+fn open_serving_chunk(
     store: &ChunkStore,
     descriptor: super::chunked::ChunkDescriptor,
     chunk_start: u64,
-    mode: ChunkReadMode,
+    start: usize,
+    end: usize,
+    nar_end: u64,
+) -> io::Result<LoadedChunk> {
+    let chunk_length = descriptor
+        .end()
+        .checked_sub(chunk_start)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end moved backwards"))?;
+    let mut file = store
+        .open_chunk(descriptor.hash())?
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+    if file.metadata()?.len() != chunk_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk length does not match its manifest record",
+        ));
+    }
+    file.seek(SeekFrom::Start(start as u64))?;
+    Ok(LoadedChunk::Serving {
+        file,
+        remaining: (end - start) as u64,
+        nar_end,
+    })
+}
+
+fn read_verified_chunk(
+    store: &ChunkStore,
+    descriptor: super::chunked::ChunkDescriptor,
+    chunk_start: u64,
 ) -> io::Result<Vec<u8>> {
     let chunk_length = descriptor
         .end()
@@ -543,32 +618,22 @@ fn read_chunk(
     let mut file = store
         .open_chunk(descriptor.hash())?
         .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-    let mut chunk = Vec::new();
-    (&mut file).take(chunk_length).read_to_end(&mut chunk)?;
-    if chunk.len() as u64 != chunk_length {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "chunk ended before its manifest length",
-        ));
-    }
-    let mut trailing = [0_u8; 1];
-    if file.read(&mut trailing)? != 0 {
+    if file.metadata()?.len() != chunk_length {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "chunk contains bytes beyond its manifest length",
+            "chunk length does not match its manifest record",
         ));
     }
-    match mode {
-        ChunkReadMode::Serving => {}
-        ChunkReadMode::Verified => {
-            let actual_hash = ChunkHash::from_digest(Sha256::digest(&chunk).into());
-            if actual_hash != descriptor.hash() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "chunk hash does not match its manifest record",
-                ));
-            }
-        }
+    let chunk_length = usize::try_from(chunk_length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk is too large"))?;
+    let mut chunk = vec![0; chunk_length];
+    file.read_exact(&mut chunk)?;
+    let actual_hash = ChunkHash::from_digest(Sha256::digest(&chunk).into());
+    if actual_hash != descriptor.hash() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk hash does not match its manifest record",
+        ));
     }
     Ok(chunk)
 }
