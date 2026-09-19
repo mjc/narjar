@@ -57,8 +57,8 @@ default `/var/lib/narjar` path on the VM's ext4 root; the
 unmount/remount conformance lane at present. ZFS is the primary
 deployment profile, but compression, copy-on-write, sparse extents, snapshots,
 and physical space accounting are filesystem observations rather than Narjar
-correctness requirements. The chunked backend is intended for a DATA dataset
-configured by the operator with `compression=zstd-19`; Narjar does not set or
+correctness requirements. The recommended ZFS DATA profile uses
+`compression=zstd` (the OpenZFS alias for `zstd-3`); Narjar does not set or
 verify ZFS properties. XFS, btrfs, ZFS-specific behavior, overlay,
 bind-mount variants, quota/inode exhaustion, read-only remounts, and Darwin
 APFS remain unverified until the corresponding evidence work is complete.

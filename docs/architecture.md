@@ -172,7 +172,8 @@ content-addressed chunks below `.narjar-chunks/` and one bounded ordered
 manifest at `.narjar-manifests/<NarHash>.manifest`. The manifest records the
 profile, logical identity, cumulative chunk ends, and chunk hashes; it is
 required data, not a rebuildable cache index. ZFS may compress these files
-with `compression=zstd-19`, but ZFS compression is not part of a content ID.
+with the operator-recommended `compression=zstd` profile (the OpenZFS alias
+for `zstd-3`), but ZFS compression is not part of a content ID.
 Both backends expose the same logical NAR identity, Nix HTTP routes, egress
 selection, signatures, and offline maintenance semantics.
 

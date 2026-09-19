@@ -190,7 +190,8 @@ tests are required in addition to the flat publication cases:
 
 The matched storage experiment uses two fresh roots containing the same
 recorded NAR identities: one flat and one chunked. Both datasets use the same
-operator-owned ZFS settings, including `compression=zstd-19`, and are synced
+operator-owned ZFS settings, including the recommended `compression=zstd`
+profile (equivalent to `zstd-3`), and are synced
 before recording `used`, `logicalused`, dataset/snapshot contributions,
 manifest overhead, chunk counts, and exact reconstruction results. The
 experiment reports physical allocation separately from logical byte totals;
