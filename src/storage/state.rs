@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
+    fmt,
     fs::File,
     path::PathBuf,
+    str::FromStr,
     sync::{Arc, Mutex, Weak, atomic::AtomicU64},
 };
 
@@ -15,6 +17,29 @@ use super::recovery::RecoveryState;
 pub enum StorageBackend {
     Flat,
     Chunked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidStorageBackend;
+
+impl fmt::Display for InvalidStorageBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("expected one of: flat, chunked")
+    }
+}
+
+impl std::error::Error for InvalidStorageBackend {}
+
+impl FromStr for StorageBackend {
+    type Err = InvalidStorageBackend;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "flat" => Ok(Self::Flat),
+            "chunked" => Ok(Self::Chunked),
+            _ => Err(InvalidStorageBackend),
+        }
+    }
 }
 
 impl StorageBackend {

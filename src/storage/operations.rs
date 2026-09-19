@@ -28,8 +28,7 @@ use super::{
     chunk_store::{ChunkStoreError, ChunkingWriter, MAX_CHUNK_MANIFEST_BYTES},
     chunked::{ChunkManifest, ChunkProfile},
     compression::{
-        IngestionReceipt, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
-        receive_uploaded_nar,
+        IngestionReceipt, encoded_file_matches, nar_file_size_matches, receive_uploaded_nar,
     },
     directory::Directory,
     egress::{CanonicalRawStatus, NarReadBody},
@@ -140,7 +139,10 @@ impl CompressedValidationName {
     fn parse(name: &OsStr) -> Option<Self> {
         let stem = name.to_str()?.strip_suffix(".validation")?;
         let nar_name = NarFileName::parse(stem).ok()?;
-        (nar_name.encoding() != WireEncoding::Raw).then_some(Self(nar_name))
+        match nar_name.encoding() {
+            WireEncoding::Raw => None,
+            WireEncoding::Compressed(_) => Some(Self(nar_name)),
+        }
     }
 
     fn nar_name(&self) -> OsString {
@@ -608,10 +610,10 @@ impl Storage {
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<NarMatch, StorageError> {
-        if let NarRepresentation::Raw(identity) = narinfo.payload().representation() {
+        if let NarRepresentation::Raw(identity) = narinfo.payload() {
             return self.canonical_nar_matches(identity);
         }
-        let representation = narinfo.payload().representation();
+        let representation = narinfo.payload();
         let nar_directory = self.nar_directory()?;
         let payload_name = representation.file_name();
         open_optional_at(&nar_directory, &payload_name.os_string())?.map_or(
@@ -1271,7 +1273,7 @@ impl Storage {
         expectation: CompressedNarIdentity,
     ) -> Result<Option<IngestionReceipt>, StorageError> {
         let directory = self.ingestion_receipt_directory()?;
-        let name = ingestion_receipt_file_name(expectation);
+        let name = IngestionReceipt::file_name_for(expectation);
         match Self::read_ingestion_receipt_file(&directory, &name)? {
             BoundedRegularFile::Valid(receipt) if receipt.matches(expectation) => Ok(Some(receipt)),
             BoundedRegularFile::Missing

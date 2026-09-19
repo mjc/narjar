@@ -3,10 +3,7 @@ use std::{collections::HashSet, ffi::OsStr, fs::File, io, io::Read};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    narinfo::{
-        PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, ValidatedPayload,
-        read_narinfo_file,
-    },
+    narinfo::{PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file},
     object::NarRepresentation,
     storage::{
         Directory, FileHash, NarFileName, NarHash, Storage, StoreHash, for_each_dir_name,
@@ -151,7 +148,7 @@ impl VerificationMode {
 
 fn inspect_directory_payload(
     payloads: &File,
-    payload: ValidatedPayload,
+    payload: NarRepresentation,
     verification: VerificationMode,
 ) -> io::Result<InventoryClass> {
     match ReferencedPayload::open(payloads, payload)? {
@@ -162,10 +159,10 @@ fn inspect_directory_payload(
 
 fn inspect_storage_payload(
     storage: &Storage,
-    payload: ValidatedPayload,
+    payload: NarRepresentation,
     verification: VerificationMode,
 ) -> io::Result<InventoryClass> {
-    if let NarRepresentation::Raw(identity) = payload.representation() {
+    if let NarRepresentation::Raw(identity) = payload {
         return inspect_storage_canonical_nar(storage, identity, verification);
     }
     inspect_directory_payload(
@@ -177,7 +174,7 @@ fn inspect_storage_payload(
 
 fn inspect_payload(
     source: PayloadSource<'_>,
-    payload: ValidatedPayload,
+    payload: NarRepresentation,
     verification: VerificationMode,
 ) -> io::Result<InventoryClass> {
     match source {
@@ -304,7 +301,7 @@ fn inspect_trusted_narinfo(
     metadata: ValidatedNarInfo,
     verification: VerificationMode,
 ) -> io::Result<MetadataAssessment> {
-    let representation = metadata.payload().representation();
+    let representation = metadata.payload();
     let payload = representation.file_name().file_hash();
     let raw_nar = FileHash::from_nar_hash(representation.identity().hash());
     let advertised_class = inspect_payload(source, metadata.payload(), verification)?;
@@ -314,7 +311,7 @@ fn inspect_trusted_narinfo(
             advertised_class,
             inspect_payload(
                 source,
-                ValidatedPayload::raw(representation.identity()),
+                NarRepresentation::Raw(representation.identity()),
                 verification,
             )?,
         ),

@@ -5,8 +5,8 @@ use std::{
 
 use sqlite::{Connection, OpenFlags, State};
 
-use super::PathInfo;
-use crate::object::{NarHash, NarIdentity, NarSize};
+use narjar::narinfo::NarInfoMetadata;
+use narjar::object::{NarHash, NarIdentity, NarSize};
 
 const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
     (
@@ -49,7 +49,10 @@ impl LocalStore {
         Ok(Self { database })
     }
 
-    pub(super) fn closure_paths(&self, installables: &[String]) -> Result<Vec<PathInfo>, String> {
+    pub(super) fn closure_paths(
+        &self,
+        installables: &[String],
+    ) -> Result<Vec<NarInfoMetadata>, String> {
         let roots = installables
             .iter()
             .map(|installable| concrete_store_path(installable))
@@ -61,7 +64,7 @@ impl LocalStore {
                 continue;
             }
             let info = self.path_info(&path)?;
-            pending.extend(info.references.iter().cloned());
+            pending.extend(info.claims().reference_paths().map(str::to_owned));
             paths.insert(path, info);
         }
         if paths.is_empty() {
@@ -71,7 +74,7 @@ impl LocalStore {
         }
     }
 
-    fn path_info(&self, path: &str) -> Result<PathInfo, String> {
+    fn path_info(&self, path: &str) -> Result<NarInfoMetadata, String> {
         let mut statement = self
             .database
             .prepare(
@@ -111,14 +114,15 @@ impl LocalStore {
             .read::<Option<String>, _>("ca")
             .map_err(|error| format!("reading Nix path content address: {error}"))?;
         let references = self.references(id)?;
-        Ok(PathInfo {
-            path: path.to_owned(),
+        NarInfoMetadata::from_store_metadata(
+            path.to_owned(),
             ca,
             deriver,
-            nar: NarIdentity::new(nar_hash_from_base16(&hash)?, NarSize::new(nar_size)),
+            NarIdentity::new(nar_hash_from_base16(&hash)?, NarSize::new(nar_size)),
             references,
             signatures,
-        })
+        )
+        .map_err(|error| error.to_string())
     }
 
     fn references(&self, id: i64) -> Result<Vec<String>, String> {
@@ -183,10 +187,6 @@ fn table_columns(database: &Connection, table: &str) -> Result<BTreeSet<String>,
     Ok(columns)
 }
 
-pub(super) fn closure_paths(installables: &[String]) -> Result<Vec<PathInfo>, String> {
-    LocalStore::open()?.closure_paths(installables)
-}
-
 fn concrete_store_path(value: &str) -> Result<String, String> {
     let relative = value
         .strip_prefix("/nix/store/")
@@ -218,7 +218,7 @@ mod tests {
     use sqlite::Connection;
 
     use super::{nar_hash_from_base16, validate_supported_schema};
-    use crate::object::NarHash;
+    use narjar::object::NarHash;
 
     #[test]
     fn converts_nix_store_hash_to_binary_identity() {

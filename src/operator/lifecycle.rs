@@ -17,7 +17,7 @@ use narjar::storage::{
 
 use crate::error::Error;
 
-use super::{StorageBackendOption, create_file, runtime, valid_key_name};
+use super::{create_file, runtime, valid_key_name};
 
 #[derive(Args)]
 pub(crate) struct Init {
@@ -27,8 +27,8 @@ pub(crate) struct Init {
     pub(crate) priority: u32,
     #[arg(long)]
     pub(crate) private_read: bool,
-    #[arg(long, value_enum, default_value = "flat")]
-    pub(crate) storage_backend: StorageBackendOption,
+    #[arg(long, default_value = "flat")]
+    pub(crate) storage_backend: StorageBackend,
 }
 
 pub(crate) fn init(options: Init) -> Result<(), Error> {
@@ -50,12 +50,12 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
     create_recovery_marker(&root)?;
     create_file(
         &root.join(LAYOUT_DESCRIPTOR),
-        StorageBackend::from(storage_backend).layout_descriptor(),
+        storage_backend.layout_descriptor(),
         0o600,
         true,
     )?;
     let directory = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize(&directory, storage_backend.into()).map_err(runtime)?;
+    let storage = Storage::initialize(&directory, storage_backend).map_err(runtime)?;
     for directory in [
         NAR_DIRECTORY,
         TEMPORARY_DIRECTORY,

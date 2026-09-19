@@ -9,22 +9,20 @@ use std::{
 
 use lzma_rust2::XzReader;
 use lzma_rust2::{XzOptions, XzWriter};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
-use crate::narinfo::{NarEncoding, ValidatedPayload};
 use crate::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
-    NarHash, NarIdentity, NarRepresentation, NarSize,
+    NarHash, NarIdentity, NarRepresentation, NarSize, WireEncoding,
 };
 
 use super::{
     publication::{StagingReservation, StorageError},
+    receipt::{deserialize_compressed_nar_identity, serialize_compressed_nar_identity},
     typestate::Validated,
 };
-const INGESTION_RECEIPT_VERSION: u8 = 1;
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) struct CheckedUploadReader<R> {
@@ -211,11 +209,6 @@ struct HashingWriter<'a, W: Write + ?Sized> {
     max_bytes: u64,
 }
 
-pub(super) struct EncodedOutput {
-    pub(super) hash: FileHash,
-    pub(super) size: EncodedSize,
-}
-
 struct EncodedOutputHasher<'a, W: Write + ?Sized> {
     inner: &'a mut W,
     hasher: Sha256,
@@ -231,11 +224,12 @@ impl<'a, W: Write + ?Sized> EncodedOutputHasher<'a, W> {
         }
     }
 
-    fn finish(self) -> EncodedOutput {
-        EncodedOutput {
-            hash: FileHash::from_digest(self.hasher.finalize().into()),
-            size: EncodedSize::new(self.bytes_written),
-        }
+    fn finish(self, codec: CompressionCodec) -> EncodedIdentity {
+        EncodedIdentity::new(
+            codec,
+            FileHash::from_digest(self.hasher.finalize().into()),
+            EncodedSize::new(self.bytes_written),
+        )
     }
 }
 
@@ -261,7 +255,7 @@ pub(super) fn encode_raw_nar(
     mut source: impl Read,
     codec: CompressionCodec,
     destination: &mut impl Write,
-) -> io::Result<EncodedOutput> {
+) -> io::Result<EncodedIdentity> {
     let mut output = EncodedOutputHasher::new(destination);
     match codec {
         CompressionCodec::Zstd => {
@@ -276,7 +270,7 @@ pub(super) fn encode_raw_nar(
             encoder.finish().map_err(io::Error::other)?;
         }
     }
-    Ok(output.finish())
+    Ok(output.finish(codec))
 }
 
 impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
@@ -320,9 +314,13 @@ impl<W: Write + ?Sized> Write for HashingWriter<'_, W> {
     }
 }
 
-pub(super) type ReceivedNar = NarRepresentation<IngestionReceipt>;
+#[derive(Debug)]
+pub(super) enum ReceivedNar {
+    Raw(NarIdentity),
+    Compressed(IngestionReceipt),
+}
 
-impl NarRepresentation<IngestionReceipt> {
+impl ReceivedNar {
     pub(super) fn identity(&self) -> NarIdentity {
         match self {
             Self::Raw(identity) => *identity,
@@ -351,12 +349,11 @@ pub(super) fn receive_uploaded_nar<W: Write>(
         max_nar_size,
     };
     let codec = match name.encoding() {
-        NarEncoding::Raw => {
+        WireEncoding::Raw => {
             let decoded = copy_raw_upload_to_raw_staging(source, expectation, destination)?;
             return Ok(ReceivedNar::Raw(decoded));
         }
-        NarEncoding::Xz => CompressionCodec::Xz,
-        NarEncoding::Zstd => CompressionCodec::Zstd,
+        WireEncoding::Compressed(codec) => codec,
     };
     let decoded = match codec {
         CompressionCodec::Xz => decode_xz_upload_to_raw_staging(source, expectation, destination)?,
@@ -510,61 +507,29 @@ impl<R> UploadCompressedSourceReader<R> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct IngestionReceipt(CompressedNarIdentity);
 
-#[derive(Deserialize, Serialize)]
-struct IngestionReceiptRecord {
-    version: u8,
-    encoding: CompressionCodec,
-    encoded_hash: FileHash,
-    encoded_size: EncodedSize,
-    decoded_hash: NarHash,
-    decoded_size: NarSize,
-}
-
-impl IngestionReceiptRecord {
-    fn from_receipt(receipt: &IngestionReceipt) -> Self {
-        let encoded = receipt.0.encoded();
-        let decoded = receipt.0.decoded();
-        Self {
-            version: INGESTION_RECEIPT_VERSION,
-            encoding: encoded.codec(),
-            encoded_hash: encoded.hash(),
-            encoded_size: encoded.size(),
-            decoded_hash: decoded.hash(),
-            decoded_size: decoded.size(),
-        }
-    }
-
-    fn into_receipt(self) -> Option<IngestionReceipt> {
-        (self.version == INGESTION_RECEIPT_VERSION).then_some(())?;
-        Some(IngestionReceipt(CompressedNarIdentity::new(
-            EncodedIdentity::new(self.encoding, self.encoded_hash, self.encoded_size),
-            NarIdentity::new(self.decoded_hash, self.decoded_size),
-        )))
-    }
-}
-
 impl IngestionReceipt {
     fn new(encoded: EncodedIdentity, decoded: NarIdentity) -> Self {
         Self(CompressedNarIdentity::new(encoded, decoded))
     }
 
     pub(super) fn file_name(&self) -> OsString {
+        Self::file_name_for(self.0)
+    }
+
+    pub(super) fn file_name_for(expectation: CompressedNarIdentity) -> OsString {
         OsString::from(format!(
             "{}{}.validation",
-            self.0.encoded().hash(),
-            self.0.encoded().codec().suffix()
+            expectation.encoded().hash(),
+            expectation.encoded().codec().suffix()
         ))
     }
 
     pub(super) fn bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(&IngestionReceiptRecord::from_receipt(self))
-            .expect("ingestion receipt serialization cannot fail")
+        serialize_compressed_nar_identity(self.0)
     }
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
-        postcard::from_bytes::<IngestionReceiptRecord>(bytes)
-            .ok()
-            .and_then(IngestionReceiptRecord::into_receipt)
+        deserialize_compressed_nar_identity(bytes).map(Self)
     }
 
     pub(super) fn matches(&self, expectation: CompressedNarIdentity) -> bool {
@@ -574,14 +539,6 @@ impl IngestionReceipt {
     pub(super) fn decoded_identity(&self) -> NarIdentity {
         self.0.decoded()
     }
-}
-
-pub(super) fn ingestion_receipt_file_name(expectation: CompressedNarIdentity) -> OsString {
-    OsString::from(format!(
-        "{}{}.validation",
-        expectation.encoded().hash(),
-        expectation.encoded().codec().suffix()
-    ))
 }
 
 #[derive(Debug)]
@@ -795,8 +752,8 @@ pub(super) fn validate_compressed_nar(
     verify_decoded_compressed_file(verified)
 }
 
-pub(crate) fn nar_file_matches(file: &File, payload: ValidatedPayload) -> io::Result<bool> {
-    match payload.representation() {
+pub(crate) fn nar_file_matches(file: &File, payload: NarRepresentation) -> io::Result<bool> {
+    match payload {
         NarRepresentation::Raw(identity) => raw_nar_file_matches(file, identity),
         NarRepresentation::Compressed(expectation) => {
             Ok(validate_compressed_nar(file, expectation)?.is_some())
@@ -822,7 +779,7 @@ pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Resu
 mod tests {
     use std::{
         fs::File,
-        io::{self, Seek, SeekFrom, Write},
+        io::{self, Write},
         sync::{Arc, Mutex},
     };
 
@@ -847,16 +804,10 @@ mod tests {
 
     #[test]
     fn encoding_propagates_physical_enospc() {
-        let mut source = tempfile::tempfile().expect("create source NAR");
-        source
-            .write_all(b"raw NAR bytes")
-            .expect("write source NAR");
-        source.seek(SeekFrom::Start(0)).expect("rewind source NAR");
-
         for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
-            let error = encode_raw_nar(&source, codec, &mut EnospcWriter)
-                .err()
-                .expect("physical output exhaustion should fail encoding");
+            let source = io::Cursor::new(b"raw NAR bytes");
+            let error = encode_raw_nar(source, codec, &mut EnospcWriter)
+                .expect_err("physical output exhaustion should fail encoding");
             assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
         }
     }

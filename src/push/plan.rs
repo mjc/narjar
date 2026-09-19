@@ -1,13 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::Error;
+use narjar::narinfo::NarInfoMetadata;
 
-use super::PathInfo;
-
-pub(super) fn dependency_waves(metadata: Vec<PathInfo>) -> Result<Vec<Vec<PathInfo>>, Error> {
+pub(super) fn dependency_waves(
+    metadata: Vec<NarInfoMetadata>,
+) -> Result<Vec<Vec<NarInfoMetadata>>, Error> {
     let mut by_path = BTreeMap::new();
     for info in metadata {
-        if by_path.insert(info.path.clone(), info).is_some() {
+        if by_path
+            .insert(info.claims().store_path().to_owned(), info)
+            .is_some()
+        {
             return Err(Error::runtime(
                 "local store metadata returned a duplicate store path",
             ));
@@ -20,26 +24,27 @@ pub(super) fn dependency_waves(metadata: Vec<PathInfo>) -> Result<Vec<Vec<PathIn
         .collect::<BTreeMap<_, _>>();
     let mut dependents = BTreeMap::<String, Vec<String>>::new();
     for info in by_path.values() {
-        let mut references = info.references.iter().collect::<Vec<_>>();
+        let mut references = info.claims().reference_paths().collect::<Vec<_>>();
         references.sort_unstable();
         references.dedup();
         for reference in references {
-            if reference == &info.path {
+            if reference == info.claims().store_path() {
                 continue;
             }
             if !by_path.contains_key(reference) {
                 return Err(Error::runtime(format!(
                     "{} has missing referenced store path {}",
-                    info.path, reference
+                    info.claims().store_path(),
+                    reference
                 )));
             }
             *indegree
-                .get_mut(&info.path)
+                .get_mut(info.claims().store_path())
                 .expect("every path has an indegree") += 1;
             dependents
-                .entry(reference.clone())
+                .entry(reference.to_owned())
                 .or_default()
-                .push(info.path.clone());
+                .push(info.claims().store_path().to_owned());
         }
     }
 
@@ -64,7 +69,7 @@ pub(super) fn dependency_waves(metadata: Vec<PathInfo>) -> Result<Vec<Vec<PathIn
             emitted += 1;
         }
         for info in &wave {
-            if let Some(children) = dependents.get(&info.path) {
+            if let Some(children) = dependents.get(info.claims().store_path()) {
                 for child in children {
                     let degree = indegree
                         .get_mut(child)

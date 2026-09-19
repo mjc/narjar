@@ -6,10 +6,9 @@ use std::{
     os::unix::fs::MetadataExt,
 };
 
-pub use crate::object::WireEncoding as NarEncoding;
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
-    NarRepresentation, NarSize,
+    EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarRepresentation,
+    NarSize, WireEncoding,
 };
 use crate::storage::{Directory, StoreHash, StoredNar, open_regular_at};
 use data_encoding::BASE64;
@@ -49,6 +48,42 @@ impl NixStorePath {
             .split_once('-')
             .expect("validated store paths contain a name")
             .0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Deriver {
+    Unknown,
+    StorePath(NixStorePath),
+}
+
+impl Deriver {
+    fn from_store_value(value: String) -> Result<Self, NarInfoError> {
+        match value.as_str() {
+            "unknown-deriver" => Ok(Self::Unknown),
+            _ => NixStorePath::parse(value).map(Self::StorePath),
+        }
+    }
+
+    fn narinfo_value(&self) -> &str {
+        match self {
+            Self::Unknown => "unknown-deriver",
+            Self::StorePath(path) => path.basename(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContentAddress(String);
+
+impl ContentAddress {
+    fn parse(value: String) -> Result<Self, NarInfoError> {
+        parse_content_address(&value)?;
+        Ok(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -156,8 +191,8 @@ impl NarInfoClaims {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NarInfoMetadata {
     claims: NarInfoClaims,
-    deriver: Option<String>,
-    content_address: Option<String>,
+    deriver: Option<Deriver>,
+    content_address: Option<ContentAddress>,
     signatures: Vec<String>,
 }
 
@@ -172,8 +207,8 @@ impl NarInfoMetadata {
     ) -> Result<Self, NarInfoError> {
         Ok(Self {
             claims: NarInfoClaims::new(store_path, references, identity)?,
-            deriver,
-            content_address,
+            deriver: deriver.map(Deriver::from_store_value).transpose()?,
+            content_address: content_address.map(ContentAddress::parse).transpose()?,
             signatures,
         })
     }
@@ -190,11 +225,12 @@ impl NarInfoMetadata {
         self.signatures.push(signature);
     }
 
-    pub fn serialize(
-        &self,
-        file_name: NarFileName,
-        file_size: EncodedSize,
-    ) -> Result<Vec<u8>, NarInfoError> {
+    pub fn serialize(&self, representation: NarRepresentation) -> Result<Vec<u8>, NarInfoError> {
+        if representation.identity() != self.claims.identity() {
+            return Err(NarInfoError);
+        }
+        let file_name = representation.file_name();
+        let file_size = representation.encoded_size();
         let mut output = format!(
             "StorePath: {}\nURL: nar/{file_name}\nCompression: {}\nFileHash: sha256:{}\nFileSize: {file_size}\nNarHash: sha256:{}\nNarSize: {}\nReferences: {}\n",
             self.claims.store_path(),
@@ -210,17 +246,13 @@ impl NarInfoMetadata {
             output.push('\n');
         });
         if let Some(deriver) = &self.deriver {
-            let deriver = match deriver.as_str() {
-                "unknown-deriver" => "unknown-deriver",
-                value => value.strip_prefix("/nix/store/").ok_or(NarInfoError)?,
-            };
             output.push_str("Deriver: ");
-            output.push_str(deriver);
+            output.push_str(deriver.narinfo_value());
             output.push('\n');
         }
         if let Some(content_address) = &self.content_address {
             output.push_str("CA: ");
-            output.push_str(content_address);
+            output.push_str(content_address.as_str());
             output.push('\n');
         }
         Ok(output.into_bytes())
@@ -409,7 +441,10 @@ impl<'text> NarInfoDocument<'text> {
             .collect()
     }
 
-    fn publication_payload(&self, identity: NarIdentity) -> Result<ValidatedPayload, NarInfoError> {
+    fn publication_payload(
+        &self,
+        identity: NarIdentity,
+    ) -> Result<NarRepresentation, NarInfoError> {
         if self.field(NarInfoField::System).is_some() {
             return Err(NarInfoError);
         }
@@ -431,7 +466,7 @@ impl<'text> NarInfoDocument<'text> {
             .parse::<u64>()
             .map(EncodedSize::new)
             .map_err(|_| NarInfoError)?;
-        ValidatedPayload::from_narinfo(file_name, file_hash, file_size, identity)
+        NarRepresentation::from_narinfo(file_name, file_hash, file_size, identity)
     }
 }
 
@@ -488,7 +523,7 @@ impl NamedSignature {
 #[derive(Debug)]
 pub struct PublicationNarInfo {
     claims: NarInfoClaims,
-    payload: ValidatedPayload,
+    payload: NarRepresentation,
     text: String,
 }
 
@@ -531,10 +566,7 @@ impl UnverifiedPublicationNarInfo {
 
 pub type ValidatedNarInfo = SignatureVerified<PublicationNarInfo>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ValidatedPayload(NarRepresentation);
-
-impl ValidatedPayload {
+impl NarRepresentation {
     fn from_narinfo(
         file_name: NarFileName,
         file_hash: FileHash,
@@ -546,26 +578,22 @@ impl ValidatedPayload {
         }
 
         match file_name.encoding() {
-            NarEncoding::Raw if !file_hash.matches_nar_hash(identity.hash()) => Err(NarInfoError),
-            NarEncoding::Raw if file_size.get() != identity.size().get() => Err(NarInfoError),
-            NarEncoding::Raw => Ok(Self(NarRepresentation::Raw(identity))),
-            NarEncoding::Zstd => Ok(Self(NarRepresentation::compressed(
-                EncodedIdentity::new(CompressionCodec::Zstd, file_hash, file_size),
+            WireEncoding::Raw => Self::validate_raw_payload(file_hash, file_size, identity),
+            WireEncoding::Compressed(codec) => Ok(Self::compressed(
+                EncodedIdentity::new(codec, file_hash, file_size),
                 identity,
-            ))),
-            NarEncoding::Xz => Ok(Self(NarRepresentation::compressed(
-                EncodedIdentity::new(CompressionCodec::Xz, file_hash, file_size),
-                identity,
-            ))),
+            )),
         }
     }
 
-    pub(crate) const fn raw(identity: NarIdentity) -> Self {
-        Self(NarRepresentation::Raw(identity))
-    }
-
-    pub(crate) const fn representation(self) -> NarRepresentation {
-        self.0
+    fn validate_raw_payload(
+        file_hash: FileHash,
+        file_size: EncodedSize,
+        identity: NarIdentity,
+    ) -> Result<Self, NarInfoError> {
+        (file_hash.matches_nar_hash(identity.hash()) && file_size.get() == identity.size().get())
+            .then_some(Self::Raw(identity))
+            .ok_or(NarInfoError)
     }
 }
 
@@ -574,7 +602,7 @@ impl SignatureVerified<PublicationNarInfo> {
         &self.0.claims
     }
 
-    pub(crate) const fn payload(&self) -> ValidatedPayload {
+    pub(crate) const fn payload(&self) -> NarRepresentation {
         self.0.payload
     }
 
@@ -587,7 +615,7 @@ impl SignatureVerified<PublicationNarInfo> {
         stored: StoredNar<'_>,
         output: NarRepresentation,
     ) -> Result<BoundNarInfo<'_>, NarInfoError> {
-        if self.0.payload.representation().identity() != stored.identity() {
+        if self.0.payload.identity() != stored.identity() {
             return Err(NarInfoError);
         }
         Ok(BoundNarInfo {
@@ -813,6 +841,68 @@ mod tests {
     const STORE_HASH: &str = "00000000000000000000000000000000";
     const NAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
     const XZ_FILE_HASH: &str = "1111111111111111111111111111111111111111111111111111";
+
+    fn local_metadata(identity: NarIdentity) -> NarInfoMetadata {
+        NarInfoMetadata::from_store_metadata(
+            format!("/nix/store/{STORE_HASH}-package"),
+            None,
+            None,
+            identity,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("test store metadata should be valid")
+    }
+
+    #[test]
+    fn local_metadata_rejects_unvalidated_protocol_fields_at_construction() {
+        let identity = NarIdentity::new(
+            NarHash::parse(NAR_HASH).expect("test NAR hash should parse"),
+            NarSize::new(1),
+        );
+        let store_path = format!("/nix/store/{STORE_HASH}-package");
+
+        assert!(
+            NarInfoMetadata::from_store_metadata(
+                store_path.clone(),
+                Some("fixed:sha256:not-a-hash".to_owned()),
+                None,
+                identity,
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err(),
+            "an invalid content address must not survive inside typed metadata"
+        );
+        assert!(
+            NarInfoMetadata::from_store_metadata(
+                store_path,
+                None,
+                Some("not-a-store-path".to_owned()),
+                identity,
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err(),
+            "an invalid deriver must not survive inside typed metadata"
+        );
+    }
+
+    #[test]
+    fn narinfo_serialization_requires_the_selected_representation_to_describe_its_claims() {
+        let claimed = NarIdentity::new(
+            NarHash::parse(NAR_HASH).expect("test NAR hash should parse"),
+            NarSize::new(1),
+        );
+        let different_size = NarIdentity::new(claimed.hash(), NarSize::new(2));
+
+        assert!(
+            local_metadata(claimed)
+                .serialize(NarRepresentation::Raw(different_size))
+                .is_err(),
+            "metadata must not advertise a representation of another logical NAR"
+        );
+    }
 
     #[test]
     fn parser_rejects_oversized_narinfo() {

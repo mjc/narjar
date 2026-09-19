@@ -21,10 +21,9 @@ use super::{
     CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageBackend,
     StorageError, StoreHash, capacity_error_kind,
 };
-use crate::narinfo::{NarEncoding, ValidatedPayload};
 use crate::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
-    NarHash, NarIdentity, NarSize,
+    NarHash, NarIdentity, NarRepresentation, NarSize, WireEncoding,
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
@@ -169,28 +168,28 @@ fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     manifest[checksum] ^= 1;
     fs::write(manifest_path, manifest).unwrap();
 
-    let result = storage.open_verified_canonical_nar(ValidatedPayload::raw(identity));
+    let result = storage.open_verified_canonical_nar(NarRepresentation::Raw(identity));
     assert!(matches!(
         result,
         Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
     ));
 }
 
-fn compressed_bytes(encoding: NarEncoding, raw: &[u8]) -> Vec<u8> {
+fn compressed_bytes(encoding: WireEncoding, raw: &[u8]) -> Vec<u8> {
     match encoding {
-        NarEncoding::Xz => {
+        WireEncoding::Compressed(CompressionCodec::Xz) => {
             let mut compressed = Vec::new();
             let mut writer = XzWriter::new(&mut compressed, XzOptions::with_preset(1)).unwrap();
             writer.write_all(raw).unwrap();
             writer.finish().unwrap();
             compressed
         }
-        NarEncoding::Zstd => {
+        WireEncoding::Compressed(CompressionCodec::Zstd) => {
             let mut compressed = Vec::new();
             compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
             compressed
         }
-        NarEncoding::Raw => panic!("test helper only compresses XZ and Zstd"),
+        WireEncoding::Raw => panic!("test helper only compresses XZ and Zstd"),
     }
 }
 
@@ -200,7 +199,7 @@ fn begin_raw_upload<'storage>(
 ) -> super::ingest::Staged<'storage, super::typestate::Streaming<super::ingest::UploadRequest>> {
     let name = NarFileName::new(
         FileHash::from_digest(Sha256::digest(bytes).into()),
-        NarEncoding::Raw,
+        WireEncoding::Raw,
     );
     let length = bytes.len() as u64;
     let reservation = storage.reserve_staging(length, 0).unwrap();
@@ -527,7 +526,10 @@ impl Read for FailsIfReadAfterEof {
 
 #[test]
 fn normalized_compressed_source_errors_remain_io_errors() {
-    for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
         let directory = TestDir::new();
         let destination = directory.path().join("raw.nar");
         let mut destination = fs::File::create(destination).expect("create raw staging file");
@@ -563,7 +565,7 @@ fn xz_uploads_are_normalized_to_the_raw_nar() {
 
     let outcome = storage
         .publish_nar(
-            NarFileName::new(encoded, NarEncoding::Xz),
+            NarFileName::new(encoded, WireEncoding::Compressed(CompressionCodec::Xz)),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -626,7 +628,10 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
     let wrong_file_hash = FileHash::parse(&"0".repeat(52)).unwrap();
     let wrong_nar_hash = NarHash::parse(&"0".repeat(52)).unwrap();
 
-    for (encoding, compressed) in [(NarEncoding::Xz, xz), (NarEncoding::Zstd, zstd)] {
+    for (encoding, compressed) in [
+        (WireEncoding::Compressed(CompressionCodec::Xz), xz),
+        (WireEncoding::Compressed(CompressionCodec::Zstd), zstd),
+    ] {
         let directory = TestDir::new();
         let path = directory.path().join("compressed-nar");
         fs::write(&path, &compressed).unwrap();
@@ -640,9 +645,8 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
             let expectation = CompressedNarIdentity::new(
                 EncodedIdentity::new(
                     match encoding {
-                        NarEncoding::Xz => CompressionCodec::Xz,
-                        NarEncoding::Zstd => CompressionCodec::Zstd,
-                        NarEncoding::Raw => {
+                        WireEncoding::Compressed(codec) => codec,
+                        WireEncoding::Raw => {
                             unreachable!("test only supplies compressed encodings")
                         }
                     },
@@ -689,7 +693,7 @@ fn zstd_uploads_are_normalized_to_the_raw_nar() {
 
     let outcome = storage
         .publish_nar(
-            NarFileName::new(encoded, NarEncoding::Zstd),
+            NarFileName::new(encoded, WireEncoding::Compressed(CompressionCodec::Zstd)),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -705,7 +709,10 @@ fn zstd_uploads_are_normalized_to_the_raw_nar() {
 
 #[test]
 fn a_restart_after_raw_commit_retries_receipt_publication() {
-    for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
         let directory = TestDir::new();
         let raw = b"nar bytes";
         let compressed = compressed_bytes(encoding, raw);
@@ -768,7 +775,10 @@ fn a_restart_after_raw_commit_retries_receipt_publication() {
 
 #[test]
 fn recovery_removes_receipts_without_a_usable_raw_object() {
-    for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
         let directory = TestDir::new();
         let raw = b"nar bytes";
         let compressed = compressed_bytes(encoding, raw);
@@ -876,7 +886,7 @@ fn compressed_uploads_converge_on_one_raw_object() {
 
     let xz_result = storage
         .publish_nar(
-            NarFileName::new(xz_id, NarEncoding::Xz),
+            NarFileName::new(xz_id, WireEncoding::Compressed(CompressionCodec::Xz)),
             Cursor::new(&xz),
             xz.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -884,7 +894,7 @@ fn compressed_uploads_converge_on_one_raw_object() {
         .expect("publish XZ NAR");
     let zstd_result = storage
         .publish_nar(
-            NarFileName::new(zstd_id, NarEncoding::Zstd),
+            NarFileName::new(zstd_id, WireEncoding::Compressed(CompressionCodec::Zstd)),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -897,13 +907,19 @@ fn compressed_uploads_converge_on_one_raw_object() {
     assert!(
         !storage
             .layout()
-            .nar_path_encoded(NarFileName::new(xz_id, NarEncoding::Xz))
+            .nar_path_encoded(NarFileName::new(
+                xz_id,
+                WireEncoding::Compressed(CompressionCodec::Xz),
+            ))
             .exists()
     );
     assert!(
         !storage
             .layout()
-            .nar_path_encoded(NarFileName::new(zstd_id, NarEncoding::Zstd))
+            .nar_path_encoded(NarFileName::new(
+                zstd_id,
+                WireEncoding::Compressed(CompressionCodec::Zstd),
+            ))
             .exists()
     );
 }
@@ -1064,10 +1080,14 @@ fn missing_compressed_derivative_must_reproduce_its_receipt_identity() {
         .expect("egress receipt should exist")
         .expect("egress receipt should be readable")
         .path();
-    let mut receipt = fs::read(&receipt_path).expect("receipt should be readable");
-    const ENCODED_HASH_OFFSET: usize = 1 + 32 + 1 + 1;
-    receipt[ENCODED_HASH_OFFSET] ^= 1;
-    fs::write(receipt_path, receipt).expect("test should rewrite the receipt identity");
+    let wrong_output_hash = FileHash::from_digest([0xff; 32]);
+    let wrong_receipt = EgressReceipt::new(
+        EgressSlot::new(identity, CompressionCodec::Zstd),
+        wrong_output_hash,
+        output.1,
+    );
+    fs::write(receipt_path, wrong_receipt.bytes())
+        .expect("test should rewrite the receipt identity");
 
     assert!(matches!(
         storage.compressed_representation_for_test(identity, CompressionCodec::Zstd, 0),
@@ -1203,7 +1223,7 @@ fn zstd_validation_rejects_bytes_after_the_frame() {
         .expect("compressed frame hash is a valid file hash");
 
     let result = storage.publish_nar(
-        NarFileName::new(nar, NarEncoding::Zstd),
+        NarFileName::new(nar, WireEncoding::Compressed(CompressionCodec::Zstd)),
         Cursor::new(&compressed),
         compressed.len() as u64,
         super::NarUploadPolicy::new(1024, 0),
@@ -1228,7 +1248,7 @@ fn xz_validation_rejects_bytes_after_the_stream() {
         .expect("compressed frame hash is a valid file hash");
 
     let result = storage.publish_nar(
-        NarFileName::new(nar, NarEncoding::Xz),
+        NarFileName::new(nar, WireEncoding::Compressed(CompressionCodec::Xz)),
         Cursor::new(&compressed),
         compressed.len() as u64,
         super::NarUploadPolicy::new(1024, 0),
@@ -1249,7 +1269,10 @@ fn compressed_nars_reject_truncated_frames() {
     let mut zstd = Vec::new();
     compress(Cursor::new(raw), &mut zstd, CompressionLevel::Fastest);
 
-    for (encoding, mut compressed) in [(NarEncoding::Xz, xz), (NarEncoding::Zstd, zstd)] {
+    for (encoding, mut compressed) in [
+        (WireEncoding::Compressed(CompressionCodec::Xz), xz),
+        (WireEncoding::Compressed(CompressionCodec::Zstd), zstd),
+    ] {
         compressed.pop().expect("compressed frame is not empty");
         let nar = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed)))
             .expect("compressed hash is a valid file hash");

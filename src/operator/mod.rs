@@ -17,13 +17,13 @@ use narjar::{
     inventory::{Inventory, InventoryClass, VerificationMode},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
-        CleanupOutcome, Directory, ReconcileClass, Storage, StoreHash,
+        CleanupOutcome, Directory, ReconcileClass, Storage, StorageBackend, StoreHash,
         gc::{self, GcOptions},
     },
 };
 use ureq::Agent;
 
-use crate::{config::StorageBackendOption, error::Error, http_url::HttpUrl};
+use crate::{error::Error, http_url::HttpUrl};
 
 mod lifecycle;
 pub(crate) use lifecycle::{Init, Key, init, key};
@@ -42,8 +42,8 @@ pub(crate) struct Reconcile {
     limit: usize,
     #[arg(long, default_value_t = 3_600)]
     min_age_seconds: u64,
-    #[arg(long, value_enum, default_value = "flat")]
-    storage_backend: StorageBackendOption,
+    #[arg(long, default_value = "flat")]
+    storage_backend: StorageBackend,
 }
 
 pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
@@ -53,7 +53,7 @@ pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
             options.limit,
             options.min_age_seconds,
             options.json,
-            options.storage_backend.into(),
+            options.storage_backend,
         );
     }
     report(
@@ -61,7 +61,7 @@ pub(crate) fn reconcile(options: Reconcile) -> Result<(), Error> {
         ReportMode::Reconcile,
         options.verify_hashes,
         options.json,
-        options.storage_backend.into(),
+        options.storage_backend,
     )
 }
 
@@ -75,8 +75,8 @@ pub(crate) struct Cleanup {
     limit: usize,
     #[arg(long)]
     json: bool,
-    #[arg(long, value_enum, default_value = "flat")]
-    storage_backend: StorageBackendOption,
+    #[arg(long, default_value = "flat")]
+    storage_backend: StorageBackend,
 }
 
 pub(crate) fn cleanup(options: Cleanup) -> Result<(), Error> {
@@ -85,7 +85,7 @@ pub(crate) fn cleanup(options: Cleanup) -> Result<(), Error> {
         options.limit,
         options.min_age_seconds,
         options.json,
-        options.storage_backend.into(),
+        options.storage_backend,
         StructuralAction::Cleanup,
     )
 }
@@ -96,8 +96,8 @@ pub(crate) struct Verify {
     data_dir: PathBuf,
     #[arg(long)]
     json: bool,
-    #[arg(long, value_enum, default_value = "flat")]
-    storage_backend: StorageBackendOption,
+    #[arg(long, default_value = "flat")]
+    storage_backend: StorageBackend,
 }
 
 pub(crate) fn verify(options: Verify) -> Result<(), Error> {
@@ -106,7 +106,7 @@ pub(crate) fn verify(options: Verify) -> Result<(), Error> {
         ReportMode::Verify,
         false,
         options.json,
-        options.storage_backend.into(),
+        options.storage_backend,
     )
 }
 
@@ -118,8 +118,8 @@ pub(crate) struct ListOrphans {
     verify_hashes: bool,
     #[arg(long)]
     json: bool,
-    #[arg(long, value_enum, default_value = "flat")]
-    storage_backend: StorageBackendOption,
+    #[arg(long, default_value = "flat")]
+    storage_backend: StorageBackend,
 }
 
 pub(crate) fn list_orphans(options: ListOrphans) -> Result<(), Error> {
@@ -128,7 +128,7 @@ pub(crate) fn list_orphans(options: ListOrphans) -> Result<(), Error> {
         ReportMode::Orphans,
         options.verify_hashes,
         options.json,
-        options.storage_backend.into(),
+        options.storage_backend,
     )
 }
 
@@ -299,8 +299,8 @@ pub(crate) struct Gc {
     apply: bool,
     #[arg(long)]
     json: bool,
-    #[arg(long, value_enum, default_value = "flat")]
-    storage_backend: StorageBackendOption,
+    #[arg(long, default_value = "flat")]
+    storage_backend: StorageBackend,
 }
 
 pub(crate) fn gc(options: Gc) -> Result<(), Error> {
@@ -324,7 +324,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         min_age: std::time::Duration::from_secs(min_age_seconds),
         protected_roots,
         apply,
-        backend: storage_backend.into(),
+        backend: storage_backend,
     })
     .map_err(runtime)?;
 
@@ -398,8 +398,8 @@ pub(crate) struct Delete {
     store_hash: String,
     #[arg(long)]
     json: bool,
-    #[arg(long, value_enum, default_value = "flat")]
-    storage_backend: StorageBackendOption,
+    #[arg(long, default_value = "flat")]
+    storage_backend: StorageBackend,
 }
 
 pub(crate) fn delete(options: Delete) -> Result<(), Error> {
@@ -411,7 +411,7 @@ pub(crate) fn delete(options: Delete) -> Result<(), Error> {
     } = options;
     let store = StoreHash::parse(&route).map_err(|_| Error::usage("--store-hash is invalid"))?;
     let root = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize(&root, storage_backend.into()).map_err(runtime)?;
+    let storage = Storage::initialize(&root, storage_backend).map_err(runtime)?;
     let trusted = TrustedPublicKeys::load(&root).map_err(runtime)?;
     let file = storage
         .open_narinfo(&store)
@@ -990,14 +990,14 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: true,
-            storage_backend: StorageBackendOption::Flat,
+            storage_backend: StorageBackend::Flat,
         })
         .expect("partial initialization should resume");
         init(Init {
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: true,
-            storage_backend: StorageBackendOption::Flat,
+            storage_backend: StorageBackend::Flat,
         })
         .expect("completed initialization should be idempotent");
 
@@ -1013,7 +1013,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: false,
-            storage_backend: StorageBackendOption::Chunked,
+            storage_backend: StorageBackend::Chunked,
         })
         .expect("chunked cache should initialize");
 
@@ -1032,7 +1032,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: true,
-            storage_backend: StorageBackendOption::Flat,
+            storage_backend: StorageBackend::Flat,
         })
         .expect("initialization should succeed");
 
@@ -1050,7 +1050,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: true,
-            storage_backend: StorageBackendOption::Flat,
+            storage_backend: StorageBackend::Flat,
         })
         .expect("retry should preserve existing material");
 
@@ -1078,7 +1078,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: false,
-            storage_backend: StorageBackendOption::Flat,
+            storage_backend: StorageBackend::Flat,
         })
         .expect_err("unknown entries should fail closed");
 
@@ -1093,7 +1093,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: false,
-            storage_backend: StorageBackendOption::Flat,
+            storage_backend: StorageBackend::Flat,
         })
         .expect("cache should initialize");
 
@@ -1113,7 +1113,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: false,
-            storage_backend: StorageBackendOption::Flat,
+            storage_backend: StorageBackend::Flat,
         })
         .expect("cache should initialize");
         fs::remove_dir_all(directory.path().join("nar"))
@@ -1138,7 +1138,7 @@ machine other.example password other-secret
             data_dir: directory.path().to_owned(),
             priority: 30,
             private_read: false,
-            storage_backend: StorageBackendOption::Flat,
+            storage_backend: StorageBackend::Flat,
         })
         .expect("cache should initialize");
         let held = File::open(directory.path()).expect("data directory should open");

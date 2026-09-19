@@ -3,14 +3,17 @@ use std::{fs, path::Path};
 use data_encoding::BASE64;
 use ed25519_dalek::{Signer, SigningKey};
 
-use super::{PathInfo, narinfo::fingerprint_for};
+use narjar::narinfo::NarInfoMetadata;
 
-pub(super) fn sign_metadata(key_path: &Path, metadata: &mut [PathInfo]) -> Result<(), String> {
+pub(super) fn sign_metadata(
+    key_path: &Path,
+    metadata: &mut [NarInfoMetadata],
+) -> Result<(), String> {
     let key = SecretKey::read(key_path)?;
     metadata.iter_mut().try_for_each(|info| {
-        let fingerprint = fingerprint_for(info)?;
+        let fingerprint = info.claims().fingerprint();
         let signature = key.sign(fingerprint.as_bytes());
-        info.signatures.push(format!(
+        info.add_signature(format!(
             "{}:{}",
             key.name,
             BASE64.encode(&signature.to_bytes())
@@ -79,8 +82,9 @@ fn valid_key_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{NarHash, NarIdentity, NarSize};
     use ed25519_dalek::Verifier;
+    use narjar::narinfo::NarInfoMetadata;
+    use narjar::object::{NarHash, NarIdentity, NarSize};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -106,24 +110,25 @@ mod tests {
         bytes[32..].copy_from_slice(signing.verifying_key().as_bytes());
         writeln!(key, "narjar-test:{}", BASE64.encode(&bytes)).expect("write signing key fixture");
 
-        let mut metadata = [PathInfo {
-            path: "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package".to_owned(),
-            ca: None,
-            deriver: None,
-            nar: NarIdentity::new(
+        let mut metadata = [NarInfoMetadata::from_store_metadata(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package".to_owned(),
+            None,
+            None,
+            NarIdentity::new(
                 NarHash::parse("01nvfd133isi40l4id6if932mbwc7mxgwxd8x625xqhjdz6mpzai")
                     .expect("test NAR hash should parse"),
                 NarSize::new(289_656),
             ),
-            references: vec![
-                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency".to_owned(),
+            vec![
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency".to_owned(),
                 "/nix/store/11111111111111111111111111111111-dependency".to_owned(),
             ],
-            signatures: Vec::new(),
-        }];
+            Vec::new(),
+        )
+        .expect("test metadata should be valid")];
         sign_metadata(key.path(), &mut metadata).expect("sign metadata");
 
-        let (name, encoded) = metadata[0].signatures[0]
+        let (name, encoded) = metadata[0].signatures()[0]
             .split_once(':')
             .expect("named signature");
         assert_eq!(name, "narjar-test");
@@ -133,10 +138,7 @@ mod tests {
         .expect("signature bytes");
         signing
             .verifying_key()
-            .verify(
-                fingerprint_for(&metadata[0]).unwrap().as_bytes(),
-                &signature,
-            )
+            .verify(metadata[0].claims().fingerprint().as_bytes(), &signature)
             .expect("signature should verify");
     }
 }

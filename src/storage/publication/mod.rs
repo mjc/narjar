@@ -2,6 +2,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read},
+    os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
@@ -209,13 +210,13 @@ pub(super) fn injected_fault(
 /// descriptions; distributed filesystems are outside the supported guarantee.
 #[derive(Debug)]
 pub(super) struct ProcessLock {
-    _file: File,
+    file: File,
 }
 
 impl ProcessLock {
     pub(super) fn acquire(parent: File) -> Result<Self, StorageError> {
         lock_exclusive(&parent)?;
-        Ok(Self { _file: parent })
+        Ok(Self { file: parent })
     }
 
     pub(super) fn validate_lock_file(root: &File) -> Result<(), StorageError> {
@@ -238,6 +239,18 @@ impl ProcessLock {
             );
         }
         Ok(())
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        // SAFETY: `file` owns the live descriptor until this method returns.
+        // Releasing explicitly makes the lease transition independent of any
+        // unrelated directory descriptors and occurs before the descriptor is
+        // closed by `File::drop`.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 

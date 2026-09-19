@@ -12,7 +12,7 @@ use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
     object::{NarHash, NarRepresentation},
     storage::{
-        Directory, FileHash, Storage, StorageBackend, StorageError, StoreHash, open_regular_at,
+        Directory, NarFileName, Storage, StorageBackend, StorageError, StoreHash, open_regular_at,
         read_dir_names,
     },
 };
@@ -259,7 +259,7 @@ fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, St
                     invalid(format!("untrusted narinfo: {name_str}"))
                 }
             })?;
-        let representation = validated.payload().representation();
+        let representation = validated.payload();
         let nar_name = OsString::from(representation.file_name().to_string());
         let nar_metadata = open_regular_at(&nar_directory, &nar_name)
             .and_then(|file| file.metadata())
@@ -405,7 +405,7 @@ fn scan_chunked(
                     invalid(format!("untrusted narinfo: {name_str}"))
                 }
             })?;
-        let representation = validated.payload().representation();
+        let representation = validated.payload();
         let raw_hash = representation.identity().hash();
         let manifest = storage
             .chunk_store
@@ -716,7 +716,7 @@ fn orphan_output_names(
         let Some(text) = name.to_str() else {
             continue;
         };
-        if (text.ends_with(".nar") || text.ends_with(".nar.xz") || text.ends_with(".nar.zst"))
+        if NarFileName::parse(text).is_ok()
             && !live_outputs.contains(&name)
             && super::entry_is_regular_at(directory, &name)?
         {
@@ -806,16 +806,10 @@ fn scan_orphans(storage: &Storage, entries: &[Entry]) -> Result<Vec<Orphan>, Sto
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        let identifier = name_str
-            .strip_suffix(".nar.xz")
-            .or_else(|| name_str.strip_suffix(".nar.zst"))
-            .or_else(|| name_str.strip_suffix(".nar"));
-        let Some(identifier) = identifier else {
+        let Ok(_nar_name) = NarFileName::parse(name_str) else {
             continue;
         };
-        if FileHash::parse(identifier).is_err()
-            || !super::entry_is_regular_at(&nar_directory, &name)?
-        {
+        if !super::entry_is_regular_at(&nar_directory, &name)? {
             continue;
         }
         if referenced.contains_key(OsStr::new(name_str)) {
