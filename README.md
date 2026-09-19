@@ -101,7 +101,7 @@ Nix public keys explicitly:
 nix run . -- push \
   --to https://cache.example \
   --trusted-upstream https://cache.nixos.org \
-  --trusted-upstream-key 'cache.nixos.org-1:BASE64_PUBLIC_KEY' \
+  --trusted-upstream-key 'https://cache.nixos.org#cache.nixos.org-1:BASE64_PUBLIC_KEY' \
   --signing-key-file ./producer.sec \
   /nix/store/some-package
 ```
@@ -113,12 +113,16 @@ metadata. It never downloads the upstream payload for this decision. Upstream
 404s, connection failures, 5xx responses, invalid signatures, and metadata
 mismatches fall back to the normal upload and produce a diagnostic. Repeating
 `--trusted-upstream` preserves command-line order; repeated
-`--trusted-upstream-key` values form the trust set used for those caches.
+`--trusted-upstream-key` values bind each key explicitly to an upstream using
+`UPSTREAM#NAME:BASE64`; repeat the binding for key rotation.
 
 Configuring an upstream is an assertion that cache consumers can also reach
 it, either as another Nix substituter or through a read-through Narjar edge.
-Narjar does not copy skipped upstream objects into the destination. `--refresh`
-forces uploads and bypasses both destination and upstream skip decisions.
+Narjar does not copy skipped upstream objects into the destination, and it does
+not verify that the upstream payload exists when it accepts a matching narinfo.
+This is a metadata-only availability decision: a stale narinfo or missing
+upstream payload can still make a later substitution fail. `--refresh` forces
+uploads and bypasses both destination and upstream skip decisions.
 
 ## Inspect and maintain a cache
 

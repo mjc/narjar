@@ -222,7 +222,7 @@ mod tests {
             "--trusted-upstream",
             "https://cache.nixos.org",
             "--trusted-upstream-key",
-            "cache.nixos.org-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "https://cache.nixos.org#cache.nixos.org-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             "/run/current-system",
         ])
         .expect("push options should parse");

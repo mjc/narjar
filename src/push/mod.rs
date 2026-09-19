@@ -74,8 +74,8 @@ pub(crate) struct Push {
     #[arg(long = "trusted-upstream", value_name = "URL")]
     trusted_upstreams: Vec<HttpUrl>,
 
-    /// Nix public key trusted for upstream narinfo signatures. Repeat for key rotation.
-    #[arg(long = "trusted-upstream-key", value_name = "NAME:BASE64")]
+    /// Nix public key trusted for one upstream: UPSTREAM#NAME:BASE64. Repeat for key rotation.
+    #[arg(long = "trusted-upstream-key", value_name = "UPSTREAM#NAME:BASE64")]
     trusted_upstream_keys: Vec<String>,
 
     /// Concrete local store paths whose closures should be pushed.
@@ -952,7 +952,7 @@ mod tests {
                 "--to",
                 "https://cache.example",
                 "--trusted-upstream-key",
-                "cache.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "https://cache.example#cache.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
                 "/run/current-system",
             ]
             .as_slice(),
@@ -969,6 +969,22 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn trusted_upstream_keys_must_name_each_configured_upstream() {
+        let urls = [
+            http_url("https://first.example"),
+            http_url("https://second.example"),
+        ];
+        let first_key =
+            "https://first.example#first:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned();
+        assert!(TrustedUpstreams::from_configuration(&urls, &[first_key]).is_err());
+
+        let unknown_key =
+            "https://unknown.example#unknown:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                .to_owned();
+        assert!(TrustedUpstreams::from_configuration(&urls, &[unknown_key]).is_err());
     }
 
     #[test]

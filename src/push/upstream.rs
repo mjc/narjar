@@ -4,7 +4,7 @@ use data_encoding::BASE64;
 use fluent_uri::UriRef;
 use narjar::{
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
-    object::NarHash,
+    object::{FileHash, NarHash},
     storage::StoreHash,
 };
 use ureq::Agent;
@@ -19,8 +19,7 @@ use crate::http_url::HttpUrl;
 
 #[derive(Clone)]
 pub(super) struct TrustedUpstreams {
-    urls: Arc<[HttpUrl]>,
-    keys: Arc<TrustedPublicKeys>,
+    entries: Arc<[ConfiguredUpstream]>,
 }
 
 impl TrustedUpstreams {
@@ -28,23 +27,57 @@ impl TrustedUpstreams {
         urls: &[HttpUrl],
         key_values: &[String],
     ) -> Result<Self, String> {
-        match (urls.is_empty(), key_values.is_empty()) {
-            (true, true) => Ok(Self {
-                urls: Arc::from([]),
-                keys: Arc::new(TrustedPublicKeys::default()),
-            }),
-            (false, false) => {
-                let keys = TrustedPublicKeys::parse(&key_values.join(" "))
-                    .map_err(|error| format!("invalid trusted upstream key: {error}"))?;
-                Ok(Self {
-                    urls: Arc::from(urls),
-                    keys: Arc::new(keys),
-                })
-            }
-            (true, false) => Err("--trusted-upstream-key requires --trusted-upstream".to_owned()),
-            (false, true) => Err("--trusted-upstream requires --trusted-upstream-key".to_owned()),
+        if urls.is_empty() && key_values.is_empty() {
+            return Ok(Self {
+                entries: Arc::from([]),
+            });
         }
+        if urls.is_empty() {
+            return Err("--trusted-upstream-key requires --trusted-upstream".to_owned());
+        }
+        if key_values.is_empty() {
+            return Err("--trusted-upstream requires --trusted-upstream-key".to_owned());
+        }
+
+        let mut keys_by_url = vec![Vec::new(); urls.len()];
+        for value in key_values {
+            let (upstream, key) = value
+                .split_once('#')
+                .ok_or_else(|| "trusted upstream keys must use UPSTREAM#NAME:BASE64".to_owned())?;
+            let upstream = upstream
+                .parse::<HttpUrl>()
+                .map_err(|error| format!("invalid trusted upstream URL in key: {error}"))?;
+            let index = urls
+                .iter()
+                .position(|configured| configured == &upstream)
+                .ok_or_else(|| {
+                    format!("trusted upstream key is scoped to unconfigured upstream {upstream}")
+                })?;
+            keys_by_url[index].push(key.to_owned());
+        }
+
+        let mut entries = Vec::with_capacity(urls.len());
+        for (url, keys) in urls.iter().cloned().zip(keys_by_url) {
+            if keys.is_empty() {
+                return Err(format!("no trusted upstream key configured for {url}"));
+            }
+            let keys = TrustedPublicKeys::parse(&keys.join(" "))
+                .map_err(|error| format!("invalid trusted upstream key for {url}: {error}"))?;
+            entries.push(ConfiguredUpstream {
+                url,
+                keys: Arc::new(keys),
+            });
+        }
+        Ok(Self {
+            entries: Arc::from(entries),
+        })
     }
+}
+
+#[derive(Clone)]
+struct ConfiguredUpstream {
+    url: HttpUrl,
+    keys: Arc<TrustedPublicKeys>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,19 +151,19 @@ impl<'a> CacheLookup<'a> {
         narinfo_name: &str,
         info: &PathInfo,
     ) -> Result<PushDisposition, String> {
-        for upstream in self.upstreams.urls.iter() {
+        for upstream in self.upstreams.entries.iter() {
             match self.lookup_upstream(route, upstream, narinfo_name, info)? {
                 UpstreamLookup::Matched(matched) => {
                     return Ok(PushDisposition::TrustedUpstreamPresent(matched));
                 }
                 UpstreamLookup::Rejected(reason) => eprintln!(
-                    "narjar push: trusted upstream {upstream} rejected for {}: {reason}; checking next source",
-                    info.path
+                    "narjar push: trusted upstream {} rejected for {}: {reason}; checking next source",
+                    upstream.url, info.path
                 ),
                 UpstreamLookup::Missing => {}
             }
         }
-        if !self.upstreams.urls.is_empty() {
+        if !self.upstreams.entries.is_empty() {
             eprintln!(
                 "narjar push: no trusted upstream matched {}; uploading instead",
                 info.path
@@ -142,11 +175,11 @@ impl<'a> CacheLookup<'a> {
     fn lookup_upstream(
         &self,
         route: &StoreHash,
-        upstream: &HttpUrl,
+        upstream: &ConfiguredUpstream,
         narinfo_name: &str,
         info: &PathInfo,
     ) -> Result<UpstreamLookup, String> {
-        let url = upstream.endpoint(&[narinfo_name]);
+        let url = upstream.url.endpoint(&[narinfo_name]);
         let response = match get_bounded(self.agent, &url, None, MAX_NARINFO_BYTES) {
             Ok(response) => response,
             Err(error) => {
@@ -167,14 +200,14 @@ impl<'a> CacheLookup<'a> {
             Ok(parsed) => parsed,
             Err(error) => return Ok(UpstreamLookup::Rejected(error.to_string())),
         };
-        let verified = match parsed.verify(&self.upstreams.keys) {
+        let verified = match parsed.verify(&upstream.keys) {
             Ok(verified) => verified,
             Err(error) => return Ok(UpstreamLookup::Rejected(error.to_string())),
         };
         let expected_references = normalized_references(info)?;
         match compare_logical_claims(info, &expected_references, &verified) {
             Ok(()) => Ok(UpstreamLookup::Matched(MatchedUpstream {
-                identity: UpstreamIdentity(upstream.clone()),
+                identity: UpstreamIdentity(upstream.url.clone()),
                 claims: verified.claims,
             })),
             Err(mismatch) => Ok(UpstreamLookup::Rejected(mismatch.to_string())),
@@ -262,6 +295,7 @@ impl UnverifiedUpstreamNarInfo {
         let url = field("URL").ok_or(UpstreamNarInfoError::Malformed)?;
         validate_upstream_url(url)?;
         require_supported_compression(field("Compression"))?;
+        validate_optional_transport_fields(field("FileHash"), field("FileSize"))?;
         let nar_hash = field("NarHash")
             .and_then(|value| value.strip_prefix("sha256:"))
             .and_then(|value| NarHash::parse(value).ok())
@@ -321,6 +355,7 @@ enum UpstreamNarInfoError {
     Malformed,
     UnsupportedCompression,
     InvalidUrl,
+    InvalidTransport,
     UntrustedSignature,
 }
 
@@ -332,6 +367,9 @@ impl fmt::Display for UpstreamNarInfoError {
                 formatter.write_str("upstream narinfo uses unsupported compression")
             }
             Self::InvalidUrl => formatter.write_str("upstream narinfo has an invalid URL"),
+            Self::InvalidTransport => {
+                formatter.write_str("upstream narinfo has invalid transport fields")
+            }
             Self::UntrustedSignature => formatter.write_str("invalid or untrusted narinfo"),
         }
     }
@@ -362,10 +400,39 @@ fn require_supported_compression(value: Option<&str>) -> Result<(), UpstreamNarI
 }
 
 fn validate_upstream_url(value: &str) -> Result<(), UpstreamNarInfoError> {
-    if value.is_empty() || UriRef::parse(value).is_err() {
-        Err(UpstreamNarInfoError::InvalidUrl)
-    } else {
-        Ok(())
+    if value.is_empty() {
+        return Err(UpstreamNarInfoError::InvalidUrl);
+    }
+    let uri = UriRef::parse(value).map_err(|_| UpstreamNarInfoError::InvalidUrl)?;
+    if uri.has_fragment() {
+        return Err(UpstreamNarInfoError::InvalidUrl);
+    }
+    let scheme = uri.scheme();
+    if scheme.is_some_and(|scheme| !["http", "https"].contains(&scheme.as_str())) {
+        return Err(UpstreamNarInfoError::InvalidUrl);
+    }
+    Ok(())
+}
+
+fn validate_optional_transport_fields(
+    file_hash: Option<&str>,
+    file_size: Option<&str>,
+) -> Result<(), UpstreamNarInfoError> {
+    match (file_hash, file_size) {
+        (None, None) => Ok(()),
+        (Some(file_hash), Some(file_size)) => {
+            let file_hash = file_hash
+                .strip_prefix("sha256:")
+                .ok_or(UpstreamNarInfoError::InvalidTransport)?;
+            FileHash::parse(file_hash).map_err(|_| UpstreamNarInfoError::InvalidTransport)?;
+            file_size
+                .parse::<u64>()
+                .ok()
+                .filter(|size| *size != 0)
+                .ok_or(UpstreamNarInfoError::InvalidTransport)?;
+            Ok(())
+        }
+        _ => Err(UpstreamNarInfoError::InvalidTransport),
     }
 }
 

@@ -331,10 +331,7 @@ fn native_push_skips_payload_generation_for_a_matching_trusted_upstream() {
     fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
         .expect("remove local payload so generation would fail");
     let upstream_url = format!("http://{upstream_address}");
-    let upstream_key = format!(
-        "narjar-test:{}",
-        BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-    );
+    let upstream_key = trusted_upstream_key_for(&upstream_url, 7);
     let output = run_native_push_fixture_with_options(
         &fixture,
         &format!("http://{destination_address}"),
@@ -403,6 +400,10 @@ fn trusted_upstream_key(seed: u8) -> String {
     )
 }
 
+fn trusted_upstream_key_for(upstream: &str, seed: u8) -> String {
+    format!("{upstream}#{}", trusted_upstream_key(seed))
+}
+
 fn signed_narinfo_with_store_path(
     store_path: &str,
     nar_hash: &str,
@@ -463,19 +464,19 @@ fn native_push_uploads_when_upstream_metadata_is_not_an_exact_trusted_match() {
         (
             "untrusted-signature",
             signed_narinfo_with_store_path(&store_path, &nar_hash, nar_size, &[]),
-            trusted_upstream_key(8),
+            8,
             "invalid or untrusted narinfo",
         ),
         (
             "nar-hash",
             signed_narinfo_with_store_path(&store_path, different_hash, nar_size, &[]),
-            trusted_upstream_key(7),
+            7,
             "NAR hash or size differs",
         ),
         (
             "nar-size",
             signed_narinfo_with_store_path(&store_path, &nar_hash, nar_size + 1, &[]),
-            trusted_upstream_key(7),
+            7,
             "NAR hash or size differs",
         ),
         (
@@ -486,20 +487,21 @@ fn native_push_uploads_when_upstream_metadata_is_not_an_exact_trusted_match() {
                 nar_size,
                 &[],
             ),
-            trusted_upstream_key(7),
+            7,
             "store path differs",
         ),
         (
             "references",
             signed_narinfo_with_store_path(&store_path, &nar_hash, nar_size, &[reference]),
-            trusted_upstream_key(7),
+            7,
             "references differ",
         ),
     ];
 
-    for (name, narinfo, key, expected_diagnostic) in cases {
+    for (name, narinfo, key_seed, expected_diagnostic) in cases {
         let destination = RunningServer::start(&format!("upstream-mismatch-{name}"));
         let (upstream, upstream_server) = one_response_cache(200, "OK", narinfo);
+        let key = trusted_upstream_key_for(&upstream, key_seed);
         let fixture = native_push_fixture();
         let output = run_native_push_fixture_with_options(
             &fixture,
@@ -552,7 +554,8 @@ fn native_push_uses_the_first_matching_trusted_upstream_in_configured_order() {
     let fixture = native_push_fixture();
     fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
         .expect("remove local payload so generation would fail");
-    let key = trusted_upstream_key(7);
+    let first_key = trusted_upstream_key_for(&first, 7);
+    let second_key = trusted_upstream_key_for(&second, 7);
 
     let output = run_native_push_fixture_with_options(
         &fixture,
@@ -565,7 +568,9 @@ fn native_push_uses_the_first_matching_trusted_upstream_in_configured_order() {
                 "--trusted-upstream",
                 &second,
                 "--trusted-upstream-key",
-                &key,
+                &first_key,
+                "--trusted-upstream-key",
+                &second_key,
             ],
             ..NativePushRunOptions::default()
         },
@@ -626,6 +631,7 @@ fn native_push_accepts_external_trusted_narinfo_transport_fields() {
         };
         let (destination, destination_server) = one_response_cache(404, "Not Found", String::new());
         let (upstream, upstream_server) = one_response_cache(200, "OK", narinfo);
+        let key = trusted_upstream_key_for(&upstream, 7);
         let fixture = native_push_fixture();
         fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
             .expect("remove local payload so generation would fail");
@@ -638,7 +644,7 @@ fn native_push_accepts_external_trusted_narinfo_transport_fields() {
                     "--trusted-upstream",
                     &upstream,
                     "--trusted-upstream-key",
-                    &trusted_upstream_key(7),
+                    &key,
                 ],
                 ..NativePushRunOptions::default()
             },
@@ -660,6 +666,89 @@ fn native_push_accepts_external_trusted_narinfo_transport_fields() {
             !fixture.invocation_log.exists(),
             "{name} should not invoke Nix"
         );
+    }
+}
+
+#[test]
+fn native_push_uploads_when_upstream_transport_fields_are_unusable() {
+    let nar_bytes = native_nar_bytes();
+    let nar_hash = nix32_sha256(&nar_bytes);
+    let nar_size = nar_bytes.len() as u64;
+    let standard_url = format!("nar/{nar_hash}.nar");
+    let cases = [
+        (
+            "invalid-file-hash",
+            signed_narinfo_for(STORE_HASH, &nar_hash, nar_size).replace(
+                &format!("FileHash: sha256:{nar_hash}"),
+                "FileHash: sha256:not-a-nix-hash",
+            ),
+        ),
+        (
+            "invalid-file-size",
+            signed_narinfo_for(STORE_HASH, &nar_hash, nar_size)
+                .replace(&format!("FileSize: {nar_size}"), "FileSize: not-a-size"),
+        ),
+        (
+            "partial-transport-fields",
+            signed_narinfo_for(STORE_HASH, &nar_hash, nar_size)
+                .lines()
+                .filter(|line| !line.starts_with("FileSize: "))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        ),
+        (
+            "file-url",
+            signed_narinfo_for(STORE_HASH, &nar_hash, nar_size)
+                .replace(&standard_url, "file:///tmp/narjar.nar"),
+        ),
+        (
+            "ftp-url",
+            signed_narinfo_for(STORE_HASH, &nar_hash, nar_size)
+                .replace(&standard_url, "ftp://cache.example/nar/object.nar"),
+        ),
+        (
+            "fragment-url",
+            signed_narinfo_for(STORE_HASH, &nar_hash, nar_size)
+                .replace(&standard_url, "nar/object.nar#fragment"),
+        ),
+    ];
+
+    for (name, narinfo) in cases {
+        let destination = RunningServer::start(&format!("invalid-upstream-transport-{name}"));
+        let (upstream, upstream_server) = one_response_cache(200, "OK", narinfo);
+        let key = trusted_upstream_key_for(&upstream, 7);
+        let fixture = native_push_fixture();
+        let output = run_native_push_fixture_with_options(
+            &fixture,
+            &format!("http://{}", destination.address),
+            "none",
+            NativePushRunOptions {
+                signing: true,
+                insecure_http: true,
+                extra_args: &[
+                    "--trusted-upstream",
+                    &upstream,
+                    "--trusted-upstream-key",
+                    &key,
+                ],
+                ..NativePushRunOptions::default()
+            },
+        );
+
+        assert!(
+            output.status.success(),
+            "{name} should fall back to upload: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("uploaded 1"),
+            "{name} should not be treated as a trusted upstream hit"
+        );
+        upstream_server.join().expect("upstream should exit");
+        let (signal, status) = destination.stop();
+        assert!(signal.success());
+        assert!(status.success());
     }
 }
 
@@ -696,7 +785,7 @@ fn native_push_treats_upstream_misses_and_outages_as_upload_required() {
         };
         let destination = RunningServer::start(name);
         let fixture = native_push_fixture();
-        let key = trusted_upstream_key(7);
+        let key = trusted_upstream_key_for(&upstream, 7);
         let output = run_native_push_fixture_with_options(
             &fixture,
             &format!("http://{}", destination.address),
@@ -826,7 +915,7 @@ fn native_push_classifies_each_closure_member_independently() {
         .expect("write root miss");
     });
     let upstream_url = format!("http://{upstream_address}");
-    let key = trusted_upstream_key(7);
+    let key = trusted_upstream_key_for(&upstream_url, 7);
 
     let output = run_native_push_fixture_with_options(
         &fixture,
