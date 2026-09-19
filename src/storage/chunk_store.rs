@@ -28,9 +28,10 @@ const CHUNK_TEMP_PREFIX: &str = "chunk";
 const MANIFEST_TEMP_PREFIX: &str = "manifest";
 const GC_MARK_DIRECTORY: &str = ".gc-marks";
 const GC_MANIFEST_MARK_DIRECTORY: &str = "manifests";
-// 32 * 24 KiB bounds the pending raw tail below 768 KiB while amortizing
+// 256 * 24 KiB bounds the pending raw tail below 6 MiB while amortizing
 // filesystem durability over enough chunks to avoid one sync per chunk.
-const CHUNK_PUBLICATION_BATCH_SIZE: usize = 32;
+const CHUNK_PUBLICATION_BATCH_SIZE: usize = 256;
+const CHUNK_PUBLICATION_WORKER_BATCH_SIZE: usize = 32;
 pub(crate) const MAX_CHUNK_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -806,8 +807,21 @@ impl ChunkingWriter<'_> {
     }
 
     fn publish_chunk_batch(&self, batch: &[PendingChunk<'_>]) -> io::Result<Vec<ChunkPublication>> {
+        batch.chunks(CHUNK_PUBLICATION_WORKER_BATCH_SIZE).try_fold(
+            Vec::with_capacity(batch.len()),
+            |mut publications, worker_batch| {
+                publications.extend(self.publish_chunk_worker_batch(worker_batch)?);
+                Ok(publications)
+            },
+        )
+    }
+
+    fn publish_chunk_worker_batch(
+        &self,
+        worker_batch: &[PendingChunk<'_>],
+    ) -> io::Result<Vec<ChunkPublication>> {
         std::thread::scope(|scope| {
-            let handles = batch
+            let handles = worker_batch
                 .iter()
                 .map(|chunk| scope.spawn(|| self.store.store_chunk(chunk.hash, chunk.bytes)))
                 .collect::<Vec<_>>();
