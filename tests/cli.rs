@@ -2813,6 +2813,74 @@ fn configured_compressed_egress_is_independent_of_ingress_encoding() {
     }
 }
 
+#[test]
+fn chunked_backend_materializes_compressed_egress_from_chunks() {
+    let server = RunningServer::start_with_args(
+        "chunked-zstd-egress",
+        &[
+            "--storage-backend",
+            "chunked",
+            "--egress-compression",
+            "zstd",
+        ],
+    );
+    let uploaded =
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
+    let narinfo = signed_narinfo_for_encoding(
+        WireEncoding::Raw,
+        NARJAR_HASH,
+        NARJAR_HASH,
+        NAR_BYTES.len() as u64,
+        NAR_BYTES.len() as u64,
+    );
+    let published = server.request_with_body(
+        "PUT",
+        &format!("/{STORE_HASH}.narinfo"),
+        &[],
+        narinfo.as_bytes(),
+    );
+    let narinfo_response = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
+    let (_, narinfo_body) = response_parts(&narinfo_response);
+    let projected = String::from_utf8(narinfo_body.to_vec()).expect("narinfo should be UTF-8");
+    let output_url = projected
+        .lines()
+        .find_map(|line| line.strip_prefix("URL: "))
+        .expect("projected narinfo should contain an output URL");
+    let output = server.request("GET", &format!("/{output_url}"));
+    let expected = encode_test_nar(WireEncoding::Zstd);
+    let (output_headers, output_body) = response_parts(&output);
+
+    assert!(
+        response_parts(&uploaded)
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n"),
+        "{uploaded:?}"
+    );
+    assert!(
+        response_parts(&published)
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n"),
+        "{published:?}"
+    );
+    assert!(projected.contains("Compression: zstd\n"), "{projected}");
+    assert!(!projected.contains("Compression: none\n"));
+    assert!(
+        output_headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{output_headers}"
+    );
+    assert_eq!(output_body, expected);
+    assert!(
+        !server
+            .data_dir
+            .join(format!("nar/{NARJAR_HASH}.nar"))
+            .exists()
+    );
+    assert!(server.data_dir.join(".narjar-egress").is_dir());
+    let (signal, status) = server.stop();
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
 fn encode_test_nar(encoding: WireEncoding) -> Vec<u8> {
     match encoding {
         WireEncoding::Raw => NAR_BYTES.to_vec(),
