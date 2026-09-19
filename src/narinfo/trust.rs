@@ -92,7 +92,7 @@ impl TrustedPublicKeys {
         bytes: Vec<u8>,
     ) -> Result<TrustedNarInfoClaims, NarInfoError> {
         let text = parse_narinfo_text(bytes)?;
-        let document = NarInfoDocument::parse(&text)?;
+        let document = NarInfoDocument::parse_external(&text)?;
         document.validate_external_transport()?;
         let claims = NarInfoClaims::from_document(route, &document)?;
         let signatures = document.named_signatures()?;

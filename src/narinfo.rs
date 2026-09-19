@@ -320,22 +320,28 @@ enum NarInfoLineField {
     Signature,
 }
 
+#[derive(Clone, Copy)]
+enum UnknownFieldHandling {
+    Reject,
+    Ignore,
+}
+
 impl NarInfoLineField {
-    fn parse(name: &str) -> Result<Self, NarInfoError> {
+    fn parse(name: &str) -> Option<Self> {
         match name {
-            "StorePath" => Ok(Self::Unique(NarInfoField::StorePath)),
-            "URL" => Ok(Self::Unique(NarInfoField::Url)),
-            "Compression" => Ok(Self::Unique(NarInfoField::Compression)),
-            "FileHash" => Ok(Self::Unique(NarInfoField::FileHash)),
-            "FileSize" => Ok(Self::Unique(NarInfoField::FileSize)),
-            "NarHash" => Ok(Self::Unique(NarInfoField::NarHash)),
-            "NarSize" => Ok(Self::Unique(NarInfoField::NarSize)),
-            "References" => Ok(Self::Unique(NarInfoField::References)),
-            "Deriver" => Ok(Self::Unique(NarInfoField::Deriver)),
-            "System" => Ok(Self::Unique(NarInfoField::System)),
-            "CA" => Ok(Self::Unique(NarInfoField::ContentAddress)),
-            "Sig" => Ok(Self::Signature),
-            _ => Err(NarInfoError),
+            "StorePath" => Some(Self::Unique(NarInfoField::StorePath)),
+            "URL" => Some(Self::Unique(NarInfoField::Url)),
+            "Compression" => Some(Self::Unique(NarInfoField::Compression)),
+            "FileHash" => Some(Self::Unique(NarInfoField::FileHash)),
+            "FileSize" => Some(Self::Unique(NarInfoField::FileSize)),
+            "NarHash" => Some(Self::Unique(NarInfoField::NarHash)),
+            "NarSize" => Some(Self::Unique(NarInfoField::NarSize)),
+            "References" => Some(Self::Unique(NarInfoField::References)),
+            "Deriver" => Some(Self::Unique(NarInfoField::Deriver)),
+            "System" => Some(Self::Unique(NarInfoField::System)),
+            "CA" => Some(Self::Unique(NarInfoField::ContentAddress)),
+            "Sig" => Some(Self::Signature),
+            _ => None,
         }
     }
 }
@@ -347,6 +353,17 @@ struct NarInfoDocument<'text> {
 
 impl<'text> NarInfoDocument<'text> {
     fn parse(text: &'text str) -> Result<Self, NarInfoError> {
+        Self::parse_with_unknown_fields(text, UnknownFieldHandling::Reject)
+    }
+
+    pub(super) fn parse_external(text: &'text str) -> Result<Self, NarInfoError> {
+        Self::parse_with_unknown_fields(text, UnknownFieldHandling::Ignore)
+    }
+
+    fn parse_with_unknown_fields(
+        text: &'text str,
+        unknown_fields: UnknownFieldHandling,
+    ) -> Result<Self, NarInfoError> {
         text.strip_suffix('\n')
             .ok_or(NarInfoError)?
             .split('\n')
@@ -355,13 +372,23 @@ impl<'text> NarInfoDocument<'text> {
                     fields: [None; NarInfoField::COUNT],
                     signature_values: Vec::new(),
                 },
-                Self::record_line,
+                |document, line| document.record_line(line, unknown_fields),
             )
     }
 
-    fn record_line(mut self, line: &'text str) -> Result<Self, NarInfoError> {
+    fn record_line(
+        mut self,
+        line: &'text str,
+        unknown_fields: UnknownFieldHandling,
+    ) -> Result<Self, NarInfoError> {
         let (name, value) = line.split_once(": ").ok_or(NarInfoError)?;
-        self.record_field(NarInfoLineField::parse(name)?, value)?;
+        let Some(field) = NarInfoLineField::parse(name) else {
+            return match unknown_fields {
+                UnknownFieldHandling::Reject => Err(NarInfoError),
+                UnknownFieldHandling::Ignore => Ok(self),
+            };
+        };
+        self.record_field(field, value)?;
         Ok(self)
     }
 
@@ -915,6 +942,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [format!("{STORE_HASH}-alpha"), format!("{STORE_HASH}-zulu")]
         );
+    }
+
+    #[test]
+    fn external_parser_ignores_unknown_fields_but_rejects_duplicate_known_fields() {
+        let text = "StorePath: /nix/store/example\nX-Cache-Extension: stable\n";
+        assert!(NarInfoDocument::parse(text).is_err());
+        assert!(NarInfoDocument::parse_external(text).is_ok());
+
+        let duplicate = "StorePath: /nix/store/first\nStorePath: /nix/store/second\n";
+        assert!(NarInfoDocument::parse_external(duplicate).is_err());
     }
 
     #[test]
