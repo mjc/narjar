@@ -207,7 +207,8 @@ PUT /nar/<file-hash>.nar[.zst|.xz]
   -> for `.nar.zst`/`.nar.xz`, stream-decode the stored bytes to validate the raw NAR hash/size
   -> reject length/hash/empty mismatch or an oversized decompressed NAR
   -> sync and no-replace publish the flat file, or publish bounded batches of
-     shared chunks, sync the filesystem, then finalize their manifest records
+     shared chunks, sync the filesystem before manifest finalization, then
+     publish the ordered manifest
   -> 201 for newly durable object, 200 for identical existing object
 
 PUT /<store-hash>.narinfo

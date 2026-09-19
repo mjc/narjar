@@ -557,8 +557,8 @@ pub(super) fn lock_exclusive(file: &File) -> Result<(), StorageError> {
 }
 
 /// Flush every dirty object and metadata change on the filesystem containing
-/// `file`. Chunk batches use this after linking their immutable files and
-/// before recording the corresponding manifest records.
+/// `file`. Chunked publication uses this once after linking all immutable
+/// chunks and before publishing the authoritative manifest.
 #[cfg(target_os = "linux")]
 pub(super) fn sync_filesystem(file: &File) -> io::Result<()> {
     // SAFETY: `file` owns a live descriptor for the duration of this call.

@@ -1020,7 +1020,7 @@ machine other.example password other-secret
 
         assert_eq!(
             fs::read(directory.path().join(".narjar-layout")).unwrap(),
-            b"narjar-layout-v1\nbackend=chunked\n"
+            b"narjar-layout-v1\nbackend=chunked\nprofile=mincdc-hash4-v2\n"
         );
         assert!(directory.path().join(".narjar-chunks").is_dir());
         assert!(directory.path().join(".narjar-manifests").is_dir());

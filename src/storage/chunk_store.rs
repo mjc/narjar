@@ -28,10 +28,10 @@ const CHUNK_TEMP_PREFIX: &str = "chunk";
 const MANIFEST_TEMP_PREFIX: &str = "manifest";
 const GC_MARK_DIRECTORY: &str = ".gc-marks";
 const GC_MANIFEST_MARK_DIRECTORY: &str = "manifests";
-// 256 * 24 KiB bounds the pending raw tail below 6 MiB while amortizing
-// filesystem durability over enough chunks to avoid one sync per chunk.
-const CHUNK_PUBLICATION_BATCH_SIZE: usize = 256;
-const CHUNK_PUBLICATION_WORKER_BATCH_SIZE: usize = 32;
+// 16 * 1 MiB bounds the pending raw tail below 16 MiB while keeping chunk
+// publication work bounded for the active content-defined profile.
+const CHUNK_PUBLICATION_BATCH_SIZE: usize = 16;
+const CHUNK_PUBLICATION_WORKER_BATCH_SIZE: usize = 16;
 pub(crate) const MAX_CHUNK_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -122,6 +122,7 @@ impl ChunkStore {
             size: 0,
             reservation,
             min_free_bytes,
+            new_chunks_need_sync: false,
         })
     }
 
@@ -574,6 +575,7 @@ pub(crate) struct ChunkingWriter<'store> {
     size: u64,
     reservation: Option<StagingReservation>,
     min_free_bytes: u64,
+    new_chunks_need_sync: bool,
 }
 
 struct ChunkSpecification {
@@ -644,6 +646,7 @@ impl ChunkingWriter<'_> {
                 actual: self.previous_end,
             });
         }
+        self.sync_new_chunks_before_manifest()?;
         let manifest = ChunkManifest::new(actual, self.profile, self.chunk_count);
         let manifest_bytes = MANIFEST_HEADER_BYTES
             .checked_add(
@@ -739,7 +742,9 @@ impl ChunkingWriter<'_> {
             .collect::<Vec<_>>();
 
         let publications = self.publish_chunk_batch(&batch)?;
-        self.sync_new_chunk_filesystem(&publications)?;
+        self.new_chunks_need_sync |= publications
+            .iter()
+            .any(|publication| publication.outcome == super::publication::PublishOutcome::Created);
         drop(batch);
         for specification in &specifications {
             self.release_materialized_bytes(specification.length);
@@ -836,12 +841,10 @@ impl ChunkingWriter<'_> {
         })
     }
 
-    fn sync_new_chunk_filesystem(&self, publications: &[ChunkPublication]) -> io::Result<()> {
-        let has_new_chunk = publications
-            .iter()
-            .any(|publication| publication.outcome == super::publication::PublishOutcome::Created);
-        if has_new_chunk {
+    fn sync_new_chunks_before_manifest(&mut self) -> io::Result<()> {
+        if self.new_chunks_need_sync {
             sync_filesystem(&self.store.chunks)?;
+            self.new_chunks_need_sync = false;
         }
         Ok(())
     }
@@ -1259,7 +1262,7 @@ mod tests {
         let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
 
         let manifest = store
-            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V1)
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
             .unwrap();
         let manifest_file = store.open_manifest(hash).unwrap().unwrap();
         let bytes = super::super::fs::read_bounded_regular_file(
@@ -1311,7 +1314,7 @@ mod tests {
         );
 
         assert!(matches!(
-            store.store_nar(Cursor::new(input), identity, ChunkProfile::MinCdcHash4V1),
+            store.store_nar(Cursor::new(input), identity, ChunkProfile::MinCdcHash4V2),
             Err(ChunkStoreError::NarHashMismatch { .. })
         ));
     }
@@ -1325,7 +1328,7 @@ mod tests {
         let hash = NarHash::from_digest(Sha256::digest(&input).into());
         let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
         store
-            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V1)
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
             .unwrap();
 
         let shard = fs::read_dir(directory.path().join(super::super::CHUNK_DIRECTORY))
@@ -1355,7 +1358,7 @@ mod tests {
         let hash = NarHash::from_digest(Sha256::digest(&input).into());
         let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
         store
-            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V1)
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
             .unwrap();
 
         let manifest_path = directory
@@ -1389,14 +1392,14 @@ mod tests {
             .store_nar(
                 Cursor::new(&first),
                 NarIdentity::new(first_hash, (first.len() as u64).into()),
-                ChunkProfile::MinCdcHash4V1,
+                ChunkProfile::MinCdcHash4V2,
             )
             .unwrap();
         store
             .store_nar(
                 Cursor::new(&second),
                 NarIdentity::new(second_hash, (second.len() as u64).into()),
-                ChunkProfile::MinCdcHash4V1,
+                ChunkProfile::MinCdcHash4V2,
             )
             .unwrap();
 

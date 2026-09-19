@@ -25,29 +25,29 @@ impl ChunkHash {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChunkProfile {
-    MinCdcHash4V1,
+    MinCdcHash4V2,
 }
 
 impl ChunkProfile {
     pub(crate) const fn id(self) -> u8 {
         match self {
-            Self::MinCdcHash4V1 => 1,
+            Self::MinCdcHash4V2 => 2,
         }
     }
     pub(crate) const fn min_size(self) -> u64 {
         match self {
-            Self::MinCdcHash4V1 => 8 * 1024,
+            Self::MinCdcHash4V2 => 256 * 1024,
         }
     }
     pub(crate) const fn max_size(self) -> u64 {
         match self {
-            Self::MinCdcHash4V1 => 24 * 1024,
+            Self::MinCdcHash4V2 => 1024 * 1024,
         }
     }
 
     fn from_id(id: u8) -> Result<Self, ManifestError> {
         match id {
-            1 => Ok(Self::MinCdcHash4V1),
+            2 => Ok(Self::MinCdcHash4V2),
             _ => Err(ManifestError::UnsupportedProfile(id)),
         }
     }
@@ -516,16 +516,28 @@ mod tests {
     }
 
     #[test]
+    fn production_chunk_profile_is_versioned_and_bounded() {
+        assert_eq!(ChunkProfile::MinCdcHash4V2.id(), 2);
+        assert_eq!(ChunkProfile::MinCdcHash4V2.min_size(), 256 * 1024);
+        assert_eq!(ChunkProfile::MinCdcHash4V2.max_size(), 1024 * 1024);
+        assert_eq!(
+            ChunkProfile::from_id(1),
+            Err(ManifestError::UnsupportedProfile(1))
+        );
+    }
+
+    #[test]
     fn manifest_round_trips_without_retaining_records() {
         let hash = ChunkHash::from_digest([9; 32]);
+        let profile = ChunkProfile::MinCdcHash4V2;
+        let first_end = profile.min_size();
         let mut records = Vec::new();
-        let mut builder =
-            ManifestBuilder::new(identity(8_200), ChunkProfile::MinCdcHash4V1, &mut records);
+        let mut builder = ManifestBuilder::new(identity(first_end + 8), profile, &mut records);
         builder
-            .append(super::ChunkDescriptor::new(8_192, hash))
+            .append(super::ChunkDescriptor::new(first_end, hash))
             .unwrap();
         builder
-            .append(super::ChunkDescriptor::new(8_200, hash))
+            .append(super::ChunkDescriptor::new(first_end + 8, hash))
             .unwrap();
         let (_, manifest) = builder.finish().unwrap();
         let decoded = ChunkManifest::decode(&encoded_manifest(manifest, &[hash, hash])).unwrap();
@@ -536,7 +548,7 @@ mod tests {
     #[test]
     fn manifest_rejects_bad_checksum_and_trailing_bytes() {
         let hash = ChunkHash::from_digest([9; 32]);
-        let manifest = ChunkManifest::new(identity(8), ChunkProfile::MinCdcHash4V1, 1);
+        let manifest = ChunkManifest::new(identity(8), ChunkProfile::MinCdcHash4V2, 1);
         let encoded = encoded_manifest(manifest, &[hash]);
         let mut corrupt = encoded.clone();
         corrupt[20] ^= 1;
@@ -559,7 +571,7 @@ mod tests {
         let mut second = Vec::new();
         chunk_stream(
             Cursor::new(&input),
-            ChunkProfile::MinCdcHash4V1,
+            ChunkProfile::MinCdcHash4V2,
             |end, hash, _| {
                 first.push((end, hash));
                 Ok(())
@@ -568,7 +580,7 @@ mod tests {
         .unwrap();
         chunk_stream(
             FragmentedReader::new(&input, 17),
-            ChunkProfile::MinCdcHash4V1,
+            ChunkProfile::MinCdcHash4V2,
             |end, hash, _| {
                 second.push((end, hash));
                 Ok(())

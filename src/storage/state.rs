@@ -21,7 +21,7 @@ impl StorageBackend {
     pub const fn layout_descriptor(self) -> &'static [u8] {
         match self {
             Self::Flat => b"narjar-layout-v1\nbackend=flat\n",
-            Self::Chunked => b"narjar-layout-v1\nbackend=chunked\n",
+            Self::Chunked => b"narjar-layout-v1\nbackend=chunked\nprofile=mincdc-hash4-v2\n",
         }
     }
 }

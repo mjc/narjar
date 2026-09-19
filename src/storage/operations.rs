@@ -541,7 +541,7 @@ impl Storage {
         let mut destination: ChunkingWriter<'_> = self
             .chunk_store
             .begin_ingest_with_reservation(
-                ChunkProfile::MinCdcHash4V1,
+                ChunkProfile::MinCdcHash4V2,
                 reservation,
                 policy.min_free_bytes,
             )
@@ -599,7 +599,7 @@ impl Storage {
         let mut destination = self
             .chunk_store
             .begin_ingest_with_reservation(
-                ChunkProfile::MinCdcHash4V1,
+                ChunkProfile::MinCdcHash4V2,
                 reservation,
                 policy.min_free_bytes,
             )
