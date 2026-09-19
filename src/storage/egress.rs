@@ -19,7 +19,6 @@ use crate::object::{
 #[cfg(test)]
 use crate::object::NarFileName;
 
-use super::EGRESS_RECEIPT_DIRECTORY;
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
 use super::compression::{
     CapacityCheckedStagingWriter, encode_raw_nar, encoded_file_matches, nar_file_size_matches,
@@ -32,6 +31,7 @@ use super::publication::{
 };
 use super::recovery::PublicationState;
 use super::state::{Storage, StorageBackend};
+use super::{CleanupAction, EGRESS_RECEIPT_DIRECTORY};
 
 const EGRESS_RECEIPT_VERSION: u8 = 1;
 pub(super) const MAX_EGRESS_RECEIPT_BYTES: u64 = 256;
@@ -47,15 +47,15 @@ enum StoredNarSource<'storage> {
     Chunked(&'storage ChunkStore),
 }
 
-enum StoredNarReader<'storage> {
-    Flat(File),
+pub(crate) enum NarReadBody<'storage> {
+    File(File),
     Chunked(Box<ChunkedNarReader<'storage>>),
 }
 
-impl Read for StoredNarReader<'_> {
+impl Read for NarReadBody<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Flat(file) => file.read(buffer),
+            Self::File(file) => file.read(buffer),
             Self::Chunked(reader) => reader.read(buffer),
         }
     }
@@ -70,12 +70,12 @@ impl<'storage> StoredNar<'storage> {
         self.storage
     }
 
-    fn reader(&self) -> Result<StoredNarReader<'storage>, StorageError> {
+    fn reader(&self) -> Result<NarReadBody<'storage>, StorageError> {
         match &self.source {
             StoredNarSource::Flat(file) => {
                 let mut file = file.try_clone()?;
                 file.seek(SeekFrom::Start(0))?;
-                Ok(StoredNarReader::Flat(file))
+                Ok(NarReadBody::File(file))
             }
             StoredNarSource::Chunked(store) => {
                 // Derivative generation must verify every immutable chunk
@@ -87,7 +87,7 @@ impl<'storage> StoredNar<'storage> {
                         MAX_CHUNK_MANIFEST_BYTES,
                     )
                     .map_err(|error| StorageError::Io(io::Error::other(error)))?;
-                Ok(StoredNarReader::Chunked(Box::new(reader)))
+                Ok(NarReadBody::Chunked(Box::new(reader)))
             }
         }
     }
@@ -144,21 +144,6 @@ pub(super) enum CanonicalRawStatus {
     Missing,
     WrongSize,
     Present,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CleanupAction {
-    Keep,
-    Remove,
-}
-
-impl CleanupAction {
-    fn combine(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Remove, _) | (_, Self::Remove) => Self::Remove,
-            (Self::Keep, Self::Keep) => Self::Keep,
-        }
-    }
 }
 
 enum DerivativeWork {

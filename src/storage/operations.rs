@@ -18,16 +18,16 @@ use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo, V
 use crate::object::{EncodedIdentity, NarFileName, NarHash, NarIdentity, WireEncoding};
 
 use super::{
-    EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, LAYOUT_DESCRIPTOR, NAR_DIRECTORY,
-    REALISATIONS_DIRECTORY, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
-    chunk_store::{ChunkStoreError, ChunkedNarReader, ChunkingWriter, MAX_CHUNK_MANIFEST_BYTES},
+    CleanupAction, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, LAYOUT_DESCRIPTOR,
+    NAR_DIRECTORY, REALISATIONS_DIRECTORY, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+    chunk_store::{ChunkStoreError, ChunkingWriter, MAX_CHUNK_MANIFEST_BYTES},
     chunked::{ChunkManifest, ChunkProfile},
     compression::{
         IngestionReceipt, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
         receive_uploaded_nar,
     },
     directory::Directory,
-    egress::CanonicalRawStatus,
+    egress::{CanonicalRawStatus, NarReadBody},
     fs::{
         BoundedRegularFile, StorageCapacity, directory_is_empty, ensure_directory_at,
         entry_is_regular_at, files_equal_at, filesystem_space, hard_link_at, open_at,
@@ -129,21 +129,6 @@ impl<'a> CreatedDestination<'a> {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum CleanupAction {
-    Keep,
-    Remove,
-}
-
-impl CleanupAction {
-    fn combine(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Remove, _) | (_, Self::Remove) => Self::Remove,
-            (Self::Keep, Self::Keep) => Self::Keep,
-        }
-    }
-}
-
 struct CompressedValidationName(NarFileName);
 
 impl CompressedValidationName {
@@ -186,22 +171,8 @@ pub enum NarInfoDeletion {
     Absent,
 }
 
-pub(crate) enum NarReadBody<'storage> {
-    File(File),
-    Chunked(Box<ChunkedNarReader<'storage>>),
-}
-
 pub(crate) struct OpenedNar<'storage> {
     pub(crate) body: NarReadBody<'storage>,
-}
-
-impl Read for NarReadBody<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::File(file) => file.read(buffer),
-            Self::Chunked(reader) => reader.read(buffer),
-        }
-    }
 }
 
 pub(super) struct OwnedTemporary<'storage> {
