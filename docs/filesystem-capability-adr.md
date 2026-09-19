@@ -25,8 +25,11 @@ The portable publication contract for both backends requires:
 The chunked backend additionally requires bounded creation and traversal of
 `.narjar-chunks/` and `.narjar-manifests/`, immutable no-replace chunk and
 manifest publication, and enough file/directory synchronization to make a
-completed manifest reconstructible after restart. A manifest is authoritative
-metadata: a chunk directory without its manifest is not a readable NAR.
+completed manifest reconstructible after restart. Chunk publication may use a
+bounded batch: every new chunk in the batch is written and published before
+the batch filesystem sync, and its manifest records are written only after
+that sync. A manifest is authoritative metadata: a chunk directory without
+its manifest is not a readable NAR.
 
 Transaction-record replacement uses `renameat` inside the transaction
 directory. That is separate from final-object publication. User-uploaded NAR

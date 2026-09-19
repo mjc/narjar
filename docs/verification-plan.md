@@ -174,8 +174,10 @@ tests are required in addition to the flat publication cases:
   `narjar init --storage-backend chunked` creates the chunk directories and
   no full canonical raw duplicate.
 - Each recovery boundary from chunk temp through manifest publication is
-  restart-tested. A failed upload may leave independently valid orphan chunks,
-  but never a visible incomplete manifest or narinfo.
+  restart-tested, including the bounded chunk-publication batch boundary. A
+  failed upload may leave independently valid orphan chunks, but never a
+  visible incomplete manifest or narinfo; manifest records are not durable
+  before the corresponding chunk batch has been filesystem-synced.
 - Inventory checks manifest/chunk availability and, in content mode,
   reconstructs and hashes the full logical NAR. A valid compressed derivative
   must not hide missing or corrupt canonical chunks.
