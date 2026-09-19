@@ -117,7 +117,7 @@ fn encodes_all_root_forms_and_round_trips() {
             Sha256::digest(&bytes).as_slice()
         );
 
-        let mut decoder = Decoder::new(io::Cursor::new(bytes));
+        let decoder = Decoder::new(io::Cursor::new(bytes));
         let mut sink = Sink::default();
         let decoded = decoder
             .decode(&mut sink)
@@ -143,7 +143,7 @@ fn preserves_streamed_payload_and_directory_order() {
         Event::EndDirectory,
     ]);
 
-    let mut decoder = Decoder::new(io::Cursor::new(bytes));
+    let decoder = Decoder::new(io::Cursor::new(bytes));
     let mut sink = Sink::default();
     decoder.decode(&mut sink).expect("decode");
     assert_eq!(summary.entries, 2);

@@ -166,7 +166,7 @@ fn decodes_chunked_directory_without_materializing_file_contents() {
         (b"a".as_slice(), regular(b"hello", true)),
         (b"link".as_slice(), symlink(b"../target")),
     ]));
-    let mut decoder = Decoder::new(Chunked {
+    let decoder = Decoder::new(Chunked {
         data: &data,
         offset: 0,
         chunk: 1,
@@ -190,7 +190,7 @@ fn streams_multiple_files_in_bounded_chunks() {
         (b"first".as_slice(), regular(&first, false)),
         (b"second".as_slice(), regular(&second, false)),
     ]));
-    let mut decoder = Decoder::new(io::Cursor::new(data));
+    let decoder = Decoder::new(io::Cursor::new(data));
     let mut chunks = Vec::new();
     let mut sink = |event: Event<'_>| {
         if let Event::FileChunk(chunk) = event {
@@ -214,7 +214,7 @@ fn streams_multiple_files_in_bounded_chunks() {
 fn decoder_preserves_each_event_sink_error_type() {
     let data = archive(regular(b"hello", false));
 
-    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let decoder = Decoder::new(io::Cursor::new(&data));
     let error = decoder
         .decode(&mut EncodeFailure)
         .expect_err("the encoder sink should fail");
@@ -229,7 +229,7 @@ fn decoder_preserves_each_event_sink_error_type() {
         "the encoder error should remain the source"
     );
 
-    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let decoder = Decoder::new(io::Cursor::new(&data));
     let error = decoder
         .decode(&mut IoFailure)
         .expect_err("the I/O sink should fail");
@@ -244,7 +244,7 @@ fn decoder_preserves_each_event_sink_error_type() {
         "the I/O error should remain the source"
     );
 
-    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let decoder = Decoder::new(io::Cursor::new(&data));
     let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
     assert!(result.is_ok(), "the never sink cannot fail");
 }
@@ -253,7 +253,7 @@ fn decoder_preserves_each_event_sink_error_type() {
 fn closure_sinks_use_their_declared_error_types() {
     let data = archive(regular(b"hello", false));
 
-    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let decoder = Decoder::new(io::Cursor::new(&data));
     let mut encode_sink = |_: Event<'_>| Err::<(), _>(EncodeError::Invalid("closure failure"));
     let error = decoder
         .decode(&mut encode_sink)
@@ -263,7 +263,7 @@ fn closure_sinks_use_their_declared_error_types() {
         DecodeError::Sink(EncodeError::Invalid("closure failure"))
     ));
 
-    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let decoder = Decoder::new(io::Cursor::new(&data));
     let mut infallible_sink = |_: Event<'_>| Ok::<(), Infallible>(());
     let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut infallible_sink);
     assert!(result.is_ok(), "the infallible closure cannot fail");
@@ -275,12 +275,12 @@ fn infallible_sink_does_not_hide_decoder_errors() {
 
     let mut truncated = data.clone();
     truncated.pop();
-    let mut decoder = Decoder::new(io::Cursor::new(truncated));
+    let decoder = Decoder::new(io::Cursor::new(truncated));
     let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
     assert!(matches!(result, Err(DecodeError::Io(_))));
 
     let invalid = archive(node(b"unknown", Vec::new()));
-    let mut decoder = Decoder::new(io::Cursor::new(invalid));
+    let decoder = Decoder::new(io::Cursor::new(invalid));
     let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
     assert!(matches!(result, Err(DecodeError::Invalid(_))));
 
@@ -288,7 +288,7 @@ fn infallible_sink_does_not_hide_decoder_errors() {
         max_total_bytes: (data.len() - 1) as u64,
         ..Limits::default()
     };
-    let mut decoder = Decoder::with_limits(io::Cursor::new(data), limits);
+    let decoder = Decoder::with_limits(io::Cursor::new(data), limits);
     let result: Result<_, DecodeError<Infallible>> = decoder.decode(&mut NeverFailure);
     assert!(matches!(result, Err(DecodeError::LimitExceeded { .. })));
 }
@@ -296,7 +296,7 @@ fn infallible_sink_does_not_hide_decoder_errors() {
 #[test]
 fn sink_failure_after_progress_stops_event_delivery() {
     let data = archive(regular(b"hello", false));
-    let mut decoder = Decoder::new(io::Cursor::new(data));
+    let decoder = Decoder::new(io::Cursor::new(data));
     let mut sink = LateFailure { events: 0 };
     let error = decoder
         .decode(&mut sink)
@@ -315,7 +315,7 @@ fn rejects_noncanonical_directory_order() {
         (b"b".as_slice(), regular(b"b", false)),
         (b"a".as_slice(), regular(b"a", false)),
     ]));
-    let mut decoder = Decoder::new(io::Cursor::new(data));
+    let decoder = Decoder::new(io::Cursor::new(data));
     let mut events = Events::default();
     assert!(matches!(
         decoder.decode(&mut events),
@@ -330,7 +330,7 @@ fn rejects_file_before_reading_an_oversized_payload() {
         max_file_bytes: 4,
         ..Limits::default()
     };
-    let mut decoder = Decoder::with_limits(io::Cursor::new(data), limits);
+    let decoder = Decoder::with_limits(io::Cursor::new(data), limits);
     let mut events = Events::default();
     assert!(matches!(
         decoder.decode(&mut events),
@@ -341,7 +341,7 @@ fn rejects_file_before_reading_an_oversized_payload() {
 #[test]
 fn hashes_the_complete_canonical_byte_stream() {
     let data = archive(regular(b"hello", false));
-    let mut decoder = Decoder::new(io::Cursor::new(&data));
+    let decoder = Decoder::new(io::Cursor::new(&data));
     let mut events = Events::default();
     let summary = decoder.decode(&mut events).expect("decode");
     let expected = Sha256::digest(&data);
@@ -358,7 +358,7 @@ fn rejects_nonzero_string_padding() {
         .position(|window| window == marker)
         .expect("content string");
     data[start + marker.len() - 1] = 1;
-    let mut decoder = Decoder::new(io::Cursor::new(data));
+    let decoder = Decoder::new(io::Cursor::new(data));
     let mut events = Events::default();
     assert!(matches!(
         decoder.decode(&mut events),
@@ -373,7 +373,7 @@ fn enforces_total_bytes_and_depth_limits() {
         max_total_bytes: (data.len() - 1) as u64,
         ..Limits::default()
     };
-    let mut decoder = Decoder::with_limits(io::Cursor::new(data.clone()), limits);
+    let decoder = Decoder::with_limits(io::Cursor::new(data.clone()), limits);
     let mut events = Events::default();
     assert!(matches!(
         decoder.decode(&mut events),
@@ -387,7 +387,7 @@ fn enforces_total_bytes_and_depth_limits() {
         max_depth: 0,
         ..Limits::default()
     };
-    let mut decoder = Decoder::with_limits(io::Cursor::new(data), limits);
+    let decoder = Decoder::with_limits(io::Cursor::new(data), limits);
     assert!(matches!(
         decoder.decode(&mut events),
         Err(DecodeError::LimitExceeded {
@@ -408,7 +408,7 @@ fn mutated_inputs_never_panic() {
         let index = (seed as usize * 17) % data.len();
         data[index] ^= (seed as u8).wrapping_mul(31).max(1);
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let mut decoder = Decoder::new(io::Cursor::new(data));
+            let decoder = Decoder::new(io::Cursor::new(data));
             let mut events = Events::default();
             let _ = decoder.decode(&mut events);
         }));

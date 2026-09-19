@@ -162,7 +162,7 @@ impl<R: Read> Decoder<R> {
     }
 
     pub fn decode<S: EventSink>(
-        &mut self,
+        mut self,
         sink: &mut S,
     ) -> Result<DecodeSummary, DecodeError<S::Error>> {
         self.expect(b"nix-archive-1")?;

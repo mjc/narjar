@@ -25,6 +25,7 @@ pub(super) struct PublicationTransaction {
     directory: File,
     name: Option<OsString>,
     path: PathBuf,
+    state: PublicationState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,10 +62,31 @@ impl PublicationState {
             .into()),
         }
     }
+
+    fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Staging, Self::Streaming)
+                | (Self::Streaming, Self::Validated)
+                | (Self::Validated, Self::Linked | Self::Published)
+                | (Self::Linked, Self::Published)
+        )
+    }
 }
 
 impl PublicationTransaction {
     pub(super) fn transition(&mut self, state: PublicationState) -> Result<(), StorageError> {
+        if !self.state.can_transition_to(state) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid publication transition: {} -> {}",
+                    self.state.as_str(),
+                    state.as_str()
+                ),
+            )
+            .into());
+        }
         let name = self
             .name
             .as_ref()
@@ -98,6 +120,7 @@ impl PublicationTransaction {
             let _ = unlink_at(&self.directory, &temporary_name);
             return Err(error.into());
         }
+        self.state = state;
         Ok(())
     }
 
@@ -187,6 +210,7 @@ impl RecoveryState {
                         directory: self.transactions.try_clone()?,
                         name: Some(name),
                         path: temporary_path,
+                        state: PublicationState::Staging,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -228,14 +252,18 @@ impl RecoveryState {
                 .take(MAX_TRANSACTION_BYTES + 1)
                 .read_to_end(&mut contents)?;
             let transaction = parse_transaction(&contents)?;
-            self.remove_temporary_path(transaction.path)?;
+            self.remove_temporary_path(transaction.path, transaction.state)?;
             unlink_at(&self.transactions, &name)?;
         }
         self.transactions.sync_all()?;
         Ok(())
     }
 
-    fn remove_temporary_path(&self, path: PathBuf) -> Result<(), StorageError> {
+    fn remove_temporary_path(
+        &self,
+        path: PathBuf,
+        state: PublicationState,
+    ) -> Result<(), StorageError> {
         let components: Vec<_> = path
             .components()
             .map(|component| component.as_os_str().to_owned())
@@ -251,7 +279,10 @@ impl RecoveryState {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "publication transaction path is outside temporary storage",
+                    format!(
+                        "publication transaction path is outside temporary storage ({})",
+                        state.as_str()
+                    ),
                 )
                 .into());
             }
@@ -265,7 +296,12 @@ impl RecoveryState {
         }
         match unlink_at(&directory, name) {
             Ok(()) => directory.sync_all()?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && matches!(
+                        state,
+                        PublicationState::Linked | PublicationState::Published
+                    ) => {}
             Err(error) => return Err(error.into()),
         }
         Ok(())
@@ -390,7 +426,7 @@ fn rename_at(
 }
 
 struct TransactionRecord {
-    _state: PublicationState,
+    state: PublicationState,
     path: PathBuf,
 }
 
@@ -428,7 +464,7 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
             .into());
         }
         return Ok(TransactionRecord {
-            _state: PublicationState::parse(state)?,
+            state: PublicationState::parse(state)?,
             path: PathBuf::from(path),
         });
     }
@@ -441,7 +477,7 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
         .into());
     }
     Ok(TransactionRecord {
-        _state: PublicationState::Staging,
+        state: PublicationState::Staging,
         path: PathBuf::from(first),
     })
 }

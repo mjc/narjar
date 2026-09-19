@@ -305,7 +305,7 @@ fn encoded_decoder_fixture(file_count: usize, file_size: usize) -> Vec<u8> {
 }
 
 fn decode_benchmark_fixture(input: &[u8]) {
-    let mut decoder = Decoder::new(Cursor::new(input));
+    let decoder = Decoder::new(Cursor::new(input));
     let mut sink = |_: Event<'_>| Ok::<(), std::io::Error>(());
     black_box(decoder.decode(&mut sink).expect("decode benchmark fixture"));
 }
