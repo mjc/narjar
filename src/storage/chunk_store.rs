@@ -642,26 +642,33 @@ impl ChunkingWriter<'_> {
         self.record_file.sync_all()?;
         self.record_file.seek(SeekFrom::Start(0))?;
         let temporary_name = temporary_name(MANIFEST_TEMP_PREFIX);
-        let mut temporary = open_at(
-            &self.store.manifests,
-            &temporary_name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )?;
-        let checksum = {
-            let mut digesting = DigestingWriter::new(&mut temporary);
-            write_manifest_header(&mut digesting, *manifest)?;
-            io::copy(&mut self.record_file, &mut digesting)?;
-            digesting.finish()
-        };
-        temporary.write_all(&checksum)?;
-        temporary.sync_all()?;
-        let outcome = publish_temporary_file(
-            &self.store.manifests,
-            &temporary_name,
-            &manifest_name(manifest.identity().hash()),
-        )?;
-        Ok(outcome)
+        let result = (|| -> Result<_, ChunkStoreError> {
+            let mut temporary = open_at(
+                &self.store.manifests,
+                &temporary_name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )?;
+            let checksum = {
+                let mut digesting = DigestingWriter::new(&mut temporary);
+                write_manifest_header(&mut digesting, *manifest)?;
+                io::copy(&mut self.record_file, &mut digesting)?;
+                digesting.finish()
+            };
+            temporary.write_all(&checksum)?;
+            temporary.sync_all()?;
+            Ok(publish_temporary_file(
+                &self.store.manifests,
+                &temporary_name,
+                &manifest_name(manifest.identity().hash()),
+            )?)
+        })();
+        let cleanup = remove_temporary_file(&self.store.manifests, &temporary_name);
+        match (result, cleanup) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
     }
 
     fn publish_complete_chunks(&mut self) -> io::Result<()> {
@@ -866,6 +873,14 @@ fn write_temporary_file(directory: &File, name: &OsStr, bytes: &[u8]) -> io::Res
     )?;
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+fn remove_temporary_file(directory: &File, name: &OsStr) -> io::Result<()> {
+    match unlink_at(directory, name) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn temporary_name(prefix: &str) -> OsString {
