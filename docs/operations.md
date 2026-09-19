@@ -108,8 +108,10 @@ narjar push
 init creates the deterministic layout, nix-cache-info, empty token files, and
 trusted-public-keys with restrictive modes. `--storage-backend` writes the
 immutable layout descriptor and creates the chunk directories when `chunked`
-is selected; it defaults to `flat`. It refuses a non-empty incompatible
-directory.
+is selected; it defaults to `flat`. A chunked descriptor records the supported
+`mincdc-hash4-v2` profile (256 KiB minimum, 1 MiB maximum). It refuses a
+non-empty incompatible directory; it does not infer or convert an older
+layout.
 
 token create generates a random 256-bit token, writes only its SHA-256 hash and
 label atomically to the scope file, and prints the secret once to stdout.
@@ -320,15 +322,17 @@ publication point.
 | Durable files after crash | Reader behavior | Reconcile result |
 | --- | --- | --- |
 | temp only | invisible | temporary, age classified |
-| NAR only | invisible as store path | orphan NAR |
-| NAR plus narinfo temp | invisible as store path | orphan NAR plus temporary |
-| NAR plus published narinfo | readable | valid pair or corruption finding |
-| narinfo without NAR | narinfo is quarantinable corruption; normal server returns 404/500 rather than bytes | missing NAR |
+| canonical object only | invisible as store path | orphan flat NAR or chunked manifest/chunks |
+| canonical object plus narinfo temp | invisible as store path | orphan canonical object plus temporary |
+| canonical object plus published narinfo | readable after backend-specific validation | valid pair or corruption finding |
+| narinfo without canonical object | narinfo is quarantinable corruption; normal server returns 404/500 rather than bytes | missing canonical object |
 | malformed final filename | unreachable by valid route | unknown/invalid file |
 
 Startup validates the fixed layout and lock, verifies the published inventory
 when recovery records are present, then removes only those recorded temporary
-objects before serving exact files. Reconciliation remains deterministic and
+objects before serving. For a flat root that inventory points at a regular NAR
+file; for a chunked root it points at a checksum-validated manifest and its
+referenced regular chunk files. Reconciliation remains deterministic and
 operator-triggered for other stale temporary files.
 
 Server-generated compressed egress has a durable receipt under
@@ -409,9 +413,10 @@ For a consistent portable copy:
 
 1. Stop Narjar and wait for the process to exit.
 2. Copy the complete data directory, including `.narjar-clean`,
-   `.narjar-recovery`, `.narjar-transactions/`, `lock`, `nar/`, `.tmp/`,
-   `realisations/`, `.narjar-validation/`, `.narjar-egress/`, `nix-cache-info`,
-   `trusted-public-keys`, and `auth/`.
+   `.narjar-recovery`, `.narjar-transactions/`, `.narjar-layout`,
+   `.narjar-chunks/` and `.narjar-manifests/` for a chunked root, `lock`,
+   `nar/`, `.tmp/`, `realisations/`, `.narjar-validation/`,
+   `.narjar-egress/`, `nix-cache-info`, `trusted-public-keys`, and `auth/`.
 3. Preserve the directory and file permissions; do not expose the copy while
    it contains credentials.
 4. On the destination, require `doctor` to exit successfully, then run

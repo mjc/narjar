@@ -158,10 +158,13 @@ reconcile and GC perform the potentially unbounded scans.
 
 `narjar init --storage-backend flat|chunked` selects the canonical layout for a
 new DATA root; `flat` remains the default. The choice is recorded in the
-small `.narjar-layout` descriptor and is immutable for that root. Startup and
-offline commands reject a missing descriptor on a populated root or a
-descriptor that disagrees with the requested backend. There is no migration,
-legacy-layout fallback, mixed per-object selection, or automatic conversion.
+small `.narjar-layout` descriptor and is immutable for that root. A chunked
+descriptor also records `profile=mincdc-hash4-v2`; this profile identifier is
+part of the storage format, not an advisory tuning value. Startup and offline
+commands reject a missing descriptor on a populated root or a descriptor that
+disagrees with the requested backend or supported profile. There is no
+migration, legacy-layout fallback, mixed per-object selection, or automatic
+conversion.
 
 The flat backend stores the complete decoded NAR at `nar/<NarHash>.nar`.
 The chunked backend stores the exact decoded byte stream as immutable

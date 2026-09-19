@@ -171,8 +171,9 @@ tests are required in addition to the flat publication cases:
   slice of the original decoded stream. A range opens and hashes only the
   intersecting chunks after bounded manifest validation.
 - Fresh `flat` and `chunked` roots reject the opposite layout descriptor;
-  `narjar init --storage-backend chunked` creates the chunk directories and
-  no full canonical raw duplicate.
+  `narjar init --storage-backend chunked` records the immutable
+  `mincdc-hash4-v2` profile, creates the chunk directories, and keeps no full
+  canonical raw duplicate.
 - Each recovery boundary from chunk temp through manifest publication is
   restart-tested, including the bounded chunk-publication batches and the
   final filesystem sync before manifest finalization. A failed upload may
