@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/casync-zfs-experiment \
+  --binary PATH \
+  --input-dir DIR \
+  --flat-data DIR \
+  --chunked-data DIR \
+  --output DIR \
+  [--port-base N]
+
+The two DATA directories must already be empty mountpoints on distinct fresh
+ZFS datasets configured with the same properties and compression=zstd-19.
+The script never creates, destroys, mounts, unmounts, or changes a dataset.
+It uploads every <NixHash>.nar file below --input-dir to both backends through
+the standard HTTP protocol, syncs ZFS, and writes compact physical/accounting
+results to --output.
+
+No corpus is copied into the repository. The input directory is read-only
+from this script's perspective.
+EOF
+}
+
+BINARY=${NARJAR_BIN:-}
+INPUT_DIR=
+FLAT_DATA=
+CHUNKED_DATA=
+OUTPUT=
+PORT_BASE=45100
+
+while (($#)); do
+    case "$1" in
+        --binary)
+            BINARY=$2
+            shift 2
+            ;;
+        --input-dir)
+            INPUT_DIR=$2
+            shift 2
+            ;;
+        --flat-data)
+            FLAT_DATA=$2
+            shift 2
+            ;;
+        --chunked-data)
+            CHUNKED_DATA=$2
+            shift 2
+            ;;
+        --output)
+            OUTPUT=$2
+            shift 2
+            ;;
+        --port-base)
+            PORT_BASE=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+[[ -n "$BINARY" && -x "$BINARY" ]] || {
+    printf '%s\n' '--binary must name an executable release binary' >&2
+    exit 2
+}
+[[ -d "$INPUT_DIR" ]] || {
+    printf 'input directory is not a directory: %s\n' "$INPUT_DIR" >&2
+    exit 2
+}
+[[ -d "$FLAT_DATA" && -d "$CHUNKED_DATA" ]] || {
+    printf '%s\n' 'both DATA directories must already exist' >&2
+    exit 2
+}
+[[ "$FLAT_DATA" != "$CHUNKED_DATA" ]] || {
+    printf '%s\n' 'flat and chunked DATA directories must differ' >&2
+    exit 2
+}
+[[ ! -e "$OUTPUT" ]] || {
+    printf 'output already exists: %s\n' "$OUTPUT" >&2
+    exit 2
+}
+
+for command in awk cmp curl find sort stat zfs zpool; do
+    command -v "$command" >/dev/null || {
+        printf "missing required command: %s\n" "$command" >&2
+        exit 1
+    }
+done
+
+INPUT_DIR=$(cd "$INPUT_DIR" && pwd)
+FLAT_DATA=$(cd "$FLAT_DATA" && pwd)
+CHUNKED_DATA=$(cd "$CHUNKED_DATA" && pwd)
+mkdir "$OUTPUT"
+OUTPUT=$(cd "$OUTPUT" && pwd)
+COMMAND_LOG=$OUTPUT/commands.log
+RESULTS=$OUTPUT/results.tsv
+INPUTS=$OUTPUT/inputs.tsv
+PROPERTIES=$OUTPUT/zfs-properties.tsv
+WORK=$(mktemp -d "$OUTPUT/.work.XXXXXX")
+SERVER_PIDS=
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    for pid in $SERVER_PIDS; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+    rm -rf "$WORK"
+    exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+: >"$COMMAND_LOG"
+chmod 600 "$COMMAND_LOG"
+printf 'metric\tflat\tchunked\n' >"$RESULTS"
+: >"$INPUTS"
+
+log_command() {
+    {
+        printf '$'
+        printf ' %q' "$@"
+        printf '\n'
+    } >>"$COMMAND_LOG"
+}
+
+run_logged() {
+    log_command "$@"
+    "$@" 2>&1 | tee -a "$COMMAND_LOG"
+    return "${PIPESTATUS[0]}"
+}
+
+capture_logged() {
+    local capture
+    capture=$(mktemp "$WORK/capture.XXXXXX")
+    log_command "$@"
+    if "$@" >"$capture" 2>>"$COMMAND_LOG"; then
+        cat "$capture" >>"$COMMAND_LOG"
+        cat "$capture"
+        rm -f "$capture"
+        return 0
+    fi
+    local status=$?
+    cat "$capture" >>"$COMMAND_LOG"
+    cat "$capture" >&2
+    rm -f "$capture"
+    return "$status"
+}
+
+capture_private() {
+    local capture
+    capture=$(mktemp "$WORK/private.XXXXXX")
+    log_command "$@"
+    if "$@" >"$capture" 2>>"$COMMAND_LOG"; then
+        cat "$capture"
+        rm -f "$capture"
+        return 0
+    fi
+    local status=$?
+    cat "$capture" >&2
+    rm -f "$capture"
+    return "$status"
+}
+
+assert_empty_data_dir() {
+    local directory=$1
+    [[ -z "$(find "$directory" -mindepth 1 -maxdepth 1 -print -quit)" ]] || {
+        printf 'refusing non-empty DATA directory: %s\n' "$directory" >&2
+        exit 1
+    }
+}
+
+dataset_for_mountpoint() {
+    local mountpoint=$1
+    zfs list -H -o name,mountpoint |
+        awk -v mountpoint="$mountpoint" '$2 == mountpoint { print $1; exit }'
+}
+
+assert_matching_datasets() {
+    local flat_dataset=$1
+    local chunked_dataset=$2
+    local flat_properties=$WORK/flat-properties
+    local chunked_properties=$WORK/chunked-properties
+    capture_logged zfs get -H -p -o property,value \
+        compression,recordsize,checksum,dedup,atime,copies,sync,quota,reservation,refreservation \
+        "$flat_dataset" | sort >"$flat_properties"
+    capture_logged zfs get -H -p -o property,value \
+        compression,recordsize,checksum,dedup,atime,copies,sync,quota,reservation,refreservation \
+        "$chunked_dataset" | sort >"$chunked_properties"
+    log_command diff -u "$flat_properties" "$chunked_properties"
+    diff -u "$flat_properties" "$chunked_properties" >>"$COMMAND_LOG" || {
+        printf '%s\n' 'flat and chunked dataset properties differ' >&2
+        exit 1
+    }
+    awk -F '\t' '$1 == "compression" && $2 != "zstd-19" { exit 1 }' \
+        "$flat_properties" || {
+        printf '%s\n' 'flat dataset is not configured with compression=zstd-19' >&2
+        exit 1
+    }
+}
+
+record_dataset_stats() {
+    local dataset=$1
+    capture_logged zfs list -H -p -o used,referenced,logicalused,usedbydataset "$dataset"
+}
+
+record_inputs() {
+    local file basename hash size
+    while IFS= read -r -d '' file; do
+        basename=${file##*/}
+        hash=${basename%.nar}
+        size=$(stat -c '%s' "$file")
+        printf '%s\t%s\t%s\n' "$hash" "$size" "$file" >>"$INPUTS"
+    done < <(find "$INPUT_DIR" -type f -name '*.nar' -print0 | sort -z)
+}
+
+start_server() {
+    local label=$1
+    local data_dir=$2
+    local backend=$3
+    local port=$4
+    local token
+    token=$(capture_private "$BINARY" token create --data-dir "$data_dir" --scope write --name experiment)
+    local netrc=$WORK/"$label".netrc
+    printf 'machine 127.0.0.1 login narjar password %s\n' "$token" >"$netrc"
+    chmod 600 "$netrc"
+    local -a server_command=(
+        "$BINARY" serve
+        --data-dir "$data_dir" \
+        --listen "127.0.0.1:$port" \
+        --workers 8 \
+        --min-free-bytes 0 \
+        --storage-backend "$backend"
+    )
+    log_command "${server_command[@]}"
+    "${server_command[@]}" >"$OUTPUT/$label-server.log" 2>&1 &
+    SERVER_PIDS="$SERVER_PIDS $!"
+    local attempt
+    for attempt in $(seq 1 100); do
+        if curl --fail --silent "http://127.0.0.1:$port/healthz" >/dev/null; then
+            printf '%s\t%s\n' "$label" "$netrc"
+            return
+        fi
+        sleep 0.1
+    done
+    printf 'server did not become ready: %s\n' "$label" >&2
+    return 1
+}
+
+stop_servers() {
+    local pid
+    for pid in $SERVER_PIDS; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in $SERVER_PIDS; do
+        wait "$pid" 2>/dev/null || true
+    done
+    SERVER_PIDS=
+}
+
+upload_inputs() {
+    local port=$1
+    local netrc=$2
+    local file basename hash size
+    while IFS= read -r -d '' file; do
+        basename=${file##*/}
+        hash=${basename%.nar}
+        size=$(stat -c '%s' "$file")
+        run_logged curl --fail --silent --show-error \
+            --netrc-file "$netrc" \
+            -H "Content-Length: $size" \
+            --upload-file "$file" \
+            "http://127.0.0.1:$port/nar/$basename"
+    done < <(find "$INPUT_DIR" -type f -name '*.nar' -print0 | sort -z)
+}
+
+verify_inputs() {
+    local label=$1
+    local port=$2
+    local hash file downloaded
+    while IFS=$'\t' read -r hash size file; do
+        downloaded=$WORK/"$label"-"$hash".nar
+        run_logged curl --fail --silent --show-error \
+            "http://127.0.0.1:$port/nar/$hash.nar" -o "$downloaded"
+        cmp -- "$file" "$downloaded"
+    done <"$INPUTS"
+}
+
+assert_empty_data_dir "$FLAT_DATA"
+assert_empty_data_dir "$CHUNKED_DATA"
+record_inputs
+[[ -s "$INPUTS" ]] || {
+    printf '%s\n' 'input directory contains no .nar files' >&2
+    exit 1
+}
+if ! awk -F '\t' '{ if (seen[$1]++) exit 1 }' "$INPUTS"; then
+    printf '%s\n' 'input directory contains duplicate NAR hashes' >&2
+    exit 1
+fi
+
+flat_dataset=$(dataset_for_mountpoint "$FLAT_DATA")
+chunked_dataset=$(dataset_for_mountpoint "$CHUNKED_DATA")
+[[ -n "$flat_dataset" && -n "$chunked_dataset" ]] || {
+    printf '%s\n' 'both DATA paths must be direct ZFS dataset mountpoints' >&2
+    exit 1
+}
+flat_pool=$(capture_logged zpool list -H -o name "$flat_dataset")
+chunked_pool=$(capture_logged zpool list -H -o name "$chunked_dataset")
+[[ "$flat_pool" == "$chunked_pool" ]] || {
+    printf '%s\n' 'flat and chunked datasets must use the same ZFS pool' >&2
+    exit 1
+}
+assert_matching_datasets "$flat_dataset" "$chunked_dataset"
+{
+    printf 'dataset\tproperty\tvalue\tsource\n'
+    capture_logged zfs get -H -p -o property,value,source \
+        compression,recordsize,checksum,dedup,atime,copies,sync,quota,reservation,refreservation \
+        "$flat_dataset" | awk -F '\t' '{ print "flat\t" $0 }'
+    capture_logged zfs get -H -p -o property,value,source \
+        compression,recordsize,checksum,dedup,atime,copies,sync,quota,reservation,refreservation \
+        "$chunked_dataset" | awk -F '\t' '{ print "chunked\t" $0 }'
+} >"$PROPERTIES"
+
+capture_logged "$BINARY" init --data-dir "$FLAT_DATA" --storage-backend flat
+capture_logged "$BINARY" init --data-dir "$CHUNKED_DATA" --storage-backend chunked
+flat_port=$PORT_BASE
+chunked_port=$((PORT_BASE + 1))
+start_server flat "$FLAT_DATA" flat "$flat_port" >"$WORK/flat-server"
+start_server chunked "$CHUNKED_DATA" chunked "$chunked_port" >"$WORK/chunked-server"
+flat_netrc=$(awk -F '\t' '$1 == "flat" { print $2 }' "$WORK/flat-server")
+chunked_netrc=$(awk -F '\t' '$1 == "chunked" { print $2 }' "$WORK/chunked-server")
+upload_inputs "$flat_port" "$flat_netrc"
+upload_inputs "$chunked_port" "$chunked_netrc"
+verify_inputs flat "$flat_port"
+verify_inputs chunked "$chunked_port"
+
+stop_servers
+run_logged sync
+run_logged zpool sync "$flat_pool"
+run_logged zpool sync "$chunked_pool"
+flat_stats=$(record_dataset_stats "$flat_dataset")
+chunked_stats=$(record_dataset_stats "$chunked_dataset")
+IFS=$'\t' read -r flat_used flat_referenced flat_logical flat_dataset_used <<<"$flat_stats"
+IFS=$'\t' read -r chunked_used chunked_referenced chunked_logical chunked_dataset_used <<<"$chunked_stats"
+printf 'used\t%s\t%s\n' "$flat_used" "$chunked_used" >>"$RESULTS"
+printf 'referenced\t%s\t%s\n' "$flat_referenced" "$chunked_referenced" >>"$RESULTS"
+printf 'logicalused\t%s\t%s\n' "$flat_logical" "$chunked_logical" >>"$RESULTS"
+printf 'usedbydataset\t%s\t%s\n' "$flat_dataset_used" "$chunked_dataset_used" >>"$RESULTS"
+awk -F '\t' -v flat="$flat_used" -v chunked="$chunked_used" \
+    'BEGIN { if (flat == 0) exit 1; printf "physical_savings\t%.6f\t-\n", 1 - chunked / flat }' \
+    >>"$RESULTS"
+input_count=$(wc -l <"$INPUTS")
+logical_input_bytes=$(awk -F '\t' '{ total += $2 } END { print total + 0 }' "$INPUTS")
+printf 'input_files\t%s\t%s\n' "$input_count" "$input_count" >>"$RESULTS"
+printf 'logical_input_bytes\t%s\t%s\n' "$logical_input_bytes" "$logical_input_bytes" >>"$RESULTS"
+
+printf 'results: %s\n' "$RESULTS"
