@@ -9,7 +9,8 @@ Usage: scripts/casync-zfs-experiment \
   --flat-data DIR \
   --chunked-data DIR \
   --output DIR \
-  [--port-base N]
+  [--port-base N] \
+  [--jobs N]
 
 The two DATA directories must already be empty mountpoints on distinct fresh
 ZFS datasets configured with the same properties and compression=zstd-19.
@@ -31,6 +32,7 @@ FLAT_DATA=
 CHUNKED_DATA=
 OUTPUT=
 PORT_BASE=45100
+JOBS=8
 
 while (($#)); do
     case "$1" in
@@ -62,6 +64,10 @@ while (($#)); do
             PORT_BASE=$2
             shift 2
             ;;
+        --jobs)
+            JOBS=$2
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -73,6 +79,11 @@ while (($#)); do
             ;;
     esac
 done
+
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || {
+    printf '%s\n' '--jobs must be a positive integer' >&2
+    exit 2
+}
 
 [[ -n "$BINARY" && -x "$BINARY" ]] || {
     printf '%s\n' '--binary must name an executable release binary' >&2
@@ -321,6 +332,14 @@ start_server() {
     return 1
 }
 
+wait_for_upload_batch() {
+    local failed=0 pid
+    for pid in "$@"; do
+        wait "$pid" || failed=1
+    done
+    return "$failed"
+}
+
 stop_servers() {
     local pid
     for pid in $SERVER_PIDS; do
@@ -336,17 +355,38 @@ upload_inputs() {
     local port=$1
     local netrc=$2
     local hash size source
+    local -a pids=()
     while IFS=$'\t' read -r hash size source; do
         if [[ -n "$INPUT_DIR" ]]; then
-            run_logged curl --fail --silent --show-error \
-                --netrc-file "$netrc" \
-                -H "Content-Length: $size" \
-                --upload-file "$source" \
-                "http://127.0.0.1:$port/nar/$hash.nar"
+            upload_file "$port" "$netrc" "$hash" "$size" "$source" &
         else
-            upload_store_path "$port" "$netrc" "$hash" "$size" "$source"
+            upload_store_path "$port" "$netrc" "$hash" "$size" "$source" &
+        fi
+        pids+=("$!")
+        if ((${#pids[@]} == JOBS)); then
+            wait_for_upload_batch "${pids[@]}"
+            pids=()
         fi
     done <"$INPUTS"
+    ((${#pids[@]} == 0)) || wait_for_upload_batch "${pids[@]}"
+}
+
+upload_file() {
+    local port=$1
+    local netrc=$2
+    local hash=$3
+    local size=$4
+    local file=$5
+    log_command curl --fail --silent --show-error \
+        --netrc-file "$netrc" \
+        -H "Content-Length: $size" \
+        --upload-file "$file" \
+        "http://127.0.0.1:$port/nar/$hash.nar"
+    curl --fail --silent --show-error \
+                --netrc-file "$netrc" \
+                -H "Content-Length: $size" \
+        --upload-file "$file" \
+        "http://127.0.0.1:$port/nar/$hash.nar"
 }
 
 upload_store_path() {
@@ -377,16 +417,33 @@ verify_inputs() {
     local label=$1
     local port=$2
     local hash size source
+    local -a pids=()
     while IFS=$'\t' read -r hash size source; do
         if [[ -n "$INPUT_DIR" ]]; then
-            local downloaded=$WORK/"$label"-"$hash".nar
-            run_logged curl --fail --silent --show-error \
-                "http://127.0.0.1:$port/nar/$hash.nar" -o "$downloaded"
-            cmp -- "$source" "$downloaded"
+            verify_file "$label" "$port" "$hash" "$source" &
         else
-            verify_store_path "$label" "$port" "$hash" "$source"
+            verify_store_path "$label" "$port" "$hash" "$source" &
+        fi
+        pids+=("$!")
+        if ((${#pids[@]} == JOBS)); then
+            wait_for_upload_batch "${pids[@]}"
+            pids=()
         fi
     done <"$INPUTS"
+    ((${#pids[@]} == 0)) || wait_for_upload_batch "${pids[@]}"
+}
+
+verify_file() {
+    local label=$1
+    local port=$2
+    local hash=$3
+    local source=$4
+    local downloaded=$WORK/"$label"-"$hash".nar
+    log_command curl --fail --silent --show-error \
+        "http://127.0.0.1:$port/nar/$hash.nar" -o "$downloaded"
+    curl --fail --silent --show-error \
+        "http://127.0.0.1:$port/nar/$hash.nar" -o "$downloaded"
+    cmp -- "$source" "$downloaded"
 }
 
 verify_store_path() {
