@@ -535,8 +535,11 @@ impl Inventory {
             verification,
         )?;
         entries.extend(inspect_unreferenced_payloads(&nar_directory, &references)?);
-        if storage.backend() == crate::storage::StorageBackend::Chunked {
-            entries.extend(inspect_unreferenced_manifests(storage, &references)?);
+        match storage.backend() {
+            crate::storage::StorageBackend::Flat => {}
+            crate::storage::StorageBackend::Chunked => {
+                entries.extend(inspect_unreferenced_manifests(storage, &references)?);
+            }
         }
         entries.sort();
         Ok(Self { entries })
