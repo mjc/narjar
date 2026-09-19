@@ -93,6 +93,33 @@ installables. Referenced store paths are uploaded in deterministic
 dependency waves; independent paths within a wave use the bounded `--jobs`
 parallelism.
 
+To avoid copying closure members already available from caches that every
+consumer can reach, list those caches in lookup order and provide their trusted
+Nix public keys explicitly:
+
+```sh
+nix run . -- push \
+  --to https://cache.example \
+  --trusted-upstream https://cache.nixos.org \
+  --trusted-upstream-key 'cache.nixos.org-1:BASE64_PUBLIC_KEY' \
+  --signing-key-file ./producer.sec \
+  /nix/store/some-package
+```
+
+Narjar checks the destination first. After a destination miss, it accepts an
+upstream hit only when the bounded narinfo has a trusted signature and its
+store path, NAR hash, NAR size, and references exactly match the local store
+metadata. It never downloads the upstream payload for this decision. Upstream
+404s, connection failures, 5xx responses, invalid signatures, and metadata
+mismatches fall back to the normal upload and produce a diagnostic. Repeating
+`--trusted-upstream` preserves command-line order; repeated
+`--trusted-upstream-key` values form the trust set used for those caches.
+
+Configuring an upstream is an assertion that cache consumers can also reach
+it, either as another Nix substituter or through a read-through Narjar edge.
+Narjar does not copy skipped upstream objects into the destination. `--refresh`
+forces uploads and bypasses both destination and upstream skip decisions.
+
 ## Inspect and maintain a cache
 
 These commands operate on the data directory and should be run with the
