@@ -621,6 +621,21 @@ impl Storage {
         &self,
         identity: NarIdentity,
     ) -> Result<CanonicalRawStatus, StorageError> {
+        if self.backend == StorageBackend::Chunked {
+            return Ok(
+                match self
+                    .chunk_store
+                    .validate_manifest(identity.hash())
+                    .map_err(super::operations::storage_error_for_chunk_store)?
+                {
+                    None => CanonicalRawStatus::Missing,
+                    Some(manifest) if manifest.identity() == identity => {
+                        CanonicalRawStatus::Present
+                    }
+                    Some(_) => CanonicalRawStatus::WrongSize,
+                },
+            );
+        }
         self.open_nar(identity.hash())?
             .map_or(Ok(CanonicalRawStatus::Missing), |file| {
                 Ok(nar_file_size_matches(&file, identity.size().get()).map(

@@ -488,11 +488,13 @@ impl Inventory {
         Ok(can_serve)
     }
 
-    pub fn can_recover(root: &Directory, trusted: &TrustedPublicKeys) -> io::Result<bool> {
-        Ok(!Self::scan(root, trusted, VerificationMode::Availability)?
-            .entries
-            .iter()
-            .any(|entry| entry.class.invalid_published_pair()))
+    pub fn can_recover(storage: &Storage, trusted: &TrustedPublicKeys) -> io::Result<bool> {
+        Ok(
+            !Self::scan_storage(storage, trusted, VerificationMode::Availability)?
+                .entries
+                .iter()
+                .any(|entry| entry.class.invalid_published_pair()),
+        )
     }
 
     pub fn scan(

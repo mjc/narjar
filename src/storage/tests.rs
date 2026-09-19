@@ -808,6 +808,55 @@ fn recovery_removes_receipts_without_a_usable_raw_object() {
 }
 
 #[test]
+fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
+    let directory = TestDir::new();
+    let raw = b"chunked raw NAR for egress recovery";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
+    let output = {
+        let storage = Storage::initialize_with_backend(
+            &Directory::open(directory.path()).unwrap(),
+            StorageBackend::Chunked,
+        )
+        .unwrap();
+        storage
+            .publish_nar(
+                NarFileName::raw(raw_hash),
+                Cursor::new(raw),
+                raw.len() as u64,
+                super::NarUploadPolicy::new(raw.len() as u64, 0),
+            )
+            .unwrap();
+        let output = storage
+            .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+            .unwrap();
+        assert_eq!(storage.egress_generations(), 1);
+        output
+    };
+
+    let restarted = Storage::initialize_with_backend(
+        &Directory::open(directory.path()).unwrap(),
+        StorageBackend::Chunked,
+    )
+    .unwrap();
+    restarted.finish_recovery().unwrap();
+    assert_eq!(
+        fs::read_dir(restarted.layout().egress_receipt_dir())
+            .unwrap()
+            .count(),
+        1,
+        "manifest-backed canonical raw storage must retain its egress receipt"
+    );
+    assert_eq!(
+        restarted
+            .compressed_representation_for_test(identity, CompressionCodec::Zstd, u64::MAX)
+            .unwrap(),
+        output
+    );
+    assert_eq!(restarted.egress_generations(), 0);
+}
+
+#[test]
 fn compressed_uploads_converge_on_one_raw_object() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
