@@ -1414,6 +1414,109 @@ mod tests {
     }
 
     #[test]
+    fn failed_chunked_ingest_publishes_no_manifest_or_staging_record() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        let wrong_identity = NarIdentity::new(
+            NarHash::from_digest([0; 32]),
+            NarSize::new(input.len() as u64),
+        );
+
+        assert!(matches!(
+            store.store_nar(
+                Cursor::new(&input),
+                wrong_identity,
+                ChunkProfile::MinCdcHash4V2
+            ),
+            Err(ChunkStoreError::NarHashMismatch { .. })
+        ));
+        assert_eq!(
+            fs::read_dir(directory.path().join(super::super::MANIFEST_DIRECTORY))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().unwrap().is_file())
+                .count(),
+            0,
+            "failed ingestion must not publish a manifest"
+        );
+
+        drop(store);
+        let restarted = ChunkStore::initialize(root.file()).unwrap();
+        assert_eq!(
+            fs::read_dir(directory.path().join(super::super::MANIFEST_DIRECTORY))
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            0,
+            "restart must remove the private manifest record"
+        );
+        drop(restarted);
+        assert!(
+            fs::read_dir(directory.path().join(super::super::CHUNK_DIRECTORY))
+                .unwrap()
+                .flat_map(|shard| {
+                    fs::read_dir(shard.unwrap().path())
+                        .unwrap()
+                        .filter_map(Result::ok)
+                })
+                .any(|entry| entry.file_type().unwrap().is_file()),
+            "independently valid orphan chunks may remain for GC"
+        );
+    }
+
+    struct FailingReader {
+        bytes: Vec<u8>,
+        sent: bool,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            let length = output.len().min(self.bytes.len());
+            output[..length].copy_from_slice(&self.bytes[..length]);
+            self.bytes.drain(..length);
+            self.sent = true;
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn source_failure_publishes_no_chunked_manifest_or_staging_record() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'y'; 2 * 1024 * 1024];
+        let expected = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+
+        assert!(matches!(
+            store.store_nar(
+                FailingReader {
+                    bytes: input,
+                    sent: false,
+                },
+                expected,
+                ChunkProfile::MinCdcHash4V2
+            ),
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(libc::EIO)
+        ));
+        assert!(store.open_manifest(expected.hash()).unwrap().is_none());
+        assert_eq!(
+            fs::read_dir(directory.path().join(super::super::MANIFEST_DIRECTORY))
+                .unwrap()
+                .count(),
+            0,
+            "source failure must remove the manifest record"
+        );
+    }
+
+    #[test]
     fn chunk_reader_rejects_a_corrupt_chunk() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
