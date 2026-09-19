@@ -5,7 +5,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/casync-zfs-experiment \
   --binary PATH \
-  --input-dir DIR \
+  (--input-dir DIR | --store-root PATH) \
   --flat-data DIR \
   --chunked-data DIR \
   --output DIR \
@@ -14,17 +14,19 @@ Usage: scripts/casync-zfs-experiment \
 The two DATA directories must already be empty mountpoints on distinct fresh
 ZFS datasets configured with the same properties and compression=zstd-19.
 The script never creates, destroys, mounts, unmounts, or changes a dataset.
-It uploads every <NixHash>.nar file below --input-dir to both backends through
-the standard HTTP protocol, syncs ZFS, and writes compact physical/accounting
-results to --output.
+It uploads every <NixHash>.nar file below --input-dir, or every NAR in the
+closure of --store-root, to both backends through the standard HTTP protocol,
+syncs ZFS, and writes compact physical/accounting results to --output.
 
-No corpus is copied into the repository. The input directory is read-only
-from this script's perspective.
+No corpus is copied into the repository. Both input sources are read-only from
+this script's perspective. Store-root mode streams `nix-store --dump` directly
+to curl and does not create a second NAR copy on disk.
 EOF
 }
 
 BINARY=${NARJAR_BIN:-}
 INPUT_DIR=
+STORE_ROOT=
 FLAT_DATA=
 CHUNKED_DATA=
 OUTPUT=
@@ -38,6 +40,10 @@ while (($#)); do
             ;;
         --input-dir)
             INPUT_DIR=$2
+            shift 2
+            ;;
+        --store-root)
+            STORE_ROOT=$2
             shift 2
             ;;
         --flat-data)
@@ -72,10 +78,21 @@ done
     printf '%s\n' '--binary must name an executable release binary' >&2
     exit 2
 }
-[[ -d "$INPUT_DIR" ]] || {
-    printf 'input directory is not a directory: %s\n' "$INPUT_DIR" >&2
+if [[ -n "$INPUT_DIR" && -n "$STORE_ROOT" ]] || [[ -z "$INPUT_DIR" && -z "$STORE_ROOT" ]]; then
+    printf '%s\n' 'provide exactly one of --input-dir or --store-root' >&2
     exit 2
-}
+fi
+if [[ -n "$INPUT_DIR" ]]; then
+    [[ -d "$INPUT_DIR" ]] || {
+        printf 'input directory is not a directory: %s\n' "$INPUT_DIR" >&2
+        exit 2
+    }
+else
+    [[ -e "$STORE_ROOT" ]] || {
+        printf 'store root does not exist: %s\n' "$STORE_ROOT" >&2
+        exit 2
+    }
+fi
 [[ -d "$FLAT_DATA" && -d "$CHUNKED_DATA" ]] || {
     printf '%s\n' 'both DATA directories must already exist' >&2
     exit 2
@@ -89,14 +106,23 @@ done
     exit 2
 }
 
-for command in awk cmp curl find sort stat zfs zpool; do
+required_commands=(awk cmp curl find sort stat zfs zpool)
+if [[ -n "$STORE_ROOT" ]]; then
+    required_commands+=(jq nix nix-store)
+fi
+for command in "${required_commands[@]}"; do
     command -v "$command" >/dev/null || {
         printf "missing required command: %s\n" "$command" >&2
         exit 1
     }
 done
 
-INPUT_DIR=$(cd "$INPUT_DIR" && pwd)
+if [[ -n "$INPUT_DIR" ]]; then
+    INPUT_DIR=$(cd "$INPUT_DIR" && pwd)
+fi
+if [[ -n "$STORE_ROOT" ]]; then
+    STORE_ROOT=$(cd "$STORE_ROOT" && pwd)
+fi
 FLAT_DATA=$(cd "$FLAT_DATA" && pwd)
 CHUNKED_DATA=$(cd "$CHUNKED_DATA" && pwd)
 mkdir "$OUTPUT"
@@ -104,6 +130,7 @@ OUTPUT=$(cd "$OUTPUT" && pwd)
 COMMAND_LOG=$OUTPUT/commands.log
 RESULTS=$OUTPUT/results.tsv
 INPUTS=$OUTPUT/inputs.tsv
+ALL_INPUTS=$OUTPUT/all-inputs.tsv
 PROPERTIES=$OUTPUT/zfs-properties.tsv
 WORK=$(mktemp -d "$OUTPUT/.work.XXXXXX")
 SERVER_PIDS=
@@ -126,6 +153,7 @@ trap cleanup EXIT INT TERM
 chmod 600 "$COMMAND_LOG"
 printf 'metric\tflat\tchunked\n' >"$RESULTS"
 : >"$INPUTS"
+: >"$ALL_INPUTS"
 
 log_command() {
     {
@@ -184,7 +212,7 @@ assert_empty_data_dir() {
 dataset_for_mountpoint() {
     local mountpoint=$1
     zfs list -H -o name,mountpoint |
-        awk -v mountpoint="$mountpoint" '$2 == mountpoint { print $1; exit }'
+        awk -v mountpoint="$mountpoint" '$2 == mountpoint { print $1 }'
 }
 
 assert_matching_datasets() {
@@ -221,8 +249,43 @@ record_inputs() {
         basename=${file##*/}
         hash=${basename%.nar}
         size=$(stat -c '%s' "$file")
-        printf '%s\t%s\t%s\n' "$hash" "$size" "$file" >>"$INPUTS"
+        printf '%s\t%s\t%s\n' "$hash" "$size" "$file" >>"$ALL_INPUTS"
     done < <(find "$INPUT_DIR" -type f -name '*.nar' -print0 | sort -z)
+}
+
+record_store_inputs() {
+    local store_paths store_info metadata store_path sri size hash
+    store_paths=$WORK/store-paths
+    store_info=$WORK/store-info.json
+    metadata=$WORK/store-metadata.tsv
+
+    run_logged nix-store --query --requisites "$STORE_ROOT" >"$store_paths"
+    run_logged nix path-info --json --stdin <"$store_paths" >"$store_info"
+    capture_logged jq -r \
+        'to_entries[] | [.key, .value.narHash, (.value.narSize | tostring)] | @tsv' \
+        "$store_info" | sort >"$metadata"
+
+    while IFS=$'\t' read -r store_path sri size; do
+        hash=$(capture_logged nix hash convert --from sri --to nix32 "$sri")
+        printf '%s\t%s\t%s\n' "$hash" "$size" "$store_path" >>"$ALL_INPUTS"
+    done <"$metadata"
+}
+
+deduplicate_input_identities() {
+    local sorted_inputs=$WORK/sorted-inputs
+    log_command sort -t $'\\t' -k1,1 -k2,2n "$ALL_INPUTS"
+    sort -t $'\t' -k1,1 -k2,2n "$ALL_INPUTS" >"$sorted_inputs"
+    awk -F '\t' '
+        {
+            if (!($1 in sizes)) {
+                sizes[$1] = $2
+                print
+            } else if (sizes[$1] != $2) {
+                printf "NAR hash %s has conflicting sizes\\n", $1 > "/dev/stderr"
+                exit 1
+            }
+        }
+    ' "$sorted_inputs" >"$INPUTS"
 }
 
 start_server() {
@@ -272,42 +335,91 @@ stop_servers() {
 upload_inputs() {
     local port=$1
     local netrc=$2
-    local file basename hash size
-    while IFS= read -r -d '' file; do
-        basename=${file##*/}
-        hash=${basename%.nar}
-        size=$(stat -c '%s' "$file")
-        run_logged curl --fail --silent --show-error \
-            --netrc-file "$netrc" \
-            -H "Content-Length: $size" \
-            --upload-file "$file" \
-            "http://127.0.0.1:$port/nar/$basename"
-    done < <(find "$INPUT_DIR" -type f -name '*.nar' -print0 | sort -z)
+    local hash size source
+    while IFS=$'\t' read -r hash size source; do
+        if [[ -n "$INPUT_DIR" ]]; then
+            run_logged curl --fail --silent --show-error \
+                --netrc-file "$netrc" \
+                -H "Content-Length: $size" \
+                --upload-file "$source" \
+                "http://127.0.0.1:$port/nar/$hash.nar"
+        else
+            upload_store_path "$port" "$netrc" "$hash" "$size" "$source"
+        fi
+    done <"$INPUTS"
+}
+
+upload_store_path() {
+    local port=$1
+    local netrc=$2
+    local hash=$3
+    local size=$4
+    local store_path=$5
+    log_command nix-store --dump "$store_path" '|' curl --fail --silent --show-error \
+        --netrc-file "$netrc" -H 'Transfer-Encoding:' -H "Content-Length: $size" \
+        --upload-file - \
+        "http://127.0.0.1:$port/nar/$hash.nar"
+    if nix-store --dump "$store_path" | curl --fail --silent --show-error \
+        --netrc-file "$netrc" \
+        -H 'Transfer-Encoding:' \
+        -H "Content-Length: $size" \
+        --upload-file - \
+        "http://127.0.0.1:$port/nar/$hash.nar"; then
+        return 0
+    fi
+    local -a statuses=("${PIPESTATUS[@]}")
+    printf 'streamed upload failed: nix-store=%s curl=%s\n' \
+        "${statuses[0]}" "${statuses[1]}" >&2
+    return 1
 }
 
 verify_inputs() {
     local label=$1
     local port=$2
-    local hash file downloaded
-    while IFS=$'\t' read -r hash size file; do
-        downloaded=$WORK/"$label"-"$hash".nar
-        run_logged curl --fail --silent --show-error \
-            "http://127.0.0.1:$port/nar/$hash.nar" -o "$downloaded"
-        cmp -- "$file" "$downloaded"
+    local hash size source
+    while IFS=$'\t' read -r hash size source; do
+        if [[ -n "$INPUT_DIR" ]]; then
+            local downloaded=$WORK/"$label"-"$hash".nar
+            run_logged curl --fail --silent --show-error \
+                "http://127.0.0.1:$port/nar/$hash.nar" -o "$downloaded"
+            cmp -- "$source" "$downloaded"
+        else
+            verify_store_path "$label" "$port" "$hash" "$source"
+        fi
     done <"$INPUTS"
+}
+
+verify_store_path() {
+    local label=$1
+    local port=$2
+    local hash=$3
+    local store_path=$4
+    log_command curl --fail --silent --show-error \
+        "http://127.0.0.1:$port/nar/$hash.nar" '|' cmp - '<(nix-store --dump ...)' \
+        "# label=$label store_path=$store_path"
+    if curl --fail --silent --show-error \
+        "http://127.0.0.1:$port/nar/$hash.nar" |
+        cmp - <(nix-store --dump "$store_path"); then
+        return 0
+    fi
+    local -a statuses=("${PIPESTATUS[@]}")
+    printf 'streamed verification failed: curl=%s cmp=%s\n' \
+        "${statuses[0]}" "${statuses[1]}" >&2
+    return 1
 }
 
 assert_empty_data_dir "$FLAT_DATA"
 assert_empty_data_dir "$CHUNKED_DATA"
-record_inputs
+if [[ -n "$INPUT_DIR" ]]; then
+    record_inputs
+else
+    record_store_inputs
+fi
+deduplicate_input_identities
 [[ -s "$INPUTS" ]] || {
-    printf '%s\n' 'input directory contains no .nar files' >&2
+    printf '%s\n' 'input selection contains no NAR files' >&2
     exit 1
 }
-if ! awk -F '\t' '{ if (seen[$1]++) exit 1 }' "$INPUTS"; then
-    printf '%s\n' 'input directory contains duplicate NAR hashes' >&2
-    exit 1
-fi
 
 flat_dataset=$(dataset_for_mountpoint "$FLAT_DATA")
 chunked_dataset=$(dataset_for_mountpoint "$CHUNKED_DATA")
@@ -315,8 +427,8 @@ chunked_dataset=$(dataset_for_mountpoint "$CHUNKED_DATA")
     printf '%s\n' 'both DATA paths must be direct ZFS dataset mountpoints' >&2
     exit 1
 }
-flat_pool=$(capture_logged zpool list -H -o name "$flat_dataset")
-chunked_pool=$(capture_logged zpool list -H -o name "$chunked_dataset")
+flat_pool=$(capture_logged zpool list -H -o name "${flat_dataset%%/*}")
+chunked_pool=$(capture_logged zpool list -H -o name "${chunked_dataset%%/*}")
 [[ "$flat_pool" == "$chunked_pool" ]] || {
     printf '%s\n' 'flat and chunked datasets must use the same ZFS pool' >&2
     exit 1
@@ -360,9 +472,13 @@ printf 'usedbydataset\t%s\t%s\n' "$flat_dataset_used" "$chunked_dataset_used" >>
 awk -F '\t' -v flat="$flat_used" -v chunked="$chunked_used" \
     'BEGIN { if (flat == 0) exit 1; printf "physical_savings\t%.6f\t-\n", 1 - chunked / flat }' \
     >>"$RESULTS"
+input_path_count=$(wc -l <"$ALL_INPUTS")
 input_count=$(wc -l <"$INPUTS")
+logical_closure_bytes=$(awk -F '\t' '{ total += $2 } END { print total + 0 }' "$ALL_INPUTS")
 logical_input_bytes=$(awk -F '\t' '{ total += $2 } END { print total + 0 }' "$INPUTS")
-printf 'input_files\t%s\t%s\n' "$input_count" "$input_count" >>"$RESULTS"
-printf 'logical_input_bytes\t%s\t%s\n' "$logical_input_bytes" "$logical_input_bytes" >>"$RESULTS"
+printf 'input_paths\t%s\t%s\n' "$input_path_count" "$input_path_count" >>"$RESULTS"
+printf 'unique_nar_objects\t%s\t%s\n' "$input_count" "$input_count" >>"$RESULTS"
+printf 'logical_closure_nar_bytes\t%s\t%s\n' "$logical_closure_bytes" "$logical_closure_bytes" >>"$RESULTS"
+printf 'logical_unique_nar_bytes\t%s\t%s\n' "$logical_input_bytes" "$logical_input_bytes" >>"$RESULTS"
 
 printf 'results: %s\n' "$RESULTS"

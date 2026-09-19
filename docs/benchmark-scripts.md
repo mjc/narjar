@@ -17,11 +17,16 @@ The active helpers are:
 - `scripts/nar-report` for NAR manifest reporting and vector validation.
 - `scripts/casync-zfs-experiment` for a matched flat-versus-chunked storage
   experiment. It accepts two already-created, empty ZFS dataset mountpoints,
-  requires matching properties including `compression=zstd-19`, streams the
-  same `.nar` inputs through both HTTP servers, verifies byte-for-byte reads,
-  stops the writers, synchronizes the pool, and records logical and physical
-  counters plus the commands and server logs. It never creates, destroys,
-  mounts, unmounts, or changes datasets, and it refuses non-empty data roots.
+  requires matching properties including `compression=zstd-19`, and accepts
+  either a directory of `.nar` files or `--store-root PATH`. Store-root mode
+  queries that path's Nix closure for the authoritative `narHash`/`narSize`
+  metadata and streams `nix-store --dump` directly into each HTTP upload; it
+  does not create a second NAR corpus on disk. Repeated NAR identities in a
+  closure are recorded as path inputs but uploaded once, with their sizes
+  checked for consistency. Both modes verify byte-for-byte reads, stop the
+  writers, synchronize the pool, and record logical and physical counters plus
+  the commands and server logs. It never creates, destroys, mounts, unmounts,
+  or changes datasets, and it refuses non-empty data roots.
 
 `tests/measurement-scripts.sh` continues to exercise the older streaming
 helpers with small fake binaries; it does not require a large corpus.
