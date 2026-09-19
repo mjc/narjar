@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use data_encoding::BASE64;
 use ed25519_dalek::{Signer, SigningKey};
 
-use narjar::narinfo::NarInfoMetadata;
+use super::NarInfoMetadata;
 
 pub(super) fn sign_metadata(
     key_path: &Path,
@@ -83,7 +83,6 @@ fn valid_key_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use ed25519_dalek::Verifier;
-    use narjar::narinfo::NarInfoMetadata;
     use narjar::object::{NarHash, NarIdentity, NarSize};
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -125,7 +124,7 @@ mod tests {
             ],
             Vec::new(),
         )
-        .expect("test metadata should be valid")];
+        .expect("valid fixture metadata")];
         sign_metadata(key.path(), &mut metadata).expect("sign metadata");
 
         let (name, encoded) = metadata[0].signatures()[0]

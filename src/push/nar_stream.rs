@@ -7,9 +7,9 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+use super::{NarInfoMetadata, payload::write_encoded_nar};
 use narjar::nar_encode::{EncodeSummary, Encoder, Event};
-use narjar::narinfo::NarInfoMetadata;
-use narjar::object::{CompressionCodec, EncodedIdentity, FileHash, NarHash, NarIdentity};
+use narjar::object::{CompressionCodec, EncodedIdentity, FileHash, NarHash};
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -38,23 +38,13 @@ pub(super) fn verify_nar_summary(
     info: &NarInfoMetadata,
     summary: &EncodeSummary,
 ) -> Result<(), String> {
-    verify_nar_identity(
-        info.claims().identity(),
-        info.claims().store_path(),
-        summary,
-    )
-}
-
-fn verify_nar_identity(
-    expected: NarIdentity,
-    source: impl std::fmt::Display,
-    summary: &EncodeSummary,
-) -> Result<(), String> {
+    let expected = info.claims().identity();
     let expected_hash = expected.hash();
     let actual_hash = NarHash::from_digest(summary.raw_sha256);
     if summary.raw_size != expected.size().get() || actual_hash != expected_hash {
         return Err(format!(
-            "NAR identity mismatch for {source}: expected {expected_hash}/{}; got {actual_hash}/{}",
+            "NAR identity mismatch for {}: expected {expected_hash}/{}; got {actual_hash}/{}",
+            info.claims().store_path(),
             expected.size(),
             summary.raw_size
         ));
@@ -73,7 +63,7 @@ fn open_verified_nar_reader_at(
     path: PathBuf,
 ) -> Result<Box<dyn Read + Send>, String> {
     let reader = VerifiedNarReader {
-        reader: spawn_nar_writer(path, NarStream::Raw)?,
+        reader: spawn_nar_writer(move |writer| write_nar(&path, writer).map(|_| ()))?,
         expected_hash: FileHash::from_nar_hash(info.claims().identity().hash()),
         expected_size: info.claims().identity().size().get(),
         digest: Sha256::new(),
@@ -88,14 +78,10 @@ pub(super) fn open_verified_encoded_nar_reader(
     codec: CompressionCodec,
     expected: EncodedIdentity,
 ) -> Result<Box<dyn Read + Send>, String> {
+    let path = local_store_path(info.claims().store_path())?;
+    let info = info.clone();
     let reader = VerifiedNarReader {
-        reader: spawn_nar_writer(
-            local_store_path(info.claims().store_path())?,
-            NarStream::Compressed {
-                codec,
-                expected: info.claims().identity(),
-            },
-        )?,
+        reader: spawn_nar_writer(move |writer| write_encoded_nar(&path, &info, codec, writer))?,
         expected_hash: expected.hash(),
         expected_size: expected.size().get(),
         digest: Sha256::new(),
@@ -105,62 +91,17 @@ pub(super) fn open_verified_encoded_nar_reader(
     Ok(Box::new(reader))
 }
 
-enum NarStream {
-    Raw,
-    Compressed {
-        codec: CompressionCodec,
-        expected: NarIdentity,
-    },
-}
-
-fn spawn_nar_writer(path: PathBuf, stream: NarStream) -> Result<PipeReader, String> {
+fn spawn_nar_writer(
+    write: impl FnOnce(&mut std::io::PipeWriter) -> Result<(), String> + Send + 'static,
+) -> Result<PipeReader, String> {
     let (reader, mut writer) = io::pipe().map_err(|error| format!("creating NAR pipe: {error}"))?;
     thread::Builder::new()
         .name("narjar-nar-stream".into())
         .spawn(move || {
-            let result = match stream {
-                NarStream::Raw => write_nar(&path, &mut writer).map(|_| ()),
-                NarStream::Compressed { codec, expected } => {
-                    write_encoded_nar(&path, expected, codec, &mut writer)
-                }
-            };
-            let _ = result;
+            let _ = write(&mut writer);
         })
         .map_err(|error| format!("starting NAR serializer: {error}"))?;
     Ok(reader)
-}
-
-fn write_encoded_nar<W: Write>(
-    path: &Path,
-    expected: NarIdentity,
-    codec: CompressionCodec,
-    output: W,
-) -> Result<(), String> {
-    let mut output = output;
-    let summary = match codec {
-        CompressionCodec::Zstd => {
-            let mut encoder = structured_zstd::encoding::StreamingEncoder::new(
-                &mut output,
-                structured_zstd::encoding::CompressionLevel::Fastest,
-            );
-            let summary = write_nar(path, &mut encoder)?;
-            encoder
-                .finish()
-                .map_err(|error| format!("finishing zstd NAR: {error}"))?;
-            summary
-        }
-        CompressionCodec::Xz => {
-            let mut encoder =
-                lzma_rust2::XzWriter::new(&mut output, lzma_rust2::XzOptions::with_preset(1))
-                    .map_err(|error| format!("creating XZ encoder: {error}"))?;
-            let summary = write_nar(path, &mut encoder)?;
-            encoder
-                .finish()
-                .map_err(|error| format!("finishing XZ NAR: {error}"))?;
-            summary
-        }
-    };
-    verify_nar_identity(expected, path.display(), &summary)
 }
 
 struct VerifiedNarReader {
@@ -299,8 +240,8 @@ mod tests {
     use std::{convert::Infallible, fs, io::Read};
 
     use super::{open_verified_nar_reader_at, write_nar};
+    use crate::push::NarInfoMetadata;
     use narjar::nar::{Decoder, Event};
-    use narjar::narinfo::NarInfoMetadata;
     use narjar::object::{NarHash, NarIdentity, NarSize};
 
     #[test]
@@ -337,7 +278,7 @@ mod tests {
         let mut expected = Vec::new();
         let summary = write_nar(directory.path(), &mut expected).expect("measure NAR fixture");
         let info = NarInfoMetadata::from_store_metadata(
-            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-test".to_owned(),
+            "/nix/store/00000000000000000000000000000000-fixture".to_owned(),
             None,
             None,
             NarIdentity::new(
@@ -347,7 +288,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
-        .expect("test metadata should be valid");
+        .expect("valid fixture metadata");
 
         let mut reader = open_verified_nar_reader_at(&info, directory.path().to_owned())
             .expect("open NAR stream");

@@ -5,7 +5,7 @@ use std::{
 
 use sqlite::{Connection, OpenFlags, State};
 
-use narjar::narinfo::NarInfoMetadata;
+use super::NarInfoMetadata;
 use narjar::object::{NarHash, NarIdentity, NarSize};
 
 const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
@@ -122,7 +122,7 @@ impl LocalStore {
             references,
             signatures,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| format!("invalid Nix path metadata for {path}: {error}"))
     }
 
     fn references(&self, id: i64) -> Result<Vec<String>, String> {

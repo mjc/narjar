@@ -1,13 +1,16 @@
 use std::{
+    fmt,
     num::{NonZeroU64, NonZeroUsize},
-    path::{Path, PathBuf},
+    path::PathBuf,
     thread,
     time::Duration,
 };
 
 use clap::Args;
-use narjar::narinfo::NarInfoMetadata;
-use narjar::object::{CompressionCodec, NarRepresentation, WireEncoding};
+use narjar::{
+    narinfo::NarInfoMetadata,
+    object::{NarRepresentation, WireEncoding},
+};
 use ureq::Agent;
 
 use crate::{error::Error, http_url::HttpUrl, operator::netrc_authorization};
@@ -19,15 +22,17 @@ mod root;
 mod signing;
 mod store;
 mod transfer;
+mod upstream;
 use nar_stream::{open_verified_encoded_nar_reader, open_verified_nar_reader};
-use payload::prepare_nar;
+use payload::measure_encoded_nar;
 use plan::dependency_waves;
 use root::StoreRoots;
 use signing::sign_metadata;
 use store::LocalStore;
 #[cfg(test)]
-use transfer::put_file;
-use transfer::{put_bytes, put_reader, request_status};
+use transfer::{get_bounded, put_file, request_status};
+use transfer::{put_bytes, put_reader};
+use upstream::{CacheLookup, PushDisposition, TrustedUpstreams};
 
 #[derive(Debug, Args)]
 pub(crate) struct Push {
@@ -63,250 +68,359 @@ pub(crate) struct Push {
     #[arg(long)]
     refresh: bool,
 
+    /// Trusted binary cache consulted before generating an upload. Repeat in lookup order.
+    #[arg(long = "trusted-upstream", value_name = "URL")]
+    trusted_upstreams: Vec<HttpUrl>,
+
+    /// Nix public key trusted for one upstream: UPSTREAM#NAME:BASE64. Repeat for key rotation.
+    #[arg(long = "trusted-upstream-key", value_name = "UPSTREAM#NAME:BASE64")]
+    trusted_upstream_keys: Vec<String>,
+
     /// Concrete local store paths whose closures should be pushed.
     #[arg(value_name = "STORE_PATH", required = true, num_args = 1..)]
     paths: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExistingNarinfo {
-    Skip,
+enum DestinationNarinfoPolicy {
+    ReuseExisting,
     Refresh,
 }
 
-enum NarinfoUpload {
-    Skip,
-    Required,
-}
-
-impl From<bool> for ExistingNarinfo {
-    fn from(refresh: bool) -> Self {
+impl DestinationNarinfoPolicy {
+    const fn from_refresh_flag(refresh: bool) -> Self {
         match refresh {
             true => Self::Refresh,
-            false => Self::Skip,
+            false => Self::ReuseExisting,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PushReport {
+    uploaded: usize,
+    destination_present: usize,
+    trusted_upstream_present: usize,
+}
+
+impl PushReport {
+    fn merge(&mut self, other: Self) {
+        self.uploaded += other.uploaded;
+        self.destination_present += other.destination_present;
+        self.trusted_upstream_present += other.trusted_upstream_present;
+    }
+
+    fn record(&mut self, outcome: PushOutcome) {
+        match outcome {
+            PushOutcome::Uploaded => self.uploaded += 1,
+            PushOutcome::DestinationPresent => self.destination_present += 1,
+            PushOutcome::TrustedUpstreamPresent => self.trusted_upstream_present += 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PushOutcome {
+    Uploaded,
+    DestinationPresent,
+    TrustedUpstreamPresent,
+}
+
+#[derive(Clone)]
+struct NativeCopyOptions {
+    target: HttpUrl,
+    netrc_file: Option<PathBuf>,
+    insecure_http: bool,
+    destination_narinfo: DestinationNarinfoPolicy,
+    compression: WireEncoding,
+    timeout_seconds: NonZeroU64,
+    trusted_upstreams: TrustedUpstreams,
+}
+
+impl NativeCopyOptions {
+    fn from_args(args: &Push) -> Result<Self, Error> {
+        let trusted_upstreams = TrustedUpstreams::from_configuration(
+            &args.trusted_upstreams,
+            &args.trusted_upstream_keys,
+        )
+        .map_err(Error::runtime)?;
+        Ok(Self {
+            target: args.to.clone(),
+            netrc_file: args.netrc_file.clone(),
+            insecure_http: args.insecure_http,
+            destination_narinfo: DestinationNarinfoPolicy::from_refresh_flag(args.refresh),
+            compression: args.compression,
+            timeout_seconds: args.timeout_seconds,
+            trusted_upstreams,
+        })
+    }
+}
+
+struct PreparedPush {
+    _roots: StoreRoots,
+    waves: Vec<Vec<NarInfoMetadata>>,
+}
+
+impl PreparedPush {
+    fn total_paths(&self) -> usize {
+        self.waves.iter().map(Vec::len).sum()
     }
 }
 
 pub(crate) fn run(args: Push) -> Result<(), Error> {
+    let copy_options = NativeCopyOptions::from_args(&args)?;
+    let prepared = prepare_push(&args)?;
+    let worker_count = args.jobs.get().min(prepared.total_paths());
+    let report = run_dependency_waves(&prepared.waves, &copy_options, args.jobs)?;
+    println!(
+        "push complete: uploaded {}, destination-present {}, trusted-upstream-present {}; {worker_count} workers",
+        report.uploaded, report.destination_present, report.trusted_upstream_present
+    );
+    Ok(())
+}
+
+fn prepare_push(args: &Push) -> Result<PreparedPush, Error> {
     let mut metadata = LocalStore::open()
-        .and_then(|store| store.closure_paths(&args.paths))
+        .map_err(Error::runtime)?
+        .closure_paths(&args.paths)
         .map_err(Error::runtime)?;
-    let _roots = StoreRoots::hold(&args.paths).map_err(Error::runtime)?;
+    let roots = StoreRoots::hold(&args.paths).map_err(Error::runtime)?;
     if let Some(key_file) = args.signing_key_file.as_deref() {
         sign_metadata(key_file, &mut metadata).map_err(Error::runtime)?;
     }
-    let waves = dependency_waves(metadata)?;
-    let total_paths = waves.iter().map(Vec::len).sum::<usize>();
-    let worker_count = args.jobs.get().min(total_paths);
-    let existing_narinfo = ExistingNarinfo::from(args.refresh);
+    Ok(PreparedPush {
+        _roots: roots,
+        waves: dependency_waves(metadata)?,
+    })
+}
 
+fn run_dependency_waves(
+    waves: &[Vec<NarInfoMetadata>],
+    copy_options: &NativeCopyOptions,
+    jobs: NonZeroUsize,
+) -> Result<PushReport, Error> {
+    waves
+        .iter()
+        .try_fold(PushReport::default(), |mut report, wave| {
+            report.merge(run_dependency_wave(wave, copy_options, jobs)?);
+            Ok(report)
+        })
+}
+
+fn run_dependency_wave(
+    wave: &[NarInfoMetadata],
+    copy_options: &NativeCopyOptions,
+    jobs: NonZeroUsize,
+) -> Result<PushReport, Error> {
+    let worker_count = jobs.get().min(wave.len());
+    let chunk_size = wave.len().div_ceil(worker_count);
+    let workers = wave
+        .chunks(chunk_size)
+        .map(|metadata| spawn_copy_worker(copy_options, metadata))
+        .collect::<Vec<_>>();
+    collect_copy_worker_results(workers)
+}
+
+fn spawn_copy_worker(copy_options: &NativeCopyOptions, metadata: &[NarInfoMetadata]) -> CopyWorker {
+    let copy_options = copy_options.clone();
+    let metadata = metadata.to_vec();
+    thread::spawn(move || native_copy_paths(&copy_options, &metadata))
+}
+
+fn collect_copy_worker_results(workers: Vec<CopyWorker>) -> Result<PushReport, Error> {
+    let mut report = PushReport::default();
     let mut failures = 0;
-    for wave in waves {
-        let wave_worker_count = args.jobs.get().min(wave.len());
-        let chunk_size = wave.len().div_ceil(wave_worker_count);
-        let mut workers = Vec::with_capacity(wave_worker_count);
-
-        for chunk in wave.chunks(chunk_size) {
-            let target = args.to.clone();
-            let netrc_file = args.netrc_file.clone();
-            let insecure_http = args.insecure_http;
-            let compression = args.compression;
-            let timeout_seconds = args.timeout_seconds;
-            let metadata = chunk.to_vec();
-            workers.push(thread::spawn(move || {
-                native_copy_paths(
-                    &target,
-                    netrc_file.as_deref(),
-                    insecure_http,
-                    existing_narinfo,
-                    compression,
-                    timeout_seconds,
-                    &metadata,
-                )
-            }));
-        }
-
-        for worker in workers {
-            match worker.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(message)) => {
-                    eprintln!("narjar push: {message}");
-                    failures += 1;
-                }
-                Err(_) => {
-                    eprintln!("narjar push: worker panicked");
-                    failures += 1;
-                }
+    for worker in workers {
+        match join_copy_worker(worker) {
+            Ok(worker_report) => report.merge(worker_report),
+            Err(failure) => {
+                eprintln!("narjar push: {failure}");
+                failures += 1;
             }
         }
-        if failures != 0 {
-            break;
+    }
+    match failures {
+        0 => Ok(report),
+        failures => Err(Error::runtime(format!("{failures} push workers failed"))),
+    }
+}
+
+type CopyWorker = thread::JoinHandle<Result<PushReport, String>>;
+
+#[derive(Debug, Eq, PartialEq)]
+enum CopyWorkerFailure {
+    Push(String),
+    Panicked,
+}
+
+impl fmt::Display for CopyWorkerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Push(message) => formatter.write_str(message),
+            Self::Panicked => formatter.write_str("worker panicked"),
         }
     }
+}
 
-    if failures == 0 {
-        println!("pushed {total_paths} paths with {worker_count} workers");
-        Ok(())
-    } else {
-        Err(Error::runtime(format!("{failures} push workers failed")))
+fn join_copy_worker(worker: CopyWorker) -> Result<PushReport, CopyWorkerFailure> {
+    match worker.join() {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(message)) => Err(CopyWorkerFailure::Push(message)),
+        Err(_) => Err(CopyWorkerFailure::Panicked),
     }
 }
 
 fn native_copy_paths(
-    target: &HttpUrl,
-    netrc_file: Option<&Path>,
-    insecure_http: bool,
-    existing_narinfo: ExistingNarinfo,
-    compression: WireEncoding,
-    timeout_seconds: NonZeroU64,
+    options: &NativeCopyOptions,
     metadata: &[NarInfoMetadata],
-) -> Result<(), String> {
-    let authorization = netrc_file
-        .map(|path| {
-            netrc_authorization(path, target, insecure_http).map_err(|error| error.to_string())
+) -> Result<PushReport, String> {
+    let client = UploadClient::new(options)?;
+    let lookup = CacheLookup::new(
+        &client.agent,
+        &options.target,
+        client.authorization.as_deref(),
+        options.destination_narinfo,
+        &options.trusted_upstreams,
+    );
+
+    metadata
+        .iter()
+        .try_fold(PushReport::default(), |mut report, info| {
+            report.record(copy_path(&lookup, &client, options, info)?);
+            Ok(report)
         })
-        .transpose()?
-        .flatten();
-    let agent: Agent = Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(timeout_seconds.get())))
-        .build()
-        .into();
-
-    metadata.iter().try_for_each(|info| {
-        upload_store_path_when_destination_requires_it(
-            &agent,
-            target,
-            authorization.as_deref(),
-            existing_narinfo,
-            compression,
-            info,
-        )
-    })
 }
 
-fn upload_store_path_when_destination_requires_it(
-    agent: &Agent,
-    target: &HttpUrl,
-    authorization: Option<&str>,
-    existing_narinfo: ExistingNarinfo,
-    compression: WireEncoding,
-    info: &NarInfoMetadata,
-) -> Result<(), String> {
-    let narinfo_name = format!("{}.narinfo", info.claims().store().as_str());
-    let narinfo_url = target.endpoint(&[&narinfo_name]);
-    match required_narinfo_upload(agent, &narinfo_url, authorization, existing_narinfo, info)? {
-        NarinfoUpload::Skip => Ok(()),
-        NarinfoUpload::Required => match compression {
-            WireEncoding::Raw => {
-                upload_raw_nar_and_narinfo(agent, target, authorization, info, &narinfo_url)
-            }
-            WireEncoding::Compressed(codec) => upload_compressed_nar_and_narinfo(
-                agent,
-                target,
-                authorization,
-                info,
-                &narinfo_url,
-                codec,
-            ),
-        },
+struct UploadClient {
+    agent: Agent,
+    authorization: Option<String>,
+}
+
+impl UploadClient {
+    fn new(options: &NativeCopyOptions) -> Result<Self, String> {
+        let authorization = authorization_for_destination(options)?;
+        let agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(options.timeout_seconds.get())))
+            .build()
+            .into();
+        Ok(Self {
+            agent,
+            authorization,
+        })
+    }
+
+    fn upload_path(
+        &self,
+        target: &HttpUrl,
+        compression: WireEncoding,
+        info: &NarInfoMetadata,
+    ) -> Result<(), String> {
+        let narinfo_url =
+            target.endpoint(&[&format!("{}.narinfo", info.claims().store().as_str())]);
+        let payload = prepare_nar_upload(info, compression)?;
+        let nar_name = payload.file_name().to_string();
+        let nar_url = target.endpoint(&["nar", &nar_name]);
+        let nar_status = put_reader(
+            &self.agent,
+            &nar_url,
+            payload.encoded_size().get(),
+            "application/x-nix-nar",
+            self.authorization.as_deref(),
+            || open_upload_reader(payload, info),
+        )?;
+        require_successful_upload(UploadArtifact::Nar, info, nar_status)?;
+
+        let narinfo = info.serialize(payload).map_err(|error| error.to_string())?;
+        let narinfo_status = put_bytes(
+            &self.agent,
+            &narinfo_url,
+            &narinfo,
+            "text/x-nix-narinfo",
+            self.authorization.as_deref(),
+        )?;
+        require_successful_upload(UploadArtifact::Narinfo, info, narinfo_status)
     }
 }
 
-fn required_narinfo_upload(
-    agent: &Agent,
-    narinfo_url: &HttpUrl,
-    authorization: Option<&str>,
-    existing_narinfo: ExistingNarinfo,
+fn authorization_for_destination(options: &NativeCopyOptions) -> Result<Option<String>, String> {
+    match options.netrc_file.as_deref() {
+        Some(path) => netrc_authorization(path, &options.target, options.insecure_http)
+            .map_err(|error| error.to_string()),
+        None => Ok(None),
+    }
+}
+
+fn copy_path(
+    lookup: &CacheLookup<'_>,
+    client: &UploadClient,
+    options: &NativeCopyOptions,
     info: &NarInfoMetadata,
-) -> Result<NarinfoUpload, String> {
-    match existing_narinfo {
-        ExistingNarinfo::Refresh => Ok(NarinfoUpload::Required),
-        ExistingNarinfo::Skip => match request_status(agent, narinfo_url, authorization)? {
-            200 => Ok(NarinfoUpload::Skip),
-            404 => Ok(NarinfoUpload::Required),
-            status => Err(format!(
-                "narinfo lookup for {} returned HTTP {status}",
+) -> Result<PushOutcome, String> {
+    match lookup.classify(info)? {
+        PushDisposition::DestinationPresent => Ok(PushOutcome::DestinationPresent),
+        PushDisposition::TrustedUpstreamPresent(upstream) => {
+            println!(
+                "skipped {}: trusted upstream {upstream}",
                 info.claims().store_path()
-            )),
-        },
+            );
+            Ok(PushOutcome::TrustedUpstreamPresent)
+        }
+        PushDisposition::UploadRequired => {
+            client.upload_path(&options.target, options.compression, info)?;
+            Ok(PushOutcome::Uploaded)
+        }
     }
 }
 
-fn upload_raw_nar_and_narinfo(
-    agent: &Agent,
-    target: &HttpUrl,
-    authorization: Option<&str>,
+fn prepare_nar_upload(
     info: &NarInfoMetadata,
-    narinfo_url: &HttpUrl,
-) -> Result<(), String> {
-    let representation = NarRepresentation::Raw(info.claims().identity());
-    let nar_name = representation.file_name().to_string();
-    let status = put_reader(
-        agent,
-        &target.endpoint(&["nar", &nar_name]),
-        representation.encoded_size().get(),
-        "application/x-nix-nar",
-        authorization,
-        || open_verified_nar_reader(info),
-    )?;
-    require_successful_upload("NAR", info, status)?;
-    upload_narinfo(agent, authorization, narinfo_url, info, representation)
+    encoding: WireEncoding,
+) -> Result<NarRepresentation, String> {
+    match encoding {
+        WireEncoding::Raw => Ok(NarRepresentation::Raw(info.claims().identity())),
+        WireEncoding::Compressed(codec) => measure_encoded_nar(info, codec)
+            .map(|encoded| NarRepresentation::compressed(encoded, info.claims().identity())),
+    }
 }
 
-fn upload_compressed_nar_and_narinfo(
-    agent: &Agent,
-    target: &HttpUrl,
-    authorization: Option<&str>,
-    info: &NarInfoMetadata,
-    narinfo_url: &HttpUrl,
-    codec: CompressionCodec,
-) -> Result<(), String> {
-    let encoded = prepare_nar(info, codec)?;
-    let representation = NarRepresentation::compressed(encoded, info.claims().identity());
-    let nar_name = representation.file_name().to_string();
-    let status = put_reader(
-        agent,
-        &target.endpoint(&["nar", &nar_name]),
-        representation.encoded_size().get(),
-        "application/x-nix-nar",
-        authorization,
-        || open_verified_encoded_nar_reader(info, codec, encoded),
-    )?;
-    require_successful_upload("NAR", info, status)?;
-    upload_narinfo(agent, authorization, narinfo_url, info, representation)
-}
-
-fn upload_narinfo(
-    agent: &Agent,
-    authorization: Option<&str>,
-    narinfo_url: &HttpUrl,
-    info: &NarInfoMetadata,
+fn open_upload_reader(
     representation: NarRepresentation,
-) -> Result<(), String> {
-    let narinfo = info
-        .serialize(representation)
-        .map_err(|error| error.to_string())?;
-    let status = put_bytes(
-        agent,
-        narinfo_url,
-        &narinfo,
-        "text/x-nix-narinfo",
-        authorization,
-    )?;
-    require_successful_upload("narinfo", info, status)
+    info: &NarInfoMetadata,
+) -> Result<Box<dyn std::io::Read + Send>, String> {
+    match representation {
+        NarRepresentation::Raw(_) => open_verified_nar_reader(info),
+        NarRepresentation::Compressed(identity) => {
+            let encoded = identity.encoded();
+            open_verified_encoded_nar_reader(info, encoded.codec(), encoded)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UploadArtifact {
+    Nar,
+    Narinfo,
+}
+
+impl fmt::Display for UploadArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Nar => formatter.write_str("NAR"),
+            Self::Narinfo => formatter.write_str("narinfo"),
+        }
+    }
 }
 
 fn require_successful_upload(
-    kind: &str,
+    artifact: UploadArtifact,
     info: &NarInfoMetadata,
     status: u16,
 ) -> Result<(), String> {
     match status {
         200 | 201 => Ok(()),
         _ => Err(format!(
-            "{kind} upload for {} returned HTTP {status}",
+            "{artifact} upload for {} returned HTTP {status}",
             info.claims().store_path()
         )),
     }
@@ -317,9 +431,8 @@ mod tests {
     use clap::{Args, Command, FromArgMatches};
 
     use super::transfer::{is_retryable_status, retry_after_delay};
-    use super::{Agent, Push, dependency_waves};
+    use super::{Agent, NarInfoMetadata, Push, TrustedUpstreams, dependency_waves};
     use crate::http_url::HttpUrl;
-    use narjar::narinfo::NarInfoMetadata;
     use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
 
     fn http_url(value: impl AsRef<str>) -> HttpUrl {
@@ -334,7 +447,7 @@ mod tests {
         )
     }
 
-    fn test_metadata(path: &str, references: Vec<String>) -> NarInfoMetadata {
+    fn test_narinfo_metadata(path: &str, references: Vec<String>) -> NarInfoMetadata {
         NarInfoMetadata::from_store_metadata(
             path.to_owned(),
             None,
@@ -343,7 +456,7 @@ mod tests {
             references,
             Vec::new(),
         )
-        .expect("test metadata should be valid")
+        .expect("valid narinfo metadata fixture")
     }
     use std::time::Duration;
 
@@ -360,12 +473,11 @@ mod tests {
             ],
             vec!["cache.example:signature".to_owned()],
         )
-        .expect("test metadata should be valid");
+        .expect("valid narinfo metadata fixture");
 
-        let identity = info.claims().identity();
         let bytes = info
-            .serialize(NarRepresentation::Raw(identity))
-            .expect("path-info metadata should serialize");
+            .serialize(NarRepresentation::Raw(info.claims().identity()))
+            .expect("narinfo metadata should serialize");
         assert_eq!(
             String::from_utf8(bytes).expect("narinfo should be UTF-8"),
             "StorePath: /nix/store/0123456789abcdfghijklmnpqrsvwxyz-package\n\
@@ -449,6 +561,44 @@ mod tests {
             200
         );
         server.join().expect("retry test server should exit");
+    }
+
+    #[test]
+    fn bounded_get_rejects_an_oversized_response() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind bounded GET listener");
+        let address = listener.local_addr().expect("inspect bounded GET listener");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept bounded GET request");
+            let mut request = [0];
+            stream
+                .read_exact(&mut request)
+                .expect("read bounded GET request");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345"
+            )
+            .expect("write oversized GET response");
+        });
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        let error = super::get_bounded(
+            &agent,
+            &http_url(format!("http://{address}/narinfo")),
+            None,
+            4,
+        )
+        .expect_err("oversized GET response must be rejected");
+        assert!(error.contains("exceeded 4 bytes"));
+        server.join().expect("bounded GET server should exit");
     }
 
     #[test]
@@ -839,12 +989,66 @@ mod tests {
     }
 
     #[test]
+    fn trusted_upstream_urls_and_keys_must_be_configured_together() {
+        for arguments in [
+            [
+                "push",
+                "--to",
+                "https://cache.example",
+                "--trusted-upstream",
+                "https://cache.nixos.org",
+                "/run/current-system",
+            ]
+            .as_slice(),
+            [
+                "push",
+                "--to",
+                "https://cache.example",
+                "--trusted-upstream-key",
+                "https://cache.example#cache.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "/run/current-system",
+            ]
+            .as_slice(),
+        ] {
+            let matches = Push::augment_args(Command::new("push"))
+                .try_get_matches_from(arguments)
+                .expect("individual upstream options should parse");
+            let push = Push::from_arg_matches(&matches).expect("push arguments should parse");
+            assert!(
+                TrustedUpstreams::from_configuration(
+                    &push.trusted_upstreams,
+                    &push.trusted_upstream_keys,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_upstream_keys_must_name_each_configured_upstream() {
+        let urls = [
+            http_url("https://first.example"),
+            http_url("https://second.example"),
+        ];
+        let first_key =
+            "https://first.example#first:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned();
+        assert!(TrustedUpstreams::from_configuration(&urls, &[first_key]).is_err());
+
+        let unknown_key =
+            "https://unknown.example#unknown:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                .to_owned();
+        assert!(TrustedUpstreams::from_configuration(&urls, &[unknown_key]).is_err());
+    }
+
+    #[test]
     fn dependency_waves_put_references_before_dependents() {
-        let dependency_path = "/nix/store/00000000000000000000000000000000-dependency";
-        let dependency = test_metadata(dependency_path, Vec::new());
-        let dependent = test_metadata(
+        let dependency = test_narinfo_metadata(
+            "/nix/store/00000000000000000000000000000000-dependency",
+            Vec::new(),
+        );
+        let dependent = test_narinfo_metadata(
             "/nix/store/11111111111111111111111111111111-dependent",
-            vec![dependency_path.to_owned()],
+            vec![dependency.claims().store_path().to_owned()],
         );
 
         let waves = dependency_waves(vec![dependent, dependency]).expect("acyclic closure");
@@ -868,7 +1072,7 @@ mod tests {
     #[test]
     fn dependency_waves_ignore_self_references() {
         let path = "/nix/store/00000000000000000000000000000000-self-referencing";
-        let info = test_metadata(path, vec![path.to_owned()]);
+        let info = test_narinfo_metadata(path, vec![path.to_owned()]);
 
         let waves =
             dependency_waves(vec![info]).expect("self references are not dependency cycles");
@@ -879,7 +1083,7 @@ mod tests {
 
     #[test]
     fn dependency_waves_reject_missing_references() {
-        let info = test_metadata(
+        let info = test_narinfo_metadata(
             "/nix/store/11111111111111111111111111111111-dependent",
             vec!["/nix/store/00000000000000000000000000000000-missing".to_owned()],
         );
