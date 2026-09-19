@@ -261,6 +261,28 @@ impl CompressionCodec {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum NarRepresentation {
+    Raw(NarIdentity),
+    Compressed(EncodedIdentity),
+}
+
+impl NarRepresentation {
+    pub(crate) const fn file_name(self) -> NarFileName {
+        match self {
+            Self::Raw(identity) => NarFileName::raw(identity.hash()),
+            Self::Compressed(identity) => identity.file_name(),
+        }
+    }
+
+    pub(crate) const fn encoded_size(self) -> EncodedSize {
+        match self {
+            Self::Raw(identity) => EncodedSize::new(identity.size().get()),
+            Self::Compressed(identity) => identity.size(),
+        }
+    }
+}
+
 impl WireEncoding {
     pub(crate) const fn compression(self) -> &'static str {
         match self {

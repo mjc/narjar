@@ -12,9 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::narinfo::ValidatedPayload;
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
-    NarSize, WireEncoding,
+    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarHash, NarIdentity,
+    NarRepresentation, NarSize, WireEncoding,
 };
+
+#[cfg(test)]
+use crate::object::NarFileName;
 
 use super::EGRESS_RECEIPT_DIRECTORY;
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
@@ -119,27 +122,6 @@ impl EgressSlot {
 
     pub(super) fn lock_key(self) -> PathBuf {
         PathBuf::from(EGRESS_RECEIPT_DIRECTORY).join(self.receipt_name())
-    }
-}
-
-pub(super) enum EgressRepresentation {
-    Raw(NarIdentity),
-    Compressed(EncodedIdentity),
-}
-
-impl EgressRepresentation {
-    pub(super) fn file_name(&self) -> NarFileName {
-        match self {
-            Self::Raw(identity) => NarFileName::raw(identity.hash()),
-            Self::Compressed(output) => output.file_name(),
-        }
-    }
-
-    pub(super) fn size(&self) -> EncodedSize {
-        match self {
-            Self::Raw(identity) => identity.size().get().into(),
-            Self::Compressed(output) => output.size(),
-        }
     }
 }
 
@@ -456,9 +438,9 @@ impl Storage {
         raw: &StoredNar<'_>,
         encoding: WireEncoding,
         policy: NarUploadPolicy,
-    ) -> Result<EgressRepresentation, StorageError> {
+    ) -> Result<NarRepresentation, StorageError> {
         match encoding {
-            WireEncoding::Raw => Ok(EgressRepresentation::Raw(raw.identity())),
+            WireEncoding::Raw => Ok(NarRepresentation::Raw(raw.identity())),
             WireEncoding::Zstd => self.select_compressed(
                 raw,
                 EgressSlot::new(raw.identity(), CompressionCodec::Zstd),
@@ -477,7 +459,7 @@ impl Storage {
         raw: &StoredNar<'_>,
         slot: EgressSlot,
         policy: NarUploadPolicy,
-    ) -> Result<EgressRepresentation, StorageError> {
+    ) -> Result<NarRepresentation, StorageError> {
         let lock = self.destination_lock(slot.lock_key());
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let decision = self.resolve_derivative_work(slot)?;
@@ -488,7 +470,7 @@ impl Storage {
             }
         };
         self.publish_egress_receipt(EgressReceipt::new(slot, output.hash(), output.size()))?;
-        Ok(EgressRepresentation::Compressed(output))
+        Ok(NarRepresentation::Compressed(output))
     }
 
     fn resolve_derivative_work(&self, slot: EgressSlot) -> Result<DerivativeWork, StorageError> {
@@ -671,7 +653,7 @@ impl Storage {
             EgressSlot::new(identity, codec),
             NarUploadPolicy::new(u64::MAX, min_free_bytes),
         )
-        .map(|output| (output.file_name(), output.size()))
+        .map(|output| (output.file_name(), output.encoded_size()))
     }
 
     #[cfg(test)]

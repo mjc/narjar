@@ -654,7 +654,7 @@ impl Storage {
         let stored = self.open_verified_canonical_nar(narinfo.payload())?;
         let output = self.select_egress(&stored, output_encoding, policy)?;
         narinfo
-            .bind_raw(stored, output.file_name(), output.size())
+            .bind_raw(stored, output.file_name(), output.encoded_size())
             .map_err(|_| StorageError::NarMismatch)
     }
 
