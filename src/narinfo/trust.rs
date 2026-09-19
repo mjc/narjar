@@ -7,13 +7,14 @@ use std::{
 };
 
 use data_encoding::BASE64;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 
 use crate::storage::{Directory, StoreHash, open_regular_at};
 
 use super::{
-    NamedSignature, NarInfoError, PublishedNarInfoError, UnverifiedPublicationNarInfo,
-    ValidatedNarInfo, valid_name,
+    NamedSignature, NarInfoClaims, NarInfoDocument, NarInfoError, PublishedNarInfoError,
+    TrustedNarInfoClaims, UnverifiedPublicationNarInfo, ValidatedNarInfo, parse_narinfo_text,
+    valid_name,
 };
 
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
@@ -85,14 +86,19 @@ impl TrustedPublicKeys {
         self.inspect(route, bytes).map_err(|_| NarInfoError)
     }
 
-    pub fn verify_signature(&self, name: &str, fingerprint: &[u8], signature: &[u8]) -> bool {
-        let Some(key) = self.0.get(name) else {
-            return false;
-        };
-        let Ok(signature) = Signature::from_slice(signature) else {
-            return false;
-        };
-        key.verify_strict(fingerprint, &signature).is_ok()
+    pub fn verify_external_narinfo(
+        &self,
+        route: &StoreHash,
+        bytes: Vec<u8>,
+    ) -> Result<TrustedNarInfoClaims, NarInfoError> {
+        let text = parse_narinfo_text(bytes)?;
+        let document = NarInfoDocument::parse(&text)?;
+        document.validate_external_transport()?;
+        let claims = NarInfoClaims::from_document(route, &document)?;
+        let signatures = document.named_signatures()?;
+        self.verifies(claims.fingerprint().as_bytes(), &signatures)
+            .then_some(TrustedNarInfoClaims(claims))
+            .ok_or(NarInfoError)
     }
 
     pub(super) fn verifies(&self, fingerprint: &[u8], signatures: &[NamedSignature]) -> bool {

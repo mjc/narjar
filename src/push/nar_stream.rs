@@ -7,9 +7,9 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use super::{PathInfo, payload::write_encoded_nar};
-use crate::nar_encode::{EncodeSummary, Encoder, Event};
-use crate::object::{CompressionCodec, EncodedIdentity, FileHash, NarHash};
+use super::{NarInfoMetadata, payload::write_encoded_nar};
+use narjar::nar_encode::{EncodeSummary, Encoder, Event};
+use narjar::object::{CompressionCodec, EncodedIdentity, FileHash, NarHash};
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -34,32 +34,38 @@ pub(super) fn local_store_path(store_path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(root).join(relative))
 }
 
-pub(super) fn verify_nar_summary(info: &PathInfo, summary: &EncodeSummary) -> Result<(), String> {
-    let expected_hash = info.nar.hash();
+pub(super) fn verify_nar_summary(
+    info: &NarInfoMetadata,
+    summary: &EncodeSummary,
+) -> Result<(), String> {
+    let expected = info.claims().identity();
+    let expected_hash = expected.hash();
     let actual_hash = NarHash::from_digest(summary.raw_sha256);
-    if summary.raw_size != info.nar.size().get() || actual_hash != expected_hash {
+    if summary.raw_size != expected.size().get() || actual_hash != expected_hash {
         return Err(format!(
             "NAR identity mismatch for {}: expected {expected_hash}/{}; got {actual_hash}/{}",
-            info.path,
-            info.nar.size(),
+            info.claims().store_path(),
+            expected.size(),
             summary.raw_size
         ));
     }
     Ok(())
 }
 
-pub(super) fn open_verified_nar_reader(info: &PathInfo) -> Result<Box<dyn Read + Send>, String> {
-    open_verified_nar_reader_at(info, local_store_path(&info.path)?)
+pub(super) fn open_verified_nar_reader(
+    info: &NarInfoMetadata,
+) -> Result<Box<dyn Read + Send>, String> {
+    open_verified_nar_reader_at(info, local_store_path(info.claims().store_path())?)
 }
 
 fn open_verified_nar_reader_at(
-    info: &PathInfo,
+    info: &NarInfoMetadata,
     path: PathBuf,
 ) -> Result<Box<dyn Read + Send>, String> {
     let reader = VerifiedNarReader {
         reader: spawn_nar_writer(move |writer| write_nar(&path, writer).map(|_| ()))?,
-        expected_hash: FileHash::from_nar_hash(info.nar.hash()),
-        expected_size: info.nar.size().get(),
+        expected_hash: FileHash::from_nar_hash(info.claims().identity().hash()),
+        expected_size: info.claims().identity().size().get(),
         digest: Sha256::new(),
         bytes_read: 0,
         complete: false,
@@ -68,11 +74,11 @@ fn open_verified_nar_reader_at(
 }
 
 pub(super) fn open_verified_encoded_nar_reader(
-    info: &PathInfo,
+    info: &NarInfoMetadata,
     codec: CompressionCodec,
     expected: EncodedIdentity,
 ) -> Result<Box<dyn Read + Send>, String> {
-    let path = local_store_path(&info.path)?;
+    let path = local_store_path(info.claims().store_path())?;
     let info = info.clone();
     let reader = VerifiedNarReader {
         reader: spawn_nar_writer(move |writer| write_encoded_nar(&path, &info, codec, writer))?,
@@ -224,7 +230,7 @@ fn emit_symlink<W: Write>(encoder: &mut Encoder<W>, path: &Path) -> io::Result<(
         .map_err(encode_io_error)
 }
 
-fn encode_io_error(error: crate::nar_encode::EncodeError) -> io::Error {
+fn encode_io_error(error: narjar::nar_encode::EncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
@@ -234,9 +240,9 @@ mod tests {
     use std::{convert::Infallible, fs, io::Read};
 
     use super::{open_verified_nar_reader_at, write_nar};
-    use crate::nar::{Decoder, Event};
-    use crate::object::{NarHash, NarIdentity, NarSize};
-    use crate::push::PathInfo;
+    use crate::push::NarInfoMetadata;
+    use narjar::nar::{Decoder, Event};
+    use narjar::object::{NarHash, NarIdentity, NarSize};
 
     #[test]
     fn emits_a_canonical_sorted_directory_stream() {
@@ -271,17 +277,18 @@ mod tests {
             .expect("write NAR fixture");
         let mut expected = Vec::new();
         let summary = write_nar(directory.path(), &mut expected).expect("measure NAR fixture");
-        let info = PathInfo {
-            path: directory.path().display().to_string(),
-            ca: None,
-            deriver: None,
-            nar: NarIdentity::new(
+        let info = NarInfoMetadata::from_store_metadata(
+            "/nix/store/00000000000000000000000000000000-fixture".to_owned(),
+            None,
+            None,
+            NarIdentity::new(
                 NarHash::from_digest(summary.raw_sha256),
                 NarSize::new(summary.raw_size),
             ),
-            references: Vec::new(),
-            signatures: Vec::new(),
-        };
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid fixture metadata");
 
         let mut reader = open_verified_nar_reader_at(&info, directory.path().to_owned())
             .expect("open NAR stream");
@@ -290,6 +297,9 @@ mod tests {
             .read_to_end(&mut actual)
             .expect("read verified NAR stream");
         assert_eq!(actual, expected);
-        assert_eq!(info.nar.hash(), NarHash::from_digest(summary.raw_sha256));
+        assert_eq!(
+            info.claims().identity().hash(),
+            NarHash::from_digest(summary.raw_sha256)
+        );
     }
 }

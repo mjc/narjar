@@ -4,16 +4,16 @@ use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
-use super::PathInfo;
+use super::NarInfoMetadata;
 use super::nar_stream::{local_store_path, verify_nar_summary, write_nar};
-use crate::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
+use narjar::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
 
 pub(super) fn measure_encoded_nar(
-    info: &PathInfo,
+    info: &NarInfoMetadata,
     codec: CompressionCodec,
 ) -> Result<EncodedIdentity, String> {
     let mut measured = MeasuredWriter::new(io::sink());
-    let path = local_store_path(&info.path)?;
+    let path = local_store_path(info.claims().store_path())?;
     write_encoded_nar(&path, info, codec, &mut measured)?;
     let (_, file_hash, file_size) = measured.finish();
     Ok(EncodedIdentity::new(codec, file_hash, file_size))
@@ -21,7 +21,7 @@ pub(super) fn measure_encoded_nar(
 
 pub(super) fn write_encoded_nar<W: Write>(
     path: &std::path::Path,
-    info: &PathInfo,
+    info: &NarInfoMetadata,
     codec: CompressionCodec,
     mut output: W,
 ) -> Result<(), String> {

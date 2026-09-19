@@ -7,17 +7,15 @@ use std::{
 };
 
 use clap::Args;
+use narjar::{
+    narinfo::NarInfoMetadata,
+    object::{NarRepresentation, WireEncoding},
+};
 use ureq::Agent;
 
-use crate::{
-    error::Error,
-    http_url::HttpUrl,
-    object::{CompressionCodec, EncodedIdentity, EncodedSize, NarFileName, NarIdentity},
-    operator::netrc_authorization,
-};
+use crate::{error::Error, http_url::HttpUrl, operator::netrc_authorization};
 
 mod nar_stream;
-mod narinfo;
 mod payload;
 mod plan;
 mod root;
@@ -26,12 +24,11 @@ mod store;
 mod transfer;
 mod upstream;
 use nar_stream::{open_verified_encoded_nar_reader, open_verified_nar_reader};
-use narinfo::serialize_narinfo;
 use payload::measure_encoded_nar;
 use plan::dependency_waves;
 use root::StoreRoots;
 use signing::sign_metadata;
-use store::closure_paths;
+use store::LocalStore;
 #[cfg(test)]
 use transfer::{get_bounded, put_file, request_status};
 use transfer::{put_bytes, put_reader};
@@ -48,8 +45,8 @@ pub(crate) struct Push {
     jobs: NonZeroUsize,
 
     /// Compression used for the uploaded NAR payload; the cache independently selects its served representation.
-    #[arg(long, value_enum, default_value_t = UploadCompression::None)]
-    compression: UploadCompression,
+    #[arg(long, default_value = "none")]
+    compression: WireEncoding,
 
     /// Maximum time allowed for each native HTTP request.
     #[arg(long, env = "NARJAR_PUSH_TIMEOUT_SECONDS", default_value_t = NonZeroU64::new(30).unwrap())]
@@ -135,7 +132,7 @@ struct NativeCopyOptions {
     netrc_file: Option<PathBuf>,
     insecure_http: bool,
     destination_narinfo: DestinationNarinfoPolicy,
-    compression: UploadCompression,
+    compression: WireEncoding,
     timeout_seconds: NonZeroU64,
     trusted_upstreams: TrustedUpstreams,
 }
@@ -161,23 +158,13 @@ impl NativeCopyOptions {
 
 struct PreparedPush {
     _roots: StoreRoots,
-    waves: Vec<Vec<PathInfo>>,
+    waves: Vec<Vec<NarInfoMetadata>>,
 }
 
 impl PreparedPush {
     fn total_paths(&self) -> usize {
         self.waves.iter().map(Vec::len).sum()
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PathInfo {
-    path: String,
-    ca: Option<String>,
-    deriver: Option<String>,
-    nar: NarIdentity,
-    references: Vec<String>,
-    signatures: Vec<String>,
 }
 
 pub(crate) fn run(args: Push) -> Result<(), Error> {
@@ -193,7 +180,10 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
 }
 
 fn prepare_push(args: &Push) -> Result<PreparedPush, Error> {
-    let mut metadata = closure_paths(&args.paths).map_err(Error::runtime)?;
+    let mut metadata = LocalStore::open()
+        .map_err(Error::runtime)?
+        .closure_paths(&args.paths)
+        .map_err(Error::runtime)?;
     let roots = StoreRoots::hold(&args.paths).map_err(Error::runtime)?;
     if let Some(key_file) = args.signing_key_file.as_deref() {
         sign_metadata(key_file, &mut metadata).map_err(Error::runtime)?;
@@ -205,7 +195,7 @@ fn prepare_push(args: &Push) -> Result<PreparedPush, Error> {
 }
 
 fn run_dependency_waves(
-    waves: &[Vec<PathInfo>],
+    waves: &[Vec<NarInfoMetadata>],
     copy_options: &NativeCopyOptions,
     jobs: NonZeroUsize,
 ) -> Result<PushReport, Error> {
@@ -218,7 +208,7 @@ fn run_dependency_waves(
 }
 
 fn run_dependency_wave(
-    wave: &[PathInfo],
+    wave: &[NarInfoMetadata],
     copy_options: &NativeCopyOptions,
     jobs: NonZeroUsize,
 ) -> Result<PushReport, Error> {
@@ -231,7 +221,7 @@ fn run_dependency_wave(
     collect_copy_worker_results(workers)
 }
 
-fn spawn_copy_worker(copy_options: &NativeCopyOptions, metadata: &[PathInfo]) -> CopyWorker {
+fn spawn_copy_worker(copy_options: &NativeCopyOptions, metadata: &[NarInfoMetadata]) -> CopyWorker {
     let copy_options = copy_options.clone();
     let metadata = metadata.to_vec();
     thread::spawn(move || native_copy_paths(&copy_options, &metadata))
@@ -280,22 +270,15 @@ fn join_copy_worker(worker: CopyWorker) -> Result<PushReport, CopyWorkerFailure>
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
-enum UploadCompression {
-    None,
-    Zstd,
-    Xz,
-}
-
 fn native_copy_paths(
     options: &NativeCopyOptions,
-    metadata: &[PathInfo],
+    metadata: &[NarInfoMetadata],
 ) -> Result<PushReport, String> {
     let client = UploadClient::new(options)?;
     let lookup = CacheLookup::new(
         &client.agent,
         &options.target,
-        client.authorization(),
+        client.authorization.as_deref(),
         options.destination_narinfo,
         &options.trusted_upstreams,
     );
@@ -327,44 +310,36 @@ impl UploadClient {
         })
     }
 
-    fn authorization(&self) -> Option<&str> {
-        self.authorization.as_deref()
-    }
-
     fn upload_path(
         &self,
         target: &HttpUrl,
-        compression: UploadCompression,
-        info: &PathInfo,
+        compression: WireEncoding,
+        info: &NarInfoMetadata,
     ) -> Result<(), String> {
-        let narinfo_url = narinfo_url_for_path(target, info)?;
-        let payload = PreparedNarUpload::prepare(info, compression)?;
-        let file_name = payload.file_name();
-        let nar_name = file_name.to_string();
+        let narinfo_url =
+            target.endpoint(&[&format!("{}.narinfo", info.claims().store().as_str())]);
+        let payload = prepare_nar_upload(info, compression)?;
+        let nar_name = payload.file_name().to_string();
         let nar_url = target.endpoint(&["nar", &nar_name]);
         let nar_status = put_reader(
             &self.agent,
             &nar_url,
-            payload.size().get(),
+            payload.encoded_size().get(),
             "application/x-nix-nar",
-            self.authorization(),
-            || payload.open_reader(info),
+            self.authorization.as_deref(),
+            || open_upload_reader(payload, info),
         )?;
         require_successful_upload(UploadArtifact::Nar, info, nar_status)?;
 
-        let narinfo = serialize_narinfo(
-            info,
-            file_name.file_hash(),
-            payload.size(),
-            file_name.encoding(),
-        )?;
-        upload_narinfo(
+        let narinfo = info.serialize(payload).map_err(|error| error.to_string())?;
+        let narinfo_status = put_bytes(
             &self.agent,
             &narinfo_url,
-            self.authorization(),
-            info,
             &narinfo,
-        )
+            "text/x-nix-narinfo",
+            self.authorization.as_deref(),
+        )?;
+        require_successful_upload(UploadArtifact::Narinfo, info, narinfo_status)
     }
 }
 
@@ -380,15 +355,14 @@ fn copy_path(
     lookup: &CacheLookup<'_>,
     client: &UploadClient,
     options: &NativeCopyOptions,
-    info: &PathInfo,
+    info: &NarInfoMetadata,
 ) -> Result<PushOutcome, String> {
     match lookup.classify(info)? {
         PushDisposition::DestinationPresent => Ok(PushOutcome::DestinationPresent),
         PushDisposition::TrustedUpstreamPresent(upstream) => {
             println!(
-                "skipped {}: trusted upstream {}",
-                info.path,
-                upstream.identity()
+                "skipped {}: trusted upstream {upstream}",
+                info.claims().store_path()
             );
             Ok(PushOutcome::TrustedUpstreamPresent)
         }
@@ -399,69 +373,28 @@ fn copy_path(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreparedNarUpload {
-    Raw(NarIdentity),
-    Compressed(EncodedIdentity),
-}
-
-impl PreparedNarUpload {
-    fn prepare(info: &PathInfo, compression: UploadCompression) -> Result<Self, String> {
-        match compression {
-            UploadCompression::None => Ok(Self::Raw(info.nar)),
-            UploadCompression::Zstd => {
-                measure_encoded_nar(info, CompressionCodec::Zstd).map(Self::Compressed)
-            }
-            UploadCompression::Xz => {
-                measure_encoded_nar(info, CompressionCodec::Xz).map(Self::Compressed)
-            }
-        }
-    }
-
-    const fn size(self) -> EncodedSize {
-        match self {
-            Self::Raw(identity) => EncodedSize::new(identity.size().get()),
-            Self::Compressed(identity) => identity.size(),
-        }
-    }
-
-    const fn file_name(self) -> NarFileName {
-        match self {
-            Self::Raw(identity) => NarFileName::raw(identity.hash()),
-            Self::Compressed(identity) => identity.file_name(),
-        }
-    }
-
-    fn open_reader(self, info: &PathInfo) -> Result<Box<dyn std::io::Read + Send>, String> {
-        match self {
-            Self::Raw(_) => open_verified_nar_reader(info),
-            Self::Compressed(identity) => {
-                open_verified_encoded_nar_reader(info, identity.codec(), identity)
-            }
-        }
+fn prepare_nar_upload(
+    info: &NarInfoMetadata,
+    encoding: WireEncoding,
+) -> Result<NarRepresentation, String> {
+    match encoding {
+        WireEncoding::Raw => Ok(NarRepresentation::Raw(info.claims().identity())),
+        WireEncoding::Compressed(codec) => measure_encoded_nar(info, codec)
+            .map(|encoded| NarRepresentation::compressed(encoded, info.claims().identity())),
     }
 }
 
-fn narinfo_url_for_path(target: &HttpUrl, info: &PathInfo) -> Result<HttpUrl, String> {
-    let store_hash = store_hash_for_path(&info.path)?;
-    Ok(target.endpoint(&[&format!("{store_hash}.narinfo")]))
-}
-
-fn upload_narinfo(
-    agent: &Agent,
-    narinfo_url: &HttpUrl,
-    authorization: Option<&str>,
-    info: &PathInfo,
-    narinfo: &[u8],
-) -> Result<(), String> {
-    let status = put_bytes(
-        agent,
-        narinfo_url,
-        narinfo,
-        "text/x-nix-narinfo",
-        authorization,
-    )?;
-    require_successful_upload(UploadArtifact::Narinfo, info, status)
+fn open_upload_reader(
+    representation: NarRepresentation,
+    info: &NarInfoMetadata,
+) -> Result<Box<dyn std::io::Read + Send>, String> {
+    match representation {
+        NarRepresentation::Raw(_) => open_verified_nar_reader(info),
+        NarRepresentation::Compressed(identity) => {
+            let encoded = identity.encoded();
+            open_verified_encoded_nar_reader(info, encoded.codec(), encoded)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -481,33 +414,15 @@ impl fmt::Display for UploadArtifact {
 
 fn require_successful_upload(
     artifact: UploadArtifact,
-    info: &PathInfo,
+    info: &NarInfoMetadata,
     status: u16,
 ) -> Result<(), String> {
     match status {
         200 | 201 => Ok(()),
         _ => Err(format!(
             "{artifact} upload for {} returned HTTP {status}",
-            info.path
+            info.claims().store_path()
         )),
-    }
-}
-
-fn store_hash_for_path(path: &str) -> Result<&str, String> {
-    let basename = path
-        .strip_prefix("/nix/store/")
-        .ok_or_else(|| format!("invalid store path: {path}"))?;
-    let (hash, _name) = basename
-        .split_once('-')
-        .filter(|(hash, name)| hash.len() == 32 && !name.is_empty())
-        .ok_or_else(|| format!("invalid store path: {path}"))?;
-    if hash
-        .bytes()
-        .all(|byte| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&byte))
-    {
-        Ok(hash)
-    } else {
-        Err(format!("invalid store hash in path: {path}"))
     }
 }
 
@@ -516,9 +431,9 @@ mod tests {
     use clap::{Args, Command, FromArgMatches};
 
     use super::transfer::{is_retryable_status, retry_after_delay};
-    use super::{Agent, PathInfo, Push, TrustedUpstreams, dependency_waves, serialize_narinfo};
+    use super::{Agent, NarInfoMetadata, Push, TrustedUpstreams, dependency_waves};
     use crate::http_url::HttpUrl;
-    use crate::object::{EncodedSize, FileHash, NarHash, NarIdentity, NarSize, WireEncoding};
+    use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
 
     fn http_url(value: impl AsRef<str>) -> HttpUrl {
         value.as_ref().parse().expect("test HTTP URL should parse")
@@ -531,29 +446,38 @@ mod tests {
             NarSize::new(289_656),
         )
     }
+
+    fn test_narinfo_metadata(path: &str, references: Vec<String>) -> NarInfoMetadata {
+        NarInfoMetadata::from_store_metadata(
+            path.to_owned(),
+            None,
+            None,
+            test_nar_identity(),
+            references,
+            Vec::new(),
+        )
+        .expect("valid narinfo metadata fixture")
+    }
     use std::time::Duration;
 
     #[test]
-    fn serializes_signed_narinfo_from_path_info() {
-        let info = PathInfo {
-            path: "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package".to_owned(),
-            deriver: Some("/nix/store/abcdefghijklmnopqrstuvwxyz0123456789.drv".to_owned()),
-            nar: test_nar_identity(),
-            references: vec![
+    fn serializes_signed_narinfo_from_shared_metadata() {
+        let info = NarInfoMetadata::from_store_metadata(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package".to_owned(),
+            Some(format!("fixed:sha256:{}", "0".repeat(64))),
+            Some("/nix/store/11111111111111111111111111111111-deriver.drv".to_owned()),
+            test_nar_identity(),
+            vec![
                 "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency".to_owned(),
                 "/nix/store/11111111111111111111111111111111-dependency".to_owned(),
             ],
-            signatures: vec!["cache.example:signature".to_owned()],
-            ca: Some("fixed:sha256:0123456789abcdef".to_owned()),
-        };
-
-        let bytes = serialize_narinfo(
-            &info,
-            FileHash::from_nar_hash(info.nar.hash()),
-            EncodedSize::new(info.nar.size().get()),
-            WireEncoding::Raw,
+            vec!["cache.example:signature".to_owned()],
         )
-        .expect("path-info metadata should serialize");
+        .expect("valid narinfo metadata fixture");
+
+        let bytes = info
+            .serialize(NarRepresentation::Raw(info.claims().identity()))
+            .expect("narinfo metadata should serialize");
         assert_eq!(
             String::from_utf8(bytes).expect("narinfo should be UTF-8"),
             "StorePath: /nix/store/0123456789abcdfghijklmnpqrsvwxyz-package\n\
@@ -565,8 +489,8 @@ mod tests {
              NarSize: 289656\n\
              References: 11111111111111111111111111111111-dependency zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dependency\n\
              Sig: cache.example:signature\n\
-             Deriver: abcdefghijklmnopqrstuvwxyz0123456789.drv\n\
-             CA: fixed:sha256:0123456789abcdef\n"
+             Deriver: 11111111111111111111111111111111-deriver.drv\n\
+             CA: fixed:sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
         );
     }
 
@@ -1118,24 +1042,23 @@ mod tests {
 
     #[test]
     fn dependency_waves_put_references_before_dependents() {
-        let dependency = PathInfo {
-            path: "/nix/store/00000000000000000000000000000000-dependency".to_owned(),
-            ca: None,
-            deriver: None,
-            nar: test_nar_identity(),
-            references: Vec::new(),
-            signatures: Vec::new(),
-        };
-        let dependent = PathInfo {
-            path: "/nix/store/11111111111111111111111111111111-dependent".to_owned(),
-            references: vec![dependency.path.clone()],
-            ..dependency.clone()
-        };
+        let dependency = test_narinfo_metadata(
+            "/nix/store/00000000000000000000000000000000-dependency",
+            Vec::new(),
+        );
+        let dependent = test_narinfo_metadata(
+            "/nix/store/11111111111111111111111111111111-dependent",
+            vec![dependency.claims().store_path().to_owned()],
+        );
 
         let waves = dependency_waves(vec![dependent, dependency]).expect("acyclic closure");
         let paths = waves
             .into_iter()
-            .map(|wave| wave.into_iter().map(|info| info.path).collect::<Vec<_>>())
+            .map(|wave| {
+                wave.into_iter()
+                    .map(|info| info.claims().store_path().to_owned())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             paths,
@@ -1149,32 +1072,21 @@ mod tests {
     #[test]
     fn dependency_waves_ignore_self_references() {
         let path = "/nix/store/00000000000000000000000000000000-self-referencing";
-        let info = PathInfo {
-            path: path.to_owned(),
-            ca: None,
-            deriver: None,
-            nar: test_nar_identity(),
-            references: vec![path.to_owned()],
-            signatures: Vec::new(),
-        };
+        let info = test_narinfo_metadata(path, vec![path.to_owned()]);
 
         let waves =
             dependency_waves(vec![info]).expect("self references are not dependency cycles");
         assert_eq!(waves.len(), 1);
         assert_eq!(waves[0].len(), 1);
-        assert_eq!(waves[0][0].path, path);
+        assert_eq!(waves[0][0].claims().store_path(), path);
     }
 
     #[test]
     fn dependency_waves_reject_missing_references() {
-        let info = PathInfo {
-            path: "/nix/store/11111111111111111111111111111111-dependent".to_owned(),
-            ca: None,
-            deriver: None,
-            nar: test_nar_identity(),
-            references: vec!["/nix/store/00000000000000000000000000000000-missing".to_owned()],
-            signatures: Vec::new(),
-        };
+        let info = test_narinfo_metadata(
+            "/nix/store/11111111111111111111111111111111-dependent",
+            vec!["/nix/store/00000000000000000000000000000000-missing".to_owned()],
+        );
 
         let error = dependency_waves(vec![info]).expect_err("missing references must fail");
         assert!(

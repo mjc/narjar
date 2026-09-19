@@ -10,6 +10,7 @@ use crate::object::{
 use crate::storage::{StoreHash, StoredNar};
 use data_encoding::BASE64;
 use ed25519_dalek::Signature;
+use fluent_uri::UriRef;
 
 mod trust;
 
@@ -424,6 +425,41 @@ impl<'text> NarInfoDocument<'text> {
             .map_err(|_| NarInfoError)?;
         NarRepresentation::from_narinfo(file_name, file_hash, file_size, identity)
     }
+
+    fn validate_external_transport(&self) -> Result<(), NarInfoError> {
+        let url = self.required(NarInfoField::Url)?;
+        if url.is_empty() {
+            return Err(NarInfoError);
+        }
+        let uri = UriRef::parse(url).map_err(|_| NarInfoError)?;
+        if uri.has_fragment()
+            || uri
+                .scheme()
+                .is_some_and(|scheme| !["http", "https"].contains(&scheme.as_str()))
+        {
+            return Err(NarInfoError);
+        }
+        self.required(NarInfoField::Compression)?
+            .parse::<WireEncoding>()
+            .map_err(|_| NarInfoError)?;
+        match (
+            self.field(NarInfoField::FileHash),
+            self.field(NarInfoField::FileSize),
+        ) {
+            (None, None) => Ok(()),
+            (Some(hash), Some(size)) => {
+                hash.strip_prefix("sha256:")
+                    .ok_or(NarInfoError)
+                    .and_then(|value| FileHash::parse(value).map_err(|_| NarInfoError))?;
+                size.parse::<u64>()
+                    .ok()
+                    .filter(|size| *size != 0)
+                    .ok_or(NarInfoError)?;
+                Ok(())
+            }
+            _ => Err(NarInfoError),
+        }
+    }
 }
 
 fn set_once<'text>(
@@ -521,6 +557,16 @@ impl UnverifiedPublicationNarInfo {
 
 #[derive(Debug)]
 pub struct ValidatedNarInfo(PublicationNarInfo);
+
+/// Logical NAR claims proven by a configured trusted signature.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedNarInfoClaims(NarInfoClaims);
+
+impl TrustedNarInfoClaims {
+    pub fn claims(&self) -> &NarInfoClaims {
+        &self.0
+    }
+}
 
 impl NarRepresentation {
     fn from_narinfo(
