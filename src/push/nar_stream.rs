@@ -116,6 +116,7 @@ fn spawn_nar_writer(
 enum VerificationState {
     Streaming,
     Complete,
+    Failed,
 }
 
 struct VerifiedNarReader {
@@ -131,26 +132,32 @@ struct VerifiedNarReader {
 impl VerifiedNarReader {
     fn finish_stream(&mut self) -> io::Result<()> {
         let mut extra = [0; 1];
-        if self.reader.read(&mut extra)? != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "NAR serializer exceeded the declared size",
-            ));
-        }
-        match self.producer.recv() {
-            Ok(Ok(())) => {
-                self.state = VerificationState::Complete;
-                Ok(())
+        let result = (|| {
+            if self.reader.read(&mut extra)? != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "NAR serializer exceeded the declared size",
+                ));
             }
-            Ok(Err(error)) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("NAR serializer failed: {error}"),
-            )),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "NAR serializer result was dropped",
-            )),
+            match self.producer.recv() {
+                Ok(Ok(())) => {
+                    self.state = VerificationState::Complete;
+                    Ok(())
+                }
+                Ok(Err(error)) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("NAR serializer failed: {error}"),
+                )),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "NAR serializer result was dropped",
+                )),
+            }
+        })();
+        if result.is_err() {
+            self.state = VerificationState::Failed;
         }
+        result
     }
 }
 
@@ -162,22 +169,39 @@ impl Read for VerifiedNarReader {
         if matches!(self.state, VerificationState::Complete) {
             return Ok(0);
         }
+        if matches!(self.state, VerificationState::Failed) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "verified NAR stream is in a failed state",
+            ));
+        }
         if self.bytes_read == self.expected_size {
             self.finish_stream()?;
             return Ok(0);
         }
-        let length = self.reader.read(buffer)?;
+        let length = match self.reader.read(buffer) {
+            Ok(length) => length,
+            Err(error) => {
+                self.state = VerificationState::Failed;
+                return Err(error);
+            }
+        };
         if length == 0 {
+            self.state = VerificationState::Failed;
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "NAR serializer ended before the declared size",
             ));
         }
-        self.bytes_read = self
-            .bytes_read
-            .checked_add(length as u64)
-            .ok_or_else(|| io::Error::other("NAR stream size overflow"))?;
+        self.bytes_read = match self.bytes_read.checked_add(length as u64) {
+            Some(bytes_read) => bytes_read,
+            None => {
+                self.state = VerificationState::Failed;
+                return Err(io::Error::other("NAR stream size overflow"));
+            }
+        };
         if self.bytes_read > self.expected_size {
+            self.state = VerificationState::Failed;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "NAR serializer exceeded the declared size",
@@ -187,6 +211,7 @@ impl Read for VerifiedNarReader {
         if self.bytes_read == self.expected_size {
             let actual_hash = FileHash::from_digest(self.digest.clone().finalize().into());
             if actual_hash != self.expected_hash {
+                self.state = VerificationState::Failed;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -413,6 +438,21 @@ mod tests {
 
         let error = io::copy(&mut reader, &mut io::sink()).expect_err("short output accepted");
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn verified_reader_stays_failed_after_a_hash_mismatch() {
+        let mut reader = test_reader(b"actual".to_vec(), b"expect".to_vec(), Ok(()));
+
+        let error = io::copy(&mut reader, &mut io::sink()).expect_err("hash mismatch accepted");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("identity mismatch"));
+
+        let error = reader
+            .read(&mut [0; 1])
+            .expect_err("failed reader returned a clean EOF");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("failed state"));
     }
 
     #[test]
