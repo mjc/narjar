@@ -5,27 +5,24 @@ const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 
 pub use crate::object::InvalidObjectId;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoreHash(pub(super) String);
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StoreHash([u8; 32]);
 
 impl StoreHash {
     pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
-        parse_nix32(value, 32).map(Self)
-    }
-
-    pub(crate) fn validate(value: &str) -> Result<(), InvalidObjectId> {
-        valid_nix32(value, 32).then_some(()).ok_or(InvalidObjectId)
+        match valid_nix32(value, 32) {
+            true => value
+                .as_bytes()
+                .try_into()
+                .map(Self)
+                .map_err(|_| InvalidObjectId),
+            false => Err(InvalidObjectId),
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        std::str::from_utf8(&self.0).expect("validated store hashes are ASCII")
     }
-}
-
-pub(crate) fn parse_nix32(value: &str, expected_len: usize) -> Result<String, InvalidObjectId> {
-    valid_nix32(value, expected_len)
-        .then(|| value.to_owned())
-        .ok_or(InvalidObjectId)
 }
 
 fn valid_nix32(value: &str, expected_len: usize) -> bool {

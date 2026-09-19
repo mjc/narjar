@@ -8,10 +8,9 @@ use std::{
 };
 
 use super::fs::unlink_at;
-use super::ids::parse_nix32;
 use super::{
-    Storage, StorageError, entry_identity_at, entry_is_directory_at, entry_is_regular_at,
-    open_regular_at, read_dir_names,
+    Storage, StorageError, StoreHash, entry_identity_at, entry_is_directory_at,
+    entry_is_regular_at, open_regular_at, read_dir_names,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -333,7 +332,7 @@ fn classify_root_entry(
 
 fn valid_store_hash_filename(name: &str) -> bool {
     name.strip_suffix(".narinfo")
-        .is_some_and(|hash| parse_nix32(hash, 32).is_ok())
+        .is_some_and(|hash| StoreHash::parse(hash).is_ok())
 }
 
 fn valid_nar_filename(name: &OsStr) -> bool {

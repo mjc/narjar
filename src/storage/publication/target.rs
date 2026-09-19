@@ -35,7 +35,7 @@ impl Layout {
     }
 
     pub(crate) fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
-        self.root.join(format!("{}.narinfo", hash.0))
+        self.root.join(format!("{}.narinfo", hash.as_str()))
     }
 
     pub(crate) fn temp_dir(&self) -> PathBuf {

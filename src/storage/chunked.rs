@@ -3,7 +3,7 @@ use std::{fmt, io, io::Read, io::Seek, io::SeekFrom, io::Write};
 use mincdc::{MinCdcHash4, ReadChunker};
 use sha2::{Digest, Sha256};
 
-use crate::object::{NarHash, NarIdentity, NarSize};
+use crate::object::{NarHash, NarIdentity, NarSize, Sha256Digest};
 
 pub(crate) const MANIFEST_MAGIC: &[u8; 8] = b"NARJCHNK";
 pub(crate) const MANIFEST_VERSION: u8 = 1;
@@ -12,16 +12,9 @@ pub(crate) const MANIFEST_RECORD_BYTES: usize = 40;
 pub(crate) const MANIFEST_CHECKSUM_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ChunkHash([u8; 32]);
+pub(crate) enum ChunkContent {}
 
-impl ChunkHash {
-    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
-        Self(digest)
-    }
-    pub(crate) const fn bytes(self) -> [u8; 32] {
-        self.0
-    }
-}
+pub(crate) type ChunkHash = Sha256Digest<ChunkContent>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChunkProfile {
@@ -353,7 +346,7 @@ fn parse_header(bytes: &[u8]) -> Result<(ChunkManifest, usize), ManifestError> {
         return Err(ManifestError::InvalidHeader);
     }
     let profile = ChunkProfile::from_id(bytes[9])?;
-    let hash = NarHash::from_storage_bytes(bytes[12..44].try_into().unwrap());
+    let hash = NarHash::from_digest(bytes[12..44].try_into().unwrap());
     let size = u64::from_le_bytes(bytes[44..52].try_into().unwrap());
     let count = u64::from_le_bytes(bytes[52..60].try_into().unwrap());
     let records = usize::try_from(count)
@@ -391,7 +384,7 @@ pub(crate) fn write_manifest_header<W: Write>(
 ) -> Result<(), ManifestError> {
     writer.write_all(MANIFEST_MAGIC)?;
     writer.write_all(&[MANIFEST_VERSION, manifest.profile.id(), 0, 0])?;
-    writer.write_all(&manifest.identity.hash().bytes_for_storage())?;
+    writer.write_all(&manifest.identity.hash().bytes())?;
     writer.write_all(&manifest.identity.size().get().to_le_bytes())?;
     writer.write_all(&manifest.chunk_count.to_le_bytes())?;
     Ok(())

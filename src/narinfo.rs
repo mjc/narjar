@@ -1,32 +1,33 @@
 use std::{
-    collections::BTreeMap,
-    ffi::OsStr,
     fmt,
     io::{self, Read, Write},
-    os::unix::fs::MetadataExt,
 };
 
 use crate::object::{
     EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarRepresentation,
     NarSize, WireEncoding,
 };
-use crate::storage::{Directory, StoreHash, StoredNar, open_regular_at};
+use crate::storage::{StoreHash, StoredNar};
 use data_encoding::BASE64;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::Signature;
 
-const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
+mod trust;
+
+pub use trust::{TrustError, TrustedPublicKeys};
+
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NixStorePath {
     value: String,
+    store: StoreHash,
 }
 
 impl NixStorePath {
     fn parse(value: String) -> Result<Self, NarInfoError> {
         let basename = value.strip_prefix("/nix/store/").ok_or(NarInfoError)?;
-        validate_store_basename(basename)?;
-        Ok(Self { value })
+        let (store, _) = validate_store_basename(basename)?;
+        Ok(Self { value, store })
     }
 
     fn from_basename(value: &str) -> Result<Self, NarInfoError> {
@@ -43,11 +44,8 @@ impl NixStorePath {
             .expect("validated store paths retain their prefix")
     }
 
-    fn store_hash(&self) -> &str {
-        self.basename()
-            .split_once('-')
-            .expect("validated store paths contain a name")
-            .0
+    fn store(&self) -> &StoreHash {
+        &self.store
     }
 }
 
@@ -71,6 +69,13 @@ impl Deriver {
             Self::StorePath(path) => path.basename(),
         }
     }
+
+    fn from_narinfo_value(value: &str) -> Result<Self, NarInfoError> {
+        match value {
+            "unknown-deriver" => Ok(Self::Unknown),
+            basename => NixStorePath::from_basename(basename).map(Self::StorePath),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,7 +94,6 @@ impl ContentAddress {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NarInfoClaims {
-    store: StoreHash,
     store_path: NixStorePath,
     references: Vec<NixStorePath>,
     identity: NarIdentity,
@@ -102,7 +106,6 @@ impl NarInfoClaims {
         identity: NarIdentity,
     ) -> Result<Self, NarInfoError> {
         let store_path = NixStorePath::parse(store_path)?;
-        let store = StoreHash::parse(store_path.store_hash()).map_err(|_| NarInfoError)?;
         let mut references = references
             .into_iter()
             .map(NixStorePath::parse)
@@ -110,7 +113,6 @@ impl NarInfoClaims {
         references.sort_unstable_by(|left, right| left.value.cmp(&right.value));
         references.dedup_by(|left, right| left.value == right.value);
         Ok(Self {
-            store,
             store_path,
             references,
             identity,
@@ -122,7 +124,7 @@ impl NarInfoClaims {
     }
 
     pub fn store(&self) -> &StoreHash {
-        &self.store
+        self.store_path.store()
     }
 
     pub fn reference_paths(&self) -> impl ExactSizeIterator<Item = &str> {
@@ -131,6 +133,16 @@ impl NarInfoClaims {
 
     pub fn reference_basenames(&self) -> impl ExactSizeIterator<Item = &str> {
         self.references.iter().map(NixStorePath::basename)
+    }
+
+    pub fn reference_stores(&self) -> impl ExactSizeIterator<Item = &StoreHash> {
+        self.references.iter().map(NixStorePath::store)
+    }
+
+    pub fn reference_store_paths(&self) -> impl ExactSizeIterator<Item = (&StoreHash, &str)> {
+        self.references
+            .iter()
+            .map(|reference| (reference.store(), reference.as_str()))
     }
 
     pub fn references_field(&self) -> String {
@@ -156,7 +168,7 @@ impl NarInfoClaims {
     ) -> Result<Self, NarInfoError> {
         let store_path =
             NixStorePath::parse(document.required(NarInfoField::StorePath)?.to_owned())?;
-        if store_path.store_hash() != route.as_str() {
+        if store_path.store() != route {
             return Err(NarInfoError);
         }
 
@@ -173,14 +185,7 @@ impl NarInfoClaims {
             .map(NarSize::new)
             .ok_or(NarInfoError)?;
 
-        validate_optional_deriver(document.field(NarInfoField::Deriver))?;
-        document
-            .field(NarInfoField::ContentAddress)
-            .map(parse_content_address)
-            .transpose()?;
-
         Ok(Self {
-            store: route.clone(),
             store_path,
             references: parse_references(document.required(NarInfoField::References)?)?,
             identity: NarIdentity::new(nar_hash, nar_size),
@@ -229,50 +234,58 @@ impl NarInfoMetadata {
         if representation.identity() != self.claims.identity() {
             return Err(NarInfoError);
         }
+        let mut output = Vec::new();
+        self.write(representation, &mut output)
+            .map_err(|_| NarInfoError)?;
+        Ok(output)
+    }
+
+    fn from_document(
+        route: &StoreHash,
+        document: &NarInfoDocument<'_>,
+    ) -> Result<Self, NarInfoError> {
+        Ok(Self {
+            claims: NarInfoClaims::from_document(route, document)?,
+            deriver: document
+                .field(NarInfoField::Deriver)
+                .map(Deriver::from_narinfo_value)
+                .transpose()?,
+            content_address: document
+                .field(NarInfoField::ContentAddress)
+                .map(str::to_owned)
+                .map(ContentAddress::parse)
+                .transpose()?,
+            signatures: document
+                .signature_values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        })
+    }
+
+    fn write(&self, representation: NarRepresentation, output: &mut impl Write) -> io::Result<()> {
         let file_name = representation.file_name();
         let file_size = representation.encoded_size();
-        let mut output = format!(
-            "StorePath: {}\nURL: nar/{file_name}\nCompression: {}\nFileHash: sha256:{}\nFileSize: {file_size}\nNarHash: sha256:{}\nNarSize: {}\nReferences: {}\n",
+        writeln!(
+            output,
+            "StorePath: {}\nURL: nar/{file_name}\nCompression: {}\nFileHash: sha256:{}\nFileSize: {file_size}\nNarHash: sha256:{}\nNarSize: {}\nReferences: {}",
             self.claims.store_path(),
             file_name.encoding().compression(),
             file_name.file_hash(),
             self.claims.identity().hash(),
             self.claims.identity().size(),
             self.claims.references_field(),
-        );
-        self.signatures.iter().for_each(|signature| {
-            output.push_str("Sig: ");
-            output.push_str(signature);
-            output.push('\n');
-        });
+        )?;
+        self.signatures
+            .iter()
+            .try_for_each(|signature| writeln!(output, "Sig: {signature}"))?;
         if let Some(deriver) = &self.deriver {
-            output.push_str("Deriver: ");
-            output.push_str(deriver.narinfo_value());
-            output.push('\n');
+            writeln!(output, "Deriver: {}", deriver.narinfo_value())?;
         }
         if let Some(content_address) = &self.content_address {
-            output.push_str("CA: ");
-            output.push_str(content_address.as_str());
-            output.push('\n');
+            writeln!(output, "CA: {}", content_address.as_str())?;
         }
-        Ok(output.into_bytes())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SignatureVerified<T>(T);
-
-impl<T> SignatureVerified<T> {
-    fn new(value: T) -> Self {
-        Self(value)
-    }
-}
-
-pub type TrustedNarInfoClaims = SignatureVerified<NarInfoClaims>;
-
-impl SignatureVerified<NarInfoClaims> {
-    pub fn claims(&self) -> &NarInfoClaims {
-        &self.0
+        Ok(())
     }
 }
 
@@ -280,83 +293,6 @@ pub(crate) fn read_narinfo_file(file: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(MAX_NARINFO_BYTES + 1).read_to_end(&mut bytes)?;
     Ok(bytes)
-}
-
-#[derive(Debug, Default)]
-pub struct TrustedPublicKeys(BTreeMap<String, VerifyingKey>);
-
-impl TrustedPublicKeys {
-    pub fn parse(contents: &str) -> Result<Self, TrustError> {
-        if contents.len() as u64 > MAX_TRUST_FILE_BYTES {
-            return Err(TrustError::InvalidTrustFile);
-        }
-
-        let mut keys = BTreeMap::new();
-        for entry in contents.split_ascii_whitespace() {
-            let (name, encoded) = entry
-                .split_once(':')
-                .filter(|(name, encoded)| valid_name(name) && !encoded.is_empty())
-                .ok_or(TrustError::InvalidTrustFile)?;
-            if keys.contains_key(name) {
-                return Err(TrustError::InvalidTrustFile);
-            }
-
-            let bytes: [u8; 32] = BASE64
-                .decode(encoded.as_bytes())
-                .ok()
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or(TrustError::InvalidTrustFile)?;
-            let key = VerifyingKey::from_bytes(&bytes).map_err(|_| TrustError::InvalidTrustFile)?;
-            if key.is_weak() {
-                return Err(TrustError::InvalidTrustFile);
-            }
-            keys.insert(name.to_owned(), key);
-        }
-        Ok(Self(keys))
-    }
-
-    pub fn load(directory: &Directory) -> Result<Self, TrustError> {
-        let mut file = match open_regular_at(directory.file(), OsStr::new("trusted-public-keys")) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(error.into()),
-        };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.mode() & 0o133 != 0 {
-            return Err(TrustError::InvalidTrustFile);
-        }
-
-        let mut contents = String::new();
-        (&mut file)
-            .take(MAX_TRUST_FILE_BYTES + 1)
-            .read_to_string(&mut contents)?;
-        Self::parse(&contents)
-    }
-    pub(crate) fn inspect(
-        &self,
-        route: &StoreHash,
-        bytes: Vec<u8>,
-    ) -> Result<ValidatedNarInfo, PublishedNarInfoError> {
-        let narinfo = UnverifiedPublicationNarInfo::parse(route, bytes)
-            .map_err(|_| PublishedNarInfoError::Malformed)?;
-        narinfo.verify_with(self)
-    }
-
-    pub fn validate(
-        &self,
-        route: &StoreHash,
-        bytes: Vec<u8>,
-    ) -> Result<ValidatedNarInfo, NarInfoError> {
-        self.inspect(route, bytes).map_err(|_| NarInfoError)
-    }
-
-    fn verifies(&self, fingerprint: &[u8], signatures: &[NamedSignature]) -> bool {
-        signatures.iter().any(|signature| {
-            self.0
-                .get(signature.name.as_str())
-                .is_some_and(|key| key.verify_strict(fingerprint, &signature.signature).is_ok())
-        })
-    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -375,62 +311,82 @@ enum NarInfoField {
 }
 
 impl NarInfoField {
+    const COUNT: usize = Self::ContentAddress as usize + 1;
+}
+
+enum NarInfoLineField {
+    Unique(NarInfoField),
+    Signature,
+}
+
+impl NarInfoLineField {
     fn parse(name: &str) -> Result<Self, NarInfoError> {
         match name {
-            "StorePath" => Ok(Self::StorePath),
-            "URL" => Ok(Self::Url),
-            "Compression" => Ok(Self::Compression),
-            "FileHash" => Ok(Self::FileHash),
-            "FileSize" => Ok(Self::FileSize),
-            "NarHash" => Ok(Self::NarHash),
-            "NarSize" => Ok(Self::NarSize),
-            "References" => Ok(Self::References),
-            "Deriver" => Ok(Self::Deriver),
-            "System" => Ok(Self::System),
-            "CA" => Ok(Self::ContentAddress),
+            "StorePath" => Ok(Self::Unique(NarInfoField::StorePath)),
+            "URL" => Ok(Self::Unique(NarInfoField::Url)),
+            "Compression" => Ok(Self::Unique(NarInfoField::Compression)),
+            "FileHash" => Ok(Self::Unique(NarInfoField::FileHash)),
+            "FileSize" => Ok(Self::Unique(NarInfoField::FileSize)),
+            "NarHash" => Ok(Self::Unique(NarInfoField::NarHash)),
+            "NarSize" => Ok(Self::Unique(NarInfoField::NarSize)),
+            "References" => Ok(Self::Unique(NarInfoField::References)),
+            "Deriver" => Ok(Self::Unique(NarInfoField::Deriver)),
+            "System" => Ok(Self::Unique(NarInfoField::System)),
+            "CA" => Ok(Self::Unique(NarInfoField::ContentAddress)),
+            "Sig" => Ok(Self::Signature),
             _ => Err(NarInfoError),
         }
     }
 }
 
 struct NarInfoDocument<'text> {
-    fields: Vec<(NarInfoField, &'text str)>,
+    fields: [Option<&'text str>; NarInfoField::COUNT],
     signature_values: Vec<&'text str>,
 }
 
 impl<'text> NarInfoDocument<'text> {
     fn parse(text: &'text str) -> Result<Self, NarInfoError> {
-        let mut fields = Vec::with_capacity(11);
-        let mut signature_values = Vec::new();
-        for line in text.strip_suffix('\n').ok_or(NarInfoError)?.split('\n') {
-            let (name, value) = line.split_once(": ").ok_or(NarInfoError)?;
-            if name == "Sig" {
-                signature_values.push(value);
-                continue;
+        text.strip_suffix('\n')
+            .ok_or(NarInfoError)?
+            .split('\n')
+            .try_fold(
+                Self {
+                    fields: [None; NarInfoField::COUNT],
+                    signature_values: Vec::new(),
+                },
+                Self::record_line,
+            )
+    }
+
+    fn record_line(mut self, line: &'text str) -> Result<Self, NarInfoError> {
+        let (name, value) = line.split_once(": ").ok_or(NarInfoError)?;
+        self.record_field(NarInfoLineField::parse(name)?, value)?;
+        Ok(self)
+    }
+
+    fn record_field(
+        &mut self,
+        field: NarInfoLineField,
+        value: &'text str,
+    ) -> Result<(), NarInfoError> {
+        match field {
+            NarInfoLineField::Signature => {
+                self.signature_values.push(value);
+                Ok(())
             }
-            let field = NarInfoField::parse(name)?;
-            if fields.iter().any(|(present, _)| *present == field) {
-                return Err(NarInfoError);
-            }
-            fields.push((field, value));
+            NarInfoLineField::Unique(field) => set_once(&mut self.fields[field as usize], value),
         }
-        Ok(Self {
-            fields,
-            signature_values,
-        })
     }
 
     fn field(&self, field: NarInfoField) -> Option<&'text str> {
-        self.fields
-            .iter()
-            .find_map(|(present, value)| (*present == field).then_some(*value))
+        self.fields[field as usize]
     }
 
     fn required(&self, field: NarInfoField) -> Result<&'text str, NarInfoError> {
         self.field(field).ok_or(NarInfoError)
     }
 
-    fn signatures(&self) -> Result<Vec<NamedSignature>, NarInfoError> {
+    fn named_signatures(&self) -> Result<Vec<NamedSignature>, NarInfoError> {
         if self.signature_values.is_empty() {
             return Err(NarInfoError);
         }
@@ -448,8 +404,8 @@ impl<'text> NarInfoDocument<'text> {
         if self.field(NarInfoField::System).is_some() {
             return Err(NarInfoError);
         }
-        let url = self.required(NarInfoField::Url)?;
-        let file_name = url
+        let file_name = self
+            .required(NarInfoField::Url)?
             .strip_prefix("nar/")
             .ok_or(NarInfoError)
             .and_then(|value| NarFileName::parse(value).map_err(|_| NarInfoError))?;
@@ -470,12 +426,17 @@ impl<'text> NarInfoDocument<'text> {
     }
 }
 
-fn validate_optional_deriver(deriver: Option<&str>) -> Result<(), NarInfoError> {
-    deriver
-        .filter(|value| *value != "unknown-deriver")
-        .map(validate_store_basename)
-        .transpose()
-        .map(|_| ())
+fn set_once<'text>(
+    destination: &mut Option<&'text str>,
+    value: &'text str,
+) -> Result<(), NarInfoError> {
+    match destination {
+        None => {
+            *destination = Some(value);
+            Ok(())
+        }
+        Some(_) => Err(NarInfoError),
+    }
 }
 
 fn parse_narinfo_text(bytes: Vec<u8>) -> Result<String, NarInfoError> {
@@ -519,12 +480,10 @@ impl NamedSignature {
     }
 }
 
-#[doc(hidden)]
 #[derive(Debug)]
-pub struct PublicationNarInfo {
-    claims: NarInfoClaims,
+struct PublicationNarInfo {
+    metadata: NarInfoMetadata,
     payload: NarRepresentation,
-    text: String,
 }
 
 struct UnverifiedPublicationNarInfo {
@@ -536,16 +495,12 @@ impl UnverifiedPublicationNarInfo {
     fn parse(route: &StoreHash, bytes: Vec<u8>) -> Result<Self, NarInfoError> {
         let text = parse_narinfo_text(bytes)?;
         let document = NarInfoDocument::parse(&text)?;
-        let claims = NarInfoClaims::from_document(route, &document)?;
-        let payload = document.publication_payload(claims.identity())?;
-        let signatures = document.signatures()?;
+        let metadata = NarInfoMetadata::from_document(route, &document)?;
+        let payload = document.publication_payload(metadata.claims().identity())?;
+        let signatures = document.named_signatures()?;
 
         Ok(Self {
-            publication: PublicationNarInfo {
-                claims,
-                payload,
-                text,
-            },
+            publication: PublicationNarInfo { metadata, payload },
             signatures,
         })
     }
@@ -555,16 +510,17 @@ impl UnverifiedPublicationNarInfo {
         trusted_keys: &TrustedPublicKeys,
     ) -> Result<ValidatedNarInfo, PublishedNarInfoError> {
         if !trusted_keys.verifies(
-            self.publication.claims.fingerprint().as_bytes(),
+            self.publication.metadata.claims().fingerprint().as_bytes(),
             &self.signatures,
         ) {
             return Err(PublishedNarInfoError::UntrustedSignature);
         }
-        Ok(SignatureVerified::new(self.publication))
+        Ok(ValidatedNarInfo(self.publication))
     }
 }
 
-pub type ValidatedNarInfo = SignatureVerified<PublicationNarInfo>;
+#[derive(Debug)]
+pub struct ValidatedNarInfo(PublicationNarInfo);
 
 impl NarRepresentation {
     fn from_narinfo(
@@ -597,17 +553,17 @@ impl NarRepresentation {
     }
 }
 
-impl SignatureVerified<PublicationNarInfo> {
+impl ValidatedNarInfo {
     pub fn claims(&self) -> &NarInfoClaims {
-        &self.0.claims
+        self.0.metadata.claims()
     }
 
     pub(crate) const fn payload(&self) -> NarRepresentation {
         self.0.payload
     }
 
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.0.text.into_bytes()
+    pub(crate) fn into_bytes(self) -> Result<Vec<u8>, NarInfoError> {
+        self.0.metadata.serialize(self.0.payload)
     }
 
     pub(crate) fn bind_to_stored_nar(
@@ -641,31 +597,13 @@ impl BoundNarInfo<'_> {
     }
 
     pub(crate) fn store(&self) -> &StoreHash {
-        self.narinfo.claims.store()
+        self.narinfo.metadata.claims().store()
     }
 
     pub(crate) fn output_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut output = BoundedNarInfoWriter::with_capacity(self.narinfo.text.len());
-        self.narinfo
-            .text
-            .lines()
-            .try_for_each(|line| self.write_output_field(line, &mut output))?;
+        let mut output = BoundedNarInfoWriter::new();
+        self.narinfo.metadata.write(self.output, &mut output)?;
         Ok(output.into_bytes())
-    }
-
-    fn write_output_field(&self, line: &str, output: &mut impl Write) -> io::Result<()> {
-        let name = self.output.file_name();
-        match line.split_once(": ") {
-            Some(("URL", _)) => writeln!(output, "URL: nar/{name}"),
-            Some(("Compression", _)) => {
-                writeln!(output, "Compression: {}", name.encoding().compression())
-            }
-            Some(("FileHash", _)) => writeln!(output, "FileHash: sha256:{}", name.file_hash()),
-            Some(("FileSize", _)) => {
-                writeln!(output, "FileSize: {}", self.output.encoded_size())
-            }
-            _ => writeln!(output, "{line}"),
-        }
     }
 }
 
@@ -674,10 +612,8 @@ struct BoundedNarInfoWriter {
 }
 
 impl BoundedNarInfoWriter {
-    fn with_capacity(input_length: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(input_length.min(MAX_NARINFO_BYTES as usize)),
-        }
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
     }
 
     fn into_bytes(self) -> Vec<u8> {
@@ -766,7 +702,7 @@ fn parse_content_address(value: &str) -> Result<(), NarInfoError> {
     valid.then_some(()).ok_or(NarInfoError)
 }
 
-fn validate_store_basename(value: &str) -> Result<(&str, &str), NarInfoError> {
+fn validate_store_basename(value: &str) -> Result<(StoreHash, &str), NarInfoError> {
     let (hash, name) = value.split_once('-').ok_or(NarInfoError)?;
     if name.is_empty()
         || !name
@@ -775,8 +711,7 @@ fn validate_store_basename(value: &str) -> Result<(&str, &str), NarInfoError> {
     {
         return Err(NarInfoError);
     }
-    StoreHash::validate(hash).map_err(|_| NarInfoError)?;
-    Ok((hash, name))
+    Ok((StoreHash::parse(hash).map_err(|_| NarInfoError)?, name))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -795,36 +730,6 @@ impl fmt::Display for NarInfoError {
 }
 
 impl std::error::Error for NarInfoError {}
-
-#[derive(Debug)]
-pub enum TrustError {
-    InvalidTrustFile,
-    Io(io::Error),
-}
-
-impl From<io::Error> for TrustError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl fmt::Display for TrustError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidTrustFile => formatter.write_str("invalid trusted public key file"),
-            Self::Io(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for TrustError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidTrustFile => None,
-            Self::Io(error) => Some(error),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -928,7 +833,7 @@ mod tests {
 
     #[test]
     fn projected_narinfo_writer_rejects_output_over_the_read_limit() {
-        let mut writer = BoundedNarInfoWriter::with_capacity(MAX_NARINFO_BYTES as usize);
+        let mut writer = BoundedNarInfoWriter::new();
         writer
             .write_all(&vec![b'x'; MAX_NARINFO_BYTES as usize])
             .expect("a boundary-sized projection should fit");
@@ -971,7 +876,7 @@ mod tests {
     fn parser_validates_store_basenames_borrowed() {
         let value = format!("{STORE_HASH}-package");
         let (hash, name) = validate_store_basename(&value).expect("valid store basename");
-        assert_eq!(hash, STORE_HASH);
+        assert_eq!(hash.as_str(), STORE_HASH);
         assert_eq!(name, "package");
     }
 

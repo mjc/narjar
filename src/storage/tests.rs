@@ -39,7 +39,7 @@ fn egress_receipt_round_trips_through_compact_binary_serialization() {
     let raw_size = NarSize::new(17);
     let encoded_size = EncodedSize::new(23);
     let slot = EgressSlot::new(NarIdentity::new(raw_hash, raw_size), CompressionCodec::Zstd);
-    let egress = EgressReceipt::new(slot, encoded_hash, encoded_size);
+    let egress = EgressReceipt::for_slot(slot, encoded_hash, encoded_size);
     let egress =
         EgressReceipt::parse(&egress.bytes()).expect("typed egress receipt should be readable");
     assert!(egress.matches(slot));
@@ -59,24 +59,41 @@ fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
 #[test]
 fn chunked_ingestion_publishes_a_verified_manifest() {
     let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let storage = Storage::initialize(
+        &Directory::open(directory.path()).unwrap(),
+        StorageBackend::Chunked,
+    )
+    .unwrap();
     let raw = vec![b'x'; 100_000];
     let hash = NarHash::from_digest(Sha256::digest(&raw).into());
     let name = NarFileName::raw(hash);
-    let manifest = storage
-        .publish_chunked_nar(
+    storage
+        .publish_nar(
             name,
             Cursor::new(&raw),
             raw.len() as u64,
             super::NarUploadPolicy::new(200_000, 0),
         )
         .unwrap();
+    let manifest = storage
+        .chunk_store()
+        .unwrap()
+        .validate_manifest(hash)
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         manifest.identity(),
         NarIdentity::new(hash, (raw.len() as u64).into())
     );
-    assert!(storage.chunk_store.open_manifest(hash).unwrap().is_some());
+    assert!(
+        storage
+            .chunk_store()
+            .unwrap()
+            .open_manifest(hash)
+            .unwrap()
+            .is_some()
+    );
     assert!(manifest.chunk_count() > 0);
 }
 
@@ -1081,7 +1098,7 @@ fn missing_compressed_derivative_must_reproduce_its_receipt_identity() {
         .expect("egress receipt should be readable")
         .path();
     let wrong_output_hash = FileHash::from_digest([0xff; 32]);
-    let wrong_receipt = EgressReceipt::new(
+    let wrong_receipt = EgressReceipt::for_slot(
         EgressSlot::new(identity, CompressionCodec::Zstd),
         wrong_output_hash,
         output.1,

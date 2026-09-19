@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use narjar::nar_encode::{EncodeSummary, Encoder, Event};
 use narjar::narinfo::NarInfoMetadata;
-use narjar::object::{CompressionCodec, EncodedIdentity, FileHash, NarHash};
+use narjar::object::{CompressionCodec, EncodedIdentity, FileHash, NarHash, NarIdentity};
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -38,13 +38,23 @@ pub(super) fn verify_nar_summary(
     info: &NarInfoMetadata,
     summary: &EncodeSummary,
 ) -> Result<(), String> {
-    let expected = info.claims().identity();
+    verify_nar_identity(
+        info.claims().identity(),
+        info.claims().store_path(),
+        summary,
+    )
+}
+
+fn verify_nar_identity(
+    expected: NarIdentity,
+    source: impl std::fmt::Display,
+    summary: &EncodeSummary,
+) -> Result<(), String> {
     let expected_hash = expected.hash();
     let actual_hash = NarHash::from_digest(summary.raw_sha256);
     if summary.raw_size != expected.size().get() || actual_hash != expected_hash {
         return Err(format!(
-            "NAR identity mismatch for {}: expected {expected_hash}/{}; got {actual_hash}/{}",
-            info.claims().store_path(),
+            "NAR identity mismatch for {source}: expected {expected_hash}/{}; got {actual_hash}/{}",
             expected.size(),
             summary.raw_size
         ));
@@ -83,7 +93,7 @@ pub(super) fn open_verified_encoded_nar_reader(
             local_store_path(info.claims().store_path())?,
             NarStream::Compressed {
                 codec,
-                info: info.clone(),
+                expected: info.claims().identity(),
             },
         )?,
         expected_hash: expected.hash(),
@@ -99,7 +109,7 @@ enum NarStream {
     Raw,
     Compressed {
         codec: CompressionCodec,
-        info: NarInfoMetadata,
+        expected: NarIdentity,
     },
 }
 
@@ -110,8 +120,8 @@ fn spawn_nar_writer(path: PathBuf, stream: NarStream) -> Result<PipeReader, Stri
         .spawn(move || {
             let result = match stream {
                 NarStream::Raw => write_nar(&path, &mut writer).map(|_| ()),
-                NarStream::Compressed { codec, info } => {
-                    write_encoded_nar(&path, &info, codec, &mut writer)
+                NarStream::Compressed { codec, expected } => {
+                    write_encoded_nar(&path, expected, codec, &mut writer)
                 }
             };
             let _ = result;
@@ -122,7 +132,7 @@ fn spawn_nar_writer(path: PathBuf, stream: NarStream) -> Result<PipeReader, Stri
 
 fn write_encoded_nar<W: Write>(
     path: &Path,
-    info: &NarInfoMetadata,
+    expected: NarIdentity,
     codec: CompressionCodec,
     output: W,
 ) -> Result<(), String> {
@@ -150,7 +160,7 @@ fn write_encoded_nar<W: Write>(
             summary
         }
     };
-    verify_nar_summary(info, &summary)
+    verify_nar_identity(expected, path.display(), &summary)
 }
 
 struct VerifiedNarReader {

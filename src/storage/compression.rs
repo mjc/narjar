@@ -20,7 +20,7 @@ use crate::object::{
 
 use super::{
     publication::{StagingReservation, StorageError},
-    receipt::{deserialize_compressed_nar_identity, serialize_compressed_nar_identity},
+    receipt::CompressedNarReceipt,
     typestate::Validated,
 };
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
@@ -327,13 +327,6 @@ impl ReceivedNar {
             Self::Compressed(receipt) => receipt.decoded_identity(),
         }
     }
-
-    pub(super) fn ingestion_receipt(&self) -> Option<IngestionReceipt> {
-        match self {
-            Self::Raw(_) => None,
-            Self::Compressed(receipt) => Some(receipt.clone()),
-        }
-    }
 }
 
 pub(super) fn receive_uploaded_nar<W: Write>(
@@ -504,16 +497,14 @@ impl<R> UploadCompressedSourceReader<R> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct IngestionReceipt(CompressedNarIdentity);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IngestionReceiptPurpose {}
 
-impl IngestionReceipt {
-    fn new(encoded: EncodedIdentity, decoded: NarIdentity) -> Self {
-        Self(CompressedNarIdentity::new(encoded, decoded))
-    }
+pub(super) type IngestionReceipt = CompressedNarReceipt<IngestionReceiptPurpose>;
 
+impl CompressedNarReceipt<IngestionReceiptPurpose> {
     pub(super) fn file_name(&self) -> OsString {
-        Self::file_name_for(self.0)
+        Self::file_name_for(self.identity())
     }
 
     pub(super) fn file_name_for(expectation: CompressedNarIdentity) -> OsString {
@@ -524,20 +515,12 @@ impl IngestionReceipt {
         ))
     }
 
-    pub(super) fn bytes(&self) -> Vec<u8> {
-        serialize_compressed_nar_identity(self.0)
-    }
-
-    pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
-        deserialize_compressed_nar_identity(bytes).map(Self)
-    }
-
     pub(super) fn matches(&self, expectation: CompressedNarIdentity) -> bool {
-        self.0 == expectation
+        self.identity() == expectation
     }
 
     pub(super) fn decoded_identity(&self) -> NarIdentity {
-        self.0.decoded()
+        self.decoded()
     }
 }
 
@@ -618,51 +601,26 @@ fn take_upload_source_error(
 }
 
 fn measure_decoded_nar<R: Read>(reader: &mut R, max_bytes: u64) -> io::Result<NarIdentity> {
-    let mut hasher = Sha256::new();
-    let mut bytes_read = 0u64;
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer).map_err(compressed_read_error)?;
-        if read == 0 {
-            break;
-        }
-        bytes_read = bytes_read
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?;
-        if bytes_read > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decompressed NAR exceeds configured size limit",
-            ));
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(NarIdentity::new(
-        NarHash::from_digest(hasher.finalize().into()),
-        NarSize::new(bytes_read),
-    ))
+    let mut sink = io::sink();
+    let mut measured = HashingWriter::new(&mut sink, max_bytes);
+    io::copy(reader, &mut measured).map_err(compressed_read_error)?;
+    Ok(measured.finish())
 }
 
-fn sha256_file(file: &File) -> io::Result<[u8; 32]> {
+fn sha256_file(file: &File) -> io::Result<NarHash> {
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize().into())
+    let mut sink = io::sink();
+    let mut measured = HashingWriter::new(&mut sink, u64::MAX);
+    io::copy(&mut file, &mut measured)?;
+    Ok(measured.finish().hash())
 }
 
 pub(super) fn encoded_file_matches(file: &File, identity: EncodedIdentity) -> io::Result<bool> {
     if file.metadata()?.len() != identity.size().get() {
         return Ok(false);
     }
-    Ok(FileHash::from_digest(sha256_file(file)?) == identity.hash())
+    Ok(identity.hash().matches_nar_hash(sha256_file(file)?))
 }
 
 pub(super) struct VerifiedCompressedNar<'file> {
@@ -765,7 +723,7 @@ fn raw_nar_file_matches(file: &File, identity: NarIdentity) -> io::Result<bool> 
     if file.metadata()?.len() != identity.size().get() {
         return Ok(false);
     }
-    Ok(NarHash::from_digest(sha256_file(file)?) == identity.hash())
+    Ok(sha256_file(file)? == identity.hash())
 }
 
 pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Result<bool> {

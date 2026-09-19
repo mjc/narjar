@@ -115,7 +115,10 @@ fn respond_narinfo(
         Err(_) => return internal_error(guard, request),
     }
 
-    let bytes = validated.into_bytes();
+    let bytes = match validated.into_bytes() {
+        Ok(bytes) => bytes,
+        Err(_) => return internal_error(guard, request),
+    };
     let bytes_out = bytes.len() as u64;
     let response = cache_policy(
         Response::from_data(bytes).with_header(header("Content-Type", "text/x-nix-narinfo")),

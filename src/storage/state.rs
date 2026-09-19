@@ -13,6 +13,29 @@ use super::publication::Layout;
 use super::publication::{ProcessLock, StagingBudget};
 use super::recovery::RecoveryState;
 
+#[derive(Debug)]
+pub(super) enum PayloadStorage {
+    Flat,
+    Chunked(ChunkStore),
+}
+
+impl PayloadStorage {
+    pub(super) const fn backend(&self) -> StorageBackend {
+        match self {
+            Self::Flat => StorageBackend::Flat,
+            Self::Chunked(_) => StorageBackend::Chunked,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn chunk_store(&self) -> Option<&ChunkStore> {
+        match self {
+            Self::Flat => None,
+            Self::Chunked(store) => Some(store),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageBackend {
     Flat,
@@ -56,8 +79,7 @@ pub struct Storage {
     #[cfg(test)]
     pub(super) layout: Layout,
     pub(super) root: File,
-    pub(super) chunk_store: ChunkStore,
-    pub(super) backend: StorageBackend,
+    pub(super) payloads: PayloadStorage,
     pub(super) recovery: RecoveryState,
     pub(super) publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     pub(super) staging_budget: Arc<Mutex<StagingBudget>>,
@@ -69,6 +91,11 @@ pub struct Storage {
 
 impl Storage {
     pub(crate) const fn backend(&self) -> StorageBackend {
-        self.backend
+        self.payloads.backend()
+    }
+
+    #[cfg(test)]
+    pub(super) const fn chunk_store(&self) -> Option<&ChunkStore> {
+        self.payloads.chunk_store()
     }
 }

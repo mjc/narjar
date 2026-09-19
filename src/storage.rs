@@ -1,3 +1,4 @@
+mod cache_info;
 #[allow(dead_code)]
 pub(crate) mod chunk_store;
 #[allow(dead_code)]
@@ -9,6 +10,7 @@ mod fs;
 pub mod gc;
 mod ids;
 mod ingest;
+mod initialization;
 pub(crate) mod inspection;
 mod operations;
 mod publication;

@@ -74,6 +74,11 @@ enum ExistingNarinfo {
     Refresh,
 }
 
+enum NarinfoUpload {
+    Skip,
+    Required,
+}
+
 impl From<bool> for ExistingNarinfo {
     fn from(refresh: bool) -> Self {
         match refresh {
@@ -169,45 +174,64 @@ fn native_copy_paths(
         .build()
         .into();
 
-    for info in metadata {
-        let store_hash = info.claims().store().as_str();
-        let narinfo_name = format!("{store_hash}.narinfo");
-        let narinfo_url = target.endpoint(&[&narinfo_name]);
-        match existing_narinfo {
-            ExistingNarinfo::Skip => {
-                match request_status(&agent, &narinfo_url, authorization.as_deref())? {
-                    200 => continue,
-                    404 => {}
-                    status => {
-                        return Err(format!(
-                            "narinfo lookup for {} returned HTTP {status}",
-                            info.claims().store_path()
-                        ));
-                    }
-                }
-            }
-            ExistingNarinfo::Refresh => {}
-        }
+    metadata.iter().try_for_each(|info| {
+        upload_store_path_when_destination_requires_it(
+            &agent,
+            target,
+            authorization.as_deref(),
+            existing_narinfo,
+            compression,
+            info,
+        )
+    })
+}
 
-        match compression {
-            WireEncoding::Raw => upload_raw_nar_and_narinfo(
-                &agent,
-                target,
-                authorization.as_deref(),
-                info,
-                &narinfo_url,
-            )?,
+fn upload_store_path_when_destination_requires_it(
+    agent: &Agent,
+    target: &HttpUrl,
+    authorization: Option<&str>,
+    existing_narinfo: ExistingNarinfo,
+    compression: WireEncoding,
+    info: &NarInfoMetadata,
+) -> Result<(), String> {
+    let narinfo_name = format!("{}.narinfo", info.claims().store().as_str());
+    let narinfo_url = target.endpoint(&[&narinfo_name]);
+    match required_narinfo_upload(agent, &narinfo_url, authorization, existing_narinfo, info)? {
+        NarinfoUpload::Skip => Ok(()),
+        NarinfoUpload::Required => match compression {
+            WireEncoding::Raw => {
+                upload_raw_nar_and_narinfo(agent, target, authorization, info, &narinfo_url)
+            }
             WireEncoding::Compressed(codec) => upload_compressed_nar_and_narinfo(
-                &agent,
+                agent,
                 target,
-                authorization.as_deref(),
+                authorization,
                 info,
                 &narinfo_url,
                 codec,
-            )?,
-        }
+            ),
+        },
     }
-    Ok(())
+}
+
+fn required_narinfo_upload(
+    agent: &Agent,
+    narinfo_url: &HttpUrl,
+    authorization: Option<&str>,
+    existing_narinfo: ExistingNarinfo,
+    info: &NarInfoMetadata,
+) -> Result<NarinfoUpload, String> {
+    match existing_narinfo {
+        ExistingNarinfo::Refresh => Ok(NarinfoUpload::Required),
+        ExistingNarinfo::Skip => match request_status(agent, narinfo_url, authorization)? {
+            200 => Ok(NarinfoUpload::Skip),
+            404 => Ok(NarinfoUpload::Required),
+            status => Err(format!(
+                "narinfo lookup for {} returned HTTP {status}",
+                info.claims().store_path()
+            )),
+        },
+    }
 }
 
 fn upload_raw_nar_and_narinfo(
