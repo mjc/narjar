@@ -261,7 +261,11 @@ fn native_copy_paths(
         match lookup.classify(info)? {
             PushDisposition::DestinationPresent => report.destination_present += 1,
             PushDisposition::TrustedUpstreamPresent(upstream) => {
-                println!("skipped {}: trusted upstream {upstream}", info.path);
+                println!(
+                    "skipped {}: trusted upstream {}",
+                    info.path,
+                    upstream.identity()
+                );
                 report.trusted_upstream_present += 1;
             }
             PushDisposition::UploadRequired => {

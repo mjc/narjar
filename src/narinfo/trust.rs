@@ -7,7 +7,7 @@ use std::{
 };
 
 use data_encoding::BASE64;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::storage::{Directory, StoreHash, open_regular_at};
 
@@ -83,6 +83,16 @@ impl TrustedPublicKeys {
         bytes: Vec<u8>,
     ) -> Result<ValidatedNarInfo, NarInfoError> {
         self.inspect(route, bytes).map_err(|_| NarInfoError)
+    }
+
+    pub fn verify_signature(&self, name: &str, fingerprint: &[u8], signature: &[u8]) -> bool {
+        let Some(key) = self.0.get(name) else {
+            return false;
+        };
+        let Ok(signature) = Signature::from_slice(signature) else {
+            return false;
+        };
+        key.verify_strict(fingerprint, &signature).is_ok()
     }
 
     pub(super) fn verifies(&self, fingerprint: &[u8], signatures: &[NamedSignature]) -> bool {

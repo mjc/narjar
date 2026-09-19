@@ -580,8 +580,87 @@ fn native_push_uses_the_first_matching_trusted_upstream_in_configured_order() {
     first_server.join().expect("first upstream should exit");
     second_server.join().expect("second upstream should exit");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stdout.contains(&format!("trusted upstream {second}")));
     assert!(stdout.contains("trusted-upstream-present 1"));
+    assert!(stderr.contains("checking next source"));
+    assert!(!stderr.contains("uploading instead"));
+}
+
+#[test]
+fn native_push_accepts_external_trusted_narinfo_transport_fields() {
+    let nar_bytes = native_nar_bytes();
+    let nar_hash = nix32_sha256(&nar_bytes);
+    let nar_size = nar_bytes.len() as u64;
+    let standard_url = format!("nar/{nar_hash}.nar");
+    let cases = [
+        (
+            "store-path-url",
+            format!("nar/{STORE_HASH}-narjar.nar"),
+            false,
+        ),
+        (
+            "absolute-url",
+            format!("https://upstream.example/nar/{STORE_HASH}-narjar.nar"),
+            false,
+        ),
+        (
+            "query-url-with-optional-fields-omitted",
+            format!("https://upstream.example/nar/{STORE_HASH}-narjar.nar?channel=stable"),
+            true,
+        ),
+    ];
+
+    for (name, url, omit_transport_fields) in cases {
+        let narinfo =
+            signed_narinfo_for(STORE_HASH, &nar_hash, nar_size).replace(&standard_url, &url);
+        let narinfo = if omit_transport_fields {
+            narinfo
+                .lines()
+                .filter(|line| !line.starts_with("FileHash: ") && !line.starts_with("FileSize: "))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        } else {
+            narinfo
+        };
+        let (destination, destination_server) = one_response_cache(404, "Not Found", String::new());
+        let (upstream, upstream_server) = one_response_cache(200, "OK", narinfo);
+        let fixture = native_push_fixture();
+        fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
+            .expect("remove local payload so generation would fail");
+        let output = run_native_push_fixture_with_options(
+            &fixture,
+            &destination,
+            "none",
+            NativePushRunOptions {
+                extra_args: &[
+                    "--trusted-upstream",
+                    &upstream,
+                    "--trusted-upstream-key",
+                    &trusted_upstream_key(7),
+                ],
+                ..NativePushRunOptions::default()
+            },
+        );
+
+        assert!(
+            output.status.success(),
+            "{name} should skip from the trusted upstream: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        destination_server.join().expect("destination should exit");
+        upstream_server.join().expect("upstream should exit");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("trusted-upstream-present 1"),
+            "{name} should be recognized as a trusted upstream hit: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            !fixture.invocation_log.exists(),
+            "{name} should not invoke Nix"
+        );
+    }
 }
 
 #[test]
