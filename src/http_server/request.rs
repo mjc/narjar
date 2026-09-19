@@ -390,6 +390,13 @@ impl Request {
         self.body_state == BodyState::Complete
     }
 
+    pub fn body_reader_started(&self) -> bool {
+        matches!(
+            self.body_state,
+            BodyState::Reading | BodyState::Complete | BodyState::Failed
+        )
+    }
+
     pub fn close_after_response(&mut self) {
         self.keep_alive = false;
     }

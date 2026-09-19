@@ -296,12 +296,7 @@ impl RecoveryState {
         }
         match unlink_at(&directory, name) {
             Ok(()) => directory.sync_all()?,
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    && matches!(
-                        state,
-                        PublicationState::Linked | PublicationState::Published
-                    ) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         Ok(())

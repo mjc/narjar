@@ -169,6 +169,10 @@ impl UploadRequest {
         self.request.body_complete()
     }
 
+    fn body_reader_started(&self) -> bool {
+        self.request.body_reader_started()
+    }
+
     fn reader(&mut self) -> Result<impl Read + '_, BodyReaderError> {
         self.request.as_reader()
     }
@@ -296,7 +300,10 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
     };
     let result = storage.publish_nar_with_staging(name, reader, length as u64, policy, staging);
     metrics.publication(started.elapsed());
-    if !upload.body_complete() {
+    if upload.body_reader_started()
+        && !upload.body_complete()
+        && !matches!(result, Err(StorageError::UploadTooLarge))
+    {
         metrics.validation_failure(ValidationClass::Nar);
         guard.record_response(0, 0);
         return None;
