@@ -11,6 +11,7 @@ Usage: scripts/casync-zfs-experiment \
   --output DIR \
   [--compression zstd-N] \
   [--port-base N] \
+  [--io-timeout-seconds N] \
   [--jobs N]
 
 The two DATA directories must already be empty mountpoints on distinct fresh
@@ -35,6 +36,7 @@ CHUNKED_DATA=
 OUTPUT=
 COMPRESSION=zstd-19
 PORT_BASE=45100
+IO_TIMEOUT_SECONDS=300
 JOBS=8
 
 while (($#)); do
@@ -71,6 +73,10 @@ while (($#)); do
             PORT_BASE=$2
             shift 2
             ;;
+        --io-timeout-seconds)
+            IO_TIMEOUT_SECONDS=$2
+            shift 2
+            ;;
         --jobs)
             JOBS=$2
             shift 2
@@ -89,6 +95,10 @@ done
 
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || {
     printf '%s\n' '--jobs must be a positive integer' >&2
+    exit 2
+}
+[[ "$IO_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+    printf '%s\n' '--io-timeout-seconds must be a positive integer' >&2
     exit 2
 }
 [[ "$COMPRESSION" =~ ^zstd-[0-9]+$ ]] || {
@@ -277,10 +287,12 @@ record_inputs() {
 }
 
 record_store_inputs() {
-    local store_paths store_info metadata store_path sri size hash
+    local store_paths store_info metadata converted_hashes store_path size hash index
+    local -a sri_hashes=() nix32_hashes=()
     store_paths=$WORK/store-paths
     store_info=$WORK/store-info.json
     metadata=$WORK/store-metadata.tsv
+    converted_hashes=$WORK/nix32-hashes
 
     run_logged nix-store --query --requisites "$STORE_ROOT" >"$store_paths"
     run_logged nix path-info --json --stdin <"$store_paths" >"$store_info"
@@ -288,9 +300,18 @@ record_store_inputs() {
         'to_entries[] | [.key, .value.narHash, (.value.narSize | tostring)] | @tsv' \
         "$store_info" | sort >"$metadata"
 
+    mapfile -t sri_hashes < <(cut -f2 "$metadata")
+    capture_logged nix hash convert --from sri --to nix32 "${sri_hashes[@]}" >"$converted_hashes"
+    mapfile -t nix32_hashes <"$converted_hashes"
+    ((${#nix32_hashes[@]} == ${#sri_hashes[@]})) || {
+        printf '%s\n' 'hash conversion returned an unexpected number of identities' >&2
+        exit 1
+    }
+    index=0
     while IFS=$'\t' read -r store_path sri size; do
-        hash=$(capture_logged nix hash convert --from sri --to nix32 "$sri")
+        hash=${nix32_hashes[index]}
         printf '%s\t%s\t%s\n' "$hash" "$size" "$store_path" >>"$ALL_INPUTS"
+        ((index += 1))
     done <"$metadata"
 }
 
@@ -327,6 +348,7 @@ start_server() {
         --listen "127.0.0.1:$port" \
         --workers 8 \
         --min-free-bytes 0 \
+        --io-timeout-seconds "$IO_TIMEOUT_SECONDS" \
         --storage-backend "$backend"
     )
     log_command "${server_command[@]}"
