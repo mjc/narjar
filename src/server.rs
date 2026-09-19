@@ -94,6 +94,7 @@ fn try_dispatch(
 }
 
 fn configure_socket_timeouts(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))
 }

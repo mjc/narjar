@@ -49,37 +49,37 @@ fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
     signed_narinfo_for(STORE_HASH, nar_hash, nar_size)
 }
 
-fn read_http_response(stream: &mut TcpStream) -> Vec<u8> {
-    let mut response = Vec::new();
-    let mut header_end = None;
-    let mut content_length = None;
+fn read_http_response(stream: &mut impl BufRead) -> Vec<u8> {
+    let mut headers = Vec::new();
     loop {
-        let mut buffer = [0; 4096];
+        let mut line = Vec::new();
         let count = stream
-            .read(&mut buffer)
-            .expect("response should be readable");
-        assert_ne!(count, 0, "response ended before its declared body");
-        response.extend_from_slice(&buffer[..count]);
-        if header_end.is_none() {
-            header_end = response
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|offset| offset + 4);
-            if let Some(header_end) = header_end {
-                let headers = std::str::from_utf8(&response[..header_end])
-                    .expect("response headers should be UTF-8");
-                content_length = headers
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
-                    .map(|value| value.trim().parse::<usize>().expect("valid Content-Length"));
-            }
-        }
-        if let (Some(header_end), Some(content_length)) = (header_end, content_length)
-            && response.len() >= header_end + content_length
-        {
-            return response;
+            .read_until(b'\n', &mut line)
+            .expect("response headers should be readable");
+        assert_ne!(count, 0, "response ended before its headers");
+        headers.extend_from_slice(&line);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
         }
     }
+    let header_text = std::str::from_utf8(&headers).expect("response headers should be UTF-8");
+    let content_length = header_text
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .map(|value| value.trim().parse::<usize>().expect("valid Content-Length"))
+        .expect("response should declare its body length");
+    let mut response = headers;
+    let body_start = response.len();
+    stream
+        .take(content_length as u64)
+        .read_to_end(&mut response)
+        .expect("response body should be readable");
+    assert_eq!(
+        response.len() - body_start,
+        content_length,
+        "response ended before its declared body"
+    );
+    response
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
@@ -2558,10 +2558,12 @@ fn cache_info_reads_the_initialized_priority() {
 #[test]
 fn http11_connection_serves_two_sequential_requests() {
     let server = RunningServer::start("http11-keep-alive");
-    let mut stream = TcpStream::connect(&server.address).expect("connect to narjar");
+    let stream = TcpStream::connect(&server.address).expect("connect to narjar");
+    let mut writer = stream.try_clone().expect("clone client stream");
+    let mut stream = BufReader::new(stream);
 
-    for _ in 0..2 {
-        stream
+    for request_number in 0..2 {
+        writer
             .write_all(
                 format!(
                     "GET /nix-cache-info HTTP/1.1\r\nHost: {}\r\n\r\n",
@@ -2572,16 +2574,21 @@ fn http11_connection_serves_two_sequential_requests() {
             .expect("write HTTP/1.1 request");
         let response =
             String::from_utf8(read_http_response(&mut stream)).expect("response should be UTF-8");
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response:?}");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "request {request_number}: {response:?}"
+        );
         assert!(
             response.contains("Connection: keep-alive\r\n"),
             "{response:?}"
         );
         assert!(
-            response.ends_with("\r\n\r\nStoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n")
+            response.ends_with("\r\n\r\nStoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n"),
+            "{response:?}"
         );
     }
 
+    drop(writer);
     drop(stream);
     let (signal, status) = server.stop();
     assert!(signal.success(), "SIGTERM should be sent");
@@ -3369,7 +3376,8 @@ fn stalled_publication_does_not_block_an_independent_put() {
         &["--io-timeout-seconds", "2"],
     );
     let path = format!("/nar/{NARJAR_HASH}.nar");
-    let mut stalled = server.open_request("PUT", &path, &[("Content-Length", "6")]);
+    let stalled = server.open_request("PUT", &path, &[("Content-Length", "6")]);
+    let mut stalled = BufReader::new(stalled);
     thread::sleep(Duration::from_millis(50));
 
     thread::scope(|scope| {
@@ -3395,6 +3403,7 @@ fn stalled_publication_does_not_block_an_independent_put() {
         );
 
         stalled
+            .get_mut()
             .write_all(NAR_BYTES)
             .expect("stalled upload body should be writable");
         let first_response = read_http_response(&mut stalled);
