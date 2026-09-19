@@ -2,7 +2,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read},
-    marker::PhantomData,
+    os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
@@ -12,6 +12,7 @@ use super::{
     operations::OwnedTemporary,
     recovery::{PublicationState, PublicationTransaction},
     state::Storage,
+    typestate::{Streaming, Validated},
 };
 
 mod target;
@@ -28,9 +29,6 @@ pub(super) struct TemporaryFile {
     pub(super) directory: File,
     pub(super) file: File,
 }
-
-pub(super) struct Streaming;
-pub(super) struct Validated;
 
 struct OwnedPublication<'storage> {
     temporary: Option<OwnedTemporary<'storage>>,
@@ -101,7 +99,7 @@ pub(super) struct StagedPublication<'storage, Checkpoint, State> {
     pub(super) destination: PublicationDestination,
     publication: OwnedPublication<'storage>,
     checkpoint: Checkpoint,
-    _state: PhantomData<State>,
+    _state: State,
 }
 
 impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
@@ -117,7 +115,7 @@ impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
             destination,
             publication: OwnedPublication::new(temporary, transaction),
             checkpoint,
-            _state: PhantomData,
+            _state: Streaming::new(()),
         }
     }
 }
@@ -158,7 +156,7 @@ where
             destination,
             publication,
             checkpoint,
-            _state: PhantomData,
+            _state: Validated::new(()),
         })
     }
 }
@@ -212,13 +210,13 @@ pub(super) fn injected_fault(
 /// descriptions; distributed filesystems are outside the supported guarantee.
 #[derive(Debug)]
 pub(super) struct ProcessLock {
-    _file: File,
+    file: File,
 }
 
 impl ProcessLock {
     pub(super) fn acquire(parent: File) -> Result<Self, StorageError> {
         lock_exclusive(&parent)?;
-        Ok(Self { _file: parent })
+        Ok(Self { file: parent })
     }
 
     pub(super) fn validate_lock_file(root: &File) -> Result<(), StorageError> {
@@ -241,6 +239,18 @@ impl ProcessLock {
             );
         }
         Ok(())
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        // SAFETY: `file` owns the live descriptor until this method returns.
+        // Releasing explicitly makes the lease transition independent of any
+        // unrelated directory descriptors and occurs before the descriptor is
+        // closed by `File::drop`.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 
@@ -304,6 +314,7 @@ pub struct StagingReservation {
 }
 
 impl StagingReservation {
+    #[cfg(test)]
     pub(super) fn empty(budget: Arc<Mutex<StagingBudget>>) -> Self {
         Self { budget, bytes: 0 }
     }
@@ -357,12 +368,6 @@ impl Drop for StagingReservation {
             budget.release(self.bytes);
         }
     }
-}
-
-#[derive(Debug)]
-pub struct PublishedPair {
-    pub nar: File,
-    pub narinfo: File,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

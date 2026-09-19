@@ -7,9 +7,9 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use super::{Compression, PathInfo};
-use crate::nar_encode::{EncodeSummary, Encoder, Event};
-use crate::object::{EncodedIdentity, FileHash, NarHash};
+use narjar::nar_encode::{EncodeSummary, Encoder, Event};
+use narjar::narinfo::NarInfoMetadata;
+use narjar::object::{CompressionCodec, EncodedIdentity, FileHash, NarHash, NarIdentity};
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -34,32 +34,48 @@ pub(super) fn local_store_path(store_path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(root).join(relative))
 }
 
-pub(super) fn verify_nar_summary(info: &PathInfo, summary: &EncodeSummary) -> Result<(), String> {
-    let expected_hash = info.nar.hash();
+pub(super) fn verify_nar_summary(
+    info: &NarInfoMetadata,
+    summary: &EncodeSummary,
+) -> Result<(), String> {
+    verify_nar_identity(
+        info.claims().identity(),
+        info.claims().store_path(),
+        summary,
+    )
+}
+
+fn verify_nar_identity(
+    expected: NarIdentity,
+    source: impl std::fmt::Display,
+    summary: &EncodeSummary,
+) -> Result<(), String> {
+    let expected_hash = expected.hash();
     let actual_hash = NarHash::from_digest(summary.raw_sha256);
-    if summary.raw_size != info.nar.size().get() || actual_hash != expected_hash {
+    if summary.raw_size != expected.size().get() || actual_hash != expected_hash {
         return Err(format!(
-            "NAR identity mismatch for {}: expected {expected_hash}/{}; got {actual_hash}/{}",
-            info.path,
-            info.nar.size(),
+            "NAR identity mismatch for {source}: expected {expected_hash}/{}; got {actual_hash}/{}",
+            expected.size(),
             summary.raw_size
         ));
     }
     Ok(())
 }
 
-pub(super) fn open_verified_nar_reader(info: &PathInfo) -> Result<Box<dyn Read + Send>, String> {
-    open_verified_nar_reader_at(info, local_store_path(&info.path)?)
+pub(super) fn open_verified_nar_reader(
+    info: &NarInfoMetadata,
+) -> Result<Box<dyn Read + Send>, String> {
+    open_verified_nar_reader_at(info, local_store_path(info.claims().store_path())?)
 }
 
 fn open_verified_nar_reader_at(
-    info: &PathInfo,
+    info: &NarInfoMetadata,
     path: PathBuf,
 ) -> Result<Box<dyn Read + Send>, String> {
     let reader = VerifiedNarReader {
-        reader: spawn_nar_writer(path, Compression::None, None)?,
-        expected_hash: FileHash::from_nar_hash(info.nar.hash()),
-        expected_size: info.nar.size().get(),
+        reader: spawn_nar_writer(path, NarStream::Raw)?,
+        expected_hash: FileHash::from_nar_hash(info.claims().identity().hash()),
+        expected_size: info.claims().identity().size().get(),
         digest: Sha256::new(),
         bytes_read: 0,
         complete: false,
@@ -68,15 +84,17 @@ fn open_verified_nar_reader_at(
 }
 
 pub(super) fn open_verified_encoded_nar_reader(
-    info: &PathInfo,
-    compression: Compression,
+    info: &NarInfoMetadata,
+    codec: CompressionCodec,
     expected: EncodedIdentity,
 ) -> Result<Box<dyn Read + Send>, String> {
     let reader = VerifiedNarReader {
         reader: spawn_nar_writer(
-            local_store_path(&info.path)?,
-            compression,
-            Some(info.clone()),
+            local_store_path(info.claims().store_path())?,
+            NarStream::Compressed {
+                codec,
+                expected: info.claims().identity(),
+            },
         )?,
         expected_hash: expected.hash(),
         expected_size: expected.size().get(),
@@ -87,23 +105,24 @@ pub(super) fn open_verified_encoded_nar_reader(
     Ok(Box::new(reader))
 }
 
-fn spawn_nar_writer(
-    path: PathBuf,
-    compression: Compression,
-    info: Option<PathInfo>,
-) -> Result<PipeReader, String> {
+enum NarStream {
+    Raw,
+    Compressed {
+        codec: CompressionCodec,
+        expected: NarIdentity,
+    },
+}
+
+fn spawn_nar_writer(path: PathBuf, stream: NarStream) -> Result<PipeReader, String> {
     let (reader, mut writer) = io::pipe().map_err(|error| format!("creating NAR pipe: {error}"))?;
     thread::Builder::new()
         .name("narjar-nar-stream".into())
         .spawn(move || {
-            let result = match compression {
-                Compression::None => write_nar(&path, &mut writer).map(|_| ()),
-                Compression::Zstd | Compression::Xz => write_encoded_nar(
-                    &path,
-                    info.as_ref().expect("encoded NAR metadata"),
-                    compression,
-                    &mut writer,
-                ),
+            let result = match stream {
+                NarStream::Raw => write_nar(&path, &mut writer).map(|_| ()),
+                NarStream::Compressed { codec, expected } => {
+                    write_encoded_nar(&path, expected, codec, &mut writer)
+                }
             };
             let _ = result;
         })
@@ -113,13 +132,13 @@ fn spawn_nar_writer(
 
 fn write_encoded_nar<W: Write>(
     path: &Path,
-    info: &PathInfo,
-    compression: Compression,
+    expected: NarIdentity,
+    codec: CompressionCodec,
     output: W,
 ) -> Result<(), String> {
     let mut output = output;
-    let summary = match compression {
-        Compression::Zstd => {
+    let summary = match codec {
+        CompressionCodec::Zstd => {
             let mut encoder = structured_zstd::encoding::StreamingEncoder::new(
                 &mut output,
                 structured_zstd::encoding::CompressionLevel::Fastest,
@@ -130,7 +149,7 @@ fn write_encoded_nar<W: Write>(
                 .map_err(|error| format!("finishing zstd NAR: {error}"))?;
             summary
         }
-        Compression::Xz => {
+        CompressionCodec::Xz => {
             let mut encoder =
                 lzma_rust2::XzWriter::new(&mut output, lzma_rust2::XzOptions::with_preset(1))
                     .map_err(|error| format!("creating XZ encoder: {error}"))?;
@@ -140,9 +159,8 @@ fn write_encoded_nar<W: Write>(
                 .map_err(|error| format!("finishing XZ NAR: {error}"))?;
             summary
         }
-        Compression::None => unreachable!("raw NARs do not use an encoded writer"),
     };
-    verify_nar_summary(info, &summary)
+    verify_nar_identity(expected, path.display(), &summary)
 }
 
 struct VerifiedNarReader {
@@ -271,7 +289,7 @@ fn emit_symlink<W: Write>(encoder: &mut Encoder<W>, path: &Path) -> io::Result<(
         .map_err(encode_io_error)
 }
 
-fn encode_io_error(error: crate::nar_encode::EncodeError) -> io::Error {
+fn encode_io_error(error: narjar::nar_encode::EncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
@@ -281,9 +299,9 @@ mod tests {
     use std::{convert::Infallible, fs, io::Read};
 
     use super::{open_verified_nar_reader_at, write_nar};
-    use crate::nar::{Decoder, Event};
-    use crate::object::{NarHash, NarIdentity, NarSize};
-    use crate::push::PathInfo;
+    use narjar::nar::{Decoder, Event};
+    use narjar::narinfo::NarInfoMetadata;
+    use narjar::object::{NarHash, NarIdentity, NarSize};
 
     #[test]
     fn emits_a_canonical_sorted_directory_stream() {
@@ -318,17 +336,18 @@ mod tests {
             .expect("write NAR fixture");
         let mut expected = Vec::new();
         let summary = write_nar(directory.path(), &mut expected).expect("measure NAR fixture");
-        let info = PathInfo {
-            path: directory.path().display().to_string(),
-            ca: None,
-            deriver: None,
-            nar: NarIdentity::new(
+        let info = NarInfoMetadata::from_store_metadata(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-test".to_owned(),
+            None,
+            None,
+            NarIdentity::new(
                 NarHash::from_digest(summary.raw_sha256),
                 NarSize::new(summary.raw_size),
             ),
-            references: Vec::new(),
-            signatures: Vec::new(),
-        };
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("test metadata should be valid");
 
         let mut reader = open_verified_nar_reader_at(&info, directory.path().to_owned())
             .expect("open NAR stream");
@@ -337,6 +356,9 @@ mod tests {
             .read_to_end(&mut actual)
             .expect("read verified NAR stream");
         assert_eq!(actual, expected);
-        assert_eq!(info.nar.hash(), NarHash::from_digest(summary.raw_sha256));
+        assert_eq!(
+            info.claims().identity().hash(),
+            NarHash::from_digest(summary.raw_sha256)
+        );
     }
 }

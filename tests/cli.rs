@@ -2,6 +2,7 @@ use data_encoding::{BASE64, BitOrder, Specification};
 use ed25519_dalek::{Signer, SigningKey};
 use lzma_rust2::{XzOptions, XzWriter};
 use narjar::nar_encode::{Encoder, Event as NarEvent};
+use narjar::object::CompressionCodec;
 use narjar::storage::WireEncoding;
 use sha2::{Digest, Sha256};
 use std::{
@@ -2744,11 +2745,26 @@ fn zstd_narinfo_is_published_as_the_canonical_raw_pair() {
 #[test]
 fn configured_compressed_egress_is_independent_of_ingress_encoding() {
     for (output_encoding, input_encoding) in [
-        (WireEncoding::Zstd, WireEncoding::Xz),
-        (WireEncoding::Xz, WireEncoding::Zstd),
-        (WireEncoding::Xz, WireEncoding::Raw),
-        (WireEncoding::Zstd, WireEncoding::Raw),
-        (WireEncoding::Raw, WireEncoding::Zstd),
+        (
+            WireEncoding::Compressed(CompressionCodec::Zstd),
+            WireEncoding::Compressed(CompressionCodec::Xz),
+        ),
+        (
+            WireEncoding::Compressed(CompressionCodec::Xz),
+            WireEncoding::Compressed(CompressionCodec::Zstd),
+        ),
+        (
+            WireEncoding::Compressed(CompressionCodec::Xz),
+            WireEncoding::Raw,
+        ),
+        (
+            WireEncoding::Compressed(CompressionCodec::Zstd),
+            WireEncoding::Raw,
+        ),
+        (
+            WireEncoding::Raw,
+            WireEncoding::Compressed(CompressionCodec::Zstd),
+        ),
     ] {
         let output_name = compression_name(output_encoding);
         let input_suffix = test_nar_suffix(input_encoding);
@@ -2880,7 +2896,7 @@ fn chunked_backend_materializes_compressed_egress_from_chunks() {
         .find_map(|line| line.strip_prefix("URL: "))
         .expect("projected narinfo should contain an output URL");
     let output = server.request("GET", &format!("/{output_url}"));
-    let expected = encode_test_nar(WireEncoding::Zstd);
+    let expected = encode_test_nar(WireEncoding::Compressed(CompressionCodec::Zstd));
     let (output_headers, output_body) = response_parts(&output);
 
     assert!(
@@ -2917,14 +2933,14 @@ fn chunked_backend_materializes_compressed_egress_from_chunks() {
 fn encode_test_nar(encoding: WireEncoding) -> Vec<u8> {
     match encoding {
         WireEncoding::Raw => NAR_BYTES.to_vec(),
-        WireEncoding::Zstd => {
+        WireEncoding::Compressed(CompressionCodec::Zstd) => {
             let mut compressed = Vec::new();
             let mut encoder = StreamingEncoder::new(&mut compressed, CompressionLevel::Fastest);
             encoder.write_all(NAR_BYTES).expect("compress NAR");
             encoder.finish().expect("finish zstd stream");
             compressed
         }
-        WireEncoding::Xz => {
+        WireEncoding::Compressed(CompressionCodec::Xz) => {
             let mut compressed = Vec::new();
             let mut writer = XzWriter::new(&mut compressed, XzOptions::with_preset(1))
                 .expect("create XZ writer");
@@ -2959,8 +2975,8 @@ fn rewrite_transport_fields(
 
 fn compression_name(encoding: WireEncoding) -> &'static str {
     match encoding {
-        WireEncoding::Xz => "xz",
-        WireEncoding::Zstd => "zstd",
+        WireEncoding::Compressed(CompressionCodec::Xz) => "xz",
+        WireEncoding::Compressed(CompressionCodec::Zstd) => "zstd",
         WireEncoding::Raw => "none",
     }
 }
@@ -2968,14 +2984,17 @@ fn compression_name(encoding: WireEncoding) -> &'static str {
 fn test_nar_suffix(encoding: WireEncoding) -> &'static str {
     match encoding {
         WireEncoding::Raw => ".nar",
-        WireEncoding::Xz => ".nar.xz",
-        WireEncoding::Zstd => ".nar.zst",
+        WireEncoding::Compressed(CompressionCodec::Xz) => ".nar.xz",
+        WireEncoding::Compressed(CompressionCodec::Zstd) => ".nar.zst",
     }
 }
 
 #[test]
 fn compressed_ingestion_receipts_survive_restart_before_narinfo_publication() {
-    for encoding in [WireEncoding::Xz, WireEncoding::Zstd] {
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
         let server =
             RunningServer::start(&format!("receipt-restart-{}", test_encoding_name(encoding)));
         let (compressed, narinfo, suffix) = compressed_upload_fixture(encoding);
@@ -3022,7 +3041,10 @@ fn compressed_ingestion_receipts_survive_restart_before_narinfo_publication() {
 fn compressed_publication_rejects_a_receipt_for_a_different_nar_identity() {
     let different_nar = b"different-nar";
     let different_hash = nix32_sha256(different_nar);
-    for encoding in [WireEncoding::Xz, WireEncoding::Zstd] {
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
         let server = RunningServer::start(&format!(
             "receipt-mismatch-{}",
             test_encoding_name(encoding)
@@ -3074,7 +3096,10 @@ fn compressed_publication_rejects_a_receipt_for_a_different_nar_identity() {
 
 #[test]
 fn an_ingestion_receipt_cannot_bind_a_missing_or_wrong_sized_raw_payload() {
-    for encoding in [WireEncoding::Xz, WireEncoding::Zstd] {
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
         let server = RunningServer::start("receipt-needs-raw-payload");
         let (compressed, narinfo, suffix) = compressed_upload_fixture(encoding);
         let uploaded = server.request_with_body(
@@ -3127,8 +3152,8 @@ fn compressed_upload_fixture(encoding: WireEncoding) -> (Vec<u8>, String, &'stat
 
 fn encode_test_nar_with(encoding: WireEncoding) -> Vec<u8> {
     match encoding {
-        WireEncoding::Xz => encode_test_nar_as_xz(),
-        WireEncoding::Zstd => encode_test_nar_as_zstd(),
+        WireEncoding::Compressed(CompressionCodec::Xz) => encode_test_nar_as_xz(),
+        WireEncoding::Compressed(CompressionCodec::Zstd) => encode_test_nar_as_zstd(),
         WireEncoding::Raw => panic!("raw is not a compressed test encoding"),
     }
 }
@@ -3160,23 +3185,27 @@ fn signed_narinfo_for_encoding(
 ) -> String {
     match encoding {
         WireEncoding::Raw => signed_narinfo(nar_hash, nar_size),
-        WireEncoding::Xz => signed_xz_narinfo(encoded_hash, nar_hash, nar_size, encoded_size),
-        WireEncoding::Zstd => signed_zstd_narinfo(encoded_hash, nar_hash, nar_size, encoded_size),
+        WireEncoding::Compressed(CompressionCodec::Xz) => {
+            signed_xz_narinfo(encoded_hash, nar_hash, nar_size, encoded_size)
+        }
+        WireEncoding::Compressed(CompressionCodec::Zstd) => {
+            signed_zstd_narinfo(encoded_hash, nar_hash, nar_size, encoded_size)
+        }
     }
 }
 
 fn test_encoding_name(encoding: WireEncoding) -> &'static str {
     match encoding {
         WireEncoding::Raw => "raw",
-        WireEncoding::Xz => "xz",
-        WireEncoding::Zstd => "zstd",
+        WireEncoding::Compressed(CompressionCodec::Xz) => "xz",
+        WireEncoding::Compressed(CompressionCodec::Zstd) => "zstd",
     }
 }
 
 fn compressed_test_suffix(encoding: WireEncoding) -> &'static str {
     match encoding {
-        WireEncoding::Xz => ".nar.xz",
-        WireEncoding::Zstd => ".nar.zst",
+        WireEncoding::Compressed(CompressionCodec::Xz) => ".nar.xz",
+        WireEncoding::Compressed(CompressionCodec::Zstd) => ".nar.zst",
         WireEncoding::Raw => panic!("raw is not a compressed test encoding"),
     }
 }

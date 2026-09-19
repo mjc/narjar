@@ -67,24 +67,18 @@ impl ChunkStore {
         Ok(Self { chunks, manifests })
     }
 
+    #[cfg(test)]
     pub(crate) fn store_nar<R: Read>(
         &self,
         mut source: R,
         identity: NarIdentity,
         profile: ChunkProfile,
     ) -> Result<ChunkManifest, ChunkStoreError> {
-        let mut writer = self.begin_ingest(profile)?;
+        let mut writer = self.begin_ingest_with_optional_reservation(profile, None, 0)?;
         io::copy(&mut source, &mut writer)?;
         writer
             .finish(identity)
             .map(|completed| completed.manifest())
-    }
-
-    pub(crate) fn begin_ingest(
-        &self,
-        profile: ChunkProfile,
-    ) -> Result<ChunkingWriter<'_>, ChunkStoreError> {
-        self.begin_ingest_with_optional_reservation(profile, None, 0)
     }
 
     pub(crate) fn begin_ingest_with_reservation(

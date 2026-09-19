@@ -9,20 +9,17 @@ use super::{
     compression::{CapacityCheckedStagingWriter, ReceivedNar, receive_uploaded_nar},
     publication::{NarUploadPolicy, PublishTarget, TemporaryFile},
     recovery::{PublicationState, PublicationTransaction},
+    typestate::{Streaming, Validated},
 };
 
-pub(super) struct Receiving {
+pub(super) struct UploadRequest {
     name: NarFileName,
     length: u64,
     policy: NarUploadPolicy,
 }
 
-pub(super) struct Complete {
-    received: ReceivedNar,
-}
-
-/// The state and the resource it describes move together. Only `Receiving`
-/// exposes a writer; only `Complete` exposes publication.
+/// The state and the resource it describes move together. Only streaming uploads
+/// expose a writer; only validated uploads expose publication.
 pub(super) struct Staged<'storage, State> {
     temporary: UploadTemporary<'storage>,
     transaction: PublicationTransaction,
@@ -61,7 +58,7 @@ impl Storage {
         length: u64,
         policy: NarUploadPolicy,
         reservation: StagingReservation,
-    ) -> Result<Staged<'_, Receiving>, StorageError> {
+    ) -> Result<Staged<'_, Streaming<UploadRequest>>, StorageError> {
         if length > policy.max_bytes {
             return Err(StorageError::UploadTooLarge);
         }
@@ -78,20 +75,20 @@ impl Storage {
             temporary,
             transaction,
             reservation,
-            state: Receiving {
+            state: Streaming::new(UploadRequest {
                 name,
                 length,
                 policy,
-            },
+            }),
         })
     }
 }
 
-impl<'storage> Staged<'storage, Receiving> {
+impl<'storage> Staged<'storage, Streaming<UploadRequest>> {
     pub(super) fn receive(
         mut self,
         source: impl Read,
-    ) -> Result<Staged<'storage, Complete>, StorageError> {
+    ) -> Result<Staged<'storage, Validated<ReceivedNar>>, StorageError> {
         self.transaction.transition(PublicationState::Streaming)?;
         let received = self.write_and_verify_uploaded_nar(source)?;
         self.temporary.file.file.sync_all()?;
@@ -100,7 +97,7 @@ impl<'storage> Staged<'storage, Receiving> {
             temporary: self.temporary,
             transaction: self.transaction,
             reservation: self.reservation,
-            state: Complete { received },
+            state: Validated::new(received),
         })
     }
 
@@ -111,19 +108,19 @@ impl<'storage> Staged<'storage, Receiving> {
         let mut destination = CapacityCheckedStagingWriter::new(
             &mut self.temporary.file.file,
             &mut self.reservation,
-            self.state.policy.min_free_bytes,
+            self.state.value().policy.min_free_bytes,
         );
         Ok(receive_uploaded_nar(
             source,
-            self.state.name,
-            self.state.length,
-            self.state.policy.max_bytes,
+            self.state.value().name,
+            self.state.value().length,
+            self.state.value().policy.max_bytes,
             &mut destination,
         )?)
     }
 }
 
-impl Staged<'_, Complete> {
+impl Staged<'_, Validated<ReceivedNar>> {
     pub(super) fn commit(self) -> Result<PublishOutcome, StorageError> {
         self.commit_with_receipt_checkpoint(|_| Ok(()))
     }
@@ -146,8 +143,9 @@ impl Staged<'_, Complete> {
             temporary,
             transaction,
             reservation,
-            state: Complete { received },
+            state,
         } = self;
+        let received = state.into_inner();
         let storage = temporary.storage;
         let outcome = temporary.commit(received.identity(), transaction)?;
         checkpoint(super::publication::PublishBoundary::AfterNarPublication)?;

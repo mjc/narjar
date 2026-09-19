@@ -1,3 +1,4 @@
+mod cache_info;
 #[allow(dead_code)]
 pub(crate) mod chunk_store;
 #[allow(dead_code)]
@@ -9,12 +10,30 @@ mod fs;
 pub mod gc;
 mod ids;
 mod ingest;
+mod initialization;
 pub(crate) mod inspection;
 mod operations;
 mod publication;
+mod receipt;
 mod reconcile;
 mod recovery;
 mod state;
+mod typestate;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CleanupAction {
+    Keep,
+    Remove,
+}
+
+impl CleanupAction {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Remove, _) | (_, Self::Remove) => Self::Remove,
+            (Self::Keep, Self::Keep) => Self::Keep,
+        }
+    }
+}
 
 pub(crate) use fs::{
     CapacityErrorKind, StorageCapacity, capacity_error_kind, entry_identity_at,
@@ -26,14 +45,11 @@ pub use crate::object::{
     EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize, WireEncoding,
 };
 pub use directory::Directory;
-pub(crate) use egress::StoredNar;
+pub(crate) use egress::{NarReadBody, StoredNar};
 pub use ids::{InvalidObjectId, StoreHash};
-pub use publication::{
-    NarUploadPolicy, PublishOutcome, PublishedPair, StagingReservation, StorageError,
-};
-pub use state::{Storage, StorageBackend};
+pub use publication::{NarUploadPolicy, PublishOutcome, StagingReservation, StorageError};
+pub use state::{InvalidStorageBackend, Storage, StorageBackend};
 
-pub(crate) use operations::NarReadBody;
 pub use operations::{NarInfoDeletion, NarMatch, StorageReadiness};
 pub use reconcile::{CleanupOutcome, ReconcileClass, ReconcileEntry, ReconcileReport};
 

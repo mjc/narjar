@@ -35,7 +35,7 @@ impl Layout {
     }
 
     pub(crate) fn narinfo_path(&self, hash: &StoreHash) -> PathBuf {
-        self.root.join(format!("{}.narinfo", hash.0))
+        self.root.join(format!("{}.narinfo", hash.as_str()))
     }
 
     pub(crate) fn temp_dir(&self) -> PathBuf {
@@ -130,7 +130,7 @@ impl PublishTarget<'_> {
             Self::RepairEgressNar(output) => PublicationDestination {
                 directory: PublicationDirectory::Nar,
                 temporary_directory: TemporaryDirectory::Nar,
-                name: NarFileName::new(output.hash(), output.codec().wire_encoding()).os_string(),
+                name: output.file_name().os_string(),
                 publication: DestinationPublication::Repair(*output),
                 temp_prefix: "nar",
             },

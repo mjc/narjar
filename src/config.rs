@@ -5,7 +5,6 @@ use std::{
 };
 
 use clap::Args;
-use clap::ValueEnum;
 use narjar::{object::WireEncoding, storage::StorageBackend};
 
 #[derive(Debug)]
@@ -20,47 +19,6 @@ pub(crate) struct ServeConfig {
     pub(crate) io_timeout_seconds: NonZeroU64,
     pub(crate) egress_compression: WireEncoding,
     pub(crate) storage_backend: StorageBackend,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum EgressCompression {
-    None,
-    Zstd,
-    Xz,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub(crate) enum StorageBackendOption {
-    Flat,
-    Chunked,
-}
-
-impl From<StorageBackendOption> for StorageBackend {
-    fn from(backend: StorageBackendOption) -> Self {
-        match backend {
-            StorageBackendOption::Flat => Self::Flat,
-            StorageBackendOption::Chunked => Self::Chunked,
-        }
-    }
-}
-
-impl StorageBackendOption {
-    pub(crate) const fn backend(self) -> StorageBackend {
-        match self {
-            Self::Flat => StorageBackend::Flat,
-            Self::Chunked => StorageBackend::Chunked,
-        }
-    }
-}
-
-impl From<EgressCompression> for WireEncoding {
-    fn from(compression: EgressCompression) -> Self {
-        match compression {
-            EgressCompression::None => Self::Raw,
-            EgressCompression::Zstd => Self::Zstd,
-            EgressCompression::Xz => Self::Xz,
-        }
-    }
 }
 
 #[derive(Args)]
@@ -89,20 +47,10 @@ pub(crate) struct ServeArgs {
         default_value_t = NonZeroU64::new(30).unwrap()
     )]
     io_timeout_seconds: NonZeroU64,
-    #[arg(
-        long,
-        env = "NARJAR_EGRESS_COMPRESSION",
-        value_enum,
-        default_value = "none"
-    )]
-    egress_compression: EgressCompression,
-    #[arg(
-        long,
-        env = "NARJAR_STORAGE_BACKEND",
-        value_enum,
-        default_value = "flat"
-    )]
-    storage_backend: StorageBackendOption,
+    #[arg(long, env = "NARJAR_EGRESS_COMPRESSION", default_value = "none")]
+    egress_compression: WireEncoding,
+    #[arg(long, env = "NARJAR_STORAGE_BACKEND", default_value = "flat")]
+    storage_backend: StorageBackend,
 }
 
 impl From<ServeArgs> for ServeConfig {
@@ -116,8 +64,8 @@ impl From<ServeArgs> for ServeConfig {
             min_free_bytes: args.min_free_bytes,
             shutdown_grace_seconds: args.shutdown_grace_seconds,
             io_timeout_seconds: args.io_timeout_seconds,
-            egress_compression: args.egress_compression.into(),
-            storage_backend: args.storage_backend.into(),
+            egress_compression: args.egress_compression,
+            storage_backend: args.storage_backend,
         }
     }
 }

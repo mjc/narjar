@@ -115,7 +115,10 @@ fn respond_narinfo(
         Err(_) => return internal_error(guard, request),
     }
 
-    let bytes = validated.into_bytes();
+    let bytes = match validated.into_bytes() {
+        Ok(bytes) => bytes,
+        Err(_) => return internal_error(guard, request),
+    };
     let bytes_out = bytes.len() as u64;
     let response = cache_policy(
         Response::from_data(bytes).with_header(header("Content-Type", "text/x-nix-narinfo")),
@@ -473,7 +476,7 @@ pub fn respond(
 #[cfg(test)]
 mod tests {
     use super::{CacheRoute, RouteMatch};
-    use crate::narinfo::NarEncoding;
+    use crate::object::{CompressionCodec, WireEncoding};
 
     #[test]
     fn legacy_main_prefix_maps_to_cache_routes() {
@@ -489,7 +492,7 @@ mod tests {
             CacheRoute::classify(
                 "/main/nar/0000000000000000000000000000000000000000000000000000.nar"
             ),
-            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == NarEncoding::Raw
+            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == WireEncoding::Raw
         ));
     }
 
@@ -497,13 +500,15 @@ mod tests {
     fn encoded_nar_routes_preserve_the_requested_encoding() {
         assert!(matches!(
             CacheRoute::classify("/nar/0000000000000000000000000000000000000000000000000000.nar.xz"),
-            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == NarEncoding::Xz
+            RouteMatch::Found(CacheRoute::Nar(name))
+                if name.encoding() == WireEncoding::Compressed(CompressionCodec::Xz)
         ));
         assert!(matches!(
             CacheRoute::classify(
                 "/nar/0000000000000000000000000000000000000000000000000000.nar.zst"
             ),
-            RouteMatch::Found(CacheRoute::Nar(name)) if name.encoding() == NarEncoding::Zstd
+            RouteMatch::Found(CacheRoute::Nar(name))
+                if name.encoding() == WireEncoding::Compressed(CompressionCodec::Zstd)
         ));
     }
 }

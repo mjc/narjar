@@ -1,4 +1,4 @@
-use std::{ffi::OsString, fmt, sync::OnceLock};
+use std::{ffi::OsString, fmt, marker::PhantomData, str::FromStr, sync::OnceLock};
 
 use data_encoding::{BitOrder, Encoding, Specification};
 use serde::{Deserialize, Serialize};
@@ -17,100 +17,120 @@ impl fmt::Display for InvalidObjectId {
 
 impl std::error::Error for InvalidObjectId {}
 
+/// Purpose tag for values describing the decoded NAR byte stream.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum LogicalNar {}
+
+/// Purpose tag for values describing an encoded payload file.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum EncodedFile {}
+
+/// A SHA-256 digest whose purpose remains part of its compile-time type.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct NarHash([u8; 32]);
+#[serde(transparent)]
+pub struct Sha256Digest<Purpose>([u8; 32], #[serde(skip)] PhantomData<fn() -> Purpose>);
 
-impl NarHash {
+/// SHA-256 identity of the decoded NAR byte stream.
+pub type NarHash = Sha256Digest<LogicalNar>;
+
+/// SHA-256 identity of an encoded payload file.
+pub type FileHash = Sha256Digest<EncodedFile>;
+
+impl<Purpose> Sha256Digest<Purpose> {
     pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
-        decode_sha256(value).map(Self)
+        decode_sha256(value).map(Self::from_digest)
     }
 
-    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
-        Self(digest)
+    pub const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest, PhantomData)
     }
 
-    pub(crate) const fn bytes_for_storage(self) -> [u8; 32] {
+    pub(crate) const fn bytes(self) -> [u8; 32] {
         self.0
-    }
-
-    #[allow(dead_code)]
-    pub(crate) const fn from_storage_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
     }
 }
 
-impl fmt::Display for NarHash {
+impl<Purpose> fmt::Display for Sha256Digest<Purpose> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&encode_nix32(&self.0))
+    }
+}
+
+impl Sha256Digest<EncodedFile> {
+    pub(crate) fn matches_nar_hash(self, hash: NarHash) -> bool {
+        self.bytes() == hash.bytes()
+    }
+
+    pub const fn from_nar_hash(hash: NarHash) -> Self {
+        Self::from_digest(hash.bytes())
+    }
+
+    pub const fn as_nar_hash(self) -> NarHash {
+        NarHash::from_digest(self.bytes())
     }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct FileHash([u8; 32]);
-
-impl FileHash {
-    pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
-        decode_sha256(value).map(Self)
-    }
-
-    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
-        Self(digest)
-    }
-
-    pub(crate) fn matches_nar_hash(self, hash: NarHash) -> bool {
-        self.0 == hash.0
-    }
-
-    pub(crate) const fn from_nar_hash(hash: NarHash) -> Self {
-        Self(hash.0)
-    }
-
-    pub(crate) const fn as_nar_hash(self) -> NarHash {
-        NarHash(self.0)
-    }
-}
-
-impl fmt::Display for FileHash {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&encode_nix32(&self.0))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct EncodedIdentity {
+/// Identity of one compressed NAR representation.
+pub struct EncodedIdentity {
     codec: CompressionCodec,
-    hash: FileHash,
-    size: EncodedSize,
+    content: ContentIdentity<EncodedFile>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+/// A compressed representation bound to its decoded logical NAR.
+pub struct CompressedNarIdentity {
+    encoded: EncodedIdentity,
+    decoded: NarIdentity,
+}
+
+impl CompressedNarIdentity {
+    pub const fn new(encoded: EncodedIdentity, decoded: NarIdentity) -> Self {
+        Self { encoded, decoded }
+    }
+
+    pub const fn encoded(self) -> EncodedIdentity {
+        self.encoded
+    }
+
+    pub const fn decoded(self) -> NarIdentity {
+        self.decoded
+    }
 }
 
 impl EncodedIdentity {
-    pub(crate) const fn new(codec: CompressionCodec, hash: FileHash, size: EncodedSize) -> Self {
-        Self { codec, hash, size }
+    pub const fn new(codec: CompressionCodec, hash: FileHash, size: EncodedSize) -> Self {
+        Self {
+            codec,
+            content: ContentIdentity::new(hash, size),
+        }
     }
 
-    pub(crate) const fn codec(self) -> CompressionCodec {
+    pub const fn codec(self) -> CompressionCodec {
         self.codec
     }
 
-    pub(crate) const fn hash(self) -> FileHash {
-        self.hash
+    pub const fn hash(self) -> FileHash {
+        self.content.hash()
     }
 
-    pub(crate) const fn size(self) -> EncodedSize {
-        self.size
+    pub const fn size(self) -> EncodedSize {
+        self.content.size()
     }
 
-    pub(crate) const fn file_name(self) -> NarFileName {
-        NarFileName::new(self.hash, self.codec.wire_encoding())
+    pub const fn file_name(self) -> NarFileName {
+        NarFileName::new(self.hash(), WireEncoding::Compressed(self.codec))
     }
 }
 
+/// A byte count whose represented content remains part of its compile-time type.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct NarSize(u64);
+#[serde(transparent)]
+pub struct ByteCount<Purpose>(u64, #[serde(skip)] PhantomData<fn() -> Purpose>);
 
-impl NarSize {
+impl<Purpose> ByteCount<Purpose> {
     pub const fn new(value: u64) -> Self {
-        Self(value)
+        Self(value, PhantomData)
     }
 
     pub const fn get(self) -> u64 {
@@ -118,62 +138,48 @@ impl NarSize {
     }
 }
 
-impl From<u64> for NarSize {
+impl<Purpose> From<u64> for ByteCount<Purpose> {
     fn from(value: u64) -> Self {
         Self::new(value)
     }
 }
 
-impl fmt::Display for NarSize {
+impl<Purpose> fmt::Display for ByteCount<Purpose> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
 }
 
+/// Size of the decoded NAR byte stream.
+pub type NarSize = ByteCount<LogicalNar>;
+
+/// Size of an encoded payload file.
+pub type EncodedSize = ByteCount<EncodedFile>;
+
+/// A hash and byte count that necessarily describe the same kind of content.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct EncodedSize(u64);
-
-impl EncodedSize {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
+#[serde(bound(serialize = "", deserialize = ""))]
+pub struct ContentIdentity<Purpose> {
+    hash: Sha256Digest<Purpose>,
+    size: ByteCount<Purpose>,
 }
 
-impl From<u64> for EncodedSize {
-    fn from(value: u64) -> Self {
-        Self::new(value)
-    }
-}
-
-impl fmt::Display for EncodedSize {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct NarIdentity {
-    pub(crate) hash: NarHash,
-    pub(crate) size: NarSize,
-}
-
-impl NarIdentity {
-    pub(crate) const fn new(hash: NarHash, size: NarSize) -> Self {
+impl<Purpose> ContentIdentity<Purpose> {
+    pub const fn new(hash: Sha256Digest<Purpose>, size: ByteCount<Purpose>) -> Self {
         Self { hash, size }
     }
 
-    pub(crate) const fn hash(self) -> NarHash {
+    pub const fn hash(self) -> Sha256Digest<Purpose> {
         self.hash
     }
 
-    pub(crate) const fn size(self) -> NarSize {
+    pub const fn size(self) -> ByteCount<Purpose> {
         self.size
     }
 }
+
+/// Hash and size of the decoded NAR byte stream.
+pub type NarIdentity = ContentIdentity<LogicalNar>;
 
 /// The immutable filename and wire representation of a NAR payload.
 ///
@@ -195,17 +201,20 @@ impl NarFileName {
     }
 
     pub fn parse(name: &str) -> Result<Self, InvalidObjectId> {
-        [WireEncoding::Zstd, WireEncoding::Xz, WireEncoding::Raw]
-            .into_iter()
-            .find_map(|encoding| {
-                name.strip_suffix(encoding.suffix()).map(|hash| {
-                    FileHash::parse(hash).map(|file_hash| Self::new(file_hash, encoding))
-                })
-            })
-            .ok_or(InvalidObjectId)?
+        [
+            WireEncoding::Compressed(CompressionCodec::Zstd),
+            WireEncoding::Compressed(CompressionCodec::Xz),
+            WireEncoding::Raw,
+        ]
+        .into_iter()
+        .find_map(|encoding| {
+            name.strip_suffix(encoding.suffix())
+                .map(|hash| FileHash::parse(hash).map(|file_hash| Self::new(file_hash, encoding)))
+        })
+        .ok_or(InvalidObjectId)?
     }
 
-    pub(crate) const fn raw(hash: NarHash) -> Self {
+    pub const fn raw(hash: NarHash) -> Self {
         Self::new(FileHash::from_nar_hash(hash), WireEncoding::Raw)
     }
 
@@ -220,7 +229,7 @@ impl NarFileName {
     pub(crate) const fn raw_hash(self) -> Option<NarHash> {
         match self.encoding {
             WireEncoding::Raw => Some(self.file_hash.as_nar_hash()),
-            WireEncoding::Xz | WireEncoding::Zstd => None,
+            WireEncoding::Compressed(_) => None,
         }
     }
 
@@ -238,43 +247,101 @@ impl fmt::Display for NarFileName {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum WireEncoding {
     Raw,
-    Zstd,
-    Xz,
+    Compressed(CompressionCodec),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidWireEncoding;
+
+impl fmt::Display for InvalidWireEncoding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("expected one of: none, zstd, xz")
+    }
+}
+
+impl std::error::Error for InvalidWireEncoding {}
+
+impl FromStr for WireEncoding {
+    type Err = InvalidWireEncoding;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::Raw),
+            "zstd" => Ok(Self::Compressed(CompressionCodec::Zstd)),
+            "xz" => Ok(Self::Compressed(CompressionCodec::Xz)),
+            _ => Err(InvalidWireEncoding),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub(crate) enum CompressionCodec {
+pub enum CompressionCodec {
     Zstd,
     Xz,
 }
 
 impl CompressionCodec {
-    pub(crate) const fn wire_encoding(self) -> WireEncoding {
+    pub const fn suffix(self) -> &'static str {
         match self {
-            Self::Zstd => WireEncoding::Zstd,
-            Self::Xz => WireEncoding::Xz,
+            Self::Zstd => ".nar.zst",
+            Self::Xz => ".nar.xz",
+        }
+    }
+}
+
+impl From<CompressionCodec> for WireEncoding {
+    fn from(codec: CompressionCodec) -> Self {
+        Self::Compressed(codec)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// The exact payload representation described by a narinfo document.
+pub enum NarRepresentation {
+    Raw(NarIdentity),
+    Compressed(CompressedNarIdentity),
+}
+
+impl NarRepresentation {
+    pub const fn compressed(encoded: EncodedIdentity, decoded: NarIdentity) -> Self {
+        Self::Compressed(CompressedNarIdentity::new(encoded, decoded))
+    }
+
+    pub const fn identity(self) -> NarIdentity {
+        match self {
+            Self::Raw(identity) => identity,
+            Self::Compressed(identity) => identity.decoded(),
         }
     }
 
-    pub(crate) const fn suffix(self) -> &'static str {
-        self.wire_encoding().suffix()
+    pub const fn file_name(self) -> NarFileName {
+        match self {
+            Self::Raw(identity) => NarFileName::raw(identity.hash()),
+            Self::Compressed(identity) => identity.encoded().file_name(),
+        }
+    }
+
+    pub const fn encoded_size(self) -> EncodedSize {
+        match self {
+            Self::Raw(identity) => EncodedSize::new(identity.size().get()),
+            Self::Compressed(identity) => identity.encoded().size(),
+        }
     }
 }
 
 impl WireEncoding {
-    pub(crate) const fn compression(self) -> &'static str {
+    pub const fn compression(self) -> &'static str {
         match self {
             Self::Raw => "none",
-            Self::Zstd => "zstd",
-            Self::Xz => "xz",
+            Self::Compressed(CompressionCodec::Zstd) => "zstd",
+            Self::Compressed(CompressionCodec::Xz) => "xz",
         }
     }
 
-    pub(crate) const fn suffix(self) -> &'static str {
+    pub const fn suffix(self) -> &'static str {
         match self {
             Self::Raw => ".nar",
-            Self::Zstd => ".nar.zst",
-            Self::Xz => ".nar.xz",
+            Self::Compressed(codec) => codec.suffix(),
         }
     }
 }

@@ -1,55 +1,54 @@
 use std::{
-    collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{File, Permissions},
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read},
     num::NonZeroUsize,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, Weak, atomic::Ordering},
     time::SystemTime,
 };
 
-use crate::narinfo::{BoundNarInfo, CompressedNarExpectation, ValidatedNarInfo, ValidatedPayload};
-use crate::object::{EncodedIdentity, NarFileName, NarHash, NarIdentity, WireEncoding};
+use crate::narinfo::{BoundNarInfo, ValidatedNarInfo};
+#[cfg(test)]
+use crate::object::NarHash;
+use crate::object::{
+    CompressedNarIdentity, EncodedIdentity, NarFileName, NarIdentity, NarRepresentation,
+    WireEncoding,
+};
 
 use super::{
-    EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, LAYOUT_DESCRIPTOR, NAR_DIRECTORY,
-    REALISATIONS_DIRECTORY, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
-    chunk_store::{ChunkStoreError, ChunkedNarReader, ChunkingWriter, MAX_CHUNK_MANIFEST_BYTES},
-    chunked::{ChunkManifest, ChunkProfile},
+    CleanupAction, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, VALIDATION_DIRECTORY,
+    cache_info::{MAX_CACHE_INFO_BYTES, validate as validate_cache_info},
+    chunk_store::{ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
+    chunked::ChunkProfile,
     compression::{
-        IngestionReceipt, encoded_file_matches, ingestion_receipt_file_name, nar_file_size_matches,
+        IngestionReceipt, ReceivedNar, encoded_file_matches, nar_file_size_matches,
         receive_uploaded_nar,
     },
-    directory::Directory,
-    egress::CanonicalRawStatus,
+    egress::{CanonicalRawStatus, NarReadBody},
     fs::{
-        BoundedRegularFile, StorageCapacity, directory_is_empty, ensure_directory_at,
-        entry_is_regular_at, files_equal_at, filesystem_space, hard_link_at, open_at,
-        open_directory_at, open_optional_at, open_regular_at, read_bounded_regular_file,
-        read_dir_names, remove_temp, rename_at, reserve_staging_bytes, rollback_link_at, unlink_at,
+        BoundedRegularFile, StorageCapacity, entry_is_regular_at, files_equal_at, filesystem_space,
+        hard_link_at, open_at, open_directory_at, open_optional_at, open_regular_at,
+        read_bounded_regular_file, read_dir_names, remove_temp, rename_at, reserve_staging_bytes,
+        rollback_link_at, unlink_at,
     },
     ids::StoreHash,
     publication::{
-        DestinationPublication, NEXT_TEMP, NarUploadPolicy, ProcessLock, PublicationDestination,
-        PublicationDirectory, PublishBoundary, PublishOutcome, PublishTarget, PublishedPair,
-        StagedPublication, StagingReservation, StorageError, Streaming, TemporaryDirectory,
-        TemporaryFile,
+        DestinationPublication, NEXT_TEMP, NarUploadPolicy, PublicationDestination,
+        PublicationDirectory, PublishBoundary, PublishOutcome, PublishTarget, StagedPublication,
+        StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
-    recovery::{PublicationState, PublicationTransaction, RecoveryState},
-    state::{Storage, StorageBackend},
+    recovery::{PublicationState, PublicationTransaction},
+    state::{PayloadStorage, Storage},
+    typestate::Streaming,
 };
 
 #[cfg(test)]
-use super::publication::{Layout, injected_fault};
+use super::publication::injected_fault;
 
-const MAX_CACHE_INFO_BYTES: u64 = 1024;
 pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
 
 #[allow(dead_code)]
@@ -129,28 +128,16 @@ impl<'a> CreatedDestination<'a> {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum CleanupAction {
-    Keep,
-    Remove,
-}
-
-impl CleanupAction {
-    fn combine(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Remove, _) | (_, Self::Remove) => Self::Remove,
-            (Self::Keep, Self::Keep) => Self::Keep,
-        }
-    }
-}
-
 struct CompressedValidationName(NarFileName);
 
 impl CompressedValidationName {
     fn parse(name: &OsStr) -> Option<Self> {
         let stem = name.to_str()?.strip_suffix(".validation")?;
         let nar_name = NarFileName::parse(stem).ok()?;
-        (nar_name.encoding() != WireEncoding::Raw).then_some(Self(nar_name))
+        match nar_name.encoding() {
+            WireEncoding::Raw => None,
+            WireEncoding::Compressed(_) => Some(Self(nar_name)),
+        }
     }
 
     fn nar_name(&self) -> OsString {
@@ -163,6 +150,15 @@ pub enum NarMatch {
     Missing,
     Mismatch,
     Match,
+}
+
+impl NarMatch {
+    const fn from_content_match(matches: bool) -> Self {
+        match matches {
+            true => Self::Match,
+            false => Self::Mismatch,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,22 +182,8 @@ pub enum NarInfoDeletion {
     Absent,
 }
 
-pub(crate) enum NarReadBody<'storage> {
-    File(File),
-    Chunked(Box<ChunkedNarReader<'storage>>),
-}
-
 pub(crate) struct OpenedNar<'storage> {
     pub(crate) body: NarReadBody<'storage>,
-}
-
-impl Read for NarReadBody<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::File(file) => file.read(buffer),
-            Self::Chunked(reader) => reader.read(buffer),
-        }
-    }
 }
 
 pub(super) struct OwnedTemporary<'storage> {
@@ -219,6 +201,10 @@ impl<'storage> OwnedTemporary<'storage> {
 
     pub(super) fn file(&self) -> &TemporaryFile {
         self.file.as_ref().expect("owned temporary file is present")
+    }
+
+    pub(super) const fn storage(&self) -> &'storage Storage {
+        self.storage
     }
 
     pub(super) fn file_mut(&mut self) -> &mut File {
@@ -302,165 +288,7 @@ impl BoundNarInfo<'_> {
     }
 }
 
-fn validate_cache_info(bytes: &[u8]) -> io::Result<()> {
-    if bytes.len() as u64 > MAX_CACHE_INFO_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "nix-cache-info exceeds configured size limit",
-        ));
-    }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nix-cache-info is not UTF-8"))?;
-    let mut fields = CacheInfoFields::default();
-    for line in text.lines() {
-        let (name, value) = line.split_once(": ").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "malformed nix-cache-info")
-        })?;
-        fields.record(name, value)?;
-    }
-    fields.finish()
-}
-
-#[derive(Default)]
-struct CacheInfoFields {
-    store_dir: Option<()>,
-    mass_query: Option<()>,
-    priority: Option<u32>,
-}
-
-impl CacheInfoFields {
-    fn record(&mut self, name: &str, value: &str) -> io::Result<()> {
-        match name {
-            "StoreDir" if self.store_dir.is_none() && value == "/nix/store" => {
-                self.store_dir = Some(());
-            }
-            "WantMassQuery" if self.mass_query.is_none() && value == "0" => {
-                self.mass_query = Some(());
-            }
-            "Priority" if self.priority.is_none() => {
-                self.priority = Some(value.parse().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid nix-cache-info priority",
-                    )
-                })?);
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unsupported or duplicate nix-cache-info field",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> io::Result<()> {
-        if self.store_dir.is_some() && self.mass_query.is_some() && self.priority.is_some() {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "nix-cache-info is missing a required field",
-            ))
-        }
-    }
-}
-
 impl Storage {
-    pub fn initialize(root: &Directory) -> Result<Self, StorageError> {
-        Self::initialize_with_backend(root, StorageBackend::Flat)
-    }
-
-    pub fn initialize_with_backend(
-        root: &Directory,
-        backend: StorageBackend,
-    ) -> Result<Self, StorageError> {
-        #[cfg(test)]
-        let layout = Layout::new(root.path.clone());
-        let root_directory = root.file.try_clone()?;
-        let root_is_empty = directory_is_empty(&root_directory)?;
-        let lock = ProcessLock::acquire(open_at(
-            &root_directory,
-            OsStr::new("."),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            0,
-        )?)?;
-        ProcessLock::validate_lock_file(&root_directory)?;
-        let nar_directory =
-            ensure_directory_at(&root_directory, OsStr::new(NAR_DIRECTORY), "nar directory")?;
-        ensure_directory_at(
-            &nar_directory,
-            OsStr::new(TEMPORARY_DIRECTORY),
-            "NAR temporary directory",
-        )?;
-        ensure_directory_at(
-            &root_directory,
-            OsStr::new(TEMPORARY_DIRECTORY),
-            "temporary directory",
-        )?;
-        let transactions = ensure_directory_at(
-            &root_directory,
-            OsStr::new(".narjar-transactions"),
-            "publication transaction directory",
-        )?;
-        transactions.set_permissions(Permissions::from_mode(0o700))?;
-        let realisations_directory = ensure_directory_at(
-            &root_directory,
-            OsStr::new(REALISATIONS_DIRECTORY),
-            "realisations directory",
-        )?;
-        ensure_directory_at(
-            &realisations_directory,
-            OsStr::new(".tmp"),
-            "realisation temporary directory",
-        )?;
-        ensure_directory_at(
-            &root_directory,
-            OsStr::new(VALIDATION_DIRECTORY),
-            "validation evidence directory",
-        )?;
-        ensure_directory_at(
-            &root_directory,
-            OsStr::new(INGESTION_RECEIPT_DIRECTORY),
-            "compressed ingestion receipt directory",
-        )?;
-        ensure_directory_at(
-            &root_directory,
-            OsStr::new(EGRESS_RECEIPT_DIRECTORY),
-            "compressed egress receipt directory",
-        )?;
-        ensure_backend_layout(&root_directory, backend, root_is_empty)?;
-        let chunk_store = super::chunk_store::ChunkStore::initialize(&root_directory)?;
-
-        root_directory.sync_all()?;
-
-        let recovery = RecoveryState::new(&root_directory)?;
-        let storage = Self {
-            #[cfg(test)]
-            layout,
-            root: root_directory,
-            chunk_store,
-            backend,
-            recovery,
-            publication_locks: Mutex::new(HashMap::new()),
-            staging_budget: Arc::new(Mutex::new(Default::default())),
-            temporary_objects: AtomicU64::new(0),
-            #[cfg(test)]
-            egress_generations: AtomicU64::new(0),
-            _lock: lock,
-        };
-        if root_is_empty {
-            storage.recovery.initialize_clean()?;
-        }
-        Ok(storage)
-    }
-
-    #[cfg(test)]
-    pub(super) fn layout(&self) -> &Layout {
-        &self.layout
-    }
-
     pub fn recovery_required(&self) -> Result<bool, StorageError> {
         self.recovery.required()
     }
@@ -482,19 +310,8 @@ impl Storage {
         bytes: u64,
         min_free_bytes: u64,
     ) -> Result<StagingReservation, StorageError> {
-        if bytes == 0 {
-            return Ok(StagingReservation::empty(Arc::clone(&self.staging_budget)));
-        }
         let directory = self.nar_temp_directory()?;
         reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, bytes)
-    }
-
-    pub(super) fn empty_staging_reservation(
-        &self,
-        min_free_bytes: u64,
-    ) -> Result<StagingReservation, StorageError> {
-        let directory = self.nar_temp_directory()?;
-        reserve_staging_bytes(&self.staging_budget, &directory, min_free_bytes, 0)
     }
 
     pub fn publish_cache_info(&self, source: impl Read) -> Result<PublishOutcome, StorageError> {
@@ -526,44 +343,6 @@ impl Storage {
         self.publish_nar_with_staging(name, source, expected_length, policy, staging)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn publish_chunked_nar(
-        &self,
-        name: NarFileName,
-        source: impl Read,
-        expected_length: u64,
-        policy: NarUploadPolicy,
-    ) -> Result<ChunkManifest, StorageError> {
-        if expected_length > policy.max_bytes {
-            return Err(StorageError::UploadTooLarge);
-        }
-        let reservation = self.empty_staging_reservation(policy.min_free_bytes)?;
-        let mut destination: ChunkingWriter<'_> = self
-            .chunk_store
-            .begin_ingest_with_reservation(
-                ChunkProfile::MinCdcHash4V2,
-                reservation,
-                policy.min_free_bytes,
-            )
-            .map_err(storage_error_for_chunk_store)?;
-        let received = receive_uploaded_nar(
-            source,
-            name,
-            expected_length,
-            policy.max_bytes,
-            &mut destination,
-        )?;
-        let completed = destination
-            .finish(received.identity())
-            .map_err(storage_error_for_chunk_store)?;
-        if let Some(receipt) = received.ingestion_receipt() {
-            self.publish_ingestion_receipt(receipt)?;
-        }
-        let manifest = completed.manifest();
-        completed.release_reservation();
-        Ok(manifest)
-    }
-
     pub fn publish_nar_with_staging(
         &self,
         name: NarFileName,
@@ -572,13 +351,14 @@ impl Storage {
         policy: NarUploadPolicy,
         staging: StagingReservation,
     ) -> Result<PublishOutcome, StorageError> {
-        match self.backend {
-            StorageBackend::Flat => {
+        match &self.payloads {
+            PayloadStorage::Flat => {
                 let receiving = self.begin_upload(name, expected_length, policy, staging)?;
                 let complete = receiving.receive(source)?;
                 complete.commit()
             }
-            StorageBackend::Chunked => self.publish_chunked_nar_with_staging(
+            PayloadStorage::Chunked(store) => self.publish_chunked_nar_with_staging(
+                store,
                 name,
                 source,
                 expected_length,
@@ -590,14 +370,14 @@ impl Storage {
 
     fn publish_chunked_nar_with_staging(
         &self,
+        store: &super::chunk_store::ChunkStore,
         name: NarFileName,
         source: impl Read,
         expected_length: u64,
         policy: NarUploadPolicy,
         reservation: StagingReservation,
     ) -> Result<PublishOutcome, StorageError> {
-        let mut destination = self
-            .chunk_store
+        let mut destination = store
             .begin_ingest_with_reservation(
                 ChunkProfile::MinCdcHash4V2,
                 reservation,
@@ -614,21 +394,10 @@ impl Storage {
         let completed = destination
             .finish(received.identity())
             .map_err(storage_error_for_chunk_store)?;
-        if let Some(receipt) = received.ingestion_receipt() {
-            self.publish_ingestion_receipt(receipt)?;
-        }
+        self.publish_ingestion_receipt_for_received_nar(received)?;
         let outcome = completed.outcome();
         completed.release_reservation();
         Ok(outcome)
-    }
-
-    #[cfg(test)]
-    pub(super) fn publish_nar_unchecked(
-        &self,
-        hash: &NarHash,
-        source: impl Read,
-    ) -> Result<PublishOutcome, StorageError> {
-        self.publish(PublishTarget::Nar(NarFileName::raw(*hash)), source)
     }
 
     #[cfg(test)]
@@ -654,20 +423,21 @@ impl Storage {
         let stored = self.open_verified_canonical_nar(narinfo.payload())?;
         let output = self.select_egress(&stored, output_encoding, policy)?;
         narinfo
-            .bind_raw(stored, output.file_name(), output.size())
+            .bind_to_stored_nar(stored, output)
             .map_err(|_| StorageError::NarMismatch)
     }
 
     pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<NarMatch, StorageError> {
-        if let ValidatedPayload::Raw(identity) = narinfo.payload() {
+        if let NarRepresentation::Raw(identity) = narinfo.payload() {
             return self.canonical_nar_matches(identity);
         }
+        let representation = narinfo.payload();
         let nar_directory = self.nar_directory()?;
-        let payload_name = narinfo.payload_name();
+        let payload_name = representation.file_name();
         open_optional_at(&nar_directory, &payload_name.os_string())?.map_or(
             Ok(NarMatch::Missing),
             |file| {
-                nar_file_size_matches(&file, narinfo.file_size().get())
+                nar_file_size_matches(&file, representation.encoded_size().get())
                     .map(|matches| match matches {
                         true => NarMatch::Match,
                         false => NarMatch::Mismatch,
@@ -678,10 +448,9 @@ impl Storage {
     }
 
     fn canonical_nar_matches(&self, identity: NarIdentity) -> Result<NarMatch, StorageError> {
-        if self.backend == StorageBackend::Chunked {
-            return Ok(
-                match self
-                    .chunk_store
+        match &self.payloads {
+            PayloadStorage::Chunked(store) => Ok(
+                match store
                     .validate_manifest(identity.hash())
                     .map_err(storage_error_for_chunk_store)?
                 {
@@ -689,19 +458,20 @@ impl Storage {
                     Some(manifest) if manifest.identity() == identity => NarMatch::Match,
                     Some(_) => NarMatch::Mismatch,
                 },
-            );
+            ),
+            PayloadStorage::Flat => {
+                let nar_directory = self.nar_directory()?;
+                let name = NarFileName::raw(identity.hash());
+                open_optional_at(&nar_directory, &name.os_string())?.map_or(
+                    Ok(NarMatch::Missing),
+                    |file| {
+                        nar_file_size_matches(&file, identity.size().get())
+                            .map(NarMatch::from_content_match)
+                            .map_err(Into::into)
+                    },
+                )
+            }
         }
-
-        let nar_directory = self.nar_directory()?;
-        let name = NarFileName::raw(identity.hash());
-        open_optional_at(&nar_directory, &name.os_string())?.map_or(Ok(NarMatch::Missing), |file| {
-            nar_file_size_matches(&file, identity.size().get())
-                .map(|matches| match matches {
-                    true => NarMatch::Match,
-                    false => NarMatch::Mismatch,
-                })
-                .map_err(Into::into)
-        })
     }
 
     #[cfg(test)]
@@ -731,48 +501,45 @@ impl Storage {
 
     #[cfg(test)]
     pub(super) fn ensure_nar(&self, nar: &NarHash) -> Result<(), StorageError> {
-        if self.backend == StorageBackend::Chunked {
-            return match self
-                .chunk_store
+        match &self.payloads {
+            PayloadStorage::Chunked(store) => match store
                 .validate_manifest(*nar)
                 .map_err(storage_error_for_chunk_store)?
             {
                 Some(manifest) if manifest.identity().hash() == *nar => Ok(()),
                 Some(_) => Err(StorageError::NarMismatch),
                 None => Err(StorageError::MissingNar),
-            };
-        }
-
-        let nar_directory = self.nar_directory()?;
-        let nar_name = NarFileName::raw(*nar);
-        match open_regular_at(&nar_directory, &nar_name.os_string()) {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StorageError::MissingNar),
-            Err(error) => Err(error.into()),
+            },
+            PayloadStorage::Flat => {
+                let nar_directory = self.nar_directory()?;
+                let nar_name = NarFileName::raw(*nar);
+                match open_regular_at(&nar_directory, &nar_name.os_string()) {
+                    Ok(_) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        Err(StorageError::MissingNar)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
         }
     }
 
-    pub fn open_nar(&self, nar: NarHash) -> Result<Option<File>, StorageError> {
-        self.open_nar_encoded(NarFileName::raw(nar))
-    }
-
-    pub fn open_nar_encoded(&self, name: NarFileName) -> Result<Option<File>, StorageError> {
+    pub fn open_nar(&self, name: NarFileName) -> Result<Option<File>, StorageError> {
         let directory = self.nar_directory()?;
         open_optional_at(&directory, &name.os_string())
     }
 
     pub(crate) fn nar_size(&self, name: NarFileName) -> Result<Option<u64>, StorageError> {
-        if let (StorageBackend::Chunked, Some(hash)) = (self.backend, name.raw_hash()) {
-            return Ok(self
-                .chunk_store
+        match (&self.payloads, name.raw_hash()) {
+            (PayloadStorage::Chunked(store), Some(hash)) => Ok(store
                 .manifest_identity(hash)
                 .map_err(storage_error_for_chunk_store)?
-                .map(|manifest| manifest.identity().size().get()));
+                .map(|manifest| manifest.identity().size().get())),
+            (PayloadStorage::Flat | PayloadStorage::Chunked(_), None)
+            | (PayloadStorage::Flat, Some(_)) => self
+                .open_nar(name)?
+                .map_or(Ok(None), |file| Ok(Some(file.metadata()?.len()))),
         }
-        let Some(file) = self.open_nar_encoded(name)? else {
-            return Ok(None);
-        };
-        Ok(Some(file.metadata()?.len()))
     }
 
     pub(crate) fn open_nar_range(
@@ -780,46 +547,35 @@ impl Storage {
         name: NarFileName,
         range: std::ops::Range<u64>,
     ) -> Result<Option<OpenedNar<'_>>, StorageError> {
-        if let (StorageBackend::Chunked, Some(hash)) = (self.backend, name.raw_hash()) {
-            if self
-                .chunk_store
-                .validate_manifest(hash)
-                .map_err(storage_error_for_chunk_store)?
-                .is_none()
-            {
-                return Ok(None);
+        match (&self.payloads, name.raw_hash()) {
+            (PayloadStorage::Chunked(store), Some(hash)) => {
+                if store
+                    .validate_manifest(hash)
+                    .map_err(storage_error_for_chunk_store)?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                let reader = store
+                    .open_reader(hash, range, MAX_CHUNK_MANIFEST_BYTES)
+                    .map_err(storage_error_for_chunk_store)?;
+                Ok(Some(OpenedNar {
+                    body: NarReadBody::Chunked(Box::new(reader)),
+                }))
             }
-            let reader = self
-                .chunk_store
-                .open_reader(hash, range, MAX_CHUNK_MANIFEST_BYTES)
-                .map_err(storage_error_for_chunk_store)?;
-            return Ok(Some(OpenedNar {
-                body: NarReadBody::Chunked(Box::new(reader)),
-            }));
+            (PayloadStorage::Flat | PayloadStorage::Chunked(_), None)
+            | (PayloadStorage::Flat, Some(_)) => self.open_nar(name)?.map_or(Ok(None), |file| {
+                Ok(Some(OpenedNar {
+                    body: NarReadBody::File(file),
+                }))
+            }),
         }
-        let Some(file) = self.open_nar_encoded(name)? else {
-            return Ok(None);
-        };
-        Ok(Some(OpenedNar {
-            body: NarReadBody::File(file),
-        }))
     }
 
     pub fn open_narinfo(&self, store: &StoreHash) -> Result<Option<File>, StorageError> {
         let directory = self.root_directory()?;
         let name = format!("{}.narinfo", store.as_str());
         open_optional_at(&directory, OsStr::new(&name))
-    }
-
-    pub fn open_pair(
-        &self,
-        store: &StoreHash,
-        nar: NarHash,
-    ) -> Result<Option<PublishedPair>, StorageError> {
-        Ok(self
-            .open_narinfo(store)?
-            .zip(self.open_nar(nar)?)
-            .map(|(narinfo, nar)| PublishedPair { nar, narinfo }))
     }
 
     pub fn is_ready(&self, min_free_bytes: u64) -> Result<StorageReadiness, StorageError> {
@@ -1213,14 +969,7 @@ impl Storage {
         self.create_temp_in_directory(directory, name)
     }
 
-    pub(super) fn create_nar_temp_named(
-        &self,
-        name: OsString,
-    ) -> Result<TemporaryFile, StorageError> {
-        self.create_temp_in_directory(self.nar_temp_directory()?, name)
-    }
-
-    fn create_temp_in_directory(
+    pub(super) fn create_temp_in_directory(
         &self,
         directory: File,
         name: OsString,
@@ -1338,12 +1087,22 @@ impl Storage {
         )
     }
 
+    fn publish_ingestion_receipt_for_received_nar(
+        &self,
+        received: ReceivedNar,
+    ) -> Result<(), StorageError> {
+        match received {
+            ReceivedNar::Raw(_) => Ok(()),
+            ReceivedNar::Compressed(receipt) => self.publish_ingestion_receipt(receipt).map(|_| ()),
+        }
+    }
+
     pub(super) fn read_ingestion_receipt(
         &self,
-        expectation: CompressedNarExpectation,
+        expectation: CompressedNarIdentity,
     ) -> Result<Option<IngestionReceipt>, StorageError> {
         let directory = self.ingestion_receipt_directory()?;
-        let name = ingestion_receipt_file_name(expectation);
+        let name = IngestionReceipt::file_name_for(expectation);
         match Self::read_ingestion_receipt_file(&directory, &name)? {
             BoundedRegularFile::Valid(receipt) if receipt.matches(expectation) => Ok(Some(receipt)),
             BoundedRegularFile::Missing
@@ -1458,49 +1217,5 @@ impl Storage {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(key, Arc::downgrade(&lock));
         lock
-    }
-}
-
-fn ensure_backend_layout(
-    root: &File,
-    backend: StorageBackend,
-    root_is_empty: bool,
-) -> io::Result<()> {
-    let name = OsStr::new(LAYOUT_DESCRIPTOR);
-    match open_optional_at(root, name).map_err(storage_error_as_io)? {
-        Some(descriptor) => {
-            let mut bytes = Vec::new();
-            descriptor.take(64).read_to_end(&mut bytes)?;
-            if bytes == backend.layout_descriptor() {
-                Ok(())
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "data directory uses a different storage backend",
-                ))
-            }
-        }
-        None if !root_is_empty => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "initialized data directory is missing its storage-layout descriptor",
-        )),
-        None => {
-            let mut descriptor = open_at(
-                root,
-                name,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-                0o600,
-            )?;
-            descriptor.write_all(backend.layout_descriptor())?;
-            descriptor.sync_all()?;
-            root.sync_all()
-        }
-    }
-}
-
-fn storage_error_as_io(error: StorageError) -> io::Error {
-    match error {
-        StorageError::Io(error) => error,
-        error => io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
     }
 }

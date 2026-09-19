@@ -10,7 +10,7 @@ use std::{
 };
 
 use super::compression::{
-    CheckedUploadReader, DecodedValidation, nar_file_size_matches, receive_uploaded_nar,
+    CheckedUploadReader, nar_file_size_matches, receive_uploaded_nar,
     verify_decoded_compressed_file, verify_encoded_compressed_file,
 };
 use super::egress::{EgressReceipt, EgressSlot};
@@ -21,10 +21,9 @@ use super::{
     CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageBackend,
     StorageError, StoreHash, capacity_error_kind,
 };
-use crate::narinfo::{CompressedNarExpectation, NarEncoding, ValidatedPayload};
 use crate::object::{
-    CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity,
-    NarSize,
+    CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
+    NarHash, NarIdentity, NarRepresentation, NarSize, WireEncoding,
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
@@ -40,7 +39,7 @@ fn egress_receipt_round_trips_through_compact_binary_serialization() {
     let raw_size = NarSize::new(17);
     let encoded_size = EncodedSize::new(23);
     let slot = EgressSlot::new(NarIdentity::new(raw_hash, raw_size), CompressionCodec::Zstd);
-    let egress = EgressReceipt::new(slot, encoded_hash, encoded_size);
+    let egress = EgressReceipt::for_slot(slot, encoded_hash, encoded_size);
     let egress =
         EgressReceipt::parse(&egress.bytes()).expect("typed egress receipt should be readable");
     assert!(egress.matches(slot));
@@ -54,37 +53,54 @@ fn egress_receipt_round_trips_through_compact_binary_serialization() {
 }
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
-    Storage::initialize(&Directory::open(path)?)
+    Storage::initialize(&Directory::open(path)?, StorageBackend::Flat)
 }
 
 #[test]
 fn chunked_ingestion_publishes_a_verified_manifest() {
     let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let storage = Storage::initialize(
+        &Directory::open(directory.path()).unwrap(),
+        StorageBackend::Chunked,
+    )
+    .unwrap();
     let raw = vec![b'x'; 100_000];
     let hash = NarHash::from_digest(Sha256::digest(&raw).into());
     let name = NarFileName::raw(hash);
-    let manifest = storage
-        .publish_chunked_nar(
+    storage
+        .publish_nar(
             name,
             Cursor::new(&raw),
             raw.len() as u64,
             super::NarUploadPolicy::new(200_000, 0),
         )
         .unwrap();
+    let manifest = storage
+        .chunk_store()
+        .unwrap()
+        .validate_manifest(hash)
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         manifest.identity(),
         NarIdentity::new(hash, (raw.len() as u64).into())
     );
-    assert!(storage.chunk_store.open_manifest(hash).unwrap().is_some());
+    assert!(
+        storage
+            .chunk_store()
+            .unwrap()
+            .open_manifest(hash)
+            .unwrap()
+            .is_some()
+    );
     assert!(manifest.chunk_count() > 0);
 }
 
 #[test]
 fn chunked_backend_routes_the_complete_nar_publication() {
     let directory = TestDir::new();
-    let storage = Storage::initialize_with_backend(
+    let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked,
     )
@@ -123,7 +139,7 @@ fn chunked_backend_routes_the_complete_nar_publication() {
         .unwrap();
     assert_eq!(
         storage
-            .open_nar_encoded(compressed_name)
+            .open_nar(compressed_name)
             .unwrap()
             .unwrap()
             .metadata()
@@ -143,7 +159,7 @@ fn chunked_backend_routes_the_complete_nar_publication() {
 #[test]
 fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     let directory = TestDir::new();
-    let storage = Storage::initialize_with_backend(
+    let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked,
     )
@@ -169,38 +185,38 @@ fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     manifest[checksum] ^= 1;
     fs::write(manifest_path, manifest).unwrap();
 
-    let result = storage.open_verified_canonical_nar(ValidatedPayload::Raw(identity));
+    let result = storage.open_verified_canonical_nar(NarRepresentation::Raw(identity));
     assert!(matches!(
         result,
         Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
     ));
 }
 
-fn compressed_bytes(encoding: NarEncoding, raw: &[u8]) -> Vec<u8> {
+fn compressed_bytes(encoding: WireEncoding, raw: &[u8]) -> Vec<u8> {
     match encoding {
-        NarEncoding::Xz => {
+        WireEncoding::Compressed(CompressionCodec::Xz) => {
             let mut compressed = Vec::new();
             let mut writer = XzWriter::new(&mut compressed, XzOptions::with_preset(1)).unwrap();
             writer.write_all(raw).unwrap();
             writer.finish().unwrap();
             compressed
         }
-        NarEncoding::Zstd => {
+        WireEncoding::Compressed(CompressionCodec::Zstd) => {
             let mut compressed = Vec::new();
             compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
             compressed
         }
-        NarEncoding::Raw => panic!("test helper only compresses XZ and Zstd"),
+        WireEncoding::Raw => panic!("test helper only compresses XZ and Zstd"),
     }
 }
 
 fn begin_raw_upload<'storage>(
     storage: &'storage Storage,
     bytes: &[u8],
-) -> super::ingest::Staged<'storage, super::ingest::Receiving> {
+) -> super::ingest::Staged<'storage, super::typestate::Streaming<super::ingest::UploadRequest>> {
     let name = NarFileName::new(
         FileHash::from_digest(Sha256::digest(bytes).into()),
-        NarEncoding::Raw,
+        WireEncoding::Raw,
     );
     let length = bytes.len() as u64;
     let reservation = storage.reserve_staging(length, 0).unwrap();
@@ -258,7 +274,7 @@ fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
         .unwrap();
     let hash = NarHash::from_digest(Sha256::digest(bytes).into());
     assert!(
-        storage.open_nar(hash).unwrap().is_none(),
+        storage.open_nar(NarFileName::raw(hash)).unwrap().is_none(),
         "receive must not publish"
     );
     assert_eq!(
@@ -273,7 +289,7 @@ fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
     );
     drop(complete);
     assert_upload_resources_released(&storage);
-    assert!(storage.open_nar(hash).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(hash)).unwrap().is_none());
 }
 
 #[test]
@@ -286,12 +302,12 @@ fn generic_publication_commits_only_after_finishing_its_stream() {
     let streaming = storage
         .begin_publication(target, |_| Ok(()))
         .expect("begin publication");
-    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
     assert_eq!(storage.temporary_objects(), 1);
     let validated = streaming
         .finish_and_sync(Cursor::new(b"nar bytes"))
         .expect("finish publication stream");
-    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
     assert_eq!(storage.temporary_objects(), 1);
 
     assert_eq!(
@@ -330,7 +346,7 @@ fn abandoned_generic_publication_cleans_up_staging() {
 
     assert_eq!(storage.temporary_objects(), 0);
     assert!(!storage.recovery_required().unwrap());
-    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
     assert!(
         fs::read_dir(storage.layout().nar_temp_dir())
             .unwrap()
@@ -379,7 +395,7 @@ fn failed_generic_publication_stream_cleans_up_staging() {
         matches!(result, Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EIO))
     );
     assert_eq!(storage.temporary_objects(), 0);
-    assert!(storage.open_nar(nar).unwrap().is_none());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
     assert!(
         fs::read_dir(storage.layout().nar_temp_dir())
             .unwrap()
@@ -452,7 +468,7 @@ fn upload_reader_checks_encoded_hash_and_length() {
     let bytes = b"encoded NAR bytes";
     let expected =
         FileHash::parse(&nix32_sha256(&Sha256::digest(bytes))).expect("file hash is valid");
-    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), &expected, bytes.len() as u64);
+    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), expected, bytes.len() as u64);
     let mut received = [0; 17];
     reader
         .read_exact(&mut received)
@@ -463,7 +479,7 @@ fn upload_reader_checks_encoded_hash_and_length() {
         .expect("matching upload should complete successfully");
 
     let wrong_hash = FileHash::parse(NAR_ID).expect("file hash is valid");
-    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), &wrong_hash, bytes.len() as u64);
+    let mut reader = CheckedUploadReader::new(Cursor::new(bytes), wrong_hash, bytes.len() as u64);
     reader
         .read_exact(&mut [0; 17])
         .expect("reading the upload body should succeed before completion");
@@ -481,7 +497,7 @@ fn upload_reader_finish_does_not_read_after_validating_eof() {
         FileHash::parse(&nix32_sha256(&Sha256::digest(bytes))).expect("file hash is valid");
     let mut reader = CheckedUploadReader::new(
         FailsIfReadAfterEof::new(bytes),
-        &expected,
+        expected,
         bytes.len() as u64,
     );
     let mut received = Vec::new();
@@ -527,7 +543,10 @@ impl Read for FailsIfReadAfterEof {
 
 #[test]
 fn normalized_compressed_source_errors_remain_io_errors() {
-    for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
         let directory = TestDir::new();
         let destination = directory.path().join("raw.nar");
         let mut destination = fs::File::create(destination).expect("create raw staging file");
@@ -563,7 +582,7 @@ fn xz_uploads_are_normalized_to_the_raw_nar() {
 
     let outcome = storage
         .publish_nar(
-            NarFileName::new(encoded, NarEncoding::Xz),
+            NarFileName::new(encoded, WireEncoding::Compressed(CompressionCodec::Xz)),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -593,10 +612,12 @@ fn encoded_verification_precedes_xz_nar_identity_verification() {
     let file_hash =
         FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).expect("file hash is valid");
 
-    let expectation = CompressedNarExpectation::new(
-        CompressionCodec::Xz,
-        file_hash,
-        EncodedSize::new(compressed.len() as u64),
+    let expectation = CompressedNarIdentity::new(
+        EncodedIdentity::new(
+            CompressionCodec::Xz,
+            file_hash,
+            EncodedSize::new(compressed.len() as u64),
+        ),
         NarIdentity::new(nar_hash, NarSize::new(raw.len() as u64)),
     );
     let verified = verify_encoded_compressed_file(&file, expectation)
@@ -607,10 +628,7 @@ fn encoded_verification_precedes_xz_nar_identity_verification() {
         verify_decoded_compressed_file(verified)
             .expect("verify decoded XZ NAR")
             .expect("decoded XZ NAR matches"),
-        DecodedValidation {
-            hash: nar_hash,
-            size: NarSize::new(raw.len() as u64),
-        }
+        NarIdentity::new(nar_hash, NarSize::new(raw.len() as u64))
     );
 }
 
@@ -627,7 +645,10 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
     let wrong_file_hash = FileHash::parse(&"0".repeat(52)).unwrap();
     let wrong_nar_hash = NarHash::parse(&"0".repeat(52)).unwrap();
 
-    for (encoding, compressed) in [(NarEncoding::Xz, xz), (NarEncoding::Zstd, zstd)] {
+    for (encoding, compressed) in [
+        (WireEncoding::Compressed(CompressionCodec::Xz), xz),
+        (WireEncoding::Compressed(CompressionCodec::Zstd), zstd),
+    ] {
         let directory = TestDir::new();
         let path = directory.path().join("compressed-nar");
         fs::write(&path, &compressed).unwrap();
@@ -638,14 +659,17 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
                        decoded_hash: &NarHash,
                        encoded_size: EncodedSize,
                        decoded_size: NarSize| {
-            let expectation = CompressedNarExpectation::new(
-                match encoding {
-                    NarEncoding::Xz => CompressionCodec::Xz,
-                    NarEncoding::Zstd => CompressionCodec::Zstd,
-                    NarEncoding::Raw => unreachable!("test only supplies compressed encodings"),
-                },
-                *encoded_hash,
-                encoded_size,
+            let expectation = CompressedNarIdentity::new(
+                EncodedIdentity::new(
+                    match encoding {
+                        WireEncoding::Compressed(codec) => codec,
+                        WireEncoding::Raw => {
+                            unreachable!("test only supplies compressed encodings")
+                        }
+                    },
+                    *encoded_hash,
+                    encoded_size,
+                ),
                 NarIdentity::new(*decoded_hash, decoded_size),
             );
             let file = fs::File::open(&path).unwrap();
@@ -686,7 +710,7 @@ fn zstd_uploads_are_normalized_to_the_raw_nar() {
 
     let outcome = storage
         .publish_nar(
-            NarFileName::new(encoded, NarEncoding::Zstd),
+            NarFileName::new(encoded, WireEncoding::Compressed(CompressionCodec::Zstd)),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -702,7 +726,10 @@ fn zstd_uploads_are_normalized_to_the_raw_nar() {
 
 #[test]
 fn a_restart_after_raw_commit_retries_receipt_publication() {
-    for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
         let directory = TestDir::new();
         let raw = b"nar bytes";
         let compressed = compressed_bytes(encoding, raw);
@@ -765,7 +792,10 @@ fn a_restart_after_raw_commit_retries_receipt_publication() {
 
 #[test]
 fn recovery_removes_receipts_without_a_usable_raw_object() {
-    for encoding in [NarEncoding::Xz, NarEncoding::Zstd] {
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
         let directory = TestDir::new();
         let raw = b"nar bytes";
         let compressed = compressed_bytes(encoding, raw);
@@ -814,7 +844,7 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     let output = {
-        let storage = Storage::initialize_with_backend(
+        let storage = Storage::initialize(
             &Directory::open(directory.path()).unwrap(),
             StorageBackend::Chunked,
         )
@@ -834,7 +864,7 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
         output
     };
 
-    let restarted = Storage::initialize_with_backend(
+    let restarted = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked,
     )
@@ -873,7 +903,7 @@ fn compressed_uploads_converge_on_one_raw_object() {
 
     let xz_result = storage
         .publish_nar(
-            NarFileName::new(xz_id, NarEncoding::Xz),
+            NarFileName::new(xz_id, WireEncoding::Compressed(CompressionCodec::Xz)),
             Cursor::new(&xz),
             xz.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -881,7 +911,7 @@ fn compressed_uploads_converge_on_one_raw_object() {
         .expect("publish XZ NAR");
     let zstd_result = storage
         .publish_nar(
-            NarFileName::new(zstd_id, NarEncoding::Zstd),
+            NarFileName::new(zstd_id, WireEncoding::Compressed(CompressionCodec::Zstd)),
             Cursor::new(&compressed),
             compressed.len() as u64,
             super::NarUploadPolicy::new(1024, 0),
@@ -894,13 +924,19 @@ fn compressed_uploads_converge_on_one_raw_object() {
     assert!(
         !storage
             .layout()
-            .nar_path_encoded(NarFileName::new(xz_id, NarEncoding::Xz))
+            .nar_path_encoded(NarFileName::new(
+                xz_id,
+                WireEncoding::Compressed(CompressionCodec::Xz),
+            ))
             .exists()
     );
     assert!(
         !storage
             .layout()
-            .nar_path_encoded(NarFileName::new(zstd_id, NarEncoding::Zstd))
+            .nar_path_encoded(NarFileName::new(
+                zstd_id,
+                WireEncoding::Compressed(CompressionCodec::Zstd),
+            ))
             .exists()
     );
 }
@@ -914,10 +950,13 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
         .collect::<Vec<_>>();
     let raw_hash = NarHash::from_digest(Sha256::digest(&raw).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(&raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(&raw),
+        )
         .expect("raw NAR should be stored");
     let raw_file = storage
-        .open_nar(raw_hash)
+        .open_nar(NarFileName::raw(raw_hash))
         .expect("raw NAR should open")
         .expect("raw NAR should exist");
     let min_free_bytes = u64::MAX;
@@ -950,7 +989,10 @@ fn repeated_compressed_egress_reuses_its_durable_derivative() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let first = storage
@@ -981,7 +1023,10 @@ fn restarting_storage_reuses_a_durable_compressed_derivative() {
     let (first, initial_generations) = {
         let storage = initialize_storage(directory.path()).expect("storage should initialize");
         storage
-            .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(raw_hash)),
+                Cursor::new(raw),
+            )
             .expect("raw NAR should be stored");
         let output = storage
             .compressed_representation_for_test(identity, CompressionCodec::Xz, 0)
@@ -1007,7 +1052,10 @@ fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let first = storage
@@ -1032,7 +1080,10 @@ fn missing_compressed_derivative_must_reproduce_its_receipt_identity() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let output = storage
@@ -1046,10 +1097,14 @@ fn missing_compressed_derivative_must_reproduce_its_receipt_identity() {
         .expect("egress receipt should exist")
         .expect("egress receipt should be readable")
         .path();
-    let mut receipt = fs::read(&receipt_path).expect("receipt should be readable");
-    const ENCODED_HASH_OFFSET: usize = 1 + 32 + 1 + 1;
-    receipt[ENCODED_HASH_OFFSET] ^= 1;
-    fs::write(receipt_path, receipt).expect("test should rewrite the receipt identity");
+    let wrong_output_hash = FileHash::from_digest([0xff; 32]);
+    let wrong_receipt = EgressReceipt::for_slot(
+        EgressSlot::new(identity, CompressionCodec::Zstd),
+        wrong_output_hash,
+        output.1,
+    );
+    fs::write(receipt_path, wrong_receipt.bytes())
+        .expect("test should rewrite the receipt identity");
 
     assert!(matches!(
         storage.compressed_representation_for_test(identity, CompressionCodec::Zstd, 0),
@@ -1082,7 +1137,10 @@ fn assert_egress_derivative_is_repaired(
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let output = storage
@@ -1135,7 +1193,10 @@ fn concurrent_requests_coalesce_compressed_derivative_generation() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     storage
-        .publish_nar_unchecked(&raw_hash, Cursor::new(raw))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(raw_hash)),
+            Cursor::new(raw),
+        )
         .expect("raw NAR should be stored");
 
     let barrier = Arc::new(std::sync::Barrier::new(4));
@@ -1179,7 +1240,7 @@ fn zstd_validation_rejects_bytes_after_the_frame() {
         .expect("compressed frame hash is a valid file hash");
 
     let result = storage.publish_nar(
-        NarFileName::new(nar, NarEncoding::Zstd),
+        NarFileName::new(nar, WireEncoding::Compressed(CompressionCodec::Zstd)),
         Cursor::new(&compressed),
         compressed.len() as u64,
         super::NarUploadPolicy::new(1024, 0),
@@ -1204,7 +1265,7 @@ fn xz_validation_rejects_bytes_after_the_stream() {
         .expect("compressed frame hash is a valid file hash");
 
     let result = storage.publish_nar(
-        NarFileName::new(nar, NarEncoding::Xz),
+        NarFileName::new(nar, WireEncoding::Compressed(CompressionCodec::Xz)),
         Cursor::new(&compressed),
         compressed.len() as u64,
         super::NarUploadPolicy::new(1024, 0),
@@ -1225,7 +1286,10 @@ fn compressed_nars_reject_truncated_frames() {
     let mut zstd = Vec::new();
     compress(Cursor::new(raw), &mut zstd, CompressionLevel::Fastest);
 
-    for (encoding, mut compressed) in [(NarEncoding::Xz, xz), (NarEncoding::Zstd, zstd)] {
+    for (encoding, mut compressed) in [
+        (WireEncoding::Compressed(CompressionCodec::Xz), xz),
+        (WireEncoding::Compressed(CompressionCodec::Zstd), zstd),
+    ] {
         compressed.pop().expect("compressed frame is not empty");
         let nar = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed)))
             .expect("compressed hash is a valid file hash");
@@ -1331,10 +1395,10 @@ fn initialization_creates_only_the_fixed_layout() {
 fn initialization_rejects_a_different_storage_backend() {
     let directory = TestDir::new();
     let root = Directory::open(directory.path()).unwrap();
-    let storage = Storage::initialize_with_backend(&root, StorageBackend::Flat).unwrap();
+    let storage = Storage::initialize(&root, StorageBackend::Flat).unwrap();
     drop(storage);
 
-    let error = Storage::initialize_with_backend(&root, StorageBackend::Chunked)
+    let error = Storage::initialize(&root, StorageBackend::Chunked)
         .expect_err("a populated root must retain its selected backend");
     assert!(error.to_string().contains("different storage backend"));
 }
@@ -1454,7 +1518,10 @@ fn publication_rejects_a_symlinked_temporary_directory() {
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     assert!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"must not escape"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"must not escape"),
+            )
             .is_err()
     );
     assert!(!storage.layout.nar_path(nar).exists());
@@ -1482,7 +1549,10 @@ fn publication_rejects_a_symlinked_destination_directory() {
 
     assert!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"must not be compared"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"must not be compared"),
+            )
             .is_err()
     );
     assert_eq!(
@@ -1688,27 +1758,30 @@ fn publication_is_immutable_idempotent_and_pair_gated() {
 
     assert_eq!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"nar bytes"),
+            )
             .expect("publish NAR"),
         PublishOutcome::Created
     );
     assert_eq!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"nar bytes"),
+            )
             .expect("retry identical NAR"),
         PublishOutcome::Identical
     );
     assert!(matches!(
-        storage.publish_nar_unchecked(&nar, Cursor::new(b"different")),
+        storage.publish(
+            PublishTarget::Nar(NarFileName::raw(nar)),
+            Cursor::new(b"different"),
+        ),
         Err(StorageError::Conflict)
     ));
-    assert!(
-        storage
-            .open_pair(&store, nar)
-            .expect("check incomplete pair")
-            .is_none(),
-        "an orphan NAR must not make a store path visible"
-    );
+    assert!(storage.open_narinfo(&store).unwrap().is_none());
 
     assert_eq!(
         storage
@@ -1727,14 +1800,18 @@ fn publication_is_immutable_idempotent_and_pair_gated() {
         Err(StorageError::Conflict)
     ));
 
-    let mut pair = storage
-        .open_pair(&store, nar)
-        .expect("open durable pair")
-        .expect("pair should be visible");
+    let mut nar_file = storage
+        .open_nar(NarFileName::raw(nar))
+        .expect("open durable NAR")
+        .expect("NAR should be visible");
+    let mut narinfo_file = storage
+        .open_narinfo(&store)
+        .expect("open durable narinfo")
+        .expect("narinfo should be visible");
     let mut nar_bytes = Vec::new();
     let mut narinfo_bytes = Vec::new();
-    pair.nar.read_to_end(&mut nar_bytes).expect("read NAR");
-    pair.narinfo
+    nar_file.read_to_end(&mut nar_bytes).expect("read NAR");
+    narinfo_file
         .read_to_end(&mut narinfo_bytes)
         .expect("read narinfo");
     assert_eq!(nar_bytes, b"nar bytes");
@@ -1782,7 +1859,10 @@ fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
         std::thread::spawn(move || {
             let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
             started_tx.send(()).expect("signal contender start");
-            let outcome = storage.publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"));
+            let outcome = storage.publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"nar bytes"),
+            );
             outcome_tx.send(outcome).expect("send contender outcome");
         })
     };
@@ -1882,7 +1962,10 @@ fn response_loss_after_parent_sync_is_visible_and_idempotent() {
     );
     assert_eq!(
         storage
-            .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                Cursor::new(b"nar bytes"),
+            )
             .expect("retry durable NAR"),
         PublishOutcome::Identical
     );
@@ -1897,13 +1980,8 @@ fn response_loss_after_parent_sync_is_visible_and_idempotent() {
             )
             .is_err()
     );
-    assert!(
-        storage
-            .open_pair(&store, nar)
-            .expect("open durable pair")
-            .is_some(),
-        "a parent-synced pair must remain visible after response loss"
-    );
+    assert!(storage.open_narinfo(&store).unwrap().is_some());
+    assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_some());
     assert_eq!(
         storage
             .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
@@ -1920,7 +1998,10 @@ fn stream_resource_failures_leave_no_false_publication_state() {
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
         let error = storage
-            .publish_nar_unchecked(&nar, BrokenReader::new(raw_error))
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(nar)),
+                BrokenReader::new(raw_error),
+            )
             .expect_err("stream failure must reject publication");
         let StorageError::Io(error) = error else {
             panic!("stream failure returned a non-I/O error");
@@ -2158,7 +2239,10 @@ fn independent_publications_do_not_wait_for_another_body() {
     let contender = {
         let storage = Arc::clone(&storage);
         std::thread::spawn(move || {
-            let outcome = storage.publish_nar_unchecked(&second, Cursor::new(b"nar"));
+            let outcome = storage.publish(
+                PublishTarget::Nar(NarFileName::raw(second)),
+                Cursor::new(b"nar"),
+            );
             outcome_tx
                 .send(outcome)
                 .expect("send second publication outcome");
@@ -2430,7 +2514,10 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
     storage
-        .publish_nar_unchecked(&nar, Cursor::new(b"nar bytes"))
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(nar)),
+            Cursor::new(b"nar bytes"),
+        )
         .expect("publish NAR");
     storage
         .publish_narinfo_unchecked(&store, nar, Cursor::new(b"narinfo bytes"))
@@ -2440,12 +2527,7 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
         storage.delete_narinfo(&store).expect("delete narinfo"),
         super::operations::NarInfoDeletion::Deleted
     );
-    assert!(
-        storage
-            .open_pair(&store, nar)
-            .expect("open deleted pair")
-            .is_none()
-    );
+    assert!(storage.open_narinfo(&store).unwrap().is_none());
     assert!(storage.layout().nar_path(nar).is_file());
     assert_eq!(
         storage.delete_narinfo(&store).expect("repeat delete"),
