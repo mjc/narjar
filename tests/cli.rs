@@ -1249,11 +1249,18 @@ impl RunningServer {
         trusted_keys: Option<&str>,
     ) -> Self {
         let data_dir = data_dir(test);
-        let output = run(&[
+        let mut init_args = vec![
             "init",
             "--data-dir",
             data_dir.to_str().expect("temporary path should be UTF-8"),
-        ]);
+        ];
+        if let Some(index) = extra_args
+            .iter()
+            .position(|argument| *argument == "--storage-backend")
+        {
+            init_args.extend(["--storage-backend", extra_args[index + 1]]);
+        }
+        let output = run(&init_args);
         assert!(
             output.status.success(),
             "test data initialization failed: {}",
@@ -2445,6 +2452,49 @@ fn nar_put_normalizes_zstd_to_raw_bytes() {
     );
     assert_eq!(download_body, NAR_BYTES);
     assert_eq!(stored, NAR_BYTES);
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn chunked_backend_serves_the_reconstructed_raw_nar() {
+    let server =
+        RunningServer::start_with_args("chunked-raw-read", &["--storage-backend", "chunked"]);
+    let path = format!("/nar/{NARJAR_HASH}.nar");
+    let uploaded = server.request_with_body("PUT", &path, &[], NAR_BYTES);
+    let full = server.request("GET", &path);
+    let range = server.request_with_headers("GET", &path, &[("Range", "bytes=1-3")]);
+    assert!(
+        !server
+            .data_dir
+            .join(format!("nar/{NARJAR_HASH}.nar"))
+            .exists()
+    );
+    assert!(
+        fs::read_dir(server.data_dir.join(".narjar-manifests"))
+            .expect("manifest directory should be readable")
+            .any(|entry| entry.is_ok())
+    );
+
+    assert!(
+        response_parts(&uploaded)
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n"),
+        "{uploaded:?}"
+    );
+    let (full_headers, full_body) = response_parts(&full);
+    assert!(
+        full_headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{full_headers}"
+    );
+    assert_eq!(full_body, NAR_BYTES);
+    let (range_headers, range_body) = response_parts(&range);
+    assert!(
+        range_headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+        "{range_headers}"
+    );
+    assert_eq!(range_body, &NAR_BYTES[1..4]);
+    let (signal, status) = server.stop();
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
 }
