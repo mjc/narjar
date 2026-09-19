@@ -74,15 +74,18 @@ impl<'storage> StoredNar<'storage> {
                 file.seek(SeekFrom::Start(0))?;
                 Ok(StoredNarReader::Flat(file))
             }
-            StoredNarSource::Chunked(store) => Ok(StoredNarReader::Chunked(Box::new(
-                store
-                    .open_reader(
+            StoredNarSource::Chunked(store) => {
+                // Derivative generation must verify every immutable chunk
+                // before encoding the declared canonical NAR.
+                let reader = store
+                    .open_verified_reader(
                         self.identity.hash(),
                         0..self.identity.size().get(),
                         MAX_CHUNK_MANIFEST_BYTES,
                     )
-                    .map_err(|error| StorageError::Io(io::Error::other(error)))?,
-            ))),
+                    .map_err(|error| StorageError::Io(io::Error::other(error)))?;
+                Ok(StoredNarReader::Chunked(Box::new(reader)))
+            }
         }
     }
 }

@@ -178,6 +178,25 @@ impl ChunkStore {
         range: Range<u64>,
         max_manifest_bytes: u64,
     ) -> Result<ChunkedNarReader<'_>, ChunkStoreError> {
+        self.open_reader_with_mode(hash, range, max_manifest_bytes, ChunkReadMode::Serving)
+    }
+
+    pub(crate) fn open_verified_reader(
+        &self,
+        hash: NarHash,
+        range: Range<u64>,
+        max_manifest_bytes: u64,
+    ) -> Result<ChunkedNarReader<'_>, ChunkStoreError> {
+        self.open_reader_with_mode(hash, range, max_manifest_bytes, ChunkReadMode::Verified)
+    }
+
+    fn open_reader_with_mode(
+        &self,
+        hash: NarHash,
+        range: Range<u64>,
+        max_manifest_bytes: u64,
+        mode: ChunkReadMode,
+    ) -> Result<ChunkedNarReader<'_>, ChunkStoreError> {
         let manifest_file = self
             .open_manifest(hash)?
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
@@ -194,6 +213,7 @@ impl ChunkStore {
             range_end: range.end,
             next_chunk_start: 0,
             current_chunk: None,
+            mode,
         })
     }
 
@@ -204,7 +224,7 @@ impl ChunkStore {
         max_manifest_bytes: u64,
         destination: &mut W,
     ) -> Result<(), ChunkStoreError> {
-        let mut reader = self.open_reader(hash, range, max_manifest_bytes)?;
+        let mut reader = self.open_verified_reader(hash, range, max_manifest_bytes)?;
         io::copy(&mut reader, destination)?;
         Ok(())
     }
@@ -422,12 +442,20 @@ pub(crate) struct ChunkedNarReader<'store> {
     range_end: u64,
     next_chunk_start: u64,
     current_chunk: Option<LoadedChunk>,
+    mode: ChunkReadMode,
+}
+
+#[derive(Clone, Copy)]
+enum ChunkReadMode {
+    Serving,
+    Verified,
 }
 
 struct LoadedChunk {
     bytes: Vec<u8>,
     position: usize,
-    end: u64,
+    end_position: usize,
+    nar_end: u64,
 }
 
 impl ChunkedNarReader<'_> {
@@ -446,17 +474,18 @@ impl ChunkedNarReader<'_> {
             if self.range_cursor >= descriptor.end() || self.range_end <= chunk_start {
                 continue;
             }
-            let bytes = read_verified_chunk(
-                self.store,
-                descriptor,
-                chunk_start,
-                self.range_cursor,
-                self.range_end,
+            let chunk = read_chunk(self.store, descriptor, chunk_start, self.mode)?;
+            let start = usize::try_from(self.range_cursor.max(chunk_start) - chunk_start).map_err(
+                |_| io::Error::new(io::ErrorKind::InvalidInput, "chunk offset is too large"),
+            )?;
+            let end = usize::try_from(self.range_end.min(descriptor.end()) - chunk_start).map_err(
+                |_| io::Error::new(io::ErrorKind::InvalidInput, "chunk offset is too large"),
             )?;
             self.current_chunk = Some(LoadedChunk {
-                bytes,
-                position: 0,
-                end: self.range_end.min(descriptor.end()),
+                bytes: chunk,
+                position: start,
+                end_position: end,
+                nar_end: self.range_end.min(descriptor.end()),
             });
             return Ok(true);
         }
@@ -477,12 +506,12 @@ impl Read for ChunkedNarReader<'_> {
         }
         loop {
             if let Some(chunk) = self.current_chunk.as_mut() {
-                let remaining = &chunk.bytes[chunk.position..];
+                let remaining = &chunk.bytes[chunk.position..chunk.end_position];
                 let copied = remaining.len().min(output.len());
                 output[..copied].copy_from_slice(&remaining[..copied]);
                 chunk.position += copied;
-                if chunk.position == chunk.bytes.len() {
-                    self.range_cursor = chunk.end;
+                if chunk.position == chunk.end_position {
+                    self.range_cursor = chunk.nar_end;
                     self.current_chunk = None;
                 }
                 return Ok(copied);
@@ -501,12 +530,11 @@ impl Read for ChunkedNarReader<'_> {
     }
 }
 
-fn read_verified_chunk(
+fn read_chunk(
     store: &ChunkStore,
     descriptor: super::chunked::ChunkDescriptor,
     chunk_start: u64,
-    range_start: u64,
-    range_end: u64,
+    mode: ChunkReadMode,
 ) -> io::Result<Vec<u8>> {
     let chunk_length = descriptor
         .end()
@@ -530,18 +558,19 @@ fn read_verified_chunk(
             "chunk contains bytes beyond its manifest length",
         ));
     }
-    let actual_hash = ChunkHash::from_digest(Sha256::digest(&chunk).into());
-    if actual_hash != descriptor.hash() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "chunk hash does not match its manifest record",
-        ));
+    match mode {
+        ChunkReadMode::Serving => {}
+        ChunkReadMode::Verified => {
+            let actual_hash = ChunkHash::from_digest(Sha256::digest(&chunk).into());
+            if actual_hash != descriptor.hash() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk hash does not match its manifest record",
+                ));
+            }
+        }
     }
-    let start = usize::try_from(range_start.max(chunk_start) - chunk_start)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "chunk offset is too large"))?;
-    let end = usize::try_from(range_end.min(descriptor.end()) - chunk_start)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "chunk offset is too large"))?;
-    Ok(chunk[start..end].to_vec())
+    Ok(chunk)
 }
 
 fn io_for_manifest_error(error: ManifestError) -> io::Error {
@@ -1247,7 +1276,7 @@ mod tests {
     use crate::{
         object::{NarHash, NarIdentity, NarSize},
         storage::{
-            chunked::{ChunkHash, ChunkProfile},
+            chunked::{ChunkHash, ChunkProfile, ManifestReader},
             directory::Directory,
         },
     };
@@ -1343,10 +1372,50 @@ mod tests {
         fs::write(chunk, bytes).unwrap();
 
         let mut reader = store
-            .open_reader(hash, 0..identity.size().get(), 1_000_000)
+            .open_verified_reader(hash, 0..identity.size().get(), 1_000_000)
             .unwrap();
         let mut output = Vec::new();
         assert!(reader.read_to_end(&mut output).is_err());
+    }
+
+    #[test]
+    fn range_reader_does_not_open_chunks_outside_the_requested_range() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let mut state = 0x1234_5678_u32;
+        let input = (0..(3 * 1024 * 1024))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        let hash = NarHash::from_digest(Sha256::digest(&input).into());
+        let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
+        store
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
+            .unwrap();
+
+        let manifest_file = store.open_manifest(hash).unwrap().unwrap();
+        let mut manifest = ManifestReader::new(manifest_file, 1_000_000).unwrap();
+        let first = manifest.next_record().unwrap().unwrap();
+        let second = manifest.next_record().unwrap().unwrap();
+        assert_ne!(first.hash(), second.hash());
+
+        let second_chunk = directory
+            .path()
+            .join(super::super::CHUNK_DIRECTORY)
+            .join(super::shard_name(second.hash()))
+            .join(super::chunk_name(second.hash()));
+        fs::remove_file(second_chunk).unwrap();
+
+        let mut output = Vec::new();
+        store
+            .read_range(hash, 0..first.end(), 1_000_000, &mut output)
+            .unwrap();
+        assert_eq!(output, input[..first.end() as usize]);
     }
 
     #[test]
