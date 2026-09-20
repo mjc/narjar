@@ -63,10 +63,12 @@ impl Storage {
             return Err(StorageError::UploadTooLarge);
         }
         let target = PublishTarget::Nar(name);
+        let destination = target.destination();
         let temp_name = self.next_temp_name(&target);
-        let transaction = self
-            .recovery
-            .begin(&self.temporary_path(&target, &temp_name))?;
+        let transaction = self.recovery.begin(
+            &self.temporary_path(&target, &temp_name),
+            &destination.relative_path(),
+        )?;
         let temporary = UploadTemporary {
             storage: self,
             file: self.create_temp_named(&target, temp_name)?,

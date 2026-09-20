@@ -8,13 +8,13 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use super::{NarInfoMetadata, payload::write_encoded_nar};
+use super::{NarInfoMetadata, PushError, payload::write_encoded_nar};
 use narjar::nar_encode::{EncodeSummary, Encoder, Event};
 use narjar::object::{CompressionCodec, EncodedIdentity, FileHash, NarHash};
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 
-pub(super) fn write_nar<W: Write>(path: &Path, output: W) -> Result<EncodeSummary, String> {
+pub(super) fn write_nar<W: Write>(path: &Path, output: W) -> Result<EncodeSummary, PushError> {
     let mut encoder =
         Encoder::new(output).map_err(|error| format!("creating NAR encoder: {error}"))?;
     emit_path(&mut encoder, path)
@@ -22,10 +22,10 @@ pub(super) fn write_nar<W: Write>(path: &Path, output: W) -> Result<EncodeSummar
     encoder
         .finish()
         .map(|(_, summary)| summary)
-        .map_err(|error| format!("finishing {}: {error}", path.display()))
+        .map_err(|error| PushError::new(format!("finishing {}: {error}", path.display())))
 }
 
-pub(super) fn local_store_path(store_path: &str) -> Result<PathBuf, String> {
+pub(super) fn local_store_path(store_path: &str) -> Result<PathBuf, PushError> {
     let relative = store_path
         .strip_prefix("/nix/store/")
         .filter(|relative| !relative.is_empty() && !relative.contains('/'))
@@ -38,7 +38,7 @@ pub(super) fn local_store_path(store_path: &str) -> Result<PathBuf, String> {
 pub(super) fn verify_nar_summary(
     info: &NarInfoMetadata,
     summary: &EncodeSummary,
-) -> Result<(), String> {
+) -> Result<(), PushError> {
     let expected = info.claims().identity();
     let expected_hash = expected.hash();
     let actual_hash = NarHash::from_digest(summary.raw_sha256);
@@ -48,21 +48,22 @@ pub(super) fn verify_nar_summary(
             info.claims().store_path(),
             expected.size(),
             summary.raw_size
-        ));
+        )
+        .into());
     }
     Ok(())
 }
 
 pub(super) fn open_verified_nar_reader(
     info: &NarInfoMetadata,
-) -> Result<Box<dyn Read + Send>, String> {
+) -> Result<Box<dyn Read + Send>, PushError> {
     open_verified_nar_reader_at(info, local_store_path(info.claims().store_path())?)
 }
 
 fn open_verified_nar_reader_at(
     info: &NarInfoMetadata,
     path: PathBuf,
-) -> Result<Box<dyn Read + Send>, String> {
+) -> Result<Box<dyn Read + Send>, PushError> {
     let (reader, producer) = spawn_nar_writer(move |writer| write_nar(&path, writer).map(|_| ()))?;
     let reader = VerifiedNarReader {
         reader,
@@ -80,7 +81,7 @@ pub(super) fn open_verified_encoded_nar_reader(
     info: &NarInfoMetadata,
     codec: CompressionCodec,
     expected: EncodedIdentity,
-) -> Result<Box<dyn Read + Send>, String> {
+) -> Result<Box<dyn Read + Send>, PushError> {
     let path = local_store_path(info.claims().store_path())?;
     let info = info.clone();
     let (reader, producer) =
@@ -98,8 +99,8 @@ pub(super) fn open_verified_encoded_nar_reader(
 }
 
 fn spawn_nar_writer(
-    write: impl FnOnce(&mut std::io::PipeWriter) -> Result<(), String> + Send + 'static,
-) -> Result<(PipeReader, Receiver<Result<(), String>>), String> {
+    write: impl FnOnce(&mut std::io::PipeWriter) -> Result<(), PushError> + Send + 'static,
+) -> Result<(PipeReader, Receiver<Result<(), PushError>>), PushError> {
     let (reader, mut writer) = io::pipe().map_err(|error| format!("creating NAR pipe: {error}"))?;
     let (result_sender, result_receiver) = mpsc::channel();
     thread::Builder::new()
@@ -121,7 +122,7 @@ enum VerificationState {
 
 struct VerifiedNarReader {
     reader: PipeReader,
-    producer: Receiver<Result<(), String>>,
+    producer: Receiver<Result<(), PushError>>,
     expected_hash: FileHash,
     expected_size: u64,
     digest: Sha256,
@@ -328,7 +329,7 @@ mod tests {
     fn test_reader(
         output: Vec<u8>,
         expected: Vec<u8>,
-        result: Result<(), String>,
+        result: Result<(), super::PushError>,
     ) -> VerifiedNarReader {
         let (reader, producer) = spawn_nar_writer(move |writer| {
             writer
@@ -413,7 +414,7 @@ mod tests {
         let mut reader = test_reader(
             expected.clone(),
             expected,
-            Err("producer failed after writing the prefix".to_owned()),
+            Err("producer failed after writing the prefix".into()),
         );
 
         let error = io::copy(&mut reader, &mut io::sink()).expect_err("producer failure is hidden");

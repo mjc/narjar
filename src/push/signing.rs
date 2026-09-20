@@ -3,12 +3,12 @@ use std::{fs, path::Path};
 use data_encoding::BASE64;
 use ed25519_dalek::{Signer, SigningKey};
 
-use super::NarInfoMetadata;
+use super::{NarInfoMetadata, PushError};
 
 pub(super) fn sign_metadata(
     key_path: &Path,
     metadata: &mut [NarInfoMetadata],
-) -> Result<(), String> {
+) -> Result<(), PushError> {
     let key = SecretKey::read(key_path)?;
     metadata.iter_mut().try_for_each(|info| {
         let fingerprint = info.claims().fingerprint();
@@ -28,7 +28,7 @@ struct SecretKey {
 }
 
 impl SecretKey {
-    fn read(path: &Path) -> Result<Self, String> {
+    fn read(path: &Path) -> Result<Self, PushError> {
         let contents = fs::read_to_string(path)
             .map_err(|error| format!("reading signing key {}: {error}", path.display()))?;
         let mut values = contents.split_ascii_whitespace();
@@ -36,10 +36,7 @@ impl SecretKey {
             .next()
             .ok_or_else(|| format!("signing key {} is empty", path.display()))?;
         if values.next().is_some() {
-            return Err(format!(
-                "signing key {} contains multiple keys",
-                path.display()
-            ));
+            return Err(format!("signing key {} contains multiple keys", path.display()).into());
         }
         let (name, encoded) = value
             .split_once(':')
@@ -56,10 +53,9 @@ impl SecretKey {
             .expect("a 64-byte secret key has a 32-byte seed");
         let signing = SigningKey::from_bytes(&seed);
         if signing.verifying_key().as_bytes() != &secret[32..] {
-            return Err(format!(
-                "signing key {} has an invalid public half",
-                path.display()
-            ));
+            return Err(
+                format!("signing key {} has an invalid public half", path.display()).into(),
+            );
         }
         Ok(Self {
             name: name.to_owned(),

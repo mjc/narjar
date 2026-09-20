@@ -715,6 +715,25 @@ pub(super) fn validate_compressed_nar(
     verify_decoded_compressed_file(verified)
 }
 
+pub(super) fn compressed_file_identity(
+    file: &File,
+    encoded: EncodedIdentity,
+) -> io::Result<Option<NarIdentity>> {
+    if !encoded_file_matches(file, encoded)? {
+        return Ok(None);
+    }
+    let expectation = CompressedNarIdentity::new(
+        encoded,
+        NarIdentity::new(encoded.hash().as_nar_hash(), NarSize::new(u64::MAX)),
+    );
+    let verified = VerifiedCompressedNar { file, expectation };
+    match decode_verified_compressed_payload(&verified) {
+        Ok(decoded) => Ok(Some(decoded)),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn nar_file_matches(file: &File, payload: NarRepresentation) -> io::Result<bool> {
     match payload {
         NarRepresentation::Raw(identity) => raw_nar_file_matches(file, identity),

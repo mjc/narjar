@@ -272,6 +272,35 @@ fn flat_canonical_nar_rejects_same_size_corruption() {
     ));
 }
 
+#[test]
+fn compressed_delivery_rejects_same_size_corruption() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let raw = vec![b'c'; 4096];
+    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    let identity = NarIdentity::new(hash, NarSize::new(raw.len() as u64));
+    storage
+        .publish_nar(
+            NarFileName::raw(hash),
+            Cursor::new(&raw),
+            raw.len() as u64,
+            super::NarUploadPolicy::new(raw.len() as u64, 0),
+        )
+        .expect("raw NAR should be stored");
+    let (name, encoded_size) = storage
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+        .expect("compressed NAR should be generated");
+    let payload = storage.layout().nar_path_encoded(name);
+    let mut corrupted = fs::read(&payload).expect("compressed payload should exist");
+    corrupted[0] ^= 1;
+    fs::write(payload, corrupted).expect("same-size corruption should be writable");
+
+    assert!(matches!(
+        storage.open_nar_range(name, 0..encoded_size.get()),
+        Err(StorageError::NarMismatch)
+    ));
+}
+
 fn compressed_bytes(encoding: WireEncoding, raw: &[u8]) -> Vec<u8> {
     match encoding {
         WireEncoding::Compressed(CompressionCodec::Xz) => {
@@ -1725,11 +1754,17 @@ fn recovery_cleans_incomplete_publication_transactions() {
         .expect("create interrupted NAR temporary file");
     storage
         .recovery
-        .begin(Path::new(".tmp/cache-info-recovery.part"))
+        .begin(
+            Path::new(".tmp/cache-info-recovery.part"),
+            Path::new("nix-cache-info"),
+        )
         .expect("record interrupted cache-info publication");
     storage
         .recovery
-        .begin(Path::new("nar/.tmp/nar-recovery.part"))
+        .begin(
+            Path::new("nar/.tmp/nar-recovery.part"),
+            Path::new("nar/recovery.nar"),
+        )
         .expect("record interrupted NAR publication");
 
     assert!(storage.recovery_required().expect("inspect recovery state"));
@@ -1746,6 +1781,73 @@ fn recovery_cleans_incomplete_publication_transactions() {
             .is_none()
     );
     assert!(!storage.recovery_required().expect("inspect clean state"));
+}
+
+#[test]
+fn recovery_requires_published_transaction_destinations() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    fs::write(
+        directory.path().join("nix-cache-info"),
+        b"Cache-Control: max-age=1\n",
+    )
+    .expect("create published destination");
+
+    let mut transaction = storage
+        .recovery
+        .begin(
+            Path::new(".tmp/published-recovery.part"),
+            Path::new("nix-cache-info"),
+        )
+        .expect("record publication");
+    transaction
+        .transition(super::recovery::PublicationState::Streaming)
+        .expect("streaming transition");
+    transaction
+        .transition(super::recovery::PublicationState::Validated)
+        .expect("validation transition");
+    transaction
+        .transition(super::recovery::PublicationState::Linked)
+        .expect("linked transition");
+    drop(transaction);
+
+    storage
+        .finish_recovery()
+        .expect("published destination should make recovery safe");
+    assert!(!storage.recovery_required().expect("inspect recovery state"));
+}
+
+#[test]
+fn recovery_keeps_evidence_when_published_destination_is_missing() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let mut transaction = storage
+        .recovery
+        .begin(
+            Path::new(".tmp/missing-destination.part"),
+            Path::new("nix-cache-info"),
+        )
+        .expect("record publication");
+    transaction
+        .transition(super::recovery::PublicationState::Streaming)
+        .expect("streaming transition");
+    transaction
+        .transition(super::recovery::PublicationState::Validated)
+        .expect("validation transition");
+    transaction
+        .transition(super::recovery::PublicationState::Published)
+        .expect("published transition");
+    drop(transaction);
+
+    assert!(matches!(
+        storage.finish_recovery(),
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+    ));
+    assert!(
+        storage
+            .recovery_required()
+            .expect("inspect recovery evidence")
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use narjar::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, TrustedNarInfoClaims, TrustedPublicKeys};
 use ureq::Agent;
 
-use super::{DestinationNarinfoPolicy, NarInfoMetadata, transfer::get_bounded};
+use super::{DestinationNarinfoPolicy, NarInfoMetadata, PushError, transfer::get_bounded};
 use crate::http_url::HttpUrl;
 
 #[derive(Clone)]
@@ -15,17 +15,17 @@ impl TrustedUpstreams {
     pub(super) fn from_configuration(
         urls: &[HttpUrl],
         key_values: &[String],
-    ) -> Result<Self, String> {
+    ) -> Result<Self, PushError> {
         if urls.is_empty() && key_values.is_empty() {
             return Ok(Self {
                 entries: Arc::from([]),
             });
         }
         if urls.is_empty() {
-            return Err("--trusted-upstream-key requires --trusted-upstream".to_owned());
+            return Err("--trusted-upstream-key requires --trusted-upstream".into());
         }
         if key_values.is_empty() {
-            return Err("--trusted-upstream requires --trusted-upstream-key".to_owned());
+            return Err("--trusted-upstream requires --trusted-upstream-key".into());
         }
 
         let mut keys_by_url = vec![Vec::new(); urls.len()];
@@ -48,7 +48,7 @@ impl TrustedUpstreams {
         let mut entries = Vec::with_capacity(urls.len());
         for (url, keys) in urls.iter().cloned().zip(keys_by_url) {
             if keys.is_empty() {
-                return Err(format!("no trusted upstream key configured for {url}"));
+                return Err(format!("no trusted upstream key configured for {url}").into());
             }
             let keys = TrustedPublicKeys::parse(&keys.join(" "))
                 .map_err(|error| format!("invalid trusted upstream key for {url}: {error}"))?;
@@ -97,7 +97,7 @@ impl<'a> CacheLookup<'a> {
         }
     }
 
-    pub(super) fn classify(&self, info: &NarInfoMetadata) -> Result<PushDisposition, String> {
+    pub(super) fn classify(&self, info: &NarInfoMetadata) -> Result<PushDisposition, PushError> {
         match self.destination_narinfo {
             DestinationNarinfoPolicy::Refresh => return Ok(PushDisposition::UploadRequired),
             DestinationNarinfoPolicy::ReuseExisting => {}
@@ -125,7 +125,8 @@ impl<'a> CacheLookup<'a> {
                 return Err(format!(
                     "narinfo lookup for {} returned HTTP {status}",
                     info.claims().store_path()
-                ));
+                )
+                .into());
             }
         }
 
@@ -137,7 +138,7 @@ impl<'a> CacheLookup<'a> {
         route: &narjar::storage::StoreHash,
         narinfo_name: &str,
         info: &NarInfoMetadata,
-    ) -> Result<PushDisposition, String> {
+    ) -> Result<PushDisposition, PushError> {
         for upstream in self.upstreams.entries.iter() {
             match self.lookup_upstream(route, upstream, narinfo_name, info)? {
                 UpstreamLookup::Matched(matched) => {
@@ -166,7 +167,7 @@ impl<'a> CacheLookup<'a> {
         upstream: &ConfiguredUpstream,
         narinfo_name: &str,
         info: &NarInfoMetadata,
-    ) -> Result<UpstreamLookup, String> {
+    ) -> Result<UpstreamLookup, PushError> {
         let url = upstream.url.endpoint(&[narinfo_name]);
         let response = match get_bounded(self.agent, &url, None, MAX_NARINFO_BYTES) {
             Ok(response) => response,

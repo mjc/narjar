@@ -1,9 +1,9 @@
-use std::ffi::OsString;
+use std::{ffi::OsString, path::PathBuf};
 
-#[cfg(test)]
-use std::path::PathBuf;
-
-use super::super::{compression::IngestionReceipt, egress::EgressReceipt, ids::StoreHash};
+use super::super::{
+    EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY,
+    compression::IngestionReceipt, egress::EgressReceipt, ids::StoreHash,
+};
 use crate::object::{EncodedIdentity, NarFileName};
 
 #[cfg(test)]
@@ -80,6 +80,23 @@ pub(crate) struct PublicationDestination {
     pub(crate) name: OsString,
     pub(crate) publication: DestinationPublication,
     pub(crate) temp_prefix: &'static str,
+}
+
+impl PublicationDestination {
+    pub(crate) fn relative_path(&self) -> PathBuf {
+        let directory = match self.directory {
+            PublicationDirectory::Root => None,
+            PublicationDirectory::Nar => Some(NAR_DIRECTORY),
+            PublicationDirectory::IngestionReceipts => Some(INGESTION_RECEIPT_DIRECTORY),
+            PublicationDirectory::EgressReceipts => Some(EGRESS_RECEIPT_DIRECTORY),
+        };
+        let mut path = PathBuf::new();
+        if let Some(directory) = directory {
+            path.push(directory);
+        }
+        path.push(&self.name);
+        path
+    }
 }
 
 #[derive(Clone, Copy)]

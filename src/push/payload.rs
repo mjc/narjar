@@ -4,14 +4,14 @@ use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
-use super::NarInfoMetadata;
 use super::nar_stream::{local_store_path, verify_nar_summary, write_nar};
+use super::{NarInfoMetadata, PushError};
 use narjar::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
 
 pub(super) fn measure_encoded_nar(
     info: &NarInfoMetadata,
     codec: CompressionCodec,
-) -> Result<EncodedIdentity, String> {
+) -> Result<EncodedIdentity, PushError> {
     let mut measured = MeasuredWriter::new(io::sink());
     let path = local_store_path(info.claims().store_path())?;
     write_encoded_nar(&path, info, codec, &mut measured)?;
@@ -24,7 +24,7 @@ pub(super) fn write_encoded_nar<W: Write>(
     info: &NarInfoMetadata,
     codec: CompressionCodec,
     mut output: W,
-) -> Result<(), String> {
+) -> Result<(), PushError> {
     let summary = match codec {
         CompressionCodec::Zstd => {
             let mut encoder = StreamingEncoder::new(&mut output, CompressionLevel::Fastest);

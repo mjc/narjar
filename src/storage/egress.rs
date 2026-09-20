@@ -15,8 +15,7 @@ use crate::object::{
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
 use super::compression::{
-    CapacityCheckedStagingWriter, encode_raw_nar, encoded_file_matches, nar_file_matches,
-    nar_file_size_matches,
+    CapacityCheckedStagingWriter, encode_raw_nar, encoded_file_matches, nar_file_size_matches,
 };
 use super::fs::{
     BoundedRegularFile, open_optional_at, read_bounded_regular_file, read_dir_names, unlink_at,
@@ -169,7 +168,9 @@ impl<'storage> Derivative<'storage, Prepared> {
     fn begin(storage: &'storage Storage) -> Result<Self, StorageError> {
         let temp_name = storage.next_temp_name_with_prefix("nar");
         let temporary_path = PathBuf::from("nar/.tmp").join(&temp_name);
-        let transaction = storage.recovery.begin(&temporary_path)?;
+        let transaction = storage
+            .recovery
+            .begin(&temporary_path, PathBuf::new().as_path())?;
         let file = storage.create_temp_in_directory(storage.nar_temp_directory()?, temp_name)?;
         Ok(Self {
             temporary: OwnedTemporary::new(storage, file),
@@ -244,7 +245,9 @@ impl Derivative<'_, Validated<EncodedIdentity>> {
         let temporary = self.temporary.into_file();
         let target = PublishTarget::RepairEgressNar(output);
         let destination = target.destination();
-        storage.commit_temporary(destination, &temporary, self.transaction, |_| Ok(()))?;
+        let mut transaction = self.transaction;
+        transaction.set_destination(&destination.relative_path());
+        storage.commit_temporary(destination, &temporary, transaction, |_| Ok(()))?;
         Ok(output)
     }
 }
@@ -304,9 +307,7 @@ impl Storage {
                 let file = self
                     .open_nar(NarFileName::raw(identity.hash()))?
                     .ok_or(StorageError::MissingNar)?;
-                if !nar_file_matches(&file, NarRepresentation::Raw(identity))? {
-                    return Err(StorageError::NarMismatch);
-                }
+                self.validated_delivery_identity(NarFileName::raw(identity.hash()), &file)?;
                 StoredNarSource::Flat(file)
             }
             PayloadStorage::Chunked(store) => {

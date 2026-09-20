@@ -5,6 +5,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use super::PushError;
 use super::nar_stream::local_store_path;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -20,7 +21,7 @@ pub(super) struct StoreRoots {
 }
 
 impl StoreRoots {
-    pub(super) fn hold(store_paths: &[String]) -> Result<Self, String> {
+    pub(super) fn hold(store_paths: &[String]) -> Result<Self, PushError> {
         let automatic_roots = std::env::var_os("NARJAR_PUSH_GCROOTS")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -39,7 +40,7 @@ impl StoreRoots {
     fn hold_in(
         automatic_roots: &Path,
         targets: impl IntoIterator<Item = PathBuf>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, PushError> {
         let mut roots = Self {
             entries: Vec::new(),
         };
@@ -59,7 +60,7 @@ impl Drop for StoreRoots {
     }
 }
 
-fn allocate_root_entry(automatic_roots: &Path, target: &Path) -> Result<PathBuf, String> {
+fn allocate_root_entry(automatic_roots: &Path, target: &Path) -> Result<PathBuf, PushError> {
     for _ in 0..128 {
         let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
         let entry = automatic_roots.join(format!("narjar-push-{}-{sequence:016x}", process::id()));
@@ -67,10 +68,9 @@ fn allocate_root_entry(automatic_roots: &Path, target: &Path) -> Result<PathBuf,
             Ok(()) => return Ok(entry),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
-                return Err(format!(
-                    "creating Nix GC root for {}: {error}",
-                    target.display()
-                ));
+                return Err(
+                    format!("creating Nix GC root for {}: {error}", target.display()).into(),
+                );
             }
         }
     }

@@ -34,6 +34,56 @@ use transfer::{get_bounded, put_file, request_status};
 use transfer::{put_bytes, put_reader};
 use upstream::{CacheLookup, PushDisposition, TrustedUpstreams};
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct PushError {
+    message: String,
+}
+
+impl PushError {
+    pub(super) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.message.contains(needle)
+    }
+}
+
+impl fmt::Display for PushError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PushError {}
+
+impl From<String> for PushError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for PushError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<crate::http_url::HttpUrlError> for PushError {
+    fn from(error: crate::http_url::HttpUrlError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<PushError> for String {
+    fn from(error: PushError) -> Self {
+        error.message
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct Push {
     /// Destination binary cache store URI.
@@ -245,18 +295,18 @@ fn collect_copy_worker_results(workers: Vec<CopyWorker>) -> Result<PushReport, E
     }
 }
 
-type CopyWorker = thread::JoinHandle<Result<PushReport, String>>;
+type CopyWorker = thread::JoinHandle<Result<PushReport, PushError>>;
 
 #[derive(Debug, Eq, PartialEq)]
 enum CopyWorkerFailure {
-    Push(String),
+    Push(PushError),
     Panicked,
 }
 
 impl fmt::Display for CopyWorkerFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Push(message) => formatter.write_str(message),
+            Self::Push(message) => message.fmt(formatter),
             Self::Panicked => formatter.write_str("worker panicked"),
         }
     }
@@ -273,7 +323,7 @@ fn join_copy_worker(worker: CopyWorker) -> Result<PushReport, CopyWorkerFailure>
 fn native_copy_paths(
     options: &NativeCopyOptions,
     metadata: &[NarInfoMetadata],
-) -> Result<PushReport, String> {
+) -> Result<PushReport, PushError> {
     let client = UploadClient::new(options)?;
     let lookup = CacheLookup::new(
         &client.agent,
@@ -297,7 +347,7 @@ struct UploadClient {
 }
 
 impl UploadClient {
-    fn new(options: &NativeCopyOptions) -> Result<Self, String> {
+    fn new(options: &NativeCopyOptions) -> Result<Self, PushError> {
         let authorization = authorization_for_destination(options)?;
         let agent = Agent::config_builder()
             .http_status_as_error(false)
@@ -315,7 +365,7 @@ impl UploadClient {
         target: &HttpUrl,
         compression: WireEncoding,
         info: &NarInfoMetadata,
-    ) -> Result<(), String> {
+    ) -> Result<(), PushError> {
         let narinfo_url =
             target.endpoint(&[&format!("{}.narinfo", info.claims().store().as_str())]);
         let payload = prepare_nar_upload(info, compression)?;
@@ -343,10 +393,12 @@ impl UploadClient {
     }
 }
 
-fn authorization_for_destination(options: &NativeCopyOptions) -> Result<Option<String>, String> {
+fn authorization_for_destination(options: &NativeCopyOptions) -> Result<Option<String>, PushError> {
     match options.netrc_file.as_deref() {
-        Some(path) => netrc_authorization(path, &options.target, options.insecure_http)
-            .map_err(|error| error.to_string()),
+        Some(path) => Ok(
+            netrc_authorization(path, &options.target, options.insecure_http)
+                .map_err(|error| error.to_string())?,
+        ),
         None => Ok(None),
     }
 }
@@ -356,7 +408,7 @@ fn copy_path(
     client: &UploadClient,
     options: &NativeCopyOptions,
     info: &NarInfoMetadata,
-) -> Result<PushOutcome, String> {
+) -> Result<PushOutcome, PushError> {
     match lookup.classify(info)? {
         PushDisposition::DestinationPresent => Ok(PushOutcome::DestinationPresent),
         PushDisposition::TrustedUpstreamPresent(upstream) => {
@@ -376,7 +428,7 @@ fn copy_path(
 fn prepare_nar_upload(
     info: &NarInfoMetadata,
     encoding: WireEncoding,
-) -> Result<NarRepresentation, String> {
+) -> Result<NarRepresentation, PushError> {
     match encoding {
         WireEncoding::Raw => Ok(NarRepresentation::Raw(info.claims().identity())),
         WireEncoding::Compressed(codec) => measure_encoded_nar(info, codec)
@@ -387,7 +439,7 @@ fn prepare_nar_upload(
 fn open_upload_reader(
     representation: NarRepresentation,
     info: &NarInfoMetadata,
-) -> Result<Box<dyn std::io::Read + Send>, String> {
+) -> Result<Box<dyn std::io::Read + Send>, PushError> {
     match representation {
         NarRepresentation::Raw(_) => open_verified_nar_reader(info),
         NarRepresentation::Compressed(identity) => {
@@ -416,13 +468,14 @@ fn require_successful_upload(
     artifact: UploadArtifact,
     info: &NarInfoMetadata,
     status: u16,
-) -> Result<(), String> {
+) -> Result<(), PushError> {
     match status {
         200 | 201 => Ok(()),
         _ => Err(format!(
             "{artifact} upload for {} returned HTTP {status}",
             info.claims().store_path()
-        )),
+        )
+        .into()),
     }
 }
 
@@ -754,7 +807,7 @@ mod tests {
                 || {
                     std::fs::File::open(payload.path())
                         .map(|file| Box::new(file) as Box<dyn std::io::Read + Send>)
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| super::PushError::new(error.to_string()))
                 }
             )
             .expect("upload retry should eventually succeed"),

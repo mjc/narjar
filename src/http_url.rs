@@ -12,6 +12,39 @@ use fluent_uri::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HttpUrl(Uri<String>);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HttpUrlError {
+    Parse(String),
+    UnsupportedScheme,
+    MissingAuthority,
+    MissingHost,
+    Credentials,
+    InvalidPort,
+    Fragment,
+    UntrustedRedirectAuthority,
+}
+
+impl fmt::Display for HttpUrlError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(error) => formatter.write_str(error),
+            Self::UnsupportedScheme => formatter.write_str("URL must use http:// or https://"),
+            Self::MissingAuthority => formatter.write_str("URL must include an authority"),
+            Self::MissingHost => formatter.write_str("URL must include a host"),
+            Self::Credentials => {
+                formatter.write_str("URL must not contain credentials; use --netrc-file")
+            }
+            Self::InvalidPort => formatter.write_str("URL port must fit in 16 bits"),
+            Self::Fragment => formatter.write_str("URL must not contain a fragment"),
+            Self::UntrustedRedirectAuthority => {
+                formatter.write_str("redirect leaves the trusted cache authority")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpUrlError {}
+
 impl HttpUrl {
     fn authority(&self) -> Authority<'_> {
         self.0
@@ -54,15 +87,16 @@ impl HttpUrl {
             .unwrap_or(host)
     }
 
-    pub(crate) fn resolve_trusted_redirect(&self, location: &str) -> Result<Self, String> {
-        let reference = UriRef::parse(location.trim())
-            .map_err(|error| format!("{self} redirect has an invalid Location: {error}"))?;
-        let mut next = reference
-            .resolve_against(&self.0)
-            .map_err(|error| format!("{self} redirect has an invalid Location: {error}"))?;
+    pub(crate) fn resolve_trusted_redirect(&self, location: &str) -> Result<Self, HttpUrlError> {
+        let reference = UriRef::parse(location.trim()).map_err(|error| {
+            HttpUrlError::Parse(format!("{self} redirect has an invalid Location: {error}"))
+        })?;
+        let mut next = reference.resolve_against(&self.0).map_err(|error| {
+            HttpUrlError::Parse(format!("{self} redirect has an invalid Location: {error}"))
+        })?;
         next.set_fragment(None);
         let next = Self::try_from_uri(next)
-            .map_err(|error| format!("{self} redirect is invalid: {error}"))?;
+            .map_err(|error| HttpUrlError::Parse(format!("{self} redirect is invalid: {error}")))?;
 
         let same_authority = self.authority().as_str() == next.authority().as_str();
         let safe_scheme = self.0.scheme() == next.0.scheme()
@@ -70,9 +104,7 @@ impl HttpUrl {
         if same_authority && safe_scheme {
             Ok(next)
         } else {
-            Err(format!(
-                "{self} redirect leaves the trusted cache authority"
-            ))
+            Err(HttpUrlError::UntrustedRedirectAuthority)
         }
     }
 
@@ -84,37 +116,35 @@ impl HttpUrl {
         self.0.scheme().as_str() == "https"
     }
 
-    fn try_from_uri(uri: Uri<String>) -> Result<Self, String> {
+    fn try_from_uri(uri: Uri<String>) -> Result<Self, HttpUrlError> {
         let uri = uri.normalize();
         match uri.scheme().as_str() {
             "http" | "https" => {}
-            _ => return Err("URL must use http:// or https://".to_owned()),
+            _ => return Err(HttpUrlError::UnsupportedScheme),
         }
-        let authority = uri
-            .authority()
-            .ok_or_else(|| "URL must include an authority".to_owned())?;
+        let authority = uri.authority().ok_or(HttpUrlError::MissingAuthority)?;
         if authority.host().is_empty() {
-            return Err("URL must include a host".to_owned());
+            return Err(HttpUrlError::MissingHost);
         }
         if authority.userinfo().is_some() {
-            return Err("URL must not contain credentials; use --netrc-file".to_owned());
+            return Err(HttpUrlError::Credentials);
         }
         authority
             .port_to_u16()
-            .map_err(|_| "URL port must fit in 16 bits".to_owned())?;
+            .map_err(|_| HttpUrlError::InvalidPort)?;
         if uri.fragment().is_some() {
-            return Err("URL must not contain a fragment".to_owned());
+            return Err(HttpUrlError::Fragment);
         }
         Ok(Self(uri))
     }
 }
 
 impl FromStr for HttpUrl {
-    type Err = String;
+    type Err = HttpUrlError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let uri = Uri::parse(value)
-            .map_err(|error| format!("invalid HTTP URL: {error}"))?
+            .map_err(|error| HttpUrlError::Parse(format!("invalid HTTP URL: {error}")))?
             .to_owned();
         Self::try_from_uri(uri)
     }

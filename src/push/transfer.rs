@@ -9,6 +9,7 @@ use std::{fs::File, path::Path};
 
 use ureq::Agent;
 
+use super::PushError;
 use crate::http_url::HttpUrl;
 
 const MAX_ATTEMPTS: usize = 3;
@@ -53,7 +54,7 @@ pub(super) fn request_status(
     agent: &Agent,
     url: &HttpUrl,
     authorization: Option<&str>,
-) -> Result<u16, String> {
+) -> Result<u16, PushError> {
     get_bounded(agent, url, authorization, MAX_IGNORED_GET_BODY_BYTES)
         .map(|response| response.status)
 }
@@ -63,7 +64,7 @@ pub(super) fn get_bounded(
     url: &HttpUrl,
     authorization: Option<&str>,
     max_body_bytes: u64,
-) -> Result<GetResponse, String> {
+) -> Result<GetResponse, PushError> {
     'attempts: for attempt in 0..MAX_ATTEMPTS {
         let mut request_url = url.clone();
         for redirect in 0..=MAX_REDIRECTS {
@@ -100,12 +101,13 @@ pub(super) fn get_bounded(
                     if bytes.len() as u64 > max_body_bytes {
                         return Err(format!(
                             "GET {request_url} response exceeded {max_body_bytes} bytes"
-                        ));
+                        )
+                        .into());
                     }
 
                     if is_get_redirect_status(status) {
                         if redirect == MAX_REDIRECTS {
-                            return Err(format!("GET {url} followed too many redirects"));
+                            return Err(format!("GET {url} followed too many redirects").into());
                         }
                         let location = location.ok_or_else(|| {
                             format!("GET {request_url} redirect response had no Location header")
@@ -127,16 +129,16 @@ pub(super) fn get_bounded(
                     retry_sleep(attempt, None);
                     continue 'attempts;
                 }
-                Err(error) => return Err(format!("GET {request_url} failed: {error}")),
+                Err(error) => return Err(format!("GET {request_url} failed: {error}").into()),
             }
         }
     }
     unreachable!("retry loop always returns")
 }
 
-fn put_with_redirects<F>(url: &HttpUrl, mut send: F) -> Result<u16, String>
+fn put_with_redirects<F>(url: &HttpUrl, mut send: F) -> Result<u16, PushError>
 where
-    F: FnMut(&HttpUrl) -> Result<ureq::http::Response<ureq::Body>, String>,
+    F: FnMut(&HttpUrl) -> Result<ureq::http::Response<ureq::Body>, PushError>,
 {
     let mut upload_url = url.clone();
     'attempts: for attempt in 0..MAX_ATTEMPTS {
@@ -166,7 +168,7 @@ where
 
             if is_put_redirect_status(status) {
                 if redirect == MAX_REDIRECTS {
-                    return Err(format!("PUT {url} followed too many redirects"));
+                    return Err(format!("PUT {url} followed too many redirects").into());
                 }
                 let location = location.ok_or_else(|| {
                     format!("PUT {upload_url} redirect response had no Location header")
@@ -193,7 +195,7 @@ pub(super) fn put_file(
     path: &Path,
     content_type: &str,
     authorization: Option<&str>,
-) -> Result<u16, String> {
+) -> Result<u16, PushError> {
     put_with_redirects(url, |upload_url| {
         let file = File::open(path)
             .map_err(|error| format!("opening NAR for PUT {upload_url} failed: {error}"))?;
@@ -208,7 +210,7 @@ pub(super) fn put_file(
         }
         request
             .send(file)
-            .map_err(|error| format!("PUT {upload_url} failed: {error}"))
+            .map_err(|error| PushError::new(format!("PUT {upload_url} failed: {error}")))
     })
 }
 
@@ -219,9 +221,9 @@ pub(super) fn put_reader<F>(
     content_type: &str,
     authorization: Option<&str>,
     mut open: F,
-) -> Result<u16, String>
+) -> Result<u16, PushError>
 where
-    F: FnMut() -> Result<Box<dyn Read + Send>, String>,
+    F: FnMut() -> Result<Box<dyn Read + Send>, PushError>,
 {
     put_with_redirects(url, |upload_url| {
         let reader = open()?;
@@ -237,7 +239,7 @@ where
         }
         request
             .send(ureq::SendBody::from_owned_reader(reader))
-            .map_err(|error| format!("PUT {upload_url} failed: {error}"))
+            .map_err(|error| PushError::new(format!("PUT {upload_url} failed: {error}")))
     })
 }
 
@@ -247,7 +249,7 @@ pub(super) fn put_bytes(
     bytes: &[u8],
     content_type: &str,
     authorization: Option<&str>,
-) -> Result<u16, String> {
+) -> Result<u16, PushError> {
     put_with_redirects(url, |upload_url| {
         let mut request = agent
             .put(upload_url.as_str())
@@ -260,6 +262,6 @@ pub(super) fn put_bytes(
         }
         request
             .send(bytes)
-            .map_err(|error| format!("PUT {upload_url} failed: {error}"))
+            .map_err(|error| PushError::new(format!("PUT {upload_url} failed: {error}")))
     })
 }

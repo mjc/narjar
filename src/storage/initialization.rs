@@ -15,7 +15,7 @@ use super::{
     fs::{directory_is_empty, ensure_directory_at, open_at, open_optional_at},
     publication::{ProcessLock, StorageError},
     recovery::RecoveryState,
-    state::{PayloadStorage, Storage, StorageBackend},
+    state::{DeliveryValidationCache, PayloadStorage, Storage, StorageBackend},
 };
 
 #[cfg(test)]
@@ -94,6 +94,7 @@ impl Storage {
             root: root_directory,
             payloads,
             recovery,
+            delivery_validation: DeliveryValidationCache::default(),
             publication_locks: Mutex::new(HashMap::new()),
             staging_budget: Arc::new(Mutex::new(Default::default())),
             temporary_objects: AtomicU64::new(0),

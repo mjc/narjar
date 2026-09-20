@@ -24,8 +24,8 @@ use super::{
     chunk_store::{ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
     chunked::ChunkProfile,
     compression::{
-        IngestionReceipt, ReceivedNar, encoded_file_matches, nar_file_matches,
-        nar_file_size_matches, receive_uploaded_nar,
+        IngestionReceipt, ReceivedNar, compressed_file_identity, encoded_file_matches,
+        nar_file_matches, receive_uploaded_nar,
     },
     egress::{CanonicalRawStatus, NarReadBody},
     fs::{
@@ -437,12 +437,14 @@ impl Storage {
         open_optional_at(&nar_directory, &payload_name.os_string())?.map_or(
             Ok(NarMatch::Missing),
             |file| {
-                nar_file_size_matches(&file, representation.encoded_size().get())
-                    .map(|matches| match matches {
+                if file.metadata()?.len() != representation.encoded_size().get() {
+                    return Ok(NarMatch::Mismatch);
+                }
+                self.validated_delivery_identity(payload_name, &file)
+                    .map(|identity| match identity == representation.identity() {
                         true => NarMatch::Match,
                         false => NarMatch::Mismatch,
                     })
-                    .map_err(Into::into)
             },
         )
     }
@@ -465,9 +467,8 @@ impl Storage {
                 open_optional_at(&nar_directory, &name.os_string())?.map_or(
                     Ok(NarMatch::Missing),
                     |file| {
-                        nar_file_matches(&file, NarRepresentation::Raw(identity))
-                            .map(NarMatch::from_content_match)
-                            .map_err(Into::into)
+                        self.validated_delivery_identity(name, &file)
+                            .map(|actual| NarMatch::from_content_match(actual == identity))
                     },
                 )
             }
@@ -565,17 +566,44 @@ impl Storage {
             }
             (PayloadStorage::Flat | PayloadStorage::Chunked(_), None)
             | (PayloadStorage::Flat, Some(_)) => self.open_nar(name)?.map_or(Ok(None), |file| {
-                if let Some(hash) = name.raw_hash() {
-                    let identity = NarIdentity::new(hash, file.metadata()?.len().into());
-                    if !nar_file_matches(&file, NarRepresentation::Raw(identity))? {
-                        return Err(StorageError::NarMismatch);
-                    }
-                }
+                self.validated_delivery_identity(name, &file)?;
                 Ok(Some(OpenedNar {
                     body: NarReadBody::File(file),
                 }))
             }),
         }
+    }
+
+    pub(super) fn validated_delivery_identity(
+        &self,
+        name: NarFileName,
+        file: &File,
+    ) -> Result<NarIdentity, StorageError> {
+        if let Some(identity) = self.delivery_validation.get(name, file)? {
+            return Ok(identity);
+        }
+        let identity = match name.raw_hash() {
+            Some(hash) => {
+                let identity = NarIdentity::new(hash, file.metadata()?.len().into());
+                if !nar_file_matches(file, NarRepresentation::Raw(identity))? {
+                    return Err(StorageError::NarMismatch);
+                }
+                identity
+            }
+            None => {
+                let encoded = EncodedIdentity::new(
+                    match name.encoding() {
+                        WireEncoding::Compressed(codec) => codec,
+                        WireEncoding::Raw => unreachable!("raw names have a raw hash"),
+                    },
+                    name.file_hash(),
+                    file.metadata()?.len().into(),
+                );
+                compressed_file_identity(file, encoded)?.ok_or(StorageError::NarMismatch)?
+            }
+        };
+        self.delivery_validation.insert(name, file, identity)?;
+        Ok(identity)
     }
 
     pub fn open_narinfo(&self, store: &StoreHash) -> Result<Option<File>, StorageError> {
@@ -663,7 +691,9 @@ impl Storage {
         let destination = target.destination();
         let temp_name = self.next_temp_name(&target);
         let temporary_path = self.temporary_path(&target, &temp_name);
-        let mut transaction = self.recovery.begin(&temporary_path)?;
+        let mut transaction = self
+            .recovery
+            .begin(&temporary_path, &destination.relative_path())?;
         checkpoint(PublishBoundary::BeforeTempCreate)?;
         let temporary = OwnedTemporary::new(self, self.create_temp_named(&target, temp_name)?);
         transaction.transition(PublicationState::Streaming)?;

@@ -5,7 +5,7 @@ use std::{
 
 use sqlite::{Connection, OpenFlags, State};
 
-use super::NarInfoMetadata;
+use super::{NarInfoMetadata, PushError};
 use narjar::object::{NarHash, NarIdentity, NarSize};
 
 const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
@@ -31,7 +31,7 @@ pub(super) struct LocalStore {
 }
 
 impl LocalStore {
-    pub(super) fn open() -> Result<Self, String> {
+    pub(super) fn open() -> Result<Self, PushError> {
         let state_dir = std::env::var_os("NIX_STATE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nix/var/nix"));
@@ -52,7 +52,7 @@ impl LocalStore {
     pub(super) fn closure_paths(
         &self,
         installables: &[String],
-    ) -> Result<Vec<NarInfoMetadata>, String> {
+    ) -> Result<Vec<NarInfoMetadata>, PushError> {
         let roots = installables
             .iter()
             .map(|installable| concrete_store_path(installable))
@@ -74,7 +74,7 @@ impl LocalStore {
         }
     }
 
-    fn path_info(&self, path: &str) -> Result<NarInfoMetadata, String> {
+    fn path_info(&self, path: &str) -> Result<NarInfoMetadata, PushError> {
         let mut statement = self
             .database
             .prepare(
@@ -89,7 +89,7 @@ impl LocalStore {
             .next()
             .map_err(|error| format!("reading Nix path lookup: {error}"))?
         else {
-            return Err(format!("store path is not valid: {path}"));
+            return Err(format!("store path is not valid: {path}").into());
         };
         let id = statement
             .read::<i64, _>("id")
@@ -122,10 +122,10 @@ impl LocalStore {
             references,
             signatures,
         )
-        .map_err(|error| format!("invalid Nix path metadata for {path}: {error}"))
+        .map_err(|error| PushError::new(format!("invalid Nix path metadata for {path}: {error}")))
     }
 
-    fn references(&self, id: i64) -> Result<Vec<String>, String> {
+    fn references(&self, id: i64) -> Result<Vec<String>, PushError> {
         let mut statement = self
             .database
             .prepare(
@@ -152,7 +152,7 @@ impl LocalStore {
     }
 }
 
-fn validate_supported_schema(database: &Connection) -> Result<(), String> {
+fn validate_supported_schema(database: &Connection) -> Result<(), PushError> {
     REQUIRED_TABLE_COLUMNS
         .iter()
         .try_for_each(|(table, required_columns)| {
@@ -163,13 +163,14 @@ fn validate_supported_schema(database: &Connection) -> Result<(), String> {
             {
                 return Err(format!(
                     "unsupported or incomplete Nix store database schema: {table}"
-                ));
+                )
+                .into());
             }
             Ok(())
         })
 }
 
-fn table_columns(database: &Connection, table: &str) -> Result<BTreeSet<String>, String> {
+fn table_columns(database: &Connection, table: &str) -> Result<BTreeSet<String>, PushError> {
     let mut statement = database
         .prepare(format!("PRAGMA table_info({table})"))
         .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?;
@@ -187,23 +188,23 @@ fn table_columns(database: &Connection, table: &str) -> Result<BTreeSet<String>,
     Ok(columns)
 }
 
-fn concrete_store_path(value: &str) -> Result<String, String> {
+fn concrete_store_path(value: &str) -> Result<String, PushError> {
     let relative = value
         .strip_prefix("/nix/store/")
         .filter(|relative| !relative.is_empty() && !relative.contains('/'))
         .ok_or_else(|| format!("native push requires a concrete store path: {value}"))?;
     if relative.split_once('-').is_none() {
-        return Err(format!("invalid concrete store path: {value}"));
+        return Err(format!("invalid concrete store path: {value}").into());
     }
     Ok(format!("/nix/store/{relative}"))
 }
 
-fn nar_hash_from_base16(value: &str) -> Result<NarHash, String> {
+fn nar_hash_from_base16(value: &str) -> Result<NarHash, PushError> {
     let value = value
         .strip_prefix("sha256:")
         .ok_or_else(|| format!("unsupported Nix path hash: {value}"))?;
     if value.len() != 64 {
-        return Err(format!("invalid Nix SHA-256 length: {}", value.len()));
+        return Err(format!("invalid Nix SHA-256 length: {}", value.len()).into());
     }
     let mut digest = [0; 32];
     let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
