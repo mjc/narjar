@@ -544,11 +544,18 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
                     "publication transaction record has no path",
                 )
             })?;
-        let destination = lines
-            .next()
-            .and_then(|line| line.strip_prefix("destination="))
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from);
+        let destination = match lines.next() {
+            None => None,
+            Some(line) => {
+                let path = line.strip_prefix("destination=").ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "publication transaction record has an invalid destination",
+                    )
+                })?;
+                (!path.is_empty()).then(|| PathBuf::from(path))
+            }
+        };
         if lines.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

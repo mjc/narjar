@@ -307,7 +307,11 @@ impl Storage {
                 let file = self
                     .open_nar(NarFileName::raw(identity.hash()))?
                     .ok_or(StorageError::MissingNar)?;
-                self.validated_delivery_identity(NarFileName::raw(identity.hash()), &file)?;
+                let actual =
+                    self.validated_delivery_identity(NarFileName::raw(identity.hash()), &file)?;
+                if actual != identity {
+                    return Err(StorageError::NarMismatch);
+                }
                 StoredNarSource::Flat(file)
             }
             PayloadStorage::Chunked(store) => {

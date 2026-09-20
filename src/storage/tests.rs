@@ -273,6 +273,28 @@ fn flat_canonical_nar_rejects_same_size_corruption() {
 }
 
 #[test]
+fn flat_canonical_nar_rejects_a_claimed_size_mismatch() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let raw = vec![b's'; 4096];
+    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    storage
+        .publish_nar(
+            NarFileName::raw(hash),
+            Cursor::new(&raw),
+            raw.len() as u64,
+            super::NarUploadPolicy::new(raw.len() as u64, 0),
+        )
+        .expect("raw NAR should be stored");
+
+    let claimed = NarIdentity::new(hash, NarSize::new(raw.len() as u64 + 1));
+    assert!(matches!(
+        storage.open_verified_canonical_nar(NarRepresentation::Raw(claimed)),
+        Err(StorageError::NarMismatch)
+    ));
+}
+
+#[test]
 fn compressed_delivery_rejects_same_size_corruption() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
@@ -1905,6 +1927,33 @@ fn malformed_publication_transaction_blocks_recovery() {
     assert!(storage.recovery_required().expect("inspect recovery state"));
     assert!(storage.finish_recovery().is_err());
     assert!(record.exists(), "failed recovery must retain its evidence");
+}
+
+#[test]
+fn malformed_publication_transaction_destination_blocks_recovery() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let trusted_keys = directory.path().join("trusted-public-keys");
+    let temporary = directory.path().join(".tmp/malformed-destination.part");
+    let record = directory
+        .path()
+        .join(".narjar-transactions/publish-malformed-destination.txn");
+    fs::write(&trusted_keys, b"").expect("create trusted key file");
+    fs::write(&temporary, b"temporary").expect("create temporary publication");
+    fs::write(
+        &record,
+        b"state=staging\npath=.tmp/malformed-destination.part\ngarbage\n",
+    )
+    .expect("create malformed destination record");
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
+        .expect("make malformed record private");
+
+    assert!(storage.finish_recovery().is_err());
+    assert!(record.exists(), "failed recovery must retain its evidence");
+    assert!(
+        temporary.exists(),
+        "failed recovery must not remove the temporary publication"
+    );
 }
 
 #[test]
