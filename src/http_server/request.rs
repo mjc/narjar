@@ -264,9 +264,9 @@ impl BufferedHead {
             url: parsed.url,
             headers: parsed.headers,
             body_length: parsed.body_length,
-            body_state: match parsed.body_length.unwrap_or(0) {
-                0 => BodyState::Complete,
-                _ => BodyState::Unread,
+            body_state: match parsed.body_length {
+                Some(_) => BodyState::Unread,
+                None => BodyState::Complete,
             },
             keep_alive: parsed.keep_alive,
         })
@@ -374,6 +374,10 @@ impl Request {
             return Err(BodyReaderError::AlreadyConsumed);
         }
         self.body_state = BodyState::Reading;
+        let remaining = self.body_length.unwrap_or(0);
+        if remaining == 0 {
+            self.body_state = BodyState::Complete;
+        }
         Ok(BodyReader {
             stream: &mut self.stream,
             prefix: self
@@ -381,7 +385,7 @@ impl Request {
                 .get(self.body_prefix.clone())
                 .expect("validated body prefix range"),
             prefix_offset: 0,
-            remaining: self.body_length.unwrap_or(0),
+            remaining,
             state: &mut self.body_state,
         })
     }
@@ -560,6 +564,35 @@ mod tests {
 
         assert_eq!(byte, [b'b']);
         assert!(!request.body_complete());
+        assert!(matches!(
+            request.as_reader(),
+            Err(super::BodyReaderError::AlreadyConsumed)
+        ));
+        sender.join().expect("sender should finish");
+    }
+
+    #[test]
+    fn an_explicit_empty_body_is_readable_once_and_complete() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let sender = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            stream
+                .write_all(b"PUT /nar/example.nar HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+                .expect("write request");
+        });
+        let (stream, _) = listener.accept().expect("accept test request");
+        let mut request = Request::read(stream).expect("parse request");
+        assert!(!request.body_complete());
+        let mut body = Vec::new();
+        request
+            .as_reader()
+            .expect("explicit empty body is readable")
+            .read_to_end(&mut body)
+            .expect("read empty body");
+
+        assert!(body.is_empty());
+        assert!(request.body_complete());
         assert!(matches!(
             request.as_reader(),
             Err(super::BodyReaderError::AlreadyConsumed)
