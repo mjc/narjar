@@ -1873,6 +1873,57 @@ fn recovery_keeps_evidence_when_published_destination_is_missing() {
 }
 
 #[test]
+fn legacy_terminal_publication_transactions_remain_recoverable() {
+    for state in ["linked", "published"] {
+        let directory = TestDir::new();
+        let storage = initialize_storage(directory.path()).expect("initialize storage");
+        let trusted_keys = directory.path().join("trusted-public-keys");
+        let temporary = directory.path().join(format!(".tmp/legacy-{state}.part"));
+        let record = directory
+            .path()
+            .join(format!(".narjar-transactions/publish-legacy-{state}.txn"));
+        fs::write(&trusted_keys, b"").expect("create trusted key file");
+        fs::write(&temporary, b"legacy temporary publication")
+            .expect("create legacy temporary publication");
+        fs::write(
+            &record,
+            format!("state={state}\npath=.tmp/legacy-{state}.part\n"),
+        )
+        .expect("create legacy transaction record");
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
+            .expect("make legacy record private");
+
+        storage
+            .finish_recovery()
+            .expect("legacy transaction should be recoverable");
+        assert!(!temporary.exists());
+        assert!(!record.exists());
+    }
+}
+
+#[test]
+fn current_terminal_publication_transactions_still_require_destinations() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let temporary = directory.path().join(".tmp/missing-field.part");
+    let record = directory
+        .path()
+        .join(".narjar-transactions/publish-missing-field.txn");
+    fs::write(&temporary, b"temporary publication").expect("create temporary publication");
+    fs::write(
+        &record,
+        b"state=published\npath=.tmp/missing-field.part\ndestination=\n",
+    )
+    .expect("create incomplete current transaction record");
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
+        .expect("make incomplete record private");
+
+    assert!(storage.finish_recovery().is_err());
+    assert!(temporary.exists());
+    assert!(record.exists());
+}
+
+#[test]
 fn recovery_records_publish_state_before_each_fault_boundary() {
     for (boundary, expected_state) in [
         (PublishBoundary::BeforeTempCreate, "staging"),

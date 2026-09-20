@@ -287,35 +287,39 @@ impl RecoveryState {
     }
 
     fn recover_transaction(&self, transaction: TransactionRecord) -> Result<(), StorageError> {
-        match transaction.state {
-            PublicationState::Linked => {
-                let destination = transaction.destination.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "linked transaction has no destination",
-                    )
-                })?;
-                match self.verify_destination(&destination) {
-                    Ok(()) => {}
-                    // A pre-durable rollback deliberately removes the linked
-                    // destination. The transaction still records enough
-                    // information to safely remove its temporary file.
-                    Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
+        match transaction.format {
+            TransactionFormat::Legacy => {}
+            TransactionFormat::Current => match transaction.state {
+                PublicationState::Linked => {
+                    let destination = transaction.destination.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "linked transaction has no destination",
+                        )
+                    })?;
+                    match self.verify_destination(&destination) {
+                        Ok(()) => {}
+                        // A pre-durable rollback deliberately removes the linked
+                        // destination. The transaction still records enough
+                        // information to safely remove its temporary file.
+                        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
-            }
-            PublicationState::Published => {
-                let destination = transaction.destination.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "published transaction has no destination",
-                    )
-                })?;
-                self.verify_destination(&destination)?;
-            }
-            PublicationState::Staging
-            | PublicationState::Streaming
-            | PublicationState::Validated => {}
+                PublicationState::Published => {
+                    let destination = transaction.destination.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "published transaction has no destination",
+                        )
+                    })?;
+                    self.verify_destination(&destination)?;
+                }
+                PublicationState::Staging
+                | PublicationState::Streaming
+                | PublicationState::Validated => {}
+            },
         }
         self.remove_temporary_path(transaction.path, transaction.state)
     }
@@ -516,6 +520,13 @@ struct TransactionRecord {
     state: PublicationState,
     path: PathBuf,
     destination: Option<PathBuf>,
+    format: TransactionFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionFormat {
+    Legacy,
+    Current,
 }
 
 fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError> {
@@ -544,8 +555,8 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
                     "publication transaction record has no path",
                 )
             })?;
-        let destination = match lines.next() {
-            None => None,
+        let (destination, format) = match lines.next() {
+            None => (None, TransactionFormat::Legacy),
             Some(line) => {
                 let path = line.strip_prefix("destination=").ok_or_else(|| {
                     io::Error::new(
@@ -553,7 +564,10 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
                         "publication transaction record has an invalid destination",
                     )
                 })?;
-                (!path.is_empty()).then(|| PathBuf::from(path))
+                (
+                    (!path.is_empty()).then(|| PathBuf::from(path)),
+                    TransactionFormat::Current,
+                )
             }
         };
         if lines.next().is_some() {
@@ -567,6 +581,7 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
             state: PublicationState::parse(state)?,
             path: PathBuf::from(path),
             destination,
+            format,
         });
     }
 
@@ -581,6 +596,7 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
         state: PublicationState::Staging,
         path: PathBuf::from(first),
         destination: None,
+        format: TransactionFormat::Legacy,
     })
 }
 
