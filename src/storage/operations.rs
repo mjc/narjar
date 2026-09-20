@@ -19,7 +19,7 @@ use crate::object::{
 };
 
 use super::{
-    CleanupAction, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, VALIDATION_DIRECTORY,
+    CleanupAction, INGESTION_RECEIPT_DIRECTORY, VALIDATION_DIRECTORY,
     cache_info::{MAX_CACHE_INFO_BYTES, validate as validate_cache_info},
     chunk_store::{ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
     chunked::ChunkProfile,
@@ -35,10 +35,11 @@ use super::{
         rollback_link_at, unlink_at,
     },
     ids::StoreHash,
+    location::TemporaryPath,
     publication::{
         DestinationPublication, NEXT_TEMP, NarUploadPolicy, PublicationDestination,
-        PublicationDirectory, PublishBoundary, PublishOutcome, PublishTarget, StagedPublication,
-        StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
+        PublishBoundary, PublishOutcome, PublishTarget, StagedPublication, StagingReservation,
+        StorageError, TemporaryDirectory, TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction},
@@ -690,10 +691,11 @@ impl Storage {
     {
         let destination = target.destination();
         let temp_name = self.next_temp_name(&target);
-        let temporary_path = self.temporary_path(&target, &temp_name);
-        let mut transaction = self
-            .recovery
-            .begin(&temporary_path, &destination.relative_path())?;
+        let temporary_path = self.temporary_path(&target, temp_name.clone());
+        let mut transaction = self.recovery.begin(
+            &temporary_path.relative_path(),
+            &destination.relative_path(),
+        )?;
         checkpoint(PublishBoundary::BeforeTempCreate)?;
         let temporary = OwnedTemporary::new(self, self.create_temp_named(&target, temp_name)?);
         transaction.transition(PublicationState::Streaming)?;
@@ -727,7 +729,8 @@ impl Storage {
     ) -> Result<PublishOutcome, StorageError> {
         let mut progress = PublicationProgress::Pending(TemporaryLocation::Staging);
         let result = (|| {
-            let destination_directory = self.destination_directory(destination.directory)?;
+            let root = self.root_directory()?;
+            let destination_directory = destination.path.open_parent(&root)?;
             checkpoint(PublishBoundary::BeforeFinalLink)?;
             self.publish_temporary_at_destination_or_resolve_existing(
                 &destination,
@@ -806,7 +809,11 @@ impl Storage {
             DestinationPublicationAttempt::Created(location) => {
                 *progress = PublicationProgress::created(location);
                 self.durably_finalize_created_destination(
-                    CreatedDestination::new(location, destination_directory, &destination.name),
+                    CreatedDestination::new(
+                        location,
+                        destination_directory,
+                        destination.path.name(),
+                    ),
                     temp,
                     transaction,
                     checkpoint,
@@ -829,7 +836,7 @@ impl Storage {
                     &temp.directory,
                     &temp.name,
                     destination_directory,
-                    &destination.name,
+                    destination.path.name(),
                 )?;
                 Ok(DestinationPublicationAttempt::Created(
                     TemporaryLocation::Destination,
@@ -860,7 +867,7 @@ impl Storage {
             &temp.directory,
             &temp.name,
             destination_directory,
-            &destination.name,
+            destination.path.name(),
         ) {
             Ok(()) => Ok(DestinationPublicationAttempt::Created(
                 TemporaryLocation::Staging,
@@ -885,7 +892,7 @@ impl Storage {
             &temp.directory,
             &temp.name,
             destination_directory,
-            &destination.name,
+            destination.path.name(),
         )? {
             Ok(DestinationPublicationAttempt::Existing)
         } else {
@@ -903,7 +910,7 @@ impl Storage {
         match self.replace_corrupt_egress_derivative(
             temp,
             destination_directory,
-            &destination.name,
+            destination.path.name(),
             output,
         ) {
             Ok(()) => Ok(DestinationPublicationAttempt::Created(
@@ -991,7 +998,11 @@ impl Storage {
         OsString::from(format!("{prefix}-{}-{sequence:016x}.part", process::id()))
     }
 
-    pub(super) fn temporary_path(&self, target: &PublishTarget<'_>, name: &OsStr) -> PathBuf {
+    pub(super) fn temporary_path(
+        &self,
+        target: &PublishTarget<'_>,
+        name: OsString,
+    ) -> TemporaryPath {
         let destination = target.destination();
         Self::temporary_path_for(destination.temporary_directory, name)
     }
@@ -1060,29 +1071,8 @@ impl Storage {
         Ok(open_directory_at(&realisations, OsStr::new(".tmp"))?)
     }
 
-    pub(super) fn destination_directory(
-        &self,
-        directory: PublicationDirectory,
-    ) -> Result<File, StorageError> {
-        match directory {
-            PublicationDirectory::Root => self.root_directory(),
-            PublicationDirectory::Nar => self.nar_directory(),
-            PublicationDirectory::IngestionReceipts => self.ingestion_receipt_directory(),
-            PublicationDirectory::EgressReceipts => self.egress_receipt_directory(),
-        }
-    }
-
     pub(super) fn destination_key(&self, destination: &PublicationDestination) -> PathBuf {
-        match destination.directory {
-            PublicationDirectory::Root => PathBuf::from(&destination.name),
-            PublicationDirectory::Nar => PathBuf::from("nar").join(&destination.name),
-            PublicationDirectory::IngestionReceipts => {
-                PathBuf::from(INGESTION_RECEIPT_DIRECTORY).join(&destination.name)
-            }
-            PublicationDirectory::EgressReceipts => {
-                PathBuf::from(EGRESS_RECEIPT_DIRECTORY).join(&destination.name)
-            }
-        }
+        destination.path.relative_path()
     }
 
     fn temporary_directory(&self, directory: TemporaryDirectory) -> Result<File, StorageError> {
@@ -1092,10 +1082,10 @@ impl Storage {
         }
     }
 
-    fn temporary_path_for(directory: TemporaryDirectory, name: &OsStr) -> PathBuf {
+    fn temporary_path_for(directory: TemporaryDirectory, name: OsString) -> TemporaryPath {
         match directory {
-            TemporaryDirectory::Root => PathBuf::from(".tmp").join(name),
-            TemporaryDirectory::Nar => PathBuf::from("nar/.tmp").join(name),
+            TemporaryDirectory::Root => TemporaryPath::root(name),
+            TemporaryDirectory::Nar => TemporaryPath::nar(name),
         }
     }
 

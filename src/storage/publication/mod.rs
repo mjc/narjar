@@ -19,8 +19,7 @@ mod target;
 #[cfg(test)]
 pub(super) use target::Layout;
 pub(super) use target::{
-    DestinationPublication, PublicationDestination, PublicationDirectory, PublishTarget,
-    TemporaryDirectory,
+    DestinationPublication, PublicationDestination, PublishTarget, TemporaryDirectory,
 };
 
 #[derive(Debug)]

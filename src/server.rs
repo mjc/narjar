@@ -99,11 +99,15 @@ fn configure_socket_timeouts(stream: &TcpStream, timeout: Duration) -> io::Resul
     stream.set_write_timeout(Some(timeout))
 }
 
-fn staging_reservation_status(error: &StorageError) -> u16 {
+fn staging_reservation_status(error: &StorageError) -> StatusCode {
     match error {
-        StorageError::InsufficientSpace | StorageError::InsufficientInodes => 507,
-        StorageError::Io(error) if error.raw_os_error() == Some(libc::EROFS) => 503,
-        _ => 500,
+        StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
+            StatusCode::INSUFFICIENT_STORAGE
+        }
+        StorageError::Io(error) if error.raw_os_error() == Some(libc::EROFS) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -279,7 +283,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                                         | TrySendError::Disconnected(publication),
                                     ) => {
                                         metrics.publication_enqueue_failed();
-                                        publication.request.reject(&metrics, 429);
+                                        publication
+                                            .request
+                                            .reject(&metrics, StatusCode::TOO_MANY_REQUESTS);
                                         break;
                                     }
                                 }

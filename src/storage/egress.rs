@@ -26,11 +26,12 @@ use super::receipt::CompressedNarReceipt;
 use super::recovery::PublicationState;
 use super::state::{PayloadStorage, Storage};
 use super::typestate::{Streaming, Validated};
-use super::{CleanupAction, EGRESS_RECEIPT_DIRECTORY};
+use super::{CleanupAction, EGRESS_RECEIPT_DIRECTORY, location::TemporaryPath};
 
 pub(super) const MAX_EGRESS_RECEIPT_BYTES: u64 = 256;
 
-pub(crate) struct StoredNar<'storage> {
+/// A canonical NAR whose backing storage and identity have been verified.
+pub(crate) struct VerifiedCanonicalNar<'storage> {
     storage: &'storage Storage,
     source: StoredNarSource<'storage>,
     identity: NarIdentity,
@@ -55,7 +56,7 @@ impl Read for NarReadBody<'_> {
     }
 }
 
-impl<'storage> StoredNar<'storage> {
+impl<'storage> VerifiedCanonicalNar<'storage> {
     pub(crate) fn identity(&self) -> NarIdentity {
         self.identity
     }
@@ -167,10 +168,10 @@ type ReadyDerivative<'storage> = Derivative<'storage, Validated<EncodedIdentity>
 impl<'storage> Derivative<'storage, Prepared> {
     fn begin(storage: &'storage Storage) -> Result<Self, StorageError> {
         let temp_name = storage.next_temp_name_with_prefix("nar");
-        let temporary_path = PathBuf::from("nar/.tmp").join(&temp_name);
+        let temporary_path = TemporaryPath::nar(temp_name.clone());
         let transaction = storage
             .recovery
-            .begin(&temporary_path, PathBuf::new().as_path())?;
+            .begin(&temporary_path.relative_path(), PathBuf::new().as_path())?;
         let file = storage.create_temp_in_directory(storage.nar_temp_directory()?, temp_name)?;
         Ok(Self {
             temporary: OwnedTemporary::new(storage, file),
@@ -192,7 +193,7 @@ impl<'storage> Derivative<'storage, Prepared> {
 impl<'storage> Derivative<'storage, Streaming> {
     fn encode_canonical_raw_nar(
         self,
-        raw: &StoredNar<'_>,
+        raw: &VerifiedCanonicalNar<'_>,
         slot: EgressSlot,
         policy: NarUploadPolicy,
         contract: GenerationContract,
@@ -225,7 +226,7 @@ impl<'storage> Derivative<'storage, Streaming> {
 }
 
 fn encode_canonical_raw_nar_into_capacity_checked_staging_file(
-    raw: &StoredNar<'_>,
+    raw: &VerifiedCanonicalNar<'_>,
     codec: CompressionCodec,
     temporary: &mut File,
     reservation: &mut super::publication::StagingReservation,
@@ -294,7 +295,7 @@ impl Storage {
     pub(super) fn open_verified_canonical_nar(
         &self,
         payload: NarRepresentation,
-    ) -> Result<StoredNar<'_>, StorageError> {
+    ) -> Result<VerifiedCanonicalNar<'_>, StorageError> {
         let identity = match payload {
             NarRepresentation::Raw(identity) => identity,
             NarRepresentation::Compressed(expectation) => self
@@ -327,7 +328,7 @@ impl Storage {
                 StoredNarSource::Chunked(store)
             }
         };
-        Ok(StoredNar {
+        Ok(VerifiedCanonicalNar {
             storage: self,
             source,
             identity,
@@ -336,7 +337,7 @@ impl Storage {
 
     pub(super) fn select_egress(
         &self,
-        raw: &StoredNar<'_>,
+        raw: &VerifiedCanonicalNar<'_>,
         encoding: WireEncoding,
         policy: NarUploadPolicy,
     ) -> Result<NarRepresentation, StorageError> {
@@ -350,7 +351,7 @@ impl Storage {
 
     fn select_compressed(
         &self,
-        raw: &StoredNar<'_>,
+        raw: &VerifiedCanonicalNar<'_>,
         slot: EgressSlot,
         policy: NarUploadPolicy,
     ) -> Result<NarRepresentation, StorageError> {
@@ -388,7 +389,7 @@ impl Storage {
 
     fn materialize_compressed_nar(
         &self,
-        raw: &StoredNar<'_>,
+        raw: &VerifiedCanonicalNar<'_>,
         slot: EgressSlot,
         policy: NarUploadPolicy,
         contract: GenerationContract,
@@ -554,7 +555,7 @@ impl Storage {
         codec: CompressionCodec,
         min_free_bytes: u64,
     ) -> Result<(), StorageError> {
-        let stored = StoredNar {
+        let stored = VerifiedCanonicalNar {
             storage: self,
             source: StoredNarSource::Flat(raw.try_clone()?),
             identity,

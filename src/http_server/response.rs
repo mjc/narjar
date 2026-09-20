@@ -18,6 +18,7 @@ impl StatusCode {
     pub const CREATED: Self = Self(201);
     pub const PARTIAL_CONTENT: Self = Self(206);
     pub const BAD_REQUEST: Self = Self(400);
+    pub const CONFLICT: Self = Self(409);
     pub const UNAUTHORIZED: Self = Self(401);
     pub const NOT_FOUND: Self = Self(404);
     pub const METHOD_NOT_ALLOWED: Self = Self(405);
@@ -97,6 +98,10 @@ impl Response<Cursor<Vec<u8>>> {
 }
 
 impl<R> Response<R> {
+    pub(crate) const fn status(&self) -> StatusCode {
+        self.status
+    }
+
     pub(crate) fn new(status: StatusCode, body: R, content_length: usize) -> Self {
         Self {
             status,

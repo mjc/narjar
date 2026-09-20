@@ -12,6 +12,7 @@ mod ids;
 mod ingest;
 mod initialization;
 pub(crate) mod inspection;
+mod location;
 mod operations;
 mod publication;
 mod receipt;
@@ -45,7 +46,7 @@ pub use crate::object::{
     EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize, WireEncoding,
 };
 pub use directory::Directory;
-pub(crate) use egress::{NarReadBody, StoredNar};
+pub(crate) use egress::{NarReadBody, VerifiedCanonicalNar};
 pub use ids::{InvalidObjectId, StoreHash};
 pub use publication::{NarUploadPolicy, PublishOutcome, StagingReservation, StorageError};
 pub use state::{InvalidStorageBackend, Storage, StorageBackend};

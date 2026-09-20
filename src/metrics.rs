@@ -3,6 +3,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::http_server::StatusCode;
+
 use crate::{
     http_server::Method,
     storage::{CapacityErrorKind, StorageCapacity},
@@ -340,16 +342,22 @@ pub(crate) struct RequestGuard<'a> {
 }
 
 impl RequestGuard<'_> {
-    pub(crate) fn record_response(&self, status: u16, bytes_out: u64) {
+    pub(crate) fn record_response(&self, status: StatusCode, bytes_out: u64) {
         self.metrics.requests[request_index(
             self.method.index(),
             self.route.index(),
-            status_index(status),
+            status_index(status.get()),
         )]
         .fetch_add(1, Ordering::Relaxed);
         if !matches!(self.method, RequestMethod::Head) {
             self.metrics.bytes_out(bytes_out);
         }
+    }
+
+    pub(crate) fn record_aborted_response(&self) {
+        self.metrics.requests
+            [request_index(self.method.index(), self.route.index(), status_index(0))]
+        .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -372,6 +380,7 @@ impl Drop for UploadGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::{Metrics, RequestMethod, RequestRoute, ValidationClass};
+    use crate::http_server::StatusCode;
     use crate::storage::StorageCapacity;
     use std::time::Duration;
 
@@ -390,8 +399,8 @@ mod tests {
         metrics.validation_failure(ValidationClass::Nar);
         metrics.set_temp_objects(1);
         metrics.publication(Duration::from_millis(3));
-        request.record_response(201, 23);
-        head.record_response(200, 23);
+        request.record_response(StatusCode::CREATED, 23);
+        head.record_response(StatusCode::OK, 23);
         drop(upload);
         drop(request);
         drop(head);

@@ -1,8 +1,9 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::ffi::OsString;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use super::super::{
-    EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, NAR_DIRECTORY,
-    compression::IngestionReceipt, egress::EgressReceipt, ids::StoreHash,
+    compression::IngestionReceipt, egress::EgressReceipt, ids::StoreHash, location::StorePath,
 };
 use crate::object::{EncodedIdentity, NarFileName};
 
@@ -61,41 +62,21 @@ pub(crate) enum PublishTarget<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum PublicationDirectory {
-    Root,
-    Nar,
-    IngestionReceipts,
-    EgressReceipts,
-}
-
-#[derive(Clone, Copy)]
 pub(crate) enum TemporaryDirectory {
     Root,
     Nar,
 }
 
 pub(crate) struct PublicationDestination {
-    pub(crate) directory: PublicationDirectory,
+    pub(crate) path: StorePath,
     pub(crate) temporary_directory: TemporaryDirectory,
-    pub(crate) name: OsString,
     pub(crate) publication: DestinationPublication,
     pub(crate) temp_prefix: &'static str,
 }
 
 impl PublicationDestination {
-    pub(crate) fn relative_path(&self) -> PathBuf {
-        let directory = match self.directory {
-            PublicationDirectory::Root => None,
-            PublicationDirectory::Nar => Some(NAR_DIRECTORY),
-            PublicationDirectory::IngestionReceipts => Some(INGESTION_RECEIPT_DIRECTORY),
-            PublicationDirectory::EgressReceipts => Some(EGRESS_RECEIPT_DIRECTORY),
-        };
-        let mut path = PathBuf::new();
-        if let Some(directory) = directory {
-            path.push(directory);
-        }
-        path.push(&self.name);
-        path
+    pub(crate) fn relative_path(&self) -> std::path::PathBuf {
+        self.path.relative_path()
     }
 }
 
@@ -110,44 +91,38 @@ impl PublishTarget<'_> {
     pub(crate) fn destination(&self) -> PublicationDestination {
         match self {
             Self::CacheInfo => PublicationDestination {
-                directory: PublicationDirectory::Root,
+                path: StorePath::Root(OsString::from("nix-cache-info")),
                 temporary_directory: TemporaryDirectory::Root,
-                name: OsString::from("nix-cache-info"),
                 publication: DestinationPublication::Link,
                 temp_prefix: "cache-info",
             },
             Self::Nar(name) => PublicationDestination {
-                directory: PublicationDirectory::Nar,
+                path: StorePath::Nar(name.os_string()),
                 temporary_directory: TemporaryDirectory::Nar,
-                name: name.os_string(),
                 publication: DestinationPublication::Link,
                 temp_prefix: "nar",
             },
             Self::NarInfo(store) => PublicationDestination {
-                directory: PublicationDirectory::Root,
+                path: StorePath::Root(OsString::from(format!("{}.narinfo", store.as_str()))),
                 temporary_directory: TemporaryDirectory::Root,
-                name: OsString::from(format!("{}.narinfo", store.as_str())),
                 publication: DestinationPublication::Link,
                 temp_prefix: "narinfo",
             },
             Self::IngestionReceipt(receipt) => PublicationDestination {
-                directory: PublicationDirectory::IngestionReceipts,
+                path: StorePath::IngestionReceipt(receipt.file_name()),
                 temporary_directory: TemporaryDirectory::Root,
-                name: receipt.file_name(),
                 publication: DestinationPublication::Replace,
                 temp_prefix: "receipt",
             },
             Self::EgressReceipt(receipt) => PublicationDestination {
-                directory: PublicationDirectory::EgressReceipts,
+                path: StorePath::EgressReceipt(receipt.file_name()),
                 temporary_directory: TemporaryDirectory::Root,
-                name: receipt.file_name(),
                 publication: DestinationPublication::Replace,
                 temp_prefix: "egress-receipt",
             },
             Self::RepairEgressNar(output) => PublicationDestination {
-                directory: PublicationDirectory::Nar,
+                path: StorePath::Nar(output.file_name().os_string()),
                 temporary_directory: TemporaryDirectory::Nar,
-                name: output.file_name().os_string(),
                 publication: DestinationPublication::Repair(*output),
                 temp_prefix: "nar",
             },

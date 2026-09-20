@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 
 use super::fs::{open_at, unlink_at};
 use super::{
-    StorageError, entry_is_regular_at, open_directory_at, open_regular_at, read_dir_names,
+    StorageError, entry_is_regular_at,
+    location::{StorePath, TemporaryPath},
+    open_directory_at, open_regular_at, read_dir_names,
 };
 
 const TRANSACTION_DIRECTORY: &str = ".narjar-transactions";
@@ -287,110 +289,42 @@ impl RecoveryState {
     }
 
     fn recover_transaction(&self, transaction: TransactionRecord) -> Result<(), StorageError> {
-        match transaction.format {
-            TransactionFormat::Legacy => {}
-            TransactionFormat::Current => match transaction.state {
-                PublicationState::Linked => {
-                    let destination = transaction.destination.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "linked transaction has no destination",
-                        )
-                    })?;
-                    match self.verify_destination(&destination) {
-                        Ok(()) => {}
-                        // A pre-durable rollback deliberately removes the linked
-                        // destination. The transaction still records enough
-                        // information to safely remove its temporary file.
-                        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+        let temporary = match transaction {
+            TransactionRecord::Legacy { temporary } => temporary,
+            TransactionRecord::Current { temporary, phase } => {
+                match phase {
+                    CurrentTransactionPhase::PreLink => {}
+                    CurrentTransactionPhase::Linked(destination) => {
+                        match self.verify_destination(&destination) {
+                            Ok(()) => {}
+                            // A pre-durable rollback deliberately removes the linked
+                            // destination. The transaction still records enough
+                            // information to safely remove its temporary file.
+                            Err(StorageError::Io(error))
+                                if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error),
                         }
-                        Err(error) => return Err(error),
+                    }
+                    CurrentTransactionPhase::Published(destination) => {
+                        self.verify_destination(&destination)?;
                     }
                 }
-                PublicationState::Published => {
-                    let destination = transaction.destination.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "published transaction has no destination",
-                        )
-                    })?;
-                    self.verify_destination(&destination)?;
-                }
-                PublicationState::Staging
-                | PublicationState::Streaming
-                | PublicationState::Validated => {}
-            },
-        }
-        self.remove_temporary_path(transaction.path, transaction.state)
-    }
-
-    fn verify_destination(&self, path: &Path) -> Result<(), StorageError> {
-        let components: Vec<_> = path
-            .components()
-            .map(|component| component.as_os_str().to_owned())
-            .collect();
-        let (directory, name) = match components.as_slice() {
-            [name] => (&self.root, name),
-            [directory, name]
-                if directory == OsStr::new("nar")
-                    || directory == OsStr::new(".narjar-ingress")
-                    || directory == OsStr::new(".narjar-egress") =>
-            {
-                let directory = open_directory_at(&self.root, directory)?;
-                // Keep the directory descriptor live through the validation.
-                return open_regular_at(&directory, name)
-                    .map(|_| ())
-                    .map_err(Into::into);
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "publication destination is outside the store",
-                )
-                .into());
+                temporary
             }
         };
-        open_regular_at(directory, name)
+        self.remove_temporary_path(temporary)
+    }
+
+    fn verify_destination(&self, destination: &StorePath) -> Result<(), StorageError> {
+        let directory = destination.open_parent(&self.root)?;
+        open_regular_at(&directory, destination.name())
             .map(|_| ())
             .map_err(Into::into)
     }
 
-    fn remove_temporary_path(
-        &self,
-        path: PathBuf,
-        state: PublicationState,
-    ) -> Result<(), StorageError> {
-        let components: Vec<_> = path
-            .components()
-            .map(|component| component.as_os_str().to_owned())
-            .collect();
-        let (directory, name) = match components.as_slice() {
-            [first, name] if first == OsStr::new(".tmp") => {
-                (open_directory_at(&self.root, OsStr::new(".tmp"))?, name)
-            }
-            [first, second, name] if first == OsStr::new("nar") && second == OsStr::new(".tmp") => {
-                let nar = open_directory_at(&self.root, OsStr::new("nar"))?;
-                (open_directory_at(&nar, OsStr::new(".tmp"))?, name)
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "publication transaction path is outside temporary storage ({})",
-                        state.as_str()
-                    ),
-                )
-                .into());
-            }
-        };
-        if !name.to_str().is_some_and(|name| name.ends_with(".part")) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "publication transaction path has an invalid temporary name",
-            )
-            .into());
-        }
-        match unlink_at(&directory, name) {
+    fn remove_temporary_path(&self, temporary: TemporaryPath) -> Result<(), StorageError> {
+        let directory = temporary.open_parent(&self.root)?;
+        match unlink_at(&directory, temporary.name()) {
             Ok(()) => directory.sync_all()?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -516,17 +450,20 @@ fn rename_at(
     }
 }
 
-struct TransactionRecord {
-    state: PublicationState,
-    path: PathBuf,
-    destination: Option<PathBuf>,
-    format: TransactionFormat,
+enum TransactionRecord {
+    Legacy {
+        temporary: TemporaryPath,
+    },
+    Current {
+        temporary: TemporaryPath,
+        phase: CurrentTransactionPhase,
+    },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TransactionFormat {
-    Legacy,
-    Current,
+enum CurrentTransactionPhase {
+    PreLink,
+    Linked(StorePath),
+    Published(StorePath),
 }
 
 fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError> {
@@ -545,6 +482,7 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
     let mut lines = contents.lines();
     let first = lines.next().unwrap_or_default();
     if let Some(state) = first.strip_prefix("state=") {
+        let state = PublicationState::parse(state)?;
         let path = lines
             .next()
             .and_then(|line| line.strip_prefix("path="))
@@ -555,8 +493,9 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
                     "publication transaction record has no path",
                 )
             })?;
-        let (destination, format) = match lines.next() {
-            None => (None, TransactionFormat::Legacy),
+        let temporary = TemporaryPath::parse(Path::new(path))?;
+        let record = match lines.next() {
+            None => TransactionRecord::Legacy { temporary },
             Some(line) => {
                 let path = line.strip_prefix("destination=").ok_or_else(|| {
                     io::Error::new(
@@ -564,10 +503,31 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
                         "publication transaction record has an invalid destination",
                     )
                 })?;
-                (
-                    (!path.is_empty()).then(|| PathBuf::from(path)),
-                    TransactionFormat::Current,
-                )
+                let destination = (!path.is_empty())
+                    .then(|| StorePath::parse(Path::new(path)))
+                    .transpose()?;
+                let phase = match state {
+                    PublicationState::Staging
+                    | PublicationState::Streaming
+                    | PublicationState::Validated => CurrentTransactionPhase::PreLink,
+                    PublicationState::Linked => {
+                        CurrentTransactionPhase::Linked(destination.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "linked transaction has no destination",
+                            )
+                        })?)
+                    }
+                    PublicationState::Published => {
+                        CurrentTransactionPhase::Published(destination.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "published transaction has no destination",
+                            )
+                        })?)
+                    }
+                };
+                TransactionRecord::Current { temporary, phase }
             }
         };
         if lines.next().is_some() {
@@ -577,12 +537,7 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
             )
             .into());
         }
-        return Ok(TransactionRecord {
-            state: PublicationState::parse(state)?,
-            path: PathBuf::from(path),
-            destination,
-            format,
-        });
+        return Ok(record);
     }
 
     if first.is_empty() || lines.next().is_some() {
@@ -592,11 +547,8 @@ fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError>
         )
         .into());
     }
-    Ok(TransactionRecord {
-        state: PublicationState::Staging,
-        path: PathBuf::from(first),
-        destination: None,
-        format: TransactionFormat::Legacy,
+    Ok(TransactionRecord::Legacy {
+        temporary: TemporaryPath::parse(Path::new(first))?,
     })
 }
 

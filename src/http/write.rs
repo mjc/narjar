@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     auth::{Authorizer, Permission},
-    http_server::{BodyReaderError, Request, Response, StatusCode},
+    http_server::{BodyReaderError, BodyState, Request, Response, StatusCode},
     metrics::{Metrics, RequestGuard, RequestMethod, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::{NarFileName, WireEncoding},
@@ -31,7 +31,7 @@ pub struct PublicationRequest {
 }
 
 impl PublicationRequest {
-    pub fn reject(self, metrics: &Metrics, status: u16) {
+    pub fn reject(self, metrics: &Metrics, status: StatusCode) {
         let guard = metrics.request(RequestMethod::Put, request_route(self.upload.request.url()));
         let _ = self.upload.respond(&guard, status);
     }
@@ -110,13 +110,7 @@ pub fn prepare_publication(
         RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
             let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-            let _ = send_response(
-                &guard,
-                request,
-                400,
-                Response::empty(StatusCode::BAD_REQUEST),
-                0,
-            );
+            let _ = send_response(&guard, request, Response::empty(StatusCode::BAD_REQUEST), 0);
             return None;
         }
         RouteMatch::Missing => {
@@ -137,78 +131,62 @@ impl UploadRequest {
             Err(status) => {
                 metrics.validation_failure(ValidationClass::Body);
                 let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-                let _ = send_response(
-                    &guard,
-                    request,
-                    status,
-                    Response::empty(
-                        StatusCode::new(status).expect("upload response status is valid"),
-                    ),
-                    0,
-                );
+                let _ = send_response(&guard, request, Response::empty(status), 0);
                 None
             }
         }
     }
 
-    fn validate_headers_and_length(request: &Request) -> Result<usize, u16> {
+    fn validate_headers_and_length(request: &Request) -> Result<usize, StatusCode> {
         if has_header(request, "Transfer-Encoding") {
-            return Err(400);
+            return Err(StatusCode::BAD_REQUEST);
         }
         if has_header(request, "Content-Encoding") {
-            return Err(415);
+            return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
-        request.body_length().ok_or(411)
+        request.body_length().ok_or(StatusCode::LENGTH_REQUIRED)
     }
 
     const fn length(&self) -> usize {
         self.length
     }
 
-    fn body_complete(&self) -> bool {
-        self.request.body_complete()
-    }
-
-    fn body_reader_started(&self) -> bool {
-        self.request.body_reader_started()
+    fn body_state(&self) -> BodyState {
+        self.request.body_state()
     }
 
     fn reader(&mut self) -> Result<impl Read + '_, BodyReaderError> {
         self.request.as_reader()
     }
 
-    fn read_body(&mut self, max_bytes: usize) -> Result<Vec<u8>, u16> {
+    fn read_body(&mut self, max_bytes: usize) -> Result<Vec<u8>, StatusCode> {
         if self.length > max_bytes {
-            return Err(413);
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
         let length = self.length;
         let mut bytes = Vec::with_capacity(length);
         let read = self
             .reader()
-            .map_err(|_| 422u16)?
+            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?
             .take(length as u64 + 1)
             .read_to_end(&mut bytes);
         if read.is_err() || bytes.len() != length {
-            return Err(422);
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
         Ok(bytes)
     }
 
-    fn respond(self, guard: &RequestGuard<'_>, status: u16) -> Option<TcpStream> {
-        send_response(
-            guard,
-            self.request,
-            status,
-            Response::empty(StatusCode::new(status).expect("upload response status is valid")),
-            0,
-        )
+    fn respond(self, guard: &RequestGuard<'_>, status: StatusCode) -> Option<TcpStream> {
+        send_response(guard, self.request, Response::empty(status), 0)
     }
 }
 
-fn capacity_status(error: &io::Error) -> Option<u16> {
+fn capacity_status(error: &io::Error) -> Option<StatusCode> {
     match error.raw_os_error().map(capacity_error_kind) {
-        Some(CapacityErrorKind::NoSpace | CapacityErrorKind::Quota) => Some(507),
-        Some(CapacityErrorKind::ReadOnly) => Some(503),
+        Some(CapacityErrorKind::NoSpace | CapacityErrorKind::Quota) => {
+            Some(StatusCode::INSUFFICIENT_STORAGE)
+        }
+        Some(CapacityErrorKind::ReadOnly) => Some(StatusCode::SERVICE_UNAVAILABLE),
         Some(CapacityErrorKind::Inodes | CapacityErrorKind::Other) | None => None,
     }
 }
@@ -234,12 +212,12 @@ fn respond_cache_info_put(
 ) -> Option<TcpStream> {
     let cache_info = match storage.cache_info() {
         Ok(cache_info) => cache_info,
-        Err(_) => return upload.respond(guard, 500),
+        Err(_) => return upload.respond(guard, StatusCode::INTERNAL_SERVER_ERROR),
     };
     let _upload = metrics.upload(upload.length() as u64);
     if upload.length() != cache_info.len() {
         metrics.validation_failure(ValidationClass::Body);
-        return upload.respond(guard, 409);
+        return upload.respond(guard, StatusCode::CONFLICT);
     }
     let bytes = match upload.read_body(cache_info.len()) {
         Ok(bytes) => bytes,
@@ -250,7 +228,7 @@ fn respond_cache_info_put(
     };
     if bytes != cache_info {
         metrics.validation_failure(ValidationClass::Body);
-        return upload.respond(guard, 409);
+        return upload.respond(guard, StatusCode::CONFLICT);
     }
 
     let started = Instant::now();
@@ -260,11 +238,13 @@ fn respond_cache_info_put(
         record_capacity_error(metrics, error);
     }
     let status = match result {
-        Ok(PublishOutcome::Created) => 201,
-        Ok(PublishOutcome::Identical) => 200,
-        Err(StorageError::Conflict) => 409,
-        Err(StorageError::Io(error)) => capacity_status(&error).unwrap_or(500),
-        Err(_) => 500,
+        Ok(PublishOutcome::Created) => StatusCode::CREATED,
+        Ok(PublishOutcome::Identical) => StatusCode::OK,
+        Err(StorageError::Conflict) => StatusCode::CONFLICT,
+        Err(StorageError::Io(error)) => {
+            capacity_status(&error).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     upload.respond(guard, status)
 }
@@ -294,33 +274,37 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
         Ok(reader) => reader,
         Err(_) => {
             metrics.validation_failure(ValidationClass::Nar);
-            guard.record_response(0, 0);
+            guard.record_aborted_response();
             return None;
         }
     };
     let result = storage.publish_nar_with_staging(name, reader, length as u64, policy, staging);
     metrics.publication(started.elapsed());
-    if upload.body_reader_started()
-        && !upload.body_complete()
+    if matches!(upload.body_state(), BodyState::Reading | BodyState::Failed)
         && !matches!(result, Err(StorageError::UploadTooLarge))
     {
         metrics.validation_failure(ValidationClass::Nar);
-        guard.record_response(0, 0);
+        guard.record_aborted_response();
         return None;
     }
     if let Err(error) = &result {
         record_capacity_error(metrics, error);
     }
     let status = match result {
-        Ok(PublishOutcome::Created) => 201,
-        Ok(PublishOutcome::Identical) => 200,
-        Err(StorageError::Conflict) => 409,
-        Err(StorageError::UploadTooLarge) => 413,
-        Err(StorageError::InsufficientSpace) => 507,
-        Err(StorageError::InsufficientInodes) => 507,
-        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => 422,
-        Err(StorageError::Io(error)) => capacity_status(&error).unwrap_or(500),
-        Err(_) => 500,
+        Ok(PublishOutcome::Created) => StatusCode::CREATED,
+        Ok(PublishOutcome::Identical) => StatusCode::OK,
+        Err(StorageError::Conflict) => StatusCode::CONFLICT,
+        Err(StorageError::UploadTooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
+        Err(StorageError::InsufficientSpace | StorageError::InsufficientInodes) => {
+            StatusCode::INSUFFICIENT_STORAGE
+        }
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        Err(StorageError::Io(error)) => {
+            capacity_status(&error).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     upload.respond(guard, status)
 }
@@ -360,7 +344,7 @@ fn respond_narinfo_put(
         Ok(validated) => validated,
         Err(_) => {
             metrics.validation_failure(ValidationClass::NarInfo);
-            return upload.respond(guard, 422);
+            return upload.respond(guard, StatusCode::UNPROCESSABLE_ENTITY);
         }
     };
     let started = Instant::now();
@@ -372,14 +356,22 @@ fn respond_narinfo_put(
         record_capacity_error(metrics, error);
     }
     let status = match result {
-        Ok(PublishOutcome::Created) => 201,
-        Ok(PublishOutcome::Identical) => 200,
-        Err(StorageError::Conflict) => 409,
-        Err(StorageError::MissingNar | StorageError::NarMismatch) => 422,
-        Err(StorageError::InsufficientSpace | StorageError::InsufficientInodes) => 507,
-        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => 422,
-        Err(StorageError::Io(error)) => capacity_status(&error).unwrap_or(500),
-        Err(_) => 500,
+        Ok(PublishOutcome::Created) => StatusCode::CREATED,
+        Ok(PublishOutcome::Identical) => StatusCode::OK,
+        Err(StorageError::Conflict) => StatusCode::CONFLICT,
+        Err(StorageError::MissingNar | StorageError::NarMismatch) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        Err(StorageError::InsufficientSpace | StorageError::InsufficientInodes) => {
+            StatusCode::INSUFFICIENT_STORAGE
+        }
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        Err(StorageError::Io(error)) => {
+            capacity_status(&error).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     upload.respond(guard, status)
 }
@@ -389,7 +381,6 @@ pub(super) fn unauthorized(guard: &RequestGuard<'_>, request: Request) -> Option
     send_response(
         guard,
         request,
-        401,
         Response::empty(StatusCode::UNAUTHORIZED).with_header(challenge),
         0,
     )

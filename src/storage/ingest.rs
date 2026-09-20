@@ -65,8 +65,9 @@ impl Storage {
         let target = PublishTarget::Nar(name);
         let destination = target.destination();
         let temp_name = self.next_temp_name(&target);
+        let temporary_path = self.temporary_path(&target, temp_name.clone());
         let transaction = self.recovery.begin(
-            &self.temporary_path(&target, &temp_name),
+            &temporary_path.relative_path(),
             &destination.relative_path(),
         )?;
         let temporary = UploadTemporary {

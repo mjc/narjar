@@ -7,7 +7,7 @@ use crate::object::{
     EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarRepresentation,
     NarSize, WireEncoding,
 };
-use crate::storage::{StoreHash, StoredNar};
+use crate::storage::{StoreHash, VerifiedCanonicalNar};
 use data_encoding::BASE64;
 use ed25519_dalek::Signature;
 use fluent_uri::UriRef;
@@ -691,7 +691,7 @@ impl ValidatedNarInfo {
 
     pub(crate) fn bind_to_stored_nar(
         self,
-        stored: StoredNar<'_>,
+        stored: VerifiedCanonicalNar<'_>,
         output: NarRepresentation,
     ) -> Result<BoundNarInfo<'_>, NarInfoError> {
         if self.0.payload.identity() != stored.identity() {
@@ -710,12 +710,12 @@ impl ValidatedNarInfo {
 /// until publication.
 pub(crate) struct BoundNarInfo<'storage> {
     narinfo: PublicationNarInfo,
-    stored: StoredNar<'storage>,
+    stored: VerifiedCanonicalNar<'storage>,
     output: NarRepresentation,
 }
 
 impl BoundNarInfo<'_> {
-    pub(crate) fn stored(&self) -> &StoredNar<'_> {
+    pub(crate) fn stored(&self) -> &VerifiedCanonicalNar<'_> {
         &self.stored
     }
 

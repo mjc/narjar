@@ -199,7 +199,7 @@ pub struct Request {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BodyState {
+pub(crate) enum BodyState {
     Unread,
     Reading,
     Complete,
@@ -394,11 +394,8 @@ impl Request {
         self.body_state == BodyState::Complete
     }
 
-    pub fn body_reader_started(&self) -> bool {
-        matches!(
-            self.body_state,
-            BodyState::Reading | BodyState::Complete | BodyState::Failed
-        )
+    pub(crate) const fn body_state(&self) -> BodyState {
+        self.body_state
     }
 
     pub fn close_after_response(&mut self) {
