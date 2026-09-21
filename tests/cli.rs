@@ -2888,10 +2888,13 @@ fn read_routes_distinguish_bad_methods_names_and_unsupported_surfaces() {
     let server = RunningServer::start("read-negatives");
 
     let wrong_method = server.request("POST", "/nix-cache-info");
-    let invalid_routes = [
-        format!("/{}.narinfo", &STORE_HASH[..STORE_HASH.len() - 1]),
+    let nar_read_misses = [
         format!("/nar/{}.nar", &NAR_ID[..NAR_ID.len() - 1]),
         format!("/nar/{NAR_ID}.nar/extra"),
+    ]
+    .map(|path| server.request("GET", &path));
+    let invalid_routes = [
+        format!("/{}.narinfo", &STORE_HASH[..STORE_HASH.len() - 1]),
         "//nix-cache-info".to_owned(),
     ]
     .map(|path| server.request("GET", &path));
@@ -2914,6 +2917,15 @@ fn read_routes_distinguish_bad_methods_names_and_unsupported_surfaces() {
     );
     assert!(headers.contains("Allow: GET, HEAD, PUT\r\n"), "{headers:?}");
     assert!(body.is_empty());
+
+    for response in nar_read_misses {
+        let (headers, body) = response_parts(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{headers:?}"
+        );
+        assert!(body.is_empty());
+    }
 
     for response in invalid_routes {
         let (headers, body) = response_parts(&response);

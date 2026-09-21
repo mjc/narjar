@@ -364,6 +364,14 @@ pub(super) fn request_route(url: &str) -> RequestRoute {
     }
 }
 
+fn invalid_route_status(method: Method, url: &str) -> StatusCode {
+    if matches!(method, Method::Get | Method::Head) && url.starts_with("/nar/") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
 pub fn respond(
     request: Request,
     storage: &Storage,
@@ -446,7 +454,8 @@ pub fn respond(
     let route = match CacheRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
-            return send_response(&guard, request, Response::empty(StatusCode::BAD_REQUEST), 0);
+            let status = invalid_route_status(request.method(), request.url());
+            return send_response(&guard, request, Response::empty(status), 0);
         }
         RouteMatch::Missing => return not_found(&guard, request),
     };
@@ -479,8 +488,23 @@ pub fn respond(
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheRoute, RouteMatch};
-    use crate::object::{CompressionCodec, WireEncoding};
+    use super::{CacheRoute, RouteMatch, invalid_route_status};
+    use crate::{
+        http_server::{Method, StatusCode},
+        object::{CompressionCodec, WireEncoding},
+    };
+
+    #[test]
+    fn malformed_nar_reads_are_cache_misses() {
+        assert_eq!(
+            invalid_route_status(Method::Get, "/nar/old-store-hash.nar"),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            invalid_route_status(Method::Put, "/nar/old-store-hash.nar"),
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[test]
     fn legacy_main_prefix_maps_to_cache_routes() {
