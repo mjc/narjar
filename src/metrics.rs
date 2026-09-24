@@ -2887,6 +2887,35 @@ mod tests {
     }
 
     #[test]
+    fn maximum_population_counts_keep_metrics_exposition_below_the_fixed_bound() {
+        let metrics = Metrics::default();
+        let counts = PopulationCounts {
+            scanned_entries: u64::MAX,
+            structurally_valid_narinfo_entries: u64::MAX,
+            narinfo_files: u64::MAX,
+            narinfo_bytes: u64::MAX,
+            narinfo_claimed_nar_bytes: u64::MAX,
+            raw_files: u64::MAX,
+            raw_bytes: u64::MAX,
+            chunk_files: u64::MAX,
+            chunk_bytes: u64::MAX,
+            manifest_files: u64::MAX,
+            manifest_bytes: u64::MAX,
+            chunked_nars: u64::MAX,
+            chunked_nar_bytes: u64::MAX,
+            apparent_file_bytes: u64::MAX,
+            ..PopulationCounts::default()
+        };
+        metrics.record_population_scan(StorageBackend::Chunked, Ok(counts), 1, 300.0);
+
+        let exposition = metrics.render(true, None, 0, 0);
+
+        assert!(exposition.len() < 256 * 1024);
+        assert!(exposition.contains("narjar_cache_population_files{kind=\"raw\""));
+        assert!(exposition.contains("narjar_cache_population_logical_nars"));
+    }
+
+    #[test]
     fn incomplete_population_scan_keeps_last_complete_totals_and_reports_coverage() {
         let metrics = Metrics::default();
         let started_at = super::unix_seconds_now().saturating_sub(3);
