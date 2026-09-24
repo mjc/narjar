@@ -10,6 +10,8 @@ use std::{
     time::SystemTime,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::narinfo::{BoundNarInfo, ValidatedNarInfo};
 #[cfg(test)]
 use crate::object::NarHash;
@@ -111,6 +113,7 @@ impl TemporaryLocation {
 enum DestinationPublicationAttempt {
     Existing,
     Created(TemporaryLocation),
+    Repaired(TemporaryLocation),
 }
 
 struct CreatedDestination<'a> {
@@ -162,17 +165,21 @@ impl NarMatch {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StorageReadiness {
     Ready,
-    Insufficient,
+    LowSpace,
+    NoInodes,
+    ReadOnly,
+    ProbeFailed,
 }
 
 impl StorageReadiness {
     pub(crate) const fn is_ready(self) -> bool {
         match self {
             Self::Ready => true,
-            Self::Insufficient => false,
+            Self::LowSpace | Self::NoInodes | Self::ReadOnly | Self::ProbeFailed => false,
         }
     }
 }
@@ -615,12 +622,16 @@ impl Storage {
 
     pub fn is_ready(&self, min_free_bytes: u64) -> Result<StorageReadiness, StorageError> {
         let directory = self.nar_temp_directory()?;
-        Ok(
-            match filesystem_space(&directory)?.required_capacity(min_free_bytes) {
-                Ok(()) => StorageReadiness::Ready,
-                Err(_) => StorageReadiness::Insufficient,
-            },
-        )
+        let space = filesystem_space(&directory)?;
+        Ok(match space.required_capacity(min_free_bytes) {
+            Ok(()) => StorageReadiness::Ready,
+            Err(StorageError::InsufficientSpace) => StorageReadiness::LowSpace,
+            Err(StorageError::InsufficientInodes) => StorageReadiness::NoInodes,
+            Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EROFS) => {
+                StorageReadiness::ReadOnly
+            }
+            Err(_) => StorageReadiness::ProbeFailed,
+        })
     }
 
     pub(crate) fn capacity(&self) -> Result<StorageCapacity, StorageError> {
@@ -633,6 +644,15 @@ impl Storage {
             available_inodes: space.available_inodes,
             read_only: space.read_only,
         })
+    }
+
+    pub(crate) fn capacity_and_staging(&self) -> Result<(StorageCapacity, u64), StorageError> {
+        let staging = self
+            .staging_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let capacity = self.capacity()?;
+        Ok((capacity, staging.outstanding_bytes()))
     }
 
     pub(crate) fn temporary_objects(&self) -> u64 {
@@ -821,6 +841,22 @@ impl Storage {
                 )?;
                 Ok(PublishOutcome::Created)
             }
+            DestinationPublicationAttempt::Repaired(location) => {
+                *progress = PublicationProgress::created(location);
+                self.durably_finalize_created_destination(
+                    CreatedDestination::new(
+                        location,
+                        destination_directory,
+                        destination.path.name(),
+                    ),
+                    temp,
+                    transaction,
+                    checkpoint,
+                    progress,
+                )?;
+                self.activity.record_egress_repair();
+                Ok(PublishOutcome::Created)
+            }
         }
     }
 
@@ -913,7 +949,10 @@ impl Storage {
             destination.path.name(),
             output,
         ) {
-            Ok(()) => Ok(DestinationPublicationAttempt::Created(
+            Ok(true) => Ok(DestinationPublicationAttempt::Repaired(
+                TemporaryLocation::Destination,
+            )),
+            Ok(false) => Ok(DestinationPublicationAttempt::Created(
                 TemporaryLocation::Destination,
             )),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -958,24 +997,30 @@ impl Storage {
         destination_directory: &File,
         destination_name: &OsStr,
         output: EncodedIdentity,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         match open_regular_at(destination_directory, destination_name) {
             Ok(file) if encoded_file_matches(&file, output)? => Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "egress derivative was published concurrently",
             )),
-            Ok(_) => rename_at(
-                &temp.directory,
-                &temp.name,
-                destination_directory,
-                destination_name,
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => rename_at(
-                &temp.directory,
-                &temp.name,
-                destination_directory,
-                destination_name,
-            ),
+            Ok(_) => {
+                rename_at(
+                    &temp.directory,
+                    &temp.name,
+                    destination_directory,
+                    destination_name,
+                )?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                rename_at(
+                    &temp.directory,
+                    &temp.name,
+                    destination_directory,
+                    destination_name,
+                )?;
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }

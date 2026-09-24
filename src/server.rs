@@ -25,18 +25,20 @@ use signal_hook::{
 };
 
 use crate::{config::ServeConfig, error::Error};
-use narjar::metrics::Metrics;
+use narjar::metrics::{ConnectionOutcome, Metrics};
 
 struct Admissions {
     limit: usize,
     in_flight: AtomicUsize,
+    metrics: Arc<Metrics>,
 }
 
 impl Admissions {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, metrics: Arc<Metrics>) -> Self {
         Self {
             limit,
             in_flight: AtomicUsize::new(0),
+            metrics,
         }
     }
 
@@ -46,16 +48,39 @@ impl Admissions {
                 (in_flight < self.limit).then_some(in_flight + 1)
             })
             .ok()?;
-        Some(Admission(Arc::clone(self)))
+        self.metrics.connection_admitted();
+        Some(Admission {
+            admissions: Arc::clone(self),
+            metrics: Arc::clone(&self.metrics),
+        })
     }
 }
 
-struct Admission(Arc<Admissions>);
+struct Admission {
+    admissions: Arc<Admissions>,
+    metrics: Arc<Metrics>,
+}
 
 impl Drop for Admission {
     fn drop(&mut self) {
-        let in_flight = self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let in_flight = self.admissions.in_flight.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(in_flight > 0);
+        self.metrics.connection_released();
+    }
+}
+
+struct PublicationActivity(Arc<Metrics>);
+
+impl PublicationActivity {
+    fn start(metrics: Arc<Metrics>) -> Self {
+        metrics.publication_worker_started();
+        Self(metrics)
+    }
+}
+
+impl Drop for PublicationActivity {
+    fn drop(&mut self) {
+        self.0.publication_worker_finished();
     }
 }
 
@@ -74,20 +99,27 @@ struct QueuedPublication {
 fn try_dispatch(
     sender: &Sender<AcceptedRequest>,
     admissions: &Arc<Admissions>,
+    metrics: &Metrics,
     stream: TcpStream,
 ) -> Option<TcpStream> {
     let admission = match admissions.try_acquire() {
         Some(admission) => admission,
-        None => return Some(stream),
+        None => {
+            metrics.record_connection_outcome(ConnectionOutcome::AdmissionRejected);
+            return Some(stream);
+        }
     };
     let accepted = AcceptedRequest {
         stream,
         _admission: admission,
     };
 
+    metrics.connection_queued();
     match sender.try_send(accepted) {
         Ok(()) => None,
         Err(TrySendError::Full(accepted) | TrySendError::Disconnected(accepted)) => {
+            metrics.connection_dequeued();
+            metrics.record_connection_outcome(ConnectionOutcome::RequestQueueFull);
             Some(accepted.stream)
         }
     }
@@ -97,6 +129,17 @@ fn configure_socket_timeouts(stream: &TcpStream, timeout: Duration) -> io::Resul
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))
+}
+
+fn request_read_failure_outcome(kind: io::ErrorKind) -> ConnectionOutcome {
+    match kind {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::NotConnected => ConnectionOutcome::Disconnected,
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ConnectionOutcome::TimedOut,
+        _ => ConnectionOutcome::MalformedRequest,
+    }
 }
 
 fn staging_reservation_status(error: &StorageError) -> StatusCode {
@@ -158,6 +201,36 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .set_nonblocking(true)
         .map_err(|error| Error::runtime(format!("cannot configure listener: {error}")))?;
     let stopping = Arc::new(AtomicBool::new(false));
+    let sampler_metrics = Arc::clone(&metrics);
+    let sampler_stopping = Arc::clone(&stopping);
+    let filesystem_sample = config
+        .stats_filesystem_sample
+        .as_ref()
+        .map(|path| (path.clone(), config.data_dir.clone()));
+    let metrics_sampler = thread::Builder::new()
+        .name("narjar-metrics-sampler".to_owned())
+        .spawn(move || {
+            while !sampler_stopping.load(Ordering::Acquire) {
+                sampler_metrics.sample_periodic();
+                if let Some((path, root)) = &filesystem_sample {
+                    sampler_metrics.sample_filesystem_sidecar(path, root);
+                }
+                thread::park_timeout(Duration::from_secs(5));
+            }
+        })
+        .map_err(|error| Error::runtime(format!("cannot start metrics sampler: {error}")))?;
+    let population_sampler = config
+        .stats_inventory_interval_seconds
+        .map(|interval| {
+            spawn_population_sampler(
+                Arc::clone(&storage),
+                Arc::clone(&metrics),
+                Arc::clone(&stopping),
+                Duration::from_secs(interval.get()),
+            )
+        })
+        .transpose()
+        .map_err(|error| Error::runtime(format!("cannot start population sampler: {error}")))?;
     let signal_count = Arc::new(AtomicUsize::new(0));
     for signal in [SIGINT, SIGTERM] {
         let stopping = Arc::clone(&stopping);
@@ -196,7 +269,8 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let upload_policy = NarUploadPolicy::new(config.max_nar_bytes.get(), config.min_free_bytes);
     let max_nar_bytes = config.max_nar_bytes.get();
     let max_in_flight = config.max_in_flight.get();
-    let admissions = Arc::new(Admissions::new(max_in_flight));
+    metrics.configure_pressure_limits(max_in_flight as u64, config.workers.get() as u64);
+    let admissions = Arc::new(Admissions::new(max_in_flight, Arc::clone(&metrics)));
     let (sender, receiver) = bounded::<AcceptedRequest>(max_in_flight);
     let (publication_sender, publication_receiver) = bounded::<QueuedPublication>(max_in_flight);
     let publication_handles: Vec<_> = (0..config.workers.get())
@@ -216,6 +290,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                             queued_at,
                         } = publication;
                         metrics.publication_dequeued(queued_at);
+                        let _activity = PublicationActivity::start(Arc::clone(&metrics));
                         request.respond(
                             &storage,
                             &trusted_keys,
@@ -242,6 +317,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             let publication_sender = publication_sender.clone();
             thread::spawn(move || {
                 while let Ok(accepted) = receiver.recv() {
+                    metrics.connection_dequeued();
                     let AcceptedRequest {
                         mut stream,
                         _admission,
@@ -301,13 +377,19 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                                 Some(next_stream) => stream = next_stream,
                                 None => break,
                             },
-                            Err((_stream, error))
-                                if error.kind() == io::ErrorKind::UnexpectedEof =>
-                            {
-                                break;
-                            }
                             Err((mut stream, _error)) => {
-                                let _ = write_status(&mut stream, StatusCode::BAD_REQUEST);
+                                let outcome = request_read_failure_outcome(_error.kind());
+                                metrics.record_connection_outcome(outcome);
+                                match outcome {
+                                    ConnectionOutcome::MalformedRequest
+                                    | ConnectionOutcome::TimedOut => {
+                                        let _ = write_status(&mut stream, StatusCode::BAD_REQUEST);
+                                    }
+                                    ConnectionOutcome::Admitted
+                                    | ConnectionOutcome::AdmissionRejected
+                                    | ConnectionOutcome::RequestQueueFull
+                                    | ConnectionOutcome::Disconnected => {}
+                                }
                                 break;
                             }
                         }
@@ -332,7 +414,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
                 .map_err(|error| {
                     Error::runtime(format!("cannot configure socket timeouts: {error}"))
                 })?;
-                if let Some(mut stream) = try_dispatch(&sender, &admissions, stream) {
+                if let Some(mut stream) = try_dispatch(&sender, &admissions, &metrics, stream) {
                     let _ = write_status(&mut stream, StatusCode::TOO_MANY_REQUESTS);
                 }
             }
@@ -344,6 +426,10 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         }
     }
     drop(sender);
+    metrics_sampler.thread().unpark();
+    if let Some(sampler) = &population_sampler {
+        sampler.thread().unpark();
+    }
 
     let deadline = Instant::now() + Duration::from_secs(config.shutdown_grace_seconds.get());
     while handles.iter().any(|handle| !handle.is_finished()) {
@@ -372,14 +458,48 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .join()
             .map_err(|_| Error::runtime("publication worker panicked"))?;
     }
+    metrics_sampler
+        .join()
+        .map_err(|_| Error::runtime("metrics sampler panicked"))?;
+    if let Some(sampler) = population_sampler {
+        sampler
+            .join()
+            .map_err(|_| Error::runtime("population sampler panicked"))?;
+    }
 
     Ok(())
+}
+
+fn spawn_population_sampler(
+    storage: Arc<Storage>,
+    metrics: Arc<Metrics>,
+    stopping: Arc<AtomicBool>,
+    interval: Duration,
+) -> io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("narjar-population-sampler".to_owned())
+        .spawn(move || {
+            thread::park_timeout(Duration::from_secs(60));
+            while !stopping.load(Ordering::Acquire) {
+                let started = Instant::now();
+                let counts = storage.population_counts(&stopping).map_err(|_| ());
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                metrics.record_population_scan(
+                    storage.backend(),
+                    counts,
+                    started.elapsed().as_secs_f64(),
+                );
+                thread::park_timeout(interval);
+            }
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        io::Write,
+        io::{self, Write},
         net::TcpListener,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::Arc,
@@ -387,13 +507,30 @@ mod tests {
         time::Duration,
     };
 
-    use narjar::http_server::Request;
+    use narjar::{http_server::Request, metrics::Metrics};
 
-    use super::{Admissions, configure_socket_timeouts};
+    use super::{Admissions, configure_socket_timeouts, request_read_failure_outcome};
+    use narjar::metrics::ConnectionOutcome;
+
+    #[test]
+    fn request_read_failures_keep_disconnect_timeout_and_malformed_distinct() {
+        assert!(matches!(
+            request_read_failure_outcome(io::ErrorKind::UnexpectedEof),
+            ConnectionOutcome::Disconnected
+        ));
+        assert!(matches!(
+            request_read_failure_outcome(io::ErrorKind::TimedOut),
+            ConnectionOutcome::TimedOut
+        ));
+        assert!(matches!(
+            request_read_failure_outcome(io::ErrorKind::InvalidData),
+            ConnectionOutcome::MalformedRequest
+        ));
+    }
 
     #[test]
     fn admission_limit_counts_live_guards() {
-        let admissions = Arc::new(Admissions::new(2));
+        let admissions = Arc::new(Admissions::new(2, Arc::new(Metrics::default())));
         let first = admissions.try_acquire().expect("first admission");
         let second = admissions.try_acquire().expect("second admission");
 
@@ -406,7 +543,7 @@ mod tests {
 
     #[test]
     fn admission_is_released_during_unwind() {
-        let admissions = Arc::new(Admissions::new(1));
+        let admissions = Arc::new(Admissions::new(1, Arc::new(Metrics::default())));
 
         let result = catch_unwind(AssertUnwindSafe({
             let admissions = Arc::clone(&admissions);

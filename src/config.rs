@@ -19,6 +19,8 @@ pub(crate) struct ServeConfig {
     pub(crate) io_timeout_seconds: NonZeroU64,
     pub(crate) egress_compression: WireEncoding,
     pub(crate) storage_backend: StorageBackend,
+    pub(crate) stats_inventory_interval_seconds: Option<NonZeroU64>,
+    pub(crate) stats_filesystem_sample: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -51,6 +53,10 @@ pub(crate) struct ServeArgs {
     egress_compression: WireEncoding,
     #[arg(long, env = "NARJAR_STORAGE_BACKEND", default_value = "flat")]
     storage_backend: StorageBackend,
+    #[arg(long, env = "NARJAR_STATS_INVENTORY_INTERVAL_SECONDS")]
+    stats_inventory_interval_seconds: Option<NonZeroU64>,
+    #[arg(long, env = "NARJAR_STATS_FILESYSTEM_SAMPLE", value_parser = non_empty_path)]
+    stats_filesystem_sample: Option<PathBuf>,
 }
 
 impl From<ServeArgs> for ServeConfig {
@@ -66,6 +72,8 @@ impl From<ServeArgs> for ServeConfig {
             io_timeout_seconds: args.io_timeout_seconds,
             egress_compression: args.egress_compression,
             storage_backend: args.storage_backend,
+            stats_inventory_interval_seconds: args.stats_inventory_interval_seconds,
+            stats_filesystem_sample: args.stats_filesystem_sample,
         }
     }
 }

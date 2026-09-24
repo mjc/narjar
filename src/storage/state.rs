@@ -8,6 +8,8 @@ use std::{
     sync::{Arc, Mutex, Weak, atomic::AtomicU64},
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::chunk_store::ChunkStore;
 #[cfg(test)]
 use super::publication::Layout;
@@ -29,7 +31,6 @@ impl PayloadStorage {
         }
     }
 
-    #[cfg(test)]
     pub(super) const fn chunk_store(&self) -> Option<&ChunkStore> {
         match self {
             Self::Flat => None,
@@ -38,7 +39,8 @@ impl PayloadStorage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StorageBackend {
     Flat,
     Chunked,
@@ -87,9 +89,133 @@ pub struct Storage {
     pub(super) publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     pub(super) staging_budget: Arc<Mutex<StagingBudget>>,
     pub(super) temporary_objects: AtomicU64,
+    pub(super) activity: Arc<StorageActivity>,
     #[cfg(test)]
     pub(super) egress_generations: AtomicU64,
     pub(super) _lock: ProcessLock,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct StorageActivity {
+    pub(super) egress_reuses: AtomicU64,
+    pub(super) egress_generations_started: AtomicU64,
+    pub(super) egress_generations_succeeded: AtomicU64,
+    pub(super) egress_generations_failed: AtomicU64,
+    pub(super) egress_repairs: AtomicU64,
+    pub(super) egress_coalesced_waits: AtomicU64,
+    pub(super) egress_coalesced_wait_nanos: AtomicU64,
+    pub(super) chunks_created: AtomicU64,
+    pub(super) chunks_reused: AtomicU64,
+    pub(super) chunk_bytes_created: AtomicU64,
+    pub(super) chunk_bytes_reused: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StorageActivitySnapshot {
+    pub(crate) backend: StorageBackend,
+    pub(crate) egress_reuses: u64,
+    pub(crate) egress_generations_started: u64,
+    pub(crate) egress_generations_succeeded: u64,
+    pub(crate) egress_generations_failed: u64,
+    pub(crate) egress_repairs: u64,
+    pub(crate) egress_coalesced_waits: u64,
+    pub(crate) egress_coalesced_wait_seconds: f64,
+    pub(crate) chunks_created: u64,
+    pub(crate) chunks_reused: u64,
+    pub(crate) chunk_bytes_created: u64,
+    pub(crate) chunk_bytes_reused: u64,
+}
+
+impl StorageActivity {
+    pub(super) fn record_egress_reuse(&self) {
+        increment_saturating(&self.egress_reuses, 1);
+    }
+
+    pub(super) fn record_egress_generation_started(&self) {
+        increment_saturating(&self.egress_generations_started, 1);
+    }
+
+    pub(super) fn record_egress_generation_succeeded(&self) {
+        increment_saturating(&self.egress_generations_succeeded, 1);
+    }
+
+    pub(super) fn record_egress_generation_failed(&self) {
+        increment_saturating(&self.egress_generations_failed, 1);
+    }
+
+    pub(super) fn record_egress_repair(&self) {
+        increment_saturating(&self.egress_repairs, 1);
+    }
+
+    pub(super) fn record_egress_coalesced_wait(&self, elapsed: std::time::Duration) {
+        increment_saturating(&self.egress_coalesced_waits, 1);
+        increment_saturating(
+            &self.egress_coalesced_wait_nanos,
+            elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+        );
+    }
+
+    pub(super) fn record_chunk_publication(
+        &self,
+        outcome: super::publication::PublishOutcome,
+        bytes: u64,
+    ) {
+        let (count, byte_count) = match outcome {
+            super::publication::PublishOutcome::Created => {
+                (&self.chunks_created, &self.chunk_bytes_created)
+            }
+            super::publication::PublishOutcome::Identical => {
+                (&self.chunks_reused, &self.chunk_bytes_reused)
+            }
+        };
+        increment_saturating(count, 1);
+        increment_saturating(byte_count, bytes);
+    }
+
+    pub(crate) fn snapshot(&self, backend: StorageBackend) -> StorageActivitySnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        StorageActivitySnapshot {
+            backend,
+            egress_reuses: self.egress_reuses.load(Relaxed),
+            egress_generations_started: self.egress_generations_started.load(Relaxed),
+            egress_generations_succeeded: self.egress_generations_succeeded.load(Relaxed),
+            egress_generations_failed: self.egress_generations_failed.load(Relaxed),
+            egress_repairs: self.egress_repairs.load(Relaxed),
+            egress_coalesced_waits: self.egress_coalesced_waits.load(Relaxed),
+            egress_coalesced_wait_seconds: self.egress_coalesced_wait_nanos.load(Relaxed) as f64
+                / 1_000_000_000.0,
+            chunks_created: self.chunks_created.load(Relaxed),
+            chunks_reused: self.chunks_reused.load(Relaxed),
+            chunk_bytes_created: self.chunk_bytes_created.load(Relaxed),
+            chunk_bytes_reused: self.chunk_bytes_reused.load(Relaxed),
+        }
+    }
+}
+
+impl Default for StorageActivitySnapshot {
+    fn default() -> Self {
+        Self {
+            backend: StorageBackend::Flat,
+            egress_reuses: 0,
+            egress_generations_started: 0,
+            egress_generations_succeeded: 0,
+            egress_generations_failed: 0,
+            egress_repairs: 0,
+            egress_coalesced_waits: 0,
+            egress_coalesced_wait_seconds: 0.0,
+            chunks_created: 0,
+            chunks_reused: 0,
+            chunk_bytes_created: 0,
+            chunk_bytes_reused: 0,
+        }
+    }
+}
+
+fn increment_saturating(counter: &AtomicU64, amount: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let _ = counter.fetch_update(Relaxed, Relaxed, |value| Some(value.saturating_add(amount)));
 }
 
 #[derive(Debug, Default)]
@@ -166,8 +292,12 @@ impl DeliveryValidationCache {
 }
 
 impl Storage {
-    pub(crate) const fn backend(&self) -> StorageBackend {
+    pub const fn backend(&self) -> StorageBackend {
         self.payloads.backend()
+    }
+
+    pub(crate) fn activity_snapshot(&self) -> StorageActivitySnapshot {
+        self.activity.snapshot(self.backend())
     }
 
     #[cfg(test)]

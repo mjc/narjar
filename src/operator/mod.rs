@@ -769,8 +769,6 @@ pub(crate) struct Stats {
     url: HttpUrl,
     #[arg(long)]
     netrc_file: Option<PathBuf>,
-    #[arg(long)]
-    json: bool,
 }
 
 pub(crate) fn stats(options: Stats) -> Result<(), Error> {
@@ -780,16 +778,19 @@ pub(crate) fn stats(options: Stats) -> Result<(), Error> {
         .map(|path| netrc_authorization(path, &options.url, false))
         .transpose()?
         .flatten();
-    let metrics_url = options.url.endpoint(&["metrics"]);
+    let stats_url = options.url.endpoint(&["metrics"]);
     let agent: Agent = Agent::config_builder()
         .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_recv_body(Some(Duration::from_secs(10)))
         .build()
         .into();
     let mut request = agent
-        .get(metrics_url.as_str())
+        .get(stats_url.as_str())
         .config()
         .max_redirects(0)
-        .build();
+        .build()
+        .header("Accept", "text/plain; version=0.0.4");
     if let Some(authorization) = authorization {
         request = request.header("Authorization", format!("Basic {authorization}"));
     }
@@ -800,12 +801,14 @@ pub(crate) fn stats(options: Stats) -> Result<(), Error> {
             response.status()
         )));
     }
-    let body = response.body_mut().read_to_string().map_err(runtime)?;
-    if options.json {
-        println!("{{\"metrics\":\"{}\"}}", json_escape(&body));
-    } else {
-        print!("{body}");
-    }
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(256 * 1024)
+        .read_to_vec()
+        .map_err(runtime)?;
+    let exposition = String::from_utf8(body).map_err(runtime)?;
+    print!("{exposition}");
     Ok(())
 }
 

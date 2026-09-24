@@ -57,6 +57,76 @@ fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
 }
 
 #[test]
+fn population_scan_counts_recognized_files_without_retaining_names() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let narinfo = format!(
+        "StorePath: /nix/store/{STORE_HASH}-sample\nURL: nar/{NAR_ID}.nar\nCompression: none\nFileHash: sha256:{NAR_ID}\nFileSize: 11\nNarHash: sha256:{NAR_ID}\nNarSize: 11\nReferences: \n"
+    );
+    fs::write(
+        directory.path().join(format!("{STORE_HASH}.narinfo")),
+        &narinfo,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("malformed.narinfo"),
+        b"invalid metadata",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("nar").join(format!("{NAR_ID}.nar")),
+        b"raw payload",
+    )
+    .unwrap();
+    fs::write(
+        directory
+            .path()
+            .join("nar")
+            .join(format!("{NAR_ID}.nar.xz")),
+        b"xz payload",
+    )
+    .unwrap();
+    fs::write(directory.path().join(".tmp").join("staged"), b"temporary").unwrap();
+
+    let population = storage
+        .population_counts(&std::sync::atomic::AtomicBool::new(false))
+        .unwrap();
+
+    assert_eq!(population.structurally_valid_narinfo_entries, 1);
+    assert_eq!(population.malformed_narinfo_filenames, 1);
+    assert_eq!(
+        population.narinfo_bytes,
+        narinfo.len() as u64 + b"invalid metadata".len() as u64
+    );
+    assert_eq!((population.raw_files, population.raw_bytes), (1, 11));
+    assert_eq!((population.xz_files, population.xz_bytes), (1, 10));
+    assert_eq!(
+        (population.temporary_files, population.temporary_bytes),
+        (1, 9)
+    );
+    assert_eq!(
+        population.apparent_file_bytes,
+        population.narinfo_bytes
+            + population.raw_bytes
+            + population.xz_bytes
+            + population.temporary_bytes
+    );
+}
+
+#[test]
+fn population_scan_can_be_cancelled_without_returning_partial_totals() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let stopping = std::sync::atomic::AtomicBool::new(true);
+
+    let error = storage.population_counts(&stopping).unwrap_err();
+
+    assert!(
+        matches!(error, StorageError::Io(ref error) if error.kind() == io::ErrorKind::Interrupted)
+    );
+}
+
+#[test]
 fn chunked_ingestion_publishes_a_verified_manifest() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
@@ -95,6 +165,14 @@ fn chunked_ingestion_publishes_a_verified_manifest() {
             .is_some()
     );
     assert!(manifest.chunk_count() > 0);
+    let population = storage
+        .population_counts(&std::sync::atomic::AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(population.manifest_files, 1);
+    assert_eq!(population.chunked_nars, 1);
+    assert_eq!(population.chunked_nar_bytes, raw.len() as u64);
+    assert!(population.chunk_files > 0);
+    assert!(population.chunk_files <= manifest.chunk_count());
 }
 
 #[test]
@@ -1103,6 +1181,10 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
         "egress must reject the configured free-space reserve before writing"
     );
     assert_eq!(storage.temporary_objects(), 0);
+    let activity = storage.activity_snapshot();
+    assert_eq!(activity.egress_generations_started, 1);
+    assert_eq!(activity.egress_generations_failed, 1);
+    assert_eq!(activity.egress_generations_succeeded, 0);
     assert_eq!(
         fs::read_dir(storage.layout().nar_temp_dir())
             .unwrap()
@@ -1136,6 +1218,10 @@ fn repeated_compressed_egress_reuses_its_durable_derivative() {
 
     assert_eq!(second, first);
     assert_eq!(storage.egress_generations(), 1);
+    let activity = storage.activity_snapshot();
+    assert_eq!(activity.egress_generations_started, 1);
+    assert_eq!(activity.egress_generations_succeeded, 1);
+    assert_eq!(activity.egress_reuses, 1);
     assert_eq!(
         fs::read_dir(storage.layout().egress_receipt_dir())
             .expect("egress receipt directory should be readable")
@@ -1312,6 +1398,7 @@ fn assert_egress_derivative_is_repaired(
         fs::read(output_path).expect("repaired derivative should be readable"),
         original
     );
+    assert_eq!(storage.activity_snapshot().egress_repairs, 1);
     assert_eq!(storage.temporary_objects(), 0);
 }
 
@@ -1350,6 +1437,9 @@ fn concurrent_requests_coalesce_compressed_derivative_generation() {
 
     assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
     assert_eq!(storage.egress_generations(), 1);
+    let activity = storage.activity_snapshot();
+    assert_eq!(activity.egress_generations_succeeded, 1);
+    assert_eq!(activity.egress_reuses, 3);
     assert_eq!(
         fs::read_dir(storage.layout().egress_receipt_dir())
             .expect("egress receipt directory should be readable")

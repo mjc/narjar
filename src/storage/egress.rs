@@ -3,6 +3,8 @@ use std::{
     fs::File,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
+    sync::TryLockError,
+    time::Instant,
 };
 
 #[cfg(test)]
@@ -356,10 +358,23 @@ impl Storage {
         policy: NarUploadPolicy,
     ) -> Result<NarRepresentation, StorageError> {
         let lock = self.destination_lock(slot.lock_key());
-        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let waiting_since = Instant::now();
+        let _guard = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.activity
+                    .record_egress_coalesced_wait(waiting_since.elapsed());
+                guard
+            }
+        };
         let decision = self.resolve_derivative_work(slot)?;
         let output = match decision {
-            DerivativeWork::Reuse(output) => output.into_inner(),
+            DerivativeWork::Reuse(output) => {
+                self.activity.record_egress_reuse();
+                output.into_inner()
+            }
             DerivativeWork::Generate(contract) => {
                 self.materialize_compressed_nar(raw, slot, policy, contract)?
             }
@@ -394,10 +409,23 @@ impl Storage {
         policy: NarUploadPolicy,
         contract: GenerationContract,
     ) -> Result<EncodedIdentity, StorageError> {
-        StagedDerivative::begin(self)?
-            .start_streaming()?
-            .encode_canonical_raw_nar(raw, slot, policy, contract)?
-            .commit()
+        self.activity.record_egress_generation_started();
+        let result = (|| {
+            StagedDerivative::begin(self)?
+                .start_streaming()?
+                .encode_canonical_raw_nar(raw, slot, policy, contract)?
+                .commit()
+        })();
+        match result {
+            Ok(output) => {
+                self.activity.record_egress_generation_succeeded();
+                Ok(output)
+            }
+            Err(error) => {
+                self.activity.record_egress_generation_failed();
+                Err(error)
+            }
+        }
     }
 
     fn inspect_egress_derivative(

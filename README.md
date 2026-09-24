@@ -140,6 +140,106 @@ nix run . -- gc --data-dir ./cache --target-bytes 100000000000 --apply --json
 nix run . -- delete --data-dir ./cache --store-hash STORE_HASH
 ```
 
+### Runtime statistics
+
+The read-authorized `GET /metrics` endpoint exposes runtime statistics in
+Prometheus text format; `HEAD /metrics` returns the same headers without a
+body. Both `/metrics` and `/main/metrics` are uncached. The CLI prints the same
+Prometheus exposition:
+
+```sh
+curl -fsS https://cache.example/metrics
+narjar stats --url https://cache.example
+```
+
+Cache lookup hit, miss, and failure counters are separate by method and object
+type; failures are not silently counted as misses. Hit ratios are request-
+weighted successful lookups divided by successful lookups plus genuine misses.
+They are exposed as `narjar_cache_lookup_hit_ratio`; failure ratios have a
+separate `narjar_cache_lookup_failure_ratio`. GET and HEAD, NAR and narinfo,
+remain separate. A ratio with no eligible observations is omitted rather than
+reported as zero or NaN. This is not a build-success rate, a unique-object
+ratio, saved bandwidth, or the local Nix store's hit rate.
+
+Lifetime byte counters reset when the daemon restarts. Upload declared bytes
+are the HTTP body length; received bytes count body bytes actually read. Served
+artifact bytes count successful socket writes/sendfile returns for NAR and
+narinfo bodies, including partial bytes before a failed transfer; they exclude
+headers, HEAD bodies, and the statistics endpoints. They describe bytes
+accepted by the local socket, not proof that a remote application consumed
+them. HTTP response counters retain each supported status code (including
+200, 206, 404, and 416); connection outcomes separately report admission,
+queue rejection, malformed requests, timeouts, and disconnects. Recent rates
+use the actual coverage of a five-second sampler with a
+fixed five-minute history; startup reports a window only after it has enough
+samples.
+
+Process RSS/CPU and cgroup-v2 service memory are separate Linux observations.
+Filesystem capacity and staging headroom are sampled from the cache's open
+directory and reservation budget; headroom is an estimate, not an admission
+promise. `narjar_readiness{reason=...}` distinguishes available, low-space,
+no-inodes, read-only, and probe-failed states. Population totals are not
+scanned on a request. To enable the delayed
+background population walk (first run after 60 seconds, then at the configured
+interval), start the service with:
+
+```sh
+narjar serve --data-dir /var/lib/narjar --stats-inventory-interval-seconds 900
+```
+
+The population report is dated and records scan duration, ignored/disappeared
+entries, and errors. Narinfo filenames and contents are structurally parsed;
+this population pass does not verify signatures. Malformed filenames and
+malformed contents are reported separately. It sums apparent file lengths for
+narinfo metadata, raw and compressed payloads, chunk files/manifests, ingress
+and egress receipts, validation evidence, recovery records, and temporary
+files. Chunked logical NAR bytes are shown separately from manifest/chunk file
+bytes; chunk-only fields are absent for the flat backend. This online walk is
+not a
+point-in-time snapshot, does not hash payload contents, and must not be used to
+certify integrity, decide GC, or claim physical ZFS space reclaimed. Before its
+first completed scan, and after a failed refresh with no previous result, the
+population state is explicitly unavailable.
+
+`GET /metrics` is the Prometheus interface. For a request-weighted narinfo GET
+hit ratio, sum the lookup outcomes before dividing rather than averaging
+instance ratios:
+
+```promql
+sum(rate(narjar_cache_lookup_outcomes_total{object="narinfo",method="GET",outcome="hit"}[5m]))
+/
+sum(rate(narjar_cache_lookup_outcomes_total{object="narinfo",method="GET",outcome=~"hit|miss"}[5m]))
+```
+
+The independent failure rate is available under `outcome="failure"`. Resource
+and population samples expose their state and sample age; missing platform
+measurements are not represented as healthy zeroes.
+
+On NixOS, set `services.narjar.statsZfsDataset` to opt into a read-only,
+once-per-minute ZFS sample for the dataset mounted at `dataDir`. The collector
+rejects a different mountpoint or child datasets, and writes a bounded sample
+under `/run`; Narjar exposes physical `used`, logical/reference usage,
+compression properties, and sample age through `/metrics`. Without this
+option, ZFS-specific series report an unavailable state.
+
+Latency histograms use fixed seconds buckets from 1 ms through 5 minutes plus
+`+Inf`. Lookup distributions stop when the object decision is made; NAR and
+narinfo delivery distributions include response writing and can therefore
+reflect slow clients. Publication and publication-queue wait are separate
+operations. Durable publication results separately count newly created,
+identical, conflicting, and failed outcomes. For example, estimate the 95th
+percentile narinfo lookup latency:
+
+The storage layer also reports compressed derivative reuse, generation,
+generation failures, repair, and callers coalesced behind active generation.
+For the chunked backend, chunk and byte counters distinguish newly stored
+content from reused content. These are actual storage outcomes, reset with the
+daemon; they are not inferred from HTTP status codes.
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(narjar_operation_duration_seconds_bucket{operation="narinfo_lookup"}[5m])))
+```
+
 `gc` is a dry run unless `--apply` is supplied. It uses logical file lengths
 for accounting; compression, snapshots, reflinks, and sparse extents are
 filesystem concerns outside that accounting. `delete` removes publication

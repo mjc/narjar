@@ -3,7 +3,11 @@ use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     ops::Range,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
 };
 
 use mincdc::{MinCdcHash4, SliceChunker};
@@ -18,10 +22,11 @@ use super::{
         MANIFEST_RECORD_BYTES, ManifestError, ManifestReader, write_manifest_header,
     },
     fs::{
-        ensure_directory_at, files_equal_at, hard_link_at, open_at, open_directory_at,
-        open_regular_at, read_dir_names, sync_filesystem, unlink_at,
+        ensure_directory_at, files_equal_at, for_each_dir_name, hard_link_at, open_at,
+        open_directory_at, open_regular_at, read_dir_names, sync_filesystem, unlink_at,
     },
     publication::{StagingReservation, StorageError},
+    state::StorageActivity,
 };
 
 const CHUNK_TEMP_PREFIX: &str = "chunk";
@@ -40,6 +45,7 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct ChunkStore {
     chunks: File,
     manifests: File,
+    activity: Arc<StorageActivity>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -54,8 +60,29 @@ pub(crate) struct ChunkPhysicalBytes {
     pub(crate) manifests: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChunkPopulationCounts {
+    pub(crate) scanned_entries: u64,
+    pub(crate) ignored_entries: u64,
+    pub(crate) disappeared_entries: u64,
+    pub(crate) errors: u64,
+    pub(crate) chunk_files: u64,
+    pub(crate) chunk_bytes: u64,
+    pub(crate) manifest_files: u64,
+    pub(crate) manifest_bytes: u64,
+    pub(crate) chunked_nars: u64,
+    pub(crate) chunked_nar_bytes: u64,
+}
+
 impl ChunkStore {
     pub(crate) fn initialize(root: &File) -> io::Result<Self> {
+        Self::initialize_with_activity(root, Arc::new(StorageActivity::default()))
+    }
+
+    pub(crate) fn initialize_with_activity(
+        root: &File,
+        activity: Arc<StorageActivity>,
+    ) -> io::Result<Self> {
         let manifests = ensure_directory_at(
             root,
             OsStr::new(MANIFEST_DIRECTORY),
@@ -64,7 +91,21 @@ impl ChunkStore {
         remove_abandoned_manifest_temps(&manifests)?;
         let chunks = ensure_directory_at(root, OsStr::new(CHUNK_DIRECTORY), "chunk directory")?;
         remove_abandoned_chunk_temps(&chunks)?;
-        Ok(Self { chunks, manifests })
+        Ok(Self {
+            chunks,
+            manifests,
+            activity,
+        })
+    }
+
+    pub(crate) fn population_counts(
+        &self,
+        stopping: &AtomicBool,
+    ) -> io::Result<ChunkPopulationCounts> {
+        let mut counts = ChunkPopulationCounts::default();
+        scan_chunk_shards(&self.chunks, stopping, &mut counts)?;
+        scan_manifests(&self.manifests, stopping, &mut counts)?;
+        Ok(counts)
     }
 
     #[cfg(test)]
@@ -426,6 +467,152 @@ impl ChunkStore {
 
     fn open_shard(&self, hash: ChunkHash) -> io::Result<File> {
         super::fs::open_directory_at(&self.chunks, OsStr::new(&shard_name(hash)))
+    }
+}
+
+fn scan_chunk_shards(
+    chunks_directory: &File,
+    stopping: &AtomicBool,
+    counts: &mut ChunkPopulationCounts,
+) -> io::Result<()> {
+    let mut interrupted = false;
+    for_each_dir_name(chunks_directory, |shard_name| {
+        if stopping.load(Ordering::Relaxed) {
+            interrupted = true;
+            return Ok(false);
+        }
+        counts.scanned_entries = checked_population_add(counts.scanned_entries, 1)?;
+        if !is_lower_hex(shard_name, 2) {
+            counts.ignored_entries = checked_population_add(counts.ignored_entries, 1)?;
+            return Ok(true);
+        }
+        match open_directory_at(chunks_directory, shard_name) {
+            Ok(shard) => scan_chunk_files(&shard, stopping, counts, &mut interrupted)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                counts.disappeared_entries = checked_population_add(counts.disappeared_entries, 1)?;
+            }
+            Err(_) => counts.errors = checked_population_add(counts.errors, 1)?,
+        }
+        Ok(!interrupted)
+    })?;
+    population_scan_result(interrupted)
+}
+
+fn scan_chunk_files(
+    shard: &File,
+    stopping: &AtomicBool,
+    counts: &mut ChunkPopulationCounts,
+    interrupted: &mut bool,
+) -> io::Result<()> {
+    for_each_dir_name(shard, |name| {
+        if stopping.load(Ordering::Relaxed) {
+            *interrupted = true;
+            return Ok(false);
+        }
+        counts.scanned_entries = checked_population_add(counts.scanned_entries, 1)?;
+        if counts.scanned_entries.is_multiple_of(256) {
+            thread::yield_now();
+        }
+        if !is_lower_hex(name, 64) {
+            counts.ignored_entries = checked_population_add(counts.ignored_entries, 1)?;
+            return Ok(true);
+        }
+        match open_regular_at(shard, name) {
+            Ok(file) => {
+                counts.chunk_files = checked_population_add(counts.chunk_files, 1)?;
+                counts.chunk_bytes =
+                    checked_population_add(counts.chunk_bytes, file.metadata()?.len())?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                counts.disappeared_entries = checked_population_add(counts.disappeared_entries, 1)?;
+            }
+            Err(_) => counts.errors = checked_population_add(counts.errors, 1)?,
+        }
+        Ok(true)
+    })
+}
+
+fn scan_manifests(
+    manifests_directory: &File,
+    stopping: &AtomicBool,
+    counts: &mut ChunkPopulationCounts,
+) -> io::Result<()> {
+    let mut interrupted = false;
+    for_each_dir_name(manifests_directory, |name| {
+        if stopping.load(Ordering::Relaxed) {
+            interrupted = true;
+            return Ok(false);
+        }
+        counts.scanned_entries = checked_population_add(counts.scanned_entries, 1)?;
+        if counts.scanned_entries.is_multiple_of(256) {
+            thread::yield_now();
+        }
+        let Some(hash) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".manifest"))
+            .and_then(|hash| NarHash::parse(hash).ok())
+        else {
+            counts.ignored_entries = checked_population_add(counts.ignored_entries, 1)?;
+            return Ok(true);
+        };
+        match open_regular_at(manifests_directory, name) {
+            Ok(file) => record_manifest(file, hash, counts)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                counts.disappeared_entries = checked_population_add(counts.disappeared_entries, 1)?;
+            }
+            Err(_) => counts.errors = checked_population_add(counts.errors, 1)?,
+        }
+        Ok(true)
+    })?;
+    population_scan_result(interrupted)
+}
+
+fn record_manifest(
+    file: File,
+    hash: NarHash,
+    counts: &mut ChunkPopulationCounts,
+) -> io::Result<()> {
+    let apparent_bytes = file.metadata()?.len();
+    counts.manifest_files = checked_population_add(counts.manifest_files, 1)?;
+    counts.manifest_bytes = checked_population_add(counts.manifest_bytes, apparent_bytes)?;
+    let manifest = match ManifestReader::new(file, MAX_CHUNK_MANIFEST_BYTES) {
+        Ok(reader) => reader,
+        Err(_) => {
+            counts.errors = checked_population_add(counts.errors, 1)?;
+            return Ok(());
+        }
+    };
+    let identity = manifest.manifest().identity();
+    if identity.hash() != hash || manifest.finish_remaining().is_err() {
+        counts.errors = checked_population_add(counts.errors, 1)?;
+        return Ok(());
+    }
+    counts.chunked_nars = checked_population_add(counts.chunked_nars, 1)?;
+    counts.chunked_nar_bytes =
+        checked_population_add(counts.chunked_nar_bytes, identity.size().get())?;
+    Ok(())
+}
+
+fn is_lower_hex(value: &OsStr, expected_length: usize) -> bool {
+    value.len() == expected_length
+        && value
+            .as_encoded_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn checked_population_add(left: u64, right: u64) -> io::Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| io::Error::other("chunk population counter overflow"))
+}
+
+fn population_scan_result(interrupted: bool) -> io::Result<()> {
+    match interrupted {
+        true => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "population scan cancelled",
+        )),
+        false => Ok(()),
     }
 }
 
@@ -830,6 +1017,14 @@ impl ChunkingWriter<'_> {
             .collect::<Vec<_>>();
 
         let publications = self.publish_chunk_batch(&batch)?;
+        specifications
+            .iter()
+            .zip(&publications)
+            .for_each(|(specification, publication)| {
+                self.store
+                    .activity
+                    .record_chunk_publication(publication.outcome, specification.length);
+            });
         self.new_chunks_need_sync |= publications
             .iter()
             .any(|publication| publication.outcome == super::publication::PublishOutcome::Created);

@@ -1,12 +1,16 @@
 use std::{
     io::{self, Read},
     net::TcpStream,
+    time::Instant,
 };
 
 use crate::{
     auth::{Authorizer, Permission, ReadVisibility},
     http_server::{Method, Request, Response, ResponseHeader as Header, StatusCode, static_header},
-    metrics::{Metrics, RequestGuard, RequestMethod, RequestRoute},
+    metrics::{
+        CacheLookupOutcome, CacheObject, Metrics, RequestGuard, RequestMethod, RequestRoute,
+        render_prometheus,
+    },
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::NarFileName,
     storage::{NarMatch, NarReadBody, Storage, StorageReadiness, StoreHash},
@@ -24,14 +28,27 @@ pub(super) fn send_response<R: Read>(
     guard: &RequestGuard<'_>,
     request: Request,
     response: Response<R>,
-    bytes_out: u64,
 ) -> Option<TcpStream> {
-    guard.record_response(response.status(), bytes_out);
-    request.respond(response).ok().flatten()
+    let status = response.status();
+    let transfer_started = Instant::now();
+    match request.respond(response) {
+        Ok(transfer) => {
+            guard.record_completed_response(
+                status,
+                transfer.body_bytes,
+                transfer_started.elapsed(),
+            );
+            transfer.connection
+        }
+        Err(transfer) => {
+            guard.record_failed_response(status, transfer.body_bytes, transfer_started.elapsed());
+            None
+        }
+    }
 }
 
 pub(super) fn not_found(guard: &RequestGuard<'_>, request: Request) -> Option<TcpStream> {
-    send_response(guard, request, Response::empty(StatusCode::NOT_FOUND), 0)
+    send_response(guard, request, Response::empty(StatusCode::NOT_FOUND))
 }
 
 pub(super) fn internal_error(guard: &RequestGuard<'_>, request: Request) -> Option<TcpStream> {
@@ -39,7 +56,6 @@ pub(super) fn internal_error(guard: &RequestGuard<'_>, request: Request) -> Opti
         guard,
         request,
         Response::empty(StatusCode::INTERNAL_SERVER_ERROR),
-        0,
     )
 }
 
@@ -79,11 +95,22 @@ fn send_file_response(
     offset: u64,
     length: u64,
 ) -> Option<TcpStream> {
-    guard.record_response(response.status(), length);
-    request
-        .respond_file(response, file, offset, length)
-        .ok()
-        .flatten()
+    let status = response.status();
+    let transfer_started = Instant::now();
+    match request.respond_file(response, file, offset, length) {
+        Ok(transfer) => {
+            guard.record_completed_response(
+                status,
+                transfer.body_bytes,
+                transfer_started.elapsed(),
+            );
+            transfer.connection
+        }
+        Err(transfer) => {
+            guard.record_failed_response(status, transfer.body_bytes, transfer_started.elapsed());
+            None
+        }
+    }
 }
 
 fn respond_narinfo(
@@ -94,10 +121,17 @@ fn respond_narinfo(
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
+    let lookup_started = Instant::now();
     let narinfo = match storage.open_narinfo(store) {
         Ok(Some(narinfo)) => narinfo,
-        Ok(None) => return not_found(guard, request),
-        Err(_) => return internal_error(guard, request),
+        Ok(None) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
+            return not_found(guard, request);
+        }
+        Err(_) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+            return internal_error(guard, request);
+        }
     };
     let mut bytes = Vec::new();
     if narinfo
@@ -106,29 +140,50 @@ fn respond_narinfo(
         .is_err()
         || bytes.len() as u64 > MAX_NARINFO_BYTES
     {
+        record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
         return internal_error(guard, request);
     }
     let validated = match trusted.validate(store, bytes) {
         Ok(validated) => validated,
-        Err(_) => return internal_error(guard, request),
+        Err(_) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+            return internal_error(guard, request);
+        }
     };
     match storage.nar_matches(&validated) {
         Ok(NarMatch::Match) => {}
-        Ok(NarMatch::Missing | NarMatch::Mismatch) => return not_found(guard, request),
-        Err(_) => return internal_error(guard, request),
+        Ok(NarMatch::Missing | NarMatch::Mismatch) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+            return not_found(guard, request);
+        }
+        Err(_) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+            return internal_error(guard, request);
+        }
     }
 
     let bytes = match validated.into_bytes() {
         Ok(bytes) => bytes,
-        Err(_) => return internal_error(guard, request),
+        Err(_) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+            return internal_error(guard, request);
+        }
     };
-    let bytes_out = bytes.len() as u64;
+    record_narinfo_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
     let response = cache_policy(
         Response::from_data(bytes).with_header(header("Content-Type", "text/x-nix-narinfo")),
         visibility,
         IMMUTABLE_CACHE_CONTROL,
     );
-    send_response(guard, request, response, bytes_out)
+    send_response(guard, request, response)
+}
+
+fn record_narinfo_lookup(
+    guard: &RequestGuard<'_>,
+    outcome: CacheLookupOutcome,
+    lookup_started: Instant,
+) {
+    guard.record_cache_lookup(CacheObject::NarInfo, outcome, lookup_started.elapsed());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,10 +256,20 @@ fn respond_nar(
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
+    let lookup_started = Instant::now();
     let length = match storage.nar_size(name) {
-        Ok(Some(length)) => length,
-        Ok(None) => return not_found(guard, request),
-        Err(_) => return internal_error(guard, request),
+        Ok(Some(length)) => {
+            record_nar_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
+            length
+        }
+        Ok(None) => {
+            record_nar_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
+            return not_found(guard, request);
+        }
+        Err(_) => {
+            record_nar_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+            return internal_error(guard, request);
+        }
     };
 
     match requested_range(&request, length) {
@@ -225,7 +290,7 @@ fn respond_nar(
                 }
                 NarReadBody::Chunked(reader) => {
                     let response = nar_response(StatusCode::OK, content_length, visibility, reader);
-                    send_response(guard, request, response, length)
+                    send_response(guard, request, response)
                 }
             }
         }
@@ -264,7 +329,7 @@ fn respond_nar(
                         Header::owned("Content-Range", format!("bytes {start}-{end}/{length}"))
                             .expect("range response header is valid"),
                     );
-                    send_response(guard, request, response, response_length)
+                    send_response(guard, request, response)
                 }
             }
         }
@@ -273,12 +338,20 @@ fn respond_nar(
                 Header::owned("Content-Range", format!("bytes */{length}"))
                     .expect("range response header is valid"),
             );
-            send_response(guard, request, response, 0)
+            send_response(guard, request, response)
         }
         RequestedRange::Invalid => {
-            send_response(guard, request, Response::empty(StatusCode::BAD_REQUEST), 0)
+            send_response(guard, request, Response::empty(StatusCode::BAD_REQUEST))
         }
     }
+}
+
+fn record_nar_lookup(
+    guard: &RequestGuard<'_>,
+    outcome: CacheLookupOutcome,
+    lookup_started: Instant,
+) {
+    guard.record_cache_lookup(CacheObject::Nar, outcome, lookup_started.elapsed());
 }
 
 #[derive(Debug)]
@@ -342,7 +415,7 @@ fn method_not_allowed(
 ) -> Option<TcpStream> {
     let response =
         Response::empty(StatusCode::METHOD_NOT_ALLOWED).with_header(header("Allow", allow));
-    send_response(guard, request, response, 0)
+    send_response(guard, request, response)
 }
 
 pub(super) fn has_header(request: &Request, name: &'static str) -> bool {
@@ -353,15 +426,24 @@ pub(super) fn has_header(request: &Request, name: &'static str) -> bool {
 }
 
 pub(super) fn request_route(url: &str) -> RequestRoute {
-    match url {
+    match route_without_main(url) {
         "/healthz" => RequestRoute::Health,
         "/readyz" => RequestRoute::Ready,
         "/metrics" => RequestRoute::Metrics,
-        "/nix-cache-info" | "/main/nix-cache-info" => RequestRoute::CacheInfo,
-        _ if url.starts_with("/nar/") => RequestRoute::Nar,
-        _ if url.ends_with(".narinfo") => RequestRoute::NarInfo,
-        _ => RequestRoute::Other,
+        _ => match CacheRoute::classify(url) {
+            RouteMatch::Found(CacheRoute::CacheInfo) => RequestRoute::CacheInfo,
+            RouteMatch::Found(CacheRoute::Nar(_)) => RequestRoute::Nar,
+            RouteMatch::Found(CacheRoute::NarInfo(_)) => RequestRoute::NarInfo,
+            RouteMatch::Invalid => RequestRoute::Invalid,
+            RouteMatch::Missing => RequestRoute::Missing,
+        },
     }
+}
+
+fn route_without_main(url: &str) -> &str {
+    url.strip_prefix("/main")
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or(url)
 }
 
 fn invalid_route_status(method: Method, url: &str) -> StatusCode {
@@ -394,10 +476,10 @@ pub fn respond(
             Response::from_string("ok\n")
                 .with_status_code(StatusCode::OK)
                 .with_header(header("Content-Type", "text/plain; charset=utf-8")),
-            3,
         );
     }
-    if matches!(request.url(), "/readyz" | "/metrics") {
+    let operator_route = route_without_main(request.url());
+    if matches!(operator_route, "/readyz" | "/metrics") {
         if !matches!(request.method(), Method::Get | Method::Head) {
             return method_not_allowed(&guard, request, "GET, HEAD");
         }
@@ -405,13 +487,16 @@ pub fn respond(
             metrics.auth_failure(false);
             return unauthorized(&guard, request);
         }
-        let ready = storage
+        let readiness = storage
             .is_ready(min_free_bytes)
-            .unwrap_or(StorageReadiness::Insufficient);
-        if request.url() == "/readyz" {
-            let (status, body) = match ready {
+            .unwrap_or(StorageReadiness::ProbeFailed);
+        if operator_route == "/readyz" {
+            let (status, body) = match readiness {
                 StorageReadiness::Ready => (StatusCode::OK, "ready\n"),
-                StorageReadiness::Insufficient => {
+                StorageReadiness::LowSpace
+                | StorageReadiness::NoInodes
+                | StorageReadiness::ReadOnly
+                | StorageReadiness::ProbeFailed => {
                     (StatusCode::SERVICE_UNAVAILABLE, "insufficient_space\n")
                 }
             };
@@ -421,21 +506,33 @@ pub fn respond(
                 Response::from_string(body)
                     .with_status_code(status)
                     .with_header(header("Content-Type", "text/plain; charset=utf-8")),
-                body.len() as u64,
             );
         } else {
             metrics.set_temp_objects(storage.temporary_objects());
-            let body = metrics.render(ready.is_ready(), storage.capacity().ok());
+            let (capacity, staging_bytes) = storage
+                .capacity_and_staging()
+                .map(|(capacity, staging_bytes)| (Some(capacity), staging_bytes))
+                .unwrap_or((None, 0));
+            let mut snapshot = metrics.snapshot(
+                readiness,
+                capacity,
+                storage.temporary_objects(),
+                min_free_bytes,
+                staging_bytes,
+            );
+            snapshot.storage_activity = storage.activity_snapshot();
+            let body = render_prometheus(&snapshot);
             return send_response(
                 &guard,
                 request,
-                Response::from_string(body.clone())
+                Response::from_string(body)
                     .with_status_code(StatusCode::OK)
                     .with_header(header(
                         "Content-Type",
                         "text/plain; version=0.0.4; charset=utf-8",
-                    )),
-                body.len() as u64,
+                    ))
+                    .with_header(header("Cache-Control", "no-store"))
+                    .with_header(header("Vary", "Authorization")),
             );
         }
     }
@@ -455,7 +552,7 @@ pub fn respond(
         RouteMatch::Found(route) => route,
         RouteMatch::Invalid => {
             let status = invalid_route_status(request.method(), request.url());
-            return send_response(&guard, request, Response::empty(status), 0);
+            return send_response(&guard, request, Response::empty(status));
         }
         RouteMatch::Missing => return not_found(&guard, request),
     };
@@ -470,14 +567,13 @@ pub fn respond(
                 Ok(cache_info) => cache_info,
                 Err(_) => return internal_error(&guard, request),
             };
-            let cache_info_length = cache_info.len() as u64;
             let response = cache_policy(
                 Response::from_data(cache_info)
                     .with_header(header("Content-Type", "text/x-nix-cache-info")),
                 visibility,
                 "public, max-age=3600",
             );
-            send_response(&guard, request, response, cache_info_length)
+            send_response(&guard, request, response)
         }
         CacheRoute::Nar(name) => respond_nar(request, storage, name, &guard, visibility),
         CacheRoute::NarInfo(store) => {
@@ -488,9 +584,10 @@ pub fn respond(
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheRoute, RouteMatch, invalid_route_status};
+    use super::{CacheRoute, RouteMatch, invalid_route_status, request_route};
     use crate::{
         http_server::{Method, StatusCode},
+        metrics::RequestRoute as MetricsRoute,
         object::{CompressionCodec, WireEncoding},
     };
 
@@ -537,6 +634,33 @@ mod tests {
             ),
             RouteMatch::Found(CacheRoute::Nar(name))
                 if name.encoding() == WireEncoding::Compressed(CompressionCodec::Zstd)
+        ));
+    }
+
+    #[test]
+    fn request_metrics_use_validated_routes_and_bound_unknown_paths() {
+        let nar = "/nar/0000000000000000000000000000000000000000000000000000.nar";
+        let narinfo = "/00000000000000000000000000000000.narinfo";
+
+        assert!(matches!(request_route("/metrics"), MetricsRoute::Metrics));
+        assert!(matches!(
+            request_route("/main/metrics"),
+            MetricsRoute::Metrics
+        ));
+        assert!(matches!(request_route(nar), MetricsRoute::Nar));
+        assert!(matches!(
+            request_route("/main/nar/0000000000000000000000000000000000000000000000000000.nar"),
+            MetricsRoute::Nar
+        ));
+        assert!(matches!(request_route(narinfo), MetricsRoute::NarInfo));
+        assert!(matches!(
+            request_route("/nar/not-a-hash.nar"),
+            MetricsRoute::Invalid
+        ));
+        assert!(matches!(request_route("/stats"), MetricsRoute::Missing));
+        assert!(matches!(
+            request_route("/unrecognized"),
+            MetricsRoute::Missing
         ));
     }
 }
