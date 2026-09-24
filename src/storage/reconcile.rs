@@ -12,6 +12,7 @@ use super::{
     Storage, StorageError, StoreHash, entry_identity_at, entry_is_directory_at,
     entry_is_regular_at, open_regular_at, read_dir_names,
 };
+use crate::maintenance::FILE_NAMES as MAINTENANCE_FILES;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ReconcileClass {
@@ -320,6 +321,9 @@ fn classify_root_entry(
             | ".narjar-clean"
             | ".narjar-recovery",
         ) => (!is_regular).then_some(ReconcileClass::UnexpectedType),
+        Some(name) if MAINTENANCE_FILES.contains(&name) => {
+            (!is_regular).then_some(ReconcileClass::UnexpectedType)
+        }
         Some(name) if valid_store_hash_filename(name) => Some(if is_regular {
             ReconcileClass::NarInfo
         } else {

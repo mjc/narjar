@@ -24,6 +24,16 @@ pub enum InventoryClass {
 }
 
 impl InventoryClass {
+    pub const ALL: [Self; 7] = [
+        Self::ValidPair,
+        Self::OrphanNar,
+        Self::MissingNar,
+        Self::MalformedNarInfo,
+        Self::HashOrSizeMismatch,
+        Self::UntrustedSignature,
+        Self::InvalidFilename,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ValidPair => "valid_pair",

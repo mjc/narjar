@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::{
     http_server::Method,
+    maintenance,
     storage::{
         CapacityErrorKind, PopulationCounts, PublishOutcome, StorageActivitySnapshot,
         StorageBackend, StorageCapacity, StorageError, StorageReadiness,
@@ -65,6 +66,12 @@ const CONNECTION_OUTCOMES: [ConnectionOutcome; 6] = [
     ConnectionOutcome::Disconnected,
 ];
 const REQUEST_SERIES: usize = METHODS.len() * ROUTES.len() * STATUS_CODES.len();
+const NAR_RANGE_OUTCOMES: [NarRangeOutcome; 4] = [
+    NarRangeOutcome::Full,
+    NarRangeOutcome::Partial,
+    NarRangeOutcome::Unsatisfiable,
+    NarRangeOutcome::Invalid,
+];
 const TRAFFIC_SAMPLE_CAPACITY: usize = 60;
 const MAX_ZFS_SAMPLE_BYTES: u64 = 16 * 1024;
 const ZFS_SAMPLE_MAX_AGE: u64 = 180;
@@ -203,6 +210,34 @@ impl RequestRoute {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NarRangeOutcome {
+    Full,
+    Partial,
+    Unsatisfiable,
+    Invalid,
+}
+
+impl NarRangeOutcome {
+    const fn index(self) -> usize {
+        match self {
+            Self::Full => 0,
+            Self::Partial => 1,
+            Self::Unsatisfiable => 2,
+            Self::Invalid => 3,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Partial => "partial",
+            Self::Unsatisfiable => "unsatisfiable",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Metrics {
     requests: [AtomicU64; REQUEST_SERIES],
@@ -214,12 +249,14 @@ pub struct Metrics {
     nar_head_lookups: [AtomicU64; 3],
     narinfo_get_lookups: [AtomicU64; 3],
     narinfo_head_lookups: [AtomicU64; 3],
+    nar_range_requests: [AtomicU64; NAR_RANGE_OUTCOMES.len() * 2],
     started_at_unix_seconds: u64,
     started_at: Instant,
     traffic_samples: Mutex<TrafficSamples>,
     process_sample: Mutex<SampleState<ProcessResources>>,
     population_sample: Mutex<SampleState<PopulationStats>>,
     filesystem_sample: Mutex<SampleState<FilesystemStats>>,
+    maintenance_sample: Mutex<SampleState<maintenance::Snapshot>>,
     requests_in_flight: AtomicU64,
     connections_in_flight: AtomicU64,
     connections_limit: AtomicU64,
@@ -271,6 +308,7 @@ impl Default for Metrics {
             nar_head_lookups: std::array::from_fn(|_| AtomicU64::new(0)),
             narinfo_get_lookups: std::array::from_fn(|_| AtomicU64::new(0)),
             narinfo_head_lookups: std::array::from_fn(|_| AtomicU64::new(0)),
+            nar_range_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             started_at_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -282,6 +320,7 @@ impl Default for Metrics {
             filesystem_sample: Mutex::new(SampleState::Unavailable {
                 reason: "not_configured".to_owned(),
             }),
+            maintenance_sample: Mutex::new(SampleState::NeverSampled),
             requests_in_flight: AtomicU64::new(0),
             connections_in_flight: AtomicU64::new(0),
             connections_limit: AtomicU64::new(0),
@@ -379,6 +418,11 @@ impl Metrics {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let maintenance = self
+            .maintenance_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         StatsSnapshot {
             http_requests: self.http_request_counts(),
             connections: self.connection_stats(),
@@ -394,6 +438,10 @@ impl Metrics {
                 nar_head: lookup_snapshot(&self.nar_head_lookups),
                 narinfo_get,
                 narinfo_head,
+            },
+            nar_range_requests: NarRangeStats {
+                get: nar_range_method_snapshot(&self.nar_range_requests, 0),
+                head: nar_range_method_snapshot(&self.nar_range_requests, 1),
             },
             latency: self.latency_snapshot(),
             traffic: TrafficStats {
@@ -446,6 +494,7 @@ impl Metrics {
             },
             inventory: population,
             filesystem,
+            maintenance,
         }
     }
 
@@ -558,7 +607,12 @@ impl Metrics {
             .process_sample
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *process_sample = next_sample_state(&process_sample, process_resources, unix_seconds_now());
+        *process_sample = next_sample_state(
+            &process_sample,
+            process_resources,
+            unix_seconds_now(),
+            "procfs_read_failed",
+        );
     }
 
     pub fn sample_filesystem_sidecar(&self, path: &Path, expected_root: &Path) {
@@ -603,6 +657,20 @@ impl Metrics {
         };
     }
 
+    pub fn sample_maintenance_sidecar(&self, root: &Path) {
+        let sample = maintenance::read_snapshot(root).map_err(|_| ());
+        let mut previous = self
+            .maintenance_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *previous = next_sample_state(
+            &previous,
+            sample,
+            unix_seconds_now(),
+            "maintenance_record_read_failed",
+        );
+    }
+
     pub fn record_population_scan(
         &self,
         backend: StorageBackend,
@@ -615,7 +683,12 @@ impl Metrics {
             .population_sample
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *previous = next_sample_state(&previous, result, unix_seconds_now());
+        *previous = next_sample_state(
+            &previous,
+            result,
+            unix_seconds_now(),
+            "population_scan_failed",
+        );
     }
 
     pub(crate) fn auth_failure(&self, write: bool) {
@@ -780,7 +853,7 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
          # HELP narjar_validation_failures_total Rejected request bodies by validation class.\n# TYPE narjar_validation_failures_total counter\nnarjar_validation_failures_total{{class=\"body\"}} {}\nnarjar_validation_failures_total{{class=\"nar\"}} {}\nnarjar_validation_failures_total{{class=\"narinfo\"}} {}\n\
          # HELP narjar_uploads_in_flight Accepted uploads currently being processed.\n# TYPE narjar_uploads_in_flight gauge\nnarjar_uploads_in_flight {}\n\
          # HELP narjar_requests_in_flight Requests currently being processed.\n# TYPE narjar_requests_in_flight gauge\nnarjar_requests_in_flight {}\n\
-         # HELP narjar_temp_objects Temporary objects currently known by reconcile.\n# TYPE narjar_temp_objects gauge\nnarjar_temp_objects {}\n\
+         # HELP narjar_temp_objects Temporary publication objects currently owned by this process.\n# TYPE narjar_temp_objects gauge\nnarjar_temp_objects {}\n\
          # HELP narjar_disk_full_total No-space capacity failures.\n# TYPE narjar_disk_full_total counter\nnarjar_disk_full_total {}\n\
          # HELP narjar_capacity_failures_total Capacity failures by reason.\n# TYPE narjar_capacity_failures_total counter\nnarjar_capacity_failures_total{{reason=\"no_space\"}} {}\nnarjar_capacity_failures_total{{reason=\"quota\"}} {}\nnarjar_capacity_failures_total{{reason=\"inodes\"}} {}\nnarjar_capacity_failures_total{{reason=\"read_only\"}} {}\n\
          # HELP narjar_publications_total Publication attempts.\n# TYPE narjar_publications_total counter\nnarjar_publications_total {}\n\
@@ -827,6 +900,7 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
     append_lookup_metrics(&mut output, "nar", "HEAD", &snapshot.cache.nar_head);
     append_lookup_metrics(&mut output, "narinfo", "GET", &snapshot.cache.narinfo_get);
     append_lookup_metrics(&mut output, "narinfo", "HEAD", &snapshot.cache.narinfo_head);
+    append_nar_range_metrics(&mut output, &snapshot.nar_range_requests);
     output.push_str(
         "# HELP narjar_cache_lookup_hit_ratio Successful lookups divided by successful lookups plus genuine misses. Failures are excluded.\n# TYPE narjar_cache_lookup_hit_ratio gauge\n# HELP narjar_cache_lookup_failure_ratio Failed lookups divided by all lookup decisions.\n# TYPE narjar_cache_lookup_failure_ratio gauge\n",
     );
@@ -853,7 +927,94 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
     append_traffic_rate_metrics(&mut output, &snapshot.traffic.recent_rates);
     append_population_metrics(&mut output, &snapshot.inventory);
     append_filesystem_metrics(&mut output, &snapshot.filesystem);
+    append_maintenance_metrics(&mut output, &snapshot.maintenance);
     output
+}
+
+fn append_maintenance_metrics(output: &mut String, sample: &SampleState<maintenance::Snapshot>) {
+    output.push_str(
+        "# HELP narjar_maintenance_sample_available Whether maintenance history could be read.\n# TYPE narjar_maintenance_sample_available gauge\n\
+         # HELP narjar_maintenance_sample_timestamp_seconds Time the maintenance history was last sampled.\n# TYPE narjar_maintenance_sample_timestamp_seconds gauge\n\
+         # HELP narjar_maintenance_sample_age_seconds Age of the last readable maintenance history.\n# TYPE narjar_maintenance_sample_age_seconds gauge\n\
+         # HELP narjar_maintenance_last_completed_timestamp_seconds Unix time of the last completed maintenance operation.\n# TYPE narjar_maintenance_last_completed_timestamp_seconds gauge\n\
+         # HELP narjar_maintenance_last_duration_seconds Duration of the last completed maintenance operation.\n# TYPE narjar_maintenance_last_duration_seconds gauge\n\
+         # HELP narjar_maintenance_last_objects Number of objects examined, selected, or reclaimed by the last maintenance operation.\n# TYPE narjar_maintenance_last_objects gauge\n\
+         # HELP narjar_maintenance_last_bytes Bytes examined or logically reclaimed by the last maintenance operation. Reclaimed bytes are not physical filesystem space.\n# TYPE narjar_maintenance_last_bytes gauge\n\
+         # HELP narjar_maintenance_inventory_entries Counts by inventory verification class from the last reconcile or verify.\n# TYPE narjar_maintenance_inventory_entries gauge\n\
+         # HELP narjar_maintenance_started_timestamp_seconds Start time for an operation without a recorded completion; this may be running or interrupted.\n# TYPE narjar_maintenance_started_timestamp_seconds gauge\n",
+    );
+    let (sampled_at, snapshot, state) = match sample {
+        SampleState::Measured {
+            sampled_at_unix_seconds,
+            value,
+        } => (*sampled_at_unix_seconds, value, "measured"),
+        SampleState::Stale {
+            sampled_at_unix_seconds,
+            value,
+            ..
+        } => (*sampled_at_unix_seconds, value, "stale"),
+        SampleState::NeverSampled | SampleState::Unavailable { .. } => {
+            output.push_str("narjar_maintenance_sample_available 0\n");
+            return;
+        }
+    };
+    output.push_str(&format!(
+        "narjar_maintenance_sample_available{{state=\"{state}\"}} 1\nnarjar_maintenance_sample_timestamp_seconds {sampled_at}\nnarjar_maintenance_sample_age_seconds {}\n",
+        unix_seconds_now().saturating_sub(sampled_at),
+    ));
+    for operation in maintenance::Operation::ALL {
+        let index = operation.index();
+        if let Some(run) = snapshot.last_runs[index] {
+            output.push_str(&format!(
+                "narjar_maintenance_last_completed_timestamp_seconds{{operation=\"{}\",mode=\"{}\",outcome=\"{}\"}} {}\n\
+                 narjar_maintenance_last_duration_seconds{{operation=\"{}\"}} {}\n",
+                operation.name(), run.mode.name(), run.outcome.name(),
+                run.completed_at_unix_seconds, operation.name(),
+                run.duration_micros as f64 / 1_000_000.0,
+            ));
+            append_maintenance_count(output, operation.name(), "examined", run.objects_examined);
+            append_maintenance_count(output, operation.name(), "selected", run.objects_selected);
+            append_maintenance_count(output, operation.name(), "reclaimed", run.objects_reclaimed);
+            append_maintenance_bytes(output, operation.name(), "examined", run.bytes_examined);
+            append_maintenance_bytes(output, operation.name(), "reclaimed", run.bytes_reclaimed);
+            if let Some(counts) = run.inventory_class_counts {
+                for (class, count) in crate::inventory::InventoryClass::ALL
+                    .into_iter()
+                    .zip(counts)
+                {
+                    output.push_str(&format!(
+                        "narjar_maintenance_inventory_entries{{operation=\"{}\",class=\"{}\"}} {count}\n",
+                        operation.name(),
+                        class.as_str(),
+                    ));
+                }
+            }
+        }
+        if let Some(started) = snapshot.started[index] {
+            output.push_str(&format!(
+                "narjar_maintenance_started_timestamp_seconds{{operation=\"{}\",mode=\"{}\"}} {}\n",
+                operation.name(),
+                started.mode.name(),
+                started.started_at_unix_seconds,
+            ));
+        }
+    }
+}
+
+fn append_maintenance_count(output: &mut String, operation: &str, kind: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        output.push_str(&format!(
+            "narjar_maintenance_last_objects{{operation=\"{operation}\",kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+}
+
+fn append_maintenance_bytes(output: &mut String, operation: &str, kind: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        output.push_str(&format!(
+            "narjar_maintenance_last_bytes{{operation=\"{operation}\",kind=\"{kind}\"}} {value}\n"
+        ));
+    }
 }
 
 fn append_readiness_reason(output: &mut String, readiness: StorageReadiness) {
@@ -875,6 +1036,24 @@ fn append_readiness_reason(output: &mut String, readiness: StorageReadiness) {
 }
 
 fn append_storage_activity_metrics(output: &mut String, activity: StorageActivitySnapshot) {
+    output.push_str(
+        "# HELP narjar_nar_upload_validated_logical_bytes_total Logical NAR bytes in uploads whose complete encoded representation and decoded hash/size validation succeeded; this does not validate NAR grammar or signatures.\n# TYPE narjar_nar_upload_validated_logical_bytes_total counter\n",
+    );
+    output.push_str(&format!(
+        "narjar_nar_upload_validated_logical_bytes_total {}\n",
+        activity.upload_validated_logical_bytes,
+    ));
+    output.push_str(
+        "# HELP narjar_nar_upload_committed_logical_bytes_total Logical NAR bytes at durable upload publication, by canonical payload outcome.\n# TYPE narjar_nar_upload_committed_logical_bytes_total counter\n",
+    );
+    for (outcome, bytes) in [
+        ("created", activity.upload_created_logical_bytes),
+        ("identical", activity.upload_identical_logical_bytes),
+    ] {
+        output.push_str(&format!(
+            "narjar_nar_upload_committed_logical_bytes_total{{outcome=\"{outcome}\"}} {bytes}\n"
+        ));
+    }
     output.push_str(
         "# HELP narjar_egress_derivatives_total Compressed egress derivative work by outcome.\n# TYPE narjar_egress_derivatives_total counter\n",
     );
@@ -956,6 +1135,36 @@ fn append_lookup_metrics(output: &mut String, object: &str, method: &str, lookup
     }
 }
 
+fn append_nar_range_metrics(output: &mut String, ranges: &NarRangeStats) {
+    output.push_str(
+        "# HELP narjar_nar_range_requests_total Existing NAR requests by method and parsed Range header outcome.\n# TYPE narjar_nar_range_requests_total counter\n",
+    );
+    for (method, counts) in [("GET", &ranges.get), ("HEAD", &ranges.head)] {
+        for outcome in NAR_RANGE_OUTCOMES {
+            let count = counts.count(outcome);
+            output.push_str(&format!(
+                "narjar_nar_range_requests_total{{method=\"{method}\",outcome=\"{}\"}} {count}\n",
+                outcome.label(),
+            ));
+        }
+    }
+}
+
+fn nar_range_method_snapshot(
+    counters: &[AtomicU64; NAR_RANGE_OUTCOMES.len() * 2],
+    method_index: usize,
+) -> NarRangeMethodStats {
+    let count = |outcome: NarRangeOutcome| {
+        counters[method_index * NAR_RANGE_OUTCOMES.len() + outcome.index()].load(Ordering::Relaxed)
+    };
+    NarRangeMethodStats {
+        full: count(NarRangeOutcome::Full),
+        partial: count(NarRangeOutcome::Partial),
+        unsatisfiable: count(NarRangeOutcome::Unsatisfiable),
+        invalid: count(NarRangeOutcome::Invalid),
+    }
+}
+
 fn append_filesystem_metrics(output: &mut String, sample: &SampleState<FilesystemStats>) {
     let (sampled_at, value, state) = match sample {
         SampleState::Measured {
@@ -1019,10 +1228,54 @@ fn append_filesystem_metrics(output: &mut String, sample: &SampleState<Filesyste
             "narjar_zfs_logical_to_used_ratio{{state=\"{state}\"}} {ratio}\n"
         ));
     }
+    output.push_str(
+        "# HELP narjar_zfs_compression_info Configured ZFS compression algorithm; unknown values are grouped as other.\n# TYPE narjar_zfs_compression_info gauge\n# HELP narjar_zfs_compression_level Configured or implied ZFS compression level, when applicable.\n# TYPE narjar_zfs_compression_level gauge\n",
+    );
+    let (algorithm, level) = zfs_compression_properties(&value.compression);
     output.push_str(&format!(
-        "narjar_zfs_compression_info{{algorithm=\"{}\",state=\"{state}\"}} 1\n",
-        value.compression,
+        "narjar_zfs_compression_info{{algorithm=\"{algorithm}\",state=\"{state}\"}} 1\n"
     ));
+    if let Some(level) = level {
+        output.push_str(&format!(
+            "narjar_zfs_compression_level{{algorithm=\"{algorithm}\",state=\"{state}\"}} {level}\n"
+        ));
+    }
+}
+
+fn zfs_compression_properties(value: &str) -> (&'static str, Option<u64>) {
+    match value {
+        "on" => ("on", None),
+        "off" => ("off", None),
+        "lz4" => ("lz4", None),
+        "lzjb" => ("lzjb", None),
+        "zle" => ("zle", None),
+        "gzip" => ("gzip", Some(6)),
+        "zstd" => ("zstd", Some(3)),
+        "zstd-fast" => ("zstd_fast", Some(1)),
+        _ => {
+            if let Some(level) = zfs_level(value, "gzip-", 1..=9) {
+                return ("gzip", Some(level));
+            }
+            if let Some(level) = zfs_level(value, "zstd-", 1..=19) {
+                return ("zstd", Some(level));
+            }
+            if let Some(level) = zstd_fast_level(value) {
+                return ("zstd_fast", Some(level));
+            }
+            ("other", None)
+        }
+    }
+}
+
+fn zfs_level(value: &str, prefix: &str, accepted: std::ops::RangeInclusive<u64>) -> Option<u64> {
+    let level = value.strip_prefix(prefix)?.parse().ok()?;
+    accepted.contains(&level).then_some(level)
+}
+
+fn zstd_fast_level(value: &str) -> Option<u64> {
+    let level = value.strip_prefix("zstd-fast-")?.parse::<u64>().ok()?;
+    (level <= 10 || (20..=100).contains(&level) && level % 10 == 0 || level == 500 || level == 1000)
+        .then_some(level)
 }
 
 fn append_filesystem_availability(output: &mut String, state: &str, available: bool) {
@@ -1334,7 +1587,8 @@ fn append_population_metrics(output: &mut String, sample: &SampleState<Populatio
          # HELP narjar_cache_population_files Observed files by fixed storage category.\n# TYPE narjar_cache_population_files gauge\n\
          # HELP narjar_cache_population_apparent_bytes Sum of observed file lengths by category.\n# TYPE narjar_cache_population_apparent_bytes gauge\n\
          # HELP narjar_cache_population_logical_nars Distinct structurally valid canonical NAR manifests.\n# TYPE narjar_cache_population_logical_nars gauge\n\
-         # HELP narjar_cache_population_logical_nar_bytes Sum of logical NAR sizes in valid chunk manifests.\n# TYPE narjar_cache_population_logical_nar_bytes gauge\n",
+         # HELP narjar_cache_population_logical_nar_bytes Sum of logical NAR sizes in valid chunk manifests.\n# TYPE narjar_cache_population_logical_nar_bytes gauge\n\
+         # HELP narjar_cache_population_narinfo_claimed_nar_bytes Sum of valid narinfo NarSize claims, counted once per store path.\n# TYPE narjar_cache_population_narinfo_claimed_nar_bytes gauge\n",
         unix_seconds_now().saturating_sub(sampled_at),
         population.elapsed_seconds,
     ));
@@ -1381,6 +1635,10 @@ fn append_population_metrics(output: &mut String, sample: &SampleState<Populatio
         "narjar_cache_population_apparent_bytes{{kind=\"total\",state=\"{state}\"}} {}\n",
         population.apparent_file_bytes,
     ));
+    output.push_str(&format!(
+        "narjar_cache_population_narinfo_claimed_nar_bytes{{state=\"{state}\"}} {}\n",
+        population.narinfo_claimed_nar_bytes,
+    ));
     if let Some(chunked) = &population.chunked {
         output.push_str(&format!(
             "narjar_cache_population_logical_nars{{state=\"{state}\"}} {}\nnarjar_cache_population_logical_nar_bytes{{state=\"{state}\"}} {}\n",
@@ -1417,6 +1675,7 @@ fn next_sample_state<T: Clone>(
     previous: &SampleState<T>,
     sampled: Result<T, ()>,
     sampled_at_unix_seconds: u64,
+    failure_reason: &'static str,
 ) -> SampleState<T> {
     match sampled {
         Ok(value) => SampleState::Measured {
@@ -1435,11 +1694,11 @@ fn next_sample_state<T: Clone>(
             } => SampleState::Stale {
                 sampled_at_unix_seconds: *sampled_at_unix_seconds,
                 value: value.clone(),
-                reason: "procfs_read_failed".to_owned(),
+                reason: failure_reason.to_owned(),
             },
             SampleState::NeverSampled | SampleState::Unavailable { .. } => {
                 SampleState::Unavailable {
-                    reason: "procfs_read_failed".to_owned(),
+                    reason: failure_reason.to_owned(),
                 }
             }
         },
@@ -1731,12 +1990,14 @@ pub struct StatsSnapshot {
     pub(crate) storage_activity: StorageActivitySnapshot,
     pub process: ProcessStats,
     pub cache: CacheStats,
+    pub nar_range_requests: NarRangeStats,
     pub latency: LatencyStats,
     pub traffic: TrafficStats,
     pub reliability: ReliabilityStats,
     pub pressure: PressureStats,
     pub inventory: SampleState<PopulationStats>,
     pub filesystem: SampleState<FilesystemStats>,
+    pub maintenance: SampleState<maintenance::Snapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -1851,6 +2112,31 @@ pub struct CacheStats {
 }
 
 #[derive(Clone, Debug)]
+pub struct NarRangeStats {
+    pub get: NarRangeMethodStats,
+    pub head: NarRangeMethodStats,
+}
+
+#[derive(Clone, Debug)]
+pub struct NarRangeMethodStats {
+    pub full: u64,
+    pub partial: u64,
+    pub unsatisfiable: u64,
+    pub invalid: u64,
+}
+
+impl NarRangeMethodStats {
+    const fn count(&self, outcome: NarRangeOutcome) -> u64 {
+        match outcome {
+            NarRangeOutcome::Full => self.full,
+            NarRangeOutcome::Partial => self.partial,
+            NarRangeOutcome::Unsatisfiable => self.unsatisfiable,
+            NarRangeOutcome::Invalid => self.invalid,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct LookupStats {
     pub hits: u64,
     pub misses: u64,
@@ -1945,6 +2231,7 @@ pub struct PopulationStats {
     pub malformed_narinfo_filenames: u64,
     pub malformed_narinfo_contents: u64,
     pub narinfo_bytes: u64,
+    pub narinfo_claimed_nar_bytes: u64,
     pub malformed_nar_bytes: u64,
     pub raw_files: u64,
     pub raw_bytes: u64,
@@ -1985,6 +2272,7 @@ impl PopulationStats {
             malformed_narinfo_filenames: counts.malformed_narinfo_filenames,
             malformed_narinfo_contents: counts.malformed_narinfo_contents,
             narinfo_bytes: counts.narinfo_bytes,
+            narinfo_claimed_nar_bytes: counts.narinfo_claimed_nar_bytes,
             malformed_nar_bytes: counts.malformed_nar_bytes,
             raw_files: counts.raw_files,
             raw_bytes: counts.raw_bytes,
@@ -2060,6 +2348,16 @@ pub(crate) struct RequestGuard<'a> {
 }
 
 impl RequestGuard<'_> {
+    pub(crate) fn record_nar_range_request(&self, outcome: NarRangeOutcome) {
+        let method_index = match self.method {
+            RequestMethod::Get => 0,
+            RequestMethod::Head => 1,
+            RequestMethod::Put | RequestMethod::Other => return,
+        };
+        let counter_index = method_index * NAR_RANGE_OUTCOMES.len() + outcome.index();
+        saturating_atomic_add(&self.metrics.nar_range_requests[counter_index], 1);
+    }
+
     pub(crate) fn record_cache_lookup(
         &self,
         object: CacheObject,
@@ -2154,9 +2452,11 @@ impl Drop for UploadGuard<'_> {
 mod tests {
     use super::{
         CacheLookupOutcome, CacheObject, ConnectionOutcome, FilesystemStats, Metrics,
-        RequestMethod, RequestRoute, SampleState, ValidationClass, render_prometheus,
+        NarRangeOutcome, RequestMethod, RequestRoute, SampleState, StorageActivitySnapshot,
+        ValidationClass, append_storage_activity_metrics, render_prometheus,
     };
     use crate::http_server::StatusCode;
+    use crate::maintenance::{Mode, Operation, Outcome, Recorder, RunValues};
     use crate::storage::{
         PopulationCounts, PublishOutcome, StorageBackend, StorageCapacity, StorageError,
         StorageReadiness,
@@ -2187,10 +2487,58 @@ mod tests {
     }
 
     #[test]
+    fn nar_range_outcomes_are_counted_with_fixed_labels() {
+        let metrics = Metrics::default();
+        let guard = metrics.request(RequestMethod::Get, RequestRoute::Nar);
+        for outcome in [
+            NarRangeOutcome::Full,
+            NarRangeOutcome::Partial,
+            NarRangeOutcome::Partial,
+            NarRangeOutcome::Unsatisfiable,
+            NarRangeOutcome::Invalid,
+        ] {
+            guard.record_nar_range_request(outcome);
+        }
+        drop(guard);
+        let head = metrics.request(RequestMethod::Head, RequestRoute::Nar);
+        head.record_nar_range_request(NarRangeOutcome::Partial);
+        drop(head);
+
+        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        assert_eq!(snapshot.nar_range_requests.get.full, 1);
+        assert_eq!(snapshot.nar_range_requests.get.partial, 2);
+        assert_eq!(snapshot.nar_range_requests.get.unsatisfiable, 1);
+        assert_eq!(snapshot.nar_range_requests.get.invalid, 1);
+        assert_eq!(snapshot.nar_range_requests.head.partial, 1);
+
+        let exposition = render_prometheus(&snapshot);
+        assert!(
+            exposition
+                .contains("narjar_nar_range_requests_total{method=\"GET\",outcome=\"full\"} 1")
+        );
+        assert!(
+            exposition
+                .contains("narjar_nar_range_requests_total{method=\"GET\",outcome=\"partial\"} 2")
+        );
+        assert!(exposition.contains(
+            "narjar_nar_range_requests_total{method=\"GET\",outcome=\"unsatisfiable\"} 1"
+        ));
+        assert!(
+            exposition
+                .contains("narjar_nar_range_requests_total{method=\"GET\",outcome=\"invalid\"} 1")
+        );
+        assert!(
+            exposition
+                .contains("narjar_nar_range_requests_total{method=\"HEAD\",outcome=\"partial\"} 1")
+        );
+    }
+
+    #[test]
     fn failed_population_refresh_keeps_the_last_complete_sample() {
         let metrics = Metrics::default();
         let counts = PopulationCounts {
             structurally_valid_narinfo_entries: 4,
+            narinfo_claimed_nar_bytes: 360,
             raw_bytes: 900,
             ..PopulationCounts::default()
         };
@@ -2203,6 +2551,7 @@ mod tests {
             first,
             super::SampleState::Measured { ref value, .. }
                 if value.structurally_valid_narinfo_entries == 4
+                    && value.narinfo_claimed_nar_bytes == 360
                     && value.raw_bytes == 900
         ));
         let exposition = metrics.render(true, None, 0, 0);
@@ -2211,6 +2560,11 @@ mod tests {
         );
         assert!(
             exposition.contains("narjar_cache_population_files{kind=\"raw\",state=\"measured\"} 0")
+        );
+        assert!(
+            exposition.contains(
+                "narjar_cache_population_narinfo_claimed_nar_bytes{state=\"measured\"} 360"
+            )
         );
         assert!(!exposition.contains("kind=\"chunk\""));
 
@@ -2292,6 +2646,63 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_history_is_exported_from_bounded_local_records() {
+        let directory = tempfile::tempdir().expect("maintenance directory should be created");
+        let metrics = Metrics::default();
+        let recorder = Recorder::begin(directory.path(), Operation::Gc, Mode::GcApply)
+            .expect("started state should be stored");
+        metrics.sample_maintenance_sidecar(directory.path());
+        let exposition =
+            render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        assert!(exposition.contains(
+            "narjar_maintenance_started_timestamp_seconds{operation=\"gc\",mode=\"gc_apply\"}"
+        ));
+
+        recorder
+            .finish(
+                Outcome::Success,
+                RunValues {
+                    objects_reclaimed: Some(2),
+                    bytes_reclaimed: Some(8192),
+                    ..RunValues::default()
+                },
+            )
+            .expect("completion should be durably recorded");
+        metrics.sample_maintenance_sidecar(directory.path());
+        let exposition =
+            render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        assert!(exposition.contains("outcome=\"success\""));
+        assert!(
+            exposition
+                .contains("narjar_maintenance_last_objects{operation=\"gc\",kind=\"reclaimed\"} 2")
+        );
+        assert!(
+            exposition.contains(
+                "narjar_maintenance_last_bytes{operation=\"gc\",kind=\"reclaimed\"} 8192"
+            )
+        );
+        assert!(
+            !exposition.contains("narjar_maintenance_started_timestamp_seconds{operation=\"gc\"")
+        );
+
+        std::fs::remove_file(directory.path().join(".narjar-maintenance-gc.last"))
+            .expect("record should be replaceable for the failure case");
+        std::os::unix::fs::symlink(
+            directory.path().join("missing"),
+            directory.path().join(".narjar-maintenance-gc.last"),
+        )
+        .expect("unsafe record should be creatable");
+        metrics.sample_maintenance_sidecar(directory.path());
+        let retained = render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        assert!(
+            retained.contains(
+                "narjar_maintenance_last_bytes{operation=\"gc\",kind=\"reclaimed\"} 8192"
+            )
+        );
+        assert!(retained.contains("narjar_maintenance_sample_available{state=\"stale\"} 1"));
+    }
+
+    #[test]
     fn zfs_metrics_report_physical_usage_compression_and_sample_freshness() {
         let mut exposition = String::new();
         super::append_filesystem_metrics(
@@ -2325,12 +2736,24 @@ mod tests {
             "narjar_zfs_compression_ratio{kind=\"compression\",state=\"measured\"} 2.5",
             "narjar_zfs_logical_to_used_ratio{state=\"measured\"} 2.5",
             "narjar_zfs_record_size_bytes{state=\"measured\"} 1048576",
-            "narjar_zfs_compression_info{algorithm=\"zstd-19\",state=\"measured\"} 1",
+            "narjar_zfs_compression_info{algorithm=\"zstd\",state=\"measured\"} 1",
+            "narjar_zfs_compression_level{algorithm=\"zstd\",state=\"measured\"} 19",
         ] {
             assert!(
                 exposition.contains(expected),
                 "missing {expected}: {exposition}"
             );
+        }
+    }
+
+    #[test]
+    fn zfs_compression_metrics_bound_labels_and_preserve_levels() {
+        for (property, expected) in [
+            ("gzip-9", ("gzip", Some(9))),
+            ("zstd-fast-1000", ("zstd_fast", Some(1000))),
+            ("future-codec-with-arbitrary-value", ("other", None)),
+        ] {
+            assert_eq!(super::zfs_compression_properties(property), expected);
         }
     }
 
@@ -2485,6 +2908,29 @@ mod tests {
     }
 
     #[test]
+    fn storage_activity_exposes_validated_and_committed_nar_bytes() {
+        let activity = StorageActivitySnapshot {
+            upload_validated_logical_bytes: 200,
+            upload_created_logical_bytes: 100,
+            upload_identical_logical_bytes: 100,
+            ..StorageActivitySnapshot::default()
+        };
+        let mut exposition = String::new();
+
+        append_storage_activity_metrics(&mut exposition, activity);
+
+        assert!(exposition.contains("narjar_nar_upload_validated_logical_bytes_total 200"));
+        assert!(
+            exposition.contains(
+                "narjar_nar_upload_committed_logical_bytes_total{outcome=\"created\"} 100"
+            )
+        );
+        assert!(exposition.contains(
+            "narjar_nar_upload_committed_logical_bytes_total{outcome=\"identical\"} 100"
+        ));
+    }
+
+    #[test]
     fn traffic_rate_reports_real_partial_window_coverage() {
         let start = Instant::now();
         let mut samples = super::TrafficSamples::default();
@@ -2515,7 +2961,7 @@ mod tests {
             sampled_at_unix_seconds: 10,
             value: 3_000_u64,
         };
-        let stale = super::next_sample_state(&measured, Err(()), 20);
+        let stale = super::next_sample_state(&measured, Err(()), 20, "test_read_failed");
         assert!(matches!(
             stale,
             super::SampleState::Stale {
@@ -2525,8 +2971,12 @@ mod tests {
             }
         ));
 
-        let unavailable =
-            super::next_sample_state(&super::SampleState::<u64>::NeverSampled, Err(()), 20);
+        let unavailable = super::next_sample_state(
+            &super::SampleState::<u64>::NeverSampled,
+            Err(()),
+            20,
+            "test_read_failed",
+        );
         assert!(matches!(
             unavailable,
             super::SampleState::Unavailable { .. }

@@ -29,6 +29,7 @@ pub struct PopulationCounts {
     pub(crate) malformed_nar_files: u64,
     pub(crate) malformed_nar_bytes: u64,
     pub(crate) narinfo_bytes: u64,
+    pub(crate) narinfo_claimed_nar_bytes: u64,
     pub(crate) raw_files: u64,
     pub(crate) raw_bytes: u64,
     pub(crate) xz_files: u64,
@@ -273,12 +274,16 @@ fn record_narinfo(
             checked_add(population.malformed_narinfo_contents, 1)?;
         return Ok(());
     }
-    match NarInfoClaims::parse_external_narinfo(&store, contents).is_ok() {
-        true => {
+    match NarInfoClaims::parse_external_narinfo(&store, contents) {
+        Ok(claims) => {
             population.structurally_valid_narinfo_entries =
                 checked_add(population.structurally_valid_narinfo_entries, 1)?;
+            population.narinfo_claimed_nar_bytes = checked_add(
+                population.narinfo_claimed_nar_bytes,
+                claims.identity().size().get(),
+            )?;
         }
-        false => {
+        Err(_) => {
             population.malformed_narinfo_contents =
                 checked_add(population.malformed_narinfo_contents, 1)?;
         }

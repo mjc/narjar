@@ -402,8 +402,13 @@ impl Storage {
         let completed = destination
             .finish(received.identity())
             .map_err(storage_error_for_chunk_store)?;
-        self.publish_ingestion_receipt_for_received_nar(received)?;
+        let identity = received.identity();
         let outcome = completed.outcome();
+        self.activity
+            .record_upload_validated_logical_bytes(identity.size().get());
+        self.activity
+            .record_upload_publication(outcome, identity.size().get());
+        self.publish_ingestion_receipt_for_received_nar(received)?;
         completed.release_reservation();
         Ok(outcome)
     }

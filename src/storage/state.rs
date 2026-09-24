@@ -97,6 +97,9 @@ pub struct Storage {
 
 #[derive(Debug, Default)]
 pub(crate) struct StorageActivity {
+    pub(super) upload_validated_logical_bytes: AtomicU64,
+    pub(super) upload_created_logical_bytes: AtomicU64,
+    pub(super) upload_identical_logical_bytes: AtomicU64,
     pub(super) egress_reuses: AtomicU64,
     pub(super) egress_generations_started: AtomicU64,
     pub(super) egress_generations_succeeded: AtomicU64,
@@ -113,6 +116,9 @@ pub(crate) struct StorageActivity {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StorageActivitySnapshot {
     pub(crate) backend: StorageBackend,
+    pub(crate) upload_validated_logical_bytes: u64,
+    pub(crate) upload_created_logical_bytes: u64,
+    pub(crate) upload_identical_logical_bytes: u64,
     pub(crate) egress_reuses: u64,
     pub(crate) egress_generations_started: u64,
     pub(crate) egress_generations_succeeded: u64,
@@ -127,6 +133,22 @@ pub(crate) struct StorageActivitySnapshot {
 }
 
 impl StorageActivity {
+    pub(super) fn record_upload_validated_logical_bytes(&self, bytes: u64) {
+        increment_saturating(&self.upload_validated_logical_bytes, bytes);
+    }
+
+    pub(super) fn record_upload_publication(
+        &self,
+        outcome: super::publication::PublishOutcome,
+        logical_bytes: u64,
+    ) {
+        let counter = match outcome {
+            super::publication::PublishOutcome::Created => &self.upload_created_logical_bytes,
+            super::publication::PublishOutcome::Identical => &self.upload_identical_logical_bytes,
+        };
+        increment_saturating(counter, logical_bytes);
+    }
+
     pub(super) fn record_egress_reuse(&self) {
         increment_saturating(&self.egress_reuses, 1);
     }
@@ -177,6 +199,9 @@ impl StorageActivity {
 
         StorageActivitySnapshot {
             backend,
+            upload_validated_logical_bytes: self.upload_validated_logical_bytes.load(Relaxed),
+            upload_created_logical_bytes: self.upload_created_logical_bytes.load(Relaxed),
+            upload_identical_logical_bytes: self.upload_identical_logical_bytes.load(Relaxed),
             egress_reuses: self.egress_reuses.load(Relaxed),
             egress_generations_started: self.egress_generations_started.load(Relaxed),
             egress_generations_succeeded: self.egress_generations_succeeded.load(Relaxed),
@@ -197,6 +222,9 @@ impl Default for StorageActivitySnapshot {
     fn default() -> Self {
         Self {
             backend: StorageBackend::Flat,
+            upload_validated_logical_bytes: 0,
+            upload_created_logical_bytes: 0,
+            upload_identical_logical_bytes: 0,
             egress_reuses: 0,
             egress_generations_started: 0,
             egress_generations_succeeded: 0,

@@ -121,7 +121,7 @@ pub fn prepare_publication(
 
     let route = match CacheRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
-        RouteMatch::Invalid => {
+        RouteMatch::InvalidNarPath | RouteMatch::Invalid => {
             let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
             let _ = send_response(&guard, request, Response::empty(StatusCode::BAD_REQUEST));
             return None;

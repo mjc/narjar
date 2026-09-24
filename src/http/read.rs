@@ -8,8 +8,8 @@ use crate::{
     auth::{Authorizer, Permission, ReadVisibility},
     http_server::{Method, Request, Response, ResponseHeader as Header, StatusCode, static_header},
     metrics::{
-        CacheLookupOutcome, CacheObject, Metrics, RequestGuard, RequestMethod, RequestRoute,
-        render_prometheus,
+        CacheLookupOutcome, CacheObject, Metrics, NarRangeOutcome, RequestGuard, RequestMethod,
+        RequestRoute, render_prometheus,
     },
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::NarFileName,
@@ -194,6 +194,17 @@ enum RequestedRange {
     Invalid,
 }
 
+impl RequestedRange {
+    const fn metric_outcome(self) -> NarRangeOutcome {
+        match self {
+            Self::Full => NarRangeOutcome::Full,
+            Self::Partial { .. } => NarRangeOutcome::Partial,
+            Self::Unsatisfiable => NarRangeOutcome::Unsatisfiable,
+            Self::Invalid => NarRangeOutcome::Invalid,
+        }
+    }
+}
+
 fn requested_range(request: &Request, length: u64) -> RequestedRange {
     let mut headers = request
         .headers()
@@ -258,10 +269,7 @@ fn respond_nar(
 ) -> Option<TcpStream> {
     let lookup_started = Instant::now();
     let length = match storage.nar_size(name) {
-        Ok(Some(length)) => {
-            record_nar_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
-            length
-        }
+        Ok(Some(length)) => length,
         Ok(None) => {
             record_nar_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
             return not_found(guard, request);
@@ -272,12 +280,17 @@ fn respond_nar(
         }
     };
 
-    match requested_range(&request, length) {
+    let range = requested_range(&request, length);
+    guard.record_nar_range_request(range.metric_outcome());
+    match range {
         RequestedRange::Full => {
             let Ok(content_length) = usize::try_from(length) else {
+                record_nar_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
                 return internal_error(guard, request);
             };
-            let opened = match storage.open_nar_range(name, 0..length) {
+            let opened = storage.open_nar_range(name, 0..length);
+            record_nar_open_outcome(guard, &opened, lookup_started);
+            let opened = match opened {
                 Ok(Some(opened)) => opened,
                 Ok(None) => return not_found(guard, request),
                 Err(_) => return internal_error(guard, request),
@@ -297,9 +310,12 @@ fn respond_nar(
         RequestedRange::Partial { start, end } => {
             let response_length = end - start + 1;
             let Ok(content_length) = usize::try_from(response_length) else {
+                record_nar_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
                 return internal_error(guard, request);
             };
-            let opened = match storage.open_nar_range(name, start..end + 1) {
+            let opened = storage.open_nar_range(name, start..end + 1);
+            record_nar_open_outcome(guard, &opened, lookup_started);
+            let opened = match opened {
                 Ok(Some(opened)) => opened,
                 Ok(None) => return not_found(guard, request),
                 Err(_) => return internal_error(guard, request),
@@ -334,6 +350,7 @@ fn respond_nar(
             }
         }
         RequestedRange::Unsatisfiable => {
+            record_nar_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
             let response = Response::empty(StatusCode::RANGE_NOT_SATISFIABLE).with_header(
                 Header::owned("Content-Range", format!("bytes */{length}"))
                     .expect("range response header is valid"),
@@ -341,9 +358,22 @@ fn respond_nar(
             send_response(guard, request, response)
         }
         RequestedRange::Invalid => {
+            record_nar_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
             send_response(guard, request, Response::empty(StatusCode::BAD_REQUEST))
         }
     }
+}
+
+fn record_nar_open_outcome<T, E>(
+    guard: &RequestGuard<'_>,
+    opened: &Result<Option<T>, E>,
+    lookup_started: Instant,
+) {
+    let outcome = match opened {
+        Ok(Some(_)) => CacheLookupOutcome::Hit,
+        Ok(None) | Err(_) => CacheLookupOutcome::Failure,
+    };
+    record_nar_lookup(guard, outcome, lookup_started);
 }
 
 fn record_nar_lookup(
@@ -364,22 +394,20 @@ pub(super) enum CacheRoute {
 #[derive(Debug)]
 pub(super) enum RouteMatch {
     Found(CacheRoute),
+    InvalidNarPath,
     Invalid,
     Missing,
 }
 
 impl CacheRoute {
     pub(super) fn classify(url: &str) -> RouteMatch {
-        if url.starts_with("//") || url.contains(['\\', '?', '#']) {
-            return RouteMatch::Invalid;
-        }
-        let url = match url.strip_prefix("/main") {
-            Some("") => return RouteMatch::Invalid,
-            Some(path) if path.starts_with('/') => path,
-            Some(_) => return RouteMatch::Missing,
-            None => url,
-        };
+        normalize_main_alias(url).map_or_else(|route| route, Self::classify_normalized)
+    }
 
+    fn classify_normalized(url: &str) -> RouteMatch {
+        if url.starts_with("//") || url.contains(['\\', '?', '#']) {
+            return invalid_cache_route(url);
+        }
         if url == "/nix-cache-info" {
             return RouteMatch::Found(Self::CacheInfo);
         }
@@ -387,7 +415,7 @@ impl CacheRoute {
         if let Some(path) = url.strip_prefix("/nar/") {
             return match NarFileName::parse(path) {
                 Ok(name) => RouteMatch::Found(Self::Nar(name)),
-                Err(_) => RouteMatch::Invalid,
+                Err(_) => RouteMatch::InvalidNarPath,
             };
         }
         if url == "/nar" || url.starts_with("/nix-cache-info/") {
@@ -405,6 +433,74 @@ impl CacheRoute {
         }
 
         RouteMatch::Missing
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OperatorRoute {
+    Health,
+    Protected(ProtectedOperatorRoute),
+}
+
+#[derive(Clone, Copy)]
+enum ProtectedOperatorRoute {
+    Readiness,
+    Metrics,
+}
+
+enum ReadRoute {
+    Operator(OperatorRoute),
+    Cache(RouteMatch),
+}
+
+impl ReadRoute {
+    fn classify(url: &str) -> Self {
+        let url = match normalize_main_alias(url) {
+            Ok(url) => url,
+            Err(route) => return Self::Cache(route),
+        };
+        match url {
+            "/healthz" => Self::Operator(OperatorRoute::Health),
+            "/readyz" => {
+                Self::Operator(OperatorRoute::Protected(ProtectedOperatorRoute::Readiness))
+            }
+            "/metrics" => Self::Operator(OperatorRoute::Protected(ProtectedOperatorRoute::Metrics)),
+            _ => Self::Cache(CacheRoute::classify_normalized(url)),
+        }
+    }
+
+    fn metrics_route(&self) -> RequestRoute {
+        match self {
+            Self::Operator(OperatorRoute::Health) => RequestRoute::Health,
+            Self::Operator(OperatorRoute::Protected(ProtectedOperatorRoute::Readiness)) => {
+                RequestRoute::Ready
+            }
+            Self::Operator(OperatorRoute::Protected(ProtectedOperatorRoute::Metrics)) => {
+                RequestRoute::Metrics
+            }
+            Self::Cache(RouteMatch::Found(CacheRoute::CacheInfo)) => RequestRoute::CacheInfo,
+            Self::Cache(RouteMatch::Found(CacheRoute::Nar(_))) => RequestRoute::Nar,
+            Self::Cache(RouteMatch::Found(CacheRoute::NarInfo(_))) => RequestRoute::NarInfo,
+            Self::Cache(RouteMatch::InvalidNarPath | RouteMatch::Invalid) => RequestRoute::Invalid,
+            Self::Cache(RouteMatch::Missing) => RequestRoute::Missing,
+        }
+    }
+}
+
+fn normalize_main_alias(url: &str) -> Result<&str, RouteMatch> {
+    match url.strip_prefix("/main") {
+        Some("") => Err(RouteMatch::Invalid),
+        Some(path) if path.starts_with('/') => Ok(path),
+        Some(_) => Err(RouteMatch::Missing),
+        None => Ok(url),
+    }
+}
+
+fn invalid_cache_route(url: &str) -> RouteMatch {
+    if url.starts_with("/nar/") {
+        RouteMatch::InvalidNarPath
+    } else {
+        RouteMatch::Invalid
     }
 }
 
@@ -426,31 +522,13 @@ pub(super) fn has_header(request: &Request, name: &'static str) -> bool {
 }
 
 pub(super) fn request_route(url: &str) -> RequestRoute {
-    match route_without_main(url) {
-        "/healthz" => RequestRoute::Health,
-        "/readyz" => RequestRoute::Ready,
-        "/metrics" => RequestRoute::Metrics,
-        _ => match CacheRoute::classify(url) {
-            RouteMatch::Found(CacheRoute::CacheInfo) => RequestRoute::CacheInfo,
-            RouteMatch::Found(CacheRoute::Nar(_)) => RequestRoute::Nar,
-            RouteMatch::Found(CacheRoute::NarInfo(_)) => RequestRoute::NarInfo,
-            RouteMatch::Invalid => RequestRoute::Invalid,
-            RouteMatch::Missing => RequestRoute::Missing,
-        },
-    }
+    ReadRoute::classify(url).metrics_route()
 }
 
-fn route_without_main(url: &str) -> &str {
-    url.strip_prefix("/main")
-        .filter(|path| path.starts_with('/'))
-        .unwrap_or(url)
-}
-
-fn invalid_route_status(method: Method, url: &str) -> StatusCode {
-    if matches!(method, Method::Get | Method::Head) && url.starts_with("/nar/") {
-        StatusCode::NOT_FOUND
-    } else {
-        StatusCode::BAD_REQUEST
+fn invalid_route_status(method: Method, route: &RouteMatch) -> StatusCode {
+    match (route, method) {
+        (RouteMatch::InvalidNarPath, Method::Get | Method::Head) => StatusCode::NOT_FOUND,
+        _ => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -462,143 +540,195 @@ pub fn respond(
     metrics: &Metrics,
     min_free_bytes: u64,
 ) -> Option<TcpStream> {
-    let guard = metrics.request(
-        RequestMethod::from(request.method()),
-        request_route(request.url()),
-    );
-    if request.url() == "/healthz" {
-        if !matches!(request.method(), Method::Get | Method::Head) {
-            return method_not_allowed(&guard, request, "GET, HEAD");
-        }
-        return send_response(
-            &guard,
-            request,
-            Response::from_string("ok\n")
-                .with_status_code(StatusCode::OK)
-                .with_header(header("Content-Type", "text/plain; charset=utf-8")),
-        );
-    }
-    let operator_route = route_without_main(request.url());
-    if matches!(operator_route, "/readyz" | "/metrics") {
-        if !matches!(request.method(), Method::Get | Method::Head) {
-            return method_not_allowed(&guard, request, "GET, HEAD");
-        }
-        if !authorizer.allows(&request, Permission::Read) {
-            metrics.auth_failure(false);
-            return unauthorized(&guard, request);
-        }
-        let readiness = storage
-            .is_ready(min_free_bytes)
-            .unwrap_or(StorageReadiness::ProbeFailed);
-        if operator_route == "/readyz" {
-            let (status, body) = match readiness {
-                StorageReadiness::Ready => (StatusCode::OK, "ready\n"),
-                StorageReadiness::LowSpace
-                | StorageReadiness::NoInodes
-                | StorageReadiness::ReadOnly
-                | StorageReadiness::ProbeFailed => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "insufficient_space\n")
-                }
-            };
-            return send_response(
-                &guard,
-                request,
-                Response::from_string(body)
-                    .with_status_code(status)
-                    .with_header(header("Content-Type", "text/plain; charset=utf-8")),
-            );
-        } else {
-            metrics.set_temp_objects(storage.temporary_objects());
-            let (capacity, staging_bytes) = storage
-                .capacity_and_staging()
-                .map(|(capacity, staging_bytes)| (Some(capacity), staging_bytes))
-                .unwrap_or((None, 0));
-            let mut snapshot = metrics.snapshot(
-                readiness,
-                capacity,
-                storage.temporary_objects(),
-                min_free_bytes,
-                staging_bytes,
-            );
-            snapshot.storage_activity = storage.activity_snapshot();
-            let body = render_prometheus(&snapshot);
-            return send_response(
-                &guard,
-                request,
-                Response::from_string(body)
-                    .with_status_code(StatusCode::OK)
-                    .with_header(header(
-                        "Content-Type",
-                        "text/plain; version=0.0.4; charset=utf-8",
-                    ))
-                    .with_header(header("Cache-Control", "no-store"))
-                    .with_header(header("Vary", "Authorization")),
-            );
-        }
-    }
-
-    let permission = if matches!(request.method(), Method::Put) {
-        Permission::Write
-    } else {
-        Permission::Read
-    };
-    if !authorizer.allows(&request, permission) {
-        metrics.auth_failure(matches!(permission, Permission::Write));
-        return unauthorized(&guard, request);
-    }
-    let visibility = authorizer.read_visibility();
-
-    let route = match CacheRoute::classify(request.url()) {
-        RouteMatch::Found(route) => route,
-        RouteMatch::Invalid => {
-            let status = invalid_route_status(request.method(), request.url());
-            return send_response(&guard, request, Response::empty(status));
-        }
-        RouteMatch::Missing => return not_found(&guard, request),
-    };
-
-    if !matches!(request.method(), Method::Get | Method::Head) {
-        return method_not_allowed(&guard, request, "GET, HEAD, PUT");
-    }
-
+    let route = ReadRoute::classify(request.url());
+    let guard = metrics.request(RequestMethod::from(request.method()), route.metrics_route());
     match route {
-        CacheRoute::CacheInfo => {
-            let cache_info = match storage.cache_info() {
-                Ok(cache_info) => cache_info,
-                Err(_) => return internal_error(&guard, request),
-            };
-            let response = cache_policy(
-                Response::from_data(cache_info)
-                    .with_header(header("Content-Type", "text/x-nix-cache-info")),
-                visibility,
-                "public, max-age=3600",
-            );
-            send_response(&guard, request, response)
+        ReadRoute::Operator(operator) => respond_operator_route(
+            operator,
+            request,
+            storage,
+            authorizer,
+            metrics,
+            min_free_bytes,
+            &guard,
+        ),
+        ReadRoute::Cache(route) => respond_cache_route(
+            route, request, storage, authorizer, trusted, metrics, &guard,
+        ),
+    }
+}
+
+fn respond_operator_route(
+    operator: OperatorRoute,
+    request: Request,
+    storage: &Storage,
+    authorizer: &Authorizer,
+    metrics: &Metrics,
+    min_free_bytes: u64,
+    guard: &RequestGuard<'_>,
+) -> Option<TcpStream> {
+    match operator {
+        OperatorRoute::Health => match request.method() {
+            Method::Get | Method::Head => send_response(
+                guard,
+                request,
+                Response::from_string("ok\n")
+                    .with_status_code(StatusCode::OK)
+                    .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+            ),
+            _ => method_not_allowed(guard, request, "GET, HEAD"),
+        },
+        OperatorRoute::Protected(operator) => {
+            match request.method() {
+                Method::Get | Method::Head => {}
+                _ => return method_not_allowed(guard, request, "GET, HEAD"),
+            }
+            if !authorizer.allows(&request, Permission::Read) {
+                metrics.auth_failure(false);
+                return unauthorized(guard, request);
+            }
+            let readiness = storage
+                .is_ready(min_free_bytes)
+                .unwrap_or(StorageReadiness::ProbeFailed);
+            match operator {
+                ProtectedOperatorRoute::Readiness => {
+                    let (status, body) = match readiness {
+                        StorageReadiness::Ready => (StatusCode::OK, "ready\n"),
+                        StorageReadiness::LowSpace
+                        | StorageReadiness::NoInodes
+                        | StorageReadiness::ReadOnly
+                        | StorageReadiness::ProbeFailed => {
+                            (StatusCode::SERVICE_UNAVAILABLE, "insufficient_space\n")
+                        }
+                    };
+                    send_response(
+                        guard,
+                        request,
+                        Response::from_string(body)
+                            .with_status_code(status)
+                            .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+                    )
+                }
+                ProtectedOperatorRoute::Metrics => {
+                    metrics.set_temp_objects(storage.temporary_objects());
+                    let (capacity, staging_bytes) = storage
+                        .capacity_and_staging()
+                        .map(|(capacity, staging_bytes)| (Some(capacity), staging_bytes))
+                        .unwrap_or((None, 0));
+                    let mut snapshot = metrics.snapshot(
+                        readiness,
+                        capacity,
+                        storage.temporary_objects(),
+                        min_free_bytes,
+                        staging_bytes,
+                    );
+                    snapshot.storage_activity = storage.activity_snapshot();
+                    send_response(
+                        guard,
+                        request,
+                        Response::from_string(render_prometheus(&snapshot))
+                            .with_status_code(StatusCode::OK)
+                            .with_header(header(
+                                "Content-Type",
+                                "text/plain; version=0.0.4; charset=utf-8",
+                            ))
+                            .with_header(header("Cache-Control", "no-store"))
+                            .with_header(header("Vary", "Authorization")),
+                    )
+                }
+            }
         }
-        CacheRoute::Nar(name) => respond_nar(request, storage, name, &guard, visibility),
-        CacheRoute::NarInfo(store) => {
-            respond_narinfo(request, storage, &store, trusted, &guard, visibility)
+    }
+}
+
+fn respond_cache_route(
+    route: RouteMatch,
+    request: Request,
+    storage: &Storage,
+    authorizer: &Authorizer,
+    trusted: &TrustedPublicKeys,
+    metrics: &Metrics,
+    guard: &RequestGuard<'_>,
+) -> Option<TcpStream> {
+    if !authorizer.allows(&request, Permission::Read) {
+        metrics.auth_failure(false);
+        return unauthorized(guard, request);
+    }
+    match route {
+        RouteMatch::InvalidNarPath | RouteMatch::Invalid => {
+            let status = invalid_route_status(request.method(), &route);
+            send_response(guard, request, Response::empty(status))
+        }
+        RouteMatch::Missing => not_found(guard, request),
+        RouteMatch::Found(route) => {
+            match request.method() {
+                Method::Get | Method::Head => {}
+                _ => return method_not_allowed(guard, request, "GET, HEAD, PUT"),
+            }
+            let visibility = authorizer.read_visibility();
+            match route {
+                CacheRoute::CacheInfo => {
+                    let cache_info = match storage.cache_info() {
+                        Ok(cache_info) => cache_info,
+                        Err(_) => return internal_error(guard, request),
+                    };
+                    let response = cache_policy(
+                        Response::from_data(cache_info)
+                            .with_header(header("Content-Type", "text/x-nix-cache-info")),
+                        visibility,
+                        "public, max-age=3600",
+                    );
+                    send_response(guard, request, response)
+                }
+                CacheRoute::Nar(name) => respond_nar(request, storage, name, guard, visibility),
+                CacheRoute::NarInfo(store) => {
+                    respond_narinfo(request, storage, &store, trusted, guard, visibility)
+                }
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheRoute, RouteMatch, invalid_route_status, request_route};
+    use std::time::Instant;
+
+    use super::{
+        CacheRoute, RouteMatch, invalid_route_status, record_nar_open_outcome, request_route,
+    };
     use crate::{
         http_server::{Method, StatusCode},
-        metrics::RequestRoute as MetricsRoute,
+        metrics::{Metrics, RequestMethod, RequestRoute as MetricsRoute},
         object::{CompressionCodec, WireEncoding},
+        storage::StorageReadiness,
     };
+
+    #[test]
+    fn nar_open_failure_after_size_lookup_is_not_counted_as_a_hit() {
+        let metrics = Metrics::default();
+        let guard = metrics.request(RequestMethod::Get, MetricsRoute::Nar);
+        let missing_after_size: Result<Option<()>, std::io::Error> = Ok(None);
+
+        record_nar_open_outcome(&guard, &missing_after_size, Instant::now());
+        drop(guard);
+
+        let lookup = metrics
+            .snapshot(StorageReadiness::Ready, None, 0, 0, 0)
+            .cache
+            .nar_get;
+        assert_eq!(lookup.hits, 0);
+        assert_eq!(lookup.failures, 1);
+        assert_eq!(lookup.hit_ratio, None);
+    }
 
     #[test]
     fn malformed_nar_reads_are_cache_misses() {
         assert_eq!(
-            invalid_route_status(Method::Get, "/nar/old-store-hash.nar"),
+            invalid_route_status(Method::Get, &RouteMatch::InvalidNarPath),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            invalid_route_status(Method::Put, "/nar/old-store-hash.nar"),
+            invalid_route_status(Method::Put, &RouteMatch::InvalidNarPath),
             StatusCode::BAD_REQUEST
         );
     }

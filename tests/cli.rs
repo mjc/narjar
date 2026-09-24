@@ -2858,6 +2858,7 @@ fn nar_get_and_head_support_one_byte_range() {
     let path = format!("/nar/{nar_hash}.nar");
     let request = |method, range| server.request_with_headers(method, &path, &[("Range", range)]);
 
+    let full = server.request("GET", &path);
     let closed = request("GET", "bytes=2-5");
     let open = request("GET", "bytes=5-");
     let suffix = request("GET", "bytes=-4");
@@ -2879,6 +2880,8 @@ fn nar_get_and_head_support_one_byte_range() {
 
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
+
+    assert_eq!(response_parts(&full).1, nar_bytes);
 
     for (response, content_range, body) in [
         (&closed, "bytes 2-5/10", &b"2345"[..]),
@@ -2938,7 +2941,7 @@ fn nar_get_and_head_support_one_byte_range() {
         assert!(body.is_empty());
     }
     assert!(
-        metrics.contains("narjar_http_bytes_out_total 13"),
+        metrics.contains("narjar_http_bytes_out_total 23"),
         "{metrics}"
     );
     assert!(
@@ -2956,6 +2959,15 @@ fn nar_get_and_head_support_one_byte_range() {
             .contains("narjar_http_requests_total{method=\"GET\",route=\"nar\",status=\"416\"} 2"),
         "{metrics}"
     );
+    for expected in [
+        "narjar_nar_range_requests_total{method=\"GET\",outcome=\"full\"} 1",
+        "narjar_nar_range_requests_total{method=\"GET\",outcome=\"partial\"} 3",
+        "narjar_nar_range_requests_total{method=\"HEAD\",outcome=\"partial\"} 1",
+        "narjar_nar_range_requests_total{method=\"GET\",outcome=\"unsatisfiable\"} 2",
+        "narjar_nar_range_requests_total{method=\"GET\",outcome=\"invalid\"} 5",
+    ] {
+        assert!(metrics.contains(expected), "missing {expected}: {metrics}");
+    }
 }
 
 #[test]

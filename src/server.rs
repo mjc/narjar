@@ -207,11 +207,13 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .stats_filesystem_sample
         .as_ref()
         .map(|path| (path.clone(), config.data_dir.clone()));
+    let maintenance_root = config.data_dir.clone();
     let metrics_sampler = thread::Builder::new()
         .name("narjar-metrics-sampler".to_owned())
         .spawn(move || {
             while !sampler_stopping.load(Ordering::Acquire) {
                 sampler_metrics.sample_periodic();
+                sampler_metrics.sample_maintenance_sidecar(&maintenance_root);
                 if let Some((path, root)) = &filesystem_sample {
                     sampler_metrics.sample_filesystem_sidecar(path, root);
                 }

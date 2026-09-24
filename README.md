@@ -174,6 +174,10 @@ use the actual coverage of a five-second sampler with a
 fixed five-minute history; startup reports a window only after it has enough
 samples.
 
+`narjar_nar_range_requests_total{method,outcome}` counts full, partial,
+unsatisfiable, and invalid Range decisions for existing NARs, with GET and
+HEAD kept separate. A 416 is also visible in the HTTP status series.
+
 Process RSS/CPU and cgroup-v2 service memory are separate Linux observations.
 Filesystem capacity and staging headroom are sampled from the cache's open
 directory and reservation budget; headroom is an estimate, not an admission
@@ -187,14 +191,44 @@ interval), start the service with:
 narjar serve --data-dir /var/lib/narjar --stats-inventory-interval-seconds 900
 ```
 
+These series use different accounting bases; do not compare or substitute
+them as though they measured the same quantity. Byte-valued metrics report
+bytes, and time-valued metrics report seconds; unit conversion for display
+belongs in the dashboard:
+
+| Observation | What it measures | What it does not mean |
+| --- | --- | --- |
+| `narjar_process_start_time_seconds`, `narjar_process_uptime_seconds` | This process's start and elapsed runtime | Host boot, service deployment time, or a restart counter |
+| `narjar_http_*_bytes_total` | Lifetime HTTP body bytes consumed or accepted by socket writes in this process epoch | Cache population size, payload bytes physically stored, or proof the peer application consumed a send |
+| `narjar_nar_upload_validated_logical_bytes_total` | Logical NAR size for completed uploads whose encoded and decoded hash/size checks succeeded | Parsed NAR grammar or signature validation |
+| `narjar_nar_upload_committed_logical_bytes_total{outcome}` | Logical NAR size at durable canonical upload publication, separated into created and identical outcomes | Encoded wire bytes or a disk-usage delta |
+| `narjar_cache_population_apparent_bytes{kind="raw"}` | Lengths of observed raw payload pathnames, each stored pathname counted once | Sum of narinfo claims, allocated blocks, or ZFS-charged space |
+| `narjar_cache_population_narinfo_claimed_nar_bytes` | Structurally valid `NarSize` claims summed per store path | Unique content bytes; paths sharing content contribute repeatedly |
+| `narjar_cache_population_logical_nar_bytes` (chunked backend) | Logical sizes in distinct valid canonical chunk manifests | Chunk/manifest file lengths or flat-backend data |
+| `narjar_storage_capacity_bytes{kind}` | Destination filesystem total and currently available capacity from `statvfs` | Bytes used by Narjar alone |
+| `narjar_cache_population_apparent_bytes{kind=...}` | Observed file lengths in the cache namespace | Filesystem block allocation; hard links, sparse files, snapshots, and metadata change allocation |
+| `narjar_zfs_bytes{kind,state}` | Values reported for the explicitly configured ZFS dataset, including logical, referenced, snapshot, child, and reservation accounting | A cache-only physical total if that dataset contains unrelated data |
+
+Process RSS is not the service cgroup's `memory.current`; they answer
+process-residency and service-accounting questions respectively. A
+`systemd MemoryCurrent` observation is service/cgroup accounting, not a
+measurement of process RSS. ZFS's reported `compressratio` is distinct from a
+derived logical-to-used quotient. No current population metric measures
+allocated blocks; use the dated ZFS sample for filesystem-level usage when
+configured.
+
 The population report is dated and records scan duration, ignored/disappeared
 entries, and errors. Narinfo filenames and contents are structurally parsed;
 this population pass does not verify signatures. Malformed filenames and
 malformed contents are reported separately. It sums apparent file lengths for
 narinfo metadata, raw and compressed payloads, chunk files/manifests, ingress
 and egress receipts, validation evidence, recovery records, and temporary
-files. Chunked logical NAR bytes are shown separately from manifest/chunk file
-bytes; chunk-only fields are absent for the flat backend. This online walk is
+files. `narjar_cache_population_narinfo_claimed_nar_bytes` separately sums
+structurally valid `NarSize` claims once per store path, so shared content is
+counted more than once there; raw-file bytes count stored pathnames instead.
+These parsed claims are not signature verification. Chunked logical NAR bytes
+are shown separately from manifest/chunk file bytes; chunk-only fields are
+absent for the flat backend. This online walk is
 not a
 point-in-time snapshot, does not hash payload contents, and must not be used to
 certify integrity, decide GC, or claim physical ZFS space reclaimed. Before its
@@ -215,12 +249,23 @@ The independent failure rate is available under `outcome="failure"`. Resource
 and population samples expose their state and sample age; missing platform
 measurements are not represented as healthy zeroes.
 
+Explicit GC, reconcile, structural cleanup, and verify commands persist one
+bounded summary per operation type. `/metrics` reports the latest completed
+timestamp, mode, outcome, duration, available object counts, inventory classes,
+and GC's logical reclaimed-byte total. A start without completion remains a
+separate observation; it may be an operation still running or one interrupted
+by process failure. GC logical bytes are not physical disk space, and counts
+the command did not measure are omitted. Reading `/metrics` never runs GC,
+reconcile, or verification.
+
 On NixOS, set `services.narjar.statsZfsDataset` to opt into a read-only,
 once-per-minute ZFS sample for the dataset mounted at `dataDir`. The collector
 rejects a different mountpoint or child datasets, and writes a bounded sample
 under `/run`; Narjar exposes physical `used`, logical/reference usage,
-compression properties, and sample age through `/metrics`. Without this
-option, ZFS-specific series report an unavailable state.
+compression properties, and sample age through `/metrics`. Compression
+algorithms use bounded labels; their numeric levels are a separate gauge, and
+unrecognized future settings are grouped as `other`. Without this option,
+ZFS-specific series report an unavailable state.
 
 Latency histograms use fixed seconds buckets from 1 ms through 5 minutes plus
 `+Inf`. Lookup distributions stop when the object decision is made; NAR and
@@ -229,6 +274,14 @@ reflect slow clients. Publication and publication-queue wait are separate
 operations. Durable publication results separately count newly created,
 identical, conflicting, and failed outcomes. For example, estimate the 95th
 percentile narinfo lookup latency:
+
+`narjar_nar_upload_validated_logical_bytes_total` counts logical NAR bytes
+after a complete upload passes encoded and decoded hash/size checks; it does
+not establish NAR grammar or signature validity.
+`narjar_nar_upload_committed_logical_bytes_total{outcome}` counts those logical
+bytes when the canonical payload is durably created or found identical. These
+storage-boundary counts are distinct from encoded HTTP body bytes and do not
+infer input-to-output encoding conversions.
 
 The storage layer also reports compressed derivative reuse, generation,
 generation failures, repair, and callers coalesced behind active generation.
