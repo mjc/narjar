@@ -677,6 +677,15 @@ classes are exported as fixed labels. GC-reclaimed bytes are Narjar's logical
 accounting delta, not a claim about physical blocks freed; unmeasured byte
 counts are omitted.
 
+Some useful measurements intentionally do not appear here. Client-side push
+preflight and trusted-cache skips cannot be inferred from server requests.
+Upstream edge-fill outcomes, native-source lease counts, and online-retention
+effects belong with those features when implemented. Per-object popularity and
+distinct-client counts are omitted to avoid a resident catalog, privacy
+exposure, and unbounded metric cardinality. Build-time savings and host-level
+ARC, disk, and network pressure belong in client or platform monitoring. These
+omissions mean "not measured," not zero.
+
 ## Filesystem support boundary
 
 Narjar's required filesystem contract is limited to regular files and
