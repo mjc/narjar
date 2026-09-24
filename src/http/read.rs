@@ -122,49 +122,17 @@ fn respond_narinfo(
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
     let lookup_started = Instant::now();
-    let narinfo = match storage.open_narinfo(store) {
-        Ok(Some(narinfo)) => narinfo,
-        Ok(None) => {
+    let bytes = match load_verified_narinfo(storage, store, trusted) {
+        Ok(bytes) => bytes,
+        Err(NarInfoReadFailure::Missing) => {
             record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
             return not_found(guard, request);
         }
-        Err(_) => {
-            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
-            return internal_error(guard, request);
-        }
-    };
-    let mut bytes = Vec::new();
-    if narinfo
-        .take(MAX_NARINFO_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() as u64 > MAX_NARINFO_BYTES
-    {
-        record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
-        return internal_error(guard, request);
-    }
-    let validated = match trusted.validate(store, bytes) {
-        Ok(validated) => validated,
-        Err(_) => {
-            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
-            return internal_error(guard, request);
-        }
-    };
-    match storage.nar_matches(&validated) {
-        Ok(NarMatch::Match) => {}
-        Ok(NarMatch::Missing | NarMatch::Mismatch) => {
+        Err(NarInfoReadFailure::PayloadUnavailable) => {
             record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
             return not_found(guard, request);
         }
-        Err(_) => {
-            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
-            return internal_error(guard, request);
-        }
-    }
-
-    let bytes = match validated.into_bytes() {
-        Ok(bytes) => bytes,
-        Err(_) => {
+        Err(NarInfoReadFailure::InvalidOrUnreadable) => {
             record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
             return internal_error(guard, request);
         }
@@ -176,6 +144,51 @@ fn respond_narinfo(
         IMMUTABLE_CACHE_CONTROL,
     );
     send_response(guard, request, response)
+}
+
+#[derive(Clone, Copy)]
+enum NarInfoReadFailure {
+    Missing,
+    PayloadUnavailable,
+    InvalidOrUnreadable,
+}
+
+fn load_verified_narinfo(
+    storage: &Storage,
+    store: &StoreHash,
+    trusted: &TrustedPublicKeys,
+) -> Result<Vec<u8>, NarInfoReadFailure> {
+    let narinfo = storage
+        .open_narinfo(store)
+        .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)?
+        .ok_or(NarInfoReadFailure::Missing)?;
+    let bytes = read_bounded_narinfo(narinfo)?;
+    let validated = trusted
+        .validate(store, bytes)
+        .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)?;
+    match storage.nar_matches(&validated) {
+        Ok(NarMatch::Match) => {}
+        Ok(NarMatch::Missing | NarMatch::Mismatch) => {
+            return Err(NarInfoReadFailure::PayloadUnavailable);
+        }
+        Err(_) => return Err(NarInfoReadFailure::InvalidOrUnreadable),
+    }
+    validated
+        .into_bytes()
+        .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)
+}
+
+fn read_bounded_narinfo(mut narinfo: impl Read) -> Result<Vec<u8>, NarInfoReadFailure> {
+    let mut bytes = Vec::new();
+    narinfo
+        .by_ref()
+        .take(MAX_NARINFO_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)?;
+    if bytes.len() as u64 > MAX_NARINFO_BYTES {
+        return Err(NarInfoReadFailure::InvalidOrUnreadable);
+    }
+    Ok(bytes)
 }
 
 fn record_narinfo_lookup(
@@ -217,7 +230,11 @@ fn requested_range(request: &Request, length: u64) -> RequestedRange {
         return RequestedRange::Invalid;
     }
 
-    let Some(specification) = header.value.as_str().strip_prefix("bytes=") else {
+    parse_range_value(header.value.as_str(), length)
+}
+
+fn parse_range_value(value: &str, length: u64) -> RequestedRange {
+    let Some(specification) = value.strip_prefix("bytes=") else {
         return RequestedRange::Invalid;
     };
     if specification.contains(',') {
@@ -226,26 +243,38 @@ fn requested_range(request: &Request, length: u64) -> RequestedRange {
     let Some((start, end)) = specification.split_once('-') else {
         return RequestedRange::Invalid;
     };
-    if start.is_empty() {
-        let Ok(suffix_length) = end.parse::<u64>() else {
-            return RequestedRange::Invalid;
-        };
-        if suffix_length == 0 || length == 0 {
-            return RequestedRange::Unsatisfiable;
-        }
-        let start = length.saturating_sub(suffix_length);
-        return RequestedRange::Partial {
-            start,
-            end: length - 1,
-        };
-    }
 
+    if start.is_empty() {
+        parse_suffix_range(end, length)
+    } else {
+        parse_starting_range(start, end, length)
+    }
+}
+
+fn parse_suffix_range(suffix: &str, length: u64) -> RequestedRange {
+    let Ok(suffix_length) = suffix.parse::<u64>() else {
+        return RequestedRange::Invalid;
+    };
+    if suffix_length == 0 || length == 0 {
+        return RequestedRange::Unsatisfiable;
+    }
+    RequestedRange::Partial {
+        start: length.saturating_sub(suffix_length),
+        end: length - 1,
+    }
+}
+
+fn parse_starting_range(start: &str, end: &str, length: u64) -> RequestedRange {
     let Ok(start) = start.parse::<u64>() else {
         return RequestedRange::Invalid;
     };
     if start >= length {
         return RequestedRange::Unsatisfiable;
     }
+    parse_range_end(start, end, length)
+}
+
+fn parse_range_end(start: u64, end: &str, length: u64) -> RequestedRange {
     let end = if end.is_empty() {
         length - 1
     } else {
@@ -283,85 +312,160 @@ fn respond_nar(
     let range = requested_range(&request, length);
     guard.record_nar_range_request(range.metric_outcome());
     match range {
-        RequestedRange::Full => {
-            let Ok(content_length) = usize::try_from(length) else {
-                record_nar_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
-                return internal_error(guard, request);
-            };
-            let opened = storage.open_nar_range(name, 0..length);
-            record_nar_open_outcome(guard, &opened, lookup_started);
-            let opened = match opened {
-                Ok(Some(opened)) => opened,
-                Ok(None) => return not_found(guard, request),
-                Err(_) => return internal_error(guard, request),
-            };
-            match opened.body {
-                NarReadBody::File(file) => {
-                    let response =
-                        nar_response(StatusCode::OK, content_length, visibility, io::empty());
-                    send_file_response(guard, request, response, file, 0, content_length as u64)
-                }
-                NarReadBody::Chunked(reader) => {
-                    let response = nar_response(StatusCode::OK, content_length, visibility, reader);
-                    send_response(guard, request, response)
-                }
-            }
-        }
-        RequestedRange::Partial { start, end } => {
-            let response_length = end - start + 1;
-            let Ok(content_length) = usize::try_from(response_length) else {
-                record_nar_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
-                return internal_error(guard, request);
-            };
-            let opened = storage.open_nar_range(name, start..end + 1);
-            record_nar_open_outcome(guard, &opened, lookup_started);
-            let opened = match opened {
-                Ok(Some(opened)) => opened,
-                Ok(None) => return not_found(guard, request),
-                Err(_) => return internal_error(guard, request),
-            };
-            match opened.body {
-                NarReadBody::File(file) => {
-                    let response = nar_response(
-                        StatusCode::PARTIAL_CONTENT,
-                        content_length,
-                        visibility,
-                        io::empty(),
-                    )
-                    .with_header(
-                        Header::owned("Content-Range", format!("bytes {start}-{end}/{length}"))
-                            .expect("range response header is valid"),
-                    );
-                    send_file_response(guard, request, response, file, start, response_length)
-                }
-                NarReadBody::Chunked(reader) => {
-                    let response = nar_response(
-                        StatusCode::PARTIAL_CONTENT,
-                        content_length,
-                        visibility,
-                        reader,
-                    )
-                    .with_header(
-                        Header::owned("Content-Range", format!("bytes {start}-{end}/{length}"))
-                            .expect("range response header is valid"),
-                    );
-                    send_response(guard, request, response)
-                }
-            }
-        }
+        RequestedRange::Full => respond_nar_bytes(
+            request,
+            storage,
+            name,
+            NarResponseRange::Full { length },
+            NarResponseContext {
+                guard,
+                visibility,
+                lookup_started,
+            },
+        ),
+        RequestedRange::Partial { start, end } => respond_nar_bytes(
+            request,
+            storage,
+            name,
+            NarResponseRange::Partial {
+                start,
+                end,
+                nar_length: length,
+            },
+            NarResponseContext {
+                guard,
+                visibility,
+                lookup_started,
+            },
+        ),
         RequestedRange::Unsatisfiable => {
-            record_nar_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
-            let response = Response::empty(StatusCode::RANGE_NOT_SATISFIABLE).with_header(
-                Header::owned("Content-Range", format!("bytes */{length}"))
-                    .expect("range response header is valid"),
-            );
-            send_response(guard, request, response)
+            respond_unsatisfiable_nar_range(request, length, guard, lookup_started)
         }
-        RequestedRange::Invalid => {
-            record_nar_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
-            send_response(guard, request, Response::empty(StatusCode::BAD_REQUEST))
+        RequestedRange::Invalid => respond_invalid_nar_range(request, guard, lookup_started),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NarResponseRange {
+    Full {
+        length: u64,
+    },
+    Partial {
+        start: u64,
+        end: u64,
+        nar_length: u64,
+    },
+}
+
+impl NarResponseRange {
+    fn byte_range(self) -> std::ops::Range<u64> {
+        match self {
+            Self::Full { length } => 0..length,
+            Self::Partial { start, end, .. } => start..end + 1,
         }
     }
+
+    fn content_length(self) -> u64 {
+        match self {
+            Self::Full { length } => length,
+            Self::Partial { start, end, .. } => end - start + 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NarResponseContext<'guard, 'metrics> {
+    guard: &'guard RequestGuard<'metrics>,
+    visibility: ReadVisibility,
+    lookup_started: Instant,
+}
+
+fn respond_nar_bytes(
+    request: Request,
+    storage: &Storage,
+    name: NarFileName,
+    response_range: NarResponseRange,
+    context: NarResponseContext<'_, '_>,
+) -> Option<TcpStream> {
+    let NarResponseContext {
+        guard,
+        visibility,
+        lookup_started,
+    } = context;
+    let range = response_range.byte_range();
+    let range_length = response_range.content_length();
+    let Ok(content_length) = usize::try_from(range_length) else {
+        record_nar_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+        return internal_error(guard, request);
+    };
+    let opened = storage.open_nar_range(name, range.clone());
+    record_nar_open_outcome(guard, &opened, lookup_started);
+    let opened = match opened {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return not_found(guard, request),
+        Err(_) => return internal_error(guard, request),
+    };
+    match opened.body {
+        NarReadBody::File(file) => {
+            let response =
+                nar_range_response(response_range, content_length, visibility, io::empty());
+            send_file_response(guard, request, response, file, range.start, range_length)
+        }
+        NarReadBody::Chunked(reader) => {
+            let response = nar_range_response(response_range, content_length, visibility, reader);
+            send_response(guard, request, response)
+        }
+    }
+}
+
+fn nar_range_response<R>(
+    response_range: NarResponseRange,
+    content_length: usize,
+    visibility: ReadVisibility,
+    body: R,
+) -> Response<R> {
+    match response_range {
+        NarResponseRange::Full { .. } => {
+            nar_response(StatusCode::OK, content_length, visibility, body)
+        }
+        NarResponseRange::Partial {
+            start,
+            end,
+            nar_length,
+        } => nar_response(
+            StatusCode::PARTIAL_CONTENT,
+            content_length,
+            visibility,
+            body,
+        )
+        .with_header(
+            Header::owned("Content-Range", format!("bytes {start}-{end}/{nar_length}"))
+                .expect("range response header is valid"),
+        ),
+    }
+}
+
+fn respond_unsatisfiable_nar_range(
+    request: Request,
+    nar_length: u64,
+    guard: &RequestGuard<'_>,
+    lookup_started: Instant,
+) -> Option<TcpStream> {
+    record_nar_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
+    let response = Response::empty(StatusCode::RANGE_NOT_SATISFIABLE).with_header(
+        Header::owned("Content-Range", format!("bytes */{nar_length}"))
+            .expect("range response header is valid"),
+    );
+    send_response(guard, request, response)
+}
+
+fn respond_invalid_nar_range(
+    request: Request,
+    guard: &RequestGuard<'_>,
+    lookup_started: Instant,
+) -> Option<TcpStream> {
+    record_nar_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
+    send_response(guard, request, Response::empty(StatusCode::BAD_REQUEST))
 }
 
 fn record_nar_open_outcome<T, E>(
@@ -568,77 +672,114 @@ fn respond_operator_route(
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
     match operator {
-        OperatorRoute::Health => match request.method() {
-            Method::Get | Method::Head => send_response(
-                guard,
-                request,
-                Response::from_string("ok\n")
-                    .with_status_code(StatusCode::OK)
-                    .with_header(header("Content-Type", "text/plain; charset=utf-8")),
-            ),
-            _ => method_not_allowed(guard, request, "GET, HEAD"),
-        },
-        OperatorRoute::Protected(operator) => {
-            match request.method() {
-                Method::Get | Method::Head => {}
-                _ => return method_not_allowed(guard, request, "GET, HEAD"),
-            }
-            if !authorizer.allows(&request, Permission::Read) {
-                metrics.auth_failure(false);
-                return unauthorized(guard, request);
-            }
-            let readiness = storage
-                .is_ready(min_free_bytes)
-                .unwrap_or(StorageReadiness::ProbeFailed);
-            match operator {
-                ProtectedOperatorRoute::Readiness => {
-                    let (status, body) = match readiness {
-                        StorageReadiness::Ready => (StatusCode::OK, "ready\n"),
-                        StorageReadiness::LowSpace
-                        | StorageReadiness::NoInodes
-                        | StorageReadiness::ReadOnly
-                        | StorageReadiness::ProbeFailed => {
-                            (StatusCode::SERVICE_UNAVAILABLE, "insufficient_space\n")
-                        }
-                    };
-                    send_response(
-                        guard,
-                        request,
-                        Response::from_string(body)
-                            .with_status_code(status)
-                            .with_header(header("Content-Type", "text/plain; charset=utf-8")),
-                    )
-                }
-                ProtectedOperatorRoute::Metrics => {
-                    metrics.set_temp_objects(storage.temporary_objects());
-                    let (capacity, staging_bytes) = storage
-                        .capacity_and_staging()
-                        .map(|(capacity, staging_bytes)| (Some(capacity), staging_bytes))
-                        .unwrap_or((None, 0));
-                    let mut snapshot = metrics.snapshot(
-                        readiness,
-                        capacity,
-                        storage.temporary_objects(),
-                        min_free_bytes,
-                        staging_bytes,
-                    );
-                    snapshot.storage_activity = storage.activity_snapshot();
-                    send_response(
-                        guard,
-                        request,
-                        Response::from_string(render_prometheus(&snapshot))
-                            .with_status_code(StatusCode::OK)
-                            .with_header(header(
-                                "Content-Type",
-                                "text/plain; version=0.0.4; charset=utf-8",
-                            ))
-                            .with_header(header("Cache-Control", "no-store"))
-                            .with_header(header("Vary", "Authorization")),
-                    )
-                }
-            }
+        OperatorRoute::Health => respond_health_request(request, guard),
+        OperatorRoute::Protected(operator) => respond_protected_operator(
+            operator,
+            request,
+            storage,
+            authorizer,
+            metrics,
+            min_free_bytes,
+            guard,
+        ),
+    }
+}
+
+fn respond_health_request(request: Request, guard: &RequestGuard<'_>) -> Option<TcpStream> {
+    match request.method() {
+        Method::Get | Method::Head => send_response(
+            guard,
+            request,
+            Response::from_string("ok\n")
+                .with_status_code(StatusCode::OK)
+                .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+        ),
+        _ => method_not_allowed(guard, request, "GET, HEAD"),
+    }
+}
+
+fn respond_protected_operator(
+    operator: ProtectedOperatorRoute,
+    request: Request,
+    storage: &Storage,
+    authorizer: &Authorizer,
+    metrics: &Metrics,
+    min_free_bytes: u64,
+    guard: &RequestGuard<'_>,
+) -> Option<TcpStream> {
+    match request.method() {
+        Method::Get | Method::Head => {}
+        _ => return method_not_allowed(guard, request, "GET, HEAD"),
+    }
+    if !authorizer.allows(&request, Permission::Read) {
+        metrics.auth_failure(false);
+        return unauthorized(guard, request);
+    }
+    let readiness = storage
+        .is_ready(min_free_bytes)
+        .unwrap_or(StorageReadiness::ProbeFailed);
+    match operator {
+        ProtectedOperatorRoute::Readiness => respond_readiness(request, readiness, guard),
+        ProtectedOperatorRoute::Metrics => {
+            respond_metrics(request, storage, metrics, readiness, min_free_bytes, guard)
         }
     }
+}
+
+fn respond_readiness(
+    request: Request,
+    readiness: StorageReadiness,
+    guard: &RequestGuard<'_>,
+) -> Option<TcpStream> {
+    let (status, body) = match readiness {
+        StorageReadiness::Ready => (StatusCode::OK, "ready\n"),
+        StorageReadiness::LowSpace
+        | StorageReadiness::NoInodes
+        | StorageReadiness::ReadOnly
+        | StorageReadiness::ProbeFailed => {
+            (StatusCode::SERVICE_UNAVAILABLE, "insufficient_space\n")
+        }
+    };
+    send_response(
+        guard,
+        request,
+        Response::from_string(body)
+            .with_status_code(status)
+            .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+    )
+}
+
+fn respond_metrics(
+    request: Request,
+    storage: &Storage,
+    metrics: &Metrics,
+    readiness: StorageReadiness,
+    min_free_bytes: u64,
+    guard: &RequestGuard<'_>,
+) -> Option<TcpStream> {
+    let temporary_objects = storage.temporary_objects();
+    metrics.set_temp_objects(temporary_objects);
+    let (capacity, staging_bytes) = storage
+        .capacity_and_staging()
+        .map(|(capacity, staging_bytes)| (Some(capacity), staging_bytes))
+        .unwrap_or((None, 0));
+    let mut snapshot = metrics.snapshot(
+        readiness,
+        capacity,
+        temporary_objects,
+        min_free_bytes,
+        staging_bytes,
+    );
+    snapshot.storage_activity = storage.activity_snapshot();
+    let response = Response::from_string(render_prometheus(&snapshot))
+        .with_status_code(StatusCode::OK)
+        .with_header(header(
+            "Content-Type",
+            "text/plain; version=0.0.4; charset=utf-8",
+        ))
+        .with_header(header("Cache-Control", "no-store"))
+        .with_header(header("Vary", "Authorization"));
+    send_response(guard, request, response)
 }
 
 fn respond_cache_route(
@@ -694,7 +835,8 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        CacheRoute, RouteMatch, invalid_route_status, record_nar_open_outcome, request_route,
+        CacheRoute, RequestedRange, RouteMatch, invalid_route_status, parse_range_value,
+        record_nar_open_outcome, request_route,
     };
     use crate::{
         http_server::{Method, StatusCode},
@@ -719,6 +861,33 @@ mod tests {
         assert_eq!(lookup.hits, 0);
         assert_eq!(lookup.failures, 1);
         assert_eq!(lookup.hit_ratio, None);
+    }
+
+    #[test]
+    fn byte_range_forms_have_explicit_valid_invalid_and_unsatisfiable_results() {
+        let cases = [
+            ("bytes=2-5", RequestedRange::Partial { start: 2, end: 5 }),
+            ("bytes=2-", RequestedRange::Partial { start: 2, end: 9 }),
+            ("bytes=-3", RequestedRange::Partial { start: 7, end: 9 }),
+            ("bytes=-0", RequestedRange::Unsatisfiable),
+            ("bytes=10-", RequestedRange::Unsatisfiable),
+            ("bytes=5-2", RequestedRange::Unsatisfiable),
+            ("items=2-5", RequestedRange::Invalid),
+            ("bytes=2-5,7-8", RequestedRange::Invalid),
+            ("bytes=two-five", RequestedRange::Invalid),
+        ];
+
+        for (header_value, expected) in cases {
+            assert_eq!(
+                parse_range_value(header_value, 10),
+                expected,
+                "{header_value}"
+            );
+        }
+        assert_eq!(
+            parse_range_value("bytes=-3", 0),
+            RequestedRange::Unsatisfiable
+        );
     }
 
     #[test]

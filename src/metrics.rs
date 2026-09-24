@@ -429,20 +429,8 @@ impl Metrics {
         min_free_bytes: u64,
         staging_bytes: u64,
     ) -> StatsSnapshot {
-        let narinfo_get = lookup_snapshot(&self.narinfo_get_lookups);
-        let narinfo_head = lookup_snapshot(&self.narinfo_head_lookups);
         let traffic_bytes_overflowed = self.traffic_bytes_overflowed.load(Ordering::Relaxed);
-        let traffic_rates = if traffic_bytes_overflowed {
-            RecentTrafficRates {
-                one_minute: None,
-                five_minutes: None,
-            }
-        } else {
-            self.traffic_samples
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .rates()
-        };
+        let traffic_rates = self.recent_traffic_rates(traffic_bytes_overflowed);
         let process_resources = self
             .process_sample
             .lock()
@@ -477,63 +465,23 @@ impl Metrics {
             cache: CacheStats {
                 nar_get: lookup_snapshot(&self.nar_get_lookups),
                 nar_head: lookup_snapshot(&self.nar_head_lookups),
-                narinfo_get,
-                narinfo_head,
+                narinfo_get: lookup_snapshot(&self.narinfo_get_lookups),
+                narinfo_head: lookup_snapshot(&self.narinfo_head_lookups),
             },
             nar_range_requests: NarRangeStats {
                 get: nar_range_method_snapshot(&self.nar_range_requests, 0),
                 head: nar_range_method_snapshot(&self.nar_range_requests, 1),
             },
             latency: self.latency_snapshot(),
-            traffic: TrafficStats {
-                requests_in_flight: self.requests_in_flight.load(Ordering::Relaxed),
-                uploads_in_flight: self.uploads_in_flight.load(Ordering::Relaxed),
-                declared_upload_bytes: self.declared_upload_bytes.load(Ordering::Relaxed),
-                received_upload_body_bytes: self.received_upload_bytes.load(Ordering::Relaxed),
-                response_body_bytes: self.bytes_out.load(Ordering::Relaxed),
-                completed_responses: self.completed_responses.load(Ordering::Relaxed),
-                aborted_responses: self.aborted_responses.load(Ordering::Relaxed),
-                cumulative_byte_counters_overflowed: traffic_bytes_overflowed,
-                recent_rates: traffic_rates,
-            },
-            reliability: ReliabilityStats {
-                auth_read_failures: self.auth_read_failures.load(Ordering::Relaxed),
-                auth_write_failures: self.auth_write_failures.load(Ordering::Relaxed),
-                validation_body_failures: self.validation_body_failures.load(Ordering::Relaxed),
-                validation_nar_failures: self.validation_nar_failures.load(Ordering::Relaxed),
-                validation_narinfo_failures: self
-                    .validation_narinfo_failures
-                    .load(Ordering::Relaxed),
-                capacity_no_space: self.capacity_no_space.load(Ordering::Relaxed),
-                capacity_quota: self.capacity_quota.load(Ordering::Relaxed),
-                capacity_inodes: self.capacity_inodes.load(Ordering::Relaxed),
-                capacity_read_only: self.capacity_read_only.load(Ordering::Relaxed),
-            },
-            pressure: PressureStats {
+            traffic: self.traffic_stats(traffic_bytes_overflowed, traffic_rates),
+            reliability: self.reliability_stats(),
+            pressure: self.pressure_stats(
                 readiness,
+                capacity,
                 temporary_objects,
-                connections_in_flight: self.connections_in_flight.load(Ordering::Relaxed),
-                connections_limit: self.connections_limit.load(Ordering::Relaxed),
-                request_queue_depth: self.queued_connections.load(Ordering::Relaxed),
-                request_queue_capacity: self.request_queue_capacity.load(Ordering::Relaxed),
-                active_publication_workers: self.active_publication_workers.load(Ordering::Relaxed),
-                publication_worker_limit: self.publication_worker_limit.load(Ordering::Relaxed),
-                publication_queue_depth: self.publication_queue_depth.load(Ordering::Relaxed),
-                publication_queue_capacity: self.publication_queue_capacity.load(Ordering::Relaxed),
-                capacity: capacity.map(|capacity| CapacityStats {
-                    total_bytes: capacity.total_bytes,
-                    available_bytes: capacity.available_bytes,
-                    total_inodes: capacity.total_inodes,
-                    available_inodes: capacity.available_inodes,
-                    read_only: capacity.read_only,
-                    configured_min_free_bytes: min_free_bytes,
-                    outstanding_staging_bytes: staging_bytes,
-                    estimated_headroom_bytes: capacity
-                        .available_bytes
-                        .saturating_sub(min_free_bytes)
-                        .saturating_sub(staging_bytes),
-                }),
-            },
+                min_free_bytes,
+                staging_bytes,
+            ),
             inventory: population.last_complete,
             inventory_attempt: population.last_attempt,
             filesystem,
@@ -541,27 +489,121 @@ impl Metrics {
         }
     }
 
+    fn recent_traffic_rates(&self, counters_overflowed: bool) -> RecentTrafficRates {
+        match counters_overflowed {
+            true => RecentTrafficRates {
+                one_minute: None,
+                five_minutes: None,
+            },
+            false => self
+                .traffic_samples
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .rates(),
+        }
+    }
+
+    fn traffic_stats(
+        &self,
+        counters_overflowed: bool,
+        recent_rates: RecentTrafficRates,
+    ) -> TrafficStats {
+        TrafficStats {
+            requests_in_flight: self.requests_in_flight.load(Ordering::Relaxed),
+            uploads_in_flight: self.uploads_in_flight.load(Ordering::Relaxed),
+            declared_upload_bytes: self.declared_upload_bytes.load(Ordering::Relaxed),
+            received_upload_body_bytes: self.received_upload_bytes.load(Ordering::Relaxed),
+            response_body_bytes: self.bytes_out.load(Ordering::Relaxed),
+            completed_responses: self.completed_responses.load(Ordering::Relaxed),
+            aborted_responses: self.aborted_responses.load(Ordering::Relaxed),
+            cumulative_byte_counters_overflowed: counters_overflowed,
+            recent_rates,
+        }
+    }
+
+    fn reliability_stats(&self) -> ReliabilityStats {
+        ReliabilityStats {
+            auth_read_failures: self.auth_read_failures.load(Ordering::Relaxed),
+            auth_write_failures: self.auth_write_failures.load(Ordering::Relaxed),
+            validation_body_failures: self.validation_body_failures.load(Ordering::Relaxed),
+            validation_nar_failures: self.validation_nar_failures.load(Ordering::Relaxed),
+            validation_narinfo_failures: self.validation_narinfo_failures.load(Ordering::Relaxed),
+            capacity_no_space: self.capacity_no_space.load(Ordering::Relaxed),
+            capacity_quota: self.capacity_quota.load(Ordering::Relaxed),
+            capacity_inodes: self.capacity_inodes.load(Ordering::Relaxed),
+            capacity_read_only: self.capacity_read_only.load(Ordering::Relaxed),
+        }
+    }
+
+    fn pressure_stats(
+        &self,
+        readiness: StorageReadiness,
+        capacity: Option<StorageCapacity>,
+        temporary_objects: u64,
+        min_free_bytes: u64,
+        staging_bytes: u64,
+    ) -> PressureStats {
+        PressureStats {
+            readiness,
+            temporary_objects,
+            connections_in_flight: self.connections_in_flight.load(Ordering::Relaxed),
+            connections_limit: self.connections_limit.load(Ordering::Relaxed),
+            request_queue_depth: self.queued_connections.load(Ordering::Relaxed),
+            request_queue_capacity: self.request_queue_capacity.load(Ordering::Relaxed),
+            active_publication_workers: self.active_publication_workers.load(Ordering::Relaxed),
+            publication_worker_limit: self.publication_worker_limit.load(Ordering::Relaxed),
+            publication_queue_depth: self.publication_queue_depth.load(Ordering::Relaxed),
+            publication_queue_capacity: self.publication_queue_capacity.load(Ordering::Relaxed),
+            capacity: capacity.map(|capacity| {
+                CapacityStats::from_storage(capacity, min_free_bytes, staging_bytes)
+            }),
+        }
+    }
+
     fn http_request_counts(&self) -> Vec<HttpRequestCount> {
         METHODS
             .into_iter()
-            .flat_map(|method| {
-                ROUTES.into_iter().flat_map(move |route| {
-                    STATUS_CODES.into_iter().enumerate().filter_map(
-                        move |(status_index, (status_code, _))| {
-                            let count = self.requests
-                                [request_index(method.index(), route.index(), status_index)]
-                            .load(Ordering::Relaxed);
-                            (count != 0).then(|| HttpRequestCount {
-                                method: method.label().to_owned(),
-                                route: route.label().to_owned(),
-                                status_code: status_code.to_owned(),
-                                count,
-                            })
-                        },
-                    )
-                })
-            })
+            .flat_map(|method| self.request_counts_for_method(method))
             .collect()
+    }
+
+    fn request_counts_for_method(
+        &self,
+        method: RequestMethod,
+    ) -> impl Iterator<Item = HttpRequestCount> + '_ {
+        ROUTES
+            .into_iter()
+            .flat_map(move |route| self.request_counts_for_route(method, route))
+    }
+
+    fn request_counts_for_route(
+        &self,
+        method: RequestMethod,
+        route: RequestRoute,
+    ) -> impl Iterator<Item = HttpRequestCount> + '_ {
+        STATUS_CODES
+            .into_iter()
+            .enumerate()
+            .filter_map(move |(status_index, (status_code, _))| {
+                self.request_count(method, route, status_index, status_code)
+            })
+    }
+
+    fn request_count(
+        &self,
+        method: RequestMethod,
+        route: RequestRoute,
+        status_index: usize,
+        status_code: &'static str,
+    ) -> Option<HttpRequestCount> {
+        let count = self.requests[request_index(method.index(), route.index(), status_index)]
+            .load(Ordering::Relaxed);
+        (count != 0).then(|| HttpRequestCount {
+            method: method.label().to_owned(),
+            route: route.label().to_owned(),
+            status_code: status_code.to_owned(),
+            count,
+        })
     }
 
     pub fn configure_pressure_limits(&self, connections: u64, workers: u64) {
@@ -693,39 +735,7 @@ impl Metrics {
             .filesystem_sample
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *previous = match result {
-            Ok((sampled_at, value)) if now.saturating_sub(sampled_at) <= ZFS_SAMPLE_MAX_AGE => {
-                SampleState::Measured {
-                    sampled_at_unix_seconds: sampled_at,
-                    value,
-                }
-            }
-            Ok((sampled_at, value)) => SampleState::Stale {
-                sampled_at_unix_seconds: sampled_at,
-                value,
-                reason: "sample_too_old".to_owned(),
-            },
-            Err(reason) => match &*previous {
-                SampleState::Measured {
-                    sampled_at_unix_seconds,
-                    value,
-                }
-                | SampleState::Stale {
-                    sampled_at_unix_seconds,
-                    value,
-                    ..
-                } => SampleState::Stale {
-                    sampled_at_unix_seconds: *sampled_at_unix_seconds,
-                    value: value.clone(),
-                    reason: reason.to_owned(),
-                },
-                SampleState::NeverSampled | SampleState::Unavailable { .. } => {
-                    SampleState::Unavailable {
-                        reason: reason.to_owned(),
-                    }
-                }
-            },
-        };
+        *previous = filesystem_sample_after_read(&previous, result, now);
     }
 
     pub fn sample_maintenance_sidecar(&self, root: &Path) {
@@ -745,44 +755,18 @@ impl Metrics {
     pub fn record_population_scan(
         &self,
         backend: StorageBackend,
-        counts: Result<PopulationCounts, ()>,
+        result: PopulationScanResult,
         started_at_unix_seconds: u64,
         elapsed_seconds: f64,
     ) {
         let completed_at_unix_seconds = unix_seconds_now();
-        let (complete_sample, attempt) = match counts {
-            Ok(counts) => {
-                let quality = PopulationQuality::from_counts(&counts);
-                let coverage = PopulationScanCoverage::from_counts(&counts);
-                let complete_sample = match quality {
-                    PopulationQuality::Complete => Ok(PopulationStats::from_scan(backend, counts)),
-                    PopulationQuality::ChangedDuringScan | PopulationQuality::EntryErrors => {
-                        Err(())
-                    }
-                    PopulationQuality::Failed => Err(()),
-                };
-                (
-                    complete_sample,
-                    PopulationAttempt {
-                        started_at_unix_seconds,
-                        completed_at_unix_seconds,
-                        elapsed_seconds,
-                        quality,
-                        coverage: Some(coverage),
-                    },
-                )
-            }
-            Err(()) => (
-                Err(()),
-                PopulationAttempt {
-                    started_at_unix_seconds,
-                    completed_at_unix_seconds,
-                    elapsed_seconds,
-                    quality: PopulationQuality::Failed,
-                    coverage: None,
-                },
-            ),
-        };
+        let (complete_sample, attempt) = population_scan_update(
+            backend,
+            result,
+            started_at_unix_seconds,
+            completed_at_unix_seconds,
+            elapsed_seconds,
+        );
         let mut samples = self
             .population_sample
             .lock()
@@ -930,15 +914,123 @@ impl Metrics {
     }
 }
 
+fn population_scan_update(
+    backend: StorageBackend,
+    result: PopulationScanResult,
+    started_at_unix_seconds: u64,
+    completed_at_unix_seconds: u64,
+    elapsed_seconds: f64,
+) -> (Result<PopulationStats, ()>, PopulationAttempt) {
+    match result {
+        Ok(counts) => completed_population_scan(
+            backend,
+            counts,
+            started_at_unix_seconds,
+            completed_at_unix_seconds,
+            elapsed_seconds,
+        ),
+        Err(PopulationScanFailure) => failed_population_scan(
+            started_at_unix_seconds,
+            completed_at_unix_seconds,
+            elapsed_seconds,
+        ),
+    }
+}
+
+pub type PopulationScanResult = Result<PopulationCounts, PopulationScanFailure>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct PopulationScanFailure;
+
+fn completed_population_scan(
+    backend: StorageBackend,
+    counts: PopulationCounts,
+    started_at_unix_seconds: u64,
+    completed_at_unix_seconds: u64,
+    elapsed_seconds: f64,
+) -> (Result<PopulationStats, ()>, PopulationAttempt) {
+    let quality = PopulationQuality::from_counts(&counts);
+    let complete_sample = match quality {
+        PopulationQuality::Complete => Ok(PopulationStats::from_scan(backend, counts)),
+        PopulationQuality::ChangedDuringScan
+        | PopulationQuality::EntryErrors
+        | PopulationQuality::Failed => Err(()),
+    };
+    let attempt = PopulationAttempt {
+        started_at_unix_seconds,
+        completed_at_unix_seconds,
+        elapsed_seconds,
+        quality,
+        coverage: Some(PopulationScanCoverage::from_counts(&counts)),
+    };
+    (complete_sample, attempt)
+}
+
+fn failed_population_scan(
+    started_at_unix_seconds: u64,
+    completed_at_unix_seconds: u64,
+    elapsed_seconds: f64,
+) -> (Result<PopulationStats, ()>, PopulationAttempt) {
+    (
+        Err(()),
+        PopulationAttempt {
+            started_at_unix_seconds,
+            completed_at_unix_seconds,
+            elapsed_seconds,
+            quality: PopulationQuality::Failed,
+            coverage: None,
+        },
+    )
+}
+
+fn filesystem_sample_after_read(
+    previous: &SampleState<FilesystemStats>,
+    result: Result<(u64, FilesystemStats), &'static str>,
+    now: u64,
+) -> SampleState<FilesystemStats> {
+    match result {
+        Ok((sampled_at, value)) if now.saturating_sub(sampled_at) <= ZFS_SAMPLE_MAX_AGE => {
+            SampleState::Measured {
+                sampled_at_unix_seconds: sampled_at,
+                value,
+            }
+        }
+        Ok((sampled_at, value)) => SampleState::Stale {
+            sampled_at_unix_seconds: sampled_at,
+            value,
+            reason: "sample_too_old".to_owned(),
+        },
+        Err(reason) => retain_or_explain_filesystem_sample(previous, reason),
+    }
+}
+
+fn retain_or_explain_filesystem_sample(
+    previous: &SampleState<FilesystemStats>,
+    reason: &str,
+) -> SampleState<FilesystemStats> {
+    match previous {
+        SampleState::Measured {
+            sampled_at_unix_seconds,
+            value,
+        }
+        | SampleState::Stale {
+            sampled_at_unix_seconds,
+            value,
+            ..
+        } => SampleState::Stale {
+            sampled_at_unix_seconds: *sampled_at_unix_seconds,
+            value: value.clone(),
+            reason: reason.to_owned(),
+        },
+        SampleState::NeverSampled | SampleState::Unavailable { .. } => SampleState::Unavailable {
+            reason: reason.to_owned(),
+        },
+    }
+}
+
 pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
     let mut output = String::new();
-    output.push_str("# HELP narjar_http_requests_total HTTP requests by method, validated route, and response status code.\n# TYPE narjar_http_requests_total counter\n");
-    for request in &snapshot.http_requests {
-        output.push_str(&format!(
-            "narjar_http_requests_total{{method=\"{}\",route=\"{}\",status=\"{}\"}} {}\n",
-            request.method, request.route, request.status_code, request.count
-        ));
-    }
+    append_http_request_metrics(&mut output, snapshot);
     append_admission_and_publication_outcomes(
         &mut output,
         &snapshot.connections,
@@ -946,8 +1038,36 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
         &snapshot.publication_outcomes,
     );
     append_storage_activity_metrics(&mut output, snapshot.storage_activity);
-    let traffic = &snapshot.traffic;
-    let reliability = &snapshot.reliability;
+    append_process_lifecycle_metrics(&mut output, snapshot);
+    append_traffic_and_reliability_metrics(&mut output, snapshot);
+    append_readiness_reason(&mut output, snapshot.pressure.readiness);
+    append_pressure_metrics(&mut output, snapshot);
+    append_cache_lookup_metrics(&mut output, &snapshot.cache, &snapshot.nar_range_requests);
+    append_capacity_metrics(&mut output, snapshot.pressure.capacity.as_ref());
+    append_process_metrics(&mut output, &snapshot.process.resources);
+    append_latency_metrics(&mut output, &snapshot.latency);
+    append_traffic_rate_metrics(&mut output, &snapshot.traffic.recent_rates);
+    append_population_metrics(
+        &mut output,
+        &snapshot.inventory,
+        snapshot.inventory_attempt.as_ref(),
+    );
+    append_filesystem_metrics(&mut output, &snapshot.filesystem);
+    append_maintenance_metrics(&mut output, &snapshot.maintenance);
+    output
+}
+
+fn append_http_request_metrics(output: &mut String, snapshot: &StatsSnapshot) {
+    output.push_str("# HELP narjar_http_requests_total HTTP requests by method, validated route, and response status code.\n# TYPE narjar_http_requests_total counter\n");
+    for request in &snapshot.http_requests {
+        output.push_str(&format!(
+            "narjar_http_requests_total{{method=\"{}\",route=\"{}\",status=\"{}\"}} {}\n",
+            request.method, request.route, request.status_code, request.count
+        ));
+    }
+}
+
+fn append_process_lifecycle_metrics(output: &mut String, snapshot: &StatsSnapshot) {
     output.push_str(&format!(
         "# HELP narjar_stats_snapshot_timestamp_seconds Unix time when this exposition snapshot was rendered.\n# TYPE narjar_stats_snapshot_timestamp_seconds gauge\nnarjar_stats_snapshot_timestamp_seconds {}\n\
          # HELP narjar_process_start_time_seconds Unix time when this process started.\n# TYPE narjar_process_start_time_seconds gauge\nnarjar_process_start_time_seconds {}\n\
@@ -956,6 +1076,11 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
         snapshot.process.started_at_unix_seconds,
         snapshot.process.uptime_seconds,
     ));
+}
+
+fn append_traffic_and_reliability_metrics(output: &mut String, snapshot: &StatsSnapshot) {
+    let traffic = &snapshot.traffic;
+    let reliability = &snapshot.reliability;
     output.push_str(&format!(
         "# HELP narjar_http_upload_declared_bytes_total Declared upload body bytes.\n# TYPE narjar_http_upload_declared_bytes_total counter\nnarjar_http_upload_declared_bytes_total {}\n\
          # HELP narjar_http_upload_received_bytes_total Upload body bytes actually read.\n# TYPE narjar_http_upload_received_bytes_total counter\nnarjar_http_upload_received_bytes_total {}\n\
@@ -990,10 +1115,11 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
         "# HELP narjar_traffic_byte_counters_overflowed Whether cumulative traffic byte counters saturated; recent byte rates are omitted when true.\n# TYPE narjar_traffic_byte_counters_overflowed gauge\nnarjar_traffic_byte_counters_overflowed {}\n",
         u8::from(traffic.cumulative_byte_counters_overflowed),
     ));
-    append_readiness_reason(&mut output, snapshot.pressure.readiness);
-    output.push_str(
-        "# HELP narjar_cache_lookup_outcomes_total Validated cache object lookup outcomes.\n# TYPE narjar_cache_lookup_outcomes_total counter\n",
-    );
+}
+
+fn append_pressure_metrics(output: &mut String, snapshot: &StatsSnapshot) {
+    let traffic = &snapshot.traffic;
+    let pressure = &snapshot.pressure;
     output.push_str(&format!(
         "# HELP narjar_responses_completed_total Responses whose full body was written.\n# TYPE narjar_responses_completed_total counter\nnarjar_responses_completed_total {}\n\
          # HELP narjar_responses_aborted_total Responses that did not finish writing.\n# TYPE narjar_responses_aborted_total counter\nnarjar_responses_aborted_total {}\n\
@@ -1005,25 +1131,32 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
          # HELP narjar_publication_workers_limit Configured publication worker count.\n# TYPE narjar_publication_workers_limit gauge\nnarjar_publication_workers_limit {}\n\
          # HELP narjar_publication_queue_capacity Publication worker queue capacity.\n# TYPE narjar_publication_queue_capacity gauge\nnarjar_publication_queue_capacity {}\n",
         traffic.completed_responses, traffic.aborted_responses,
-        snapshot.pressure.connections_in_flight, snapshot.pressure.connections_limit,
-        snapshot.pressure.request_queue_depth, snapshot.pressure.request_queue_capacity,
-        snapshot.pressure.active_publication_workers,
-        snapshot.pressure.publication_worker_limit,
-        snapshot.pressure.publication_queue_capacity,
+        pressure.connections_in_flight, pressure.connections_limit,
+        pressure.request_queue_depth, pressure.request_queue_capacity,
+        pressure.active_publication_workers,
+        pressure.publication_worker_limit,
+        pressure.publication_queue_capacity,
     ));
-    append_lookup_metrics(&mut output, "nar", "GET", &snapshot.cache.nar_get);
-    append_lookup_metrics(&mut output, "nar", "HEAD", &snapshot.cache.nar_head);
-    append_lookup_metrics(&mut output, "narinfo", "GET", &snapshot.cache.narinfo_get);
-    append_lookup_metrics(&mut output, "narinfo", "HEAD", &snapshot.cache.narinfo_head);
-    append_nar_range_metrics(&mut output, &snapshot.nar_range_requests);
+}
+
+fn append_cache_lookup_metrics(output: &mut String, cache: &CacheStats, ranges: &NarRangeStats) {
+    output.push_str(
+        "# HELP narjar_cache_lookup_outcomes_total Validated cache object lookup outcomes.\n# TYPE narjar_cache_lookup_outcomes_total counter\n",
+    );
+    for (object, method, lookup) in cache.lookups() {
+        append_lookup_metrics(output, object, method, lookup);
+    }
+    append_nar_range_metrics(output, ranges);
     output.push_str(
         "# HELP narjar_cache_lookup_hit_ratio Successful lookups divided by successful lookups plus genuine misses. Failures are excluded.\n# TYPE narjar_cache_lookup_hit_ratio gauge\n# HELP narjar_cache_lookup_failure_ratio Failed lookups divided by all lookup decisions.\n# TYPE narjar_cache_lookup_failure_ratio gauge\n",
     );
-    append_lookup_ratios(&mut output, "nar", "GET", &snapshot.cache.nar_get);
-    append_lookup_ratios(&mut output, "nar", "HEAD", &snapshot.cache.nar_head);
-    append_lookup_ratios(&mut output, "narinfo", "GET", &snapshot.cache.narinfo_get);
-    append_lookup_ratios(&mut output, "narinfo", "HEAD", &snapshot.cache.narinfo_head);
-    if let Some(capacity) = &snapshot.pressure.capacity {
+    for (object, method, lookup) in cache.lookups() {
+        append_lookup_ratios(output, object, method, lookup);
+    }
+}
+
+fn append_capacity_metrics(output: &mut String, capacity: Option<&CapacityStats>) {
+    if let Some(capacity) = capacity {
         output.push_str(&format!(
             "# HELP narjar_storage_capacity_bytes Destination filesystem bytes.\n# TYPE narjar_storage_capacity_bytes gauge\nnarjar_storage_capacity_bytes{{kind=\"total\"}} {}\nnarjar_storage_capacity_bytes{{kind=\"available\"}} {}\n\
              # HELP narjar_storage_capacity_inodes Destination filesystem inodes.\n# TYPE narjar_storage_capacity_inodes gauge\nnarjar_storage_capacity_inodes{{kind=\"total\"}} {}\nnarjar_storage_capacity_inodes{{kind=\"available\"}} {}\n\
@@ -1037,17 +1170,6 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
             capacity.estimated_headroom_bytes,
         ));
     }
-    append_process_metrics(&mut output, &snapshot.process.resources);
-    append_latency_metrics(&mut output, &snapshot.latency);
-    append_traffic_rate_metrics(&mut output, &snapshot.traffic.recent_rates);
-    append_population_metrics(
-        &mut output,
-        &snapshot.inventory,
-        snapshot.inventory_attempt.as_ref(),
-    );
-    append_filesystem_metrics(&mut output, &snapshot.filesystem);
-    append_maintenance_metrics(&mut output, &snapshot.maintenance);
-    output
 }
 
 fn append_maintenance_metrics(output: &mut String, sample: &SampleState<maintenance::Snapshot>) {
@@ -1696,27 +1818,10 @@ fn append_population_metrics(
     output.push_str(
         "# HELP narjar_cache_population_sample_available Whether a complete cache population scan is available.\n# TYPE narjar_cache_population_sample_available gauge\n# HELP narjar_cache_population_refresh_failed Whether the most recent population refresh was incomplete or failed.\n# TYPE narjar_cache_population_refresh_failed gauge\n",
     );
-    let previous_complete = match sample {
-        SampleState::Measured {
-            sampled_at_unix_seconds,
-            value,
-        } => Some((*sampled_at_unix_seconds, value, "measured")),
-        SampleState::Stale {
-            sampled_at_unix_seconds,
-            value,
-            ..
-        } => Some((*sampled_at_unix_seconds, value, "stale")),
-        SampleState::NeverSampled | SampleState::Unavailable { .. } => None,
-    };
-    let sample_state = match sample {
-        SampleState::Measured { .. } => Some("measured"),
-        SampleState::Stale { .. } => Some("stale"),
-        SampleState::NeverSampled => None,
-        SampleState::Unavailable { .. } => Some("unavailable"),
-    };
+    let sample = PopulationSampleView::from(sample);
     let refresh_failed =
         attempt.is_some_and(|attempt| attempt.quality != PopulationQuality::Complete);
-    match sample_state {
+    match sample.availability_label() {
         Some(state) => output.push_str(&format!(
             "narjar_cache_population_sample_available{{state=\"{state}\"}} 1\n"
         )),
@@ -1727,20 +1832,95 @@ fn append_population_metrics(
         u8::from(refresh_failed),
     ));
     append_population_attempt_metrics(output, attempt);
-    let Some((sampled_at, population, state)) = previous_complete else {
+    let Some((sampled_at, population, state)) = sample.last_complete() else {
         return;
     };
+    append_population_sample_timestamps(output, sampled_at);
+    append_population_file_categories(output, population, state);
+    append_population_total_bytes(output, population, state);
+    append_population_narinfo_counts(output, population, state);
+    append_chunked_population_metrics(output, population.chunked.as_ref(), state);
+}
+
+#[derive(Clone, Copy)]
+enum PopulationSampleView<'a> {
+    NeverSampled,
+    Unavailable,
+    Measured {
+        sampled_at: u64,
+        population: &'a PopulationStats,
+    },
+    Stale {
+        sampled_at: u64,
+        population: &'a PopulationStats,
+    },
+}
+
+impl<'a> From<&'a SampleState<PopulationStats>> for PopulationSampleView<'a> {
+    fn from(sample: &'a SampleState<PopulationStats>) -> Self {
+        match sample {
+            SampleState::NeverSampled => Self::NeverSampled,
+            SampleState::Unavailable { .. } => Self::Unavailable,
+            SampleState::Measured {
+                sampled_at_unix_seconds,
+                value,
+            } => Self::Measured {
+                sampled_at: *sampled_at_unix_seconds,
+                population: value,
+            },
+            SampleState::Stale {
+                sampled_at_unix_seconds,
+                value,
+                ..
+            } => Self::Stale {
+                sampled_at: *sampled_at_unix_seconds,
+                population: value,
+            },
+        }
+    }
+}
+
+impl<'a> PopulationSampleView<'a> {
+    const fn availability_label(self) -> Option<&'static str> {
+        match self {
+            Self::NeverSampled => None,
+            Self::Unavailable => Some("unavailable"),
+            Self::Measured { .. } => Some("measured"),
+            Self::Stale { .. } => Some("stale"),
+        }
+    }
+
+    const fn last_complete(self) -> Option<(u64, &'a PopulationStats, &'static str)> {
+        match self {
+            Self::Measured {
+                sampled_at,
+                population,
+            } => Some((sampled_at, population, "measured")),
+            Self::Stale {
+                sampled_at,
+                population,
+            } => Some((sampled_at, population, "stale")),
+            Self::NeverSampled | Self::Unavailable => None,
+        }
+    }
+}
+
+fn append_population_sample_timestamps(output: &mut String, sampled_at: u64) {
     output.push_str(&format!(
         "# HELP narjar_cache_population_sample_timestamp_seconds Completion time of the last complete population scan.\n# TYPE narjar_cache_population_sample_timestamp_seconds gauge\nnarjar_cache_population_sample_timestamp_seconds {sampled_at}\n\
-         # HELP narjar_cache_population_sample_age_seconds Age of the last completed population scan.\n# TYPE narjar_cache_population_sample_age_seconds gauge\nnarjar_cache_population_sample_age_seconds {}\n\
-         # HELP narjar_cache_population_files Observed files by fixed storage category.\n# TYPE narjar_cache_population_files gauge\n\
-         # HELP narjar_cache_population_apparent_bytes Sum of observed file lengths by category.\n# TYPE narjar_cache_population_apparent_bytes gauge\n\
-         # HELP narjar_cache_population_logical_nars Distinct structurally valid canonical NAR manifests.\n# TYPE narjar_cache_population_logical_nars gauge\n\
-         # HELP narjar_cache_population_logical_nar_bytes Sum of logical NAR sizes in valid chunk manifests.\n# TYPE narjar_cache_population_logical_nar_bytes gauge\n\
-         # HELP narjar_cache_population_narinfo_entries Narinfo pathname outcomes from the last complete population scan.\n# TYPE narjar_cache_population_narinfo_entries gauge\
-         # HELP narjar_cache_population_narinfo_claimed_nar_bytes Sum of valid narinfo NarSize claims, counted once per store path.\n# TYPE narjar_cache_population_narinfo_claimed_nar_bytes gauge\n",
+         # HELP narjar_cache_population_sample_age_seconds Age of the last completed population scan.\n# TYPE narjar_cache_population_sample_age_seconds gauge\nnarjar_cache_population_sample_age_seconds {}\n",
         unix_seconds_now().saturating_sub(sampled_at),
     ));
+}
+
+fn append_population_file_categories(
+    output: &mut String,
+    population: &PopulationStats,
+    state: &str,
+) {
+    output.push_str(
+        "# HELP narjar_cache_population_files Observed files by fixed storage category.\n# TYPE narjar_cache_population_files gauge\n# HELP narjar_cache_population_apparent_bytes Sum of observed file lengths by category.\n# TYPE narjar_cache_population_apparent_bytes gauge\n",
+    );
     for (kind, count, bytes) in [
         (
             "narinfo",
@@ -1785,11 +1965,24 @@ fn append_population_metrics(
             "narjar_cache_population_files{{kind=\"{kind}\",state=\"{state}\"}} {count}\nnarjar_cache_population_apparent_bytes{{kind=\"{kind}\",state=\"{state}\"}} {bytes}\n"
         ));
     }
+}
+
+fn append_population_total_bytes(output: &mut String, population: &PopulationStats, state: &str) {
     output.push_str(&format!(
         "narjar_cache_population_apparent_bytes{{kind=\"total\",state=\"{state}\"}} {}\nnarjar_cache_population_narinfo_claimed_nar_bytes{{state=\"{state}\"}} {}\n",
         population.apparent_file_bytes,
         population.narinfo_claimed_nar_bytes,
     ));
+}
+
+fn append_population_narinfo_counts(
+    output: &mut String,
+    population: &PopulationStats,
+    state: &str,
+) {
+    output.push_str(
+        "# HELP narjar_cache_population_narinfo_entries Narinfo pathname outcomes from the last complete population scan.\n# TYPE narjar_cache_population_narinfo_entries gauge\n# HELP narjar_cache_population_narinfo_claimed_nar_bytes Sum of valid narinfo NarSize claims, counted once per store path.\n# TYPE narjar_cache_population_narinfo_claimed_nar_bytes gauge\n",
+    );
     for (kind, count) in [
         ("parsed", population.structurally_valid_narinfo_entries),
         ("malformed_filename", population.malformed_narinfo_filenames),
@@ -1800,7 +1993,17 @@ fn append_population_metrics(
             "narjar_cache_population_narinfo_entries{{kind=\"{kind}\",state=\"{state}\"}} {count}\n"
         ));
     }
-    if let Some(chunked) = &population.chunked {
+}
+
+fn append_chunked_population_metrics(
+    output: &mut String,
+    chunked: Option<&ChunkedPopulationStats>,
+    state: &str,
+) {
+    if let Some(chunked) = chunked {
+        output.push_str(
+            "# HELP narjar_cache_population_logical_nars Distinct structurally valid canonical NAR manifests.\n# TYPE narjar_cache_population_logical_nars gauge\n# HELP narjar_cache_population_logical_nar_bytes Sum of logical NAR sizes in valid chunk manifests.\n# TYPE narjar_cache_population_logical_nar_bytes gauge\n",
+        );
         output.push_str(&format!(
             "narjar_cache_population_logical_nars{{state=\"{state}\"}} {}\nnarjar_cache_population_logical_nar_bytes{{state=\"{state}\"}} {}\n",
             chunked.nars, chunked.logical_nar_bytes,
@@ -2339,6 +2542,17 @@ pub struct CacheStats {
     pub narinfo_head: LookupStats,
 }
 
+impl CacheStats {
+    fn lookups(&self) -> [(&'static str, &'static str, &LookupStats); 4] {
+        [
+            ("nar", "GET", &self.nar_get),
+            ("nar", "HEAD", &self.nar_head),
+            ("narinfo", "GET", &self.narinfo_get),
+            ("narinfo", "HEAD", &self.narinfo_head),
+        ]
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NarRangeStats {
     pub get: NarRangeMethodStats,
@@ -2427,6 +2641,28 @@ pub struct CapacityStats {
     pub configured_min_free_bytes: u64,
     pub outstanding_staging_bytes: u64,
     pub estimated_headroom_bytes: u64,
+}
+
+impl CapacityStats {
+    fn from_storage(
+        capacity: StorageCapacity,
+        configured_min_free_bytes: u64,
+        outstanding_staging_bytes: u64,
+    ) -> Self {
+        Self {
+            total_bytes: capacity.total_bytes,
+            available_bytes: capacity.available_bytes,
+            total_inodes: capacity.total_inodes,
+            available_inodes: capacity.available_inodes,
+            read_only: capacity.read_only,
+            configured_min_free_bytes,
+            outstanding_staging_bytes,
+            estimated_headroom_bytes: capacity
+                .available_bytes
+                .saturating_sub(configured_min_free_bytes)
+                .saturating_sub(outstanding_staging_bytes),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2706,8 +2942,9 @@ impl Drop for UploadGuard<'_> {
 mod tests {
     use super::{
         CacheLookupOutcome, CacheObject, ConnectionOutcome, FilesystemStats, Metrics,
-        NarRangeOutcome, RequestMethod, RequestRoute, SampleState, StorageActivitySnapshot,
-        ValidationClass, append_storage_activity_metrics, render_prometheus,
+        NarRangeOutcome, PopulationScanFailure, RequestMethod, RequestRoute, SampleState,
+        StorageActivitySnapshot, ValidationClass, append_storage_activity_metrics,
+        render_prometheus,
     };
     use crate::http_server::{StatusCode, TransferFailure};
     use crate::maintenance::{Mode, Operation, Outcome, Recorder, RunValues};
@@ -2869,7 +3106,12 @@ mod tests {
         assert!(exposition.contains("narjar_cache_population_refresh_failed 0"));
         assert!(!exposition.contains("kind=\"chunk\""));
 
-        metrics.record_population_scan(StorageBackend::Chunked, Err(()), started_at, 0.0);
+        metrics.record_population_scan(
+            StorageBackend::Chunked,
+            Err(PopulationScanFailure),
+            started_at,
+            0.0,
+        );
         let refreshed = metrics
             .snapshot(StorageReadiness::Ready, None, 0, 0, 0)
             .inventory;

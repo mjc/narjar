@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crossbeam_channel::{Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use narjar::{
     auth::Authorizer,
@@ -17,6 +17,7 @@ use narjar::{
     http_server::{Method, Request, StatusCode, write_status},
     inventory::Inventory,
     narinfo::TrustedPublicKeys,
+    object::WireEncoding,
     storage::{Directory, NarUploadPolicy, StagingReservation, Storage, StorageError},
 };
 use signal_hook::{
@@ -25,7 +26,7 @@ use signal_hook::{
 };
 
 use crate::{config::ServeConfig, error::Error};
-use narjar::metrics::{ConnectionOutcome, Metrics};
+use narjar::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure};
 
 struct Admissions {
     limit: usize,
@@ -96,6 +97,177 @@ struct QueuedPublication {
     queued_at: Instant,
 }
 
+#[derive(Clone)]
+struct RequestWorkerContext {
+    storage: Arc<Storage>,
+    authorizer: Arc<Authorizer>,
+    trusted_keys: Arc<TrustedPublicKeys>,
+    metrics: Arc<Metrics>,
+    publication_sender: Sender<QueuedPublication>,
+    min_free_bytes: u64,
+    max_nar_bytes: u64,
+}
+
+#[derive(Clone)]
+struct PublicationWorkerContext {
+    storage: Arc<Storage>,
+    trusted_keys: Arc<TrustedPublicKeys>,
+    metrics: Arc<Metrics>,
+    upload_policy: NarUploadPolicy,
+    egress_compression: WireEncoding,
+}
+
+fn spawn_publication_workers(
+    workers: usize,
+    receiver: Receiver<QueuedPublication>,
+    context: PublicationWorkerContext,
+) -> Result<Vec<thread::JoinHandle<()>>, Error> {
+    (0..workers)
+        .map(|index| {
+            let receiver = receiver.clone();
+            let context = context.clone();
+            thread::Builder::new()
+                .name(format!("narjar-publication-{index}"))
+                .spawn(move || run_publication_worker(receiver, context))
+                .map_err(|error| {
+                    Error::runtime(format!("cannot start publication worker: {error}"))
+                })
+        })
+        .collect()
+}
+
+fn run_publication_worker(
+    receiver: Receiver<QueuedPublication>,
+    context: PublicationWorkerContext,
+) {
+    while let Ok(publication) = receiver.recv() {
+        let QueuedPublication {
+            request,
+            _admission,
+            _staging,
+            queued_at,
+        } = publication;
+        context.metrics.publication_dequeued(queued_at);
+        let _activity = PublicationActivity::start(Arc::clone(&context.metrics));
+        request.respond(
+            &context.storage,
+            &context.trusted_keys,
+            context.upload_policy,
+            context.egress_compression,
+            &context.metrics,
+            _staging,
+        );
+    }
+}
+
+fn spawn_request_workers(
+    workers: usize,
+    receiver: Receiver<AcceptedRequest>,
+    context: RequestWorkerContext,
+) -> Vec<thread::JoinHandle<()>> {
+    (0..workers)
+        .map(|_| {
+            let receiver = receiver.clone();
+            let context = context.clone();
+            thread::spawn(move || run_request_worker(receiver, context))
+        })
+        .collect()
+}
+
+fn run_request_worker(receiver: Receiver<AcceptedRequest>, context: RequestWorkerContext) {
+    while let Ok(accepted) = receiver.recv() {
+        context.metrics.connection_dequeued();
+        let AcceptedRequest {
+            mut stream,
+            _admission,
+        } = accepted;
+        let mut admission = Some(_admission);
+        while let Some(next_stream) = process_next_request(stream, &mut admission, &context) {
+            stream = next_stream;
+        }
+    }
+}
+
+fn process_next_request(
+    stream: TcpStream,
+    admission: &mut Option<Admission>,
+    context: &RequestWorkerContext,
+) -> Option<TcpStream> {
+    match Request::read(stream) {
+        Ok(request) => match request.method() {
+            Method::Put => {
+                queue_publication(request, admission, context);
+                None
+            }
+            Method::Get | Method::Head | Method::Other => respond(
+                request,
+                &context.storage,
+                &context.authorizer,
+                &context.trusted_keys,
+                &context.metrics,
+                context.min_free_bytes,
+            ),
+        },
+        Err((mut stream, error)) => {
+            report_request_read_failure(&mut stream, error, &context.metrics);
+            None
+        }
+    }
+}
+
+fn queue_publication(
+    request: Request,
+    admission: &mut Option<Admission>,
+    context: &RequestWorkerContext,
+) {
+    let Some(request) = prepare_publication(request, &context.authorizer, &context.metrics) else {
+        return;
+    };
+    let staging = context.storage.reserve_staging(
+        request.staging_bytes(context.max_nar_bytes).unwrap_or(0),
+        context.min_free_bytes,
+    );
+    let staging = match staging {
+        Ok(staging) => staging,
+        Err(error) => {
+            request.reject(&context.metrics, staging_reservation_status(&error));
+            return;
+        }
+    };
+    let publication = QueuedPublication {
+        request,
+        _admission: admission
+            .take()
+            .expect("connection admission remains until publication is queued"),
+        _staging: staging,
+        queued_at: Instant::now(),
+    };
+    context.metrics.publication_enqueued();
+    match context.publication_sender.try_send(publication) {
+        Ok(()) => {}
+        Err(TrySendError::Full(publication) | TrySendError::Disconnected(publication)) => {
+            context.metrics.publication_enqueue_failed();
+            publication
+                .request
+                .reject(&context.metrics, StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+}
+
+fn report_request_read_failure(stream: &mut TcpStream, error: io::Error, metrics: &Metrics) {
+    let outcome = request_read_failure_outcome(error.kind());
+    metrics.record_connection_outcome(outcome);
+    match outcome {
+        ConnectionOutcome::MalformedRequest | ConnectionOutcome::TimedOut => {
+            let _ = write_status(stream, StatusCode::BAD_REQUEST);
+        }
+        ConnectionOutcome::Admitted
+        | ConnectionOutcome::AdmissionRejected
+        | ConnectionOutcome::RequestQueueFull
+        | ConnectionOutcome::Disconnected => {}
+    }
+}
+
 fn try_dispatch(
     sender: &Sender<AcceptedRequest>,
     admissions: &Arc<Admissions>,
@@ -147,7 +319,13 @@ fn staging_reservation_status(error: &StorageError) -> StatusCode {
     }
 }
 
-pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
+struct ServerResources {
+    storage: Arc<Storage>,
+    authorizer: Arc<Authorizer>,
+    trusted_keys: Arc<TrustedPublicKeys>,
+}
+
+fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, Error> {
     let root_directory =
         Directory::open(&config.data_dir).map_err(|error| Error::runtime(error.to_string()))?;
     root_directory.validate_initialized().map_err(|error| {
@@ -156,27 +334,36 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             config.data_dir.display()
         ))
     })?;
-    let storage = Arc::new(
+    let storage =
         Storage::initialize(&root_directory, config.storage_backend).map_err(|error| {
             Error::runtime(format!(
                 "cannot initialize data directory {}: {error}",
                 config.data_dir.display()
             ))
-        })?,
-    );
-    let authorizer =
-        Arc::new(Authorizer::load(&root_directory).map_err(|error| {
-            Error::runtime(format!("cannot load authorization policy: {error}"))
-        })?);
+        })?;
+    let authorizer = Authorizer::load(&root_directory)
+        .map_err(|error| Error::runtime(format!("cannot load authorization policy: {error}")))?;
     let trusted_keys = TrustedPublicKeys::load(&root_directory)
         .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
-    if storage
+    finish_required_recovery(&storage, &trusted_keys)?;
+    Ok(ServerResources {
+        storage: Arc::new(storage),
+        authorizer: Arc::new(authorizer),
+        trusted_keys: Arc::new(trusted_keys),
+    })
+}
+
+fn finish_required_recovery(
+    storage: &Storage,
+    trusted_keys: &TrustedPublicKeys,
+) -> Result<(), Error> {
+    let recovery_required = storage
         .recovery_required_for()
-        .map_err(|error| Error::runtime(format!("cannot inspect cache recovery state: {error}")))?
-    {
-        if !Inventory::can_recover(&storage, &trusted_keys)
-            .map_err(|error| Error::runtime(format!("cannot validate cache: {error}")))?
-        {
+        .map_err(|error| Error::runtime(format!("cannot inspect cache recovery state: {error}")))?;
+    if recovery_required {
+        let inventory_is_recoverable = Inventory::can_recover(storage, trusted_keys)
+            .map_err(|error| Error::runtime(format!("cannot validate cache: {error}")))?;
+        if !inventory_is_recoverable {
             return Err(Error::runtime(
                 "cannot recover cache before serving: published inventory contains an invalid narinfo/NAR pair",
             ));
@@ -185,7 +372,99 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .finish_recovery()
             .map_err(|error| Error::runtime(format!("cannot complete cache recovery: {error}")))?;
     }
-    let trusted_keys = Arc::new(trusted_keys);
+    Ok(())
+}
+
+fn spawn_metrics_sampler(
+    config: &ServeConfig,
+    metrics: Arc<Metrics>,
+    stopping: Arc<AtomicBool>,
+) -> io::Result<thread::JoinHandle<()>> {
+    let filesystem_sample = config
+        .stats_filesystem_sample
+        .as_ref()
+        .map(|path| (path.clone(), config.data_dir.clone()));
+    let maintenance_root = config.data_dir.clone();
+    thread::Builder::new()
+        .name("narjar-metrics-sampler".to_owned())
+        .spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                metrics.sample_periodic();
+                metrics.sample_maintenance_sidecar(&maintenance_root);
+                if let Some((path, root)) = &filesystem_sample {
+                    metrics.sample_filesystem_sidecar(path, root);
+                }
+                thread::park_timeout(Duration::from_secs(5));
+            }
+        })
+}
+
+fn install_signal_handlers(
+    stopping: Arc<AtomicBool>,
+    signal_count: Arc<AtomicUsize>,
+) -> Result<(), Error> {
+    [SIGINT, SIGTERM].into_iter().try_for_each(|signal| {
+        let stopping = Arc::clone(&stopping);
+        let signal_count = Arc::clone(&signal_count);
+        // SAFETY: the handler only performs atomic operations and `_exit`,
+        // both of which are async-signal-safe.
+        unsafe {
+            low_level::register(signal, move || {
+                if signal_count.fetch_add(1, Ordering::Relaxed) > 0 {
+                    libc::_exit(128 + signal);
+                }
+                stopping.store(true, Ordering::Release);
+            })
+        }
+        .map(|_| ())
+        .map_err(|error| Error::runtime(format!("cannot install signal handler: {error}")))
+    })
+}
+
+struct AcceptLoopContext {
+    sender: Sender<AcceptedRequest>,
+    admissions: Arc<Admissions>,
+    metrics: Arc<Metrics>,
+    stopping: Arc<AtomicBool>,
+    io_timeout: Duration,
+}
+
+fn run_accept_loop(listener: TcpListener, context: AcceptLoopContext) -> Result<(), Error> {
+    while !context.stopping.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                if context.stopping.load(Ordering::Acquire) {
+                    drop(stream);
+                    break;
+                }
+                configure_socket_timeouts(&stream, context.io_timeout).map_err(|error| {
+                    Error::runtime(format!("cannot configure socket timeouts: {error}"))
+                })?;
+                if let Some(mut stream) = try_dispatch(
+                    &context.sender,
+                    &context.admissions,
+                    &context.metrics,
+                    stream,
+                ) {
+                    let _ = write_status(&mut stream, StatusCode::TOO_MANY_REQUESTS);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Error::runtime(format!("cannot accept connection: {error}"))),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
+    let ServerResources {
+        storage,
+        authorizer,
+        trusted_keys,
+    } = initialize_server_resources(&config)?;
     let metrics = Arc::new(Metrics::default());
 
     let listener = TcpListener::bind(config.listen)
@@ -194,26 +473,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .set_nonblocking(true)
         .map_err(|error| Error::runtime(format!("cannot configure listener: {error}")))?;
     let stopping = Arc::new(AtomicBool::new(false));
-    let sampler_metrics = Arc::clone(&metrics);
-    let sampler_stopping = Arc::clone(&stopping);
-    let filesystem_sample = config
-        .stats_filesystem_sample
-        .as_ref()
-        .map(|path| (path.clone(), config.data_dir.clone()));
-    let maintenance_root = config.data_dir.clone();
-    let metrics_sampler = thread::Builder::new()
-        .name("narjar-metrics-sampler".to_owned())
-        .spawn(move || {
-            while !sampler_stopping.load(Ordering::Acquire) {
-                sampler_metrics.sample_periodic();
-                sampler_metrics.sample_maintenance_sidecar(&maintenance_root);
-                if let Some((path, root)) = &filesystem_sample {
-                    sampler_metrics.sample_filesystem_sidecar(path, root);
-                }
-                thread::park_timeout(Duration::from_secs(5));
-            }
-        })
-        .map_err(|error| Error::runtime(format!("cannot start metrics sampler: {error}")))?;
+    let metrics_sampler =
+        spawn_metrics_sampler(&config, Arc::clone(&metrics), Arc::clone(&stopping))
+            .map_err(|error| Error::runtime(format!("cannot start metrics sampler: {error}")))?;
     let population_sampler = config
         .stats_inventory_interval_seconds
         .map(|interval| {
@@ -227,21 +489,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .transpose()
         .map_err(|error| Error::runtime(format!("cannot start population sampler: {error}")))?;
     let signal_count = Arc::new(AtomicUsize::new(0));
-    for signal in [SIGINT, SIGTERM] {
-        let stopping = Arc::clone(&stopping);
-        let signal_count = Arc::clone(&signal_count);
-        // SAFETY: the handler only performs atomic operations and `_exit`,
-        // both of which are async-signal-safe.
-        unsafe {
-            low_level::register(signal, move || {
-                if signal_count.fetch_add(1, Ordering::Relaxed) > 0 {
-                    libc::_exit(128 + signal);
-                }
-                stopping.store(true, Ordering::Release);
-            })
-        }
-        .map_err(|error| Error::runtime(format!("cannot install signal handler: {error}")))?;
-    }
+    install_signal_handlers(Arc::clone(&stopping), signal_count)?;
 
     println!(
         "listening http://{} workers={} max_in_flight={} max_nar_bytes={} min_free_bytes={} shutdown_grace_seconds={} io_timeout_seconds={}",
@@ -268,159 +516,40 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let admissions = Arc::new(Admissions::new(max_in_flight, Arc::clone(&metrics)));
     let (sender, receiver) = bounded::<AcceptedRequest>(max_in_flight);
     let (publication_sender, publication_receiver) = bounded::<QueuedPublication>(max_in_flight);
-    let publication_handles: Vec<_> = (0..config.workers.get())
-        .map(|index| {
-            let publication_receiver = publication_receiver.clone();
-            let storage = Arc::clone(&storage);
-            let trusted_keys = Arc::clone(&trusted_keys);
-            let metrics = Arc::clone(&metrics);
-            thread::Builder::new()
-                .name(format!("narjar-publication-{index}"))
-                .spawn(move || {
-                    while let Ok(publication) = publication_receiver.recv() {
-                        let QueuedPublication {
-                            request,
-                            _admission,
-                            _staging,
-                            queued_at,
-                        } = publication;
-                        metrics.publication_dequeued(queued_at);
-                        let _activity = PublicationActivity::start(Arc::clone(&metrics));
-                        request.respond(
-                            &storage,
-                            &trusted_keys,
-                            upload_policy,
-                            egress_compression,
-                            &metrics,
-                            _staging,
-                        );
-                    }
-                })
-                .map_err(|error| {
-                    Error::runtime(format!("cannot start publication worker: {error}"))
-                })
-        })
-        .collect::<Result<_, _>>()?;
+    let publication_handles = spawn_publication_workers(
+        config.workers.get(),
+        publication_receiver.clone(),
+        PublicationWorkerContext {
+            storage: Arc::clone(&storage),
+            trusted_keys: Arc::clone(&trusted_keys),
+            metrics: Arc::clone(&metrics),
+            upload_policy,
+            egress_compression,
+        },
+    )?;
     drop(publication_receiver);
-    let handles: Vec<_> = (0..config.workers.get())
-        .map(|_| {
-            let receiver = receiver.clone();
-            let storage = Arc::clone(&storage);
-            let authorizer = Arc::clone(&authorizer);
-            let trusted_keys = Arc::clone(&trusted_keys);
-            let metrics = Arc::clone(&metrics);
-            let publication_sender = publication_sender.clone();
-            thread::spawn(move || {
-                while let Ok(accepted) = receiver.recv() {
-                    metrics.connection_dequeued();
-                    let AcceptedRequest {
-                        mut stream,
-                        _admission,
-                    } = accepted;
-                    let mut admission = Some(_admission);
-                    loop {
-                        match Request::read(stream) {
-                            Ok(request) if matches!(request.method(), Method::Put) => {
-                                let Some(request) =
-                                    prepare_publication(request, &authorizer, &metrics)
-                                else {
-                                    break;
-                                };
-                                let staging = storage.reserve_staging(
-                                    request.staging_bytes(max_nar_bytes).unwrap_or(0),
-                                    min_free_bytes,
-                                );
-                                let staging = match staging {
-                                    Ok(staging) => staging,
-                                    Err(error) => {
-                                        request
-                                            .reject(&metrics, staging_reservation_status(&error));
-                                        break;
-                                    }
-                                };
-                                let publication = QueuedPublication {
-                                    request,
-                                    _admission: admission
-                                        .take()
-                                        .expect("request admission is present"),
-                                    _staging: staging,
-                                    queued_at: Instant::now(),
-                                };
-                                metrics.publication_enqueued();
-                                match publication_sender.try_send(publication) {
-                                    Ok(()) => break,
-                                    Err(
-                                        TrySendError::Full(publication)
-                                        | TrySendError::Disconnected(publication),
-                                    ) => {
-                                        metrics.publication_enqueue_failed();
-                                        publication
-                                            .request
-                                            .reject(&metrics, StatusCode::TOO_MANY_REQUESTS);
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(request) => match respond(
-                                request,
-                                &storage,
-                                &authorizer,
-                                &trusted_keys,
-                                &metrics,
-                                min_free_bytes,
-                            ) {
-                                Some(next_stream) => stream = next_stream,
-                                None => break,
-                            },
-                            Err((mut stream, _error)) => {
-                                let outcome = request_read_failure_outcome(_error.kind());
-                                metrics.record_connection_outcome(outcome);
-                                match outcome {
-                                    ConnectionOutcome::MalformedRequest
-                                    | ConnectionOutcome::TimedOut => {
-                                        let _ = write_status(&mut stream, StatusCode::BAD_REQUEST);
-                                    }
-                                    ConnectionOutcome::Admitted
-                                    | ConnectionOutcome::AdmissionRejected
-                                    | ConnectionOutcome::RequestQueueFull
-                                    | ConnectionOutcome::Disconnected => {}
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-        })
-        .collect();
+    let request_context = RequestWorkerContext {
+        storage: Arc::clone(&storage),
+        authorizer: Arc::clone(&authorizer),
+        trusted_keys: Arc::clone(&trusted_keys),
+        metrics: Arc::clone(&metrics),
+        publication_sender: publication_sender.clone(),
+        min_free_bytes,
+        max_nar_bytes,
+    };
+    let handles = spawn_request_workers(config.workers.get(), receiver.clone(), request_context);
     drop(receiver);
 
-    while !stopping.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _peer)) => {
-                if stopping.load(Ordering::Acquire) {
-                    drop(stream);
-                    break;
-                }
-                configure_socket_timeouts(
-                    &stream,
-                    Duration::from_secs(config.io_timeout_seconds.get()),
-                )
-                .map_err(|error| {
-                    Error::runtime(format!("cannot configure socket timeouts: {error}"))
-                })?;
-                if let Some(mut stream) = try_dispatch(&sender, &admissions, &metrics, stream) {
-                    let _ = write_status(&mut stream, StatusCode::TOO_MANY_REQUESTS);
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(Error::runtime(format!("cannot accept connection: {error}"))),
-        }
-    }
-    drop(sender);
+    run_accept_loop(
+        listener,
+        AcceptLoopContext {
+            sender,
+            admissions,
+            metrics: Arc::clone(&metrics),
+            stopping: Arc::clone(&stopping),
+            io_timeout: Duration::from_secs(config.io_timeout_seconds.get()),
+        },
+    )?;
     metrics_sampler.thread().unpark();
     if let Some(sampler) = &population_sampler {
         sampler.thread().unpark();
@@ -481,13 +610,15 @@ fn spawn_population_sampler(
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let counts = storage.population_counts(&stopping).map_err(|_| ());
+                let result = storage
+                    .population_counts(&stopping)
+                    .map_err(|_| PopulationScanFailure);
                 if stopping.load(Ordering::Acquire) {
                     break;
                 }
                 metrics.record_population_scan(
                     storage.backend(),
-                    counts,
+                    result,
                     started_at_unix_seconds,
                     started.elapsed().as_secs_f64(),
                 );

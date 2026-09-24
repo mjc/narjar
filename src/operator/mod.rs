@@ -14,7 +14,7 @@ use std::{
 use clap::Args;
 use data_encoding::BASE64;
 use narjar::{
-    inventory::{Inventory, InventoryClass, VerificationMode},
+    inventory::{Inventory, InventoryClass, InventoryEntry, VerificationMode},
     maintenance::{
         Mode as MaintenanceMode, Operation as MaintenanceOperation, Outcome as MaintenanceOutcome,
         Recorder as MaintenanceRecorder, RunValues as MaintenanceValues,
@@ -144,15 +144,40 @@ enum ReportMode {
 }
 
 impl ReportMode {
-    const fn scans_content(self) -> bool {
+    const fn verification_mode(self, verify_hashes: bool) -> VerificationMode {
         match self {
-            Self::Verify => true,
-            Self::Reconcile | Self::Orphans => false,
+            Self::Verify => VerificationMode::Content,
+            Self::Reconcile | Self::Orphans if verify_hashes => VerificationMode::Content,
+            Self::Reconcile | Self::Orphans => VerificationMode::Availability,
         }
     }
 
-    const fn only_orphans(self) -> bool {
-        matches!(self, Self::Orphans)
+    fn includes_finding(self, class: InventoryClass) -> bool {
+        match self {
+            Self::Reconcile | Self::Verify => true,
+            Self::Orphans => class == InventoryClass::OrphanNar,
+        }
+    }
+
+    fn begin_maintenance(self, root: &Path) -> Option<MaintenanceRecorder> {
+        match self {
+            Self::Reconcile => begin_maintenance(
+                root,
+                MaintenanceOperation::Reconcile,
+                MaintenanceMode::Reconcile,
+            ),
+            Self::Verify => {
+                begin_maintenance(root, MaintenanceOperation::Verify, MaintenanceMode::Verify)
+            }
+            Self::Orphans => None,
+        }
+    }
+
+    const fn verification_failed(self, invalid_pairs: u64) -> bool {
+        match self {
+            Self::Verify => invalid_pairs != 0,
+            Self::Reconcile | Self::Orphans => false,
+        }
     }
 }
 
@@ -163,31 +188,8 @@ fn report(
     json: bool,
     backend: narjar::storage::StorageBackend,
 ) -> Result<(), Error> {
-    let recorder = match mode {
-        ReportMode::Reconcile => begin_maintenance(
-            &root,
-            MaintenanceOperation::Reconcile,
-            MaintenanceMode::Reconcile,
-        ),
-        ReportMode::Verify => {
-            begin_maintenance(&root, MaintenanceOperation::Verify, MaintenanceMode::Verify)
-        }
-        ReportMode::Orphans => None,
-    };
-    let verification = match mode {
-        ReportMode::Verify => VerificationMode::Content,
-        ReportMode::Reconcile | ReportMode::Orphans => match verify_hashes {
-            true => VerificationMode::Content,
-            false => VerificationMode::Availability,
-        },
-    };
-    let scan = || -> Result<Inventory, Error> {
-        let root_directory = Directory::open(&root).map_err(runtime)?;
-        let trusted = TrustedPublicKeys::load(&root_directory).map_err(runtime)?;
-        let storage = Storage::initialize(&root_directory, backend).map_err(runtime)?;
-        Inventory::scan_storage(&storage, &trusted, verification).map_err(runtime)
-    };
-    let inventory = match scan() {
+    let recorder = mode.begin_maintenance(&root);
+    let inventory = match scan_inventory(&root, mode.verification_mode(verify_hashes), backend) {
         Ok(inventory) => inventory,
         Err(error) => {
             finish_maintenance(
@@ -198,43 +200,11 @@ fn report(
             return Err(error);
         }
     };
-    let inventory_class_counts: [_; InventoryClass::ALL.len()] = std::array::from_fn(|index| {
-        let class = InventoryClass::ALL[index];
-        inventory
-            .entries()
-            .iter()
-            .filter(|finding| finding.class() == class)
-            .count() as u64
-    });
-    let invalid_pairs = inventory
-        .entries()
-        .iter()
-        .filter(|finding| finding.class().invalid_published_pair())
-        .count() as u64;
+    let inventory_class_counts = inventory_class_counts(&inventory);
+    let invalid_pairs = invalid_published_pair_count(&inventory);
+    print_inventory_findings(&inventory, mode, json);
 
-    for finding in inventory
-        .entries()
-        .iter()
-        .filter(|finding| !mode.only_orphans() || finding.class() == InventoryClass::OrphanNar)
-    {
-        if json {
-            println!(
-                "{{\"class\":\"{}\",\"identifier\":\"{}\",\"action\":\"{}\"}}",
-                finding.class(),
-                json_escape(finding.identifier()),
-                finding.class().action()
-            );
-        } else {
-            println!(
-                "{}\t{}\t{}",
-                finding.class(),
-                finding.identifier(),
-                finding.class().action()
-            );
-        }
-    }
-
-    let failed_verification = mode.scans_content() && invalid_pairs != 0;
+    let failed_verification = mode.verification_failed(invalid_pairs);
     finish_maintenance(
         recorder,
         if failed_verification {
@@ -252,6 +222,62 @@ fn report(
         return Err(Error::runtime("verification found invalid published pairs"));
     }
     Ok(())
+}
+
+fn scan_inventory(
+    root: &Path,
+    verification: VerificationMode,
+    backend: StorageBackend,
+) -> Result<Inventory, Error> {
+    let root_directory = Directory::open(root).map_err(runtime)?;
+    let trusted = TrustedPublicKeys::load(&root_directory).map_err(runtime)?;
+    let storage = Storage::initialize(&root_directory, backend).map_err(runtime)?;
+    Inventory::scan_storage(&storage, &trusted, verification).map_err(runtime)
+}
+
+fn inventory_class_counts(inventory: &Inventory) -> [u64; InventoryClass::ALL.len()] {
+    std::array::from_fn(|index| {
+        let class = InventoryClass::ALL[index];
+        inventory
+            .entries()
+            .iter()
+            .filter(|finding| finding.class() == class)
+            .count() as u64
+    })
+}
+
+fn invalid_published_pair_count(inventory: &Inventory) -> u64 {
+    inventory
+        .entries()
+        .iter()
+        .filter(|finding| finding.class().invalid_published_pair())
+        .count() as u64
+}
+
+fn print_inventory_findings(inventory: &Inventory, mode: ReportMode, json: bool) {
+    inventory
+        .entries()
+        .iter()
+        .filter(|finding| mode.includes_finding(finding.class()))
+        .for_each(|finding| print_inventory_finding(finding, json));
+}
+
+fn print_inventory_finding(finding: &InventoryEntry, json: bool) {
+    if json {
+        println!(
+            "{{\"class\":\"{}\",\"identifier\":\"{}\",\"action\":\"{}\"}}",
+            finding.class(),
+            json_escape(finding.identifier()),
+            finding.class().action()
+        );
+    } else {
+        println!(
+            "{}\t{}\t{}",
+            finding.class(),
+            finding.identifier(),
+            finding.class().action()
+        );
+    }
 }
 
 fn structural_report(
@@ -285,54 +311,13 @@ fn structural_scan(
     backend: narjar::storage::StorageBackend,
     action: StructuralAction,
 ) -> Result<(), Error> {
-    let limit =
-        NonZeroUsize::new(limit).ok_or_else(|| Error::usage("limit must be greater than zero"))?;
-    let stale_before = SystemTime::now()
-        .checked_sub(Duration::from_secs(min_age_seconds))
-        .ok_or_else(|| Error::usage("minimum age is out of range"))?;
-    let operation_mode = match action {
-        StructuralAction::Inspect => MaintenanceMode::Structural,
-        StructuralAction::Cleanup => MaintenanceMode::Cleanup,
-    };
-    let recorder = begin_maintenance(&root, MaintenanceOperation::Reconcile, operation_mode);
-    let result = (|| {
-        let root_directory = Directory::open(&root).map_err(runtime)?;
-        let storage = Storage::initialize(&root_directory, backend).map_err(runtime)?;
-        let report = storage.reconcile(limit, stale_before).map_err(runtime)?;
-        let mut removed = 0_u64;
-
-        for entry in report.entries() {
-            let output_action = match (action, entry.class()) {
-                (StructuralAction::Cleanup, ReconcileClass::TempStale) => {
-                    match storage.cleanup_stale_temp(entry).map_err(runtime)? {
-                        CleanupOutcome::Removed => {
-                            removed = removed.saturating_add(1);
-                            "deleted"
-                        }
-                        CleanupOutcome::Unchanged => "kept_replaced",
-                    }
-                }
-                (StructuralAction::Cleanup, _) => "kept",
-                (StructuralAction::Inspect, _) => "inspect",
-            };
-            print_structural_entry(entry.class(), entry.relative_path(), output_action, json);
-        }
-
-        if report.truncated() {
-            return Err(Error::runtime(format!(
-                "structural reconciliation reached the --limit of {limit} entries"
-            )));
-        }
-        let objects_reclaimed = match action {
-            StructuralAction::Inspect => None,
-            StructuralAction::Cleanup => Some(removed),
-        };
-        Ok(MaintenanceValues {
-            objects_examined: Some(report.entries().len() as u64),
-            objects_reclaimed,
-            ..MaintenanceValues::default()
-        })
-    })();
+    let options = StructuralScanOptions::new(limit, min_age_seconds)?;
+    let recorder = begin_maintenance(
+        &root,
+        MaintenanceOperation::Reconcile,
+        action.maintenance_mode(),
+    );
+    let result = run_structural_scan(root, options, json, backend, action);
     match result {
         Ok(values) => finish_maintenance(recorder, MaintenanceOutcome::Success, values),
         Err(error) => {
@@ -345,6 +330,123 @@ fn structural_scan(
         }
     }
     Ok(())
+}
+
+struct StructuralScanOptions {
+    limit: NonZeroUsize,
+    stale_before: SystemTime,
+}
+
+impl StructuralScanOptions {
+    fn new(limit: usize, min_age_seconds: u64) -> Result<Self, Error> {
+        let limit = NonZeroUsize::new(limit)
+            .ok_or_else(|| Error::usage("limit must be greater than zero"))?;
+        let stale_before = SystemTime::now()
+            .checked_sub(Duration::from_secs(min_age_seconds))
+            .ok_or_else(|| Error::usage("minimum age is out of range"))?;
+        Ok(Self {
+            limit,
+            stale_before,
+        })
+    }
+}
+
+impl StructuralAction {
+    const fn maintenance_mode(self) -> MaintenanceMode {
+        match self {
+            Self::Inspect => MaintenanceMode::Structural,
+            Self::Cleanup => MaintenanceMode::Cleanup,
+        }
+    }
+}
+
+fn run_structural_scan(
+    root: PathBuf,
+    options: StructuralScanOptions,
+    json: bool,
+    backend: StorageBackend,
+    action: StructuralAction,
+) -> Result<MaintenanceValues, Error> {
+    let root_directory = Directory::open(&root).map_err(runtime)?;
+    let storage = Storage::initialize(&root_directory, backend).map_err(runtime)?;
+    let report = storage
+        .reconcile(options.limit, options.stale_before)
+        .map_err(runtime)?;
+    let removed_entries = report.entries().iter().try_fold(0_u64, |removed, entry| {
+        process_structural_entry(&storage, entry, action, json)
+            .map(|result| removed.saturating_add(result.removed_count()))
+    })?;
+
+    if report.truncated() {
+        return Err(Error::runtime(format!(
+            "structural reconciliation reached the --limit of {} entries",
+            options.limit
+        )));
+    }
+    Ok(MaintenanceValues {
+        objects_examined: Some(report.entries().len() as u64),
+        objects_reclaimed: action.reclaimed_entries(removed_entries),
+        ..MaintenanceValues::default()
+    })
+}
+
+#[derive(Clone, Copy)]
+enum StructuralEntryResult {
+    Kept,
+    Removed,
+}
+
+impl StructuralEntryResult {
+    const fn removed_count(self) -> u64 {
+        match self {
+            Self::Kept => 0,
+            Self::Removed => 1,
+        }
+    }
+}
+
+impl StructuralAction {
+    const fn reclaimed_entries(self, removed: u64) -> Option<u64> {
+        match self {
+            Self::Inspect => None,
+            Self::Cleanup => Some(removed),
+        }
+    }
+}
+
+fn process_structural_entry(
+    storage: &Storage,
+    entry: &narjar::storage::ReconcileEntry,
+    action: StructuralAction,
+    json: bool,
+) -> Result<StructuralEntryResult, Error> {
+    let (output_action, result) = structural_entry_action(storage, entry, action)?;
+    print_structural_entry(entry.class(), entry.relative_path(), output_action, json);
+    Ok(result)
+}
+
+fn structural_entry_action(
+    storage: &Storage,
+    entry: &narjar::storage::ReconcileEntry,
+    action: StructuralAction,
+) -> Result<(&'static str, StructuralEntryResult), Error> {
+    match action {
+        StructuralAction::Inspect => Ok(("inspect", StructuralEntryResult::Kept)),
+        StructuralAction::Cleanup => cleanup_structural_entry(storage, entry),
+    }
+}
+
+fn cleanup_structural_entry(
+    storage: &Storage,
+    entry: &narjar::storage::ReconcileEntry,
+) -> Result<(&'static str, StructuralEntryResult), Error> {
+    match entry.class() {
+        ReconcileClass::TempStale => match storage.cleanup_stale_temp(entry).map_err(runtime)? {
+            CleanupOutcome::Removed => Ok(("deleted", StructuralEntryResult::Removed)),
+            CleanupOutcome::Unchanged => Ok(("kept_replaced", StructuralEntryResult::Kept)),
+        },
+        _ => Ok(("kept", StructuralEntryResult::Kept)),
+    }
 }
 
 fn print_structural_entry(class: ReconcileClass, path: &Path, action: &str, json: bool) {

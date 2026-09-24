@@ -64,10 +64,8 @@ impl PopulationCounts {
     ) -> io::Result<()> {
         self.scanned_entries = checked_add(self.scanned_entries, chunks.scanned_entries)?;
         self.ignored_entries = checked_add(self.ignored_entries, chunks.ignored_entries)?;
-        self.disappeared_entries = self
-            .disappeared_entries
-            .checked_add(chunks.disappeared_entries)
-            .ok_or_else(|| io::Error::other("cache population counter overflow"))?;
+        self.disappeared_entries =
+            checked_add(self.disappeared_entries, chunks.disappeared_entries)?;
         self.errors = checked_add(self.errors, chunks.errors)?;
         self.chunk_files = chunks.chunk_files;
         self.chunk_bytes = chunks.chunk_bytes;
@@ -75,11 +73,10 @@ impl PopulationCounts {
         self.manifest_bytes = chunks.manifest_bytes;
         self.chunked_nars = chunks.chunked_nars;
         self.chunked_nar_bytes = chunks.chunked_nar_bytes;
-        self.apparent_file_bytes = self
-            .apparent_file_bytes
-            .checked_add(chunks.chunk_bytes)
-            .and_then(|bytes| bytes.checked_add(chunks.manifest_bytes))
-            .ok_or_else(|| io::Error::other("cache population counter overflow"))?;
+        self.apparent_file_bytes = checked_add(
+            self.apparent_file_bytes,
+            checked_add(chunks.chunk_bytes, chunks.manifest_bytes)?,
+        )?;
         Ok(())
     }
 }
@@ -219,20 +216,7 @@ fn scan_files(
             population.ignored_entries = checked_add(population.ignored_entries, 1)?;
             return Ok(true);
         };
-        match open_regular_at(directory, name) {
-            Ok(file) => match record_open_file(population, kind, file) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    population.disappeared_entries =
-                        checked_add(population.disappeared_entries, 1)?;
-                }
-                Err(_) => record_entry_error(population, kind)?,
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                population.disappeared_entries = checked_add(population.disappeared_entries, 1)?;
-            }
-            Err(_) => record_entry_error(population, kind)?,
-        }
+        record_classified_entry(directory, population, name, kind)?;
         Ok(true)
     })?;
     match interrupted {
@@ -241,6 +225,36 @@ fn scan_files(
             "population scan cancelled",
         )),
         false => Ok(()),
+    }
+}
+
+fn record_classified_entry(
+    directory: &File,
+    population: &mut PopulationCounts,
+    name: &OsStr,
+    kind: FileKind,
+) -> io::Result<()> {
+    let file = match open_regular_at(directory, name) {
+        Ok(file) => file,
+        Err(error) => return record_entry_access_result(population, kind, error),
+    };
+    match record_open_file(population, kind, file) {
+        Ok(()) => Ok(()),
+        Err(error) => record_entry_access_result(population, kind, error),
+    }
+}
+
+fn record_entry_access_result(
+    population: &mut PopulationCounts,
+    kind: FileKind,
+    error: io::Error,
+) -> io::Result<()> {
+    match error.kind() {
+        io::ErrorKind::NotFound => {
+            population.disappeared_entries = checked_add(population.disappeared_entries, 1)?;
+            Ok(())
+        }
+        _ => record_entry_error(population, kind),
     }
 }
 
@@ -296,75 +310,90 @@ fn record_narinfo(
 
 fn record_file(population: &mut PopulationCounts, kind: FileKind, bytes: u64) -> io::Result<()> {
     population.apparent_file_bytes = checked_add(population.apparent_file_bytes, bytes)?;
+    record_category_file(population, kind, bytes)
+}
+
+fn record_category_file(
+    population: &mut PopulationCounts,
+    kind: FileKind,
+    bytes: u64,
+) -> io::Result<()> {
     match kind {
-        FileKind::NarInfo(_) => {
-            return Err(io::Error::other(
-                "narinfo entries require structural parsing",
-            ));
-        }
-        FileKind::MalformedNarInfo => {
-            population.malformed_narinfo_filenames =
-                checked_add(population.malformed_narinfo_filenames, 1)?;
-            population.narinfo_files = checked_add(population.narinfo_files, 1)?;
-            population.narinfo_bytes = checked_add(population.narinfo_bytes, bytes)?;
-        }
+        FileKind::NarInfo(_) => Err(io::Error::other(
+            "narinfo entries require structural parsing",
+        )),
+        FileKind::MalformedNarInfo => record_malformed_narinfo_filename(population, bytes),
         FileKind::Raw => {
-            population.raw_files = checked_add(population.raw_files, 1)?;
-            population.raw_bytes = checked_add(population.raw_bytes, bytes)?;
+            record_file_count_and_bytes(&mut population.raw_files, &mut population.raw_bytes, bytes)
         }
         FileKind::Xz => {
-            population.xz_files = checked_add(population.xz_files, 1)?;
-            population.xz_bytes = checked_add(population.xz_bytes, bytes)?;
+            record_file_count_and_bytes(&mut population.xz_files, &mut population.xz_bytes, bytes)
         }
-        FileKind::Zstd => {
-            population.zstd_files = checked_add(population.zstd_files, 1)?;
-            population.zstd_bytes = checked_add(population.zstd_bytes, bytes)?;
-        }
-        FileKind::MalformedNar => {
-            population.malformed_nar_files = checked_add(population.malformed_nar_files, 1)?;
-            population.malformed_nar_bytes = checked_add(population.malformed_nar_bytes, bytes)?;
-        }
-        FileKind::IngestionReceipt => {
-            population.ingestion_receipt_files =
-                checked_add(population.ingestion_receipt_files, 1)?;
-            population.ingestion_receipt_bytes =
-                checked_add(population.ingestion_receipt_bytes, bytes)?;
-        }
-        FileKind::EgressReceipt => {
-            population.egress_receipt_files = checked_add(population.egress_receipt_files, 1)?;
-            population.egress_receipt_bytes = checked_add(population.egress_receipt_bytes, bytes)?;
-        }
-        FileKind::Validation => {
-            population.validation_files = checked_add(population.validation_files, 1)?;
-            population.validation_bytes = checked_add(population.validation_bytes, bytes)?;
-        }
-        FileKind::Transaction => {
-            population.transaction_files = checked_add(population.transaction_files, 1)?;
-            population.transaction_bytes = checked_add(population.transaction_bytes, bytes)?;
-        }
-        FileKind::Temporary => {
-            population.temporary_files = checked_add(population.temporary_files, 1)?;
-            population.temporary_bytes = checked_add(population.temporary_bytes, bytes)?;
-        }
+        FileKind::Zstd => record_file_count_and_bytes(
+            &mut population.zstd_files,
+            &mut population.zstd_bytes,
+            bytes,
+        ),
+        FileKind::MalformedNar => record_file_count_and_bytes(
+            &mut population.malformed_nar_files,
+            &mut population.malformed_nar_bytes,
+            bytes,
+        ),
+        FileKind::IngestionReceipt => record_file_count_and_bytes(
+            &mut population.ingestion_receipt_files,
+            &mut population.ingestion_receipt_bytes,
+            bytes,
+        ),
+        FileKind::EgressReceipt => record_file_count_and_bytes(
+            &mut population.egress_receipt_files,
+            &mut population.egress_receipt_bytes,
+            bytes,
+        ),
+        FileKind::Validation => record_file_count_and_bytes(
+            &mut population.validation_files,
+            &mut population.validation_bytes,
+            bytes,
+        ),
+        FileKind::Transaction => record_file_count_and_bytes(
+            &mut population.transaction_files,
+            &mut population.transaction_bytes,
+            bytes,
+        ),
+        FileKind::Temporary => record_file_count_and_bytes(
+            &mut population.temporary_files,
+            &mut population.temporary_bytes,
+            bytes,
+        ),
     }
+}
+
+fn record_malformed_narinfo_filename(
+    population: &mut PopulationCounts,
+    bytes: u64,
+) -> io::Result<()> {
+    population.malformed_narinfo_filenames =
+        checked_add(population.malformed_narinfo_filenames, 1)?;
+    record_file_count_and_bytes(
+        &mut population.narinfo_files,
+        &mut population.narinfo_bytes,
+        bytes,
+    )
+}
+
+fn record_file_count_and_bytes(
+    files: &mut u64,
+    category_bytes: &mut u64,
+    bytes: u64,
+) -> io::Result<()> {
+    *files = checked_add(*files, 1)?;
+    *category_bytes = checked_add(*category_bytes, bytes)?;
     Ok(())
 }
 
 fn record_entry_error(population: &mut PopulationCounts, kind: FileKind) -> io::Result<()> {
     population.errors = checked_add(population.errors, 1)?;
-    match kind {
-        FileKind::NarInfo(_) | FileKind::MalformedNarInfo => {
-            population.narinfo_read_errors = checked_add(population.narinfo_read_errors, 1)?;
-        }
-        FileKind::Raw
-        | FileKind::Xz
-        | FileKind::Zstd
-        | FileKind::MalformedNar
-        | FileKind::IngestionReceipt
-        | FileKind::EgressReceipt
-        | FileKind::Validation
-        | FileKind::Transaction
-        | FileKind::Temporary => {}
+    if kind.is_narinfo() {
+        population.narinfo_read_errors = checked_add(population.narinfo_read_errors, 1)?;
     }
     Ok(())
 }
@@ -387,4 +416,21 @@ enum FileKind {
     Validation,
     Transaction,
     Temporary,
+}
+
+impl FileKind {
+    fn is_narinfo(self) -> bool {
+        match self {
+            Self::NarInfo(_) | Self::MalformedNarInfo => true,
+            Self::Raw
+            | Self::Xz
+            | Self::Zstd
+            | Self::MalformedNar
+            | Self::IngestionReceipt
+            | Self::EgressReceipt
+            | Self::Validation
+            | Self::Transaction
+            | Self::Temporary => false,
+        }
+    }
 }
