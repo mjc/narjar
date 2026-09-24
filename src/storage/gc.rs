@@ -123,6 +123,15 @@ struct Orphan {
 }
 
 pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
+    run_with_lock_acquired(options, || {})
+}
+
+/// Run GC and call `on_lock_acquired` after storage initialization owns the
+/// data-directory lock, before inspecting or changing cache contents.
+pub fn run_with_lock_acquired(
+    options: GcOptions,
+    on_lock_acquired: impl FnOnce(),
+) -> Result<GcReport, StorageError> {
     let target_bytes = options.target_bytes.or(options.max_bytes);
     if options.max_bytes.is_none() && options.target_bytes.is_none() && options.max_age.is_none() {
         return Err(invalid("at least one retention policy is required"));
@@ -137,6 +146,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
 
     let root = Directory::open(&options.data_dir)?;
     let storage = Storage::initialize(&root, options.backend)?;
+    on_lock_acquired();
     let trusted = TrustedPublicKeys::load(&root).map_err(|error| invalid(error.to_string()))?;
     if let PayloadStorage::Chunked(chunk_store) = &storage.payloads {
         return run_chunked(options, &storage, chunk_store, trusted, target_bytes);

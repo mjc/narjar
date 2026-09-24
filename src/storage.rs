@@ -14,6 +14,7 @@ mod initialization;
 pub(crate) mod inspection;
 mod location;
 mod operations;
+mod population;
 mod publication;
 mod receipt;
 mod reconcile;
@@ -49,9 +50,11 @@ pub use directory::Directory;
 pub(crate) use egress::{NarReadBody, VerifiedCanonicalNar};
 pub use ids::{InvalidObjectId, StoreHash};
 pub use publication::{NarUploadPolicy, PublishOutcome, StagingReservation, StorageError};
+pub(crate) use state::StorageActivitySnapshot;
 pub use state::{InvalidStorageBackend, Storage, StorageBackend};
 
 pub use operations::{NarInfoDeletion, NarMatch, StorageReadiness};
+pub use population::PopulationCounts;
 pub use reconcile::{CleanupOutcome, ReconcileClass, ReconcileEntry, ReconcileReport};
 
 pub const NAR_DIRECTORY: &str = "nar";

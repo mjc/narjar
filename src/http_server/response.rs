@@ -80,6 +80,18 @@ pub struct Response<R> {
     content_length: usize,
 }
 
+#[derive(Debug)]
+pub struct TransferFailure {
+    pub error: io::Error,
+    pub body_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct CompletedTransfer {
+    pub connection: Option<TcpStream>,
+    pub body_bytes: u64,
+}
+
 impl Response<io::Empty> {
     pub fn empty(status: StatusCode) -> Self {
         Self::new(status, io::empty(), 0)
@@ -154,15 +166,44 @@ impl<R> Response<R> {
         stream: &mut TcpStream,
         head: bool,
         keep_alive: bool,
-    ) -> io::Result<()>
+    ) -> Result<u64, TransferFailure>
     where
         R: Read,
     {
-        self.write_headers(stream, keep_alive)?;
+        self.write_headers(stream, keep_alive)
+            .map_err(|error| TransferFailure {
+                error,
+                body_bytes: 0,
+            })?;
         if !head {
-            io::copy(&mut self.body, stream)?;
+            let mut writer = BodyWriter {
+                stream,
+                body_bytes: 0,
+            };
+            io::copy(&mut self.body, &mut writer).map_err(|error| TransferFailure {
+                error,
+                body_bytes: writer.body_bytes,
+            })?;
+            return Ok(writer.body_bytes);
         }
-        Ok(())
+        Ok(0)
+    }
+}
+
+struct BodyWriter<'a> {
+    stream: &'a mut TcpStream,
+    body_bytes: u64,
+}
+
+impl io::Write for BodyWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.stream.write(buffer)?;
+        self.body_bytes = self.body_bytes.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
 
@@ -171,7 +212,7 @@ pub(crate) fn copy_file_to_stream(
     stream: &mut TcpStream,
     offset: u64,
     length: u64,
-) -> io::Result<()> {
+) -> Result<u64, TransferFailure> {
     #[cfg(test)]
     if FORCE_PORTABLE_FILE_COPY.with(std::cell::Cell::get) {
         return copy_file_to_stream_portable(file, stream, offset, length);
@@ -190,13 +231,14 @@ fn copy_file_to_stream_linux(
     stream: &mut TcpStream,
     offset: u64,
     length: u64,
-) -> io::Result<()> {
+) -> Result<u64, TransferFailure> {
     use std::os::fd::AsRawFd;
 
-    let mut offset = i64::try_from(offset)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset is too large"))?;
+    let mut offset = i64::try_from(offset).map_err(|_| TransferFailure {
+        error: io::Error::new(io::ErrorKind::InvalidInput, "file offset is too large"),
+        body_bytes: 0,
+    })?;
     let mut remaining = length;
-    let mut sent_any = false;
     while remaining != 0 {
         let count = remaining.min(usize::MAX as u64) as usize;
         // SAFETY: both descriptors stay open for the call, `offset` is valid,
@@ -204,21 +246,23 @@ fn copy_file_to_stream_linux(
         let sent =
             unsafe { libc::sendfile(stream.as_raw_fd(), file.as_raw_fd(), &raw mut offset, count) };
         if sent > 0 {
-            sent_any = true;
             remaining -= sent as u64;
             continue;
         }
         if sent == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "file ended before the declared response length",
-            ));
+            return Err(TransferFailure {
+                error: io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "file ended before the declared response length",
+                ),
+                body_bytes: length - remaining,
+            });
         }
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::Interrupted {
             continue;
         }
-        if !sent_any
+        if length == remaining
             && matches!(
                 error.raw_os_error(),
                 Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
@@ -226,9 +270,12 @@ fn copy_file_to_stream_linux(
         {
             return copy_file_to_stream_portable(file, stream, offset as u64, remaining);
         }
-        return Err(error);
+        return Err(TransferFailure {
+            error,
+            body_bytes: length - remaining,
+        });
     }
-    Ok(())
+    Ok(length)
 }
 
 fn copy_file_to_stream_portable(
@@ -236,16 +283,31 @@ fn copy_file_to_stream_portable(
     stream: &mut TcpStream,
     offset: u64,
     length: u64,
-) -> io::Result<()> {
-    file.seek(SeekFrom::Start(offset))?;
-    let copied = io::copy(&mut file.take(length), stream)?;
+) -> Result<u64, TransferFailure> {
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| TransferFailure {
+            error,
+            body_bytes: 0,
+        })?;
+    let mut writer = BodyWriter {
+        stream,
+        body_bytes: 0,
+    };
+    let copied =
+        io::copy(&mut file.take(length), &mut writer).map_err(|error| TransferFailure {
+            error,
+            body_bytes: writer.body_bytes,
+        })?;
     if copied == length {
-        Ok(())
+        Ok(copied)
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "file ended before the declared response length",
-        ))
+        Err(TransferFailure {
+            error: io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file ended before the declared response length",
+            ),
+            body_bytes: copied,
+        })
     }
 }
 
@@ -261,7 +323,10 @@ pub fn static_header(
 }
 
 pub fn write_status(stream: &mut TcpStream, status: StatusCode) -> io::Result<()> {
-    Response::empty(status).write_to(stream, false, false)
+    Response::empty(status)
+        .write_to(stream, false, false)
+        .map(|_| ())
+        .map_err(|failure| failure.error)
 }
 
 fn reason(code: u16) -> &'static str {

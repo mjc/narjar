@@ -41,6 +41,7 @@ const NAR_BYTES: &[u8] = b"narjar";
 const NARJAR_HASH: &str = "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl";
 const CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
 const STORE_HASH: &str = "00000000000000000000000000000000";
+const ABSENT_STORE_HASH: &str = "11111111111111111111111111111111";
 const TEST_AUTHORIZATION: &str = "Basic bmFyamFyOnRlc3Qtd3JpdGUtdG9rZW4=";
 const TEST_WRITE_TOKEN: &str =
     "test 4c6fe1d79dd5595d75e9b7c82dbdc4481996f7aea7143e7153c8eb5e9f94ea45\n";
@@ -2270,7 +2271,8 @@ impl Drop for RunningServer {
 
 #[test]
 fn serve_reports_listener_and_stops_on_sigterm() {
-    let server = RunningServer::start("lifecycle");
+    let server =
+        RunningServer::start_with_args("lifecycle", &["--stats-inventory-interval-seconds", "900"]);
 
     for directory in ["nar", ".tmp", "realisations"] {
         assert!(
@@ -2317,6 +2319,45 @@ fn stalled_request_headers_are_closed_by_the_socket_timeout() {
 
     assert!(started.elapsed() < Duration::from_secs(3));
     assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
+        .expect("metrics should be UTF-8");
+    assert!(
+        metrics.contains("narjar_connections_total{outcome=\"timeout\"} 1"),
+        "{metrics}"
+    );
+    let (_, status) = server.stop();
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn malformed_request_headers_are_counted_without_a_route_label() {
+    let server = RunningServer::start("malformed-request-headers");
+    let mut stream = TcpStream::connect(&server.address).expect("connect to narjar");
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\ninvalid header\r\n\r\n")
+        .expect("write malformed request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("configure client timeout");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("malformed request should close");
+    assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+
+    let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
+        .expect("metrics should be UTF-8");
+    assert!(
+        metrics.contains("narjar_connections_total{outcome=\"malformed_request\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains(
+            "narjar_http_requests_total{method=\"GET\",route=\"healthz\",status=\"400\"}"
+        ),
+        "malformed requests must not be assigned a parsed route: {metrics}"
+    );
+
     let (_, status) = server.stop();
     assert!(status.success(), "narjar should shut down cleanly");
 }
@@ -2347,6 +2388,12 @@ fn stalled_upload_body_is_rejected_without_publication() {
             .data_dir
             .join(format!("narinfo/{STORE_HASH}.narinfo"))
             .exists()
+    );
+    let (_, metrics_body) = response_parts(&server.request("GET", "/metrics"));
+    let metrics = String::from_utf8(metrics_body).expect("metrics should be UTF-8");
+    assert!(
+        metrics.contains("narjar_connections_total{outcome=\"timeout\"} 1"),
+        "stalled upload body should count as a timed-out connection: {metrics}"
     );
     let (_, status) = server.stop();
     assert!(status.success(), "narjar should shut down cleanly");
@@ -2613,6 +2660,8 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
         missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
         "{missing:?}"
     );
+    let _absent_metadata = server.request("GET", &format!("/{ABSENT_STORE_HASH}.narinfo"));
+    let _missing_nar = server.request("GET", &format!("/nar/{nar_hash}.nar"));
 
     fs::write(
         server.data_dir.join(format!("nar/{nar_hash}.nar")),
@@ -2624,11 +2673,23 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
     let narinfo_head = server.request("HEAD", &format!("/{STORE_HASH}.narinfo"));
     let nar_get = server.request("GET", &format!("/nar/{nar_hash}.nar"));
     let nar_head = server.request("HEAD", &format!("/nar/{nar_hash}.nar"));
+    let (_, metrics_body) = response_parts(&server.request("GET", "/metrics"));
+    let metrics = String::from_utf8(metrics_body).expect("metrics response should be UTF-8");
     let (signal, status) = server.stop();
 
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
-
+    for series in [
+        "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"GET\",outcome=\"hit\"} 1",
+        "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"GET\",outcome=\"miss\"} 1",
+        "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"GET\",outcome=\"failure\"} 1",
+        "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"HEAD\",outcome=\"hit\"} 1",
+        "narjar_cache_lookup_outcomes_total{object=\"nar\",method=\"GET\",outcome=\"hit\"} 1",
+        "narjar_cache_lookup_outcomes_total{object=\"nar\",method=\"GET\",outcome=\"miss\"} 1",
+        "narjar_cache_lookup_outcomes_total{object=\"nar\",method=\"HEAD\",outcome=\"hit\"} 1",
+    ] {
+        assert!(metrics.contains(series), "missing {series}: {metrics}");
+    }
     let split = |response: &[u8]| {
         response
             .windows(4)
@@ -2641,6 +2702,11 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
     let narinfo_head_body = split(&narinfo_head);
     let nar_get_body = split(&nar_get);
     let nar_head_body = split(&nar_head);
+    assert_eq!(
+        metric_value(&metrics, "narjar_http_bytes_out_total"),
+        (narinfo_get.len() - narinfo_get_body + nar_get.len() - nar_get_body) as u64,
+        "HEAD and /metrics bodies are control traffic, not artifact bytes"
+    );
     let narinfo_get_headers =
         String::from_utf8_lossy(&narinfo_get[..narinfo_get_body]).into_owned();
     let narinfo_head_headers =
@@ -2727,6 +2793,16 @@ fn response_parts(response: &[u8]) -> (String, Vec<u8>) {
     (headers, body)
 }
 
+fn metric_value(exposition: &str, name: &str) -> u64 {
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(name))
+        .expect("metric should be present")
+        .trim()
+        .parse()
+        .expect("metric value should be an integer")
+}
+
 fn run_conformance_trace(server: &RunningServer, fixture: &str) -> String {
     let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
     let mut transcript = String::new();
@@ -2788,6 +2864,7 @@ fn nar_get_and_head_support_one_byte_range() {
     let path = format!("/nar/{nar_hash}.nar");
     let request = |method, range| server.request_with_headers(method, &path, &[("Range", range)]);
 
+    let full = server.request("GET", &path);
     let closed = request("GET", "bytes=2-5");
     let open = request("GET", "bytes=5-");
     let suffix = request("GET", "bytes=-4");
@@ -2809,6 +2886,8 @@ fn nar_get_and_head_support_one_byte_range() {
 
     assert!(signal.success(), "SIGTERM should be sent");
     assert!(status.success(), "narjar should shut down cleanly");
+
+    assert_eq!(response_parts(&full).1, nar_bytes);
 
     for (response, content_range, body) in [
         (&closed, "bytes 2-5/10", &b"2345"[..]),
@@ -2868,19 +2947,33 @@ fn nar_get_and_head_support_one_byte_range() {
         assert!(body.is_empty());
     }
     assert!(
-        metrics.contains("narjar_http_bytes_out_total 13"),
+        metrics.contains("narjar_http_bytes_out_total 23"),
         "{metrics}"
     );
     assert!(
         metrics
-            .contains("narjar_http_requests_total{method=\"GET\",route=\"nar\",status=\"2xx\"} 3"),
+            .contains("narjar_http_requests_total{method=\"GET\",route=\"nar\",status=\"206\"} 3"),
         "{metrics}"
     );
     assert!(
         metrics
-            .contains("narjar_http_requests_total{method=\"HEAD\",route=\"nar\",status=\"2xx\"} 1"),
+            .contains("narjar_http_requests_total{method=\"HEAD\",route=\"nar\",status=\"206\"} 1"),
         "{metrics}"
     );
+    assert!(
+        metrics
+            .contains("narjar_http_requests_total{method=\"GET\",route=\"nar\",status=\"416\"} 2"),
+        "{metrics}"
+    );
+    for expected in [
+        "narjar_nar_range_requests_total{method=\"GET\",outcome=\"full\"} 1",
+        "narjar_nar_range_requests_total{method=\"GET\",outcome=\"partial\"} 3",
+        "narjar_nar_range_requests_total{method=\"HEAD\",outcome=\"partial\"} 1",
+        "narjar_nar_range_requests_total{method=\"GET\",outcome=\"unsatisfiable\"} 2",
+        "narjar_nar_range_requests_total{method=\"GET\",outcome=\"invalid\"} 5",
+    ] {
+        assert!(metrics.contains(expected), "missing {expected}: {metrics}");
+    }
 }
 
 #[test]
@@ -3369,7 +3462,7 @@ fn xz_publications_are_idempotent_at_1_8_and_32_way_concurrency() {
         );
         assert!(
             metrics.contains(&format!(
-                "narjar_publication_queue_wait_seconds_count {concurrency}"
+                "narjar_operation_duration_seconds_count{{operation=\"publication_queue_wait\"}} {concurrency}"
             )),
             "{metrics}"
         );
@@ -3432,7 +3525,9 @@ fn stalled_publication_does_not_block_an_independent_put() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("narjar_publication_queue_wait_seconds_count 2"),
+        metrics.contains(
+            "narjar_operation_duration_seconds_count{operation=\"publication_queue_wait\"} 2"
+        ),
         "{metrics}"
     );
 
@@ -3681,6 +3776,8 @@ fn chunked_backend_materializes_compressed_egress_from_chunks() {
     );
     let uploaded =
         server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
+    let repeated_upload =
+        server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
     let narinfo = signed_narinfo_for_encoding(
         WireEncoding::Raw,
         NARJAR_HASH,
@@ -3689,6 +3786,12 @@ fn chunked_backend_materializes_compressed_egress_from_chunks() {
         NAR_BYTES.len() as u64,
     );
     let published = server.request_with_body(
+        "PUT",
+        &format!("/{STORE_HASH}.narinfo"),
+        &[],
+        narinfo.as_bytes(),
+    );
+    let repeated_publication = server.request_with_body(
         "PUT",
         &format!("/{STORE_HASH}.narinfo"),
         &[],
@@ -3712,6 +3815,18 @@ fn chunked_backend_materializes_compressed_egress_from_chunks() {
         "{uploaded:?}"
     );
     assert!(
+        response_parts(&repeated_upload)
+            .0
+            .starts_with("HTTP/1.1 200 OK\r\n"),
+        "{repeated_upload:?}"
+    );
+    assert!(
+        response_parts(&repeated_publication)
+            .0
+            .starts_with("HTTP/1.1 200 OK\r\n"),
+        "{repeated_publication:?}"
+    );
+    assert!(
         response_parts(&published)
             .0
             .starts_with("HTTP/1.1 201 Created\r\n"),
@@ -3724,6 +3839,17 @@ fn chunked_backend_materializes_compressed_egress_from_chunks() {
         "{output_headers}"
     );
     assert_eq!(output_body, expected);
+
+    let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
+        .expect("metrics should be UTF-8");
+    assert!(
+        metrics.contains("narjar_egress_derivatives_total{outcome=\"generation_succeeded\"} 1")
+    );
+    assert!(metrics.contains("narjar_egress_derivatives_total{outcome=\"reused\"} 1"));
+    assert!(metrics.contains("narjar_chunks_total{outcome=\"created\"} 1"));
+    assert!(metrics.contains("narjar_chunks_total{outcome=\"reused\"} 1"));
+    assert!(metrics.contains("narjar_chunk_bytes_total{outcome=\"created\"} 6"));
+    assert!(metrics.contains("narjar_chunk_bytes_total{outcome=\"reused\"} 6"));
     assert!(
         !server
             .data_dir
@@ -4252,6 +4378,8 @@ fn nar_put_rejects_encoded_malformed_oversized_and_truncated_bodies() {
         .expect("read temp directory")
         .next()
         .is_none();
+    let (_, metrics_body) = response_parts(&server.request("GET", "/metrics"));
+    let metrics = String::from_utf8(metrics_body).expect("metrics should be UTF-8");
     let (signal, status) = server.stop();
 
     let limited = RunningServer::start_with_args("nar-put-oversized", &["--max-nar-bytes", "5"]);
@@ -4285,6 +4413,10 @@ fn nar_put_rejects_encoded_malformed_oversized_and_truncated_bodies() {
     assert!(
         truncated.is_empty(),
         "truncated request closes without a response"
+    );
+    assert!(
+        metrics.contains("narjar_connections_total{outcome=\"disconnected\"} 1"),
+        "truncated upload body should count as a disconnected connection: {metrics}"
     );
     assert!(temp_is_empty);
     assert!(!oversized_path.exists());
@@ -5324,7 +5456,8 @@ fn health_readiness_metrics_and_stats_follow_the_operator_contract() {
     let metrics = String::from_utf8(metric_body).expect("metrics should be UTF-8");
     for series in [
         "narjar_http_requests_total",
-        "narjar_http_bytes_in_total",
+        "narjar_http_upload_declared_bytes_total",
+        "narjar_http_upload_received_bytes_total",
         "narjar_http_bytes_out_total",
         "narjar_auth_failures_total",
         "narjar_validation_failures_total",
@@ -5339,6 +5472,23 @@ fn health_readiness_metrics_and_stats_follow_the_operator_contract() {
         assert!(metrics.contains(series), "missing {series}: {metrics}");
     }
 
+    let (metrics_headers, metrics_body) = response_parts(&server.request("GET", "/metrics"));
+    assert!(
+        metrics_headers.starts_with("HTTP/1.1 200"),
+        "{metrics_headers}"
+    );
+    assert!(metrics_headers.contains("Content-Type: text/plain"));
+    assert!(metrics_headers.contains("Cache-Control: no-store"));
+    let metrics = String::from_utf8(metrics_body).expect("metrics should be UTF-8");
+    assert!(metrics.contains("narjar_cache_lookup_outcomes_total"));
+    assert!(metrics.contains("narjar_ready 1"));
+    let (removed_stats_headers, _) = response_parts(&server.request("GET", "/stats"));
+    assert!(removed_stats_headers.starts_with("HTTP/1.1 404"));
+    let (head_headers, head_body) = response_parts(&server.request("HEAD", "/main/metrics"));
+    assert!(head_headers.starts_with("HTTP/1.1 200"), "{head_headers}");
+    assert!(head_headers.contains("Content-Length:"));
+    assert!(head_body.is_empty());
+
     let url = format!("http://{}", server.address);
     let stats = run(&["stats", "--url", &url]);
     assert!(
@@ -5347,6 +5497,7 @@ fn health_readiness_metrics_and_stats_follow_the_operator_contract() {
         String::from_utf8_lossy(&stats.stderr)
     );
     assert!(String::from_utf8_lossy(&stats.stdout).contains("narjar_ready 1"));
+    assert!(String::from_utf8_lossy(&stats.stdout).contains("narjar_cache_lookup_outcomes_total"));
 
     let (signal, status) = server.stop();
     assert!(signal.success());
@@ -5379,9 +5530,12 @@ fn readiness_fails_without_affecting_liveness_when_space_is_reserved() {
 
     let health = response_parts(&server.request("GET", "/healthz")).0;
     let (ready, reason) = response_parts(&server.request("GET", "/readyz"));
+    let (_, metrics_body) = response_parts(&server.request("GET", "/metrics"));
+    let metrics = String::from_utf8(metrics_body).expect("metrics should be UTF-8");
     assert!(health.starts_with("HTTP/1.1 200"), "{health}");
     assert!(ready.starts_with("HTTP/1.1 503"), "{ready}");
     assert_eq!(reason, b"insufficient_space\n");
+    assert!(metrics.contains("narjar_ready 0"));
 
     let (signal, status) = server.stop();
     assert!(signal.success());

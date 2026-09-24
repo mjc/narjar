@@ -132,6 +132,7 @@ mod tests {
             .as_slice(),
             ["push", "--to", "file:///tmp/cache", "/run/current-system"].as_slice(),
             ["stats", "--url", "https://user:secret@cache.example"].as_slice(),
+            ["stats", "--url", "https://cache.example", "--json"].as_slice(),
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("narjar").chain(args.iter().copied())).is_err()

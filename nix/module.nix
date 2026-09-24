@@ -15,6 +15,8 @@
     if cfg.dynamicUser
     then "/var/lib/private/${stateDirectory}"
     else cfg.dataDir;
+  zfsSampleDirectory = "/run/narjar-zfs-stats";
+  zfsSampleFile = "${zfsSampleDirectory}/sample.json";
   fixedPaths = [
     runtimeDataDir
     "${runtimeDataDir}/nar"
@@ -120,23 +122,104 @@
     ${chownOptionalFixedPaths}
   '';
   privilegedPreStart = pkgs.writeShellScript "narjar-pre-start" privilegedPreStartScript;
-  serveArgs = lib.escapeShellArgs [
-    "serve"
-    "--data-dir"
-    runtimeDataDir
-    "--listen"
-    cfg.listen
-    "--workers"
-    (toString cfg.workers)
-    "--max-in-flight"
-    (toString cfg.maxInFlight)
-    "--max-nar-bytes"
-    (toString cfg.maxNarBytes)
-    "--min-free-bytes"
-    (toString cfg.minFreeBytes)
-    "--shutdown-grace-seconds"
-    (toString cfg.shutdownGraceSeconds)
+  serveArgs = lib.escapeShellArgs (
+    [
+      "serve"
+      "--data-dir"
+      runtimeDataDir
+      "--listen"
+      cfg.listen
+      "--workers"
+      (toString cfg.workers)
+      "--max-in-flight"
+      (toString cfg.maxInFlight)
+      "--max-nar-bytes"
+      (toString cfg.maxNarBytes)
+      "--min-free-bytes"
+      (toString cfg.minFreeBytes)
+      "--shutdown-grace-seconds"
+      (toString cfg.shutdownGraceSeconds)
+    ]
+      ++ lib.optionals cfg.statsInventory [
+        "--stats-inventory-interval-seconds"
+        (toString cfg.statsInventoryIntervalSeconds)
+      ]
+      ++ lib.optionals (cfg.statsZfsDataset != null) [
+        "--stats-filesystem-sample"
+        zfsSampleFile
+      ]
+  );
+  zfsProperties = [
+    "mountpoint"
+    "used"
+    "logicalused"
+    "referenced"
+    "logicalreferenced"
+    "usedbydataset"
+    "usedbysnapshots"
+    "usedbychildren"
+    "usedbyrefreservation"
+    "available"
+    "compressratio"
+    "refcompressratio"
+    "compression"
+    "recordsize"
   ];
+  zfsSampleCollector = lib.optionalString (cfg.statsZfsDataset != null) (pkgs.writeShellScript "narjar-zfs-stats-sample" ''
+    set -eu
+    dataset=${lib.escapeShellArg (if cfg.statsZfsDataset == null then "" else cfg.statsZfsDataset)}
+    expected_mountpoint=${lib.escapeShellArg cfg.dataDir}
+    storage_root=${lib.escapeShellArg runtimeDataDir}
+    sample_directory=${lib.escapeShellArg zfsSampleDirectory}
+    temporary_file=
+
+    cleanup() {
+      if [ -n "$temporary_file" ]; then
+        ${pkgs.coreutils}/bin/rm -f -- "$temporary_file"
+      fi
+    }
+    trap cleanup EXIT
+
+    actual_mountpoint=$(${pkgs.zfs}/bin/zfs get -H -o value mountpoint "$dataset")
+    test "$actual_mountpoint" = "$expected_mountpoint"
+    mounted_source=$(${pkgs.util-linux}/bin/findmnt --noheadings --raw --output SOURCE --target "$expected_mountpoint")
+    mounted_type=$(${pkgs.util-linux}/bin/findmnt --noheadings --raw --output FSTYPE --target "$expected_mountpoint")
+    test "$mounted_source" = "$dataset"
+    test "$mounted_type" = "zfs"
+    descendant_count=$(${pkgs.zfs}/bin/zfs list -H -r -o name "$dataset" | ${pkgs.coreutils}/bin/wc -l)
+    test "$descendant_count" -eq 1
+
+    properties=$(${pkgs.zfs}/bin/zfs get -Hp -o property,value ${lib.escapeShellArgs zfsProperties} "$dataset")
+    temporary_file=$(${pkgs.coreutils}/bin/mktemp "$sample_directory/.sample.XXXXXX")
+    printf '%s\n' "$properties" | ${pkgs.jq}/bin/jq -Rn \
+      --arg storage_root "$storage_root" \
+      --arg dataset "$dataset" '
+        [inputs | split("\t") | {(.[0]): .[1]}] | add | . as $p |
+        {
+          schema_version: 1,
+          storage_root: $storage_root,
+          dataset: $dataset,
+          mountpoint: $p.mountpoint,
+          sampled_at_unix_seconds: (now | floor),
+          used_bytes: ($p.used | tonumber),
+          logical_used_bytes: ($p.logicalused | tonumber),
+          referenced_bytes: ($p.referenced | tonumber),
+          logical_referenced_bytes: ($p.logicalreferenced | tonumber),
+          used_by_dataset_bytes: ($p.usedbydataset | tonumber),
+          used_by_snapshots_bytes: ($p.usedbysnapshots | tonumber),
+          used_by_children_bytes: ($p.usedbychildren | tonumber),
+          used_by_refreservation_bytes: ($p.usedbyrefreservation | tonumber),
+          available_bytes: ($p.available | tonumber),
+          compression_ratio: $p.compressratio,
+          referenced_compression_ratio: $p.refcompressratio,
+          compression: $p.compression,
+          record_size_bytes: ($p.recordsize | tonumber)
+        }
+      ' > "$temporary_file"
+    ${pkgs.coreutils}/bin/chmod 0644 "$temporary_file"
+    ${pkgs.coreutils}/bin/mv -fT -- "$temporary_file" ${lib.escapeShellArg zfsSampleFile}
+    temporary_file=
+  '');
   commonServiceConfig = {
     PrivateTmp = true;
     ProtectSystem = "strict";
@@ -225,6 +308,24 @@ in {
       default = 30;
     };
 
+    statsInventory = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Enable the delayed, bounded cache-population sampler.";
+    };
+
+    statsInventoryIntervalSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 900;
+      description = "Interval between cache-population scans when statsInventory is enabled.";
+    };
+
+    statsZfsDataset = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Optional ZFS dataset mounted directly at dataDir; enables a bounded one-minute read-only usage sample.";
+    };
+
     gc = {
       enable = lib.mkEnableOption "scheduled Narjar garbage collection";
 
@@ -301,6 +402,10 @@ in {
           || cfg.gc.maxAgeSeconds != null;
         message = "services.narjar.gc requires maxBytes, targetBytes, or maxAgeSeconds";
       }
+      {
+        assertion = cfg.statsZfsDataset == null || cfg.statsZfsDataset != "";
+        message = "services.narjar.statsZfsDataset must be null or a non-empty ZFS dataset name";
+      }
     ];
 
     users.groups.narjar = lib.mkIf (!cfg.dynamicUser) {};
@@ -361,6 +466,38 @@ in {
             "~@resources"
           ];
         };
+    };
+    systemd.services.narjar-zfs-stats = lib.mkIf (cfg.statsZfsDataset != null) {
+      description = "Sample Narjar ZFS dataset usage";
+      after = ["local-fs.target" "zfs-import.target"];
+      unitConfig.RequiresMountsFor = [cfg.dataDir];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = zfsSampleCollector;
+        TimeoutStartSec = "15s";
+        RuntimeDirectory = "narjar-zfs-stats";
+        RuntimeDirectoryMode = "0755";
+        RuntimeDirectoryPreserve = "yes";
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        NoNewPrivileges = true;
+        DevicePolicy = "closed";
+        DeviceAllow = ["/dev/zfs rw"];
+        ReadWritePaths = [zfsSampleDirectory];
+        RestrictAddressFamilies = [ ];
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+      };
+    };
+
+    systemd.timers.narjar-zfs-stats = lib.mkIf (cfg.statsZfsDataset != null) {
+      wantedBy = ["timers.target"];
+      timerConfig = {
+        OnBootSec = "60s";
+        OnUnitActiveSec = "60s";
+        Unit = "narjar-zfs-stats.service";
+      };
     };
     systemd.services.narjar-gc = lib.mkIf cfg.gc.enable {
       description = "Narjar offline garbage collection";

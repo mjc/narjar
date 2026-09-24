@@ -300,7 +300,6 @@ impl StagingBudget {
         self.outstanding_bytes = self.outstanding_bytes.saturating_sub(bytes);
     }
 
-    #[cfg(test)]
     pub(super) const fn outstanding_bytes(&self) -> u64 {
         self.outstanding_bytes
     }

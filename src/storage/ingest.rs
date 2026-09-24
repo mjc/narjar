@@ -96,6 +96,10 @@ impl<'storage> Staged<'storage, Streaming<UploadRequest>> {
         let received = self.write_and_verify_uploaded_nar(source)?;
         self.temporary.file.file.sync_all()?;
         self.transaction.transition(PublicationState::Validated)?;
+        self.temporary
+            .storage
+            .activity
+            .record_upload_validated_logical_bytes(received.identity().size().get());
         Ok(Staged {
             temporary: self.temporary,
             transaction: self.transaction,
@@ -150,7 +154,11 @@ impl Staged<'_, Validated<ReceivedNar>> {
         } = self;
         let received = state.into_inner();
         let storage = temporary.storage;
-        let outcome = temporary.commit(received.identity(), transaction)?;
+        let identity = received.identity();
+        let outcome = temporary.commit(identity, transaction)?;
+        storage
+            .activity
+            .record_upload_publication(outcome, identity.size().get());
         checkpoint(super::publication::PublishBoundary::AfterNarPublication)?;
         match received {
             ReceivedNar::Raw(_) => {}

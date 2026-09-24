@@ -9,6 +9,7 @@ use std::{
 use clap::{Args, Subcommand};
 use data_encoding::BASE64;
 use ed25519_dalek::SigningKey;
+use narjar::maintenance::FILE_NAMES as MAINTENANCE_FILES;
 use narjar::storage::{
     CHUNK_DIRECTORY, Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY,
     LAYOUT_DESCRIPTOR, MANIFEST_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY, Storage,
@@ -109,10 +110,13 @@ fn reject_unexpected_init_entries(root: &Path) -> Result<(), Error> {
     for entry in fs::read_dir(root).map_err(runtime)? {
         let entry = entry.map_err(runtime)?;
         let name = entry.file_name();
-        if !INIT_ROOT_ENTRIES
+        let allowed = INIT_ROOT_ENTRIES
             .iter()
             .any(|allowed| name == std::ffi::OsStr::new(allowed))
-        {
+            || MAINTENANCE_FILES
+                .iter()
+                .any(|allowed| name == std::ffi::OsStr::new(allowed));
+        if !allowed {
             unexpected.insert(name.to_string_lossy().into_owned());
         }
     }

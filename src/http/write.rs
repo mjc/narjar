@@ -6,8 +6,8 @@ use std::{
 
 use crate::{
     auth::{Authorizer, Permission},
-    http_server::{BodyReaderError, BodyState, Request, Response, StatusCode},
-    metrics::{Metrics, RequestGuard, RequestMethod, ValidationClass},
+    http_server::{BodyReader, BodyReaderError, BodyState, Request, Response, StatusCode},
+    metrics::{ConnectionOutcome, Metrics, RequestGuard, RequestMethod, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::{NarFileName, WireEncoding},
     storage::{
@@ -23,6 +23,52 @@ use super::read::{
 struct UploadRequest {
     request: Request,
     length: usize,
+}
+
+struct CountedUploadReader<'a> {
+    body: BodyReader<'a>,
+    metrics: &'a Metrics,
+    expected_bytes: u64,
+    received_bytes: u64,
+    failure_observation: SocketFailureObservation,
+}
+
+#[derive(Clone, Copy)]
+enum SocketFailureObservation {
+    NotObserved,
+    Observed,
+}
+
+impl CountedUploadReader<'_> {
+    fn record_socket_failure(&mut self, outcome: ConnectionOutcome) {
+        match self.failure_observation {
+            SocketFailureObservation::NotObserved => {
+                self.metrics.record_connection_outcome(outcome);
+                self.failure_observation = SocketFailureObservation::Observed;
+            }
+            SocketFailureObservation::Observed => {}
+        }
+    }
+}
+
+impl Read for CountedUploadReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = match self.body.read(buffer) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                if let Some(outcome) = Metrics::socket_read_failure(error.kind()) {
+                    self.record_socket_failure(outcome);
+                }
+                return Err(error);
+            }
+        };
+        self.metrics.received_upload_body_bytes(bytes_read);
+        self.received_bytes = self.received_bytes.saturating_add(bytes_read as u64);
+        if bytes_read == 0 && self.received_bytes < self.expected_bytes {
+            self.record_socket_failure(ConnectionOutcome::Disconnected);
+        }
+        Ok(bytes_read)
+    }
 }
 
 pub struct PublicationRequest {
@@ -108,9 +154,9 @@ pub fn prepare_publication(
 
     let route = match CacheRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
-        RouteMatch::Invalid => {
+        RouteMatch::InvalidNarPath | RouteMatch::Invalid => {
             let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-            let _ = send_response(&guard, request, Response::empty(StatusCode::BAD_REQUEST), 0);
+            let _ = send_response(&guard, request, Response::empty(StatusCode::BAD_REQUEST));
             return None;
         }
         RouteMatch::Missing => {
@@ -131,7 +177,7 @@ impl UploadRequest {
             Err(status) => {
                 metrics.validation_failure(ValidationClass::Body);
                 let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-                let _ = send_response(&guard, request, Response::empty(status), 0);
+                let _ = send_response(&guard, request, Response::empty(status));
                 None
             }
         }
@@ -155,18 +201,27 @@ impl UploadRequest {
         self.request.body_state()
     }
 
-    fn reader(&mut self) -> Result<impl Read + '_, BodyReaderError> {
-        self.request.as_reader()
+    fn reader<'a>(
+        &'a mut self,
+        metrics: &'a Metrics,
+    ) -> Result<CountedUploadReader<'a>, BodyReaderError> {
+        Ok(CountedUploadReader {
+            body: self.request.as_reader()?,
+            metrics,
+            expected_bytes: self.length as u64,
+            received_bytes: 0,
+            failure_observation: SocketFailureObservation::NotObserved,
+        })
     }
 
-    fn read_body(&mut self, max_bytes: usize) -> Result<Vec<u8>, StatusCode> {
+    fn read_body(&mut self, max_bytes: usize, metrics: &Metrics) -> Result<Vec<u8>, StatusCode> {
         if self.length > max_bytes {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
         let length = self.length;
         let mut bytes = Vec::with_capacity(length);
         let read = self
-            .reader()
+            .reader(metrics)
             .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?
             .take(length as u64 + 1)
             .read_to_end(&mut bytes);
@@ -177,7 +232,7 @@ impl UploadRequest {
     }
 
     fn respond(self, guard: &RequestGuard<'_>, status: StatusCode) -> Option<TcpStream> {
-        send_response(guard, self.request, Response::empty(status), 0)
+        send_response(guard, self.request, Response::empty(status))
     }
 }
 
@@ -219,7 +274,7 @@ fn respond_cache_info_put(
         metrics.validation_failure(ValidationClass::Body);
         return upload.respond(guard, StatusCode::CONFLICT);
     }
-    let bytes = match upload.read_body(cache_info.len()) {
+    let bytes = match upload.read_body(cache_info.len(), metrics) {
         Ok(bytes) => bytes,
         Err(status) => {
             metrics.validation_failure(ValidationClass::Body);
@@ -234,6 +289,7 @@ fn respond_cache_info_put(
     let started = Instant::now();
     let result = storage.publish_cache_info(bytes.as_slice());
     metrics.publication(started.elapsed());
+    metrics.record_publication_result(&result);
     if let Err(error) = &result {
         record_capacity_error(metrics, error);
     }
@@ -270,7 +326,7 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
     let length = upload.length();
     let _upload = metrics.upload(length as u64);
     let started = Instant::now();
-    let reader = match upload.reader() {
+    let reader = match upload.reader(metrics) {
         Ok(reader) => reader,
         Err(_) => {
             metrics.validation_failure(ValidationClass::Nar);
@@ -280,6 +336,7 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
     };
     let result = storage.publish_nar_with_staging(name, reader, length as u64, policy, staging);
     metrics.publication(started.elapsed());
+    metrics.record_publication_result(&result);
     if matches!(upload.body_state(), BodyState::Reading | BodyState::Failed)
         && !matches!(result, Err(StorageError::UploadTooLarge))
     {
@@ -333,7 +390,7 @@ fn respond_narinfo_put(
         guard,
     } = context;
     let _upload = metrics.upload(upload.length() as u64);
-    let bytes = match upload.read_body(MAX_NARINFO_BYTES as usize) {
+    let bytes = match upload.read_body(MAX_NARINFO_BYTES as usize, metrics) {
         Ok(bytes) => bytes,
         Err(status) => {
             metrics.validation_failure(ValidationClass::Body);
@@ -352,6 +409,7 @@ fn respond_narinfo_put(
         .bind_narinfo(validated, egress_compression, policy)
         .and_then(|bound| bound.publish());
     metrics.publication(started.elapsed());
+    metrics.record_publication_result(&result);
     if let Err(error) = &result {
         record_capacity_error(metrics, error);
     }
@@ -382,6 +440,5 @@ pub(super) fn unauthorized(guard: &RequestGuard<'_>, request: Request) -> Option
         guard,
         request,
         Response::empty(StatusCode::UNAUTHORIZED).with_header(challenge),
-        0,
     )
 }

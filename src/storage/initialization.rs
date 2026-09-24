@@ -15,7 +15,7 @@ use super::{
     fs::{directory_is_empty, ensure_directory_at, open_at, open_optional_at},
     publication::{ProcessLock, StorageError},
     recovery::RecoveryState,
-    state::{DeliveryValidationCache, PayloadStorage, Storage, StorageBackend},
+    state::{DeliveryValidationCache, PayloadStorage, Storage, StorageActivity, StorageBackend},
 };
 
 #[cfg(test)]
@@ -78,11 +78,12 @@ impl Storage {
             "compressed egress receipt directory",
         )?;
         ensure_backend_layout(&root_directory, backend, root_is_empty)?;
+        let activity = Arc::new(StorageActivity::default());
         let payloads = match backend {
             StorageBackend::Flat => PayloadStorage::Flat,
-            StorageBackend::Chunked => {
-                PayloadStorage::Chunked(ChunkStore::initialize(&root_directory)?)
-            }
+            StorageBackend::Chunked => PayloadStorage::Chunked(
+                ChunkStore::initialize_with_activity(&root_directory, Arc::clone(&activity))?,
+            ),
         };
 
         root_directory.sync_all()?;
@@ -98,6 +99,7 @@ impl Storage {
             publication_locks: Mutex::new(HashMap::new()),
             staging_budget: Arc::new(Mutex::new(Default::default())),
             temporary_objects: AtomicU64::new(0),
+            activity,
             #[cfg(test)]
             egress_generations: AtomicU64::new(0),
             _lock: lock,

@@ -10,7 +10,7 @@ pub(crate) use super::response::FORCE_PORTABLE_FILE_COPY;
 pub(super) use super::response::Response;
 #[cfg(test)]
 pub(super) use super::response::StatusCode;
-use super::response::{copy_file_to_stream, invalid_data};
+use super::response::{CompletedTransfer, TransferFailure, copy_file_to_stream, invalid_data};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
@@ -402,11 +402,17 @@ impl Request {
         self.keep_alive = false;
     }
 
-    pub fn respond<R: Read>(self, response: Response<R>) -> io::Result<Option<TcpStream>> {
+    pub fn respond<R: Read>(
+        self,
+        response: Response<R>,
+    ) -> Result<CompletedTransfer, TransferFailure> {
         let head = self.method == Method::Head;
         let mut stream = self.stream;
-        response.write_to(&mut stream, head, self.keep_alive)?;
-        Ok(self.keep_alive.then_some(stream))
+        let body_bytes = response.write_to(&mut stream, head, self.keep_alive)?;
+        Ok(CompletedTransfer {
+            connection: self.keep_alive.then_some(stream),
+            body_bytes,
+        })
     }
 
     pub fn respond_file(
@@ -415,14 +421,24 @@ impl Request {
         mut file: File,
         offset: u64,
         length: u64,
-    ) -> io::Result<Option<TcpStream>> {
+    ) -> Result<CompletedTransfer, TransferFailure> {
         let head = self.method == Method::Head;
         let mut stream = self.stream;
-        response.write_headers(&mut stream, self.keep_alive)?;
-        if !head {
-            copy_file_to_stream(&mut file, &mut stream, offset, length)?;
-        }
-        Ok(self.keep_alive.then_some(stream))
+        response
+            .write_headers(&mut stream, self.keep_alive)
+            .map_err(|error| TransferFailure {
+                error,
+                body_bytes: 0,
+            })?;
+        let body_bytes = if head {
+            0
+        } else {
+            copy_file_to_stream(&mut file, &mut stream, offset, length)?
+        };
+        Ok(CompletedTransfer {
+            connection: self.keep_alive.then_some(stream),
+            body_bytes,
+        })
     }
 }
 
@@ -664,7 +680,7 @@ mod tests {
         let (stream, _) = listener.accept().expect("accept test request");
         let request = Request::read(stream).expect("parse request");
         let file = fs::File::open(path).expect("open NAR fixture");
-        request
+        let transfer = request
             .respond_file(
                 Response::new(StatusCode::PARTIAL_CONTENT, std::io::empty(), 4),
                 file,
@@ -672,10 +688,47 @@ mod tests {
                 4,
             )
             .expect("write file response");
+        assert_eq!(transfer.body_bytes, 4);
         let response = sender.join().expect("sender should finish");
         assert_eq!(
             response,
             b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nConnection: close\r\n\r\n2345"
+        );
+    }
+
+    #[test]
+    fn short_file_response_retains_bytes_written_before_eof() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("short-nar");
+        fs::write(&path, b"partial").expect("write short NAR fixture");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let sender = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            stream
+                .write_all(b"GET /nar/example.nar HTTP/1.1\r\nConnection: close\r\n\r\n")
+                .expect("write request");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("read response");
+            response
+        });
+        let (stream, _) = listener.accept().expect("accept test request");
+        let request = Request::read(stream).expect("parse request");
+        let failure = request
+            .respond_file(
+                Response::new(StatusCode::PARTIAL_CONTENT, std::io::empty(), 11),
+                fs::File::open(path).expect("open short NAR fixture"),
+                0,
+                11,
+            )
+            .expect_err("short file should fail the declared transfer");
+        assert_eq!(failure.body_bytes, 7);
+        assert_eq!(failure.error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            sender
+                .join()
+                .expect("sender should finish")
+                .ends_with(b"\r\n\r\npartial")
         );
     }
 

@@ -92,7 +92,6 @@ narjar key generate
 narjar stats
   --url HTTP_URL
   [--netrc-file PATH]
-  [--json]
 
 narjar push
   --to STORE_URI
@@ -585,20 +584,43 @@ public.
 
 GET /metrics exposes Prometheus text generated directly from atomic counters,
 without a metrics crate. Private-read mode requires read authorization.
+`narjar stats` fetches and prints that same exposition; it has no JSON output
+mode, and `/metrics` is the only statistics route.
 Required series:
 
-- `narjar_http_requests_total{method,route,status}` uses fixed method, route,
-  and HTTP status-class values (`2xx` through `5xx` plus `other`).
-- `narjar_http_bytes_in_total` counts accepted upload body bytes and
-  `narjar_http_bytes_out_total` counts served artifact and endpoint bytes.
+- `narjar_http_requests_total{method,route,status}` uses fixed method and route
+  values, plus exact supported HTTP status codes and `other`.
+- `narjar_http_upload_declared_bytes_total` counts declared upload body bytes;
+  `narjar_http_upload_received_bytes_total` counts upload body bytes actually
+  consumed, including bytes consumed before a failed or truncated upload.
+  `narjar_nar_upload_validated_logical_bytes_total` counts logical bytes only
+  after the complete encoded upload and decoded hash/size validation succeeds;
+  it does not claim NAR grammar or signature validation.
+  `narjar_nar_upload_committed_logical_bytes_total{outcome}` counts logical
+  bytes at durable canonical publication, separating newly created payloads
+  from identical duplicates. These are storage-boundary counters, not HTTP
+  declared/received bytes or output-format conversion counts.
+  `narjar_http_bytes_out_total` counts NAR and narinfo body bytes actually
+  accepted by socket writes/sendfile, including partial progress before a
+  failed delivery. It excludes control endpoints, response headers, TLS, and
+  HEAD bodies; it does not prove that the client application received them.
+  `narjar_response_transfer_failures_total{kind}` classifies failed response
+  writes as `timeout`, `disconnected`, or `other`; this bounded cause counter
+  complements the selected HTTP status and partial-body byte total. Request
+  header and upload-body read timeouts/disconnects are counted in
+  `narjar_connections_total`.
 - `narjar_auth_failures_total{scope}` uses only `read` and `write` scopes.
 - `narjar_validation_failures_total{class}` uses only `body`, `nar`, and
   `narinfo` classes.
+- `narjar_nar_range_requests_total{method,outcome}` counts parsed range
+  decisions for existing NARs: `full`, `partial`, `unsatisfiable`, and
+  `invalid`. GET and HEAD remain separate; status 416 separately identifies
+  unsatisfiable responses.
 - `narjar_uploads_in_flight` and `narjar_requests_in_flight` are RAII gauges
   and return to zero after each request completes.
 - `narjar_temp_objects` is the current process's temporary-publication count;
   it is updated at create/remove boundaries and does not perform an online
-  cache inventory.
+  cache inventory. Temporary files left by an earlier process are not included.
 - `narjar_disk_full_total` and `narjar_capacity_failures_total{reason}` use
   fixed `no_space`, `quota`, `inodes`, and `read_only` reasons.
 - `narjar_publications_total` and the
@@ -609,6 +631,34 @@ Required series:
   values from `statvfs` on the NAR destination; `narjar_storage_read_only`
   reports its read-only flag. These are O(1) descriptor queries and omit the
   series when the destination probe fails.
+- `narjar_cache_population_narinfo_claimed_nar_bytes` sums structurally valid
+  `NarSize` claims once per store path. Shared NAR content contributes once
+  for each store path; this is distinct from stored raw-file bytes and is not
+  signature verification.
+- `narjar_cache_population_scan_started_timestamp_seconds` and
+  `narjar_cache_population_scan_timestamp_seconds` bracket the most recent
+  scan attempt; `narjar_cache_population_scan_duration_seconds` uses monotonic
+  elapsed time. `narjar_cache_population_sample_timestamp_seconds` is the
+  completion time of the last complete aggregate.
+- `narjar_cache_population_scan_entries`,
+  `narjar_cache_population_scan_ignored_entries`,
+  `narjar_cache_population_scan_disappeared_entries`, and
+  `narjar_cache_population_scan_errors` describe traversal coverage;
+  `narjar_cache_population_scan_narinfo_read_errors` isolates unreadable
+  metadata among those errors.
+  `narjar_cache_population_scan_quality{quality}` uses only `complete`,
+  `changed_during_scan`, `entry_errors`, or `failed`.
+- `narjar_cache_population_narinfo_entries{kind}` separates structurally
+  parsed, malformed-filename, malformed-content, and unreadable narinfo
+  entries from the last complete aggregate.
+  `narjar_cache_population_refresh_failed` is 1 after an incomplete or failed
+  attempt; its coverage and quality describe that attempt while the previous
+  complete aggregate remains available with stale state.
+- Optional ZFS observations use `narjar_zfs_bytes{kind,state}` for used,
+  logical, referenced, snapshot, child, reservation, and available byte totals.
+  `narjar_zfs_compression_info{algorithm,state}` has fixed algorithm values;
+  `narjar_zfs_compression_level{algorithm,state}` reports numeric levels
+  separately, and unknown future settings use `algorithm="other"`.
 - narjar_ready 0/1
 
 The [`health_readiness_metrics_and_stats_follow_the_operator_contract`](../tests/cli.rs)
@@ -617,6 +667,24 @@ metric implementation is in [`src/metrics.rs`](../src/metrics.rs).
 
 Labels are fixed enums; no request IDs, paths, token names, or hashes become
 metric labels.
+
+Explicit `gc`, `reconcile` (including structural inspection/cleanup), and
+`verify` commands persist a bounded last-run summary in the cache directory.
+`/metrics` samples those summaries without running maintenance itself. A
+started timestamp with no completion is reported separately, so an interrupted
+operation cannot replace or refresh the last completed result. Inventory
+classes are exported as fixed labels. GC-reclaimed bytes are Narjar's logical
+accounting delta, not a claim about physical blocks freed; unmeasured byte
+counts are omitted.
+
+Some useful measurements intentionally do not appear here. Client-side push
+preflight and trusted-cache skips cannot be inferred from server requests.
+Upstream edge-fill outcomes, native-source lease counts, and online-retention
+effects belong with those features when implemented. Per-object popularity and
+distinct-client counts are omitted to avoid a resident catalog, privacy
+exposure, and unbounded metric cardinality. Build-time savings and host-level
+ARC, disk, and network pressure belong in client or platform monitoring. These
+omissions mean "not measured," not zero.
 
 ## Filesystem support boundary
 

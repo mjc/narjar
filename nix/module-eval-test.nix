@@ -13,24 +13,32 @@ let
     system.stateVersion = "25.11";
   };
 
+  configuration = {
+    dataDir,
+    statsInventory ? false,
+    statsInventoryIntervalSeconds ? 900,
+    statsZfsDataset ? null,
+  }:
+    (import (pkgs.path + "/nixos/lib/eval-config.nix") {
+      system = pkgs.system;
+      modules = [
+        module
+        base
+        {
+          services.narjar = {
+            enable = true;
+            inherit dataDir statsInventory statsInventoryIntervalSeconds statsZfsDataset;
+            minFreeBytes = 0;
+            package = package;
+          };
+        }
+      ];
+    }).config;
+
   evaluates = dataDir:
     let
       result = builtins.tryEval (
-        (import (pkgs.path + "/nixos/lib/eval-config.nix") {
-          system = pkgs.system;
-          modules = [
-            module
-            base
-            {
-              services.narjar = {
-                enable = true;
-                inherit dataDir;
-                minFreeBytes = 0;
-                package = package;
-              };
-            }
-          ];
-        }).config.system.build.toplevel.drvPath
+        (configuration {inherit dataDir;}).system.build.toplevel.drvPath
       );
     in result.success;
 
@@ -47,7 +55,34 @@ let
     "/var/lib/foo/"
     "/var/lib//foo"
   ];
+  defaultConfig = configuration {dataDir = "/var/lib/narjar";};
+  sampledConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    statsInventory = true;
+  };
+  customIntervalConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    statsInventory = true;
+    statsInventoryIntervalSeconds = 30;
+  };
+  zfsSampledConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    statsZfsDataset = "tank/narjar";
+  };
+  emptyZfsDatasetConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    statsZfsDataset = "";
+  };
 in
 assert builtins.all evaluates valid;
 assert builtins.all (dataDir: !(evaluates dataDir)) invalid;
+assert !(lib.hasInfix "--stats-inventory-interval-seconds" defaultConfig.systemd.services.narjar.serviceConfig.ExecStart);
+assert (lib.hasInfix "--stats-inventory-interval-seconds 900" sampledConfig.systemd.services.narjar.serviceConfig.ExecStart);
+assert (lib.hasInfix "--stats-inventory-interval-seconds 30" customIntervalConfig.systemd.services.narjar.serviceConfig.ExecStart);
+assert !(lib.hasInfix "--stats-filesystem-sample" defaultConfig.systemd.services.narjar.serviceConfig.ExecStart);
+assert (lib.hasInfix "--stats-filesystem-sample /run/narjar-zfs-stats/sample.json" zfsSampledConfig.systemd.services.narjar.serviceConfig.ExecStart);
+assert (lib.hasAttr "narjar-zfs-stats" zfsSampledConfig.systemd.services);
+assert (zfsSampledConfig.systemd.timers.narjar-zfs-stats.timerConfig.OnUnitActiveSec == "60s");
+assert (!(lib.hasAttr "narjar-zfs-stats" defaultConfig.systemd.services));
+assert (!(builtins.tryEval emptyZfsDatasetConfig.system.build.toplevel.drvPath).success);
 "narjar module dataDir assertions passed"
