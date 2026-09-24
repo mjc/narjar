@@ -182,8 +182,12 @@ fn run_request_worker(receiver: Receiver<AcceptedRequest>, context: RequestWorke
             _admission,
         } = accepted;
         let mut admission = Some(_admission);
-        while let Some(next_stream) = process_next_request(stream, &mut admission, &context) {
+        let mut has_served_request = false;
+        while let Some(next_stream) =
+            process_next_request(stream, &mut admission, &context, has_served_request)
+        {
             stream = next_stream;
+            has_served_request = true;
         }
     }
 }
@@ -192,7 +196,19 @@ fn process_next_request(
     stream: TcpStream,
     admission: &mut Option<Admission>,
     context: &RequestWorkerContext,
+    has_served_request: bool,
 ) -> Option<TcpStream> {
+    if has_served_request {
+        match keep_alive_request_is_waiting(&stream) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                let mut stream = stream;
+                report_request_read_failure(&mut stream, error, &context.metrics);
+                return None;
+            }
+        }
+    }
     match Request::read(stream) {
         Ok(request) => match request.method() {
             Method::Put => {
@@ -211,6 +227,24 @@ fn process_next_request(
         Err((mut stream, error)) => {
             report_request_read_failure(&mut stream, error, &context.metrics);
             None
+        }
+    }
+}
+
+fn keep_alive_request_is_waiting(stream: &TcpStream) -> io::Result<bool> {
+    let mut first_byte = [0; 1];
+    loop {
+        match stream.peek(&mut first_byte) {
+            Ok(0) => return Ok(false),
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -631,7 +665,7 @@ fn spawn_population_sampler(
 mod tests {
     use std::{
         io::{self, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         panic::{AssertUnwindSafe, catch_unwind},
         sync::Arc,
         thread,
@@ -640,7 +674,10 @@ mod tests {
 
     use narjar::{http_server::Request, metrics::Metrics};
 
-    use super::{Admissions, configure_socket_timeouts, request_read_failure_outcome};
+    use super::{
+        Admissions, configure_socket_timeouts, keep_alive_request_is_waiting,
+        request_read_failure_outcome,
+    };
     use narjar::metrics::ConnectionOutcome;
 
     #[test]
@@ -712,6 +749,61 @@ mod tests {
             error.kind(),
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
         ));
+        client.join().expect("client should finish");
+    }
+
+    #[test]
+    fn idle_keep_alive_timeout_has_no_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let client = thread::spawn(move || {
+            let _stream = TcpStream::connect(address).expect("connect test listener");
+            thread::sleep(Duration::from_millis(150));
+        });
+
+        let (stream, _) = listener.accept().expect("accept idle connection");
+        configure_socket_timeouts(&stream, Duration::from_millis(30))
+            .expect("configure socket timeout");
+        assert!(!keep_alive_request_is_waiting(&stream).expect("peek idle connection"));
+        client.join().expect("client should finish");
+    }
+
+    #[test]
+    fn clean_keep_alive_close_has_no_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let client = thread::spawn(move || {
+            drop(TcpStream::connect(address).expect("connect test listener"));
+        });
+
+        let (stream, _) = listener.accept().expect("accept closed connection");
+        configure_socket_timeouts(&stream, Duration::from_millis(100))
+            .expect("configure socket timeout");
+        client.join().expect("client should close cleanly");
+        assert!(!keep_alive_request_is_waiting(&stream).expect("peek closed connection"));
+    }
+
+    #[test]
+    fn partial_keep_alive_request_is_not_mistaken_for_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect test listener");
+            stream.write_all(b"G").expect("write start of next request");
+            thread::sleep(Duration::from_millis(150));
+        });
+
+        let (stream, _) = listener.accept().expect("accept partial request");
+        configure_socket_timeouts(&stream, Duration::from_millis(30))
+            .expect("configure socket timeout");
+        assert!(keep_alive_request_is_waiting(&stream).expect("peek partial request"));
+        let error = match Request::read(stream) {
+            Ok(_) => panic!("incomplete request should time out"),
+            Err((_, error)) => error,
+        };
+        assert!(
+            error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock
+        );
         client.join().expect("client should finish");
     }
 }

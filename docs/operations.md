@@ -588,8 +588,8 @@ without a metrics crate. Private-read mode requires read authorization.
 mode, and `/metrics` is the only statistics route.
 Required series:
 
-- `narjar_http_requests_total{method,route,status}` uses fixed method, route,
-  and HTTP status-class values (`2xx` through `5xx` plus `other`).
+- `narjar_http_requests_total{method,route,status}` uses fixed method and route
+  values, plus exact supported HTTP status codes and `other`.
 - `narjar_http_upload_declared_bytes_total` counts declared upload body bytes;
   `narjar_http_upload_received_bytes_total` counts upload body bytes actually
   consumed, including bytes consumed before a failed or truncated upload.

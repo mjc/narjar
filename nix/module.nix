@@ -482,8 +482,8 @@ in {
         ProtectSystem = "strict";
         ProtectHome = true;
         NoNewPrivileges = true;
-        PrivateDevices = true;
-        DeviceAllow = ["/dev/zfs r"];
+        DevicePolicy = "closed";
+        DeviceAllow = ["/dev/zfs rw"];
         ReadWritePaths = [zfsSampleDirectory];
         RestrictAddressFamilies = [ ];
         RestrictNamespaces = true;

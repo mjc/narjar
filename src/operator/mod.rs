@@ -499,25 +499,27 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         json,
         storage_backend,
     } = options;
-    let recorder = begin_maintenance(
-        &data_dir,
-        MaintenanceOperation::Gc,
-        if apply {
-            MaintenanceMode::GcApply
-        } else {
-            MaintenanceMode::GcDryRun
+    let maintenance_mode = if apply {
+        MaintenanceMode::GcApply
+    } else {
+        MaintenanceMode::GcDryRun
+    };
+    let mut recorder = None;
+    let report = match gc::run_with_lock_acquired(
+        GcOptions {
+            data_dir: data_dir.clone(),
+            max_bytes,
+            target_bytes,
+            max_age: max_age_seconds.map(std::time::Duration::from_secs),
+            min_age: std::time::Duration::from_secs(min_age_seconds),
+            protected_roots,
+            mode: if apply { GcMode::Apply } else { GcMode::DryRun },
+            backend: storage_backend,
         },
-    );
-    let report = match gc::run(GcOptions {
-        data_dir,
-        max_bytes,
-        target_bytes,
-        max_age: max_age_seconds.map(std::time::Duration::from_secs),
-        min_age: std::time::Duration::from_secs(min_age_seconds),
-        protected_roots,
-        mode: if apply { GcMode::Apply } else { GcMode::DryRun },
-        backend: storage_backend,
-    }) {
+        || {
+            recorder = begin_maintenance(&data_dir, MaintenanceOperation::Gc, maintenance_mode);
+        },
+    ) {
         Ok(report) => report,
         Err(error) => {
             finish_maintenance(
@@ -992,6 +994,7 @@ pub(crate) fn stats(options: Stats) -> Result<(), Error> {
     let stats_url = options.url.endpoint(&["metrics"]);
     let agent: Agent = Agent::config_builder()
         .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(15)))
         .timeout_connect(Some(Duration::from_secs(5)))
         .timeout_recv_body(Some(Duration::from_secs(10)))
         .build()
@@ -1242,6 +1245,51 @@ machine other.example password other-secret
                 .to_string_lossy()
                 .starts_with(".narjar-maintenance-")
         }));
+    }
+
+    #[test]
+    fn gc_lock_conflict_does_not_overwrite_an_active_maintenance_record() {
+        let directory = tempfile::tempdir().expect("cache directory should be created");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+            storage_backend: StorageBackend::Flat,
+        })
+        .expect("cache should initialize");
+        let before = narjar::maintenance::read_snapshot(directory.path())
+            .expect("maintenance history should be readable");
+        let root = Directory::open(directory.path()).expect("cache root should open");
+        let _active_storage = Storage::initialize(&root, StorageBackend::Flat)
+            .expect("first operation should hold the cache lock");
+
+        let result = gc(Gc {
+            data_dir: directory.path().to_owned(),
+            max_bytes: None,
+            target_bytes: Some(0),
+            max_age_seconds: None,
+            min_age_seconds: 0,
+            protected_roots: None,
+            dry_run: false,
+            apply: false,
+            json: false,
+            storage_backend: StorageBackend::Flat,
+        });
+        assert!(
+            result.is_err(),
+            "a concurrent GC must fail to acquire the lock"
+        );
+
+        let after = narjar::maintenance::read_snapshot(directory.path())
+            .expect("maintenance history should remain readable");
+        assert_eq!(
+            after.started[Operation::Gc.index()],
+            before.started[Operation::Gc.index()]
+        );
+        assert_eq!(
+            after.last_runs[Operation::Gc.index()],
+            before.last_runs[Operation::Gc.index()]
+        );
     }
 
     #[test]

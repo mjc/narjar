@@ -293,6 +293,10 @@ operations. Durable publication results separately count newly created,
 identical, conflicting, and failed outcomes. For example, estimate the 95th
 percentile narinfo lookup latency:
 
+```promql
+histogram_quantile(0.95, sum by (le) (rate(narjar_operation_duration_seconds_bucket{operation="narinfo_lookup"}[5m])))
+```
+
 `narjar_nar_upload_validated_logical_bytes_total` counts logical NAR bytes
 after a complete upload passes encoded and decoded hash/size checks; it does
 not establish NAR grammar or signature validity.
@@ -309,10 +313,6 @@ generation failures, repair, and callers coalesced behind active generation.
 For the chunked backend, chunk and byte counters distinguish newly stored
 content from reused content. These are actual storage outcomes, reset with the
 daemon; they are not inferred from HTTP status codes.
-
-```promql
-histogram_quantile(0.95, sum by (le) (rate(narjar_operation_duration_seconds_bucket{operation="narinfo_lookup"}[5m])))
-```
 
 `gc` is a dry run unless `--apply` is supplied. It uses logical file lengths
 for accounting; compression, snapshots, reflinks, and sparse extents are

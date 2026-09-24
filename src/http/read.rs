@@ -731,15 +731,7 @@ fn respond_readiness(
     readiness: StorageReadiness,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
-    let (status, body) = match readiness {
-        StorageReadiness::Ready => (StatusCode::OK, "ready\n"),
-        StorageReadiness::LowSpace
-        | StorageReadiness::NoInodes
-        | StorageReadiness::ReadOnly
-        | StorageReadiness::ProbeFailed => {
-            (StatusCode::SERVICE_UNAVAILABLE, "insufficient_space\n")
-        }
-    };
+    let (status, body) = readiness_response(readiness);
     send_response(
         guard,
         request,
@@ -747,6 +739,16 @@ fn respond_readiness(
             .with_status_code(status)
             .with_header(header("Content-Type", "text/plain; charset=utf-8")),
     )
+}
+
+fn readiness_response(readiness: StorageReadiness) -> (StatusCode, &'static str) {
+    match readiness {
+        StorageReadiness::Ready => (StatusCode::OK, "ready\n"),
+        StorageReadiness::LowSpace => (StatusCode::SERVICE_UNAVAILABLE, "insufficient_space\n"),
+        StorageReadiness::NoInodes => (StatusCode::SERVICE_UNAVAILABLE, "no_inodes\n"),
+        StorageReadiness::ReadOnly => (StatusCode::SERVICE_UNAVAILABLE, "read_only\n"),
+        StorageReadiness::ProbeFailed => (StatusCode::SERVICE_UNAVAILABLE, "probe_failed\n"),
+    }
 }
 
 fn respond_metrics(
@@ -836,7 +838,7 @@ mod tests {
 
     use super::{
         CacheRoute, RequestedRange, RouteMatch, invalid_route_status, parse_range_value,
-        record_nar_open_outcome, request_route,
+        readiness_response, record_nar_open_outcome, request_route,
     };
     use crate::{
         http_server::{Method, StatusCode},
@@ -961,5 +963,39 @@ mod tests {
             request_route("/unrecognized"),
             MetricsRoute::Missing
         ));
+    }
+    #[test]
+    fn readiness_responses_preserve_each_bounded_failure_reason() {
+        let responses = [
+            (StorageReadiness::Ready, StatusCode::OK, "ready\n"),
+            (
+                StorageReadiness::LowSpace,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "insufficient_space\n",
+            ),
+            (
+                StorageReadiness::NoInodes,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_inodes\n",
+            ),
+            (
+                StorageReadiness::ReadOnly,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "read_only\n",
+            ),
+            (
+                StorageReadiness::ProbeFailed,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "probe_failed\n",
+            ),
+        ];
+
+        for (readiness, expected_status, expected_body) in responses {
+            assert_eq!(
+                readiness_response(readiness),
+                (expected_status, expected_body),
+                "{readiness:?}"
+            );
+        }
     }
 }
