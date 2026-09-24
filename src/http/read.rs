@@ -41,7 +41,7 @@ pub(super) fn send_response<R: Read>(
             transfer.connection
         }
         Err(transfer) => {
-            guard.record_failed_response(status, transfer.body_bytes, transfer_started.elapsed());
+            guard.record_failed_response(status, transfer, transfer_started.elapsed());
             None
         }
     }
@@ -107,7 +107,7 @@ fn send_file_response(
             transfer.connection
         }
         Err(transfer) => {
-            guard.record_failed_response(status, transfer.body_bytes, transfer_started.elapsed());
+            guard.record_failed_response(status, transfer, transfer_started.elapsed());
             None
         }
     }

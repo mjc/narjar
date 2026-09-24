@@ -28,6 +28,8 @@ pub struct PopulationCounts {
     pub(crate) malformed_narinfo_contents: u64,
     pub(crate) malformed_nar_files: u64,
     pub(crate) malformed_nar_bytes: u64,
+    pub(crate) narinfo_files: u64,
+    pub(crate) narinfo_read_errors: u64,
     pub(crate) narinfo_bytes: u64,
     pub(crate) narinfo_claimed_nar_bytes: u64,
     pub(crate) raw_files: u64,
@@ -224,12 +226,12 @@ fn scan_files(
                     population.disappeared_entries =
                         checked_add(population.disappeared_entries, 1)?;
                 }
-                Err(_) => population.errors = checked_add(population.errors, 1)?,
+                Err(_) => record_entry_error(population, kind)?,
             },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 population.disappeared_entries = checked_add(population.disappeared_entries, 1)?;
             }
-            Err(_) => population.errors = checked_add(population.errors, 1)?,
+            Err(_) => record_entry_error(population, kind)?,
         }
         Ok(true)
     })?;
@@ -261,6 +263,7 @@ fn record_narinfo(
     let file_size = file.metadata()?.len();
     population.apparent_file_bytes = checked_add(population.apparent_file_bytes, file_size)?;
     population.narinfo_bytes = checked_add(population.narinfo_bytes, file_size)?;
+    population.narinfo_files = checked_add(population.narinfo_files, 1)?;
     if file_size > MAX_NARINFO_BYTES {
         population.malformed_narinfo_contents =
             checked_add(population.malformed_narinfo_contents, 1)?;
@@ -302,6 +305,7 @@ fn record_file(population: &mut PopulationCounts, kind: FileKind, bytes: u64) ->
         FileKind::MalformedNarInfo => {
             population.malformed_narinfo_filenames =
                 checked_add(population.malformed_narinfo_filenames, 1)?;
+            population.narinfo_files = checked_add(population.narinfo_files, 1)?;
             population.narinfo_bytes = checked_add(population.narinfo_bytes, bytes)?;
         }
         FileKind::Raw => {
@@ -342,6 +346,25 @@ fn record_file(population: &mut PopulationCounts, kind: FileKind, bytes: u64) ->
             population.temporary_files = checked_add(population.temporary_files, 1)?;
             population.temporary_bytes = checked_add(population.temporary_bytes, bytes)?;
         }
+    }
+    Ok(())
+}
+
+fn record_entry_error(population: &mut PopulationCounts, kind: FileKind) -> io::Result<()> {
+    population.errors = checked_add(population.errors, 1)?;
+    match kind {
+        FileKind::NarInfo(_) | FileKind::MalformedNarInfo => {
+            population.narinfo_read_errors = checked_add(population.narinfo_read_errors, 1)?;
+        }
+        FileKind::Raw
+        | FileKind::Xz
+        | FileKind::Zstd
+        | FileKind::MalformedNar
+        | FileKind::IngestionReceipt
+        | FileKind::EgressReceipt
+        | FileKind::Validation
+        | FileKind::Transaction
+        | FileKind::Temporary => {}
     }
     Ok(())
 }

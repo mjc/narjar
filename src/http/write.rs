@@ -7,7 +7,7 @@ use std::{
 use crate::{
     auth::{Authorizer, Permission},
     http_server::{BodyReader, BodyReaderError, BodyState, Request, Response, StatusCode},
-    metrics::{Metrics, RequestGuard, RequestMethod, ValidationClass},
+    metrics::{ConnectionOutcome, Metrics, RequestGuard, RequestMethod, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::{NarFileName, WireEncoding},
     storage::{
@@ -28,12 +28,45 @@ struct UploadRequest {
 struct CountedUploadReader<'a> {
     body: BodyReader<'a>,
     metrics: &'a Metrics,
+    expected_bytes: u64,
+    received_bytes: u64,
+    failure_observation: SocketFailureObservation,
+}
+
+#[derive(Clone, Copy)]
+enum SocketFailureObservation {
+    NotObserved,
+    Observed,
+}
+
+impl CountedUploadReader<'_> {
+    fn record_socket_failure(&mut self, outcome: ConnectionOutcome) {
+        match self.failure_observation {
+            SocketFailureObservation::NotObserved => {
+                self.metrics.record_connection_outcome(outcome);
+                self.failure_observation = SocketFailureObservation::Observed;
+            }
+            SocketFailureObservation::Observed => {}
+        }
+    }
 }
 
 impl Read for CountedUploadReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let bytes_read = self.body.read(buffer)?;
+        let bytes_read = match self.body.read(buffer) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                if let Some(outcome) = Metrics::socket_read_failure(error.kind()) {
+                    self.record_socket_failure(outcome);
+                }
+                return Err(error);
+            }
+        };
         self.metrics.received_upload_body_bytes(bytes_read);
+        self.received_bytes = self.received_bytes.saturating_add(bytes_read as u64);
+        if bytes_read == 0 && self.received_bytes < self.expected_bytes {
+            self.record_socket_failure(ConnectionOutcome::Disconnected);
+        }
         Ok(bytes_read)
     }
 }
@@ -175,6 +208,9 @@ impl UploadRequest {
         Ok(CountedUploadReader {
             body: self.request.as_reader()?,
             metrics,
+            expected_bytes: self.length as u64,
+            received_bytes: 0,
+            failure_observation: SocketFailureObservation::NotObserved,
         })
     }
 

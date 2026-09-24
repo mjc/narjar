@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam_channel::{Sender, TrySendError, bounded};
@@ -132,14 +132,7 @@ fn configure_socket_timeouts(stream: &TcpStream, timeout: Duration) -> io::Resul
 }
 
 fn request_read_failure_outcome(kind: io::ErrorKind) -> ConnectionOutcome {
-    match kind {
-        io::ErrorKind::UnexpectedEof
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::NotConnected => ConnectionOutcome::Disconnected,
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ConnectionOutcome::TimedOut,
-        _ => ConnectionOutcome::MalformedRequest,
-    }
+    Metrics::socket_read_failure(kind).unwrap_or(ConnectionOutcome::MalformedRequest)
 }
 
 fn staging_reservation_status(error: &StorageError) -> StatusCode {
@@ -484,6 +477,10 @@ fn spawn_population_sampler(
             thread::park_timeout(Duration::from_secs(60));
             while !stopping.load(Ordering::Acquire) {
                 let started = Instant::now();
+                let started_at_unix_seconds = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 let counts = storage.population_counts(&stopping).map_err(|_| ());
                 if stopping.load(Ordering::Acquire) {
                     break;
@@ -491,6 +488,7 @@ fn spawn_population_sampler(
                 metrics.record_population_scan(
                     storage.backend(),
                     counts,
+                    started_at_unix_seconds,
                     started.elapsed().as_secs_f64(),
                 );
                 thread::park_timeout(interval);

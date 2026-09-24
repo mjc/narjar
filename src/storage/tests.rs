@@ -67,6 +67,8 @@ fn population_scan_counts_recognized_files_without_retaining_names() {
     let second_narinfo = narinfo
         .replace(STORE_HASH, &second_store_hash)
         .replace("-sample", "-sample-two");
+    let third_store_hash = format!("{}2", &STORE_HASH[..STORE_HASH.len() - 1]);
+    let fourth_store_hash = format!("{}3", &STORE_HASH[..STORE_HASH.len() - 1]);
     fs::write(
         directory.path().join(format!("{STORE_HASH}.narinfo")),
         &narinfo,
@@ -85,6 +87,18 @@ fn population_scan_counts_recognized_files_without_retaining_names() {
     )
     .unwrap();
     fs::write(
+        directory.path().join(format!("{third_store_hash}.narinfo")),
+        b"broken narinfo",
+    )
+    .unwrap();
+    symlink(
+        directory.path().join(format!("{STORE_HASH}.narinfo")),
+        directory
+            .path()
+            .join(format!("{fourth_store_hash}.narinfo")),
+    )
+    .unwrap();
+    fs::write(
         directory.path().join("nar").join(format!("{NAR_ID}.nar")),
         b"raw payload",
     )
@@ -98,6 +112,11 @@ fn population_scan_counts_recognized_files_without_retaining_names() {
     )
     .unwrap();
     fs::write(directory.path().join(".tmp").join("staged"), b"temporary").unwrap();
+    fs::write(
+        directory.path().join("nar").join("not-a-hash.nar"),
+        b"bad payload name",
+    )
+    .unwrap();
 
     let population = storage
         .population_counts(&std::sync::atomic::AtomicBool::new(false))
@@ -105,13 +124,26 @@ fn population_scan_counts_recognized_files_without_retaining_names() {
 
     assert_eq!(population.structurally_valid_narinfo_entries, 2);
     assert_eq!(population.malformed_narinfo_filenames, 1);
+    assert_eq!(population.malformed_narinfo_contents, 1);
+    assert_eq!(population.narinfo_read_errors, 1);
+    assert_eq!(population.narinfo_files, 4);
     assert_eq!(
         population.narinfo_bytes,
-        narinfo.len() as u64 + second_narinfo.len() as u64 + b"invalid metadata".len() as u64
+        narinfo.len() as u64
+            + second_narinfo.len() as u64
+            + b"invalid metadata".len() as u64
+            + b"broken narinfo".len() as u64
     );
     assert_eq!(population.narinfo_claimed_nar_bytes, 22);
     assert_eq!((population.raw_files, population.raw_bytes), (1, 11));
     assert_eq!((population.xz_files, population.xz_bytes), (1, 10));
+    assert_eq!(
+        (
+            population.malformed_nar_files,
+            population.malformed_nar_bytes
+        ),
+        (1, 16)
+    );
     assert_eq!(
         (population.temporary_files, population.temporary_bytes),
         (1, 9)
@@ -121,6 +153,7 @@ fn population_scan_counts_recognized_files_without_retaining_names() {
         population.narinfo_bytes
             + population.raw_bytes
             + population.xz_bytes
+            + population.malformed_nar_bytes
             + population.temporary_bytes
     );
 }

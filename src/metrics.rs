@@ -1,15 +1,16 @@
 use std::{
+    cell::Cell,
     fs::{File, OpenOptions},
     io::Read,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::http_server::StatusCode;
+use crate::http_server::{StatusCode, TransferFailure};
 use serde::Deserialize;
 
 use crate::{
@@ -65,6 +66,11 @@ const CONNECTION_OUTCOMES: [ConnectionOutcome; 6] = [
     ConnectionOutcome::TimedOut,
     ConnectionOutcome::Disconnected,
 ];
+const RESPONSE_TRANSFER_FAILURES: [ResponseTransferFailureKind; 3] = [
+    ResponseTransferFailureKind::TimedOut,
+    ResponseTransferFailureKind::Disconnected,
+    ResponseTransferFailureKind::Other,
+];
 const REQUEST_SERIES: usize = METHODS.len() * ROUTES.len() * STATUS_CODES.len();
 const NAR_RANGE_OUTCOMES: [NarRangeOutcome; 4] = [
     NarRangeOutcome::Full,
@@ -72,7 +78,10 @@ const NAR_RANGE_OUTCOMES: [NarRangeOutcome; 4] = [
     NarRangeOutcome::Unsatisfiable,
     NarRangeOutcome::Invalid,
 ];
-const TRAFFIC_SAMPLE_CAPACITY: usize = 60;
+// A 5-second sampler needs both endpoints to cover an exact five-minute window.
+const TRAFFIC_SAMPLE_CAPACITY: usize = 61;
+#[cfg(target_os = "linux")]
+const MAX_PROCESS_FD_ENTRIES: usize = 16_384;
 const MAX_ZFS_SAMPLE_BYTES: u64 = 16 * 1024;
 const ZFS_SAMPLE_MAX_AGE: u64 = 180;
 const LATENCY_BUCKET_BOUNDS_SECONDS: [f64; 13] = [
@@ -124,10 +133,16 @@ impl DurationHistogram {
     }
 }
 
-fn saturating_atomic_add(counter: &AtomicU64, amount: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        Some(value.saturating_add(amount))
-    });
+fn saturating_atomic_add(counter: &AtomicU64, amount: u64) -> bool {
+    let mut overflowed = false;
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            let next = value.checked_add(amount);
+            overflowed = next.is_none();
+            Some(next.unwrap_or(u64::MAX))
+        })
+        .expect("saturating update always returns a value");
+    overflowed
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +223,19 @@ impl RequestRoute {
             Self::Other => "other",
         }
     }
+
+    const fn is_artifact(self) -> bool {
+        match self {
+            Self::Nar | Self::NarInfo => true,
+            Self::Health
+            | Self::Ready
+            | Self::Metrics
+            | Self::CacheInfo
+            | Self::Invalid
+            | Self::Missing
+            | Self::Other => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -242,6 +270,7 @@ impl NarRangeOutcome {
 pub struct Metrics {
     requests: [AtomicU64; REQUEST_SERIES],
     connection_outcomes: [AtomicU64; CONNECTION_OUTCOMES.len()],
+    response_transfer_failures: [AtomicU64; RESPONSE_TRANSFER_FAILURES.len()],
     publication_outcomes: [AtomicU64; 4],
     completed_responses: AtomicU64,
     aborted_responses: AtomicU64,
@@ -254,7 +283,7 @@ pub struct Metrics {
     started_at: Instant,
     traffic_samples: Mutex<TrafficSamples>,
     process_sample: Mutex<SampleState<ProcessResources>>,
-    population_sample: Mutex<SampleState<PopulationStats>>,
+    population_sample: Mutex<PopulationSamples>,
     filesystem_sample: Mutex<SampleState<FilesystemStats>>,
     maintenance_sample: Mutex<SampleState<maintenance::Snapshot>>,
     requests_in_flight: AtomicU64,
@@ -268,6 +297,7 @@ pub struct Metrics {
     declared_upload_bytes: AtomicU64,
     received_upload_bytes: AtomicU64,
     bytes_out: AtomicU64,
+    traffic_bytes_overflowed: AtomicBool,
     auth_read_failures: AtomicU64,
     auth_write_failures: AtomicU64,
     validation_body_failures: AtomicU64,
@@ -301,6 +331,7 @@ impl Default for Metrics {
         Self {
             requests: std::array::from_fn(|_| AtomicU64::new(0)),
             connection_outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
+            response_transfer_failures: std::array::from_fn(|_| AtomicU64::new(0)),
             publication_outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
             completed_responses: AtomicU64::new(0),
             aborted_responses: AtomicU64::new(0),
@@ -316,7 +347,7 @@ impl Default for Metrics {
             started_at: Instant::now(),
             traffic_samples: Mutex::new(TrafficSamples::default()),
             process_sample: Mutex::new(SampleState::NeverSampled),
-            population_sample: Mutex::new(SampleState::NeverSampled),
+            population_sample: Mutex::new(PopulationSamples::default()),
             filesystem_sample: Mutex::new(SampleState::Unavailable {
                 reason: "not_configured".to_owned(),
             }),
@@ -332,6 +363,7 @@ impl Default for Metrics {
             declared_upload_bytes: AtomicU64::new(0),
             received_upload_bytes: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
+            traffic_bytes_overflowed: AtomicBool::new(false),
             auth_read_failures: AtomicU64::new(0),
             auth_write_failures: AtomicU64::new(0),
             validation_body_failures: AtomicU64::new(0),
@@ -369,6 +401,7 @@ impl Metrics {
             metrics: self,
             method,
             route,
+            recording: Cell::new(RequestRecordingState::Pending),
         }
     }
 
@@ -398,11 +431,18 @@ impl Metrics {
     ) -> StatsSnapshot {
         let narinfo_get = lookup_snapshot(&self.narinfo_get_lookups);
         let narinfo_head = lookup_snapshot(&self.narinfo_head_lookups);
-        let traffic_rates = self
-            .traffic_samples
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .rates();
+        let traffic_bytes_overflowed = self.traffic_bytes_overflowed.load(Ordering::Relaxed);
+        let traffic_rates = if traffic_bytes_overflowed {
+            RecentTrafficRates {
+                one_minute: None,
+                five_minutes: None,
+            }
+        } else {
+            self.traffic_samples
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .rates()
+        };
         let process_resources = self
             .process_sample
             .lock()
@@ -426,6 +466,7 @@ impl Metrics {
         StatsSnapshot {
             http_requests: self.http_request_counts(),
             connections: self.connection_stats(),
+            response_transfer_failures: self.response_transfer_failure_stats(),
             publication_outcomes: self.publication_outcome_stats(),
             storage_activity: StorageActivitySnapshot::default(),
             process: ProcessStats {
@@ -452,6 +493,7 @@ impl Metrics {
                 response_body_bytes: self.bytes_out.load(Ordering::Relaxed),
                 completed_responses: self.completed_responses.load(Ordering::Relaxed),
                 aborted_responses: self.aborted_responses.load(Ordering::Relaxed),
+                cumulative_byte_counters_overflowed: traffic_bytes_overflowed,
                 recent_rates: traffic_rates,
             },
             reliability: ReliabilityStats {
@@ -492,7 +534,8 @@ impl Metrics {
                         .saturating_sub(staging_bytes),
                 }),
             },
-            inventory: population,
+            inventory: population.last_complete,
+            inventory_attempt: population.last_attempt,
             filesystem,
             maintenance,
         }
@@ -540,6 +583,20 @@ impl Metrics {
         self.connection_outcomes[outcome.index()].fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn socket_read_failure(kind: std::io::ErrorKind) -> Option<ConnectionOutcome> {
+        match kind {
+            std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected => Some(ConnectionOutcome::Disconnected),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                Some(ConnectionOutcome::TimedOut)
+            }
+            _ => None,
+        }
+    }
+
     fn connection_stats(&self) -> ConnectionStats {
         let count = |outcome: ConnectionOutcome| {
             self.connection_outcomes[outcome.index()].load(Ordering::Relaxed)
@@ -552,6 +609,19 @@ impl Metrics {
             timeouts: count(ConnectionOutcome::TimedOut),
             disconnected: count(ConnectionOutcome::Disconnected),
         }
+    }
+
+    fn response_transfer_failure_stats(&self) -> ResponseTransferFailureStats {
+        ResponseTransferFailureStats {
+            timed_out: self.response_transfer_failures[0].load(Ordering::Relaxed),
+            disconnected: self.response_transfer_failures[1].load(Ordering::Relaxed),
+            other: self.response_transfer_failures[2].load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_response_transfer_failure(&self, failure: &TransferFailure) {
+        let kind = ResponseTransferFailureKind::from_error(&failure.error);
+        self.response_transfer_failures[kind.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     fn publication_outcome_stats(&self) -> PublicationOutcomeStats {
@@ -600,6 +670,7 @@ impl Metrics {
             upload_bytes: self.received_upload_bytes.load(Ordering::Relaxed),
             download_bytes: self.bytes_out.load(Ordering::Relaxed),
             process_cpu_seconds,
+            byte_counters_overflowed: self.traffic_bytes_overflowed.load(Ordering::Relaxed),
         });
         drop(samples);
 
@@ -675,20 +746,54 @@ impl Metrics {
         &self,
         backend: StorageBackend,
         counts: Result<PopulationCounts, ()>,
+        started_at_unix_seconds: u64,
         elapsed_seconds: f64,
     ) {
-        let result =
-            counts.map(|counts| PopulationStats::from_scan(backend, counts, elapsed_seconds));
-        let mut previous = self
+        let completed_at_unix_seconds = unix_seconds_now();
+        let (complete_sample, attempt) = match counts {
+            Ok(counts) => {
+                let quality = PopulationQuality::from_counts(&counts);
+                let coverage = PopulationScanCoverage::from_counts(&counts);
+                let complete_sample = match quality {
+                    PopulationQuality::Complete => Ok(PopulationStats::from_scan(backend, counts)),
+                    PopulationQuality::ChangedDuringScan | PopulationQuality::EntryErrors => {
+                        Err(())
+                    }
+                    PopulationQuality::Failed => Err(()),
+                };
+                (
+                    complete_sample,
+                    PopulationAttempt {
+                        started_at_unix_seconds,
+                        completed_at_unix_seconds,
+                        elapsed_seconds,
+                        quality,
+                        coverage: Some(coverage),
+                    },
+                )
+            }
+            Err(()) => (
+                Err(()),
+                PopulationAttempt {
+                    started_at_unix_seconds,
+                    completed_at_unix_seconds,
+                    elapsed_seconds,
+                    quality: PopulationQuality::Failed,
+                    coverage: None,
+                },
+            ),
+        };
+        let mut samples = self
             .population_sample
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *previous = next_sample_state(
-            &previous,
-            result,
-            unix_seconds_now(),
-            "population_scan_failed",
+        samples.last_complete = next_sample_state(
+            &samples.last_complete,
+            complete_sample,
+            completed_at_unix_seconds,
+            "population_scan_incomplete",
         );
+        samples.last_attempt = Some(attempt);
     }
 
     pub(crate) fn auth_failure(&self, write: bool) {
@@ -717,12 +822,17 @@ impl Metrics {
     }
 
     pub(crate) fn received_upload_body_bytes(&self, bytes: usize) {
-        self.received_upload_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.record_traffic_bytes(&self.received_upload_bytes, bytes as u64);
     }
 
     pub(crate) fn bytes_out(&self, bytes: u64) {
-        self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+        self.record_traffic_bytes(&self.bytes_out, bytes);
+    }
+
+    fn record_traffic_bytes(&self, counter: &AtomicU64, bytes: u64) {
+        if saturating_atomic_add(counter, bytes) {
+            self.traffic_bytes_overflowed.store(true, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn set_temp_objects(&self, count: u64) {
@@ -832,6 +942,7 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
     append_admission_and_publication_outcomes(
         &mut output,
         &snapshot.connections,
+        &snapshot.response_transfer_failures,
         &snapshot.publication_outcomes,
     );
     append_storage_activity_metrics(&mut output, snapshot.storage_activity);
@@ -874,6 +985,10 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
         snapshot.latency.publication.count,
         snapshot.pressure.publication_queue_depth,
         u8::from(snapshot.pressure.readiness.is_ready()),
+    ));
+    output.push_str(&format!(
+        "# HELP narjar_traffic_byte_counters_overflowed Whether cumulative traffic byte counters saturated; recent byte rates are omitted when true.\n# TYPE narjar_traffic_byte_counters_overflowed gauge\nnarjar_traffic_byte_counters_overflowed {}\n",
+        u8::from(traffic.cumulative_byte_counters_overflowed),
     ));
     append_readiness_reason(&mut output, snapshot.pressure.readiness);
     output.push_str(
@@ -925,7 +1040,11 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
     append_process_metrics(&mut output, &snapshot.process.resources);
     append_latency_metrics(&mut output, &snapshot.latency);
     append_traffic_rate_metrics(&mut output, &snapshot.traffic.recent_rates);
-    append_population_metrics(&mut output, &snapshot.inventory);
+    append_population_metrics(
+        &mut output,
+        &snapshot.inventory,
+        snapshot.inventory_attempt.as_ref(),
+    );
     append_filesystem_metrics(&mut output, &snapshot.filesystem);
     append_maintenance_metrics(&mut output, &snapshot.maintenance);
     output
@@ -1091,6 +1210,7 @@ fn append_storage_activity_metrics(output: &mut String, activity: StorageActivit
 fn append_admission_and_publication_outcomes(
     output: &mut String,
     connections: &ConnectionStats,
+    transfer_failures: &ResponseTransferFailureStats,
     publication_outcomes: &PublicationOutcomeStats,
 ) {
     output.push_str(
@@ -1106,6 +1226,18 @@ fn append_admission_and_publication_outcomes(
     ] {
         output.push_str(&format!(
             "narjar_connections_total{{outcome=\"{outcome}\"}} {count}\n"
+        ));
+    }
+    output.push_str(
+        "# HELP narjar_response_transfer_failures_total Failed response transfers by bounded I/O error class; partial body bytes remain in narjar_http_bytes_out_total.\n# TYPE narjar_response_transfer_failures_total counter\n",
+    );
+    for (kind, count) in [
+        ("timeout", transfer_failures.timed_out),
+        ("disconnected", transfer_failures.disconnected),
+        ("other", transfer_failures.other),
+    ] {
+        output.push_str(&format!(
+            "narjar_response_transfer_failures_total{{kind=\"{kind}\"}} {count}\n"
         ));
     }
     output.push_str(
@@ -1425,7 +1557,7 @@ fn valid_zfs_compression_name(value: &str) -> bool {
         && value.len() <= 32
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 fn append_process_metrics(output: &mut String, sample: &SampleState<ProcessResources>) {
@@ -1439,13 +1571,22 @@ fn append_process_metrics(output: &mut String, sample: &SampleState<ProcessResou
             value,
             ..
         } => (*sampled_at_unix_seconds, value, "stale"),
-        SampleState::NeverSampled | SampleState::Unavailable { .. } => {
+        SampleState::NeverSampled => {
             output.push_str(
                 "# HELP narjar_process_sample_available Whether process resource sampling has produced a value.\n# TYPE narjar_process_sample_available gauge\nnarjar_process_sample_available 0\n",
             );
+            append_process_sample_state(output, "never_sampled");
+            return;
+        }
+        SampleState::Unavailable { .. } => {
+            output.push_str(
+                "# HELP narjar_process_sample_available Whether process resource sampling has produced a value.\n# TYPE narjar_process_sample_available gauge\nnarjar_process_sample_available 0\n",
+            );
+            append_process_sample_state(output, "unavailable");
             return;
         }
     };
+    append_process_sample_state(output, state);
     output.push_str(&format!(
         "# HELP narjar_process_sample_available Whether process resource sampling has produced a value.\n# TYPE narjar_process_sample_available gauge\nnarjar_process_sample_available 1\n\
          # HELP narjar_process_sample_timestamp_seconds Unix timestamp of the process sample.\n# TYPE narjar_process_sample_timestamp_seconds gauge\nnarjar_process_sample_timestamp_seconds{{state=\"{state}\"}} {sampled_at}\n\
@@ -1454,6 +1595,12 @@ fn append_process_metrics(output: &mut String, sample: &SampleState<ProcessResou
         resources.resident_bytes,
         resources.user_cpu_seconds,
         resources.system_cpu_seconds,
+    ));
+    let source = match resources.source {
+        ProcessResourceSource::LinuxProcfs => "linux_procfs",
+    };
+    output.push_str(&format!(
+        "# HELP narjar_process_resource_source_info Source of process resource measurements.\n# TYPE narjar_process_resource_source_info gauge\nnarjar_process_resource_source_info{{source=\"{source}\"}} 1\n"
     ));
     if let Some(high_water_bytes) = resources.high_water_bytes {
         output.push_str(&format!(
@@ -1465,37 +1612,17 @@ fn append_process_metrics(output: &mut String, sample: &SampleState<ProcessResou
             "# HELP narjar_process_threads Number of process threads.\n# TYPE narjar_process_threads gauge\nnarjar_process_threads{{state=\"{state}\"}} {threads}\n"
         ));
     }
-    match &resources.cgroup_v2 {
-        SampleState::Measured { value, .. } | SampleState::Stale { value, .. } => {
-            append_cgroup_metric(output, "memory_current_bytes", value.memory_current_bytes);
-            append_cgroup_metric(output, "memory_peak_bytes", value.memory_peak_bytes);
-            append_cgroup_metric(output, "memory_limit_bytes", value.memory_limit_bytes);
-            append_cgroup_counter_metric(
-                output,
-                "cpu_throttled_periods_total",
-                value.cpu_throttled_periods,
-            );
-            append_cgroup_seconds_metric(
-                output,
-                "cpu_usage_seconds_total",
-                value.cpu_usage_seconds,
-            );
-            append_cgroup_seconds_metric(
-                output,
-                "cpu_throttled_seconds_total",
-                value.cpu_throttled_seconds,
-            );
-        }
-        SampleState::NeverSampled | SampleState::Unavailable { .. } => {}
+    if let Some(open_file_descriptors) = resources.open_file_descriptors {
+        output.push_str(&format!(
+            "# HELP narjar_process_open_file_descriptors Number of open process file descriptors; sampled with a bounded procfs directory read.\n# TYPE narjar_process_open_file_descriptors gauge\nnarjar_process_open_file_descriptors{{state=\"{state}\"}} {open_file_descriptors}\n"
+        ));
     }
 }
 
-fn append_cgroup_seconds_metric(output: &mut String, name: &str, value: Option<f64>) {
-    if let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) {
-        output.push_str(&format!(
-            "# HELP narjar_cgroup_{name} Cgroup CPU time or throttling duration in seconds.\n# TYPE narjar_cgroup_{name} counter\nnarjar_cgroup_{name} {value}\n"
-        ));
-    }
+fn append_process_sample_state(output: &mut String, state: &str) {
+    output.push_str(&format!(
+        "# HELP narjar_process_sample_state State of process resource sampling.\n# TYPE narjar_process_sample_state gauge\nnarjar_process_sample_state{{state=\"{state}\"}} 1\n"
+    ));
 }
 
 fn append_traffic_rate_metrics(output: &mut String, rates: &RecentTrafficRates) {
@@ -1561,46 +1688,73 @@ fn append_duration_histogram(
     ));
 }
 
-fn append_population_metrics(output: &mut String, sample: &SampleState<PopulationStats>) {
-    let (sampled_at, population, state) = match sample {
+fn append_population_metrics(
+    output: &mut String,
+    sample: &SampleState<PopulationStats>,
+    attempt: Option<&PopulationAttempt>,
+) {
+    output.push_str(
+        "# HELP narjar_cache_population_sample_available Whether a complete cache population scan is available.\n# TYPE narjar_cache_population_sample_available gauge\n# HELP narjar_cache_population_refresh_failed Whether the most recent population refresh was incomplete or failed.\n# TYPE narjar_cache_population_refresh_failed gauge\n",
+    );
+    let previous_complete = match sample {
         SampleState::Measured {
             sampled_at_unix_seconds,
             value,
-        } => (*sampled_at_unix_seconds, value, "measured"),
+        } => Some((*sampled_at_unix_seconds, value, "measured")),
         SampleState::Stale {
             sampled_at_unix_seconds,
             value,
             ..
-        } => (*sampled_at_unix_seconds, value, "stale"),
-        SampleState::NeverSampled | SampleState::Unavailable { .. } => {
-            output.push_str(
-                "# HELP narjar_cache_population_sample_available Whether a complete cache population scan is available.\n# TYPE narjar_cache_population_sample_available gauge\nnarjar_cache_population_sample_available 0\n",
-            );
-            return;
-        }
+        } => Some((*sampled_at_unix_seconds, value, "stale")),
+        SampleState::NeverSampled | SampleState::Unavailable { .. } => None,
+    };
+    let sample_state = match sample {
+        SampleState::Measured { .. } => Some("measured"),
+        SampleState::Stale { .. } => Some("stale"),
+        SampleState::NeverSampled => None,
+        SampleState::Unavailable { .. } => Some("unavailable"),
+    };
+    let refresh_failed =
+        attempt.is_some_and(|attempt| attempt.quality != PopulationQuality::Complete);
+    match sample_state {
+        Some(state) => output.push_str(&format!(
+            "narjar_cache_population_sample_available{{state=\"{state}\"}} 1\n"
+        )),
+        None => output.push_str("narjar_cache_population_sample_available 0\n"),
+    }
+    output.push_str(&format!(
+        "narjar_cache_population_refresh_failed {}\n",
+        u8::from(refresh_failed),
+    ));
+    append_population_attempt_metrics(output, attempt);
+    let Some((sampled_at, population, state)) = previous_complete else {
+        return;
     };
     output.push_str(&format!(
-        "# HELP narjar_cache_population_sample_available Whether a complete cache population scan is available.\n# TYPE narjar_cache_population_sample_available gauge\nnarjar_cache_population_sample_available{{state=\"{state}\"}} 1\n\
-         # HELP narjar_cache_population_sample_timestamp_seconds Completion time of the last complete population scan.\n# TYPE narjar_cache_population_sample_timestamp_seconds gauge\nnarjar_cache_population_sample_timestamp_seconds {sampled_at}\n\
+        "# HELP narjar_cache_population_sample_timestamp_seconds Completion time of the last complete population scan.\n# TYPE narjar_cache_population_sample_timestamp_seconds gauge\nnarjar_cache_population_sample_timestamp_seconds {sampled_at}\n\
          # HELP narjar_cache_population_sample_age_seconds Age of the last completed population scan.\n# TYPE narjar_cache_population_sample_age_seconds gauge\nnarjar_cache_population_sample_age_seconds {}\n\
-         # HELP narjar_cache_population_scan_duration_seconds Duration of the most recent population scan.\n# TYPE narjar_cache_population_scan_duration_seconds gauge\nnarjar_cache_population_scan_duration_seconds {}\n\
          # HELP narjar_cache_population_files Observed files by fixed storage category.\n# TYPE narjar_cache_population_files gauge\n\
          # HELP narjar_cache_population_apparent_bytes Sum of observed file lengths by category.\n# TYPE narjar_cache_population_apparent_bytes gauge\n\
          # HELP narjar_cache_population_logical_nars Distinct structurally valid canonical NAR manifests.\n# TYPE narjar_cache_population_logical_nars gauge\n\
          # HELP narjar_cache_population_logical_nar_bytes Sum of logical NAR sizes in valid chunk manifests.\n# TYPE narjar_cache_population_logical_nar_bytes gauge\n\
+         # HELP narjar_cache_population_narinfo_entries Narinfo pathname outcomes from the last complete population scan.\n# TYPE narjar_cache_population_narinfo_entries gauge\
          # HELP narjar_cache_population_narinfo_claimed_nar_bytes Sum of valid narinfo NarSize claims, counted once per store path.\n# TYPE narjar_cache_population_narinfo_claimed_nar_bytes gauge\n",
         unix_seconds_now().saturating_sub(sampled_at),
-        population.elapsed_seconds,
     ));
     for (kind, count, bytes) in [
         (
             "narinfo",
-            population.structurally_valid_narinfo_entries,
+            population.narinfo_files,
             population.narinfo_bytes,
         ),
         ("raw", population.raw_files, population.raw_bytes),
         ("xz", population.xz_files, population.xz_bytes),
         ("zstd", population.zstd_files, population.zstd_bytes),
+        (
+            "malformed_nar",
+            population.malformed_nar_files,
+            population.malformed_nar_bytes,
+        ),
         (
             "ingestion_receipt",
             population.ingestion_receipt_files,
@@ -1632,13 +1786,20 @@ fn append_population_metrics(output: &mut String, sample: &SampleState<Populatio
         ));
     }
     output.push_str(&format!(
-        "narjar_cache_population_apparent_bytes{{kind=\"total\",state=\"{state}\"}} {}\n",
+        "narjar_cache_population_apparent_bytes{{kind=\"total\",state=\"{state}\"}} {}\nnarjar_cache_population_narinfo_claimed_nar_bytes{{state=\"{state}\"}} {}\n",
         population.apparent_file_bytes,
-    ));
-    output.push_str(&format!(
-        "narjar_cache_population_narinfo_claimed_nar_bytes{{state=\"{state}\"}} {}\n",
         population.narinfo_claimed_nar_bytes,
     ));
+    for (kind, count) in [
+        ("parsed", population.structurally_valid_narinfo_entries),
+        ("malformed_filename", population.malformed_narinfo_filenames),
+        ("malformed_contents", population.malformed_narinfo_contents),
+        ("unreadable", population.narinfo_read_errors),
+    ] {
+        output.push_str(&format!(
+            "narjar_cache_population_narinfo_entries{{kind=\"{kind}\",state=\"{state}\"}} {count}\n"
+        ));
+    }
     if let Some(chunked) = &population.chunked {
         output.push_str(&format!(
             "narjar_cache_population_logical_nars{{state=\"{state}\"}} {}\nnarjar_cache_population_logical_nar_bytes{{state=\"{state}\"}} {}\n",
@@ -1655,18 +1816,50 @@ fn append_population_metrics(output: &mut String, sample: &SampleState<Populatio
     }
 }
 
-fn append_cgroup_metric(output: &mut String, name: &str, value: Option<u64>) {
-    if let Some(value) = value {
+fn append_population_attempt_metrics(output: &mut String, attempt: Option<&PopulationAttempt>) {
+    output.push_str(
+        "# HELP narjar_cache_population_scan_started_timestamp_seconds Unix time when the most recent population scan started.\n# TYPE narjar_cache_population_scan_started_timestamp_seconds gauge\n# HELP narjar_cache_population_scan_timestamp_seconds Unix time when the most recent population scan attempt ended.\n# TYPE narjar_cache_population_scan_timestamp_seconds gauge\n# HELP narjar_cache_population_scan_duration_seconds Monotonic duration of the most recent population scan attempt.\n# TYPE narjar_cache_population_scan_duration_seconds gauge\n# HELP narjar_cache_population_scan_quality Quality of the most recent population scan attempt.\n# TYPE narjar_cache_population_scan_quality gauge\n# HELP narjar_cache_population_scan_entries Directory entries visited during the most recent population scan attempt.\n# TYPE narjar_cache_population_scan_entries gauge\n# HELP narjar_cache_population_scan_ignored_entries Entries outside recognized cache categories.\n# TYPE narjar_cache_population_scan_ignored_entries gauge\n# HELP narjar_cache_population_scan_disappeared_entries Entries that disappeared during the scan.\n# TYPE narjar_cache_population_scan_disappeared_entries gauge\n# HELP narjar_cache_population_scan_errors Entries that could not be inspected during the scan.\n# TYPE narjar_cache_population_scan_errors gauge\n",
+    );
+    output.push_str(
+        "# HELP narjar_cache_population_scan_narinfo_read_errors Narinfo entries unreadable during the most recent scan attempt.\n# TYPE narjar_cache_population_scan_narinfo_read_errors gauge\n",
+    );
+    let Some(attempt) = attempt else {
+        return;
+    };
+    output.push_str(&format!(
+        "narjar_cache_population_scan_started_timestamp_seconds {}\nnarjar_cache_population_scan_timestamp_seconds {}\nnarjar_cache_population_scan_duration_seconds {}\n",
+        attempt.started_at_unix_seconds,
+        attempt.completed_at_unix_seconds,
+        attempt.elapsed_seconds,
+    ));
+    for quality in [
+        PopulationQuality::Complete,
+        PopulationQuality::ChangedDuringScan,
+        PopulationQuality::EntryErrors,
+        PopulationQuality::Failed,
+    ] {
+        let quality_name = match quality {
+            PopulationQuality::Complete => "complete",
+            PopulationQuality::ChangedDuringScan => "changed_during_scan",
+            PopulationQuality::EntryErrors => "entry_errors",
+            PopulationQuality::Failed => "failed",
+        };
         output.push_str(&format!(
-            "# HELP narjar_cgroup_{name} Cgroup v2 {name} in bytes.\n# TYPE narjar_cgroup_{name} gauge\nnarjar_cgroup_{name} {value}\n"
+            "narjar_cache_population_scan_quality{{quality=\"{quality_name}\"}} {}\n",
+            u8::from(attempt.quality == quality),
         ));
     }
-}
-
-fn append_cgroup_counter_metric(output: &mut String, name: &str, value: Option<u64>) {
-    if let Some(value) = value {
+    if let Some(coverage) = &attempt.coverage {
         output.push_str(&format!(
-            "# HELP narjar_cgroup_{name} Cgroup v2 cumulative CPU throttling periods.\n# TYPE narjar_cgroup_{name} counter\nnarjar_cgroup_{name} {value}\n"
+            "narjar_cache_population_scan_entries {}\nnarjar_cache_population_scan_ignored_entries {}\nnarjar_cache_population_scan_disappeared_entries {}\nnarjar_cache_population_scan_errors {}\n",
+            coverage.scanned_entries,
+            coverage.ignored_entries,
+            coverage.disappeared_entries,
+            coverage.errors,
+        ));
+        output.push_str(&format!(
+            "narjar_cache_population_scan_narinfo_read_errors {}\n",
+            coverage.narinfo_read_errors,
         ));
     }
 }
@@ -1711,24 +1904,16 @@ fn sample_process_resources() -> Result<ProcessResources, ()> {
     let resident_bytes = status_value_kib(&status, "VmRSS:").ok_or(())?;
     let high_water_bytes = status_value_kib(&status, "VmHWM:");
     let threads = status_value(&status, "Threads:");
+    let open_file_descriptors = process_open_file_descriptors();
     let (user_cpu_seconds, system_cpu_seconds) = process_cpu_seconds()?;
-    let cgroup_v2 = match sample_cgroup_v2() {
-        Some(value) => SampleState::Measured {
-            sampled_at_unix_seconds: unix_seconds_now(),
-            value,
-        },
-        None => SampleState::Unavailable {
-            reason: "cgroup_v2_unavailable".to_owned(),
-        },
-    };
     Ok(ProcessResources {
-        source: "linux_procfs".to_owned(),
+        source: ProcessResourceSource::LinuxProcfs,
         resident_bytes,
         high_water_bytes,
         user_cpu_seconds,
         system_cpu_seconds,
         threads,
-        cgroup_v2,
+        open_file_descriptors,
     })
 }
 
@@ -1787,57 +1972,15 @@ fn process_cpu_seconds() -> Result<(f64, f64), ()> {
 }
 
 #[cfg(target_os = "linux")]
-fn sample_cgroup_v2() -> Option<CgroupResources> {
-    let cgroup_text = read_bounded_text("/proc/self/cgroup", 64 * 1024).ok()?;
-    let cgroup_path = cgroup_text
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))?;
-    let relative_path = cgroup_path.strip_prefix('/')?;
-    if Path::new(relative_path)
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return None;
-    }
-    let directory = PathBuf::from("/sys/fs/cgroup").join(relative_path);
-    let memory_current_bytes = cgroup_number(&directory.join("memory.current"))?;
-    let memory_peak_bytes = cgroup_number(&directory.join("memory.peak"));
-    let memory_limit_bytes = cgroup_number_or_unlimited(&directory.join("memory.max"))?;
-    let cpu_stat = read_bounded_text(directory.join("cpu.stat"), 4096).ok()?;
-    let cpu_usage_seconds =
-        cpu_stat_value(&cpu_stat, "usage_usec").map(|usec| usec as f64 / 1_000_000.0);
-    let cpu_throttled_periods = cpu_stat_value(&cpu_stat, "nr_throttled");
-    let cpu_throttled_seconds =
-        cpu_stat_value(&cpu_stat, "throttled_usec").map(|usec| usec as f64 / 1_000_000.0);
-    Some(CgroupResources {
-        memory_current_bytes: Some(memory_current_bytes),
-        memory_peak_bytes,
-        memory_limit_bytes,
-        cpu_usage_seconds,
-        cpu_throttled_periods,
-        cpu_throttled_seconds,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn cgroup_number(path: &Path) -> Option<u64> {
-    read_bounded_text(path, 128).ok()?.trim().parse().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn cgroup_number_or_unlimited(path: &Path) -> Option<Option<u64>> {
-    let value = read_bounded_text(path, 128).ok()?;
-    Some(value.trim().parse().ok())
-}
-
-#[cfg(target_os = "linux")]
-fn cpu_stat_value(stat: &str, name: &str) -> Option<u64> {
-    stat.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        (fields.next()? == name)
-            .then(|| fields.next()?.parse().ok())
-            .flatten()
-    })
+fn process_open_file_descriptors() -> Option<u64> {
+    let entries = std::fs::read_dir("/proc/self/fd").ok()?;
+    let observed = entries
+        .take(MAX_PROCESS_FD_ENTRIES + 1)
+        .try_fold(0_u64, |count, entry| {
+            entry.ok()?;
+            count.checked_add(1)
+        })?;
+    (observed <= MAX_PROCESS_FD_ENTRIES as u64).then_some(observed.saturating_sub(1))
 }
 
 fn lookup_snapshot(counters: &[AtomicU64; 3]) -> LookupStats {
@@ -1866,6 +2009,7 @@ struct TrafficSample {
     upload_bytes: u64,
     download_bytes: u64,
     process_cpu_seconds: Option<f64>,
+    byte_counters_overflowed: bool,
 }
 
 #[derive(Debug)]
@@ -1907,24 +2051,25 @@ impl TrafficSamples {
         let mut samples = samples.peekable();
         let first = samples.next()?;
         let latest = samples.last().unwrap_or(first);
+        if latest.byte_counters_overflowed {
+            return None;
+        }
         let cutoff = latest.at - Duration::from_secs(window_seconds);
         let first_in_window = (0..self.len)
             .filter_map(|offset| self.samples[(oldest_index + offset) % TRAFFIC_SAMPLE_CAPACITY])
             .find(|sample| sample.at >= cutoff)?;
         let coverage = latest.at.duration_since(first_in_window.at).as_secs_f64();
+        let uploaded_bytes = latest
+            .upload_bytes
+            .checked_sub(first_in_window.upload_bytes)?;
+        let downloaded_bytes = latest
+            .download_bytes
+            .checked_sub(first_in_window.download_bytes)?;
         (coverage > 0.0).then(|| TrafficRate {
             requested_window_seconds: window_seconds,
             coverage_seconds: coverage,
-            upload_bytes_per_second: latest
-                .upload_bytes
-                .saturating_sub(first_in_window.upload_bytes)
-                as f64
-                / coverage,
-            artifact_bytes_per_second: latest
-                .download_bytes
-                .saturating_sub(first_in_window.download_bytes)
-                as f64
-                / coverage,
+            upload_bytes_per_second: uploaded_bytes as f64 / coverage,
+            artifact_bytes_per_second: downloaded_bytes as f64 / coverage,
             process_cpu_cores: match (
                 first_in_window.process_cpu_seconds,
                 latest.process_cpu_seconds,
@@ -1951,6 +2096,40 @@ pub enum ConnectionOutcome {
     MalformedRequest,
     TimedOut,
     Disconnected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestRecordingState {
+    Pending,
+    Finished,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResponseTransferFailureKind {
+    TimedOut,
+    Disconnected,
+    Other,
+}
+
+impl ResponseTransferFailureKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::TimedOut => 0,
+            Self::Disconnected => 1,
+            Self::Other => 2,
+        }
+    }
+
+    fn from_error(error: &std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => Self::TimedOut,
+            std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::WriteZero => Self::Disconnected,
+            _ => Self::Other,
+        }
+    }
 }
 
 impl ConnectionOutcome {
@@ -1986,6 +2165,7 @@ pub(crate) enum CacheObject {
 pub struct StatsSnapshot {
     pub http_requests: Vec<HttpRequestCount>,
     pub connections: ConnectionStats,
+    pub response_transfer_failures: ResponseTransferFailureStats,
     pub publication_outcomes: PublicationOutcomeStats,
     pub(crate) storage_activity: StorageActivitySnapshot,
     pub process: ProcessStats,
@@ -1996,6 +2176,7 @@ pub struct StatsSnapshot {
     pub reliability: ReliabilityStats,
     pub pressure: PressureStats,
     pub inventory: SampleState<PopulationStats>,
+    pub(crate) inventory_attempt: Option<PopulationAttempt>,
     pub filesystem: SampleState<FilesystemStats>,
     pub maintenance: SampleState<maintenance::Snapshot>,
 }
@@ -2016,6 +2197,13 @@ pub struct ConnectionStats {
     pub malformed_requests: u64,
     pub timeouts: u64,
     pub disconnected: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResponseTransferFailureStats {
+    pub timed_out: u64,
+    pub disconnected: u64,
+    pub other: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2083,24 +2271,64 @@ pub enum SampleState<T> {
 }
 
 #[derive(Clone, Debug)]
+struct PopulationSamples {
+    last_complete: SampleState<PopulationStats>,
+    last_attempt: Option<PopulationAttempt>,
+}
+
+impl Default for PopulationSamples {
+    fn default() -> Self {
+        Self {
+            last_complete: SampleState::NeverSampled,
+            last_attempt: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PopulationAttempt {
+    started_at_unix_seconds: u64,
+    completed_at_unix_seconds: u64,
+    elapsed_seconds: f64,
+    quality: PopulationQuality,
+    coverage: Option<PopulationScanCoverage>,
+}
+
+#[derive(Clone, Debug)]
+struct PopulationScanCoverage {
+    scanned_entries: u64,
+    ignored_entries: u64,
+    disappeared_entries: u64,
+    errors: u64,
+    narinfo_read_errors: u64,
+}
+
+impl PopulationScanCoverage {
+    fn from_counts(counts: &PopulationCounts) -> Self {
+        Self {
+            scanned_entries: counts.scanned_entries,
+            ignored_entries: counts.ignored_entries,
+            disappeared_entries: counts.disappeared_entries,
+            errors: counts.errors,
+            narinfo_read_errors: counts.narinfo_read_errors,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ProcessResources {
-    pub source: String,
+    pub source: ProcessResourceSource,
     pub resident_bytes: u64,
     pub high_water_bytes: Option<u64>,
     pub user_cpu_seconds: f64,
     pub system_cpu_seconds: f64,
     pub threads: Option<u64>,
-    pub cgroup_v2: SampleState<CgroupResources>,
+    pub open_file_descriptors: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
-pub struct CgroupResources {
-    pub memory_current_bytes: Option<u64>,
-    pub memory_peak_bytes: Option<u64>,
-    pub memory_limit_bytes: Option<u64>,
-    pub cpu_usage_seconds: Option<f64>,
-    pub cpu_throttled_periods: Option<u64>,
-    pub cpu_throttled_seconds: Option<f64>,
+#[derive(Clone, Copy, Debug)]
+pub enum ProcessResourceSource {
+    LinuxProcfs,
 }
 
 #[derive(Clone, Debug)]
@@ -2155,6 +2383,7 @@ pub struct TrafficStats {
     pub response_body_bytes: u64,
     pub completed_responses: u64,
     pub aborted_responses: u64,
+    pub cumulative_byte_counters_overflowed: bool,
     pub recent_rates: RecentTrafficRates,
 }
 
@@ -2221,17 +2450,14 @@ pub struct FilesystemStats {
 #[derive(Clone, Debug)]
 pub struct PopulationStats {
     pub backend: StorageBackend,
-    pub elapsed_seconds: f64,
-    pub quality: PopulationQuality,
-    pub scanned_entries: u64,
-    pub ignored_entries: u64,
-    pub disappeared_entries: u64,
-    pub errors: u64,
     pub structurally_valid_narinfo_entries: u64,
     pub malformed_narinfo_filenames: u64,
     pub malformed_narinfo_contents: u64,
+    pub narinfo_read_errors: u64,
+    pub narinfo_files: u64,
     pub narinfo_bytes: u64,
     pub narinfo_claimed_nar_bytes: u64,
+    pub malformed_nar_files: u64,
     pub malformed_nar_bytes: u64,
     pub raw_files: u64,
     pub raw_bytes: u64,
@@ -2254,25 +2480,17 @@ pub struct PopulationStats {
 }
 
 impl PopulationStats {
-    fn from_scan(backend: StorageBackend, counts: PopulationCounts, elapsed_seconds: f64) -> Self {
-        let quality = match (counts.errors, counts.disappeared_entries) {
-            (0, 0) => PopulationQuality::Complete,
-            (0, _) => PopulationQuality::ChangedDuringScan,
-            _ => PopulationQuality::EntryErrors,
-        };
+    fn from_scan(backend: StorageBackend, counts: PopulationCounts) -> Self {
         Self {
             backend,
-            elapsed_seconds,
-            quality,
-            scanned_entries: counts.scanned_entries,
-            ignored_entries: counts.ignored_entries,
-            disappeared_entries: counts.disappeared_entries,
-            errors: counts.errors,
             structurally_valid_narinfo_entries: counts.structurally_valid_narinfo_entries,
             malformed_narinfo_filenames: counts.malformed_narinfo_filenames,
             malformed_narinfo_contents: counts.malformed_narinfo_contents,
+            narinfo_read_errors: counts.narinfo_read_errors,
+            narinfo_files: counts.narinfo_files,
             narinfo_bytes: counts.narinfo_bytes,
             narinfo_claimed_nar_bytes: counts.narinfo_claimed_nar_bytes,
+            malformed_nar_files: counts.malformed_nar_files,
             malformed_nar_bytes: counts.malformed_nar_bytes,
             raw_files: counts.raw_files,
             raw_bytes: counts.raw_bytes,
@@ -2316,11 +2534,22 @@ pub struct ChunkedPopulationStats {
     pub logical_nar_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PopulationQuality {
     Complete,
     ChangedDuringScan,
     EntryErrors,
+    Failed,
+}
+
+impl PopulationQuality {
+    fn from_counts(counts: &PopulationCounts) -> Self {
+        match (counts.errors, counts.disappeared_entries) {
+            (0, 0) => Self::Complete,
+            (0, _) => Self::ChangedDuringScan,
+            _ => Self::EntryErrors,
+        }
+    }
 }
 
 fn request_index(method: usize, route: usize, status: usize) -> usize {
@@ -2345,6 +2574,7 @@ pub(crate) struct RequestGuard<'a> {
     metrics: &'a Metrics,
     method: RequestMethod,
     route: RequestRoute,
+    recording: Cell<RequestRecordingState>,
 }
 
 impl RequestGuard<'_> {
@@ -2377,6 +2607,10 @@ impl RequestGuard<'_> {
         body_bytes: u64,
         elapsed: Duration,
     ) {
+        match self.recording.replace(RequestRecordingState::Finished) {
+            RequestRecordingState::Pending => {}
+            RequestRecordingState::Finished => return,
+        }
         self.record_status(status);
         self.metrics
             .completed_responses
@@ -2388,14 +2622,19 @@ impl RequestGuard<'_> {
     pub(crate) fn record_failed_response(
         &self,
         status: StatusCode,
-        body_bytes: u64,
+        transfer: TransferFailure,
         elapsed: Duration,
     ) {
+        match self.recording.replace(RequestRecordingState::Finished) {
+            RequestRecordingState::Pending => {}
+            RequestRecordingState::Finished => return,
+        }
         self.record_status(status);
         self.metrics
             .aborted_responses
             .fetch_add(1, Ordering::Relaxed);
-        self.record_artifact_bytes(body_bytes);
+        self.metrics.record_response_transfer_failure(&transfer);
+        self.record_artifact_bytes(transfer.body_bytes);
         self.record_delivery_latency(elapsed);
     }
 
@@ -2408,7 +2647,7 @@ impl RequestGuard<'_> {
     }
 
     fn record_artifact_bytes(&self, body_bytes: u64) {
-        if matches!(self.route, RequestRoute::Nar | RequestRoute::NarInfo) {
+        if self.route.is_artifact() {
             self.metrics.bytes_out(body_bytes);
         }
     }
@@ -2423,6 +2662,10 @@ impl RequestGuard<'_> {
     }
 
     pub(crate) fn record_aborted_response(&self) {
+        match self.recording.replace(RequestRecordingState::Finished) {
+            RequestRecordingState::Pending => {}
+            RequestRecordingState::Finished => return,
+        }
         self.metrics.requests
             [request_index(self.method.index(), self.route.index(), status_index(0))]
         .fetch_add(1, Ordering::Relaxed);
@@ -2434,6 +2677,17 @@ impl RequestGuard<'_> {
 
 impl Drop for RequestGuard<'_> {
     fn drop(&mut self) {
+        match self.recording.replace(RequestRecordingState::Finished) {
+            RequestRecordingState::Pending => {
+                self.metrics.requests
+                    [request_index(self.method.index(), self.route.index(), status_index(0))]
+                .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .aborted_responses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RequestRecordingState::Finished => {}
+        }
         self.metrics
             .requests_in_flight
             .fetch_sub(1, Ordering::Relaxed);
@@ -2455,7 +2709,7 @@ mod tests {
         NarRangeOutcome, RequestMethod, RequestRoute, SampleState, StorageActivitySnapshot,
         ValidationClass, append_storage_activity_metrics, render_prometheus,
     };
-    use crate::http_server::StatusCode;
+    use crate::http_server::{StatusCode, TransferFailure};
     use crate::maintenance::{Mode, Operation, Outcome, Recorder, RunValues};
     use crate::storage::{
         PopulationCounts, PublishOutcome, StorageBackend, StorageCapacity, StorageError,
@@ -2463,8 +2717,32 @@ mod tests {
     };
     use std::{
         os::unix::fs::symlink,
+        path::Path,
         time::{Duration, Instant},
     };
+
+    fn zfs_sample_document(storage_root: &Path, mountpoint: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "storage_root": storage_root,
+            "dataset": "tank/narjar",
+            "mountpoint": mountpoint,
+            "sampled_at_unix_seconds": super::unix_seconds_now(),
+            "used_bytes": 20,
+            "logical_used_bytes": 50,
+            "referenced_bytes": 18,
+            "logical_referenced_bytes": 45,
+            "used_by_dataset_bytes": 17,
+            "used_by_snapshots_bytes": 2,
+            "used_by_children_bytes": 1,
+            "used_by_refreservation_bytes": 0,
+            "available_bytes": 80,
+            "compression_ratio": "2.50x",
+            "referenced_compression_ratio": "2.25x",
+            "compression": "off",
+            "record_size_bytes": 1_048_576,
+        })
+    }
 
     #[test]
     fn process_lifetime_is_exported_with_unix_timestamps() {
@@ -2537,12 +2815,23 @@ mod tests {
     fn failed_population_refresh_keeps_the_last_complete_sample() {
         let metrics = Metrics::default();
         let counts = PopulationCounts {
+            scanned_entries: 17,
+            ignored_entries: 3,
+            disappeared_entries: 0,
+            errors: 0,
             structurally_valid_narinfo_entries: 4,
+            malformed_narinfo_filenames: 2,
+            malformed_narinfo_contents: 3,
+            narinfo_read_errors: 0,
+            narinfo_files: 10,
             narinfo_claimed_nar_bytes: 360,
+            malformed_nar_files: 1,
+            malformed_nar_bytes: 20,
             raw_bytes: 900,
             ..PopulationCounts::default()
         };
-        metrics.record_population_scan(StorageBackend::Flat, Ok(counts), 2.5);
+        let started_at = super::unix_seconds_now().saturating_sub(3);
+        metrics.record_population_scan(StorageBackend::Flat, Ok(counts), started_at, 2.5);
 
         let first = metrics
             .snapshot(StorageReadiness::Ready, None, 0, 0, 0)
@@ -2566,9 +2855,21 @@ mod tests {
                 "narjar_cache_population_narinfo_claimed_nar_bytes{state=\"measured\"} 360"
             )
         );
+        assert!(exposition.contains("narjar_cache_population_scan_started_timestamp_seconds "));
+        assert!(
+            exposition.contains("narjar_cache_population_scan_quality{quality=\"complete\"} 1")
+        );
+        assert!(exposition.contains("narjar_cache_population_scan_entries 17"));
+        assert!(exposition.contains("narjar_cache_population_scan_ignored_entries 3"));
+        assert!(exposition.contains("narjar_cache_population_scan_disappeared_entries 0"));
+        assert!(exposition.contains("narjar_cache_population_scan_errors 0"));
+        assert!(exposition.contains(
+            "narjar_cache_population_narinfo_entries{kind=\"parsed\",state=\"measured\"} 4"
+        ));
+        assert!(exposition.contains("narjar_cache_population_refresh_failed 0"));
         assert!(!exposition.contains("kind=\"chunk\""));
 
-        metrics.record_population_scan(StorageBackend::Chunked, Err(()), 0.0);
+        metrics.record_population_scan(StorageBackend::Chunked, Err(()), started_at, 0.0);
         let refreshed = metrics
             .snapshot(StorageReadiness::Ready, None, 0, 0, 0)
             .inventory;
@@ -2579,6 +2880,71 @@ mod tests {
                     && value.structurally_valid_narinfo_entries == 4
                     && value.raw_bytes == 900
         ));
+        let exposition = metrics.render(true, None, 0, 0);
+        assert!(exposition.contains("narjar_cache_population_sample_available{state=\"stale\"} 1"));
+        assert!(exposition.contains("narjar_cache_population_refresh_failed 1"));
+        assert!(exposition.contains("narjar_cache_population_scan_quality{quality=\"failed\"} 1"));
+    }
+
+    #[test]
+    fn incomplete_population_scan_keeps_last_complete_totals_and_reports_coverage() {
+        let metrics = Metrics::default();
+        let started_at = super::unix_seconds_now().saturating_sub(3);
+        metrics.record_population_scan(
+            StorageBackend::Flat,
+            Ok(PopulationCounts {
+                raw_files: 4,
+                raw_bytes: 900,
+                ..PopulationCounts::default()
+            }),
+            started_at,
+            1.0,
+        );
+        metrics.record_population_scan(
+            StorageBackend::Flat,
+            Ok(PopulationCounts {
+                scanned_entries: 12,
+                ignored_entries: 2,
+                errors: 1,
+                narinfo_read_errors: 1,
+                raw_files: 1,
+                raw_bytes: 50,
+                ..PopulationCounts::default()
+            }),
+            started_at + 1,
+            2.0,
+        );
+
+        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        assert!(matches!(
+            &snapshot.inventory,
+            super::SampleState::Stale { value, .. } if value.raw_bytes == 900
+        ));
+        let attempt = snapshot
+            .inventory_attempt
+            .as_ref()
+            .expect("the latest scan attempt should be retained");
+        assert_eq!(attempt.quality, super::PopulationQuality::EntryErrors);
+        assert_eq!(
+            attempt
+                .coverage
+                .as_ref()
+                .map(|coverage| coverage.scanned_entries),
+            Some(12)
+        );
+
+        let exposition = super::render_prometheus(&snapshot);
+        assert!(
+            exposition.contains(
+                "narjar_cache_population_apparent_bytes{kind=\"raw\",state=\"stale\"} 900"
+            )
+        );
+        assert!(exposition.contains("narjar_cache_population_scan_entries 12"));
+        assert!(exposition.contains("narjar_cache_population_scan_errors 1"));
+        assert!(exposition.contains("narjar_cache_population_scan_narinfo_read_errors 1"));
+        assert!(
+            exposition.contains("narjar_cache_population_scan_quality{quality=\"entry_errors\"} 1")
+        );
     }
 
     #[test]
@@ -2765,26 +3131,7 @@ mod tests {
         let mount_alias = temporary.path().join("mounted-cache");
         symlink(&storage_root, &mount_alias).expect("mount alias should be created");
         let sample_path = temporary.path().join("sample.json");
-        let sample = serde_json::json!({
-            "schema_version": 1,
-            "storage_root": storage_root,
-            "dataset": "tank/narjar",
-            "mountpoint": mount_alias,
-            "sampled_at_unix_seconds": super::unix_seconds_now(),
-            "used_bytes": 20,
-            "logical_used_bytes": 50,
-            "referenced_bytes": 18,
-            "logical_referenced_bytes": 45,
-            "used_by_dataset_bytes": 17,
-            "used_by_snapshots_bytes": 2,
-            "used_by_children_bytes": 1,
-            "used_by_refreservation_bytes": 0,
-            "available_bytes": 80,
-            "compression_ratio": "2.50x",
-            "referenced_compression_ratio": "2.25x",
-            "compression": "zstd-19",
-            "record_size_bytes": 1_048_576,
-        });
+        let sample = zfs_sample_document(&storage_root, &mount_alias);
         std::fs::write(
             &sample_path,
             serde_json::to_vec(&sample).expect("sample should serialize"),
@@ -2810,6 +3157,84 @@ mod tests {
         ));
         assert!(
             render_prometheus(&snapshot).contains("narjar_zfs_sample_available{state=\"stale\"} 0")
+        );
+    }
+
+    #[test]
+    fn zfs_sample_rejects_malformed_oversized_future_and_wrong_root_files() {
+        let temporary = tempfile::tempdir().expect("temporary root should be created");
+        let storage_root = temporary.path().join("cache");
+        std::fs::create_dir(&storage_root).expect("storage root should be created");
+        let sample_path = temporary.path().join("sample.json");
+        let mut sample = zfs_sample_document(&storage_root, &storage_root);
+        let now = super::unix_seconds_now();
+
+        sample["storage_root"] = serde_json::json!(temporary.path().join("other-cache"));
+        std::fs::write(&sample_path, serde_json::to_vec(&sample).unwrap()).unwrap();
+        assert_eq!(
+            super::read_zfs_sample(&sample_path, &storage_root, now).unwrap_err(),
+            "sample_wrong_storage_root"
+        );
+
+        sample["storage_root"] = serde_json::json!(&storage_root);
+        sample["sampled_at_unix_seconds"] = serde_json::json!(now + 31);
+        std::fs::write(&sample_path, serde_json::to_vec(&sample).unwrap()).unwrap();
+        assert_eq!(
+            super::read_zfs_sample(&sample_path, &storage_root, now).unwrap_err(),
+            "sample_timestamp_in_future"
+        );
+
+        std::fs::write(&sample_path, b"not-json").unwrap();
+        assert_eq!(
+            super::read_zfs_sample(&sample_path, &storage_root, now).unwrap_err(),
+            "sample_invalid"
+        );
+
+        std::fs::write(
+            &sample_path,
+            vec![b' '; (super::MAX_ZFS_SAMPLE_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_zfs_sample(&sample_path, &storage_root, now).unwrap_err(),
+            "sample_too_large"
+        );
+    }
+
+    #[test]
+    fn zfs_sample_marks_old_values_stale_and_accepts_compression_off() {
+        let temporary = tempfile::tempdir().expect("temporary root should be created");
+        let storage_root = temporary.path().join("cache");
+        std::fs::create_dir(&storage_root).expect("storage root should be created");
+        let sample_path = temporary.path().join("sample.json");
+        let metrics = Metrics::default();
+        let sample = zfs_sample_document(&storage_root, &storage_root);
+        std::fs::write(&sample_path, serde_json::to_vec(&sample).unwrap()).unwrap();
+
+        metrics.sample_filesystem_sidecar(&sample_path, &storage_root);
+        let exposition =
+            render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        assert!(
+            exposition
+                .contains("narjar_zfs_compression_info{algorithm=\"off\",state=\"measured\"} 1")
+        );
+        assert!(
+            exposition.contains("narjar_zfs_bytes{kind=\"used_by_children\",state=\"measured\"} 1")
+        );
+
+        let mut stale_sample = sample;
+        stale_sample["sampled_at_unix_seconds"] = serde_json::json!(
+            super::unix_seconds_now().saturating_sub(super::ZFS_SAMPLE_MAX_AGE + 1)
+        );
+        std::fs::write(&sample_path, serde_json::to_vec(&stale_sample).unwrap()).unwrap();
+        metrics.sample_filesystem_sidecar(&sample_path, &storage_root);
+        let stale = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        assert!(matches!(
+            stale.filesystem,
+            SampleState::Stale { ref value, .. } if value.used_bytes == 20
+        ));
+        assert!(
+            render_prometheus(&stale).contains("narjar_zfs_sample_available{state=\"stale\"} 0")
         );
     }
 
@@ -2842,13 +3267,63 @@ mod tests {
     fn aborted_artifact_transfer_keeps_partial_bytes_not_expected_length() {
         let metrics = Metrics::default();
         let request = metrics.request(RequestMethod::Get, RequestRoute::Nar);
-        request.record_failed_response(StatusCode::OK, 7, Duration::from_millis(12));
+        request.record_failed_response(
+            StatusCode::OK,
+            TransferFailure {
+                error: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+                body_bytes: 7,
+            },
+            Duration::from_millis(12),
+        );
+        request.record_completed_response(StatusCode::OK, 100, Duration::from_millis(1));
         drop(request);
 
         let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
         assert_eq!(snapshot.traffic.response_body_bytes, 7);
         assert_eq!(snapshot.traffic.completed_responses, 0);
         assert_eq!(snapshot.traffic.aborted_responses, 1);
+        assert_eq!(snapshot.response_transfer_failures.disconnected, 1);
+        assert_eq!(snapshot.response_transfer_failures.timed_out, 0);
+    }
+
+    #[test]
+    fn dropped_request_guard_records_an_abandoned_response_once() {
+        let metrics = Metrics::default();
+        let request = metrics.request(RequestMethod::Get, RequestRoute::NarInfo);
+        drop(request);
+
+        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        assert_eq!(snapshot.traffic.requests_in_flight, 0);
+        assert_eq!(snapshot.traffic.aborted_responses, 1);
+        let exposition = render_prometheus(&snapshot);
+        assert!(exposition.contains(
+            "narjar_http_requests_total{method=\"GET\",route=\"narinfo\",status=\"other\"} 1"
+        ));
+        assert!(exposition.contains("narjar_response_transfer_failures_total{kind=\"timeout\"} 0"));
+    }
+
+    #[test]
+    fn response_transfer_failures_use_bounded_timeout_and_other_classes() {
+        let metrics = Metrics::default();
+        for error_kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let request = metrics.request(RequestMethod::Get, RequestRoute::Nar);
+            request.record_failed_response(
+                StatusCode::OK,
+                TransferFailure {
+                    error: std::io::Error::from(error_kind),
+                    body_bytes: 0,
+                },
+                Duration::from_millis(1),
+            );
+        }
+
+        let exposition =
+            render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        assert!(exposition.contains("narjar_response_transfer_failures_total{kind=\"timeout\"} 1"));
+        assert!(exposition.contains("narjar_response_transfer_failures_total{kind=\"other\"} 1"));
     }
 
     #[test]
@@ -2939,12 +3414,14 @@ mod tests {
             upload_bytes: 100,
             download_bytes: 200,
             process_cpu_seconds: Some(1.0),
+            byte_counters_overflowed: false,
         });
         samples.record(super::TrafficSample {
             at: start + Duration::from_secs(30),
             upload_bytes: 400,
             download_bytes: 800,
             process_cpu_seconds: Some(1.6),
+            byte_counters_overflowed: false,
         });
 
         let rate = samples.rate_over(60).expect("two samples define a rate");
@@ -2953,6 +3430,106 @@ mod tests {
         assert_eq!(rate.upload_bytes_per_second, 10.0);
         assert_eq!(rate.artifact_bytes_per_second, 20.0);
         assert!((rate.process_cpu_cores.expect("CPU sample is present") - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn traffic_rate_windows_include_both_endpoints_and_report_idle_zeroes() {
+        let start = Instant::now();
+        let mut samples = super::TrafficSamples::default();
+        assert!(samples.rates().one_minute.is_none());
+        assert!(samples.rates().five_minutes.is_none());
+
+        (0..=60).for_each(|sample_index| {
+            let elapsed_seconds = sample_index * 5;
+            samples.record(super::TrafficSample {
+                at: start + Duration::from_secs(elapsed_seconds),
+                upload_bytes: 0,
+                download_bytes: 0,
+                process_cpu_seconds: Some(0.0),
+                byte_counters_overflowed: false,
+            });
+        });
+
+        let rates = samples.rates();
+        let one_minute = rates.one_minute.expect("full one-minute coverage");
+        assert_eq!(one_minute.coverage_seconds, 60.0);
+        assert_eq!(one_minute.upload_bytes_per_second, 0.0);
+        assert_eq!(one_minute.artifact_bytes_per_second, 0.0);
+
+        let five_minutes = rates.five_minutes.expect("full five-minute coverage");
+        assert_eq!(five_minutes.coverage_seconds, 300.0);
+        assert_eq!(five_minutes.upload_bytes_per_second, 0.0);
+        assert_eq!(five_minutes.artifact_bytes_per_second, 0.0);
+    }
+
+    #[test]
+    fn traffic_rates_are_unavailable_after_counter_reset_or_overflow() {
+        let start = Instant::now();
+        let mut reset_samples = super::TrafficSamples::default();
+        reset_samples.record(super::TrafficSample {
+            at: start,
+            upload_bytes: 100,
+            download_bytes: 200,
+            process_cpu_seconds: Some(1.0),
+            byte_counters_overflowed: false,
+        });
+        reset_samples.record(super::TrafficSample {
+            at: start + Duration::from_secs(30),
+            upload_bytes: 50,
+            download_bytes: 100,
+            process_cpu_seconds: Some(1.5),
+            byte_counters_overflowed: false,
+        });
+        assert!(reset_samples.rate_over(60).is_none());
+
+        let mut overflowed_samples = super::TrafficSamples::default();
+        overflowed_samples.record(super::TrafficSample {
+            at: start,
+            upload_bytes: 100,
+            download_bytes: 200,
+            process_cpu_seconds: Some(1.0),
+            byte_counters_overflowed: false,
+        });
+        overflowed_samples.record(super::TrafficSample {
+            at: start + Duration::from_secs(30),
+            upload_bytes: u64::MAX,
+            download_bytes: u64::MAX,
+            process_cpu_seconds: Some(1.5),
+            byte_counters_overflowed: true,
+        });
+        assert!(overflowed_samples.rate_over(60).is_none());
+    }
+
+    #[test]
+    fn traffic_byte_counters_saturate_and_expose_overflow() {
+        let metrics = Metrics::default();
+        metrics
+            .received_upload_bytes
+            .store(u64::MAX - 1, std::sync::atomic::Ordering::Relaxed);
+
+        metrics.received_upload_body_bytes(2);
+
+        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        assert_eq!(snapshot.traffic.received_upload_body_bytes, u64::MAX);
+        assert!(snapshot.traffic.cumulative_byte_counters_overflowed);
+        assert!(snapshot.traffic.recent_rates.one_minute.is_none());
+        assert!(snapshot.traffic.recent_rates.five_minutes.is_none());
+        assert!(render_prometheus(&snapshot).contains("narjar_traffic_byte_counters_overflowed 1"));
+    }
+
+    #[test]
+    fn unavailable_process_sample_has_a_bounded_explicit_state() {
+        let mut exposition = String::new();
+        super::append_process_metrics(
+            &mut exposition,
+            &super::SampleState::<super::ProcessResources>::Unavailable {
+                reason: "/private/path must not appear".to_owned(),
+            },
+        );
+
+        assert!(exposition.contains("narjar_process_sample_available 0"));
+        assert!(exposition.contains("narjar_process_sample_state{state=\"unavailable\"} 1"));
+        assert!(!exposition.contains("/private/path"));
     }
 
     #[test]
@@ -2990,12 +3567,19 @@ mod tests {
         metrics.sample_periodic();
 
         let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
-        let super::SampleState::Measured { value, .. } = snapshot.process.resources else {
+        let super::SampleState::Measured { ref value, .. } = snapshot.process.resources else {
             panic!("Linux procfs sample should be available");
         };
         assert!(value.resident_bytes > 0);
         assert!(value.user_cpu_seconds.is_finite());
         assert!(value.system_cpu_seconds.is_finite());
+        assert!(value.open_file_descriptors.is_some());
+        let exposition = render_prometheus(&snapshot);
+        assert!(!exposition.contains("cgroup"));
+        assert!(
+            exposition.contains("narjar_process_resource_source_info{source=\"linux_procfs\"} 1")
+        );
+        assert!(exposition.contains("narjar_process_sample_state{state=\"measured\"} 1"));
     }
 
     #[test]

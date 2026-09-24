@@ -604,6 +604,11 @@ Required series:
   accepted by socket writes/sendfile, including partial progress before a
   failed delivery. It excludes control endpoints, response headers, TLS, and
   HEAD bodies; it does not prove that the client application received them.
+  `narjar_response_transfer_failures_total{kind}` classifies failed response
+  writes as `timeout`, `disconnected`, or `other`; this bounded cause counter
+  complements the selected HTTP status and partial-body byte total. Request
+  header and upload-body read timeouts/disconnects are counted in
+  `narjar_connections_total`.
 - `narjar_auth_failures_total{scope}` uses only `read` and `write` scopes.
 - `narjar_validation_failures_total{class}` uses only `body`, `nar`, and
   `narinfo` classes.
@@ -630,6 +635,25 @@ Required series:
   `NarSize` claims once per store path. Shared NAR content contributes once
   for each store path; this is distinct from stored raw-file bytes and is not
   signature verification.
+- `narjar_cache_population_scan_started_timestamp_seconds` and
+  `narjar_cache_population_scan_timestamp_seconds` bracket the most recent
+  scan attempt; `narjar_cache_population_scan_duration_seconds` uses monotonic
+  elapsed time. `narjar_cache_population_sample_timestamp_seconds` is the
+  completion time of the last complete aggregate.
+- `narjar_cache_population_scan_entries`,
+  `narjar_cache_population_scan_ignored_entries`,
+  `narjar_cache_population_scan_disappeared_entries`, and
+  `narjar_cache_population_scan_errors` describe traversal coverage;
+  `narjar_cache_population_scan_narinfo_read_errors` isolates unreadable
+  metadata among those errors.
+  `narjar_cache_population_scan_quality{quality}` uses only `complete`,
+  `changed_during_scan`, `entry_errors`, or `failed`.
+- `narjar_cache_population_narinfo_entries{kind}` separates structurally
+  parsed, malformed-filename, malformed-content, and unreadable narinfo
+  entries from the last complete aggregate.
+  `narjar_cache_population_refresh_failed` is 1 after an incomplete or failed
+  attempt; its coverage and quality describe that attempt while the previous
+  complete aggregate remains available with stale state.
 - Optional ZFS observations use `narjar_zfs_bytes{kind,state}` for used,
   logical, referenced, snapshot, child, reservation, and available byte totals.
   `narjar_zfs_compression_info{algorithm,state}` has fixed algorithm values;

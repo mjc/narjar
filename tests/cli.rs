@@ -2389,6 +2389,12 @@ fn stalled_upload_body_is_rejected_without_publication() {
             .join(format!("narinfo/{STORE_HASH}.narinfo"))
             .exists()
     );
+    let (_, metrics_body) = response_parts(&server.request("GET", "/metrics"));
+    let metrics = String::from_utf8(metrics_body).expect("metrics should be UTF-8");
+    assert!(
+        metrics.contains("narjar_connections_total{outcome=\"timeout\"} 1"),
+        "stalled upload body should count as a timed-out connection: {metrics}"
+    );
     let (_, status) = server.stop();
     assert!(status.success(), "narjar should shut down cleanly");
 }
@@ -4372,6 +4378,8 @@ fn nar_put_rejects_encoded_malformed_oversized_and_truncated_bodies() {
         .expect("read temp directory")
         .next()
         .is_none();
+    let (_, metrics_body) = response_parts(&server.request("GET", "/metrics"));
+    let metrics = String::from_utf8(metrics_body).expect("metrics should be UTF-8");
     let (signal, status) = server.stop();
 
     let limited = RunningServer::start_with_args("nar-put-oversized", &["--max-nar-bytes", "5"]);
@@ -4405,6 +4413,10 @@ fn nar_put_rejects_encoded_malformed_oversized_and_truncated_bodies() {
     assert!(
         truncated.is_empty(),
         "truncated request closes without a response"
+    );
+    assert!(
+        metrics.contains("narjar_connections_total{outcome=\"disconnected\"} 1"),
+        "truncated upload body should count as a disconnected connection: {metrics}"
     );
     assert!(temp_is_empty);
     assert!(!oversized_path.exists());

@@ -140,7 +140,7 @@
       "--shutdown-grace-seconds"
       (toString cfg.shutdownGraceSeconds)
     ]
-      ++ lib.optionals (cfg.statsInventoryIntervalSeconds != null) [
+      ++ lib.optionals cfg.statsInventory [
         "--stats-inventory-interval-seconds"
         (toString cfg.statsInventoryIntervalSeconds)
       ]
@@ -182,6 +182,10 @@
 
     actual_mountpoint=$(${pkgs.zfs}/bin/zfs get -H -o value mountpoint "$dataset")
     test "$actual_mountpoint" = "$expected_mountpoint"
+    mounted_source=$(${pkgs.util-linux}/bin/findmnt --noheadings --raw --output SOURCE --target "$expected_mountpoint")
+    mounted_type=$(${pkgs.util-linux}/bin/findmnt --noheadings --raw --output FSTYPE --target "$expected_mountpoint")
+    test "$mounted_source" = "$dataset"
+    test "$mounted_type" = "zfs"
     descendant_count=$(${pkgs.zfs}/bin/zfs list -H -r -o name "$dataset" | ${pkgs.coreutils}/bin/wc -l)
     test "$descendant_count" -eq 1
 
@@ -304,10 +308,16 @@ in {
       default = 30;
     };
 
+    statsInventory = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Enable the delayed, bounded cache-population sampler.";
+    };
+
     statsInventoryIntervalSeconds = lib.mkOption {
-      type = lib.types.nullOr lib.types.ints.positive;
-      default = null;
-      description = "Enable periodic bounded cache-population sampling at this interval in seconds.";
+      type = lib.types.ints.positive;
+      default = 900;
+      description = "Interval between cache-population scans when statsInventory is enabled.";
     };
 
     statsZfsDataset = lib.mkOption {

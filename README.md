@@ -178,17 +178,20 @@ samples.
 unsatisfiable, and invalid Range decisions for existing NARs, with GET and
 HEAD kept separate. A 416 is also visible in the HTTP status series.
 
-Process RSS/CPU and cgroup-v2 service memory are separate Linux observations.
-Filesystem capacity and staging headroom are sampled from the cache's open
-directory and reservation budget; headroom is an estimate, not an admission
-promise. `narjar_readiness{reason=...}` distinguishes available, low-space,
-no-inodes, read-only, and probe-failed states. Population totals are not
-scanned on a request. To enable the delayed
-background population walk (first run after 60 seconds, then at the configured
-interval), start the service with:
+Process RSS/CPU, thread count, and bounded open-file-descriptor count are Linux
+process observations. They describe Narjar itself, not cache hits or storage
+capacity. Filesystem capacity and staging headroom are sampled from the cache's
+open directory and reservation budget; headroom is an estimate, not an
+admission promise.
+
+`narjar_readiness{reason=...}` distinguishes available, low-space, no-inodes,
+read-only, and probe-failed states. Population totals are not scanned on a
+request. Enable the delayed background population walk with a 60-second first
+delay and a 15-minute default interval (optionally pass another interval in
+seconds):
 
 ```sh
-narjar serve --data-dir /var/lib/narjar --stats-inventory-interval-seconds 900
+narjar serve --data-dir /var/lib/narjar --stats-inventory-interval-seconds
 ```
 
 These series use different accounting bases; do not compare or substitute
@@ -209,18 +212,21 @@ belongs in the dashboard:
 | `narjar_cache_population_apparent_bytes{kind=...}` | Observed file lengths in the cache namespace | Filesystem block allocation; hard links, sparse files, snapshots, and metadata change allocation |
 | `narjar_zfs_bytes{kind,state}` | Values reported for the explicitly configured ZFS dataset, including logical, referenced, snapshot, child, and reservation accounting | A cache-only physical total if that dataset contains unrelated data |
 
-Process RSS is not the service cgroup's `memory.current`; they answer
-process-residency and service-accounting questions respectively. A
-`systemd MemoryCurrent` observation is service/cgroup accounting, not a
-measurement of process RSS. ZFS's reported `compressratio` is distinct from a
-derived logical-to-used quotient. No current population metric measures
-allocated blocks; use the dated ZFS sample for filesystem-level usage when
-configured.
+ZFS's reported `compressratio` is distinct from a derived logical-to-used
+quotient. No current population metric measures allocated blocks; use the dated
+ZFS sample for filesystem-level usage when configured.
 
-The population report is dated and records scan duration, ignored/disappeared
-entries, and errors. Narinfo filenames and contents are structurally parsed;
+The population report exposes its start and completion timestamps, elapsed
+duration, entries scanned, ignored/disappeared entries, errors, and a bounded
+quality classification (`complete`, `changed_during_scan`, `entry_errors`, or
+`failed`).
+`narjar_cache_population_refresh_failed` distinguishes an incomplete/failed
+refresh from an initial not-yet-run scan. An incomplete or failed refresh
+preserves the previous complete sample and marks it stale instead of replacing
+it with partial totals. Narinfo filenames and contents are structurally parsed;
 this population pass does not verify signatures. Malformed filenames and
-malformed contents are reported separately. It sums apparent file lengths for
+malformed contents and unreadable narinfo entries are reported separately from
+structurally parsed metadata. It sums apparent file lengths for
 narinfo metadata, raw and compressed payloads, chunk files/manifests, ingress
 and egress receipts, validation evidence, recovery records, and temporary
 files. `narjar_cache_population_narinfo_claimed_nar_bytes` separately sums
@@ -249,6 +255,13 @@ The independent failure rate is available under `outcome="failure"`. Resource
 and population samples expose their state and sample age; missing platform
 measurements are not represented as healthy zeroes.
 
+The one- and five-minute upload/artifact throughput and process-CPU gauges use
+the actual elapsed sample coverage, reported separately from the requested
+window. They are absent until there are at least two usable samples. If a
+cumulative traffic-byte counter saturates, Narjar reports
+`narjar_traffic_byte_counters_overflowed 1` and omits byte-rate estimates
+rather than presenting a misleading delta.
+
 Explicit GC, reconcile, structural cleanup, and verify commands persist one
 bounded summary per operation type. `/metrics` reports the latest completed
 timestamp, mode, outcome, duration, available object counts, inventory classes,
@@ -258,10 +271,15 @@ by process failure. GC logical bytes are not physical disk space, and counts
 the command did not measure are omitted. Reading `/metrics` never runs GC,
 reconcile, or verification.
 
-On NixOS, set `services.narjar.statsZfsDataset` to opt into a read-only,
+On NixOS, set `services.narjar.statsInventory = true` to enable the bounded
+population sampler; its interval defaults to 900 seconds and can be changed
+with `services.narjar.statsInventoryIntervalSeconds`.
+
+Set `services.narjar.statsZfsDataset` to opt into a read-only,
 once-per-minute ZFS sample for the dataset mounted at `dataDir`. The collector
-rejects a different mountpoint or child datasets, and writes a bounded sample
-under `/run`; Narjar exposes physical `used`, logical/reference usage,
+checks both the dataset's configured mountpoint and the active mount source,
+rejects child datasets, and writes a bounded sample under `/run`; Narjar
+exposes physical `used`, logical/reference usage,
 compression properties, and sample age through `/metrics`. Compression
 algorithms use bounded labels; their numeric levels are a separate gauge, and
 unrecognized future settings are grouped as `other`. Without this option,
@@ -282,6 +300,9 @@ not establish NAR grammar or signature validity.
 bytes when the canonical payload is durably created or found identical. These
 storage-boundary counts are distinct from encoded HTTP body bytes and do not
 infer input-to-output encoding conversions.
+Failed response transfers are classified by `narjar_response_transfer_failures_total`
+with fixed `timeout`, `disconnected`, and `other` labels; partial body bytes
+remain included in the artifact-output counter.
 
 The storage layer also reports compressed derivative reuse, generation,
 generation failures, repair, and callers coalesced behind active generation.
