@@ -8,7 +8,7 @@ use std::{
 
 use clap::Args;
 use narjar::{
-    narinfo::NarInfoMetadata,
+    narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, NarInfoMetadata},
     object::{NarRepresentation, WireEncoding},
 };
 use ureq::Agent;
@@ -29,9 +29,9 @@ use plan::dependency_waves;
 use root::StoreRoots;
 use signing::sign_metadata;
 use store::LocalStore;
+use transfer::{get_bounded, put_bytes, put_reader};
 #[cfg(test)]
-use transfer::{get_bounded, put_file, request_status};
-use transfer::{put_bytes, put_reader};
+use transfer::{put_file, request_status};
 use upstream::{CacheLookup, PushDisposition, TrustedUpstreams};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -118,6 +118,10 @@ pub(crate) struct Push {
     #[arg(long)]
     refresh: bool,
 
+    /// Keep publishing when a destination already has different immutable metadata.
+    #[arg(long)]
+    ignore_conflicts: bool,
+
     /// Trusted binary cache consulted before generating an upload. Repeat in lookup order.
     #[arg(long = "trusted-upstream", value_name = "URL")]
     trusted_upstreams: Vec<HttpUrl>,
@@ -151,6 +155,7 @@ struct PushReport {
     uploaded: usize,
     destination_present: usize,
     trusted_upstream_present: usize,
+    conflicts: usize,
 }
 
 impl PushReport {
@@ -158,6 +163,7 @@ impl PushReport {
         self.uploaded += other.uploaded;
         self.destination_present += other.destination_present;
         self.trusted_upstream_present += other.trusted_upstream_present;
+        self.conflicts += other.conflicts;
     }
 
     fn record(&mut self, outcome: PushOutcome) {
@@ -165,6 +171,7 @@ impl PushReport {
             PushOutcome::Uploaded => self.uploaded += 1,
             PushOutcome::DestinationPresent => self.destination_present += 1,
             PushOutcome::TrustedUpstreamPresent => self.trusted_upstream_present += 1,
+            PushOutcome::Conflict => self.conflicts += 1,
         }
     }
 }
@@ -174,6 +181,7 @@ enum PushOutcome {
     Uploaded,
     DestinationPresent,
     TrustedUpstreamPresent,
+    Conflict,
 }
 
 #[derive(Clone)]
@@ -182,6 +190,7 @@ struct NativeCopyOptions {
     netrc_file: Option<PathBuf>,
     insecure_http: bool,
     destination_narinfo: DestinationNarinfoPolicy,
+    ignore_conflicts: bool,
     compression: WireEncoding,
     timeout_seconds: NonZeroU64,
     trusted_upstreams: TrustedUpstreams,
@@ -199,6 +208,7 @@ impl NativeCopyOptions {
             netrc_file: args.netrc_file.clone(),
             insecure_http: args.insecure_http,
             destination_narinfo: DestinationNarinfoPolicy::from_refresh_flag(args.refresh),
+            ignore_conflicts: args.ignore_conflicts,
             compression: args.compression,
             timeout_seconds: args.timeout_seconds,
             trusted_upstreams,
@@ -226,6 +236,12 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
         "push complete: uploaded {}, destination-present {}, trusted-upstream-present {}; {worker_count} workers",
         report.uploaded, report.destination_present, report.trusted_upstream_present
     );
+    if report.conflicts > 0 {
+        eprintln!(
+            "narjar push: skipped {} immutable destination conflict(s)",
+            report.conflicts
+        );
+    }
     Ok(())
 }
 
@@ -365,7 +381,7 @@ impl UploadClient {
         target: &HttpUrl,
         compression: WireEncoding,
         info: &NarInfoMetadata,
-    ) -> Result<(), PushError> {
+    ) -> Result<NarInfoUploadOutcome, PushError> {
         let narinfo_url =
             target.endpoint(&[&format!("{}.narinfo", info.claims().store().as_str())]);
         let payload = prepare_nar_upload(info, compression)?;
@@ -389,7 +405,42 @@ impl UploadClient {
             "text/x-nix-narinfo",
             self.authorization.as_deref(),
         )?;
-        require_successful_upload(UploadArtifact::Narinfo, info, narinfo_status)
+        self.require_narinfo_upload(&narinfo_url, info, narinfo_status)
+    }
+
+    fn require_narinfo_upload(
+        &self,
+        narinfo_url: &HttpUrl,
+        info: &NarInfoMetadata,
+        status: u16,
+    ) -> Result<NarInfoUploadOutcome, PushError> {
+        if matches!(status, 200 | 201) {
+            return Ok(NarInfoUploadOutcome::Uploaded);
+        }
+        if status == 409 && self.destination_narinfo_matches(narinfo_url, info)? {
+            return Ok(NarInfoUploadOutcome::AlreadyPresent);
+        }
+        if status == 409 {
+            return Ok(NarInfoUploadOutcome::Conflict);
+        }
+        require_successful_upload(UploadArtifact::Narinfo, info, status)
+            .map(|()| NarInfoUploadOutcome::Uploaded)
+    }
+
+    fn destination_narinfo_matches(
+        &self,
+        narinfo_url: &HttpUrl,
+        info: &NarInfoMetadata,
+    ) -> Result<bool, PushError> {
+        let response = get_bounded(
+            &self.agent,
+            narinfo_url,
+            self.authorization.as_deref(),
+            MAX_NARINFO_BYTES,
+        )?;
+        Ok(response.status == 200
+            && NarInfoClaims::parse_external_narinfo(info.claims().store(), response.body)
+                .is_ok_and(|claims| claims == *info.claims()))
     }
 }
 
@@ -419,8 +470,22 @@ fn copy_path(
             Ok(PushOutcome::TrustedUpstreamPresent)
         }
         PushDisposition::UploadRequired => {
-            client.upload_path(&options.target, options.compression, info)?;
-            Ok(PushOutcome::Uploaded)
+            match client.upload_path(&options.target, options.compression, info)? {
+                NarInfoUploadOutcome::Uploaded => Ok(PushOutcome::Uploaded),
+                NarInfoUploadOutcome::AlreadyPresent => Ok(PushOutcome::DestinationPresent),
+                NarInfoUploadOutcome::Conflict if options.ignore_conflicts => {
+                    eprintln!(
+                        "narjar push: skipping immutable conflict for {}",
+                        info.claims().store_path()
+                    );
+                    Ok(PushOutcome::Conflict)
+                }
+                NarInfoUploadOutcome::Conflict => Err(format!(
+                    "narinfo upload for {} returned HTTP 409",
+                    info.claims().store_path()
+                )
+                .into()),
+            }
         }
     }
 }
@@ -453,6 +518,13 @@ fn open_upload_reader(
 enum UploadArtifact {
     Nar,
     Narinfo,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NarInfoUploadOutcome {
+    Uploaded,
+    AlreadyPresent,
+    Conflict,
 }
 
 impl fmt::Display for UploadArtifact {
@@ -545,6 +617,66 @@ mod tests {
              Deriver: 11111111111111111111111111111111-deriver.drv\n\
              CA: fixed:sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
         );
+    }
+
+    #[test]
+    fn accepts_matching_narinfo_after_immutable_conflict() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let info = test_narinfo_metadata(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package",
+            Vec::new(),
+        );
+        let body = info
+            .serialize(NarRepresentation::Raw(info.claims().identity()))
+            .expect("narinfo fixture should serialize");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind narinfo conflict listener");
+        let address = listener
+            .local_addr()
+            .expect("inspect narinfo conflict listener");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept narinfo verification GET");
+            let mut request = [0; 1024];
+            let read = stream
+                .read(&mut request)
+                .expect("read narinfo verification GET");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /narinfo HTTP/1.1"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write narinfo verification headers");
+            stream
+                .write_all(&body)
+                .expect("write narinfo verification body");
+        });
+
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let client = super::UploadClient {
+            agent,
+            authorization: None,
+        };
+        let result = client.require_narinfo_upload(
+            &http_url(format!("http://{address}/narinfo")),
+            &info,
+            409,
+        );
+
+        assert!(
+            result.is_ok(),
+            "matching immutable narinfo should be accepted"
+        );
+        server
+            .join()
+            .expect("narinfo verification server should exit");
     }
 
     #[test]
@@ -1022,6 +1154,22 @@ mod tests {
         let push = Push::from_arg_matches(&matches).expect("push arguments should parse");
 
         assert_eq!(push.jobs.get(), 1);
+    }
+
+    #[test]
+    fn push_can_explicitly_skip_immutable_conflicts() {
+        let matches = Push::augment_args(Command::new("push"))
+            .try_get_matches_from([
+                "push",
+                "--to",
+                "https://cache.example",
+                "--ignore-conflicts",
+                "/run/current-system",
+            ])
+            .expect("push options should parse");
+        let push = Push::from_arg_matches(&matches).expect("push arguments should parse");
+
+        assert!(push.ignore_conflicts);
     }
 
     #[test]

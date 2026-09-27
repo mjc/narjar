@@ -93,6 +93,11 @@ installables. Referenced store paths are uploaded in deterministic
 dependency waves; independent paths within a wave use the bounded `--jobs`
 parallelism.
 
+Shared publishers can pass `--ignore-conflicts` to skip a store path whose
+immutable destination already has a different NAR identity and continue the
+closure. The existing destination remains untouched; without this explicit
+option, the push fails so the conflict is visible.
+
 To avoid copying closure members already available from caches that every
 consumer can reach, list those caches in lookup order and provide their trusted
 Nix public keys explicitly:

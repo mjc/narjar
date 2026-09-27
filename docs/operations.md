@@ -101,6 +101,7 @@ narjar push
   [--netrc-file PATH]
   [--signing-key-file PATH]
   [--refresh]
+  [--ignore-conflicts]
   INSTALLABLE...
 ~~~
 
@@ -139,6 +140,11 @@ file must already have restrictive permissions. `NARJAR_PUSH_GCROOTS` may point
 to an operator-owned existing `gcroots/auto` directory when the normal Nix
 state directory is not writable; it changes only where Narjar places its
 temporary reachability symlinks, not Nix's store or state database.
+
+Shared publishers can pass `--ignore-conflicts` to skip a store path whose
+immutable destination already has a different NAR identity and continue the
+closure. The existing destination remains untouched; without this explicit
+option, the push fails so the conflict is visible.
 
 The native client transfers store-path NARs and narinfos only. Realisations,
 build logs, `.ls` listings, and other store-daemon metadata are outside this
