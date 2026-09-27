@@ -8,7 +8,7 @@ use std::{
 
 use clap::Args;
 use narjar::{
-    narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, NarInfoMetadata},
+    narinfo::{MAX_NARINFO_BYTES, NarInfoMetadata},
     object::{NarRepresentation, WireEncoding},
 };
 use ureq::Agent;
@@ -439,8 +439,9 @@ impl UploadClient {
             MAX_NARINFO_BYTES,
         )?;
         Ok(response.status == 200
-            && NarInfoClaims::parse_external_narinfo(info.claims().store(), response.body)
-                .is_ok_and(|claims| claims == *info.claims()))
+            && info
+                .claims()
+                .matches_external_narinfo(info.claims().store(), response.body))
     }
 }
 

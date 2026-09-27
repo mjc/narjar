@@ -180,6 +180,10 @@ impl NarInfoClaims {
         Ok(claims)
     }
 
+    pub fn matches_external_narinfo(&self, route: &StoreHash, bytes: Vec<u8>) -> bool {
+        Self::parse_external_narinfo(route, bytes).is_ok_and(|claims| claims == *self)
+    }
+
     fn from_document(
         route: &StoreHash,
         document: &NarInfoDocument<'_>,
@@ -727,6 +731,10 @@ impl BoundNarInfo<'_> {
         let mut output = BoundedNarInfoWriter::new();
         self.narinfo.metadata.write(self.output, &mut output)?;
         Ok(output.into_bytes())
+    }
+
+    pub(crate) fn claims(&self) -> &NarInfoClaims {
+        self.narinfo.metadata.claims()
     }
 }
 

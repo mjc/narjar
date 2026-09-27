@@ -21,6 +21,7 @@ use super::{
     CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageBackend,
     StorageError, StoreHash, capacity_error_kind,
 };
+use crate::narinfo::NarInfoClaims;
 use crate::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
     NarHash, NarIdentity, NarRepresentation, NarSize, WireEncoding,
@@ -2288,6 +2289,45 @@ fn publication_is_immutable_idempotent_and_pair_gated() {
             .next()
             .is_none(),
         "completed attempts must not leave temporary files"
+    );
+}
+
+#[test]
+fn narinfo_publication_is_idempotent_for_matching_logical_claims() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
+    let identity = NarIdentity::new(nar, NarSize::new(11));
+    let claims = NarInfoClaims::new(
+        format!("/nix/store/{STORE_HASH}-sample"),
+        Vec::new(),
+        identity,
+    )
+    .expect("valid narinfo claims");
+    let existing = format!(
+        "StorePath: /nix/store/{STORE_HASH}-sample\n\
+         URL: nar/{NAR_ID}.nar\n\
+         Compression: none\n\
+         FileHash: sha256:{NAR_ID}\n\
+         FileSize: 11\n\
+         NarHash: sha256:{NAR_ID}\n\
+         NarSize: 11\n\
+         References: \n"
+    );
+    storage
+        .publish(
+            PublishTarget::NarInfo(&store),
+            Cursor::new(existing.as_bytes()),
+        )
+        .expect("publish existing narinfo");
+
+    let incoming = format!("{existing}Sig: another-key:signature\n").into_bytes();
+    assert_eq!(
+        storage
+            .publish_narinfo_with_claims(&store, &claims, incoming)
+            .expect("matching claims should make publication idempotent"),
+        PublishOutcome::Identical
     );
 }
 

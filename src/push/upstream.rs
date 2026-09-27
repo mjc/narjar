@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use narjar::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, TrustedNarInfoClaims, TrustedPublicKeys};
+use narjar::narinfo::{MAX_NARINFO_BYTES, TrustedNarInfoClaims, TrustedPublicKeys};
 use ureq::Agent;
 
 use super::{DestinationNarinfoPolicy, NarInfoMetadata, PushError, transfer::get_bounded};
@@ -114,8 +114,7 @@ impl<'a> CacheLookup<'a> {
         )?;
         match response.status {
             200 => {
-                let matches_expected = NarInfoClaims::parse_external_narinfo(route, response.body)
-                    .is_ok_and(|claims| claims == *info.claims());
+                let matches_expected = info.claims().matches_external_narinfo(route, response.body);
                 if matches_expected {
                     return Ok(PushDisposition::DestinationPresent);
                 }
