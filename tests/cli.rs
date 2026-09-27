@@ -2083,7 +2083,16 @@ impl RunningServer {
             .split_whitespace()
             .nth(1)
             .and_then(|url| url.strip_prefix("http://"))
-            .expect("startup line should contain listener address")
+            .unwrap_or_else(|| {
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .take()
+                    .expect("stderr should be piped")
+                    .read_to_string(&mut stderr)
+                    .expect("startup error should be readable");
+                panic!("startup line should contain listener address: {startup_line:?}; {stderr}");
+            })
             .to_owned();
 
         Self {
@@ -5655,6 +5664,12 @@ fn dirty_start_rejects_a_malformed_published_narinfo() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("recovery required; checking published narinfo references"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
         data_dir.join(".narjar-recovery").exists(),
         "failed recovery must retain its marker"
     );
@@ -5697,6 +5712,37 @@ fn dirty_start_rejects_a_published_narinfo_without_its_nar() {
         data_dir.join(".narjar-recovery").exists(),
         "failed recovery must retain its marker"
     );
+}
+
+#[test]
+fn dirty_start_checks_payload_availability_without_hashing_it() {
+    let data_dir = init_data_dir("dirty-start-availability");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(
+        data_dir.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("signed narinfo should be written");
+    fs::write(
+        data_dir.join(format!("nar/{NARJAR_HASH}.nar")),
+        vec![b'x'; NAR_BYTES.len()],
+    )
+    .expect("same-sized payload should be written");
+    let recovery = data_dir.join(".narjar-recovery");
+    fs::write(&recovery, b"").expect("recovery marker should be created");
+    fs::set_permissions(&recovery, fs::Permissions::from_mode(0o600))
+        .expect("recovery marker should be private");
+    let server = RunningServer::start_in(data_dir, &[]);
+    let (signal, status) = server.stop();
+    assert!(signal.success());
+    assert!(status.success());
 }
 
 #[test]

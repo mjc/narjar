@@ -15,7 +15,7 @@ use narjar::{
     auth::Authorizer,
     http::{PublicationRequest, prepare_publication, respond},
     http_server::{Method, Request, StatusCode, write_status},
-    inventory::Inventory,
+    inventory::{Inventory, RecoveryOutcome},
     narinfo::TrustedPublicKeys,
     object::WireEncoding,
     storage::{Directory, NarUploadPolicy, StagingReservation, Storage, StorageError},
@@ -395,16 +395,40 @@ fn finish_required_recovery(
         .recovery_required_for()
         .map_err(|error| Error::runtime(format!("cannot inspect cache recovery state: {error}")))?;
     if recovery_required {
-        let inventory_is_recoverable = Inventory::can_recover(storage, trusted_keys)
-            .map_err(|error| Error::runtime(format!("cannot validate cache: {error}")))?;
-        if !inventory_is_recoverable {
-            return Err(Error::runtime(
-                "cannot recover cache before serving: published inventory contains an invalid narinfo/NAR pair",
-            ));
-        }
+        let started = Instant::now();
+        let mut last_progress = Instant::now();
+        eprintln!("narjar: recovery required; checking published narinfo references");
+        let outcome = Inventory::can_recover(storage, trusted_keys, |checked| {
+            if checked % 1000 == 0 || last_progress.elapsed() >= Duration::from_secs(10) {
+                eprintln!(
+                    "narjar: recovery checked {checked} narinfo entries in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+                last_progress = Instant::now();
+            }
+        })
+        .map_err(|error| Error::runtime(format!("cannot validate cache: {error}")))?;
+        let checked = match outcome {
+            RecoveryOutcome::Ready { checked } => checked,
+            RecoveryOutcome::Invalid { checked, entry } => {
+                return Err(Error::runtime(format!(
+                    "cannot recover cache before serving: published inventory contains an invalid narinfo/NAR pair after checking {checked} entries: {} ({})",
+                    entry.identifier(),
+                    entry.class().as_str()
+                )));
+            }
+        };
+        eprintln!(
+            "narjar: recovery checked {checked} narinfo entries in {:.1}s; replaying publication transactions",
+            started.elapsed().as_secs_f64()
+        );
         storage
             .finish_recovery()
             .map_err(|error| Error::runtime(format!("cannot complete cache recovery: {error}")))?;
+        eprintln!(
+            "narjar: recovery complete in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
     }
     Ok(())
 }

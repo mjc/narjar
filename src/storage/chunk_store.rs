@@ -207,6 +207,48 @@ impl ChunkStore {
         Ok(Some(manifest))
     }
 
+    pub(crate) fn check_nar_availability(
+        &self,
+        identity: NarIdentity,
+    ) -> Result<(), ChunkStoreError> {
+        let file = self
+            .open_manifest(identity.hash())?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let mut reader = ManifestReader::new(file, MAX_CHUNK_MANIFEST_BYTES)?;
+        let manifest = reader.manifest();
+        if manifest.identity().hash() != identity.hash() {
+            return Err(ChunkStoreError::NarHashMismatch {
+                expected: identity.hash(),
+                actual: manifest.identity().hash(),
+            });
+        }
+        if manifest.identity().size() != identity.size() {
+            return Err(ChunkStoreError::NarSizeMismatch {
+                expected: identity.size().get(),
+                actual: manifest.identity().size().get(),
+            });
+        }
+        (0..manifest.chunk_count()).try_fold(0_u64, |start, _| {
+            let descriptor = reader.next_record()?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest ended before its chunk count",
+                )
+            })?;
+            let file = self
+                .open_chunk(descriptor.hash())?
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            let expected = descriptor.end() - start;
+            let actual = file.metadata()?.len();
+            if actual != expected {
+                return Err(ChunkStoreError::NarSizeMismatch { expected, actual });
+            }
+            Ok(descriptor.end())
+        })?;
+        reader.finish_remaining()?;
+        Ok(())
+    }
+
     pub(crate) fn open_reader(
         &self,
         hash: NarHash,

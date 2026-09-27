@@ -271,9 +271,14 @@ records its private temporary path and initial `staging` state under
 complete. Body transfer, validation, and
 temporary-file sync are independent; only final-link comparison and the
 destination-directory sync use a per-destination commit lock. Queue depth and
-queue-wait summaries remain exposed in metrics. Startup recovery validates the
-published inventory before removing transaction-recorded temporary files and
-rewriting the clean marker. The earlier serialized design and its measurement
+queue-wait summaries remain exposed in metrics. Startup recovery checks trusted
+published narinfo references for available payloads before removing
+transaction-recorded temporary files and rewriting the clean marker. Flat
+payloads are checked by file type and size; chunked payloads are checked by
+manifest and chunk type and size. Startup does not read payload contents or
+scan orphans. It stops at the first invalid published pair and logs progress
+and elapsed time. Full content verification remains an explicit operator task.
+The earlier serialized design and its measurement
 remain historical context in [`publication-lock-adr.md`](publication-lock-adr.md).
 
 ## Publication and crash semantics

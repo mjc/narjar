@@ -114,6 +114,17 @@ pub struct Inventory {
     entries: Vec<InventoryEntry>,
 }
 
+#[derive(Debug)]
+pub enum RecoveryOutcome {
+    Ready {
+        checked: usize,
+    },
+    Invalid {
+        checked: usize,
+        entry: InventoryEntry,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerificationMode {
     /// Inspect trusted metadata and the referenced payload's existence and size.
@@ -200,6 +211,21 @@ fn inspect_storage_canonical_nar(
     identity: crate::object::NarIdentity,
     verification: VerificationMode,
 ) -> io::Result<InventoryClass> {
+    match verification {
+        VerificationMode::Availability => match storage.ensure_canonical_nar_available(identity) {
+            Ok(()) => Ok(InventoryClass::ValidPair),
+            Err(error) => classify_storage_failure(&error)
+                .map(Ok)
+                .unwrap_or_else(|| Err(storage_error_to_io(error))),
+        },
+        VerificationMode::Content => verify_storage_canonical_nar_content(storage, identity),
+    }
+}
+
+fn verify_storage_canonical_nar_content(
+    storage: &Storage,
+    identity: crate::object::NarIdentity,
+) -> io::Result<InventoryClass> {
     let name = NarFileName::raw(identity.hash());
     let size = match storage.nar_size(name) {
         Ok(Some(size)) => size,
@@ -244,16 +270,12 @@ fn inspect_storage_canonical_nar(
         bytes = bytes
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR size overflow"))?;
-        if verification == VerificationMode::Content {
-            hasher.update(&buffer[..read]);
-        }
+        hasher.update(&buffer[..read]);
     }
     if bytes != identity.size().get() {
         return Ok(InventoryClass::HashOrSizeMismatch);
     }
-    if verification == VerificationMode::Content
-        && NarHash::from_digest(hasher.finalize().into()) != identity.hash()
-    {
+    if NarHash::from_digest(hasher.finalize().into()) != identity.hash() {
         return Ok(InventoryClass::HashOrSizeMismatch);
     }
     Ok(InventoryClass::ValidPair)
@@ -498,13 +520,41 @@ impl Inventory {
         Ok(can_serve)
     }
 
-    pub fn can_recover(storage: &Storage, trusted: &TrustedPublicKeys) -> io::Result<bool> {
-        Ok(
-            !Self::scan_storage(storage, trusted, VerificationMode::Availability)?
-                .entries
-                .iter()
-                .any(|entry| entry.class.invalid_published_pair()),
-        )
+    pub fn can_recover(
+        storage: &Storage,
+        trusted: &TrustedPublicKeys,
+        mut progress: impl FnMut(usize),
+    ) -> io::Result<RecoveryOutcome> {
+        let root = storage.root_directory().map_err(storage_error_to_io)?;
+        let mut checked = 0;
+        let mut invalid = None;
+        for_each_dir_name(&root, |name| {
+            let Some(name) = NarinfoName::classify(name) else {
+                return Ok(true);
+            };
+            let assessment = inspect_narinfo_entry(
+                name,
+                &root,
+                PayloadSource::Storage(storage),
+                trusted,
+                VerificationMode::Availability,
+            )?;
+            let entry = match assessment {
+                MetadataAssessment::Rejected(entry)
+                | MetadataAssessment::Referenced { entry, .. } => entry,
+            };
+            checked += 1;
+            progress(checked);
+            if entry.class.invalid_published_pair() {
+                invalid = Some(entry);
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        Ok(match invalid {
+            Some(entry) => RecoveryOutcome::Invalid { checked, entry },
+            None => RecoveryOutcome::Ready { checked },
+        })
     }
 
     pub fn scan(
@@ -573,6 +623,49 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn flat_availability_checks_size_without_reading_contents() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let storage = Storage::initialize(&root, StorageBackend::Flat).unwrap();
+        let raw = b"canonical raw nar";
+        let hash = NarHash::from_digest(Sha256::digest(raw).into());
+        let identity = crate::object::NarIdentity::new(hash, (raw.len() as u64).into());
+        storage
+            .publish_nar(
+                NarFileName::raw(hash),
+                Cursor::new(raw),
+                raw.len() as u64,
+                NarUploadPolicy::new(raw.len() as u64, 0),
+            )
+            .unwrap();
+
+        let path = directory.path().join(format!("nar/{hash}.nar"));
+        std::fs::write(&path, vec![b'x'; raw.len()]).unwrap();
+        assert_eq!(
+            inspect_storage_canonical_nar(&storage, identity, VerificationMode::Availability)
+                .unwrap(),
+            InventoryClass::ValidPair
+        );
+        assert_eq!(
+            inspect_storage_canonical_nar(&storage, identity, VerificationMode::Content).unwrap(),
+            InventoryClass::HashOrSizeMismatch
+        );
+
+        std::fs::write(&path, b"short").unwrap();
+        assert_eq!(
+            inspect_storage_canonical_nar(&storage, identity, VerificationMode::Availability)
+                .unwrap(),
+            InventoryClass::HashOrSizeMismatch
+        );
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            inspect_storage_canonical_nar(&storage, identity, VerificationMode::Availability)
+                .unwrap(),
+            InventoryClass::MissingNar
+        );
+    }
+
+    #[test]
     fn chunked_storage_inventory_checks_the_manifest_backed_nar() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
@@ -610,6 +703,59 @@ mod tests {
             .unwrap(),
             InventoryClass::ValidPair
         );
+
+        let chunk_root = directory.path().join(crate::storage::CHUNK_DIRECTORY);
+        let shard = std::fs::read_dir(chunk_root)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|entry| entry.file_name().len() == 2)
+            .expect("published NAR has a chunk shard");
+        let chunk = std::fs::read_dir(shard.path())
+            .unwrap()
+            .next()
+            .expect("published NAR has a chunk")
+            .unwrap()
+            .path();
+        std::fs::write(&chunk, vec![b'x'; raw.len()]).unwrap();
+        assert_eq!(
+            inspect_storage_canonical_nar(
+                &storage,
+                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
+                VerificationMode::Availability,
+            )
+            .unwrap(),
+            InventoryClass::ValidPair
+        );
+        assert_eq!(
+            inspect_storage_canonical_nar(
+                &storage,
+                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
+                VerificationMode::Content,
+            )
+            .unwrap(),
+            InventoryClass::HashOrSizeMismatch
+        );
+        std::fs::write(&chunk, b"short").unwrap();
+        assert_eq!(
+            inspect_storage_canonical_nar(
+                &storage,
+                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
+                VerificationMode::Availability,
+            )
+            .unwrap(),
+            InventoryClass::HashOrSizeMismatch
+        );
+        std::fs::remove_file(&chunk).unwrap();
+        assert_eq!(
+            inspect_storage_canonical_nar(
+                &storage,
+                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
+                VerificationMode::Availability,
+            )
+            .unwrap(),
+            InventoryClass::MissingNar
+        );
+        std::fs::write(&chunk, &raw).unwrap();
 
         let inventory = Inventory::scan_storage(
             &storage,

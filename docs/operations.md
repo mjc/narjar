@@ -284,11 +284,13 @@ receive 429 when admission is full.
 
 If a process stops during publication, the transaction record keeps the
 temporary path and durable state recoverable without making an incomplete final
-object visible. Startup validates the published inventory, validates each
-record, removes recorded temporary state, and only then writes the clean
-marker. During that recovery check, every trusted narinfo must have a regular
-referenced NAR whose encoded size matches the metadata; startup does not rehash
-the payload because upload validation already established its content hash.
+object visible. Startup checks published references, validates each recovery
+record, removes recorded temporary state, and only then writes the clean marker.
+During that recovery check, every trusted narinfo must have its
+referenced payloads available at the declared sizes. Flat storage checks file
+metadata; chunked storage verifies the manifest and each chunk's presence and
+size. Startup stops at the first invalid pair and reports progress and elapsed
+time without reading payload bytes. Run `narjar verify` for a full content scan.
 Concurrent writers still use private temporary files and atomic
 link-no-replace, so a retry is identical success or a deterministic conflict.
 

@@ -333,7 +333,7 @@ impl Storage {
         self.recovery.required_for()
     }
 
-    /// Records that a full inventory scan has completed successfully.
+    /// Cleans abandoned publication state after published references were checked.
     pub fn finish_recovery(&self) -> Result<(), StorageError> {
         self.remove_orphan_validation_evidence()?;
         self.remove_orphan_ingestion_receipts()?;
@@ -581,6 +581,25 @@ impl Storage {
             | (PayloadStorage::Flat, Some(_)) => self
                 .open_nar(name)?
                 .map_or(Ok(None), |file| Ok(Some(file.metadata()?.len()))),
+        }
+    }
+
+    pub(crate) fn ensure_canonical_nar_available(
+        &self,
+        identity: NarIdentity,
+    ) -> Result<(), StorageError> {
+        match &self.payloads {
+            PayloadStorage::Chunked(store) => store
+                .check_nar_availability(identity)
+                .map_err(storage_error_for_chunk_store),
+            PayloadStorage::Flat => {
+                let name = NarFileName::raw(identity.hash());
+                let file = self.open_nar(name)?.ok_or(StorageError::MissingNar)?;
+                if file.metadata()?.len() != identity.size().get() {
+                    return Err(StorageError::NarMismatch);
+                }
+                Ok(())
+            }
         }
     }
 
