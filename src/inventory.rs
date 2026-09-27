@@ -1,4 +1,4 @@
-use std::{collections::HashSet, ffi::OsStr, fs::File, io, io::Read};
+use std::{collections::HashSet, ffi::OsStr, fs::File, io, io::Write};
 
 use sha2::{Digest, Sha256};
 
@@ -114,13 +114,32 @@ pub struct Inventory {
     entries: Vec<InventoryEntry>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NarInfoCount(usize);
+
+impl NarInfoCount {
+    pub const fn get(self) -> usize {
+        self.0
+    }
+
+    fn increment(&mut self) {
+        self.0 += 1;
+    }
+}
+
+impl std::fmt::Display for NarInfoCount {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Debug)]
 pub enum RecoveryOutcome {
     Ready {
-        checked: usize,
+        checked: NarInfoCount,
     },
     Invalid {
-        checked: usize,
+        checked: NarInfoCount,
         entry: InventoryEntry,
     },
 }
@@ -212,12 +231,10 @@ fn inspect_storage_canonical_nar(
     verification: VerificationMode,
 ) -> io::Result<InventoryClass> {
     match verification {
-        VerificationMode::Availability => match storage.ensure_canonical_nar_available(identity) {
-            Ok(()) => Ok(InventoryClass::ValidPair),
-            Err(error) => classify_storage_failure(&error)
-                .map(Ok)
-                .unwrap_or_else(|| Err(storage_error_to_io(error))),
-        },
+        VerificationMode::Availability => storage
+            .ensure_canonical_nar_available(identity)
+            .map(|()| InventoryClass::ValidPair)
+            .or_else(classify_storage_error),
         VerificationMode::Content => verify_storage_canonical_nar_content(storage, identity),
     }
 }
@@ -230,12 +247,7 @@ fn verify_storage_canonical_nar_content(
     let size = match storage.nar_size(name) {
         Ok(Some(size)) => size,
         Ok(None) => return Ok(InventoryClass::MissingNar),
-        Err(error) => {
-            if let Some(class) = classify_storage_failure(&error) {
-                return Ok(class);
-            }
-            return Err(storage_error_to_io(error));
-        }
+        Err(error) => return classify_storage_error(error),
     };
     if size != identity.size().get() {
         return Ok(InventoryClass::HashOrSizeMismatch);
@@ -243,42 +255,58 @@ fn verify_storage_canonical_nar_content(
     let mut opened = match storage.open_nar_range(name, 0..size) {
         Ok(Some(opened)) => opened,
         Ok(None) => return Ok(InventoryClass::MissingNar),
-        Err(error) => {
-            if let Some(class) = classify_storage_failure(&error) {
-                return Ok(class);
-            }
-            return Err(storage_error_to_io(error));
-        }
+        Err(error) => return classify_storage_error(error),
     };
 
-    let mut hasher = Sha256::new();
-    let mut bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = match opened.body.read(&mut buffer) {
-            Ok(read) => read,
-            Err(error) => {
-                if let Some(class) = classify_io_failure(&error) {
-                    return Ok(class);
-                }
-                return Err(error);
-            }
-        };
-        if read == 0 {
-            break;
-        }
-        bytes = bytes
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR size overflow"))?;
-        hasher.update(&buffer[..read]);
-    }
+    let mut hasher = NarContentHasher::new();
+    let bytes = match io::copy(&mut opened.body, &mut hasher) {
+        Ok(bytes) => bytes,
+        Err(error) => return classify_io_error(error),
+    };
     if bytes != identity.size().get() {
         return Ok(InventoryClass::HashOrSizeMismatch);
     }
-    if NarHash::from_digest(hasher.finalize().into()) != identity.hash() {
+    if hasher.finish() != identity.hash() {
         return Ok(InventoryClass::HashOrSizeMismatch);
     }
     Ok(InventoryClass::ValidPair)
+}
+
+struct NarContentHasher(Sha256);
+
+impl NarContentHasher {
+    fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    fn finish(self) -> NarHash {
+        NarHash::from_digest(self.0.finalize().into())
+    }
+}
+
+impl Write for NarContentHasher {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn classify_storage_error(error: crate::storage::StorageError) -> io::Result<InventoryClass> {
+    match classify_storage_failure(&error) {
+        Some(class) => Ok(class),
+        None => Err(storage_error_to_io(error)),
+    }
+}
+
+fn classify_io_error(error: io::Error) -> io::Result<InventoryClass> {
+    match classify_io_failure(&error) {
+        Some(class) => Ok(class),
+        None => Err(error),
+    }
 }
 
 fn storage_error_to_io(error: crate::storage::StorageError) -> io::Error {
@@ -523,10 +551,10 @@ impl Inventory {
     pub fn can_recover(
         storage: &Storage,
         trusted: &TrustedPublicKeys,
-        mut progress: impl FnMut(usize),
+        mut progress: impl FnMut(NarInfoCount),
     ) -> io::Result<RecoveryOutcome> {
         let root = storage.root_directory().map_err(storage_error_to_io)?;
-        let mut checked = 0;
+        let mut checked = NarInfoCount::default();
         let mut invalid = None;
         for_each_dir_name(&root, |name| {
             let Some(name) = NarinfoName::classify(name) else {
@@ -543,7 +571,7 @@ impl Inventory {
                 MetadataAssessment::Rejected(entry)
                 | MetadataAssessment::Referenced { entry, .. } => entry,
             };
-            checked += 1;
+            checked.increment();
             progress(checked);
             if entry.class.invalid_published_pair() {
                 invalid = Some(entry);
@@ -622,6 +650,18 @@ mod tests {
     use std::{io::Cursor, path::Path};
     use tempfile::tempdir;
 
+    fn assert_canonical_nar_class(
+        storage: &Storage,
+        identity: crate::object::NarIdentity,
+        verification: VerificationMode,
+        expected: InventoryClass,
+    ) {
+        assert_eq!(
+            inspect_storage_canonical_nar(storage, identity, verification).unwrap(),
+            expected
+        );
+    }
+
     #[test]
     fn flat_availability_checks_size_without_reading_contents() {
         let directory = tempdir().unwrap();
@@ -641,27 +681,32 @@ mod tests {
 
         let path = directory.path().join(format!("nar/{hash}.nar"));
         std::fs::write(&path, vec![b'x'; raw.len()]).unwrap();
-        assert_eq!(
-            inspect_storage_canonical_nar(&storage, identity, VerificationMode::Availability)
-                .unwrap(),
-            InventoryClass::ValidPair
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Availability,
+            InventoryClass::ValidPair,
         );
-        assert_eq!(
-            inspect_storage_canonical_nar(&storage, identity, VerificationMode::Content).unwrap(),
-            InventoryClass::HashOrSizeMismatch
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Content,
+            InventoryClass::HashOrSizeMismatch,
         );
 
         std::fs::write(&path, b"short").unwrap();
-        assert_eq!(
-            inspect_storage_canonical_nar(&storage, identity, VerificationMode::Availability)
-                .unwrap(),
-            InventoryClass::HashOrSizeMismatch
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Availability,
+            InventoryClass::HashOrSizeMismatch,
         );
         std::fs::remove_file(path).unwrap();
-        assert_eq!(
-            inspect_storage_canonical_nar(&storage, identity, VerificationMode::Availability)
-                .unwrap(),
-            InventoryClass::MissingNar
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Availability,
+            InventoryClass::MissingNar,
         );
     }
 
@@ -685,23 +730,18 @@ mod tests {
             PublishOutcome::Created
         );
 
-        assert_eq!(
-            inspect_storage_canonical_nar(
-                &storage,
-                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
-                VerificationMode::Availability,
-            )
-            .unwrap(),
-            InventoryClass::ValidPair
+        let identity = crate::object::NarIdentity::new(hash, (raw.len() as u64).into());
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Availability,
+            InventoryClass::ValidPair,
         );
-        assert_eq!(
-            inspect_storage_canonical_nar(
-                &storage,
-                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
-                VerificationMode::Content,
-            )
-            .unwrap(),
-            InventoryClass::ValidPair
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Content,
+            InventoryClass::ValidPair,
         );
 
         let chunk_root = directory.path().join(crate::storage::CHUNK_DIRECTORY);
@@ -717,43 +757,31 @@ mod tests {
             .unwrap()
             .path();
         std::fs::write(&chunk, vec![b'x'; raw.len()]).unwrap();
-        assert_eq!(
-            inspect_storage_canonical_nar(
-                &storage,
-                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
-                VerificationMode::Availability,
-            )
-            .unwrap(),
-            InventoryClass::ValidPair
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Availability,
+            InventoryClass::ValidPair,
         );
-        assert_eq!(
-            inspect_storage_canonical_nar(
-                &storage,
-                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
-                VerificationMode::Content,
-            )
-            .unwrap(),
-            InventoryClass::HashOrSizeMismatch
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Content,
+            InventoryClass::HashOrSizeMismatch,
         );
         std::fs::write(&chunk, b"short").unwrap();
-        assert_eq!(
-            inspect_storage_canonical_nar(
-                &storage,
-                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
-                VerificationMode::Availability,
-            )
-            .unwrap(),
-            InventoryClass::HashOrSizeMismatch
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Availability,
+            InventoryClass::HashOrSizeMismatch,
         );
         std::fs::remove_file(&chunk).unwrap();
-        assert_eq!(
-            inspect_storage_canonical_nar(
-                &storage,
-                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
-                VerificationMode::Availability,
-            )
-            .unwrap(),
-            InventoryClass::MissingNar
+        assert_canonical_nar_class(
+            &storage,
+            identity,
+            VerificationMode::Availability,
+            InventoryClass::MissingNar,
         );
         std::fs::write(&chunk, &raw).unwrap();
 

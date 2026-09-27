@@ -211,24 +211,30 @@ impl ChunkStore {
         &self,
         identity: NarIdentity,
     ) -> Result<(), ChunkStoreError> {
+        let mut reader = self.open_manifest_reader(identity)?;
+        let manifest = reader.manifest();
+        validate_manifest_identity(manifest.identity(), identity)?;
+        self.check_manifest_chunk_sizes(&mut reader, manifest.chunk_count())?;
+        reader.finish_remaining()?;
+        Ok(())
+    }
+
+    fn open_manifest_reader(
+        &self,
+        identity: NarIdentity,
+    ) -> Result<ManifestReader<File>, ChunkStoreError> {
         let file = self
             .open_manifest(identity.hash())?
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        let mut reader = ManifestReader::new(file, MAX_CHUNK_MANIFEST_BYTES)?;
-        let manifest = reader.manifest();
-        if manifest.identity().hash() != identity.hash() {
-            return Err(ChunkStoreError::NarHashMismatch {
-                expected: identity.hash(),
-                actual: manifest.identity().hash(),
-            });
-        }
-        if manifest.identity().size() != identity.size() {
-            return Err(ChunkStoreError::NarSizeMismatch {
-                expected: identity.size().get(),
-                actual: manifest.identity().size().get(),
-            });
-        }
-        (0..manifest.chunk_count()).try_fold(0_u64, |start, _| {
+        ManifestReader::new(file, MAX_CHUNK_MANIFEST_BYTES).map_err(Into::into)
+    }
+
+    fn check_manifest_chunk_sizes(
+        &self,
+        reader: &mut ManifestReader<File>,
+        chunk_count: u64,
+    ) -> Result<(), ChunkStoreError> {
+        (0..chunk_count).try_fold(0_u64, |start, _| {
             let descriptor = reader.next_record()?.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -245,7 +251,6 @@ impl ChunkStore {
             }
             Ok(descriptor.end())
         })?;
-        reader.finish_remaining()?;
         Ok(())
     }
 
@@ -510,6 +515,25 @@ impl ChunkStore {
     fn open_shard(&self, hash: ChunkHash) -> io::Result<File> {
         super::fs::open_directory_at(&self.chunks, OsStr::new(&shard_name(hash)))
     }
+}
+
+fn validate_manifest_identity(
+    actual: NarIdentity,
+    expected: NarIdentity,
+) -> Result<(), ChunkStoreError> {
+    if actual.hash() != expected.hash() {
+        return Err(ChunkStoreError::NarHashMismatch {
+            expected: expected.hash(),
+            actual: actual.hash(),
+        });
+    }
+    if actual.size() != expected.size() {
+        return Err(ChunkStoreError::NarSizeMismatch {
+            expected: expected.size().get(),
+            actual: actual.size().get(),
+        });
+    }
+    Ok(())
 }
 
 fn scan_chunk_shards(

@@ -15,7 +15,7 @@ use narjar::{
     auth::Authorizer,
     http::{PublicationRequest, prepare_publication, respond},
     http_server::{Method, Request, StatusCode, write_status},
-    inventory::{Inventory, RecoveryOutcome},
+    inventory::{Inventory, NarInfoCount, RecoveryOutcome},
     narinfo::TrustedPublicKeys,
     object::WireEncoding,
     storage::{Directory, NarUploadPolicy, StagingReservation, Storage, StorageError},
@@ -359,6 +359,10 @@ struct ServerResources {
     trusted_keys: Arc<TrustedPublicKeys>,
 }
 
+struct ValidatedRecoveryInventory {
+    checked_narinfos: NarInfoCount,
+}
+
 fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, Error> {
     let root_directory =
         Directory::open(&config.data_dir).map_err(|error| Error::runtime(error.to_string()))?;
@@ -394,43 +398,62 @@ fn finish_required_recovery(
     let recovery_required = storage
         .recovery_required_for()
         .map_err(|error| Error::runtime(format!("cannot inspect cache recovery state: {error}")))?;
-    if recovery_required {
-        let started = Instant::now();
-        let mut last_progress = Instant::now();
-        eprintln!("narjar: recovery required; checking published narinfo references");
-        let outcome = Inventory::can_recover(storage, trusted_keys, |checked| {
-            if checked % 1000 == 0 || last_progress.elapsed() >= Duration::from_secs(10) {
-                eprintln!(
-                    "narjar: recovery checked {checked} narinfo entries in {:.1}s",
-                    started.elapsed().as_secs_f64()
-                );
-                last_progress = Instant::now();
-            }
-        })
-        .map_err(|error| Error::runtime(format!("cannot validate cache: {error}")))?;
-        let checked = match outcome {
-            RecoveryOutcome::Ready { checked } => checked,
-            RecoveryOutcome::Invalid { checked, entry } => {
-                return Err(Error::runtime(format!(
-                    "cannot recover cache before serving: published inventory contains an invalid narinfo/NAR pair after checking {checked} entries: {} ({})",
-                    entry.identifier(),
-                    entry.class().as_str()
-                )));
-            }
-        };
-        eprintln!(
-            "narjar: recovery checked {checked} narinfo entries in {:.1}s; replaying publication transactions",
-            started.elapsed().as_secs_f64()
-        );
-        storage
-            .finish_recovery()
-            .map_err(|error| Error::runtime(format!("cannot complete cache recovery: {error}")))?;
-        eprintln!(
-            "narjar: recovery complete in {:.1}s",
-            started.elapsed().as_secs_f64()
-        );
+    if !recovery_required {
+        return Ok(());
     }
+
+    let started = Instant::now();
+    let validated = check_recovery_inventory(storage, trusted_keys, started)?;
+    finish_validated_recovery(storage, validated, started)
+}
+
+fn finish_validated_recovery(
+    storage: &Storage,
+    validated: ValidatedRecoveryInventory,
+    started: Instant,
+) -> Result<(), Error> {
+    eprintln!(
+        "narjar: recovery checked {} narinfo entries in {:.1}s; replaying publication transactions",
+        validated.checked_narinfos,
+        started.elapsed().as_secs_f64()
+    );
+    storage
+        .finish_recovery()
+        .map_err(|error| Error::runtime(format!("cannot complete cache recovery: {error}")))?;
+    eprintln!(
+        "narjar: recovery complete in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
+}
+
+fn check_recovery_inventory(
+    storage: &Storage,
+    trusted_keys: &TrustedPublicKeys,
+    started: Instant,
+) -> Result<ValidatedRecoveryInventory, Error> {
+    let mut last_progress = Instant::now();
+    eprintln!("narjar: recovery required; checking published narinfo references");
+    let outcome = Inventory::can_recover(storage, trusted_keys, |checked| {
+        if checked.get() % 1000 == 0 || last_progress.elapsed() >= Duration::from_secs(10) {
+            eprintln!(
+                "narjar: recovery checked {checked} narinfo entries in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+            last_progress = Instant::now();
+        }
+    })
+    .map_err(|error| Error::runtime(format!("cannot validate cache: {error}")))?;
+    match outcome {
+        RecoveryOutcome::Ready { checked } => Ok(ValidatedRecoveryInventory {
+            checked_narinfos: checked,
+        }),
+        RecoveryOutcome::Invalid { checked, entry } => Err(Error::runtime(format!(
+            "cannot recover cache before serving: published inventory contains an invalid narinfo/NAR pair after checking {checked} entries: {} ({})",
+            entry.identifier(),
+            entry.class().as_str()
+        ))),
+    }
 }
 
 fn spawn_metrics_sampler(
