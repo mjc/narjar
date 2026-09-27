@@ -22,7 +22,7 @@ use super::compression::{
 use super::fs::{
     BoundedRegularFile, open_optional_at, read_bounded_regular_file, read_dir_names, unlink_at,
 };
-use super::operations::OwnedTemporary;
+use super::operations::{NarMatch, OwnedTemporary};
 use super::publication::{NarUploadPolicy, PublishOutcome, PublishTarget, StorageError};
 use super::receipt::CompressedNarReceipt;
 use super::recovery::PublicationState;
@@ -126,13 +126,6 @@ enum ExistingDerivative {
     Missing,
     Corrupt,
     Usable(Validated<EncodedIdentity>),
-}
-
-#[derive(Debug)]
-pub(super) enum CanonicalRawStatus {
-    Missing,
-    WrongSize,
-    Present,
 }
 
 enum DerivativeWork {
@@ -512,8 +505,8 @@ impl Storage {
         receipt: EgressReceipt,
     ) -> Result<CleanupAction, StorageError> {
         match self.canonical_raw_status(receipt.slot().raw())? {
-            CanonicalRawStatus::Present => Ok(CleanupAction::Keep),
-            CanonicalRawStatus::Missing | CanonicalRawStatus::WrongSize => {
+            NarMatch::Match => Ok(CleanupAction::Keep),
+            NarMatch::Missing | NarMatch::Mismatch => {
                 unlink_at(directory, name)?;
                 Ok(CleanupAction::Remove)
             }
@@ -523,28 +516,23 @@ impl Storage {
     pub(super) fn canonical_raw_status(
         &self,
         identity: NarIdentity,
-    ) -> Result<CanonicalRawStatus, StorageError> {
+    ) -> Result<NarMatch, StorageError> {
         match &self.payloads {
             PayloadStorage::Chunked(store) => Ok(
                 match store
                     .validate_manifest(identity.hash())
                     .map_err(super::operations::storage_error_for_chunk_store)?
                 {
-                    None => CanonicalRawStatus::Missing,
-                    Some(manifest) if manifest.identity() == identity => {
-                        CanonicalRawStatus::Present
-                    }
-                    Some(_) => CanonicalRawStatus::WrongSize,
+                    None => NarMatch::Missing,
+                    Some(manifest) if manifest.identity() == identity => NarMatch::Match,
+                    Some(_) => NarMatch::Mismatch,
                 },
             ),
             PayloadStorage::Flat => self.open_nar(NarFileName::raw(identity.hash()))?.map_or(
-                Ok(CanonicalRawStatus::Missing),
+                Ok(NarMatch::Missing),
                 |file| {
                     nar_file_size_matches(&file, identity.size().get())
-                        .map(|matches| match matches {
-                            true => CanonicalRawStatus::Present,
-                            false => CanonicalRawStatus::WrongSize,
-                        })
+                        .map(NarMatch::from_content_match)
                         .map_err(Into::into)
                 },
             ),

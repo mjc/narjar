@@ -29,7 +29,7 @@ use super::{
         IngestionReceipt, ReceivedNar, compressed_file_identity, encoded_file_matches,
         nar_file_matches, receive_uploaded_nar,
     },
-    egress::{CanonicalRawStatus, NarReadBody},
+    egress::NarReadBody,
     fs::{
         BoundedRegularFile, StorageCapacity, entry_is_regular_at, files_equal_at, filesystem_space,
         hard_link_at, open_at, open_directory_at, open_optional_at, open_regular_at,
@@ -157,7 +157,7 @@ pub enum NarMatch {
 }
 
 impl NarMatch {
-    const fn from_content_match(matches: bool) -> Self {
+    pub(super) const fn from_content_match(matches: bool) -> Self {
         match matches {
             true => Self::Match,
             false => Self::Mismatch,
@@ -1264,8 +1264,8 @@ impl Storage {
             }
             BoundedRegularFile::Valid(receipt) => {
                 match self.canonical_raw_status(receipt.decoded_identity())? {
-                    CanonicalRawStatus::Present => Ok(CleanupAction::Keep),
-                    CanonicalRawStatus::Missing | CanonicalRawStatus::WrongSize => {
+                    NarMatch::Match => Ok(CleanupAction::Keep),
+                    NarMatch::Missing | NarMatch::Mismatch => {
                         unlink_at(receipts, name)?;
                         Ok(CleanupAction::Remove)
                     }
