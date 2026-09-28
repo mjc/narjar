@@ -29,7 +29,7 @@ use plan::dependency_waves;
 use root::StoreRoots;
 use signing::sign_metadata;
 use store::LocalStore;
-use transfer::{get_bounded, put_bytes, put_reader};
+use transfer::{LookupPurpose, get_bounded, put_bytes, put_reader};
 #[cfg(test)]
 use transfer::{put_file, request_status};
 use upstream::{CacheLookup, PushDisposition, TrustedUpstreams};
@@ -430,13 +430,11 @@ impl DestinationClient {
             &narinfo_url(&self.base_url, info),
             self.authorization.as_deref(),
             MAX_NARINFO_BYTES,
+            LookupPurpose::Destination,
         )?;
         match response {
             transfer::GetResponse::Found(body) => {
-                let state = if info
-                    .claims()
-                    .matches_external_narinfo(info.claims().store(), body)
-                {
+                let state = if info.claims().matches_external_narinfo(body) {
                     DestinationNarinfoState::MatchesExpected
                 } else {
                     DestinationNarinfoState::Different
@@ -862,6 +860,77 @@ mod tests {
     }
 
     #[test]
+    fn different_destination_claims_never_query_trusted_upstreams() {
+        use super::{CacheLookup, DestinationNarinfoPolicy, PushDisposition};
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let info = test_narinfo_metadata(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package",
+            Vec::new(),
+        );
+        let different = test_narinfo_metadata(
+            info.claims().store_path(),
+            vec!["/nix/store/11111111111111111111111111111111-dependency".to_owned()],
+        );
+        let body = different
+            .serialize(NarRepresentation::Raw(different.claims().identity()))
+            .unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = destination.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = destination.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            BufReader::new(&mut stream)
+                .lines()
+                .map(Result::unwrap)
+                .take_while(|line| !line.is_empty())
+                .for_each(drop);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream_listener.set_nonblocking(true).unwrap();
+        let upstream = http_url(format!(
+            "http://{}",
+            upstream_listener.local_addr().unwrap()
+        ));
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let keys = [format!(
+            "{upstream}#test:{}",
+            data_encoding::BASE64.encode(key.as_bytes())
+        )];
+        let upstreams = TrustedUpstreams::from_configuration(&[upstream], &keys).unwrap();
+        let client = DestinationClient {
+            base_url: http_url(format!("http://{address}")),
+            agent: Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(5)))
+                .build()
+                .into(),
+            authorization: None,
+        };
+        let lookup = CacheLookup::new(&client, DestinationNarinfoPolicy::ReuseExisting, &upstreams);
+        let result = lookup.classify(&info);
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), PushDisposition::UploadRequired);
+        assert_eq!(
+            upstream_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "an upstream must never hide a conflicting destination entry"
+        );
+    }
+
+    #[test]
     fn retry_after_delay_accepts_seconds_and_has_a_bound() {
         assert_eq!(
             retry_after_delay("3"),
@@ -998,6 +1067,7 @@ mod tests {
             &http_url(format!("http://{address}/narinfo")),
             None,
             4,
+            super::LookupPurpose::Destination,
         )
         .expect_err("oversized GET response must be rejected");
         assert!(error.contains("exceeded 4 bytes"));

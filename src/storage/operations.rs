@@ -289,40 +289,34 @@ impl PublicationProgress {
 
 impl BoundNarInfo<'_> {
     pub(crate) fn publish(self) -> Result<PublishOutcome, StorageError> {
-        let store = self.store();
         let claims = self.claims();
         let bytes = self.output_bytes()?;
         self.stored()
             .storage()
-            .publish_narinfo_with_claims(store, claims, bytes)
+            .publish_narinfo_with_claims(claims, bytes)
     }
 }
 
 impl Storage {
     pub(crate) fn publish_narinfo_with_claims(
         &self,
-        store: &StoreHash,
         claims: &NarInfoClaims,
         bytes: Vec<u8>,
     ) -> Result<PublishOutcome, StorageError> {
-        match self.publish(PublishTarget::NarInfo(store), Cursor::new(bytes)) {
-            Err(StorageError::Conflict) if self.existing_narinfo_matches(store, claims)? => {
+        match self.publish(PublishTarget::NarInfo(claims.store()), Cursor::new(bytes)) {
+            Err(StorageError::Conflict) if self.existing_narinfo_matches(claims)? => {
                 Ok(PublishOutcome::Identical)
             }
             result => result,
         }
     }
 
-    fn existing_narinfo_matches(
-        &self,
-        store: &StoreHash,
-        expected: &NarInfoClaims,
-    ) -> Result<bool, StorageError> {
-        let Some(file) = self.open_narinfo(store)? else {
+    fn existing_narinfo_matches(&self, expected: &NarInfoClaims) -> Result<bool, StorageError> {
+        let Some(file) = self.open_narinfo(expected.store())? else {
             return Ok(false);
         };
         let bytes = read_narinfo_file(file)?;
-        Ok(expected.matches_external_narinfo(store, bytes))
+        Ok(expected.matches_external_narinfo(bytes))
     }
 
     pub fn recovery_required(&self) -> Result<bool, StorageError> {

@@ -1,11 +1,12 @@
 use std::{fmt, sync::Arc};
 
-use narjar::narinfo::{MAX_NARINFO_BYTES, TrustedNarInfoClaims, TrustedPublicKeys};
+use narjar::narinfo::{LogicalClaimsMismatch, MAX_NARINFO_BYTES, TrustedPublicKeys};
 use ureq::http::StatusCode;
 
 use super::{
     DestinationClient, DestinationNarinfoPolicy, DestinationNarinfoState, NarInfoMetadata,
-    PushError, narinfo_url, transfer::get_bounded,
+    PushError, narinfo_url,
+    transfer::{LookupPurpose, get_bounded},
 };
 use crate::http_url::HttpUrl;
 
@@ -102,9 +103,8 @@ impl<'a> CacheLookup<'a> {
                     DestinationNarinfoState::MatchesExpected => {
                         Ok(PushDisposition::DestinationPresent)
                     }
-                    DestinationNarinfoState::Different | DestinationNarinfoState::Missing => {
-                        Ok(self.classify_upstream(info))
-                    }
+                    DestinationNarinfoState::Different => Ok(PushDisposition::UploadRequired),
+                    DestinationNarinfoState::Missing => Ok(self.classify_upstream(info)),
                 }
             }
         }
@@ -145,19 +145,23 @@ impl<'a> CacheLookup<'a> {
         info: &NarInfoMetadata,
     ) -> UpstreamLookup {
         let url = narinfo_url(&upstream.url, info);
-        get_bounded(&self.destination.agent, &url, None, MAX_NARINFO_BYTES)
-            .map(|response| match response {
-                super::transfer::GetResponse::Found(body) => {
-                    verify_upstream_narinfo(upstream, info, body)
-                }
-                super::transfer::GetResponse::Missing => UpstreamLookup::Missing,
-                super::transfer::GetResponse::UnexpectedStatus(status) => {
-                    UpstreamLookup::Rejected(UpstreamRejection::UnexpectedStatus(status))
-                }
-            })
-            .unwrap_or_else(|error| {
-                UpstreamLookup::Rejected(UpstreamRejection::LookupFailed(error))
-            })
+        get_bounded(
+            &self.destination.agent,
+            &url,
+            None,
+            MAX_NARINFO_BYTES,
+            LookupPurpose::UpstreamProbe,
+        )
+        .map(|response| match response {
+            super::transfer::GetResponse::Found(body) => {
+                verify_upstream_narinfo(upstream, info, body)
+            }
+            super::transfer::GetResponse::Missing => UpstreamLookup::Missing,
+            super::transfer::GetResponse::UnexpectedStatus(status) => {
+                UpstreamLookup::Rejected(UpstreamRejection::UnexpectedStatus(status))
+            }
+        })
+        .unwrap_or_else(|error| UpstreamLookup::Rejected(UpstreamRejection::LookupFailed(error)))
     }
 }
 
@@ -175,7 +179,7 @@ fn verify_upstream_narinfo(
             return UpstreamLookup::Rejected(UpstreamRejection::InvalidNarInfo(error.to_string()));
         }
     };
-    match compare_logical_claims(info, &claims) {
+    match info.claims().compare_logical_claims(claims.claims()) {
         Ok(()) => UpstreamLookup::Matched(upstream.url.clone()),
         Err(mismatch) => UpstreamLookup::Rejected(UpstreamRejection::ClaimsMismatch(mismatch)),
     }
@@ -203,39 +207,4 @@ impl fmt::Display for UpstreamRejection {
             Self::ClaimsMismatch(mismatch) => mismatch.fmt(formatter),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LogicalClaimsMismatch {
-    StorePath,
-    NarIdentity,
-    References,
-}
-
-impl fmt::Display for LogicalClaimsMismatch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::StorePath => formatter.write_str("store path differs"),
-            Self::NarIdentity => formatter.write_str("NAR hash or size differs"),
-            Self::References => formatter.write_str("references differ"),
-        }
-    }
-}
-
-fn compare_logical_claims(
-    local: &NarInfoMetadata,
-    upstream: &TrustedNarInfoClaims,
-) -> Result<(), LogicalClaimsMismatch> {
-    let upstream = upstream.claims();
-    let local = local.claims();
-    if upstream.store_path() != local.store_path() {
-        return Err(LogicalClaimsMismatch::StorePath);
-    }
-    if upstream.identity() != local.identity() {
-        return Err(LogicalClaimsMismatch::NarIdentity);
-    }
-    if upstream.reference_paths().ne(local.reference_paths()) {
-        return Err(LogicalClaimsMismatch::References);
-    }
-    Ok(())
 }

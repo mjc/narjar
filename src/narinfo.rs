@@ -100,6 +100,25 @@ pub struct NarInfoClaims {
     identity: NarIdentity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogicalClaimsMismatch {
+    StorePath,
+    NarIdentity,
+    References,
+}
+
+impl fmt::Display for LogicalClaimsMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StorePath => formatter.write_str("store path differs"),
+            Self::NarIdentity => formatter.write_str("NAR hash or size differs"),
+            Self::References => formatter.write_str("references differ"),
+        }
+    }
+}
+
+impl std::error::Error for LogicalClaimsMismatch {}
+
 #[derive(Clone, Copy)]
 enum ReferencesFieldHandling {
     Required,
@@ -180,8 +199,28 @@ impl NarInfoClaims {
         Ok(claims)
     }
 
-    pub fn matches_external_narinfo(&self, route: &StoreHash, bytes: Vec<u8>) -> bool {
-        Self::parse_external_narinfo(route, bytes).is_ok_and(|claims| claims == *self)
+    pub fn matches_external_narinfo(&self, bytes: Vec<u8>) -> bool {
+        Self::parse_external_narinfo(self.store(), bytes)
+            .is_ok_and(|claims| self.compare_logical_claims(&claims).is_ok())
+    }
+
+    /// Compare every signed logical field, independently of transport and signatures.
+    pub fn compare_logical_claims(&self, other: &Self) -> Result<(), LogicalClaimsMismatch> {
+        let Self {
+            store_path,
+            references,
+            identity,
+        } = self;
+        if store_path != &other.store_path {
+            return Err(LogicalClaimsMismatch::StorePath);
+        }
+        if identity != &other.identity {
+            return Err(LogicalClaimsMismatch::NarIdentity);
+        }
+        if references != &other.references {
+            return Err(LogicalClaimsMismatch::References);
+        }
+        Ok(())
     }
 
     fn from_document(
@@ -721,10 +760,6 @@ pub(crate) struct BoundNarInfo<'storage> {
 impl BoundNarInfo<'_> {
     pub(crate) fn stored(&self) -> &VerifiedCanonicalNar<'_> {
         &self.stored
-    }
-
-    pub(crate) fn store(&self) -> &StoreHash {
-        self.narinfo.metadata.claims().store()
     }
 
     pub(crate) fn output_bytes(&self) -> io::Result<Vec<u8>> {

@@ -20,8 +20,14 @@ const MAX_IGNORED_RESPONSE_BODY_BYTES: u64 = 64 * 1024;
 type Response = ureq::http::Response<ureq::Body>;
 
 #[derive(Clone, Copy)]
+pub(super) enum LookupPurpose {
+    Destination,
+    UpstreamProbe,
+}
+
+#[derive(Clone, Copy)]
 enum RequestKind {
-    Get,
+    Get(LookupPurpose),
     Put,
 }
 
@@ -61,13 +67,15 @@ enum TransferStep {
 
 impl RetryState {
     fn new(kind: RequestKind) -> Self {
+        let (status, gateway, transport) = match kind {
+            RequestKind::Get(LookupPurpose::Destination) => (2, 7, 2),
+            RequestKind::Get(LookupPurpose::UpstreamProbe) => (0, 0, 0),
+            RequestKind::Put => (2, 2, 2),
+        };
         Self {
-            status: 0..2,
-            gateway: 0..match kind {
-                RequestKind::Get => 7,
-                RequestKind::Put => 2,
-            },
-            transport: 0..2,
+            status: 0..status,
+            gateway: 0..gateway,
+            transport: 0..transport,
         }
     }
 
@@ -115,23 +123,23 @@ impl RequestKind {
         match (self, response.status()) {
             (_, StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT)
             | (
-                Self::Get,
+                Self::Get(_),
                 StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER,
             ) => TransferStep::Redirect(response),
-            (Self::Get | Self::Put, _) => TransferStep::Complete(response),
+            (Self::Get(_) | Self::Put, _) => TransferStep::Complete(response),
         }
     }
 
     fn method(self) -> ureq::http::Method {
         match self {
-            Self::Get => ureq::http::Method::GET,
+            Self::Get(_) => ureq::http::Method::GET,
             Self::Put => ureq::http::Method::PUT,
         }
     }
 
     fn restart_after_delay(self, original: &HttpUrl, current: &mut HttpUrl, delay: Duration) {
         match self {
-            Self::Get => current.clone_from(original),
+            Self::Get(_) => current.clone_from(original),
             Self::Put => {}
         }
         thread::sleep(delay);
@@ -139,7 +147,7 @@ impl RequestKind {
 
     fn discard_redirect_body(self, url: &HttpUrl, response: Response) -> Result<(), PushError> {
         match self {
-            Self::Get => Ok(()),
+            Self::Get(_) => Ok(()),
             Self::Put => finish_upload_response(url, response).map(|_| ()),
         }
     }
@@ -204,12 +212,17 @@ pub(super) fn request_status(
     url: &HttpUrl,
     authorization: Option<&str>,
 ) -> Result<u16, PushError> {
-    get_bounded(agent, url, authorization, MAX_IGNORED_RESPONSE_BODY_BYTES).map(|response| {
-        match response {
-            GetResponse::Found(_) => StatusCode::OK.as_u16(),
-            GetResponse::Missing => StatusCode::NOT_FOUND.as_u16(),
-            GetResponse::UnexpectedStatus(status) => status.as_u16(),
-        }
+    get_bounded(
+        agent,
+        url,
+        authorization,
+        MAX_IGNORED_RESPONSE_BODY_BYTES,
+        LookupPurpose::Destination,
+    )
+    .map(|response| match response {
+        GetResponse::Found(_) => StatusCode::OK.as_u16(),
+        GetResponse::Missing => StatusCode::NOT_FOUND.as_u16(),
+        GetResponse::UnexpectedStatus(status) => status.as_u16(),
     })
 }
 
@@ -218,21 +231,23 @@ pub(super) fn get_bounded(
     url: &HttpUrl,
     authorization: Option<&str>,
     max_body_bytes: u64,
+    purpose: LookupPurpose,
 ) -> Result<GetResponse, PushError> {
-    let (request_url, response) = send_with_retries(RequestKind::Get, url, |request_url| {
-        let mut request = agent
-            .get(request_url.as_str())
-            .config()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build();
-        if let Some(authorization) = authorization {
-            request = request.header("Authorization", format!("Basic {authorization}"));
-        }
-        request
-            .call()
-            .map_err(|error| format!("GET {request_url} failed: {error}").into())
-    })?;
+    let (request_url, response) =
+        send_with_retries(RequestKind::Get(purpose), url, |request_url| {
+            let mut request = agent
+                .get(request_url.as_str())
+                .config()
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .build();
+            if let Some(authorization) = authorization {
+                request = request.header("Authorization", format!("Basic {authorization}"));
+            }
+            request
+                .call()
+                .map_err(|error| format!("GET {request_url} failed: {error}").into())
+        })?;
     match response.status() {
         StatusCode::OK => read_bounded_success_body(response, &request_url, max_body_bytes)
             .map(GetResponse::Found),
@@ -365,9 +380,49 @@ pub(super) fn put_bytes(
 mod tests {
     use super::*;
 
+    const DESTINATION_GET: RequestKind = RequestKind::Get(LookupPurpose::Destination);
+
+    #[test]
+    fn optional_upstream_probes_never_retry_service_or_transport_failures() {
+        let url: HttpUrl = "http://cache.example/probe".parse().unwrap();
+        let kind = RequestKind::Get(LookupPurpose::UpstreamProbe);
+        for status in [408, 429, 500, 502, 503, 504] {
+            let mut requests = 0;
+            let (_, result) = send_with_retries(kind, &url, |_| {
+                requests += 1;
+                Ok(response(status, ""))
+            })
+            .unwrap();
+            assert_eq!(requests, 1);
+            assert_eq!(result.status().as_u16(), status);
+        }
+        let mut requests = 0;
+        let error = send_with_retries(kind, &url, |_| {
+            requests += 1;
+            Err(PushError::new("upstream offline"))
+        })
+        .unwrap_err();
+        assert_eq!(requests, 1);
+        assert!(error.contains("upstream offline"));
+
+        let mut retries = RetryState::new(kind);
+        let delayed = ureq::http::Response::builder()
+            .status(503)
+            .header("Retry-After", "60")
+            .body(ureq::Body::builder().data(Vec::new()))
+            .unwrap();
+        assert!(
+            matches!(
+                kind.classify_attempt(&mut retries, Ok(delayed)).unwrap(),
+                TransferStep::Complete(_)
+            ),
+            "an optional probe must not wait for Retry-After"
+        );
+    }
+
     #[test]
     fn exhausted_gateway_retries_do_not_borrow_the_status_budget() {
-        for (kind, attempts) in [(RequestKind::Get, 7), (RequestKind::Put, 2)] {
+        for (kind, attempts) in [(DESTINATION_GET, 7), (RequestKind::Put, 2)] {
             let mut retries = RetryState::new(kind);
             let cause = RetryCause::from_status(StatusCode::BAD_GATEWAY, None).unwrap();
             for _ in 0..attempts {
@@ -409,7 +464,7 @@ mod tests {
     #[test]
     fn get_retries_restart_the_lookup_and_put_retries_keep_the_upload_target() {
         let original: HttpUrl = "http://cache.example/start".parse().unwrap();
-        for (kind, last_path) in [(RequestKind::Get, "start"), (RequestKind::Put, "payload")] {
+        for (kind, last_path) in [(DESTINATION_GET, "start"), (RequestKind::Put, "payload")] {
             let mut script = [
                 ("start", response(307, "/payload")),
                 ("payload", response(503, "")),
@@ -437,7 +492,7 @@ mod tests {
     fn redirect_policy_never_changes_an_upload_into_a_get() {
         let original: HttpUrl = "http://cache.example/start".parse().unwrap();
         for status in [301, 302, 303, 307, 308] {
-            for (kind, follows) in [(RequestKind::Get, true), (RequestKind::Put, status >= 307)] {
+            for (kind, follows) in [(DESTINATION_GET, true), (RequestKind::Put, status >= 307)] {
                 let mut requests = 0;
                 let (_, result) = send_with_retries(kind, &original, |url| {
                     requests += 1;
@@ -460,7 +515,7 @@ mod tests {
     #[test]
     fn both_methods_bound_redirects_and_reject_untrusted_targets_before_sending() {
         let original: HttpUrl = "https://cache.example/start".parse().unwrap();
-        for kind in [RequestKind::Get, RequestKind::Put] {
+        for kind in [DESTINATION_GET, RequestKind::Put] {
             let mut requests = 0;
             let error = send_with_retries(kind, &original, |_| {
                 requests += 1;
@@ -493,7 +548,7 @@ mod tests {
     #[test]
     fn persistent_gateway_failure_stops_at_each_methods_own_budget() {
         let url: HttpUrl = "http://cache.example/start".parse().unwrap();
-        for (kind, expected_requests) in [(RequestKind::Get, 8), (RequestKind::Put, 3)] {
+        for (kind, expected_requests) in [(DESTINATION_GET, 8), (RequestKind::Put, 3)] {
             let mut requests = 0;
             let (_, result) = send_with_retries(kind, &url, |_| {
                 requests += 1;
