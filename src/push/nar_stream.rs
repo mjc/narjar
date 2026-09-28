@@ -135,6 +135,7 @@ impl StreamingNar {
     fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let length = self.reader.read(buffer)?;
         if length == 0 && self.reader.limit() != 0 {
+            wait_for_nar_producer(&self.producer)?;
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "NAR serializer ended before the declared size",
@@ -145,40 +146,50 @@ impl StreamingNar {
     }
 
     fn finish(self) -> io::Result<()> {
-        let actual_hash = FileHash::from_digest(self.digest.finalize().into());
-        if actual_hash != self.expected.hash() {
+        let Self {
+            reader: mut bounded_reader,
+            producer,
+            expected,
+            digest,
+        } = self;
+        let actual_hash = FileHash::from_digest(digest.finalize().into());
+        if actual_hash != expected.hash() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "NAR identity mismatch: expected {}/{}; got {}/{}",
-                    self.expected.hash(),
-                    self.expected.size(),
+                    expected.hash(),
+                    expected.size(),
                     actual_hash,
-                    self.expected.size(),
+                    expected.size(),
                 ),
             ));
         }
-        if self.reader.into_inner().read(&mut [0; 1])? != 0 {
+        if bounded_reader.get_mut().read(&mut [0; 1])? != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "NAR serializer exceeded the declared size",
             ));
         }
-        self.producer
-            .recv()
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "NAR serializer result was dropped",
-                )
-            })?
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("NAR serializer failed: {error}"),
-                )
-            })
+        wait_for_nar_producer(&producer)
     }
+}
+
+fn wait_for_nar_producer(producer: &Receiver<Result<(), PushError>>) -> io::Result<()> {
+    producer
+        .recv()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "NAR serializer result was dropped",
+            )
+        })?
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("NAR serializer failed: {error}"),
+            )
+        })
 }
 
 fn emit_path<W: Write>(encoder: &mut Encoder<W>, path: &Path) -> io::Result<()> {
@@ -392,6 +403,21 @@ mod tests {
 
         let error = io::copy(&mut reader, &mut io::sink()).expect_err("short output accepted");
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_stays_failed(&mut reader);
+    }
+
+    #[test]
+    fn verified_reader_reports_producer_failure_when_output_is_short() {
+        let mut reader = test_reader(
+            b"short".to_vec(),
+            b"longer than short".to_vec(),
+            Err("source file could not be read".into()),
+        );
+
+        let error = io::copy(&mut reader, &mut io::sink())
+            .expect_err("producer failure should explain the short stream");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("source file could not be read"));
         assert_stays_failed(&mut reader);
     }
 
