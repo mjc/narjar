@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, PipeReader, Read, Write},
+    io::{self, PipeReader, Read, Take, Write},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use super::{NarInfoMetadata, PushError, payload::write_encoded_nar};
 use narjar::nar_encode::{EncodeSummary, Encoder, Event};
-use narjar::object::{CompressionCodec, EncodedIdentity, FileHash, NarHash};
+use narjar::object::{ContentIdentity, EncodedFile, FileHash, NarRepresentation};
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -35,130 +35,87 @@ pub(super) fn local_store_path(store_path: &str) -> Result<PathBuf, PushError> {
     Ok(PathBuf::from(root).join(relative))
 }
 
-pub(super) fn verify_nar_summary(
-    info: &NarInfoMetadata,
-    summary: &EncodeSummary,
-) -> Result<(), PushError> {
-    let expected = info.claims().identity();
-    let expected_hash = expected.hash();
-    let actual_hash = NarHash::from_digest(summary.raw_sha256);
-    if summary.raw_size != expected.size().get() || actual_hash != expected_hash {
-        return Err(format!(
-            "NAR identity mismatch for {}: expected {expected_hash}/{}; got {actual_hash}/{}",
-            info.claims().store_path(),
-            expected.size(),
-            summary.raw_size
-        )
-        .into());
-    }
-    Ok(())
-}
-
-pub(super) fn open_verified_nar_reader(
+pub(super) fn open_upload_reader(
+    representation: NarRepresentation,
     info: &NarInfoMetadata,
 ) -> Result<Box<dyn Read + Send>, PushError> {
-    open_verified_nar_reader_at(info, local_store_path(info.claims().store_path())?)
+    open_upload_reader_at(
+        representation,
+        local_store_path(info.claims().store_path())?,
+    )
 }
 
-fn open_verified_nar_reader_at(
-    info: &NarInfoMetadata,
+fn open_upload_reader_at(
+    representation: NarRepresentation,
     path: PathBuf,
 ) -> Result<Box<dyn Read + Send>, PushError> {
-    let (reader, producer) = spawn_nar_writer(move |writer| write_nar(&path, writer).map(|_| ()))?;
-    let reader = VerifiedNarReader {
-        reader,
-        producer,
-        expected_hash: FileHash::from_nar_hash(info.claims().identity().hash()),
-        expected_size: info.claims().identity().size().get(),
-        digest: Sha256::new(),
-        bytes_read: 0,
-        state: VerificationState::Streaming,
-    };
+    let expected = ContentIdentity::new(
+        representation.file_name().file_hash(),
+        representation.encoded_size(),
+    );
+    let reader = VerifiedNarReader::spawn(expected, move |writer| match representation {
+        NarRepresentation::Raw(_) => write_nar(&path, writer).map(|_| ()),
+        NarRepresentation::Compressed(identity) => write_encoded_nar(&path, identity, writer),
+    })?;
     Ok(Box::new(reader))
 }
 
-pub(super) fn open_verified_encoded_nar_reader(
-    info: &NarInfoMetadata,
-    codec: CompressionCodec,
-    expected: EncodedIdentity,
-) -> Result<Box<dyn Read + Send>, PushError> {
-    let path = local_store_path(info.claims().store_path())?;
-    let info = info.clone();
-    let (reader, producer) =
-        spawn_nar_writer(move |writer| write_encoded_nar(&path, &info, codec, writer))?;
-    let reader = VerifiedNarReader {
-        reader,
-        producer,
-        expected_hash: expected.hash(),
-        expected_size: expected.size().get(),
-        digest: Sha256::new(),
-        bytes_read: 0,
-        state: VerificationState::Streaming,
-    };
-    Ok(Box::new(reader))
-}
-
-fn spawn_nar_writer(
-    write: impl FnOnce(&mut std::io::PipeWriter) -> Result<(), PushError> + Send + 'static,
-) -> Result<(PipeReader, Receiver<Result<(), PushError>>), PushError> {
-    let (reader, mut writer) = io::pipe().map_err(|error| format!("creating NAR pipe: {error}"))?;
-    let (result_sender, result_receiver) = mpsc::channel();
-    thread::Builder::new()
-        .name("narjar-nar-stream".into())
-        .spawn(move || {
-            let result = write(&mut writer);
-            drop(writer);
-            let _ = result_sender.send(result);
-        })
-        .map_err(|error| format!("starting NAR serializer: {error}"))?;
-    Ok((reader, result_receiver))
-}
-
-enum VerificationState {
-    Streaming,
+enum VerifiedNarReader {
+    Streaming(StreamingNar),
     Complete,
     Failed,
 }
 
-struct VerifiedNarReader {
-    reader: PipeReader,
+struct StreamingNar {
+    reader: Take<PipeReader>,
     producer: Receiver<Result<(), PushError>>,
-    expected_hash: FileHash,
-    expected_size: u64,
+    expected: ContentIdentity<EncodedFile>,
     digest: Sha256,
-    bytes_read: u64,
-    state: VerificationState,
 }
 
 impl VerifiedNarReader {
-    fn finish_stream(&mut self) -> io::Result<()> {
-        let mut extra = [0; 1];
-        let result = (|| {
-            if self.reader.read(&mut extra)? != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "NAR serializer exceeded the declared size",
-                ));
+    fn spawn(
+        expected: ContentIdentity<EncodedFile>,
+        write: impl FnOnce(&mut std::io::PipeWriter) -> Result<(), PushError> + Send + 'static,
+    ) -> Result<Self, PushError> {
+        let (reader, mut writer) =
+            io::pipe().map_err(|error| format!("creating NAR pipe: {error}"))?;
+        let (sender, producer) = mpsc::channel();
+        thread::Builder::new()
+            .name("narjar-nar-stream".into())
+            .spawn(move || {
+                let result = write(&mut writer);
+                drop(writer);
+                let _ = sender.send(result);
+            })
+            .map_err(|error| format!("starting NAR serializer: {error}"))?;
+        Ok(Self::Streaming(StreamingNar {
+            reader: reader.take(expected.size().get()),
+            producer,
+            expected,
+            digest: Sha256::new(),
+        }))
+    }
+
+    fn read_next(self, buffer: &mut [u8]) -> io::Result<(Self, usize)> {
+        match self {
+            Self::Streaming(mut stream) => {
+                let length = stream.read_chunk(buffer)?;
+                let next = match stream.reader.limit() {
+                    0 => {
+                        stream.finish()?;
+                        Self::Complete
+                    }
+                    _ => Self::Streaming(stream),
+                };
+                Ok((next, length))
             }
-            match self.producer.recv() {
-                Ok(Ok(())) => {
-                    self.state = VerificationState::Complete;
-                    Ok(())
-                }
-                Ok(Err(error)) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("NAR serializer failed: {error}"),
-                )),
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "NAR serializer result was dropped",
-                )),
-            }
-        })();
-        if result.is_err() {
-            self.state = VerificationState::Failed;
+            Self::Complete => Ok((Self::Complete, 0)),
+            Self::Failed => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "verified NAR stream is in a failed state",
+            )),
         }
-        result
     }
 }
 
@@ -167,63 +124,60 @@ impl Read for VerifiedNarReader {
         if buffer.is_empty() {
             return Ok(0);
         }
-        if matches!(self.state, VerificationState::Complete) {
-            return Ok(0);
-        }
-        if matches!(self.state, VerificationState::Failed) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "verified NAR stream is in a failed state",
-            ));
-        }
-        if self.bytes_read == self.expected_size {
-            self.finish_stream()?;
-            return Ok(0);
-        }
-        let length = match self.reader.read(buffer) {
-            Ok(length) => length,
-            Err(error) => {
-                self.state = VerificationState::Failed;
-                return Err(error);
-            }
-        };
-        if length == 0 {
-            self.state = VerificationState::Failed;
+        let current = std::mem::replace(self, Self::Failed);
+        let (next, length) = current.read_next(buffer)?;
+        *self = next;
+        Ok(length)
+    }
+}
+
+impl StreamingNar {
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let length = self.reader.read(buffer)?;
+        if length == 0 && self.reader.limit() != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "NAR serializer ended before the declared size",
             ));
         }
-        self.bytes_read = match self.bytes_read.checked_add(length as u64) {
-            Some(bytes_read) => bytes_read,
-            None => {
-                self.state = VerificationState::Failed;
-                return Err(io::Error::other("NAR stream size overflow"));
-            }
-        };
-        if self.bytes_read > self.expected_size {
-            self.state = VerificationState::Failed;
+        self.digest.update(&buffer[..length]);
+        Ok(length)
+    }
+
+    fn finish(self) -> io::Result<()> {
+        let actual_hash = FileHash::from_digest(self.digest.finalize().into());
+        if actual_hash != self.expected.hash() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "NAR identity mismatch: expected {}/{}; got {}/{}",
+                    self.expected.hash(),
+                    self.expected.size(),
+                    actual_hash,
+                    self.expected.size(),
+                ),
+            ));
+        }
+        if self.reader.into_inner().read(&mut [0; 1])? != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "NAR serializer exceeded the declared size",
             ));
         }
-        self.digest.update(&buffer[..length]);
-        if self.bytes_read == self.expected_size {
-            let actual_hash = FileHash::from_digest(self.digest.clone().finalize().into());
-            if actual_hash != self.expected_hash {
-                self.state = VerificationState::Failed;
-                return Err(io::Error::new(
+        self.producer
+            .recv()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "NAR serializer result was dropped",
+                )
+            })?
+            .map_err(|error| {
+                io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "NAR identity mismatch: expected {}/{}; got {}/{}",
-                        self.expected_hash, self.expected_size, actual_hash, self.bytes_read
-                    ),
-                ));
-            }
-            self.finish_stream()?;
-        }
-        Ok(length)
+                    format!("NAR serializer failed: {error}"),
+                )
+            })
     }
 }
 
@@ -317,13 +271,12 @@ mod tests {
         io::{self, Read, Write},
     };
 
-    use super::{
-        VerificationState, VerifiedNarReader, open_verified_nar_reader_at, spawn_nar_writer,
-        write_nar,
-    };
+    use super::{VerifiedNarReader, open_upload_reader_at, write_nar};
     use crate::push::NarInfoMetadata;
     use narjar::nar::{Decoder, Event};
-    use narjar::object::{FileHash, NarHash, NarIdentity, NarSize};
+    use narjar::object::{
+        ContentIdentity, EncodedSize, FileHash, NarHash, NarIdentity, NarRepresentation, NarSize,
+    };
     use sha2::{Digest, Sha256};
 
     fn test_reader(
@@ -331,22 +284,17 @@ mod tests {
         expected: Vec<u8>,
         result: Result<(), super::PushError>,
     ) -> VerifiedNarReader {
-        let (reader, producer) = spawn_nar_writer(move |writer| {
+        let expected = ContentIdentity::new(
+            FileHash::from_digest(Sha256::digest(&expected).into()),
+            EncodedSize::new(expected.len() as u64),
+        );
+        VerifiedNarReader::spawn(expected, move |writer| {
             writer
                 .write_all(&output)
                 .map_err(|error| error.to_string())?;
             result
         })
-        .expect("spawn test NAR producer");
-        VerifiedNarReader {
-            reader,
-            producer,
-            expected_hash: FileHash::from_digest(Sha256::digest(&expected).into()),
-            expected_size: expected.len() as u64,
-            digest: Sha256::new(),
-            bytes_read: 0,
-            state: VerificationState::Streaming,
-        }
+        .expect("spawn test NAR producer")
     }
 
     #[test]
@@ -395,8 +343,11 @@ mod tests {
         )
         .expect("valid fixture metadata");
 
-        let mut reader = open_verified_nar_reader_at(&info, directory.path().to_owned())
-            .expect("open NAR stream");
+        let mut reader = open_upload_reader_at(
+            NarRepresentation::Raw(info.claims().identity()),
+            directory.path().to_owned(),
+        )
+        .expect("open NAR stream");
         let mut actual = Vec::new();
         reader
             .read_to_end(&mut actual)
@@ -420,6 +371,7 @@ mod tests {
         let error = io::copy(&mut reader, &mut io::sink()).expect_err("producer failure is hidden");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("producer failed"));
+        assert_stays_failed(&mut reader);
     }
 
     #[test]
@@ -431,6 +383,7 @@ mod tests {
         let error = io::copy(&mut reader, &mut io::sink()).expect_err("trailing bytes accepted");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exceeded"));
+        assert_stays_failed(&mut reader);
     }
 
     #[test]
@@ -439,6 +392,7 @@ mod tests {
 
         let error = io::copy(&mut reader, &mut io::sink()).expect_err("short output accepted");
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_stays_failed(&mut reader);
     }
 
     #[test]
@@ -448,7 +402,12 @@ mod tests {
         let error = io::copy(&mut reader, &mut io::sink()).expect_err("hash mismatch accepted");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("identity mismatch"));
+        assert_stays_failed(&mut reader);
+    }
 
+    fn assert_stays_failed(reader: &mut VerifiedNarReader) {
+        assert!(matches!(reader, VerifiedNarReader::Failed));
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
         let error = reader
             .read(&mut [0; 1])
             .expect_err("failed reader returned a clean EOF");
@@ -466,11 +425,66 @@ mod tests {
             .read_to_end(&mut actual)
             .expect("complete stream should read successfully");
         assert_eq!(actual, expected);
+        assert!(matches!(reader, VerifiedNarReader::Complete));
         assert_eq!(
             reader
                 .read(&mut [0; 1])
                 .expect("completed reader is readable"),
             0
         );
+    }
+
+    #[test]
+    fn verified_reader_does_not_return_the_final_byte_before_producer_verification() {
+        for (output, result) in [
+            (b"ab".to_vec(), Err("producer failed".into())),
+            (b"ab!".to_vec(), Ok(())),
+        ] {
+            let mut reader = test_reader(output, b"ab".to_vec(), result);
+            let mut byte = [0; 1];
+            assert_eq!(reader.read(&mut byte).unwrap(), 1);
+            assert_eq!(byte, *b"a");
+            let error = reader
+                .read(&mut byte)
+                .expect_err("the last byte must not complete a failed upload");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_stays_failed(&mut reader);
+        }
+    }
+
+    #[test]
+    fn empty_reads_do_not_consume_or_complete_a_stream() {
+        let mut reader = test_reader(b"a".to_vec(), b"a".to_vec(), Ok(()));
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert!(matches!(reader, VerifiedNarReader::Streaming(_)));
+        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 1);
+        assert!(matches!(reader, VerifiedNarReader::Complete));
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_streams_still_require_the_expected_hash_and_producer_success() {
+        let empty_hash = FileHash::from_digest(Sha256::digest([]).into());
+        let wrong_hash = FileHash::from_digest(Sha256::digest(b"not empty").into());
+        for (hash, result, succeeds) in [
+            (empty_hash, Ok(()), true),
+            (wrong_hash, Ok(()), false),
+            (empty_hash, Err("producer failed".into()), false),
+        ] {
+            let mut reader = VerifiedNarReader::spawn(
+                ContentIdentity::new(hash, EncodedSize::new(0)),
+                move |_| result,
+            )
+            .unwrap();
+            let read = reader.read(&mut [0; 1]);
+            if succeeds {
+                assert_eq!(read.unwrap(), 0);
+                assert!(matches!(reader, VerifiedNarReader::Complete));
+            } else {
+                assert_eq!(read.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                assert_stays_failed(&mut reader);
+            }
+        }
     }
 }

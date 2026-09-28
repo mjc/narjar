@@ -5,10 +5,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use std::{fs::File, path::Path};
-
-use ureq::{Agent, http::StatusCode};
+use ureq::{Agent, AsSendBody, RequestBuilder, http::StatusCode};
 
 use super::PushError;
 use crate::http_url::HttpUrl;
@@ -37,34 +34,6 @@ struct RetryState {
     transport: Range<usize>,
 }
 
-#[derive(Clone, Copy)]
-enum RetryCause {
-    Gateway(Option<Duration>),
-    Status(Option<Duration>),
-    Transport,
-}
-
-impl RetryCause {
-    fn from_status(status: StatusCode, retry_after: Option<Duration>) -> Option<Self> {
-        match status {
-            StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => {
-                Some(Self::Gateway(retry_after))
-            }
-            StatusCode::REQUEST_TIMEOUT
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::INTERNAL_SERVER_ERROR
-            | StatusCode::GATEWAY_TIMEOUT => Some(Self::Status(retry_after)),
-            _ => None,
-        }
-    }
-}
-
-enum TransferStep {
-    RetryAfter(Duration),
-    Redirect(Response),
-    Complete(Response),
-}
-
 impl RetryState {
     fn new(kind: RequestKind) -> Self {
         let (status, gateway, transport) = match kind {
@@ -79,11 +48,25 @@ impl RetryState {
         }
     }
 
-    fn delay(&mut self, cause: RetryCause) -> Option<Duration> {
-        let (attempt, retry_after) = match cause {
-            RetryCause::Gateway(delay) => (self.gateway.next()?, delay),
-            RetryCause::Status(delay) => (self.status.next()?, delay),
-            RetryCause::Transport => (self.transport.next()?, None),
+    fn delay_for(&mut self, result: &Result<Response, PushError>) -> Option<Duration> {
+        let (attempt, retry_after) = match result {
+            Ok(response) => {
+                let attempt = match response.status() {
+                    StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => {
+                        self.gateway.next()?
+                    }
+                    StatusCode::REQUEST_TIMEOUT
+                    | StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::INTERNAL_SERVER_ERROR
+                    | StatusCode::GATEWAY_TIMEOUT => self.status.next()?,
+                    _ => return None,
+                };
+                (
+                    attempt,
+                    response_header(response, "Retry-After").and_then(retry_after_delay),
+                )
+            }
+            Err(_) => (self.transport.next()?, None),
         };
         Some(retry_delay(attempt, retry_after))
     }
@@ -97,36 +80,19 @@ pub(super) enum GetResponse {
 }
 
 impl RequestKind {
-    fn classify_attempt(
+    fn redirect_target(
         self,
-        retries: &mut RetryState,
-        result: Result<Response, PushError>,
-    ) -> Result<TransferStep, PushError> {
-        match result {
-            Ok(response) => {
-                let retry =
-                    RetryCause::from_status(response.status(), response_retry_after(&response))
-                        .and_then(|cause| retries.delay(cause));
-                Ok(match retry {
-                    Some(delay) => TransferStep::RetryAfter(delay),
-                    None => self.redirect_or_complete(response),
-                })
-            }
-            Err(error) => retries
-                .delay(RetryCause::Transport)
-                .map(TransferStep::RetryAfter)
-                .ok_or(error),
-        }
-    }
-
-    fn redirect_or_complete(self, response: Response) -> TransferStep {
+        url: &HttpUrl,
+        response: &Response,
+        redirects: usize,
+    ) -> Result<Option<HttpUrl>, PushError> {
         match (self, response.status()) {
             (_, StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT)
             | (
                 Self::Get(_),
                 StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER,
-            ) => TransferStep::Redirect(response),
-            (Self::Get(_) | Self::Put, _) => TransferStep::Complete(response),
+            ) => resolve_response_redirect(self, url, response, redirects).map(Some),
+            (Self::Get(_) | Self::Put, _) => Ok(None),
         }
     }
 
@@ -163,19 +129,8 @@ fn retry_delay(retry: usize, retry_after: Option<Duration>) -> Duration {
     retry_after.unwrap_or_else(|| Duration::from_millis(100 * multiplier))
 }
 
-fn response_retry_after(response: &Response) -> Option<Duration> {
-    response
-        .headers()
-        .get("Retry-After")
-        .and_then(|value| value.to_str().ok())
-        .and_then(retry_after_delay)
-}
-
-fn response_location(response: &Response) -> Option<&str> {
-    response
-        .headers()
-        .get("Location")
-        .and_then(|value| value.to_str().ok())
+fn response_header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+    response.headers().get(name)?.to_str().ok()
 }
 
 fn read_bounded_success_body(
@@ -235,16 +190,7 @@ pub(super) fn get_bounded(
 ) -> Result<GetResponse, PushError> {
     let (request_url, response) =
         send_with_retries(RequestKind::Get(purpose), url, |request_url| {
-            let mut request = agent
-                .get(request_url.as_str())
-                .config()
-                .max_redirects(0)
-                .http_status_as_error(false)
-                .build();
-            if let Some(authorization) = authorization {
-                request = request.header("Authorization", format!("Basic {authorization}"));
-            }
-            request
+            configure_request(agent.get(request_url.as_str()), authorization)
                 .call()
                 .map_err(|error| format!("GET {request_url} failed: {error}").into())
         })?;
@@ -265,18 +211,24 @@ fn send_with_retries(
     let mut redirects = 0;
     let mut retries = RetryState::new(kind);
     loop {
-        match kind.classify_attempt(&mut retries, send(&request_url))? {
-            TransferStep::RetryAfter(delay) => {
+        let response = send(&request_url);
+        match retries.delay_for(&response) {
+            Some(delay) => {
+                drop(response);
                 redirects = 0;
                 kind.restart_after_delay(original_url, &mut request_url, delay);
             }
-            TransferStep::Redirect(response) => {
-                let next_url = resolve_response_redirect(kind, &request_url, &response, redirects)?;
-                kind.discard_redirect_body(&request_url, response)?;
-                request_url = next_url;
-                redirects += 1;
+            None => {
+                let response = response?;
+                match kind.redirect_target(&request_url, &response, redirects)? {
+                    Some(next_url) => {
+                        kind.discard_redirect_body(&request_url, response)?;
+                        request_url = next_url;
+                        redirects += 1;
+                    }
+                    None => return Ok((request_url, response)),
+                }
             }
-            TransferStep::Complete(response) => return Ok((request_url, response)),
         }
     }
 }
@@ -291,89 +243,44 @@ fn resolve_response_redirect(
     if redirects == MAX_REDIRECTS {
         return Err(format!("{method} {request_url} followed too many redirects").into());
     }
-    let location = response_location(response).ok_or_else(|| {
+    let location = response_header(response, "Location").ok_or_else(|| {
         format!("{method} {request_url} redirect response had no Location header")
     })?;
     Ok(request_url.resolve_trusted_redirect(location)?)
 }
 
-fn put_with_redirects(
-    url: &HttpUrl,
-    send: impl FnMut(&HttpUrl) -> Result<Response, PushError>,
-) -> Result<StatusCode, PushError> {
-    let (url, response) = send_with_retries(RequestKind::Put, url, send)?;
-    finish_upload_response(&url, response)
-}
-
-fn upload_request(
-    agent: &Agent,
-    url: &HttpUrl,
-    content_type: &str,
+fn configure_request<State>(
+    request: RequestBuilder<State>,
     authorization: Option<&str>,
-) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
-    let mut request = agent
-        .put(url.as_str())
+) -> RequestBuilder<State> {
+    let request = request
         .config()
         .max_redirects(0)
         .http_status_as_error(false)
-        .build()
-        .header("Content-Type", content_type);
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", format!("Basic {authorization}"));
+        .build();
+    match authorization {
+        Some(authorization) => request.header("Authorization", format!("Basic {authorization}")),
+        None => request,
     }
-    request
 }
 
-#[cfg(test)]
-pub(super) fn put_file(
-    agent: &Agent,
-    url: &HttpUrl,
-    path: &Path,
-    content_type: &str,
-    authorization: Option<&str>,
-) -> Result<StatusCode, PushError> {
-    put_with_redirects(url, |upload_url| {
-        let file = File::open(path)
-            .map_err(|error| format!("opening NAR for PUT {upload_url} failed: {error}"))?;
-        upload_request(agent, upload_url, content_type, authorization)
-            .send(file)
-            .map_err(|error| PushError::new(format!("PUT {upload_url} failed: {error}")))
-    })
-}
-
-pub(super) fn put_reader<F>(
+pub(super) fn put<Body: AsSendBody>(
     agent: &Agent,
     url: &HttpUrl,
     content_length: u64,
     content_type: &str,
     authorization: Option<&str>,
-    mut open: F,
-) -> Result<StatusCode, PushError>
-where
-    F: FnMut() -> Result<Box<dyn Read + Send>, PushError>,
-{
-    put_with_redirects(url, |upload_url| {
-        let reader = open()?;
-        let request = upload_request(agent, upload_url, content_type, authorization)
-            .header("Content-Length", content_length.to_string());
-        request
-            .send(ureq::SendBody::from_owned_reader(reader))
-            .map_err(|error| PushError::new(format!("PUT {upload_url} failed: {error}")))
-    })
-}
-
-pub(super) fn put_bytes(
-    agent: &Agent,
-    url: &HttpUrl,
-    bytes: &[u8],
-    content_type: &str,
-    authorization: Option<&str>,
+    mut open: impl FnMut() -> Result<Body, PushError>,
 ) -> Result<StatusCode, PushError> {
-    put_with_redirects(url, |upload_url| {
-        upload_request(agent, upload_url, content_type, authorization)
-            .send(bytes)
+    let (url, response) = send_with_retries(RequestKind::Put, url, |upload_url| {
+        let body = open()?;
+        configure_request(agent.put(upload_url.as_str()), authorization)
+            .header("Content-Type", content_type)
+            .header("Content-Length", content_length.to_string())
+            .send(body)
             .map_err(|error| PushError::new(format!("PUT {upload_url} failed: {error}")))
-    })
+    })?;
+    finish_upload_response(&url, response)
 }
 
 #[cfg(test)]
@@ -411,11 +318,9 @@ mod tests {
             .header("Retry-After", "60")
             .body(ureq::Body::builder().data(Vec::new()))
             .unwrap();
-        assert!(
-            matches!(
-                kind.classify_attempt(&mut retries, Ok(delayed)).unwrap(),
-                TransferStep::Complete(_)
-            ),
+        assert_eq!(
+            retries.delay_for(&Ok(delayed)),
+            None,
             "an optional probe must not wait for Retry-After"
         );
     }
@@ -424,31 +329,33 @@ mod tests {
     fn exhausted_gateway_retries_do_not_borrow_the_status_budget() {
         for (kind, attempts) in [(DESTINATION_GET, 7), (RequestKind::Put, 2)] {
             let mut retries = RetryState::new(kind);
-            let cause = RetryCause::from_status(StatusCode::BAD_GATEWAY, None).unwrap();
             for _ in 0..attempts {
-                assert!(retries.delay(cause).is_some());
+                assert!(retries.delay_for(&Ok(response(502, ""))).is_some());
             }
             assert_eq!(
-                retries
-                    .delay(RetryCause::from_status(StatusCode::SERVICE_UNAVAILABLE, None).unwrap()),
+                retries.delay_for(&Ok(response(503, ""))),
                 None,
                 "502 and 503 share one budget; exhaustion must not fall through to another class"
             );
-            assert!(
-                retries
-                    .delay(RetryCause::from_status(StatusCode::TOO_MANY_REQUESTS, None).unwrap())
-                    .is_some()
-            );
+            assert!(retries.delay_for(&Ok(response(429, ""))).is_some());
         }
     }
 
     #[test]
     fn retries_only_transient_http_failures() {
         for status in [408, 429, 500, 502, 503, 504] {
-            assert!(RetryCause::from_status(StatusCode::from_u16(status).unwrap(), None).is_some());
+            assert!(
+                RetryState::new(DESTINATION_GET)
+                    .delay_for(&Ok(response(status, "")))
+                    .is_some()
+            );
         }
         for status in [200, 201, 301, 307, 400, 401, 404, 409, 413, 422] {
-            assert!(RetryCause::from_status(StatusCode::from_u16(status).unwrap(), None).is_none());
+            assert!(
+                RetryState::new(DESTINATION_GET)
+                    .delay_for(&Ok(response(status, "")))
+                    .is_none()
+            );
         }
     }
 

@@ -23,15 +23,15 @@ mod signing;
 mod store;
 mod transfer;
 mod upstream;
-use nar_stream::{open_verified_encoded_nar_reader, open_verified_nar_reader};
+use nar_stream::open_upload_reader;
 use payload::measure_encoded_nar;
 use plan::dependency_waves;
 use root::StoreRoots;
 use signing::sign_metadata;
 use store::LocalStore;
-use transfer::{LookupPurpose, get_bounded, put_bytes, put_reader};
 #[cfg(test)]
-use transfer::{put_file, request_status};
+use transfer::request_status;
+use transfer::{LookupPurpose, get_bounded, put};
 use upstream::{CacheLookup, PushDisposition, TrustedUpstreams};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -365,7 +365,6 @@ impl DestinationClient {
     fn new(options: &NativeCopyOptions) -> Result<Self, PushError> {
         let authorization = authorization_for_destination(options)?;
         let agent = Agent::config_builder()
-            .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(options.timeout_seconds.get())))
             .build()
             .into();
@@ -385,42 +384,47 @@ impl DestinationClient {
         let payload = prepare_nar_upload(info, compression)?;
         let nar_name = payload.file_name().to_string();
         let nar_url = self.base_url.endpoint(&["nar", &nar_name]);
-        let nar_status = put_reader(
+        let nar_status = put(
             &self.agent,
             &nar_url,
             payload.encoded_size().get(),
             "application/x-nix-nar",
             self.authorization.as_deref(),
-            || open_upload_reader(payload, info),
+            || open_upload_reader(payload, info).map(ureq::SendBody::from_owned_reader),
         )?;
-        require_successful_upload(UploadArtifact::Nar, info, nar_status)?;
+        self.accept_upload_response(UploadArtifact::Nar, info, nar_status)?;
 
         let narinfo = info.serialize(payload).map_err(|error| error.to_string())?;
-        let narinfo_status = put_bytes(
+        let narinfo_status = put(
             &self.agent,
             &narinfo_url,
-            &narinfo,
+            narinfo.len() as u64,
             "text/x-nix-narinfo",
             self.authorization.as_deref(),
+            || Ok(narinfo.as_slice()),
         )?;
-        self.require_narinfo_upload(info, narinfo_status)
+        self.accept_upload_response(UploadArtifact::Narinfo, info, narinfo_status)
     }
 
-    fn require_narinfo_upload(
+    fn accept_upload_response(
         &self,
+        artifact: UploadArtifact,
         info: &NarInfoMetadata,
         status: StatusCode,
     ) -> Result<PushOutcome, PushError> {
-        match status {
-            StatusCode::OK | StatusCode::CREATED => Ok(PushOutcome::Uploaded),
-            StatusCode::CONFLICT => match self.narinfo_state(info)? {
+        match (artifact, status) {
+            (_, StatusCode::OK | StatusCode::CREATED) => Ok(PushOutcome::Uploaded),
+            (UploadArtifact::Narinfo, StatusCode::CONFLICT) => match self.narinfo_state(info)? {
                 DestinationNarinfoState::MatchesExpected => Ok(PushOutcome::DestinationPresent),
                 DestinationNarinfoState::Different | DestinationNarinfoState::Missing => {
                     Ok(PushOutcome::Conflict)
                 }
             },
-            _ => require_successful_upload(UploadArtifact::Narinfo, info, status)
-                .map(|()| PushOutcome::Uploaded),
+            _ => Err(format!(
+                "{artifact} upload for {} returned HTTP {status}",
+                info.claims().store_path()
+            )
+            .into()),
         }
     }
 
@@ -517,19 +521,6 @@ fn prepare_nar_upload(
     }
 }
 
-fn open_upload_reader(
-    representation: NarRepresentation,
-    info: &NarInfoMetadata,
-) -> Result<Box<dyn std::io::Read + Send>, PushError> {
-    match representation {
-        NarRepresentation::Raw(_) => open_verified_nar_reader(info),
-        NarRepresentation::Compressed(identity) => {
-            let encoded = identity.encoded();
-            open_verified_encoded_nar_reader(info, encoded.codec(), encoded)
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UploadArtifact {
     Nar,
@@ -549,21 +540,6 @@ impl fmt::Display for UploadArtifact {
             Self::Nar => formatter.write_str("NAR"),
             Self::Narinfo => formatter.write_str("narinfo"),
         }
-    }
-}
-
-fn require_successful_upload(
-    artifact: UploadArtifact,
-    info: &NarInfoMetadata,
-    status: StatusCode,
-) -> Result<(), PushError> {
-    match status {
-        StatusCode::OK | StatusCode::CREATED => Ok(()),
-        _ => Err(format!(
-            "{artifact} upload for {} returned HTTP {status}",
-            info.claims().store_path()
-        )
-        .into()),
     }
 }
 
@@ -687,7 +663,11 @@ mod tests {
             agent,
             authorization: None,
         };
-        let result = client.require_narinfo_upload(&info, StatusCode::CONFLICT);
+        let result = client.accept_upload_response(
+            super::UploadArtifact::Narinfo,
+            &info,
+            StatusCode::CONFLICT,
+        );
 
         assert!(
             result.is_ok(),
@@ -852,7 +832,11 @@ mod tests {
             let lookup =
                 CacheLookup::new(&client, DestinationNarinfoPolicy::ReuseExisting, &upstreams);
             let preflight_result = lookup.classify(&info);
-            let conflict_result = client.require_narinfo_upload(&info, StatusCode::CONFLICT);
+            let conflict_result = client.accept_upload_response(
+                super::UploadArtifact::Narinfo,
+                &info,
+                StatusCode::CONFLICT,
+            );
             server.join().unwrap();
             assert_eq!(preflight_result.unwrap(), preflight);
             assert_eq!(conflict_result.unwrap(), conflict);
@@ -1218,7 +1202,7 @@ mod tests {
             .into();
 
         assert_eq!(
-            super::put_reader(
+            super::put(
                 &agent,
                 &http_url(format!("http://{address}/nar/test.nar")),
                 payload_size,
@@ -1226,7 +1210,7 @@ mod tests {
                 None,
                 || {
                     std::fs::File::open(payload.path())
-                        .map(|file| Box::new(file) as Box<dyn std::io::Read + Send>)
+                        .map(ureq::SendBody::from_owned_reader)
                         .map_err(|error| super::PushError::new(error.to_string()))
                 }
             )
@@ -1319,12 +1303,14 @@ mod tests {
             .into();
 
         assert_eq!(
-            super::put_file(
+            super::put(
                 &agent,
                 &http_url(format!("http://{address}/nar/test.nar")),
-                payload.path(),
+                payload.as_file().metadata().unwrap().len(),
                 "application/x-nix-nar",
-                None
+                None,
+                || std::fs::File::open(payload.path())
+                    .map_err(|error| super::PushError::new(error.to_string()))
             )
             .expect("redirected upload should succeed"),
             StatusCode::CREATED
@@ -1405,23 +1391,26 @@ mod tests {
             .into();
 
         assert_eq!(
-            super::put_file(
+            super::put(
                 &agent,
                 &http_url(format!("http://{address}/nar/test.nar")),
-                payload.path(),
+                payload.as_file().metadata().unwrap().len(),
                 "application/x-nix-nar",
-                None
+                None,
+                || std::fs::File::open(payload.path())
+                    .map_err(|error| super::PushError::new(error.to_string()))
             )
             .expect("content-type upload should succeed"),
             StatusCode::CREATED
         );
         assert_eq!(
-            super::put_bytes(
+            super::put(
                 &agent,
                 &http_url(format!("http://{address}/store.narinfo")),
-                b"StorePath: /nix/store/test\n",
+                b"StorePath: /nix/store/test\n".len() as u64,
                 "text/x-nix-narinfo",
-                None
+                None,
+                || Ok(b"StorePath: /nix/store/test\n".as_slice())
             )
             .expect("narinfo content-type upload should succeed"),
             StatusCode::CREATED
