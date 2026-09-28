@@ -485,23 +485,29 @@ fn copy_path(
             );
             Ok(PushOutcome::TrustedUpstreamPresent)
         }
-        PushDisposition::UploadRequired => {
-            match client.upload_path(&options.target, options.compression, info)? {
-                PushOutcome::Conflict if options.ignore_conflicts => {
-                    eprintln!(
-                        "narjar push: skipping immutable conflict for {}",
-                        info.claims().store_path()
-                    );
-                    Ok(PushOutcome::Conflict)
-                }
-                PushOutcome::Conflict => Err(format!(
-                    "narinfo upload for {} returned HTTP 409",
-                    info.claims().store_path()
-                )
-                .into()),
-                outcome => Ok(outcome),
-            }
+        PushDisposition::UploadRequired => upload_required_path(client, options, info),
+    }
+}
+
+fn upload_required_path(
+    client: &UploadClient,
+    options: &NativeCopyOptions,
+    info: &NarInfoMetadata,
+) -> Result<PushOutcome, PushError> {
+    match client.upload_path(&options.target, options.compression, info)? {
+        PushOutcome::Conflict if options.ignore_conflicts => {
+            eprintln!(
+                "narjar push: skipping immutable conflict for {}",
+                info.claims().store_path()
+            );
+            Ok(PushOutcome::Conflict)
         }
+        PushOutcome::Conflict => Err(format!(
+            "narinfo upload for {} returned HTTP 409",
+            info.claims().store_path()
+        )
+        .into()),
+        outcome => Ok(outcome),
     }
 }
 

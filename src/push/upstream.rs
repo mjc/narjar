@@ -174,29 +174,37 @@ impl<'a> CacheLookup<'a> {
         info: &NarInfoMetadata,
     ) -> UpstreamLookup {
         let url = upstream.url.endpoint(&[narinfo_name]);
-        let response = match get_bounded(self.agent, &url, None, MAX_NARINFO_BYTES) {
-            Ok(response) => response,
-            Err(error) => return UpstreamLookup::Rejected(UpstreamRejection::LookupFailed(error)),
-        };
-        let body = match response {
-            super::transfer::GetResponse::Found(body) => body,
-            super::transfer::GetResponse::Missing => return UpstreamLookup::Missing,
-            super::transfer::GetResponse::UnexpectedStatus(status) => {
-                return UpstreamLookup::Rejected(UpstreamRejection::UnexpectedStatus(status));
-            }
-        };
-        let claims = match upstream.keys.verify_external_narinfo(route, body) {
-            Ok(verified) => verified,
-            Err(error) => {
-                return UpstreamLookup::Rejected(UpstreamRejection::InvalidNarInfo(
-                    error.to_string(),
-                ));
-            }
-        };
-        match compare_logical_claims(info, &claims) {
-            Ok(()) => UpstreamLookup::Matched(upstream.url.clone()),
-            Err(mismatch) => UpstreamLookup::Rejected(UpstreamRejection::ClaimsMismatch(mismatch)),
+        get_bounded(self.agent, &url, None, MAX_NARINFO_BYTES)
+            .map(|response| match response {
+                super::transfer::GetResponse::Found(body) => {
+                    verify_upstream_narinfo(route, upstream, info, body)
+                }
+                super::transfer::GetResponse::Missing => UpstreamLookup::Missing,
+                super::transfer::GetResponse::UnexpectedStatus(status) => {
+                    UpstreamLookup::Rejected(UpstreamRejection::UnexpectedStatus(status))
+                }
+            })
+            .unwrap_or_else(|error| {
+                UpstreamLookup::Rejected(UpstreamRejection::LookupFailed(error))
+            })
+    }
+}
+
+fn verify_upstream_narinfo(
+    route: &narjar::storage::StoreHash,
+    upstream: &ConfiguredUpstream,
+    info: &NarInfoMetadata,
+    body: Vec<u8>,
+) -> UpstreamLookup {
+    let claims = match upstream.keys.verify_external_narinfo(route, body) {
+        Ok(verified) => verified,
+        Err(error) => {
+            return UpstreamLookup::Rejected(UpstreamRejection::InvalidNarInfo(error.to_string()));
         }
+    };
+    match compare_logical_claims(info, &claims) {
+        Ok(()) => UpstreamLookup::Matched(upstream.url.clone()),
+        Err(mismatch) => UpstreamLookup::Rejected(UpstreamRejection::ClaimsMismatch(mismatch)),
     }
 }
 
