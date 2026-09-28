@@ -381,7 +381,7 @@ impl UploadClient {
         target: &HttpUrl,
         compression: WireEncoding,
         info: &NarInfoMetadata,
-    ) -> Result<NarInfoUploadOutcome, PushError> {
+    ) -> Result<PushOutcome, PushError> {
         let narinfo_url =
             target.endpoint(&[&format!("{}.narinfo", info.claims().store().as_str())]);
         let payload = prepare_nar_upload(info, compression)?;
@@ -413,19 +413,17 @@ impl UploadClient {
         narinfo_url: &HttpUrl,
         info: &NarInfoMetadata,
         status: StatusCode,
-    ) -> Result<NarInfoUploadOutcome, PushError> {
+    ) -> Result<PushOutcome, PushError> {
         match status {
-            StatusCode::OK | StatusCode::CREATED => Ok(NarInfoUploadOutcome::Uploaded),
+            StatusCode::OK | StatusCode::CREATED => Ok(PushOutcome::Uploaded),
             StatusCode::CONFLICT => match self.destination_narinfo_state(narinfo_url, info)? {
-                DestinationNarinfoState::MatchesExpected => {
-                    Ok(NarInfoUploadOutcome::AlreadyPresent)
-                }
+                DestinationNarinfoState::MatchesExpected => Ok(PushOutcome::DestinationPresent),
                 DestinationNarinfoState::Different | DestinationNarinfoState::Missing => {
-                    Ok(NarInfoUploadOutcome::Conflict)
+                    Ok(PushOutcome::Conflict)
                 }
             },
             _ => require_successful_upload(UploadArtifact::Narinfo, info, status)
-                .map(|()| NarInfoUploadOutcome::Uploaded),
+                .map(|()| PushOutcome::Uploaded),
         }
     }
 
@@ -489,20 +487,19 @@ fn copy_path(
         }
         PushDisposition::UploadRequired => {
             match client.upload_path(&options.target, options.compression, info)? {
-                NarInfoUploadOutcome::Uploaded => Ok(PushOutcome::Uploaded),
-                NarInfoUploadOutcome::AlreadyPresent => Ok(PushOutcome::DestinationPresent),
-                NarInfoUploadOutcome::Conflict if options.ignore_conflicts => {
+                PushOutcome::Conflict if options.ignore_conflicts => {
                     eprintln!(
                         "narjar push: skipping immutable conflict for {}",
                         info.claims().store_path()
                     );
                     Ok(PushOutcome::Conflict)
                 }
-                NarInfoUploadOutcome::Conflict => Err(format!(
+                PushOutcome::Conflict => Err(format!(
                     "narinfo upload for {} returned HTTP 409",
                     info.claims().store_path()
                 )
                 .into()),
+                outcome => Ok(outcome),
             }
         }
     }
@@ -536,13 +533,6 @@ fn open_upload_reader(
 enum UploadArtifact {
     Nar,
     Narinfo,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NarInfoUploadOutcome {
-    Uploaded,
-    AlreadyPresent,
-    Conflict,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

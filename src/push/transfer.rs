@@ -295,6 +295,24 @@ where
     }
 }
 
+fn upload_request(
+    agent: &Agent,
+    url: &HttpUrl,
+    content_type: &str,
+    authorization: Option<&str>,
+) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+    let mut request = agent
+        .put(url.as_str())
+        .config()
+        .max_redirects(0)
+        .build()
+        .header("Content-Type", content_type);
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", format!("Basic {authorization}"));
+    }
+    request
+}
+
 #[cfg(test)]
 pub(super) fn put_file(
     agent: &Agent,
@@ -306,16 +324,7 @@ pub(super) fn put_file(
     put_with_redirects(url, |upload_url| {
         let file = File::open(path)
             .map_err(|error| format!("opening NAR for PUT {upload_url} failed: {error}"))?;
-        let mut request = agent
-            .put(upload_url.as_str())
-            .config()
-            .max_redirects(0)
-            .build()
-            .header("Content-Type", content_type);
-        if let Some(authorization) = authorization {
-            request = request.header("Authorization", format!("Basic {authorization}"));
-        }
-        request
+        upload_request(agent, upload_url, content_type, authorization)
             .send(file)
             .map_err(|error| PushError::new(format!("PUT {upload_url} failed: {error}")))
     })
@@ -334,16 +343,8 @@ where
 {
     put_with_redirects(url, |upload_url| {
         let reader = open()?;
-        let mut request = agent
-            .put(upload_url.as_str())
-            .config()
-            .max_redirects(0)
-            .build()
-            .header("Content-Type", content_type)
+        let request = upload_request(agent, upload_url, content_type, authorization)
             .header("Content-Length", content_length.to_string());
-        if let Some(authorization) = authorization {
-            request = request.header("Authorization", format!("Basic {authorization}"));
-        }
         request
             .send(ureq::SendBody::from_owned_reader(reader))
             .map_err(|error| PushError::new(format!("PUT {upload_url} failed: {error}")))
@@ -358,16 +359,7 @@ pub(super) fn put_bytes(
     authorization: Option<&str>,
 ) -> Result<StatusCode, PushError> {
     put_with_redirects(url, |upload_url| {
-        let mut request = agent
-            .put(upload_url.as_str())
-            .config()
-            .max_redirects(0)
-            .build()
-            .header("Content-Type", content_type);
-        if let Some(authorization) = authorization {
-            request = request.header("Authorization", format!("Basic {authorization}"));
-        }
-        request
+        upload_request(agent, upload_url, content_type, authorization)
             .send(bytes)
             .map_err(|error| PushError::new(format!("PUT {upload_url} failed: {error}")))
     })
