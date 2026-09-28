@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use narjar::narinfo::{MAX_NARINFO_BYTES, TrustedNarInfoClaims, TrustedPublicKeys};
-use ureq::Agent;
+use ureq::{Agent, http::StatusCode};
 
 use super::{DestinationNarinfoPolicy, NarInfoMetadata, PushError, transfer::get_bounded};
 use crate::http_url::HttpUrl;
@@ -112,15 +112,15 @@ impl<'a> CacheLookup<'a> {
             self.destination_authorization,
             MAX_NARINFO_BYTES,
         )?;
-        match response.status {
-            200 => {
-                let matches_expected = info.claims().matches_external_narinfo(route, response.body);
+        match response {
+            super::transfer::GetResponse::Found(body) => {
+                let matches_expected = info.claims().matches_external_narinfo(route, body);
                 if matches_expected {
                     return Ok(PushDisposition::DestinationPresent);
                 }
             }
-            404 => {}
-            status => {
+            super::transfer::GetResponse::Missing => {}
+            super::transfer::GetResponse::UnexpectedStatus(status) => {
                 return Err(format!(
                     "narinfo lookup for {} returned HTTP {status}",
                     info.claims().store_path()
@@ -138,26 +138,32 @@ impl<'a> CacheLookup<'a> {
         narinfo_name: &str,
         info: &NarInfoMetadata,
     ) -> Result<PushDisposition, PushError> {
-        for upstream in self.upstreams.entries.iter() {
-            match self.lookup_upstream(route, upstream, narinfo_name, info)? {
-                UpstreamLookup::Matched(matched) => {
-                    return Ok(PushDisposition::TrustedUpstreamPresent(matched));
+        let matched_upstream = self.upstreams.entries.iter().find_map(|upstream| {
+            match self.lookup_upstream(route, upstream, narinfo_name, info) {
+                UpstreamLookup::Matched(matched) => Some(matched),
+                UpstreamLookup::Rejected(reason) => {
+                    eprintln!(
+                        "narjar push: trusted upstream {} rejected for {}: {reason}; checking next source",
+                        upstream.url,
+                        info.claims().store_path()
+                    );
+                    None
                 }
-                UpstreamLookup::Rejected(reason) => eprintln!(
-                    "narjar push: trusted upstream {} rejected for {}: {reason}; checking next source",
-                    upstream.url,
-                    info.claims().store_path()
-                ),
-                UpstreamLookup::Missing => {}
+                UpstreamLookup::Missing => None,
+            }
+        });
+        match matched_upstream {
+            Some(upstream) => Ok(PushDisposition::TrustedUpstreamPresent(upstream)),
+            None => {
+                if !self.upstreams.entries.is_empty() {
+                    eprintln!(
+                        "narjar push: no trusted upstream matched {}; uploading instead",
+                        info.claims().store_path()
+                    );
+                }
+                Ok(PushDisposition::UploadRequired)
             }
         }
-        if !self.upstreams.entries.is_empty() {
-            eprintln!(
-                "narjar push: no trusted upstream matched {}; uploading instead",
-                info.claims().store_path()
-            );
-        }
-        Ok(PushDisposition::UploadRequired)
     }
 
     fn lookup_upstream(
@@ -166,39 +172,56 @@ impl<'a> CacheLookup<'a> {
         upstream: &ConfiguredUpstream,
         narinfo_name: &str,
         info: &NarInfoMetadata,
-    ) -> Result<UpstreamLookup, PushError> {
+    ) -> UpstreamLookup {
         let url = upstream.url.endpoint(&[narinfo_name]);
         let response = match get_bounded(self.agent, &url, None, MAX_NARINFO_BYTES) {
             Ok(response) => response,
-            Err(error) => {
-                return Ok(UpstreamLookup::Rejected(format!("lookup failed: {error}")));
+            Err(error) => return UpstreamLookup::Rejected(UpstreamRejection::LookupFailed(error)),
+        };
+        let body = match response {
+            super::transfer::GetResponse::Found(body) => body,
+            super::transfer::GetResponse::Missing => return UpstreamLookup::Missing,
+            super::transfer::GetResponse::UnexpectedStatus(status) => {
+                return UpstreamLookup::Rejected(UpstreamRejection::UnexpectedStatus(status));
             }
         };
-        match response.status {
-            404 => return Ok(UpstreamLookup::Missing),
-            200 => {}
-            status => {
-                return Ok(UpstreamLookup::Rejected(format!(
-                    "lookup returned HTTP {status}"
-                )));
-            }
-        }
-
-        let claims = match upstream.keys.verify_external_narinfo(route, response.body) {
+        let claims = match upstream.keys.verify_external_narinfo(route, body) {
             Ok(verified) => verified,
-            Err(error) => return Ok(UpstreamLookup::Rejected(error.to_string())),
+            Err(error) => {
+                return UpstreamLookup::Rejected(UpstreamRejection::InvalidNarInfo(
+                    error.to_string(),
+                ));
+            }
         };
         match compare_logical_claims(info, &claims) {
-            Ok(()) => Ok(UpstreamLookup::Matched(upstream.url.clone())),
-            Err(mismatch) => Ok(UpstreamLookup::Rejected(mismatch.to_string())),
+            Ok(()) => UpstreamLookup::Matched(upstream.url.clone()),
+            Err(mismatch) => UpstreamLookup::Rejected(UpstreamRejection::ClaimsMismatch(mismatch)),
         }
     }
 }
 
 enum UpstreamLookup {
     Missing,
-    Rejected(String),
+    Rejected(UpstreamRejection),
     Matched(HttpUrl),
+}
+
+enum UpstreamRejection {
+    LookupFailed(PushError),
+    UnexpectedStatus(StatusCode),
+    InvalidNarInfo(String),
+    ClaimsMismatch(LogicalClaimsMismatch),
+}
+
+impl fmt::Display for UpstreamRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LookupFailed(error) => write!(formatter, "lookup failed: {error}"),
+            Self::UnexpectedStatus(status) => write!(formatter, "lookup returned HTTP {status}"),
+            Self::InvalidNarInfo(error) => formatter.write_str(error),
+            Self::ClaimsMismatch(mismatch) => mismatch.fmt(formatter),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

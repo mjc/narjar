@@ -1262,7 +1262,7 @@ fn native_push_honors_configured_http_timeout() {
             drop(stream);
         });
 
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (mut stream, _) = listener.accept().expect("accept retried native request");
             let request = read_http_request(&mut stream);
             let request = String::from_utf8_lossy(&request);

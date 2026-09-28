@@ -7,35 +7,106 @@ use std::{
 #[cfg(test)]
 use std::{fs::File, path::Path};
 
-use ureq::Agent;
+use ureq::{Agent, http::StatusCode};
 
 use super::PushError;
 use crate::http_url::HttpUrl;
 
-const MAX_ATTEMPTS: usize = 3;
 const MAX_REDIRECTS: usize = 10;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
-const RETRYABLE_STATUSES: &[u16] = &[408, 429, 500, 502, 503, 504];
-const GET_REDIRECT_STATUSES: &[u16] = &[301, 302, 303, 307, 308];
-const PUT_REDIRECT_STATUSES: &[u16] = &[307, 308];
-#[cfg(test)]
-const MAX_IGNORED_GET_BODY_BYTES: u64 = 1024 * 1024;
+const RETRYABLE_STATUSES: &[StatusCode] = &[
+    StatusCode::REQUEST_TIMEOUT,
+    StatusCode::TOO_MANY_REQUESTS,
+    StatusCode::INTERNAL_SERVER_ERROR,
+    StatusCode::BAD_GATEWAY,
+    StatusCode::SERVICE_UNAVAILABLE,
+    StatusCode::GATEWAY_TIMEOUT,
+];
+const GET_REDIRECT_STATUSES: &[StatusCode] = &[
+    StatusCode::MOVED_PERMANENTLY,
+    StatusCode::FOUND,
+    StatusCode::SEE_OTHER,
+    StatusCode::TEMPORARY_REDIRECT,
+    StatusCode::PERMANENT_REDIRECT,
+];
+const PUT_REDIRECT_STATUSES: &[StatusCode] = &[
+    StatusCode::TEMPORARY_REDIRECT,
+    StatusCode::PERMANENT_REDIRECT,
+];
+const MAX_IGNORED_RESPONSE_BODY_BYTES: u64 = 64 * 1024;
+const GET_RETRIES: RetryBudget = RetryBudget {
+    status: 2,
+    gateway: 7,
+    transport: 2,
+};
+const PUT_RETRIES: RetryBudget = RetryBudget {
+    status: 2,
+    gateway: 2,
+    transport: 2,
+};
 
-#[derive(Debug)]
-pub(super) struct GetResponse {
-    pub(super) status: u16,
-    pub(super) body: Vec<u8>,
+#[derive(Clone, Copy)]
+struct RetryBudget {
+    status: usize,
+    gateway: usize,
+    transport: usize,
 }
 
-pub(super) fn is_retryable_status(status: u16) -> bool {
+#[derive(Default)]
+struct RetryState {
+    status: usize,
+    gateway: usize,
+    transport: usize,
+}
+
+#[derive(Clone, Copy)]
+enum RetryCause {
+    Status(StatusCode, Option<Duration>),
+    Transport,
+}
+
+impl RetryState {
+    fn delay(&mut self, budget: RetryBudget, cause: RetryCause) -> Option<Duration> {
+        match cause {
+            RetryCause::Status(
+                StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE,
+                retry_after,
+            ) if self.gateway < budget.gateway => {
+                let attempt = self.gateway;
+                self.gateway += 1;
+                Some(retry_delay(attempt, retry_after))
+            }
+            RetryCause::Status(_, retry_after) if self.status < budget.status => {
+                let attempt = self.status;
+                self.status += 1;
+                Some(retry_delay(attempt, retry_after))
+            }
+            RetryCause::Transport if self.transport < budget.transport => {
+                let attempt = self.transport;
+                self.transport += 1;
+                Some(retry_delay(attempt, None))
+            }
+            RetryCause::Status(_, _) | RetryCause::Transport => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum GetResponse {
+    Found(Vec<u8>),
+    Missing,
+    UnexpectedStatus(StatusCode),
+}
+
+pub(super) fn is_retryable_status(status: StatusCode) -> bool {
     RETRYABLE_STATUSES.contains(&status)
 }
 
-fn is_get_redirect_status(status: u16) -> bool {
+fn is_get_redirect_status(status: StatusCode) -> bool {
     GET_REDIRECT_STATUSES.contains(&status)
 }
 
-fn is_put_redirect_status(status: u16) -> bool {
+fn is_put_redirect_status(status: StatusCode) -> bool {
     PUT_REDIRECT_STATUSES.contains(&status)
 }
 
@@ -44,9 +115,55 @@ pub(super) fn retry_after_delay(value: &str) -> Option<Duration> {
     Some(Duration::from_secs(seconds.min(MAX_RETRY_AFTER_SECONDS)))
 }
 
-fn retry_sleep(attempt: usize, retry_after: Option<Duration>) {
-    let multiplier = 1u64 << attempt.min(6);
-    thread::sleep(retry_after.unwrap_or_else(|| Duration::from_millis(100 * multiplier)));
+fn retry_delay(retry: usize, retry_after: Option<Duration>) -> Duration {
+    let multiplier = 1u64 << retry.min(6);
+    retry_after.unwrap_or_else(|| Duration::from_millis(100 * multiplier))
+}
+
+fn wait_for_retry(delay: Duration) {
+    thread::sleep(delay);
+}
+
+fn response_retry_after(response: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
+    response
+        .headers()
+        .get("Retry-After")
+        .and_then(|value| value.to_str().ok())
+        .and_then(retry_after_delay)
+}
+
+fn response_location(response: &ureq::http::Response<ureq::Body>) -> Option<String> {
+    response
+        .headers()
+        .get("Location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn read_bounded_success_body(
+    response: ureq::http::Response<ureq::Body>,
+    request_url: &HttpUrl,
+    max_body_bytes: u64,
+) -> Result<Vec<u8>, PushError> {
+    let mut body = response.into_body().into_reader();
+    let mut bytes = Vec::new();
+    (&mut body)
+        .take(max_body_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("reading GET {request_url} response failed: {error}"))?;
+    if bytes.len() as u64 > max_body_bytes {
+        return Err(format!("GET {request_url} response exceeded {max_body_bytes} bytes").into());
+    }
+    Ok(bytes)
+}
+
+fn discard_response_body(response: ureq::http::Response<ureq::Body>) -> io::Result<()> {
+    let body = response.into_body().into_reader();
+    io::copy(
+        &mut body.take(MAX_IGNORED_RESPONSE_BODY_BYTES),
+        &mut io::sink(),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -55,8 +172,13 @@ pub(super) fn request_status(
     url: &HttpUrl,
     authorization: Option<&str>,
 ) -> Result<u16, PushError> {
-    get_bounded(agent, url, authorization, MAX_IGNORED_GET_BODY_BYTES)
-        .map(|response| response.status)
+    get_bounded(agent, url, authorization, MAX_IGNORED_RESPONSE_BODY_BYTES).map(|response| {
+        match response {
+            GetResponse::Found(_) => StatusCode::OK.as_u16(),
+            GetResponse::Missing => StatusCode::NOT_FOUND.as_u16(),
+            GetResponse::UnexpectedStatus(status) => status.as_u16(),
+        }
+    })
 }
 
 pub(super) fn get_bounded(
@@ -65,7 +187,8 @@ pub(super) fn get_bounded(
     authorization: Option<&str>,
     max_body_bytes: u64,
 ) -> Result<GetResponse, PushError> {
-    'attempts: for attempt in 0..MAX_ATTEMPTS {
+    let mut retries = RetryState::default();
+    'attempts: loop {
         let mut request_url = url.clone();
         for redirect in 0..=MAX_REDIRECTS {
             let mut request = agent
@@ -79,113 +202,97 @@ pub(super) fn get_bounded(
             }
             match request.call() {
                 Ok(response) => {
-                    let status = response.status().as_u16();
-                    let retry_after = response
-                        .headers()
-                        .get("Retry-After")
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(retry_after_delay);
-                    let location = response
-                        .headers()
-                        .get("Location")
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned);
-                    let mut body = response.into_body().into_reader();
-                    let mut bytes = Vec::new();
-                    (&mut body)
-                        .take(max_body_bytes.saturating_add(1))
-                        .read_to_end(&mut bytes)
-                        .map_err(|error| {
-                            format!("reading GET {request_url} response failed: {error}")
-                        })?;
-                    if bytes.len() as u64 > max_body_bytes {
-                        return Err(format!(
-                            "GET {request_url} response exceeded {max_body_bytes} bytes"
-                        )
-                        .into());
-                    }
+                    let status = response.status();
 
                     if is_get_redirect_status(status) {
                         if redirect == MAX_REDIRECTS {
                             return Err(format!("GET {url} followed too many redirects").into());
                         }
-                        let location = location.ok_or_else(|| {
+                        let location = response_location(&response).ok_or_else(|| {
                             format!("GET {request_url} redirect response had no Location header")
                         })?;
                         request_url = request_url.resolve_trusted_redirect(&location)?;
                         continue;
                     }
 
-                    if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                        retry_sleep(attempt, retry_after);
+                    if is_retryable_status(status)
+                        && let Some(delay) = retries.delay(
+                            GET_RETRIES,
+                            RetryCause::Status(status, response_retry_after(&response)),
+                        )
+                    {
+                        wait_for_retry(delay);
                         continue 'attempts;
                     }
-                    return Ok(GetResponse {
-                        status,
-                        body: bytes,
-                    });
+                    return match status {
+                        StatusCode::OK => {
+                            read_bounded_success_body(response, &request_url, max_body_bytes)
+                                .map(GetResponse::Found)
+                        }
+                        StatusCode::NOT_FOUND => Ok(GetResponse::Missing),
+                        status => Ok(GetResponse::UnexpectedStatus(status)),
+                    };
                 }
-                Err(_error) if attempt + 1 < MAX_ATTEMPTS => {
-                    retry_sleep(attempt, None);
-                    continue 'attempts;
-                }
-                Err(error) => return Err(format!("GET {request_url} failed: {error}").into()),
+                Err(error) => match retries.delay(GET_RETRIES, RetryCause::Transport) {
+                    Some(delay) => {
+                        wait_for_retry(delay);
+                        continue 'attempts;
+                    }
+                    None => return Err(format!("GET {request_url} failed: {error}").into()),
+                },
             }
         }
     }
-    unreachable!("retry loop always returns")
 }
 
-fn put_with_redirects<F>(url: &HttpUrl, mut send: F) -> Result<u16, PushError>
+fn put_with_redirects<F>(url: &HttpUrl, mut send: F) -> Result<StatusCode, PushError>
 where
     F: FnMut(&HttpUrl) -> Result<ureq::http::Response<ureq::Body>, PushError>,
 {
     let mut upload_url = url.clone();
-    'attempts: for attempt in 0..MAX_ATTEMPTS {
+    let mut retries = RetryState::default();
+    'attempts: loop {
         for redirect in 0..=MAX_REDIRECTS {
             let response = match send(&upload_url) {
                 Ok(response) => response,
-                Err(_error) if attempt + 1 < MAX_ATTEMPTS => {
-                    retry_sleep(attempt, None);
-                    continue 'attempts;
-                }
-                Err(error) => return Err(error),
+                Err(error) => match retries.delay(PUT_RETRIES, RetryCause::Transport) {
+                    Some(delay) => {
+                        wait_for_retry(delay);
+                        continue 'attempts;
+                    }
+                    None => return Err(error),
+                },
             };
-            let status = response.status().as_u16();
-            let retry_after = response
-                .headers()
-                .get("Retry-After")
-                .and_then(|value| value.to_str().ok())
-                .and_then(retry_after_delay);
-            let location = response
-                .headers()
-                .get("Location")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let mut body = response.into_body().into_reader();
-            io::copy(&mut body, &mut io::sink())
-                .map_err(|error| format!("reading PUT {upload_url} response failed: {error}"))?;
+            let status = response.status();
 
             if is_put_redirect_status(status) {
                 if redirect == MAX_REDIRECTS {
                     return Err(format!("PUT {url} followed too many redirects").into());
                 }
-                let location = location.ok_or_else(|| {
+                let location = response_location(&response).ok_or_else(|| {
                     format!("PUT {upload_url} redirect response had no Location header")
+                })?;
+                discard_response_body(response).map_err(|error| {
+                    format!("reading PUT {upload_url} response failed: {error}")
                 })?;
                 upload_url = upload_url.resolve_trusted_redirect(&location)?;
                 continue;
             }
 
-            if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
-                retry_sleep(attempt, retry_after);
+            if is_retryable_status(status)
+                && let Some(delay) = retries.delay(
+                    PUT_RETRIES,
+                    RetryCause::Status(status, response_retry_after(&response)),
+                )
+            {
+                wait_for_retry(delay);
                 continue 'attempts;
             }
+            discard_response_body(response)
+                .map_err(|error| format!("reading PUT {upload_url} response failed: {error}"))?;
             return Ok(status);
         }
-        unreachable!("redirect loop always returns")
     }
-    unreachable!("retry loop always returns")
 }
 
 #[cfg(test)]
@@ -195,7 +302,7 @@ pub(super) fn put_file(
     path: &Path,
     content_type: &str,
     authorization: Option<&str>,
-) -> Result<u16, PushError> {
+) -> Result<StatusCode, PushError> {
     put_with_redirects(url, |upload_url| {
         let file = File::open(path)
             .map_err(|error| format!("opening NAR for PUT {upload_url} failed: {error}"))?;
@@ -221,7 +328,7 @@ pub(super) fn put_reader<F>(
     content_type: &str,
     authorization: Option<&str>,
     mut open: F,
-) -> Result<u16, PushError>
+) -> Result<StatusCode, PushError>
 where
     F: FnMut() -> Result<Box<dyn Read + Send>, PushError>,
 {
@@ -249,7 +356,7 @@ pub(super) fn put_bytes(
     bytes: &[u8],
     content_type: &str,
     authorization: Option<&str>,
-) -> Result<u16, PushError> {
+) -> Result<StatusCode, PushError> {
     put_with_redirects(url, |upload_url| {
         let mut request = agent
             .put(upload_url.as_str())

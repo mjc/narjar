@@ -11,7 +11,7 @@ use narjar::{
     narinfo::{MAX_NARINFO_BYTES, NarInfoMetadata},
     object::{NarRepresentation, WireEncoding},
 };
-use ureq::Agent;
+use ureq::{Agent, http::StatusCode};
 
 use crate::{error::Error, http_url::HttpUrl, operator::netrc_authorization};
 
@@ -412,36 +412,53 @@ impl UploadClient {
         &self,
         narinfo_url: &HttpUrl,
         info: &NarInfoMetadata,
-        status: u16,
+        status: StatusCode,
     ) -> Result<NarInfoUploadOutcome, PushError> {
-        if matches!(status, 200 | 201) {
-            return Ok(NarInfoUploadOutcome::Uploaded);
+        match status {
+            StatusCode::OK | StatusCode::CREATED => Ok(NarInfoUploadOutcome::Uploaded),
+            StatusCode::CONFLICT => match self.destination_narinfo_state(narinfo_url, info)? {
+                DestinationNarinfoState::MatchesExpected => {
+                    Ok(NarInfoUploadOutcome::AlreadyPresent)
+                }
+                DestinationNarinfoState::Different | DestinationNarinfoState::Missing => {
+                    Ok(NarInfoUploadOutcome::Conflict)
+                }
+            },
+            _ => require_successful_upload(UploadArtifact::Narinfo, info, status)
+                .map(|()| NarInfoUploadOutcome::Uploaded),
         }
-        if status == 409 && self.destination_narinfo_matches(narinfo_url, info)? {
-            return Ok(NarInfoUploadOutcome::AlreadyPresent);
-        }
-        if status == 409 {
-            return Ok(NarInfoUploadOutcome::Conflict);
-        }
-        require_successful_upload(UploadArtifact::Narinfo, info, status)
-            .map(|()| NarInfoUploadOutcome::Uploaded)
     }
 
-    fn destination_narinfo_matches(
+    fn destination_narinfo_state(
         &self,
         narinfo_url: &HttpUrl,
         info: &NarInfoMetadata,
-    ) -> Result<bool, PushError> {
+    ) -> Result<DestinationNarinfoState, PushError> {
         let response = get_bounded(
             &self.agent,
             narinfo_url,
             self.authorization.as_deref(),
             MAX_NARINFO_BYTES,
         )?;
-        Ok(response.status == 200
-            && info
-                .claims()
-                .matches_external_narinfo(info.claims().store(), response.body))
+        match response {
+            transfer::GetResponse::Found(body) => {
+                let state = if info
+                    .claims()
+                    .matches_external_narinfo(info.claims().store(), body)
+                {
+                    DestinationNarinfoState::MatchesExpected
+                } else {
+                    DestinationNarinfoState::Different
+                };
+                Ok(state)
+            }
+            transfer::GetResponse::Missing => Ok(DestinationNarinfoState::Missing),
+            transfer::GetResponse::UnexpectedStatus(status) => Err(format!(
+                "narinfo lookup for {} returned HTTP {status}",
+                info.claims().store_path()
+            )
+            .into()),
+        }
     }
 }
 
@@ -528,6 +545,13 @@ enum NarInfoUploadOutcome {
     Conflict,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DestinationNarinfoState {
+    MatchesExpected,
+    Different,
+    Missing,
+}
+
 impl fmt::Display for UploadArtifact {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -540,10 +564,10 @@ impl fmt::Display for UploadArtifact {
 fn require_successful_upload(
     artifact: UploadArtifact,
     info: &NarInfoMetadata,
-    status: u16,
+    status: StatusCode,
 ) -> Result<(), PushError> {
     match status {
-        200 | 201 => Ok(()),
+        StatusCode::OK | StatusCode::CREATED => Ok(()),
         _ => Err(format!(
             "{artifact} upload for {} returned HTTP {status}",
             info.claims().store_path()
@@ -557,9 +581,10 @@ mod tests {
     use clap::{Args, Command, FromArgMatches};
 
     use super::transfer::{is_retryable_status, retry_after_delay};
-    use super::{Agent, NarInfoMetadata, Push, TrustedUpstreams, dependency_waves};
+    use super::{Agent, NarInfoMetadata, Push, TrustedUpstreams, UploadClient, dependency_waves};
     use crate::http_url::HttpUrl;
     use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
+    use ureq::http::StatusCode;
 
     fn http_url(value: impl AsRef<str>) -> HttpUrl {
         value.as_ref().parse().expect("test HTTP URL should parse")
@@ -668,7 +693,7 @@ mod tests {
         let result = client.require_narinfo_upload(
             &http_url(format!("http://{address}/narinfo")),
             &info,
-            409,
+            StatusCode::CONFLICT,
         );
 
         assert!(
@@ -681,11 +706,71 @@ mod tests {
     }
 
     #[test]
+    fn narinfo_conflict_verification_preserves_unexpected_http_statuses() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let info = test_narinfo_metadata(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package",
+            Vec::new(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind status test listener");
+        let address = listener.local_addr().expect("inspect status test listener");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept status verification GET");
+            let mut request = [0; 1024];
+            let read = stream
+                .read(&mut request)
+                .expect("read status verification GET");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /narinfo HTTP/1.1"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write unexpected status response");
+        });
+        let client = UploadClient {
+            agent: Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into(),
+            authorization: None,
+        };
+
+        let error = client
+            .destination_narinfo_state(&http_url(format!("http://{address}/narinfo")), &info)
+            .expect_err("unexpected verification status should propagate");
+        assert!(error.contains("HTTP 418"));
+        server
+            .join()
+            .expect("status verification server should exit");
+    }
+
+    #[test]
     fn retries_only_transient_http_failures() {
-        for status in [408, 429, 500, 502, 503, 504] {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
             assert!(is_retryable_status(status), "HTTP {status} should retry");
         }
-        for status in [200, 201, 400, 401, 404, 409, 413, 422] {
+        for status in [
+            StatusCode::OK,
+            StatusCode::CREATED,
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
             assert!(
                 !is_retryable_status(status),
                 "HTTP {status} should not retry"
@@ -747,6 +832,55 @@ mod tests {
             200
         );
         server.join().expect("retry test server should exit");
+    }
+
+    #[test]
+    fn retries_through_a_cache_restart_longer_than_the_request_burst() {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind restart retry listener");
+        let address = listener
+            .local_addr()
+            .expect("inspect restart retry listener");
+        let server = thread::spawn(move || {
+            let mut responses = [502, 502, 502, 502, 502, 502, 502, 200].into_iter();
+            loop {
+                let (mut stream, _) = listener.accept().expect("accept retry request");
+                let mut request = [0; 1024];
+                let read = stream.read(&mut request).expect("read retry request");
+                if request[..read].starts_with(b"GET /stop") {
+                    break;
+                }
+                let status = responses.next().expect("test sent too many requests");
+                let retry_after = if status == 502 {
+                    "Retry-After: 0\r\n"
+                } else {
+                    ""
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\n{retry_after}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write retry response");
+            }
+        });
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        let status =
+            super::request_status(&agent, &http_url(format!("http://{address}/narinfo")), None)
+                .expect("restart retry should reach the recovered cache");
+        let mut stop = TcpStream::connect(address).expect("connect to stop retry server");
+        stop.write_all(b"GET /stop HTTP/1.1\r\n\r\n")
+            .expect("stop retry server");
+        server.join().expect("restart retry server should exit");
+        assert_eq!(status, 200);
     }
 
     #[test]
@@ -944,7 +1078,7 @@ mod tests {
                 }
             )
             .expect("upload retry should eventually succeed"),
-            201
+            StatusCode::CREATED
         );
         server.join().expect("upload retry test server should exit");
     }
@@ -1040,7 +1174,7 @@ mod tests {
                 None
             )
             .expect("redirected upload should succeed"),
-            201
+            StatusCode::CREATED
         );
         server.join().expect("redirect test server should exit");
     }
@@ -1126,7 +1260,7 @@ mod tests {
                 None
             )
             .expect("content-type upload should succeed"),
-            201
+            StatusCode::CREATED
         );
         assert_eq!(
             super::put_bytes(
@@ -1137,7 +1271,7 @@ mod tests {
                 None
             )
             .expect("narinfo content-type upload should succeed"),
-            201
+            StatusCode::CREATED
         );
         server.join().expect("content-type server should exit");
     }
