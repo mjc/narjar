@@ -66,6 +66,19 @@ enum RetryCause {
 }
 
 impl RetryState {
+    fn delay_for_status(
+        &mut self,
+        budget: RetryBudget,
+        status: StatusCode,
+        retry_after: Option<Duration>,
+    ) -> Option<Duration> {
+        if is_retryable_status(status) {
+            self.delay(budget, RetryCause::Status(status, retry_after))
+        } else {
+            None
+        }
+    }
+
     fn delay(&mut self, budget: RetryBudget, cause: RetryCause) -> Option<Duration> {
         match cause {
             RetryCause::Status(
@@ -215,12 +228,11 @@ pub(super) fn get_bounded(
                         continue;
                     }
 
-                    if is_retryable_status(status)
-                        && let Some(delay) = retries.delay(
-                            GET_RETRIES,
-                            RetryCause::Status(status, response_retry_after(&response)),
-                        )
-                    {
+                    if let Some(delay) = retries.delay_for_status(
+                        GET_RETRIES,
+                        status,
+                        response_retry_after(&response),
+                    ) {
                         wait_for_retry(delay);
                         continue 'attempts;
                     }
@@ -279,11 +291,8 @@ where
                 continue;
             }
 
-            if is_retryable_status(status)
-                && let Some(delay) = retries.delay(
-                    PUT_RETRIES,
-                    RetryCause::Status(status, response_retry_after(&response)),
-                )
+            if let Some(delay) =
+                retries.delay_for_status(PUT_RETRIES, status, response_retry_after(&response))
             {
                 wait_for_retry(delay);
                 continue 'attempts;
