@@ -7,6 +7,7 @@ pub mod maintenance;
 #[doc(hidden)]
 pub mod metrics;
 pub mod nar;
+pub mod nar_compression;
 pub mod nar_encode;
 pub mod narinfo;
 pub mod object;
