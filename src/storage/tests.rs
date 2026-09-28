@@ -2325,7 +2325,7 @@ fn narinfo_publication_is_idempotent_for_matching_logical_claims() {
     let incoming = format!("{existing}Sig: another-key:signature\n").into_bytes();
     assert_eq!(
         storage
-            .publish_narinfo_with_claims(&store, &claims, incoming)
+            .publish_narinfo_with_claims(&claims, incoming)
             .expect("matching claims should make publication idempotent"),
         PublishOutcome::Identical
     );

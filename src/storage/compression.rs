@@ -8,10 +8,8 @@ use std::{
 };
 
 use lzma_rust2::XzReader;
-use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
-use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
 use crate::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
@@ -207,70 +205,6 @@ struct HashingWriter<'a, W: Write + ?Sized> {
     hasher: Sha256,
     bytes_written: u64,
     max_bytes: u64,
-}
-
-struct EncodedOutputHasher<'a, W: Write + ?Sized> {
-    inner: &'a mut W,
-    hasher: Sha256,
-    bytes_written: u64,
-}
-
-impl<'a, W: Write + ?Sized> EncodedOutputHasher<'a, W> {
-    fn new(inner: &'a mut W) -> Self {
-        Self {
-            inner,
-            hasher: Sha256::new(),
-            bytes_written: 0,
-        }
-    }
-
-    fn finish(self, codec: CompressionCodec) -> EncodedIdentity {
-        EncodedIdentity::new(
-            codec,
-            FileHash::from_digest(self.hasher.finalize().into()),
-            EncodedSize::new(self.bytes_written),
-        )
-    }
-}
-
-impl<W: Write + ?Sized> Write for EncodedOutputHasher<'_, W> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buffer)?;
-        self.bytes_written = self
-            .bytes_written
-            .checked_add(written as u64)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "encoded NAR is too large")
-            })?;
-        self.hasher.update(&buffer[..written]);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-pub(super) fn encode_raw_nar(
-    mut source: impl Read,
-    codec: CompressionCodec,
-    destination: &mut impl Write,
-) -> io::Result<EncodedIdentity> {
-    let mut output = EncodedOutputHasher::new(destination);
-    match codec {
-        CompressionCodec::Zstd => {
-            let mut encoder = StreamingEncoder::new(&mut output, CompressionLevel::Fastest);
-            io::copy(&mut source, &mut encoder)?;
-            encoder.finish()?;
-        }
-        CompressionCodec::Xz => {
-            let mut encoder =
-                XzWriter::new(&mut output, XzOptions::with_preset(1)).map_err(io::Error::other)?;
-            io::copy(&mut source, &mut encoder)?;
-            encoder.finish().map_err(io::Error::other)?;
-        }
-    }
-    Ok(output.finish(codec))
 }
 
 impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
@@ -767,7 +701,7 @@ mod tests {
 
     use super::{
         EncodedIdentity, EncodedSize, FileHash, IngestionReceipt, NarHash, NarIdentity, NarSize,
-        StagingReservation, encode_raw_nar, reserve_preferred_or_exact_staging_growth,
+        StagingReservation, reserve_preferred_or_exact_staging_growth,
     };
     use crate::object::CompressionCodec;
     use crate::storage::fs::filesystem_space;
@@ -787,9 +721,13 @@ mod tests {
     #[test]
     fn encoding_propagates_physical_enospc() {
         for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
-            let source = io::Cursor::new(b"raw NAR bytes");
-            let error = encode_raw_nar(source, codec, &mut EnospcWriter)
-                .expect_err("physical output exhaustion should fail encoding");
+            let mut source = io::Cursor::new(b"raw NAR bytes");
+            let error = crate::nar_compression::encode_and_measure_nar(
+                codec,
+                &mut EnospcWriter,
+                |output| io::copy(&mut source, output).map(|_| ()),
+            )
+            .expect_err("physical output exhaustion should fail encoding");
             assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
         }
     }

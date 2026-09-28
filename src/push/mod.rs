@@ -11,7 +11,7 @@ use narjar::{
     narinfo::{MAX_NARINFO_BYTES, NarInfoMetadata},
     object::{NarRepresentation, WireEncoding},
 };
-use ureq::Agent;
+use ureq::{Agent, http::StatusCode};
 
 use crate::{error::Error, http_url::HttpUrl, operator::netrc_authorization};
 
@@ -23,15 +23,15 @@ mod signing;
 mod store;
 mod transfer;
 mod upstream;
-use nar_stream::{open_verified_encoded_nar_reader, open_verified_nar_reader};
+use nar_stream::open_upload_reader;
 use payload::measure_encoded_nar;
 use plan::dependency_waves;
 use root::StoreRoots;
 use signing::sign_metadata;
 use store::LocalStore;
-use transfer::{get_bounded, put_bytes, put_reader};
 #[cfg(test)]
-use transfer::{put_file, request_status};
+use transfer::request_status;
+use transfer::{LookupPurpose, get_bounded, put};
 use upstream::{CacheLookup, PushDisposition, TrustedUpstreams};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -340,11 +340,9 @@ fn native_copy_paths(
     options: &NativeCopyOptions,
     metadata: &[NarInfoMetadata],
 ) -> Result<PushReport, PushError> {
-    let client = UploadClient::new(options)?;
+    let client = DestinationClient::new(options)?;
     let lookup = CacheLookup::new(
-        &client.agent,
-        &options.target,
-        client.authorization.as_deref(),
+        &client,
         options.destination_narinfo,
         &options.trusted_upstreams,
     );
@@ -357,20 +355,21 @@ fn native_copy_paths(
         })
 }
 
-struct UploadClient {
+struct DestinationClient {
+    base_url: HttpUrl,
     agent: Agent,
     authorization: Option<String>,
 }
 
-impl UploadClient {
+impl DestinationClient {
     fn new(options: &NativeCopyOptions) -> Result<Self, PushError> {
         let authorization = authorization_for_destination(options)?;
         let agent = Agent::config_builder()
-            .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(options.timeout_seconds.get())))
             .build()
             .into();
         Ok(Self {
+            base_url: options.target.clone(),
             agent,
             authorization,
         })
@@ -378,71 +377,86 @@ impl UploadClient {
 
     fn upload_path(
         &self,
-        target: &HttpUrl,
         compression: WireEncoding,
         info: &NarInfoMetadata,
-    ) -> Result<NarInfoUploadOutcome, PushError> {
-        let narinfo_url =
-            target.endpoint(&[&format!("{}.narinfo", info.claims().store().as_str())]);
+    ) -> Result<PushOutcome, PushError> {
+        let narinfo_url = narinfo_url(&self.base_url, info);
         let payload = prepare_nar_upload(info, compression)?;
         let nar_name = payload.file_name().to_string();
-        let nar_url = target.endpoint(&["nar", &nar_name]);
-        let nar_status = put_reader(
+        let nar_url = self.base_url.endpoint(&["nar", &nar_name]);
+        let nar_status = put(
             &self.agent,
             &nar_url,
             payload.encoded_size().get(),
             "application/x-nix-nar",
             self.authorization.as_deref(),
-            || open_upload_reader(payload, info),
+            || open_upload_reader(payload, info).map(ureq::SendBody::from_owned_reader),
         )?;
-        require_successful_upload(UploadArtifact::Nar, info, nar_status)?;
+        self.accept_upload_response(UploadArtifact::Nar, info, nar_status)?;
 
         let narinfo = info.serialize(payload).map_err(|error| error.to_string())?;
-        let narinfo_status = put_bytes(
+        let narinfo_status = put(
             &self.agent,
             &narinfo_url,
-            &narinfo,
+            narinfo.len() as u64,
             "text/x-nix-narinfo",
             self.authorization.as_deref(),
+            || Ok(narinfo.as_slice()),
         )?;
-        self.require_narinfo_upload(&narinfo_url, info, narinfo_status)
+        self.accept_upload_response(UploadArtifact::Narinfo, info, narinfo_status)
     }
 
-    fn require_narinfo_upload(
+    fn accept_upload_response(
         &self,
-        narinfo_url: &HttpUrl,
+        artifact: UploadArtifact,
         info: &NarInfoMetadata,
-        status: u16,
-    ) -> Result<NarInfoUploadOutcome, PushError> {
-        if matches!(status, 200 | 201) {
-            return Ok(NarInfoUploadOutcome::Uploaded);
+        status: StatusCode,
+    ) -> Result<PushOutcome, PushError> {
+        match (artifact, status) {
+            (_, StatusCode::OK | StatusCode::CREATED) => Ok(PushOutcome::Uploaded),
+            (UploadArtifact::Narinfo, StatusCode::CONFLICT) => match self.narinfo_state(info)? {
+                DestinationNarinfoState::MatchesExpected => Ok(PushOutcome::DestinationPresent),
+                DestinationNarinfoState::Different | DestinationNarinfoState::Missing => {
+                    Ok(PushOutcome::Conflict)
+                }
+            },
+            _ => Err(format!(
+                "{artifact} upload for {} returned HTTP {status}",
+                info.claims().store_path()
+            )
+            .into()),
         }
-        if status == 409 && self.destination_narinfo_matches(narinfo_url, info)? {
-            return Ok(NarInfoUploadOutcome::AlreadyPresent);
-        }
-        if status == 409 {
-            return Ok(NarInfoUploadOutcome::Conflict);
-        }
-        require_successful_upload(UploadArtifact::Narinfo, info, status)
-            .map(|()| NarInfoUploadOutcome::Uploaded)
     }
 
-    fn destination_narinfo_matches(
-        &self,
-        narinfo_url: &HttpUrl,
-        info: &NarInfoMetadata,
-    ) -> Result<bool, PushError> {
+    fn narinfo_state(&self, info: &NarInfoMetadata) -> Result<DestinationNarinfoState, PushError> {
         let response = get_bounded(
             &self.agent,
-            narinfo_url,
+            &narinfo_url(&self.base_url, info),
             self.authorization.as_deref(),
             MAX_NARINFO_BYTES,
+            LookupPurpose::Destination,
         )?;
-        Ok(response.status == 200
-            && info
-                .claims()
-                .matches_external_narinfo(info.claims().store(), response.body))
+        match response {
+            transfer::GetResponse::Found(body) => {
+                let state = if info.claims().matches_external_narinfo(body) {
+                    DestinationNarinfoState::MatchesExpected
+                } else {
+                    DestinationNarinfoState::Different
+                };
+                Ok(state)
+            }
+            transfer::GetResponse::Missing => Ok(DestinationNarinfoState::Missing),
+            transfer::GetResponse::UnexpectedStatus(status) => Err(format!(
+                "narinfo lookup for {} returned HTTP {status}",
+                info.claims().store_path()
+            )
+            .into()),
+        }
     }
+}
+
+fn narinfo_url(base_url: &HttpUrl, info: &NarInfoMetadata) -> HttpUrl {
+    base_url.endpoint(&[&format!("{}.narinfo", info.claims().store().as_str())])
 }
 
 fn authorization_for_destination(options: &NativeCopyOptions) -> Result<Option<String>, PushError> {
@@ -457,7 +471,7 @@ fn authorization_for_destination(options: &NativeCopyOptions) -> Result<Option<S
 
 fn copy_path(
     lookup: &CacheLookup<'_>,
-    client: &UploadClient,
+    client: &DestinationClient,
     options: &NativeCopyOptions,
     info: &NarInfoMetadata,
 ) -> Result<PushOutcome, PushError> {
@@ -470,24 +484,29 @@ fn copy_path(
             );
             Ok(PushOutcome::TrustedUpstreamPresent)
         }
-        PushDisposition::UploadRequired => {
-            match client.upload_path(&options.target, options.compression, info)? {
-                NarInfoUploadOutcome::Uploaded => Ok(PushOutcome::Uploaded),
-                NarInfoUploadOutcome::AlreadyPresent => Ok(PushOutcome::DestinationPresent),
-                NarInfoUploadOutcome::Conflict if options.ignore_conflicts => {
-                    eprintln!(
-                        "narjar push: skipping immutable conflict for {}",
-                        info.claims().store_path()
-                    );
-                    Ok(PushOutcome::Conflict)
-                }
-                NarInfoUploadOutcome::Conflict => Err(format!(
-                    "narinfo upload for {} returned HTTP 409",
-                    info.claims().store_path()
-                )
-                .into()),
-            }
+        PushDisposition::UploadRequired => upload_required_path(client, options, info),
+    }
+}
+
+fn upload_required_path(
+    client: &DestinationClient,
+    options: &NativeCopyOptions,
+    info: &NarInfoMetadata,
+) -> Result<PushOutcome, PushError> {
+    match client.upload_path(options.compression, info)? {
+        PushOutcome::Conflict if options.ignore_conflicts => {
+            eprintln!(
+                "narjar push: skipping immutable conflict for {}",
+                info.claims().store_path()
+            );
+            Ok(PushOutcome::Conflict)
         }
+        PushOutcome::Conflict => Err(format!(
+            "narinfo upload for {} returned HTTP 409",
+            info.claims().store_path()
+        )
+        .into()),
+        outcome => Ok(outcome),
     }
 }
 
@@ -502,19 +521,6 @@ fn prepare_nar_upload(
     }
 }
 
-fn open_upload_reader(
-    representation: NarRepresentation,
-    info: &NarInfoMetadata,
-) -> Result<Box<dyn std::io::Read + Send>, PushError> {
-    match representation {
-        NarRepresentation::Raw(_) => open_verified_nar_reader(info),
-        NarRepresentation::Compressed(identity) => {
-            let encoded = identity.encoded();
-            open_verified_encoded_nar_reader(info, encoded.codec(), encoded)
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UploadArtifact {
     Nar,
@@ -522,10 +528,10 @@ enum UploadArtifact {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NarInfoUploadOutcome {
-    Uploaded,
-    AlreadyPresent,
-    Conflict,
+enum DestinationNarinfoState {
+    MatchesExpected,
+    Different,
+    Missing,
 }
 
 impl fmt::Display for UploadArtifact {
@@ -537,29 +543,17 @@ impl fmt::Display for UploadArtifact {
     }
 }
 
-fn require_successful_upload(
-    artifact: UploadArtifact,
-    info: &NarInfoMetadata,
-    status: u16,
-) -> Result<(), PushError> {
-    match status {
-        200 | 201 => Ok(()),
-        _ => Err(format!(
-            "{artifact} upload for {} returned HTTP {status}",
-            info.claims().store_path()
-        )
-        .into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use clap::{Args, Command, FromArgMatches};
 
-    use super::transfer::{is_retryable_status, retry_after_delay};
-    use super::{Agent, NarInfoMetadata, Push, TrustedUpstreams, dependency_waves};
+    use super::transfer::retry_after_delay;
+    use super::{
+        Agent, DestinationClient, NarInfoMetadata, Push, TrustedUpstreams, dependency_waves,
+    };
     use crate::http_url::HttpUrl;
     use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
+    use ureq::http::StatusCode;
 
     fn http_url(value: impl AsRef<str>) -> HttpUrl {
         value.as_ref().parse().expect("test HTTP URL should parse")
@@ -645,7 +639,10 @@ mod tests {
             let read = stream
                 .read(&mut request)
                 .expect("read narinfo verification GET");
-            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /narinfo HTTP/1.1"));
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .starts_with("GET /0123456789abcdfghijklmnpqrsvwxyz.narinfo HTTP/1.1")
+            );
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -661,14 +658,15 @@ mod tests {
             .http_status_as_error(false)
             .build()
             .into();
-        let client = super::UploadClient {
+        let client = DestinationClient {
+            base_url: http_url(format!("http://{address}")),
             agent,
             authorization: None,
         };
-        let result = client.require_narinfo_upload(
-            &http_url(format!("http://{address}/narinfo")),
+        let result = client.accept_upload_response(
+            super::UploadArtifact::Narinfo,
             &info,
-            409,
+            StatusCode::CONFLICT,
         );
 
         assert!(
@@ -681,16 +679,239 @@ mod tests {
     }
 
     #[test]
-    fn retries_only_transient_http_failures() {
-        for status in [408, 429, 500, 502, 503, 504] {
-            assert!(is_retryable_status(status), "HTTP {status} should retry");
-        }
-        for status in [200, 201, 400, 401, 404, 409, 413, 422] {
+    fn narinfo_conflict_verification_preserves_unexpected_http_statuses() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let info = test_narinfo_metadata(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package",
+            Vec::new(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind status test listener");
+        let address = listener.local_addr().expect("inspect status test listener");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept status verification GET");
+            let mut request = [0; 1024];
+            let read = stream
+                .read(&mut request)
+                .expect("read status verification GET");
             assert!(
-                !is_retryable_status(status),
-                "HTTP {status} should not retry"
+                String::from_utf8_lossy(&request[..read])
+                    .starts_with("GET /0123456789abcdfghijklmnpqrsvwxyz.narinfo HTTP/1.1")
             );
+            stream
+                .write_all(
+                    b"HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write unexpected status response");
+        });
+        let client = DestinationClient {
+            base_url: http_url(format!("http://{address}")),
+            agent: Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into(),
+            authorization: None,
+        };
+
+        let error = client
+            .narinfo_state(&info)
+            .expect_err("unexpected verification status should propagate");
+        assert!(error.contains("HTTP 418"));
+        server
+            .join()
+            .expect("status verification server should exit");
+    }
+
+    #[test]
+    fn destination_preflight_and_conflict_verification_agree_on_logical_identity() {
+        use super::{CacheLookup, DestinationNarinfoPolicy, PushDisposition, PushOutcome};
+        use narjar::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let path = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package";
+        let info = test_narinfo_metadata(path, Vec::new());
+        let different = test_narinfo_metadata(
+            path,
+            vec!["/nix/store/11111111111111111111111111111111-dependency".to_owned()],
+        );
+        let raw = NarRepresentation::Raw(info.claims().identity());
+        let compressed = |codec| {
+            NarRepresentation::compressed(
+                EncodedIdentity::new(
+                    codec,
+                    FileHash::parse(&"0".repeat(52)).unwrap(),
+                    EncodedSize::new(123),
+                ),
+                info.claims().identity(),
+            )
+        };
+        for (status, body, preflight, conflict) in [
+            (
+                200,
+                info.serialize(raw).unwrap(),
+                PushDisposition::DestinationPresent,
+                PushOutcome::DestinationPresent,
+            ),
+            (
+                200,
+                info.serialize(compressed(CompressionCodec::Xz)).unwrap(),
+                PushDisposition::DestinationPresent,
+                PushOutcome::DestinationPresent,
+            ),
+            (
+                200,
+                info.serialize(compressed(CompressionCodec::Zstd)).unwrap(),
+                PushDisposition::DestinationPresent,
+                PushOutcome::DestinationPresent,
+            ),
+            (
+                200,
+                different.serialize(raw).unwrap(),
+                PushDisposition::UploadRequired,
+                PushOutcome::Conflict,
+            ),
+            (
+                200,
+                b"invalid narinfo".to_vec(),
+                PushDisposition::UploadRequired,
+                PushOutcome::Conflict,
+            ),
+            (
+                404,
+                Vec::new(),
+                PushDisposition::UploadRequired,
+                PushOutcome::Conflict,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let headers: Vec<_> = BufReader::new(&mut stream)
+                        .lines()
+                        .map(Result::unwrap)
+                        .take_while(|line| !line.is_empty())
+                        .collect();
+                    assert_eq!(
+                        headers[0],
+                        "GET /cache/0123456789abcdfghijklmnpqrsvwxyz.narinfo HTTP/1.1"
+                    );
+                    assert!(headers.iter().any(|line| {
+                        line.eq_ignore_ascii_case("Authorization: Basic dGVzdDp0b2tlbg==")
+                    }));
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+            });
+            let client = DestinationClient {
+                base_url: http_url(format!("http://{address}/cache")),
+                agent: Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .build()
+                    .into(),
+                authorization: Some("dGVzdDp0b2tlbg==".to_owned()),
+            };
+            let upstreams = TrustedUpstreams::from_configuration(&[], &[]).unwrap();
+            let lookup =
+                CacheLookup::new(&client, DestinationNarinfoPolicy::ReuseExisting, &upstreams);
+            let preflight_result = lookup.classify(&info);
+            let conflict_result = client.accept_upload_response(
+                super::UploadArtifact::Narinfo,
+                &info,
+                StatusCode::CONFLICT,
+            );
+            server.join().unwrap();
+            assert_eq!(preflight_result.unwrap(), preflight);
+            assert_eq!(conflict_result.unwrap(), conflict);
         }
+    }
+
+    #[test]
+    fn different_destination_claims_never_query_trusted_upstreams() {
+        use super::{CacheLookup, DestinationNarinfoPolicy, PushDisposition};
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let info = test_narinfo_metadata(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package",
+            Vec::new(),
+        );
+        let different = test_narinfo_metadata(
+            info.claims().store_path(),
+            vec!["/nix/store/11111111111111111111111111111111-dependency".to_owned()],
+        );
+        let body = different
+            .serialize(NarRepresentation::Raw(different.claims().identity()))
+            .unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = destination.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = destination.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            BufReader::new(&mut stream)
+                .lines()
+                .map(Result::unwrap)
+                .take_while(|line| !line.is_empty())
+                .for_each(drop);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream_listener.set_nonblocking(true).unwrap();
+        let upstream = http_url(format!(
+            "http://{}",
+            upstream_listener.local_addr().unwrap()
+        ));
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let keys = [format!(
+            "{upstream}#test:{}",
+            data_encoding::BASE64.encode(key.as_bytes())
+        )];
+        let upstreams = TrustedUpstreams::from_configuration(&[upstream], &keys).unwrap();
+        let client = DestinationClient {
+            base_url: http_url(format!("http://{address}")),
+            agent: Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(5)))
+                .build()
+                .into(),
+            authorization: None,
+        };
+        let lookup = CacheLookup::new(&client, DestinationNarinfoPolicy::ReuseExisting, &upstreams);
+        let result = lookup.classify(&info);
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), PushDisposition::UploadRequired);
+        assert_eq!(
+            upstream_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "an upstream must never hide a conflicting destination entry"
+        );
     }
 
     #[test]
@@ -750,6 +971,55 @@ mod tests {
     }
 
     #[test]
+    fn retries_through_a_cache_restart_longer_than_the_request_burst() {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind restart retry listener");
+        let address = listener
+            .local_addr()
+            .expect("inspect restart retry listener");
+        let server = thread::spawn(move || {
+            let mut responses = [502, 502, 502, 502, 502, 502, 502, 200].into_iter();
+            loop {
+                let (mut stream, _) = listener.accept().expect("accept retry request");
+                let mut request = [0; 1024];
+                let read = stream.read(&mut request).expect("read retry request");
+                if request[..read].starts_with(b"GET /stop") {
+                    break;
+                }
+                let status = responses.next().expect("test sent too many requests");
+                let retry_after = if status == 502 {
+                    "Retry-After: 0\r\n"
+                } else {
+                    ""
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\n{retry_after}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write retry response");
+            }
+        });
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        let status =
+            super::request_status(&agent, &http_url(format!("http://{address}/narinfo")), None)
+                .expect("restart retry should reach the recovered cache");
+        let mut stop = TcpStream::connect(address).expect("connect to stop retry server");
+        stop.write_all(b"GET /stop HTTP/1.1\r\n\r\n")
+            .expect("stop retry server");
+        server.join().expect("restart retry server should exit");
+        assert_eq!(status, 200);
+    }
+
+    #[test]
     fn bounded_get_rejects_an_oversized_response() {
         use std::{
             io::{Read, Write},
@@ -781,6 +1051,7 @@ mod tests {
             &http_url(format!("http://{address}/narinfo")),
             None,
             4,
+            super::LookupPurpose::Destination,
         )
         .expect_err("oversized GET response must be rejected");
         assert!(error.contains("exceeded 4 bytes"));
@@ -931,7 +1202,7 @@ mod tests {
             .into();
 
         assert_eq!(
-            super::put_reader(
+            super::put(
                 &agent,
                 &http_url(format!("http://{address}/nar/test.nar")),
                 payload_size,
@@ -939,12 +1210,12 @@ mod tests {
                 None,
                 || {
                     std::fs::File::open(payload.path())
-                        .map(|file| Box::new(file) as Box<dyn std::io::Read + Send>)
+                        .map(ureq::SendBody::from_owned_reader)
                         .map_err(|error| super::PushError::new(error.to_string()))
                 }
             )
             .expect("upload retry should eventually succeed"),
-            201
+            StatusCode::CREATED
         );
         server.join().expect("upload retry test server should exit");
     }
@@ -1032,15 +1303,17 @@ mod tests {
             .into();
 
         assert_eq!(
-            super::put_file(
+            super::put(
                 &agent,
                 &http_url(format!("http://{address}/nar/test.nar")),
-                payload.path(),
+                payload.as_file().metadata().unwrap().len(),
                 "application/x-nix-nar",
-                None
+                None,
+                || std::fs::File::open(payload.path())
+                    .map_err(|error| super::PushError::new(error.to_string()))
             )
             .expect("redirected upload should succeed"),
-            201
+            StatusCode::CREATED
         );
         server.join().expect("redirect test server should exit");
     }
@@ -1118,26 +1391,29 @@ mod tests {
             .into();
 
         assert_eq!(
-            super::put_file(
+            super::put(
                 &agent,
                 &http_url(format!("http://{address}/nar/test.nar")),
-                payload.path(),
+                payload.as_file().metadata().unwrap().len(),
                 "application/x-nix-nar",
-                None
+                None,
+                || std::fs::File::open(payload.path())
+                    .map_err(|error| super::PushError::new(error.to_string()))
             )
             .expect("content-type upload should succeed"),
-            201
+            StatusCode::CREATED
         );
         assert_eq!(
-            super::put_bytes(
+            super::put(
                 &agent,
                 &http_url(format!("http://{address}/store.narinfo")),
-                b"StorePath: /nix/store/test\n",
+                b"StorePath: /nix/store/test\n".len() as u64,
                 "text/x-nix-narinfo",
-                None
+                None,
+                || Ok(b"StorePath: /nix/store/test\n".as_slice())
             )
             .expect("narinfo content-type upload should succeed"),
-            201
+            StatusCode::CREATED
         );
         server.join().expect("content-type server should exit");
     }

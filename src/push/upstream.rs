@@ -1,9 +1,13 @@
 use std::{fmt, sync::Arc};
 
-use narjar::narinfo::{MAX_NARINFO_BYTES, TrustedNarInfoClaims, TrustedPublicKeys};
-use ureq::Agent;
+use narjar::narinfo::{LogicalClaimsMismatch, MAX_NARINFO_BYTES, TrustedPublicKeys};
+use ureq::http::StatusCode;
 
-use super::{DestinationNarinfoPolicy, NarInfoMetadata, PushError, transfer::get_bounded};
+use super::{
+    DestinationClient, DestinationNarinfoPolicy, DestinationNarinfoState, NarInfoMetadata,
+    PushError, narinfo_url,
+    transfer::{LookupPurpose, get_bounded},
+};
 use crate::http_url::HttpUrl;
 
 #[derive(Clone)]
@@ -73,25 +77,19 @@ pub(super) enum PushDisposition {
 }
 
 pub(super) struct CacheLookup<'a> {
-    agent: &'a Agent,
-    destination: &'a HttpUrl,
-    destination_authorization: Option<&'a str>,
+    destination: &'a DestinationClient,
     destination_narinfo: DestinationNarinfoPolicy,
     upstreams: &'a TrustedUpstreams,
 }
 
 impl<'a> CacheLookup<'a> {
     pub(super) fn new(
-        agent: &'a Agent,
-        destination: &'a HttpUrl,
-        destination_authorization: Option<&'a str>,
+        destination: &'a DestinationClient,
         destination_narinfo: DestinationNarinfoPolicy,
         upstreams: &'a TrustedUpstreams,
     ) -> Self {
         Self {
-            agent,
             destination,
-            destination_authorization,
             destination_narinfo,
             upstreams,
         }
@@ -99,139 +97,114 @@ impl<'a> CacheLookup<'a> {
 
     pub(super) fn classify(&self, info: &NarInfoMetadata) -> Result<PushDisposition, PushError> {
         match self.destination_narinfo {
-            DestinationNarinfoPolicy::Refresh => return Ok(PushDisposition::UploadRequired),
-            DestinationNarinfoPolicy::ReuseExisting => {}
-        }
-
-        let route = info.claims().store();
-        let narinfo_name = format!("{}.narinfo", route.as_str());
-        let destination_url = self.destination.endpoint(&[&narinfo_name]);
-        let response = get_bounded(
-            self.agent,
-            &destination_url,
-            self.destination_authorization,
-            MAX_NARINFO_BYTES,
-        )?;
-        match response.status {
-            200 => {
-                let matches_expected = info.claims().matches_external_narinfo(route, response.body);
-                if matches_expected {
-                    return Ok(PushDisposition::DestinationPresent);
+            DestinationNarinfoPolicy::Refresh => Ok(PushDisposition::UploadRequired),
+            DestinationNarinfoPolicy::ReuseExisting => {
+                match self.destination.narinfo_state(info)? {
+                    DestinationNarinfoState::MatchesExpected => {
+                        Ok(PushDisposition::DestinationPresent)
+                    }
+                    DestinationNarinfoState::Different => Ok(PushDisposition::UploadRequired),
+                    DestinationNarinfoState::Missing => Ok(self.classify_upstream(info)),
                 }
             }
-            404 => {}
-            status => {
-                return Err(format!(
-                    "narinfo lookup for {} returned HTTP {status}",
-                    info.claims().store_path()
-                )
-                .into());
-            }
         }
-
-        self.classify_upstream(route, &narinfo_name, info)
     }
 
-    fn classify_upstream(
-        &self,
-        route: &narjar::storage::StoreHash,
-        narinfo_name: &str,
-        info: &NarInfoMetadata,
-    ) -> Result<PushDisposition, PushError> {
-        for upstream in self.upstreams.entries.iter() {
-            match self.lookup_upstream(route, upstream, narinfo_name, info)? {
-                UpstreamLookup::Matched(matched) => {
-                    return Ok(PushDisposition::TrustedUpstreamPresent(matched));
+    fn classify_upstream(&self, info: &NarInfoMetadata) -> PushDisposition {
+        let matched_upstream = self.upstreams.entries.iter().find_map(|upstream| {
+            match self.lookup_upstream(upstream, info) {
+                UpstreamLookup::Matched(matched) => Some(matched),
+                UpstreamLookup::Rejected(reason) => {
+                    eprintln!(
+                        "narjar push: trusted upstream {} rejected for {}: {reason}; checking next source",
+                        upstream.url,
+                        info.claims().store_path()
+                    );
+                    None
                 }
-                UpstreamLookup::Rejected(reason) => eprintln!(
-                    "narjar push: trusted upstream {} rejected for {}: {reason}; checking next source",
-                    upstream.url,
-                    info.claims().store_path()
-                ),
-                UpstreamLookup::Missing => {}
+                UpstreamLookup::Missing => None,
+            }
+        });
+        match matched_upstream {
+            Some(upstream) => PushDisposition::TrustedUpstreamPresent(upstream),
+            None => {
+                if !self.upstreams.entries.is_empty() {
+                    eprintln!(
+                        "narjar push: no trusted upstream matched {}; uploading instead",
+                        info.claims().store_path()
+                    );
+                }
+                PushDisposition::UploadRequired
             }
         }
-        if !self.upstreams.entries.is_empty() {
-            eprintln!(
-                "narjar push: no trusted upstream matched {}; uploading instead",
-                info.claims().store_path()
-            );
-        }
-        Ok(PushDisposition::UploadRequired)
     }
 
     fn lookup_upstream(
         &self,
-        route: &narjar::storage::StoreHash,
         upstream: &ConfiguredUpstream,
-        narinfo_name: &str,
         info: &NarInfoMetadata,
-    ) -> Result<UpstreamLookup, PushError> {
-        let url = upstream.url.endpoint(&[narinfo_name]);
-        let response = match get_bounded(self.agent, &url, None, MAX_NARINFO_BYTES) {
-            Ok(response) => response,
-            Err(error) => {
-                return Ok(UpstreamLookup::Rejected(format!("lookup failed: {error}")));
+    ) -> UpstreamLookup {
+        let url = narinfo_url(&upstream.url, info);
+        get_bounded(
+            &self.destination.agent,
+            &url,
+            None,
+            MAX_NARINFO_BYTES,
+            LookupPurpose::UpstreamProbe,
+        )
+        .map(|response| match response {
+            super::transfer::GetResponse::Found(body) => {
+                verify_upstream_narinfo(upstream, info, body)
             }
-        };
-        match response.status {
-            404 => return Ok(UpstreamLookup::Missing),
-            200 => {}
-            status => {
-                return Ok(UpstreamLookup::Rejected(format!(
-                    "lookup returned HTTP {status}"
-                )));
+            super::transfer::GetResponse::Missing => UpstreamLookup::Missing,
+            super::transfer::GetResponse::UnexpectedStatus(status) => {
+                UpstreamLookup::Rejected(UpstreamRejection::UnexpectedStatus(status))
             }
-        }
+        })
+        .unwrap_or_else(|error| UpstreamLookup::Rejected(UpstreamRejection::LookupFailed(error)))
+    }
+}
 
-        let claims = match upstream.keys.verify_external_narinfo(route, response.body) {
-            Ok(verified) => verified,
-            Err(error) => return Ok(UpstreamLookup::Rejected(error.to_string())),
-        };
-        match compare_logical_claims(info, &claims) {
-            Ok(()) => Ok(UpstreamLookup::Matched(upstream.url.clone())),
-            Err(mismatch) => Ok(UpstreamLookup::Rejected(mismatch.to_string())),
+fn verify_upstream_narinfo(
+    upstream: &ConfiguredUpstream,
+    info: &NarInfoMetadata,
+    body: Vec<u8>,
+) -> UpstreamLookup {
+    let claims = match upstream
+        .keys
+        .verify_external_narinfo(info.claims().store(), body)
+    {
+        Ok(verified) => verified,
+        Err(error) => {
+            return UpstreamLookup::Rejected(UpstreamRejection::InvalidNarInfo(error.to_string()));
         }
+    };
+    match info.claims().compare_logical_claims(claims.claims()) {
+        Ok(()) => UpstreamLookup::Matched(upstream.url.clone()),
+        Err(mismatch) => UpstreamLookup::Rejected(UpstreamRejection::ClaimsMismatch(mismatch)),
     }
 }
 
 enum UpstreamLookup {
     Missing,
-    Rejected(String),
+    Rejected(UpstreamRejection),
     Matched(HttpUrl),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LogicalClaimsMismatch {
-    StorePath,
-    NarIdentity,
-    References,
+enum UpstreamRejection {
+    LookupFailed(PushError),
+    UnexpectedStatus(StatusCode),
+    InvalidNarInfo(String),
+    ClaimsMismatch(LogicalClaimsMismatch),
 }
 
-impl fmt::Display for LogicalClaimsMismatch {
+impl fmt::Display for UpstreamRejection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StorePath => formatter.write_str("store path differs"),
-            Self::NarIdentity => formatter.write_str("NAR hash or size differs"),
-            Self::References => formatter.write_str("references differ"),
+            Self::LookupFailed(error) => write!(formatter, "lookup failed: {error}"),
+            Self::UnexpectedStatus(status) => write!(formatter, "lookup returned HTTP {status}"),
+            Self::InvalidNarInfo(error) => formatter.write_str(error),
+            Self::ClaimsMismatch(mismatch) => mismatch.fmt(formatter),
         }
     }
-}
-
-fn compare_logical_claims(
-    local: &NarInfoMetadata,
-    upstream: &TrustedNarInfoClaims,
-) -> Result<(), LogicalClaimsMismatch> {
-    let upstream = upstream.claims();
-    let local = local.claims();
-    if upstream.store_path() != local.store_path() {
-        return Err(LogicalClaimsMismatch::StorePath);
-    }
-    if upstream.identity() != local.identity() {
-        return Err(LogicalClaimsMismatch::NarIdentity);
-    }
-    if upstream.reference_paths().ne(local.reference_paths()) {
-        return Err(LogicalClaimsMismatch::References);
-    }
-    Ok(())
 }

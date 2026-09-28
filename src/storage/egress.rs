@@ -10,6 +10,7 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
+use crate::nar_compression::encode_and_measure_nar;
 use crate::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
     NarIdentity, NarRepresentation, WireEncoding,
@@ -17,7 +18,7 @@ use crate::object::{
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
 use super::compression::{
-    CapacityCheckedStagingWriter, encode_raw_nar, encoded_file_matches, nar_file_size_matches,
+    CapacityCheckedStagingWriter, encoded_file_matches, nar_file_size_matches,
 };
 use super::fs::{
     BoundedRegularFile, open_optional_at, read_bounded_regular_file, read_dir_names, unlink_at,
@@ -228,8 +229,10 @@ fn encode_canonical_raw_nar_into_capacity_checked_staging_file(
     min_free_bytes: u64,
 ) -> Result<EncodedIdentity, StorageError> {
     let mut destination = CapacityCheckedStagingWriter::new(temporary, reservation, min_free_bytes);
-    let source = raw.reader()?;
-    let output = encode_raw_nar(source, codec, &mut destination)?;
+    let mut source = raw.reader()?;
+    let output = encode_and_measure_nar(codec, &mut destination, |output| {
+        io::copy(&mut source, output).map(|_| ())
+    })?;
     destination.flush()?;
     Ok(output)
 }
