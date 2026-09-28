@@ -340,11 +340,9 @@ fn native_copy_paths(
     options: &NativeCopyOptions,
     metadata: &[NarInfoMetadata],
 ) -> Result<PushReport, PushError> {
-    let client = UploadClient::new(options)?;
+    let client = DestinationClient::new(options)?;
     let lookup = CacheLookup::new(
-        &client.agent,
-        &options.target,
-        client.authorization.as_deref(),
+        &client,
         options.destination_narinfo,
         &options.trusted_upstreams,
     );
@@ -357,12 +355,13 @@ fn native_copy_paths(
         })
 }
 
-struct UploadClient {
+struct DestinationClient {
+    base_url: HttpUrl,
     agent: Agent,
     authorization: Option<String>,
 }
 
-impl UploadClient {
+impl DestinationClient {
     fn new(options: &NativeCopyOptions) -> Result<Self, PushError> {
         let authorization = authorization_for_destination(options)?;
         let agent = Agent::config_builder()
@@ -371,6 +370,7 @@ impl UploadClient {
             .build()
             .into();
         Ok(Self {
+            base_url: options.target.clone(),
             agent,
             authorization,
         })
@@ -378,15 +378,13 @@ impl UploadClient {
 
     fn upload_path(
         &self,
-        target: &HttpUrl,
         compression: WireEncoding,
         info: &NarInfoMetadata,
     ) -> Result<PushOutcome, PushError> {
-        let narinfo_url =
-            target.endpoint(&[&format!("{}.narinfo", info.claims().store().as_str())]);
+        let narinfo_url = narinfo_url(&self.base_url, info);
         let payload = prepare_nar_upload(info, compression)?;
         let nar_name = payload.file_name().to_string();
-        let nar_url = target.endpoint(&["nar", &nar_name]);
+        let nar_url = self.base_url.endpoint(&["nar", &nar_name]);
         let nar_status = put_reader(
             &self.agent,
             &nar_url,
@@ -405,18 +403,17 @@ impl UploadClient {
             "text/x-nix-narinfo",
             self.authorization.as_deref(),
         )?;
-        self.require_narinfo_upload(&narinfo_url, info, narinfo_status)
+        self.require_narinfo_upload(info, narinfo_status)
     }
 
     fn require_narinfo_upload(
         &self,
-        narinfo_url: &HttpUrl,
         info: &NarInfoMetadata,
         status: StatusCode,
     ) -> Result<PushOutcome, PushError> {
         match status {
             StatusCode::OK | StatusCode::CREATED => Ok(PushOutcome::Uploaded),
-            StatusCode::CONFLICT => match self.destination_narinfo_state(narinfo_url, info)? {
+            StatusCode::CONFLICT => match self.narinfo_state(info)? {
                 DestinationNarinfoState::MatchesExpected => Ok(PushOutcome::DestinationPresent),
                 DestinationNarinfoState::Different | DestinationNarinfoState::Missing => {
                     Ok(PushOutcome::Conflict)
@@ -427,14 +424,10 @@ impl UploadClient {
         }
     }
 
-    fn destination_narinfo_state(
-        &self,
-        narinfo_url: &HttpUrl,
-        info: &NarInfoMetadata,
-    ) -> Result<DestinationNarinfoState, PushError> {
+    fn narinfo_state(&self, info: &NarInfoMetadata) -> Result<DestinationNarinfoState, PushError> {
         let response = get_bounded(
             &self.agent,
-            narinfo_url,
+            &narinfo_url(&self.base_url, info),
             self.authorization.as_deref(),
             MAX_NARINFO_BYTES,
         )?;
@@ -460,6 +453,10 @@ impl UploadClient {
     }
 }
 
+fn narinfo_url(base_url: &HttpUrl, info: &NarInfoMetadata) -> HttpUrl {
+    base_url.endpoint(&[&format!("{}.narinfo", info.claims().store().as_str())])
+}
+
 fn authorization_for_destination(options: &NativeCopyOptions) -> Result<Option<String>, PushError> {
     match options.netrc_file.as_deref() {
         Some(path) => Ok(
@@ -472,7 +469,7 @@ fn authorization_for_destination(options: &NativeCopyOptions) -> Result<Option<S
 
 fn copy_path(
     lookup: &CacheLookup<'_>,
-    client: &UploadClient,
+    client: &DestinationClient,
     options: &NativeCopyOptions,
     info: &NarInfoMetadata,
 ) -> Result<PushOutcome, PushError> {
@@ -490,11 +487,11 @@ fn copy_path(
 }
 
 fn upload_required_path(
-    client: &UploadClient,
+    client: &DestinationClient,
     options: &NativeCopyOptions,
     info: &NarInfoMetadata,
 ) -> Result<PushOutcome, PushError> {
-    match client.upload_path(&options.target, options.compression, info)? {
+    match client.upload_path(options.compression, info)? {
         PushOutcome::Conflict if options.ignore_conflicts => {
             eprintln!(
                 "narjar push: skipping immutable conflict for {}",
@@ -576,8 +573,10 @@ fn require_successful_upload(
 mod tests {
     use clap::{Args, Command, FromArgMatches};
 
-    use super::transfer::{is_retryable_status, retry_after_delay};
-    use super::{Agent, NarInfoMetadata, Push, TrustedUpstreams, UploadClient, dependency_waves};
+    use super::transfer::retry_after_delay;
+    use super::{
+        Agent, DestinationClient, NarInfoMetadata, Push, TrustedUpstreams, dependency_waves,
+    };
     use crate::http_url::HttpUrl;
     use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
     use ureq::http::StatusCode;
@@ -666,7 +665,10 @@ mod tests {
             let read = stream
                 .read(&mut request)
                 .expect("read narinfo verification GET");
-            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /narinfo HTTP/1.1"));
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .starts_with("GET /0123456789abcdfghijklmnpqrsvwxyz.narinfo HTTP/1.1")
+            );
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -682,15 +684,12 @@ mod tests {
             .http_status_as_error(false)
             .build()
             .into();
-        let client = super::UploadClient {
+        let client = DestinationClient {
+            base_url: http_url(format!("http://{address}")),
             agent,
             authorization: None,
         };
-        let result = client.require_narinfo_upload(
-            &http_url(format!("http://{address}/narinfo")),
-            &info,
-            StatusCode::CONFLICT,
-        );
+        let result = client.require_narinfo_upload(&info, StatusCode::CONFLICT);
 
         assert!(
             result.is_ok(),
@@ -721,14 +720,18 @@ mod tests {
             let read = stream
                 .read(&mut request)
                 .expect("read status verification GET");
-            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /narinfo HTTP/1.1"));
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .starts_with("GET /0123456789abcdfghijklmnpqrsvwxyz.narinfo HTTP/1.1")
+            );
             stream
                 .write_all(
                     b"HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .expect("write unexpected status response");
         });
-        let client = UploadClient {
+        let client = DestinationClient {
+            base_url: http_url(format!("http://{address}")),
             agent: Agent::config_builder()
                 .http_status_as_error(false)
                 .build()
@@ -737,7 +740,7 @@ mod tests {
         };
 
         let error = client
-            .destination_narinfo_state(&http_url(format!("http://{address}/narinfo")), &info)
+            .narinfo_state(&info)
             .expect_err("unexpected verification status should propagate");
         assert!(error.contains("HTTP 418"));
         server
@@ -746,31 +749,115 @@ mod tests {
     }
 
     #[test]
-    fn retries_only_transient_http_failures() {
-        for status in [
-            StatusCode::REQUEST_TIMEOUT,
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            StatusCode::BAD_GATEWAY,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::GATEWAY_TIMEOUT,
+    fn destination_preflight_and_conflict_verification_agree_on_logical_identity() {
+        use super::{CacheLookup, DestinationNarinfoPolicy, PushDisposition, PushOutcome};
+        use narjar::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let path = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package";
+        let info = test_narinfo_metadata(path, Vec::new());
+        let different = test_narinfo_metadata(
+            path,
+            vec!["/nix/store/11111111111111111111111111111111-dependency".to_owned()],
+        );
+        let raw = NarRepresentation::Raw(info.claims().identity());
+        let compressed = |codec| {
+            NarRepresentation::compressed(
+                EncodedIdentity::new(
+                    codec,
+                    FileHash::parse(&"0".repeat(52)).unwrap(),
+                    EncodedSize::new(123),
+                ),
+                info.claims().identity(),
+            )
+        };
+        for (status, body, preflight, conflict) in [
+            (
+                200,
+                info.serialize(raw).unwrap(),
+                PushDisposition::DestinationPresent,
+                PushOutcome::DestinationPresent,
+            ),
+            (
+                200,
+                info.serialize(compressed(CompressionCodec::Xz)).unwrap(),
+                PushDisposition::DestinationPresent,
+                PushOutcome::DestinationPresent,
+            ),
+            (
+                200,
+                info.serialize(compressed(CompressionCodec::Zstd)).unwrap(),
+                PushDisposition::DestinationPresent,
+                PushOutcome::DestinationPresent,
+            ),
+            (
+                200,
+                different.serialize(raw).unwrap(),
+                PushDisposition::UploadRequired,
+                PushOutcome::Conflict,
+            ),
+            (
+                200,
+                b"invalid narinfo".to_vec(),
+                PushDisposition::UploadRequired,
+                PushOutcome::Conflict,
+            ),
+            (
+                404,
+                Vec::new(),
+                PushDisposition::UploadRequired,
+                PushOutcome::Conflict,
+            ),
         ] {
-            assert!(is_retryable_status(status), "HTTP {status} should retry");
-        }
-        for status in [
-            StatusCode::OK,
-            StatusCode::CREATED,
-            StatusCode::BAD_REQUEST,
-            StatusCode::UNAUTHORIZED,
-            StatusCode::NOT_FOUND,
-            StatusCode::CONFLICT,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ] {
-            assert!(
-                !is_retryable_status(status),
-                "HTTP {status} should not retry"
-            );
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let headers: Vec<_> = BufReader::new(&mut stream)
+                        .lines()
+                        .map(Result::unwrap)
+                        .take_while(|line| !line.is_empty())
+                        .collect();
+                    assert_eq!(
+                        headers[0],
+                        "GET /cache/0123456789abcdfghijklmnpqrsvwxyz.narinfo HTTP/1.1"
+                    );
+                    assert!(headers.iter().any(|line| {
+                        line.eq_ignore_ascii_case("Authorization: Basic dGVzdDp0b2tlbg==")
+                    }));
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+            });
+            let client = DestinationClient {
+                base_url: http_url(format!("http://{address}/cache")),
+                agent: Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .build()
+                    .into(),
+                authorization: Some("dGVzdDp0b2tlbg==".to_owned()),
+            };
+            let upstreams = TrustedUpstreams::from_configuration(&[], &[]).unwrap();
+            let lookup =
+                CacheLookup::new(&client, DestinationNarinfoPolicy::ReuseExisting, &upstreams);
+            let preflight_result = lookup.classify(&info);
+            let conflict_result = client.require_narinfo_upload(&info, StatusCode::CONFLICT);
+            server.join().unwrap();
+            assert_eq!(preflight_result.unwrap(), preflight);
+            assert_eq!(conflict_result.unwrap(), conflict);
         }
     }
 

@@ -1,9 +1,12 @@
 use std::{fmt, sync::Arc};
 
 use narjar::narinfo::{MAX_NARINFO_BYTES, TrustedNarInfoClaims, TrustedPublicKeys};
-use ureq::{Agent, http::StatusCode};
+use ureq::http::StatusCode;
 
-use super::{DestinationNarinfoPolicy, NarInfoMetadata, PushError, transfer::get_bounded};
+use super::{
+    DestinationClient, DestinationNarinfoPolicy, DestinationNarinfoState, NarInfoMetadata,
+    PushError, narinfo_url, transfer::get_bounded,
+};
 use crate::http_url::HttpUrl;
 
 #[derive(Clone)]
@@ -73,25 +76,19 @@ pub(super) enum PushDisposition {
 }
 
 pub(super) struct CacheLookup<'a> {
-    agent: &'a Agent,
-    destination: &'a HttpUrl,
-    destination_authorization: Option<&'a str>,
+    destination: &'a DestinationClient,
     destination_narinfo: DestinationNarinfoPolicy,
     upstreams: &'a TrustedUpstreams,
 }
 
 impl<'a> CacheLookup<'a> {
     pub(super) fn new(
-        agent: &'a Agent,
-        destination: &'a HttpUrl,
-        destination_authorization: Option<&'a str>,
+        destination: &'a DestinationClient,
         destination_narinfo: DestinationNarinfoPolicy,
         upstreams: &'a TrustedUpstreams,
     ) -> Self {
         Self {
-            agent,
             destination,
-            destination_authorization,
             destination_narinfo,
             upstreams,
         }
@@ -99,47 +96,23 @@ impl<'a> CacheLookup<'a> {
 
     pub(super) fn classify(&self, info: &NarInfoMetadata) -> Result<PushDisposition, PushError> {
         match self.destination_narinfo {
-            DestinationNarinfoPolicy::Refresh => return Ok(PushDisposition::UploadRequired),
-            DestinationNarinfoPolicy::ReuseExisting => {}
-        }
-
-        let route = info.claims().store();
-        let narinfo_name = format!("{}.narinfo", route.as_str());
-        let destination_url = self.destination.endpoint(&[&narinfo_name]);
-        let response = get_bounded(
-            self.agent,
-            &destination_url,
-            self.destination_authorization,
-            MAX_NARINFO_BYTES,
-        )?;
-        match response {
-            super::transfer::GetResponse::Found(body) => {
-                let matches_expected = info.claims().matches_external_narinfo(route, body);
-                if matches_expected {
-                    return Ok(PushDisposition::DestinationPresent);
+            DestinationNarinfoPolicy::Refresh => Ok(PushDisposition::UploadRequired),
+            DestinationNarinfoPolicy::ReuseExisting => {
+                match self.destination.narinfo_state(info)? {
+                    DestinationNarinfoState::MatchesExpected => {
+                        Ok(PushDisposition::DestinationPresent)
+                    }
+                    DestinationNarinfoState::Different | DestinationNarinfoState::Missing => {
+                        Ok(self.classify_upstream(info))
+                    }
                 }
             }
-            super::transfer::GetResponse::Missing => {}
-            super::transfer::GetResponse::UnexpectedStatus(status) => {
-                return Err(format!(
-                    "narinfo lookup for {} returned HTTP {status}",
-                    info.claims().store_path()
-                )
-                .into());
-            }
         }
-
-        self.classify_upstream(route, &narinfo_name, info)
     }
 
-    fn classify_upstream(
-        &self,
-        route: &narjar::storage::StoreHash,
-        narinfo_name: &str,
-        info: &NarInfoMetadata,
-    ) -> Result<PushDisposition, PushError> {
+    fn classify_upstream(&self, info: &NarInfoMetadata) -> PushDisposition {
         let matched_upstream = self.upstreams.entries.iter().find_map(|upstream| {
-            match self.lookup_upstream(route, upstream, narinfo_name, info) {
+            match self.lookup_upstream(upstream, info) {
                 UpstreamLookup::Matched(matched) => Some(matched),
                 UpstreamLookup::Rejected(reason) => {
                     eprintln!(
@@ -153,7 +126,7 @@ impl<'a> CacheLookup<'a> {
             }
         });
         match matched_upstream {
-            Some(upstream) => Ok(PushDisposition::TrustedUpstreamPresent(upstream)),
+            Some(upstream) => PushDisposition::TrustedUpstreamPresent(upstream),
             None => {
                 if !self.upstreams.entries.is_empty() {
                     eprintln!(
@@ -161,23 +134,21 @@ impl<'a> CacheLookup<'a> {
                         info.claims().store_path()
                     );
                 }
-                Ok(PushDisposition::UploadRequired)
+                PushDisposition::UploadRequired
             }
         }
     }
 
     fn lookup_upstream(
         &self,
-        route: &narjar::storage::StoreHash,
         upstream: &ConfiguredUpstream,
-        narinfo_name: &str,
         info: &NarInfoMetadata,
     ) -> UpstreamLookup {
-        let url = upstream.url.endpoint(&[narinfo_name]);
-        get_bounded(self.agent, &url, None, MAX_NARINFO_BYTES)
+        let url = narinfo_url(&upstream.url, info);
+        get_bounded(&self.destination.agent, &url, None, MAX_NARINFO_BYTES)
             .map(|response| match response {
                 super::transfer::GetResponse::Found(body) => {
-                    verify_upstream_narinfo(route, upstream, info, body)
+                    verify_upstream_narinfo(upstream, info, body)
                 }
                 super::transfer::GetResponse::Missing => UpstreamLookup::Missing,
                 super::transfer::GetResponse::UnexpectedStatus(status) => {
@@ -191,12 +162,14 @@ impl<'a> CacheLookup<'a> {
 }
 
 fn verify_upstream_narinfo(
-    route: &narjar::storage::StoreHash,
     upstream: &ConfiguredUpstream,
     info: &NarInfoMetadata,
     body: Vec<u8>,
 ) -> UpstreamLookup {
-    let claims = match upstream.keys.verify_external_narinfo(route, body) {
+    let claims = match upstream
+        .keys
+        .verify_external_narinfo(info.claims().store(), body)
+    {
         Ok(verified) => verified,
         Err(error) => {
             return UpstreamLookup::Rejected(UpstreamRejection::InvalidNarInfo(error.to_string()));
