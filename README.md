@@ -34,12 +34,19 @@ cargo install --locked --path .
 ```
 
 The repository also provides a Nix package, a NixOS module, and a Linux OCI image.
-The package builds on Linux and macOS. Chunked storage is supported only on
-Linux; macOS must use the flat backend.
+The Nix package is provided for x86_64 Linux and Apple-silicon macOS. The
+crates.io consumer smoke test currently runs on x86_64 Linux. Chunked storage is
+supported only on Linux; macOS must use the flat backend.
 To run the CLI with Nix:
 
 ```sh
 nix run github:mjc/narjar -- --help
+```
+
+After Narjar has been published to crates.io, install a released version with:
+
+```sh
+cargo install --locked narjar
 ```
 
 ## Create a cache
@@ -273,8 +280,8 @@ cargo nextest run --locked
 nix flake check -L --no-update-lock-file
 ```
 
-The library exports NAR encoding and decoding, narinfo, and storage APIs.
-Generate API documentation with `cargo doc --no-deps --open`.
+The supported library API exports NAR encoding and decoding plus typed content
+identities. Generate API documentation with `cargo doc --no-deps --open`.
 
 Further documentation:
 
