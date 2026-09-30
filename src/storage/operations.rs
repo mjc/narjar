@@ -365,9 +365,7 @@ impl Storage {
         expected_length: u64,
         policy: NarUploadPolicy,
     ) -> Result<PublishOutcome, StorageError> {
-        if expected_length > policy.max_bytes {
-            return Err(StorageError::UploadTooLarge);
-        }
+        policy.ensure_encoded_size_within_limit(expected_length)?;
 
         let staging = self.reserve_staging(expected_length, policy.min_free_bytes)?;
         self.publish_nar_with_staging(name, source, expected_length, policy, staging)
@@ -381,6 +379,7 @@ impl Storage {
         policy: NarUploadPolicy,
         staging: StagingReservation,
     ) -> Result<PublishOutcome, StorageError> {
+        policy.ensure_encoded_size_within_limit(expected_length)?;
         match &self.payloads {
             PayloadStorage::Flat => {
                 let receiving = self.begin_upload(name, expected_length, policy, staging)?;
@@ -418,7 +417,8 @@ impl Storage {
             source,
             name,
             expected_length,
-            policy.max_bytes,
+            policy.max_decoded_bytes,
+            policy.decoder_memory_limit,
             &mut destination,
         )?;
         let completed = destination

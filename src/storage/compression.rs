@@ -3,13 +3,15 @@ use std::{
     ffi::OsString,
     fmt,
     fs::File,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     rc::Rc,
 };
 
 use lzma_rust2::XzReader;
 use sha2::{Digest, Sha256};
-use structured_zstd::decoding::StreamingDecoder as StructuredZstdDecoder;
+use structured_zstd::decoding::{
+    StreamingDecoder as StructuredZstdDecoder, read_frame_header_info,
+};
 
 use crate::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
@@ -17,11 +19,15 @@ use crate::object::{
 };
 
 use super::{
-    publication::{StagingReservation, StorageError},
+    publication::{
+        DecoderMemoryLimit, DecoderMemoryLimitExceeded, StagingReservation, StorageError,
+    },
     receipt::CompressedNarReceipt,
     typestate::Validated,
 };
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
+const ZSTD_FRAME_HEADER_MAX_BYTES: usize = 18;
+const ZSTD_BLOCK_BUFFER_BYTES: u64 = 128 * 1024;
 
 pub(super) struct CheckedUploadReader<R> {
     inner: R,
@@ -268,12 +274,14 @@ pub(super) fn receive_uploaded_nar<W: Write>(
     name: NarFileName,
     length: u64,
     max_nar_size: u64,
+    decoder_memory_limit: DecoderMemoryLimit,
     destination: &mut W,
 ) -> io::Result<ReceivedNar> {
     let expectation = UploadExpectation {
         name,
         size: length.into(),
         max_nar_size,
+        decoder_memory_limit,
     };
     let codec = match name.encoding() {
         WireEncoding::Raw => {
@@ -313,9 +321,10 @@ fn decode_xz_upload_to_raw_staging<W: Write>(
     let input =
         CheckedUploadReader::new(source, expectation.name.file_hash(), expectation.size.get());
     let source_error = Rc::new(RefCell::new(None));
-    let mut decoder = XzReader::new(
+    let mut decoder = XzReader::new_mem_limit(
         UploadCompressedSourceReader::new(input, Rc::clone(&source_error)),
         false,
+        xz_decoder_memory_limit_kib(expectation.decoder_memory_limit.get()),
     );
     let decoded = copy_decoded_upload_to_raw_staging(
         &mut decoder,
@@ -335,19 +344,68 @@ fn decode_zstd_upload_to_raw_staging<W: Write>(
     let input =
         CheckedUploadReader::new(source, expectation.name.file_hash(), expectation.size.get());
     let source_error = Rc::new(RefCell::new(None));
-    let mut decoder = StructuredZstdDecoder::new(UploadCompressedSourceReader::new(
-        input,
-        Rc::clone(&source_error),
-    ))
-    .map_err(|error| take_upload_source_error(&source_error, compressed_decoder_error(error)))?;
+    let upload_source = UploadCompressedSourceReader::new(input, Rc::clone(&source_error));
+    let prefixed_source =
+        preflight_zstd_window(upload_source, expectation.decoder_memory_limit.get())
+            .map_err(|error| take_upload_source_error(&source_error, error))?;
+    let mut decoder = StructuredZstdDecoder::new(prefixed_source).map_err(|error| {
+        take_upload_source_error(&source_error, compressed_decoder_error(error))
+    })?;
     let decoded = copy_decoded_upload_to_raw_staging(
         &mut decoder,
         destination,
         expectation.max_nar_size,
         &source_error,
     )?;
-    finish_encoded_upload_after_decoding(decoder.into_inner().into_inner(), &source_error)?;
+    finish_zstd_upload_after_decoding(decoder.into_inner(), &source_error)?;
     Ok(decoded)
+}
+
+fn xz_decoder_memory_limit_kib(max_memory_bytes: u64) -> u32 {
+    (max_memory_bytes / 1024).min(u64::from(u32::MAX)) as u32
+}
+
+fn preflight_zstd_window<R: Read>(
+    mut source: R,
+    max_decoder_memory_bytes: u64,
+) -> io::Result<io::Chain<Cursor<Vec<u8>>, R>> {
+    let mut header_bytes = [0; ZSTD_FRAME_HEADER_MAX_BYTES];
+    let mut header_length = 0;
+    while header_length < header_bytes.len() {
+        match source.read(&mut header_bytes[header_length..]) {
+            Ok(0) => break,
+            Ok(read) => header_length += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    let header_prefix = &header_bytes[..header_length];
+    let header = read_frame_header_info(header_prefix, false)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let maximum_window = max_decoder_memory_bytes.saturating_sub(ZSTD_BLOCK_BUFFER_BYTES);
+    if header.window_size > maximum_window {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            DecoderMemoryLimitExceeded,
+        ));
+    }
+
+    Ok(Cursor::new(header_prefix.to_vec()).chain(source))
+}
+
+fn finish_zstd_upload_after_decoding<R: Read>(
+    input: io::Chain<Cursor<Vec<u8>>, UploadCompressedSourceReader<CheckedUploadReader<R>>>,
+    source_error: &RefCell<Option<io::Error>>,
+) -> io::Result<()> {
+    let (prefix, source) = input.into_inner();
+    if prefix.position() != prefix.get_ref().len() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zstd frame has trailing bytes",
+        ));
+    }
+    finish_encoded_upload_after_decoding(source.into_inner(), source_error)
 }
 
 #[derive(Clone, Copy)]
@@ -355,6 +413,7 @@ struct UploadExpectation {
     name: NarFileName,
     size: EncodedSize,
     max_nar_size: u64,
+    decoder_memory_limit: DecoderMemoryLimit,
 }
 
 impl UploadExpectation {
@@ -420,7 +479,13 @@ struct NormalizeCompressedReadErrors<R>(R);
 
 impl<R: Read> Read for NormalizeCompressedReadErrors<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buffer).map_err(compressed_read_error)
+        self.0.read(buffer).map_err(|error| {
+            if error.kind() == io::ErrorKind::OutOfMemory {
+                io::Error::new(io::ErrorKind::InvalidData, DecoderMemoryLimitExceeded)
+            } else {
+                compressed_read_error(error)
+            }
+        })
     }
 }
 

@@ -59,9 +59,6 @@ impl Storage {
         policy: NarUploadPolicy,
         reservation: StagingReservation,
     ) -> Result<Staged<'_, Streaming<UploadRequest>>, StorageError> {
-        if length > policy.max_bytes {
-            return Err(StorageError::UploadTooLarge);
-        }
         let target = PublishTarget::Nar(name);
         let destination = target.destination();
         let temp_name = self.next_temp_name(&target);
@@ -121,7 +118,8 @@ impl<'storage> Staged<'storage, Streaming<UploadRequest>> {
             source,
             self.state.value().name,
             self.state.value().length,
-            self.state.value().policy.max_bytes,
+            self.state.value().policy.max_decoded_bytes,
+            self.state.value().policy.decoder_memory_limit,
             &mut destination,
         )?)
     }

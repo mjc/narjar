@@ -14,6 +14,8 @@ pub(crate) struct ServeConfig {
     pub(crate) workers: NonZeroUsize,
     pub(crate) max_in_flight: NonZeroUsize,
     pub(crate) max_nar_bytes: NonZeroU64,
+    pub(crate) max_encoded_nar_bytes: NonZeroU64,
+    pub(crate) max_decoder_memory_bytes: NonZeroU64,
     pub(crate) min_free_bytes: u64,
     pub(crate) shutdown_grace_seconds: NonZeroU64,
     pub(crate) io_timeout_seconds: NonZeroU64,
@@ -35,6 +37,10 @@ pub(crate) struct ServeArgs {
     max_in_flight: NonZeroUsize,
     #[arg(long, env = "NARJAR_MAX_NAR_BYTES", default_value_t = NonZeroU64::new(17_179_869_184).unwrap())]
     max_nar_bytes: NonZeroU64,
+    #[arg(long, env = "NARJAR_MAX_ENCODED_NAR_BYTES", default_value_t = NonZeroU64::new(17_179_869_184).unwrap())]
+    max_encoded_nar_bytes: NonZeroU64,
+    #[arg(long, env = "NARJAR_MAX_DECODER_MEMORY_BYTES", default_value_t = NonZeroU64::new(134_217_728).unwrap())]
+    max_decoder_memory_bytes: NonZeroU64,
     #[arg(long, env = "NARJAR_MIN_FREE_BYTES", default_value_t = 1_073_741_824)]
     min_free_bytes: u64,
     #[arg(
@@ -72,6 +78,8 @@ impl From<ServeArgs> for ServeConfig {
             workers: args.workers,
             max_in_flight: args.max_in_flight,
             max_nar_bytes: args.max_nar_bytes,
+            max_encoded_nar_bytes: args.max_encoded_nar_bytes,
+            max_decoder_memory_bytes: args.max_decoder_memory_bytes,
             min_free_bytes: args.min_free_bytes,
             shutdown_grace_seconds: args.shutdown_grace_seconds,
             io_timeout_seconds: args.io_timeout_seconds,
@@ -138,5 +146,28 @@ mod tests {
             custom_args.stats_inventory_interval_seconds,
             NonZeroU64::new(30)
         );
+    }
+
+    #[test]
+    fn encoded_size_and_decoder_memory_limits_are_independently_configurable() {
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from([
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--max-nar-bytes",
+                "100",
+                "--max-encoded-nar-bytes",
+                "200",
+                "--max-decoder-memory-bytes",
+                "300",
+            ])
+            .expect("each upload resource limit has its own option");
+        let args =
+            ServeArgs::from_arg_matches(&matches).expect("serve arguments should deserialize");
+
+        assert_eq!(args.max_nar_bytes.get(), 100);
+        assert_eq!(args.max_encoded_nar_bytes.get(), 200);
+        assert_eq!(args.max_decoder_memory_bytes.get(), 300);
     }
 }

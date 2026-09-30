@@ -254,17 +254,61 @@ impl Drop for ProcessLock {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecoderMemoryLimit(u64);
+
+impl DecoderMemoryLimit {
+    pub(crate) const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NarUploadPolicy {
-    pub(super) max_bytes: u64,
+    pub(super) max_encoded_bytes: u64,
+    pub(super) max_decoded_bytes: u64,
+    pub(super) decoder_memory_limit: DecoderMemoryLimit,
     pub(super) min_free_bytes: u64,
 }
 
 impl NarUploadPolicy {
+    pub const DEFAULT_MAX_DECODER_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+
     pub const fn new(max_bytes: u64, min_free_bytes: u64) -> Self {
         Self {
-            max_bytes,
+            max_encoded_bytes: max_bytes,
+            max_decoded_bytes: max_bytes,
+            decoder_memory_limit: DecoderMemoryLimit::new(Self::DEFAULT_MAX_DECODER_MEMORY_BYTES),
             min_free_bytes,
         }
+    }
+
+    /// Construct upload policy with separate encoded, decoded, and decoder-memory limits.
+    pub const fn with_limits(
+        max_encoded_bytes: u64,
+        max_decoded_bytes: u64,
+        max_decoder_memory_bytes: u64,
+        min_free_bytes: u64,
+    ) -> Self {
+        Self {
+            max_encoded_bytes,
+            max_decoded_bytes,
+            decoder_memory_limit: DecoderMemoryLimit::new(max_decoder_memory_bytes),
+            min_free_bytes,
+        }
+    }
+
+    pub(super) fn ensure_encoded_size_within_limit(
+        self,
+        encoded_bytes: u64,
+    ) -> Result<(), StorageError> {
+        if encoded_bytes > self.max_encoded_bytes {
+            return Err(StorageError::UploadTooLarge);
+        }
+        Ok(())
     }
 
     pub const fn min_free_bytes(self) -> u64 {
@@ -377,6 +421,7 @@ pub enum PublishOutcome {
 #[derive(Debug)]
 pub enum StorageError {
     Conflict,
+    DecoderMemoryLimitExceeded,
     InsufficientSpace,
     InsufficientInodes,
     Locked,
@@ -388,14 +433,34 @@ pub enum StorageError {
 
 impl From<io::Error> for StorageError {
     fn from(error: io::Error) -> Self {
-        Self::Io(error)
+        if error
+            .get_ref()
+            .is_some_and(|source| source.is::<DecoderMemoryLimitExceeded>())
+        {
+            Self::DecoderMemoryLimitExceeded
+        } else {
+            Self::Io(error)
+        }
     }
 }
+
+#[derive(Debug)]
+pub(super) struct DecoderMemoryLimitExceeded;
+
+impl std::fmt::Display for DecoderMemoryLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("compressed decoder memory requirement exceeds configured limit")
+    }
+}
+
+impl std::error::Error for DecoderMemoryLimitExceeded {}
 
 impl std::fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Conflict => formatter.write_str("immutable destination has different contents"),
+            Self::DecoderMemoryLimitExceeded => formatter
+                .write_str("compressed decoder memory requirement exceeds configured limit"),
             Self::InsufficientSpace => {
                 formatter.write_str("configured free space reserve would be violated")
             }
@@ -414,6 +479,7 @@ impl std::error::Error for StorageError {
         match self {
             Self::Io(error) => Some(error),
             Self::Conflict
+            | Self::DecoderMemoryLimitExceeded
             | Self::InsufficientSpace
             | Self::InsufficientInodes
             | Self::Locked

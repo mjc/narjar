@@ -82,10 +82,10 @@ impl PublicationRequest {
         let _ = self.upload.respond(&guard, status);
     }
 
-    pub fn staging_bytes(&self, max_nar_bytes: u64) -> Option<u64> {
+    pub fn staging_bytes(&self, max_encoded_nar_bytes: u64) -> Option<u64> {
         let length = u64::try_from(self.upload.length()).ok()?;
         match &self.route {
-            CacheRoute::Nar(_) if length <= max_nar_bytes => Some(length),
+            CacheRoute::Nar(_) if length <= max_encoded_nar_bytes => Some(length),
             CacheRoute::Nar(_) => None,
             CacheRoute::NarInfo(_) => Some(length.min(MAX_NARINFO_BYTES)),
             CacheRoute::CacheInfo => Some(0),
@@ -338,9 +338,19 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
     metrics.publication(started.elapsed());
     metrics.record_publication_result(&result);
     if matches!(upload.body_state(), BodyState::Reading | BodyState::Failed)
-        && !matches!(result, Err(StorageError::UploadTooLarge))
+        && !matches!(
+            result,
+            Err(StorageError::UploadTooLarge | StorageError::DecoderMemoryLimitExceeded)
+        )
     {
         metrics.validation_failure(ValidationClass::Nar);
+        if matches!(&result, Err(StorageError::DecoderMemoryLimitExceeded)) {
+            // Decoder limits are checked before consuming the payload. Report
+            // the client error, then close rather than reusing a stream with
+            // unread request-body bytes.
+            drop(upload.respond(guard, StatusCode::UNPROCESSABLE_ENTITY));
+            return None;
+        }
         guard.record_aborted_response();
         return None;
     }
@@ -352,6 +362,7 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
         Ok(PublishOutcome::Identical) => StatusCode::OK,
         Err(StorageError::Conflict) => StatusCode::CONFLICT,
         Err(StorageError::UploadTooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
+        Err(StorageError::DecoderMemoryLimitExceeded) => StatusCode::UNPROCESSABLE_ENTITY,
         Err(StorageError::InsufficientSpace | StorageError::InsufficientInodes) => {
             StatusCode::INSUFFICIENT_STORAGE
         }

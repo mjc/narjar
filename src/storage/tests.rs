@@ -16,7 +16,7 @@ use super::compression::{
 use super::egress::{EgressReceipt, EgressSlot};
 use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sync_dir};
 use super::ids::nix32_sha256;
-use super::publication::{Layout, PublishBoundary, PublishTarget};
+use super::publication::{DecoderMemoryLimit, Layout, PublishBoundary, PublishTarget};
 use super::{
     CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageBackend,
     StorageError, StoreHash, capacity_error_kind,
@@ -28,6 +28,7 @@ use crate::object::{
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
+use structured_zstd::decoding::read_frame_header_info;
 use structured_zstd::encoding::{CompressionLevel, compress};
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -279,6 +280,54 @@ fn chunked_backend_routes_the_complete_nar_publication() {
             .publish_nar(name, Cursor::new(&raw), raw.len() as u64, policy)
             .unwrap(),
         PublishOutcome::Identical
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn chunked_upload_enforces_encoded_size_before_creating_staging() {
+    let directory = TestDir::new();
+    let storage = Storage::initialize(
+        &Directory::open(directory.path()).unwrap(),
+        StorageBackend::Chunked,
+    )
+    .unwrap();
+    let raw = b"compressed body larger than encoded upload limit";
+    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let encoding = WireEncoding::Compressed(CompressionCodec::Zstd);
+    let compressed = compressed_bytes(encoding, raw);
+    let encoded_hash = FileHash::from_digest(Sha256::digest(&compressed).into());
+    let name = NarFileName::new(encoded_hash, encoding);
+    let policy = super::NarUploadPolicy::with_limits(
+        5,
+        raw.len() as u64,
+        super::NarUploadPolicy::DEFAULT_MAX_DECODER_MEMORY_BYTES,
+        0,
+    );
+    let reservation = storage.reserve_staging(0, 0).unwrap();
+
+    assert!(
+        matches!(
+            storage.publish_nar_with_staging(
+                name,
+                Cursor::new(&compressed),
+                compressed.len() as u64,
+                policy,
+                reservation,
+            ),
+            Err(StorageError::UploadTooLarge)
+        ),
+        "the chunked path applies encoded-size policy before ingest"
+    );
+    assert_eq!(
+        storage.staging_budget.lock().unwrap().outstanding_bytes(),
+        0
+    );
+    assert!(
+        !directory
+            .path()
+            .join(format!("nar/{raw_hash}.nar"))
+            .exists()
     );
 }
 
@@ -865,6 +914,7 @@ fn normalized_compressed_source_errors_remain_io_errors() {
                 ),
                 3,
                 u64::MAX,
+                DecoderMemoryLimit::new(super::NarUploadPolicy::DEFAULT_MAX_DECODER_MEMORY_BYTES),
                 &mut destination,
             )
             .expect_err("source failure must not become invalid content");
@@ -901,11 +951,141 @@ fn compressed_output_writer_errors_remain_io_errors() {
             nar_name,
             compressed.len() as u64,
             u64::MAX,
+            DecoderMemoryLimit::new(super::NarUploadPolicy::DEFAULT_MAX_DECODER_MEMORY_BYTES),
             &mut UnsupportedOutputWriter,
         )
         .expect_err("output storage failure must not become invalid compressed input");
 
         assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{encoding:?}");
+    }
+}
+
+#[test]
+fn xz_upload_decoder_rejects_memory_just_below_the_declared_dictionary_requirement() {
+    let raw = b"XZ dictionary memory limit fixture";
+    let compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
+    let required_kib =
+        lzma_rust2::lzma2_get_memory_usage(XzOptions::with_preset(1).lzma_options.dict_size);
+    let exact_limit = u64::from(required_kib) * 1024;
+
+    assert_compressed_upload_memory_limit(
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        raw,
+        &compressed,
+        exact_limit - 1024,
+        false,
+    );
+    assert_compressed_upload_memory_limit(
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        raw,
+        &compressed,
+        exact_limit,
+        true,
+    );
+    assert_compressed_upload_memory_limit(
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        raw,
+        &compressed,
+        exact_limit + 1024,
+        true,
+    );
+}
+
+#[test]
+fn zstd_upload_decoder_rejects_windows_above_the_configured_memory_limit() {
+    let raw = vec![b'z'; 512 * 1024];
+    let encoding = WireEncoding::Compressed(CompressionCodec::Zstd);
+    let compressed = compressed_bytes(encoding, &raw);
+    let window_bytes = read_frame_header_info(&compressed, false)
+        .expect("fixture has a complete zstd frame header")
+        .window_size;
+    let exact_limit = window_bytes + 128 * 1024;
+
+    assert_compressed_upload_memory_limit(encoding, &raw, &compressed, exact_limit - 1, false);
+    assert_compressed_upload_memory_limit(encoding, &raw, &compressed, exact_limit, true);
+    assert_compressed_upload_memory_limit(encoding, &raw, &compressed, exact_limit + 1, true);
+}
+
+#[test]
+fn upload_memory_rejection_publishes_no_nar_and_releases_staging() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let raw = b"compressed upload rejected before decoder allocation";
+    let decoded_hash = NarHash::from_digest(Sha256::digest(raw).into());
+    let decoder_limit = 1024;
+
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
+        let compressed = compressed_bytes(encoding, raw);
+        let encoded_hash = FileHash::from_digest(Sha256::digest(&compressed).into());
+        let policy = super::NarUploadPolicy::with_limits(
+            compressed.len() as u64,
+            raw.len() as u64,
+            decoder_limit,
+            0,
+        );
+        let result = storage.publish_nar(
+            NarFileName::new(encoded_hash, encoding),
+            Cursor::new(&compressed),
+            compressed.len() as u64,
+            policy,
+        );
+
+        assert!(
+            matches!(&result, Err(StorageError::DecoderMemoryLimitExceeded)),
+            "{encoding:?} decoder requirement should be a client content error: {result:?}"
+        );
+        assert!(
+            !directory
+                .path()
+                .join(format!("nar/{decoded_hash}.nar"))
+                .exists()
+        );
+        assert_eq!(
+            fs::read_dir(directory.path().join(".tmp"))
+                .expect("temporary directory exists")
+                .count(),
+            0,
+            "rejection removes its staging file"
+        );
+        assert_eq!(
+            storage.staging_budget.lock().unwrap().outstanding_bytes(),
+            0,
+            "rejection releases its staging reservation"
+        );
+    }
+}
+
+fn assert_compressed_upload_memory_limit(
+    encoding: WireEncoding,
+    raw: &[u8],
+    compressed: &[u8],
+    memory_limit: u64,
+    should_decode: bool,
+) {
+    let hash = FileHash::from_digest(Sha256::digest(compressed).into());
+    let mut decoded = Vec::new();
+    let result = receive_uploaded_nar(
+        Cursor::new(compressed),
+        NarFileName::new(hash, encoding),
+        compressed.len() as u64,
+        raw.len() as u64,
+        DecoderMemoryLimit::new(memory_limit),
+        &mut decoded,
+    );
+
+    if should_decode {
+        result.expect("frame at or below the configured memory limit is accepted");
+        assert_eq!(decoded, raw);
+    } else {
+        let error = result.expect_err("frame above the configured memory limit is rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            decoded.is_empty(),
+            "decoder rejected the frame before output"
+        );
     }
 }
 

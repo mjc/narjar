@@ -2216,6 +2216,20 @@ impl RunningServer {
         self.exchange(method, path, headers, Some(body)).response
     }
 
+    #[cfg(target_os = "linux")]
+    fn peak_rss_bytes(&self) -> u64 {
+        let process_id = self.child.as_ref().expect("server is running").id();
+        let status = fs::read_to_string(format!("/proc/{process_id}/status"))
+            .expect("kernel reports the server process status");
+        let peak_kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("kernel reports the server's peak resident memory");
+        peak_kib * 1024
+    }
+
     fn raw_request_with_body(
         &self,
         method: &str,
@@ -2374,7 +2388,7 @@ fn serve_reports_listener_and_stops_on_sigterm() {
     );
     assert!(
         server.startup_line.ends_with(
-            " workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824 shutdown_grace_seconds=30 io_timeout_seconds=30\n"
+            " workers=1 max_in_flight=64 max_nar_bytes=17179869184 max_encoded_nar_bytes=17179869184 max_decoder_memory_bytes=134217728 max_concurrent_decoders=1 min_free_bytes=1073741824 shutdown_grace_seconds=30 io_timeout_seconds=30\n"
         ),
         "startup line omits effective limits: {:?}",
         server.startup_line
@@ -3430,6 +3444,132 @@ fn nar_put_normalizes_zstd_to_raw_bytes() {
 }
 
 #[test]
+fn compressed_upload_memory_limits_return_422_without_publishing() {
+    for (index, encoding) in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let server = RunningServer::start_with_args(
+            &format!("decoder-memory-{index}"),
+            &["--max-decoder-memory-bytes", "131071"],
+        );
+        let compressed = encode_test_nar_with(encoding);
+        let path = format!(
+            "/nar/{}{}",
+            nix32_sha256(&compressed),
+            compressed_test_suffix(encoding)
+        );
+        let response = server.request_with_body("PUT", &path, &[], &compressed);
+        let published_raw = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
+        let temporary = fs::read_dir(server.data_dir.join(".tmp"))
+            .expect("temporary directory exists")
+            .count();
+        let (signal, status) = server.stop();
+
+        let (headers, body) = response_parts(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+            "{encoding:?}: {headers:?}"
+        );
+        assert!(body.is_empty());
+        assert!(
+            !published_raw.exists(),
+            "{encoding:?} was rejected before commit"
+        );
+        assert_eq!(temporary, 0, "{encoding:?} staging file was removed");
+        assert!(signal.success());
+        assert!(status.success());
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn concurrent_compressed_uploads_stay_within_the_worker_memory_ceiling() {
+    const DECODER_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+    const ALLOWED_FIXED_PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+    const DICTIONARY_SIZE: usize = 16 * 1024 * 1024;
+
+    let server = RunningServer::start_with_workers(
+        "concurrent-decoder-memory",
+        2,
+        &["--max-decoder-memory-bytes", "67108864"],
+    );
+    let baseline_peak_bytes = server.peak_rss_bytes();
+    let raw_nars = [0x1234_5678_u32, 0x9abc_def0]
+        .iter()
+        .map(|seed| {
+            let mut state = *seed;
+            let mut raw = (0..DICTIONARY_SIZE)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect::<Vec<_>>();
+            raw.extend_from_within(..);
+            raw
+        })
+        .collect::<Vec<_>>();
+    let uploads = raw_nars
+        .iter()
+        .map(|raw| {
+            let mut compressed = Vec::new();
+            compress(
+                std::io::Cursor::new(raw),
+                &mut compressed,
+                CompressionLevel::Fastest,
+            );
+            let path = format!("/nar/{}.nar.zst", nix32_sha256(&compressed));
+            (compressed, path)
+        })
+        .collect::<Vec<_>>();
+
+    let responses = std::thread::scope(|scope| {
+        let requests = uploads
+            .iter()
+            .map(|(compressed, path)| {
+                scope.spawn(|| server.request_with_body("PUT", path, &[], compressed))
+            })
+            .collect::<Vec<_>>();
+        requests
+            .into_iter()
+            .map(|request| request.join().expect("upload thread should complete"))
+            .collect::<Vec<_>>()
+    });
+    let peak_rss_bytes = server.peak_rss_bytes();
+    eprintln!(
+        "compressed upload RSS: baseline={baseline_peak_bytes} B peak={peak_rss_bytes} B, \
+         decoder_limit={DECODER_LIMIT_BYTES} B × 2 publication workers"
+    );
+    let (signal, status) = server.stop();
+
+    for response in responses {
+        let (headers, body) = response_parts(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 201 Created\r\n"),
+            "{headers:?}"
+        );
+        assert!(body.is_empty());
+    }
+    let configured_concurrency = 2;
+    let configured_peak_bytes = baseline_peak_bytes
+        + DECODER_LIMIT_BYTES * configured_concurrency
+        + ALLOWED_FIXED_PROCESS_OVERHEAD;
+    assert!(
+        peak_rss_bytes <= configured_peak_bytes,
+        "observed server peak RSS {peak_rss_bytes} B exceeded baseline {baseline_peak_bytes} B + \
+         {configured_concurrency} × {DECODER_LIMIT_BYTES} B decoder budget + \
+         {ALLOWED_FIXED_PROCESS_OVERHEAD} B fixed overhead"
+    );
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
 #[cfg(not(target_os = "macos"))]
 fn chunked_backend_serves_the_reconstructed_raw_nar() {
     let server =
@@ -4470,7 +4610,8 @@ fn nar_put_rejects_encoded_malformed_oversized_and_truncated_bodies() {
     let metrics = String::from_utf8(metrics_body).expect("metrics should be UTF-8");
     let (signal, status) = server.stop();
 
-    let limited = RunningServer::start_with_args("nar-put-oversized", &["--max-nar-bytes", "5"]);
+    let limited =
+        RunningServer::start_with_args("nar-put-oversized", &["--max-encoded-nar-bytes", "5"]);
     let oversized = limited.request_with_body("PUT", &path, &[], NAR_BYTES);
     let oversized_path = limited.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
     let (limited_signal, limited_status) = limited.stop();

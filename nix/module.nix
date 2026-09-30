@@ -229,6 +229,10 @@
       (toString cfg.maxInFlight)
       "--max-nar-bytes"
       (toString cfg.maxNarBytes)
+      "--max-encoded-nar-bytes"
+      (toString cfg.maxEncodedNarBytes)
+      "--max-decoder-memory-bytes"
+      (toString cfg.maxDecoderMemoryBytes)
       "--min-free-bytes"
       (toString cfg.minFreeBytes)
       "--shutdown-grace-seconds"
@@ -410,6 +414,19 @@ in {
     maxNarBytes = lib.mkOption {
       type = lib.types.ints.positive;
       default = 16 * 1024 * 1024 * 1024;
+      description = "Maximum decoded NAR size.";
+    };
+
+    maxEncodedNarBytes = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 16 * 1024 * 1024 * 1024;
+      description = "Maximum encoded NAR upload size.";
+    };
+
+    maxDecoderMemoryBytes = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 128 * 1024 * 1024;
+      description = "Maximum decoder working memory per compressed upload.";
     };
 
     minFreeBytes = lib.mkOption {
