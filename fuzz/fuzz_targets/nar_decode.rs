@@ -25,7 +25,7 @@ fuzz_target!(|input: &[u8]| {
         max_total_bytes: 8 * 1024 * 1024,
         max_work: 65_536,
     };
-    let mut decoder = Decoder::with_limits(input, limits);
+    let decoder = Decoder::with_limits(input, limits);
     let mut sink = Sink;
     let _ = decoder.decode(&mut sink);
 });

@@ -118,6 +118,12 @@
           };
           toolchain = mkToolchain pkgs [ ];
           build = mkCraneBuild { inherit pkgs toolchain; };
+          fuzzToolchain = pkgs.rust-bin.nightly.latest.default;
+          fuzzCraneLib = (crane.mkLib pkgs).overrideToolchain fuzzToolchain;
+          fuzzVendorDir = fuzzCraneLib.vendorCargoDeps {
+            src = repositorySrc;
+            cargoLock = ./fuzz/Cargo.lock;
+          };
           provenance = pkgs.writeShellScriptBin "narjar-provenance" ''
             echo "flake_lock_identity=${lockIdentity}"
             echo "nix_version=$(${pkgs.nix}/bin/nix --version)"
@@ -188,6 +194,8 @@
           inherit
             pkgs
             toolchain
+            fuzzToolchain
+            fuzzVendorDir
             provenance
             advisoryCheck
             nixE2E
@@ -372,6 +380,28 @@
               bash ci/check-cargo-package.sh
               touch "$out"
             '';
+          fuzzTargetCheck = env.pkgs.runCommand "narjar-fuzz-target-check"
+            {
+              nativeBuildInputs = [ env.fuzzToolchain env.pkgs.pkg-config ];
+              buildInputs = [ env.pkgs.sqlite ];
+            }
+            ''
+              export HOME="$TMPDIR/home"
+              export CARGO_HOME="$TMPDIR/cargo-home"
+              mkdir -p "$HOME" "$CARGO_HOME"
+              cat ${env.fuzzVendorDir}/config.toml > "$CARGO_HOME/config.toml"
+              cat >> "$CARGO_HOME/config.toml" <<EOF
+              [net]
+              offline = true
+              EOF
+              cp -R ${repositorySrc} source
+              chmod -R u+w source
+              cd source
+              export RUSTC="${env.fuzzToolchain}/bin/rustc"
+              export CARGO_TARGET_DIR="$PWD/target/fuzz"
+              cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+              touch "$out"
+            '';
           semantic-descriptor = env.pkgs.runCommand "narjar-semantic-descriptor" { } ''
             ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/semantic-descriptor.sh
             touch $out
@@ -421,6 +451,7 @@
             source-filter
             lock-consistency
             cratePackageCheck
+            fuzzTargetCheck
             semantic-descriptor
             virtual-nar-segments
             publication-lock-benchmark
