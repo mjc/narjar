@@ -22,6 +22,15 @@ const MAX_TRANSACTION_BYTES: u64 = 256;
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(0);
 
+/// Recovery work performed while opening storage for serving or maintenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryStatus {
+    /// The storage did not require recovery.
+    NotRequired,
+    /// Recovery completed after validating this many published narinfos.
+    Completed(crate::inventory::NarInfoCount),
+}
+
 #[derive(Debug)]
 pub(super) struct PublicationTransaction {
     directory: File,

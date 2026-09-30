@@ -330,6 +330,19 @@
     ReadWritePaths = [runtimeDataDir];
     UMask = "0077";
   };
+  serviceIdentityConfig =
+    if cfg.dynamicUser
+    then {
+      DynamicUser = true;
+      User = "narjar";
+      Group = "narjar";
+      StateDirectory = stateDirectory;
+      StateDirectoryMode = "0700";
+    }
+    else {
+      User = "narjar";
+      Group = "narjar";
+    };
   gcArgs = lib.escapeShellArgs (
     [
       "gc"
@@ -588,13 +601,9 @@ in {
 
       serviceConfig =
         commonServiceConfig
+        // serviceIdentityConfig
         // {
           Environment = "NARJAR_CREDENTIALS_DIRECTORY=%d";
-          DynamicUser = lib.mkIf cfg.dynamicUser true;
-          User = lib.mkIf (!cfg.dynamicUser) "narjar";
-          Group = lib.mkIf (!cfg.dynamicUser) "narjar";
-          StateDirectory = lib.mkIf cfg.dynamicUser stateDirectory;
-          StateDirectoryMode = lib.mkIf cfg.dynamicUser "0700";
           ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";
           LoadCredential = map (credential: "${credential.name}:${credential.source}") credentials;
           ExecStart = "${executable} ${serveArgs}";
@@ -669,11 +678,12 @@ in {
 
       serviceConfig =
         commonServiceConfig
+        // serviceIdentityConfig
         // {
           Type = "oneshot";
-          ExecStartPre = "${pkgs.systemd}/bin/systemctl stop narjar.service";
+          ExecStartPre = "+${pkgs.systemd}/bin/systemctl stop narjar.service";
           ExecStart = "${executable} ${gcArgs}";
-          ExecStopPost = "${pkgs.systemd}/bin/systemctl start narjar.service";
+          ExecStopPost = "+${pkgs.systemd}/bin/systemctl start narjar.service";
           TimeoutStartSec = "infinity";
         };
     };

@@ -1,7 +1,10 @@
 use data_encoding::{BASE64, BitOrder, Specification};
 use ed25519_dalek::{Signer, SigningKey};
 use lzma_rust2::{XzOptions, XzWriter};
-use narjar::__private::storage::WireEncoding;
+use narjar::__private::storage::{
+    WireEncoding,
+    gc::{GcMode, GcOptions},
+};
 use narjar::nar_encode::{Encoder, Event as NarEvent};
 use narjar::object::CompressionCodec;
 use sha2::{Digest, Sha256};
@@ -6239,6 +6242,160 @@ fn dirty_start_rejects_a_malformed_published_narinfo() {
 }
 
 #[test]
+fn gc_recovers_a_published_nar_before_eviction_and_restart() {
+    let data_dir = init_data_dir("gc-recovers-before-eviction");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("published NAR should be written");
+    fs::write(
+        data_dir.join(format!("{STORE_HASH}.narinfo")),
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("signed narinfo should be written");
+    let staging = data_dir.join(".tmp/gc-pending.part");
+    fs::write(&staging, b"transaction staging").expect("staging should be written");
+    let transaction = data_dir.join(".narjar-transactions/gc-pending.txn");
+    fs::write(
+        &transaction,
+        format!("state=published\npath=.tmp/gc-pending.part\ndestination=nar/{NARJAR_HASH}.nar\n"),
+    )
+    .expect("published transaction should be written");
+    fs::set_permissions(&transaction, fs::Permissions::from_mode(0o600))
+        .expect("transaction should be private");
+    let recovery_marker = data_dir.join(".narjar-recovery");
+    fs::write(&recovery_marker, b"interrupted\n").expect("recovery marker should be written");
+    fs::set_permissions(&recovery_marker, fs::Permissions::from_mode(0o600))
+        .expect("recovery marker should be private");
+
+    let output = run(&[
+        "gc",
+        "--data-dir",
+        data_dir.to_str().expect("data dir should be UTF-8"),
+        "--target-bytes",
+        "0",
+        "--apply",
+    ]);
+    assert!(
+        output.status.success(),
+        "GC failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+    assert!(!data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists());
+    assert!(
+        !transaction.exists(),
+        "recovery journal should be completed"
+    );
+    assert!(!staging.exists(), "recovery staging should be removed");
+    assert!(
+        !recovery_marker.exists(),
+        "recovery marker should be cleared"
+    );
+
+    let root = narjar::__private::storage::Directory::open(data_dir.path())
+        .expect("cache root should reopen after GC");
+    let storage = narjar::__private::storage::Storage::initialize(
+        &root,
+        narjar::__private::storage::StorageBackend::Flat,
+    )
+    .expect("cache storage should restart after GC");
+    assert!(
+        !storage
+            .recovery_required()
+            .expect("recovery state should read"),
+        "restart must not find a pending transaction whose destination GC evicted"
+    );
+}
+
+#[test]
+fn delete_recovers_a_published_narinfo_before_removing_it() {
+    let data_dir = init_data_dir("delete-recovers-before-removal");
+    fs::write(
+        data_dir.join("trusted-public-keys"),
+        format!(
+            "narjar-test:{}\n",
+            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+        ),
+    )
+    .expect("trusted key should be written");
+    fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
+        .expect("published NAR should be written");
+    let narinfo = data_dir.join(format!("{STORE_HASH}.narinfo"));
+    fs::write(
+        &narinfo,
+        signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
+    )
+    .expect("signed narinfo should be written");
+    let staging = data_dir.join(".tmp/delete-pending.part");
+    fs::write(&staging, b"transaction staging").expect("staging should be written");
+    let transaction = data_dir.join(".narjar-transactions/delete-pending.txn");
+    fs::write(
+        &transaction,
+        format!(
+            "state=published\npath=.tmp/delete-pending.part\ndestination={STORE_HASH}.narinfo\n"
+        ),
+    )
+    .expect("published transaction should be written");
+    fs::set_permissions(&transaction, fs::Permissions::from_mode(0o600))
+        .expect("transaction should be private");
+    let recovery_marker = data_dir.join(".narjar-recovery");
+    fs::write(&recovery_marker, b"interrupted\n").expect("recovery marker should be written");
+    fs::set_permissions(&recovery_marker, fs::Permissions::from_mode(0o600))
+        .expect("recovery marker should be private");
+
+    let output = run(&[
+        "delete",
+        "--data-dir",
+        data_dir.to_str().expect("data dir should be UTF-8"),
+        "--store-hash",
+        STORE_HASH,
+    ]);
+    assert!(
+        output.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !narinfo.exists(),
+        "delete should remove the selected metadata"
+    );
+    assert!(
+        data_dir.join(format!("nar/{NARJAR_HASH}.nar")).exists(),
+        "delete should retain the payload"
+    );
+    assert!(
+        !transaction.exists(),
+        "recovery journal should be completed"
+    );
+    assert!(!staging.exists(), "recovery staging should be removed");
+    assert!(
+        !recovery_marker.exists(),
+        "recovery marker should be cleared"
+    );
+
+    let root = narjar::__private::storage::Directory::open(data_dir.path())
+        .expect("cache root should reopen after delete");
+    let storage = narjar::__private::storage::Storage::initialize(
+        &root,
+        narjar::__private::storage::StorageBackend::Flat,
+    )
+    .expect("cache storage should restart after delete");
+    assert!(
+        !storage
+            .recovery_required()
+            .expect("recovery state should read"),
+        "restart must not find a pending transaction whose destination delete removed"
+    );
+}
+
+#[test]
 fn dirty_start_rejects_a_published_narinfo_without_its_nar() {
     let data_dir = init_data_dir("dirty-start-missing-nar");
     fs::write(
@@ -6847,6 +7004,53 @@ fn gc_rejects_symlinked_narinfo_without_removing_it() {
     let path = data_dir.to_str().expect("temporary path should be UTF-8");
     let output = run(&["gc", "--data-dir", path, "--target-bytes", "0", "--apply"]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("regular file"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("malformed_narinfo"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+}
+
+#[test]
+fn library_gc_dry_run_preserves_pending_recovery_state() {
+    let data_dir = init_data_dir("library-gc-dry-run-recovery");
+    let staging = data_dir.join(".tmp/gc-pending.part");
+    fs::write(&staging, b"pending publication staging")
+        .expect("transaction staging should be written");
+    let transaction = data_dir.join(".narjar-transactions/gc-pending.txn");
+    fs::write(
+        &transaction,
+        b"state=published\npath=.tmp/gc-pending.part\ndestination=nix-cache-info\n",
+    )
+    .expect("published transaction should be written");
+    fs::set_permissions(&transaction, fs::Permissions::from_mode(0o600))
+        .expect("transaction should be private");
+    let recovery_marker = data_dir.join(".narjar-recovery");
+    fs::write(&recovery_marker, b"interrupted\n").expect("recovery marker should be written");
+    fs::set_permissions(&recovery_marker, fs::Permissions::from_mode(0o600))
+        .expect("recovery marker should be private");
+
+    let report = narjar::__private::storage::gc::run(GcOptions {
+        data_dir: data_dir.path().to_owned(),
+        max_bytes: None,
+        target_bytes: Some(0),
+        max_age: None,
+        min_age: Duration::ZERO,
+        protected_roots: None,
+        mode: GcMode::DryRun,
+        backend: narjar::__private::storage::StorageBackend::Flat,
+    })
+    .expect("library dry-run should inspect without completing recovery");
+
+    assert!(report.dry_run);
+    assert!(transaction.exists(), "dry-run must preserve the journal");
+    assert!(
+        staging.exists(),
+        "dry-run must preserve transaction staging"
+    );
+    assert!(
+        recovery_marker.exists(),
+        "dry-run must preserve the recovery marker"
+    );
 }

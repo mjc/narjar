@@ -89,14 +89,17 @@ impl ChunkStore {
             OsStr::new(MANIFEST_DIRECTORY),
             "chunk manifest directory",
         )?;
-        remove_abandoned_manifest_temps(&manifests)?;
         let chunks = ensure_directory_at(root, OsStr::new(CHUNK_DIRECTORY), "chunk directory")?;
-        remove_abandoned_chunk_temps(&chunks)?;
         Ok(Self {
             chunks,
             manifests,
             activity,
         })
+    }
+
+    pub(crate) fn remove_abandoned_temporary_files(&self) -> io::Result<()> {
+        remove_abandoned_manifest_temps(&self.manifests)?;
+        remove_abandoned_chunk_temps(&self.chunks)
     }
 
     pub(crate) fn population_counts(
@@ -1953,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_removes_abandoned_chunk_and_manifest_temps() {
+    fn recovery_completion_removes_abandoned_chunk_and_manifest_temps() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
         let store = ChunkStore::initialize(root.file()).unwrap();
@@ -1984,6 +1987,11 @@ mod tests {
         let shard = restarted
             .open_shard(ChunkHash::from_digest([0; 32]))
             .unwrap();
+        assert!(
+            super::super::fs::open_regular_at(&shard, chunk_temp).is_ok(),
+            "storage construction must leave journal-owned staging intact"
+        );
+        restarted.remove_abandoned_temporary_files().unwrap();
         assert!(super::super::fs::open_regular_at(&shard, chunk_temp).is_err());
         assert!(super::super::fs::open_regular_at(&restarted.manifests, manifest_temp).is_err());
     }

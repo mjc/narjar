@@ -12,8 +12,8 @@ use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
     object::{NarHash, NarRepresentation},
     storage::{
-        Directory, NarFileName, Storage, StorageBackend, StorageError, StoreHash, open_regular_at,
-        read_dir_names,
+        Directory, NarFileName, RecoveredStorage, Storage, StorageBackend, StorageError, StoreHash,
+        open_regular_at, read_dir_names,
     },
 };
 
@@ -123,35 +123,62 @@ struct Orphan {
 }
 
 pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
-    run_with_lock_acquired(options, || {})
+    let root = Directory::open(&options.data_dir)?;
+    let storage = Storage::initialize(&root, options.backend)?;
+    let trusted = TrustedPublicKeys::load(&root).map_err(|error| invalid(error.to_string()))?;
+    match options.mode {
+        GcMode::DryRun => run_dry_run(options, &storage, &trusted),
+        GcMode::Apply => {
+            let recovered = storage.recover_for_mutation(&trusted)?;
+            run_apply(options, &recovered, &trusted)
+        }
+    }
 }
 
-/// Run GC and call `on_lock_acquired` after storage initialization owns the
-/// data-directory lock, before inspecting or changing cache contents.
-pub fn run_with_lock_acquired(
+/// Inspect GC candidates without recovering or mutating cache state.
+pub fn run_dry_run(
     options: GcOptions,
-    on_lock_acquired: impl FnOnce(),
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
 ) -> Result<GcReport, StorageError> {
-    let target_bytes = options.target_bytes.or(options.max_bytes);
+    run_with_mode(options, storage, trusted, GcMode::DryRun)
+}
+
+/// Apply garbage collection only with storage whose recovery has completed.
+pub fn run_apply(
+    options: GcOptions,
+    recovered: &RecoveredStorage<'_>,
+    trusted: &TrustedPublicKeys,
+) -> Result<GcReport, StorageError> {
+    run_with_mode(options, recovered.storage(), trusted, GcMode::Apply)
+}
+
+fn run_with_mode(
+    mut options: GcOptions,
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
+    mode: GcMode,
+) -> Result<GcReport, StorageError> {
+    options.mode = mode;
+    let target_bytes = gc_target_bytes(&options)?;
+    if let PayloadStorage::Chunked(chunk_store) = &storage.payloads {
+        return run_chunked(options, storage, chunk_store, trusted, target_bytes);
+    }
+    run_flat_gc(options, storage, trusted, target_bytes, scan)
+}
+
+fn gc_target_bytes(options: &GcOptions) -> Result<Option<u64>, StorageError> {
     if options.max_bytes.is_none() && options.target_bytes.is_none() && options.max_age.is_none() {
         return Err(invalid("at least one retention policy is required"));
     }
     if options
         .target_bytes
         .zip(options.max_bytes)
-        .is_some_and(|(target, max)| target > max)
+        .is_some_and(|(target, maximum)| target > maximum)
     {
         return Err(invalid("--target-bytes cannot exceed --max-bytes"));
     }
-
-    let root = Directory::open(&options.data_dir)?;
-    let storage = Storage::initialize(&root, options.backend)?;
-    on_lock_acquired();
-    let trusted = TrustedPublicKeys::load(&root).map_err(|error| invalid(error.to_string()))?;
-    if let PayloadStorage::Chunked(chunk_store) = &storage.payloads {
-        return run_chunked(options, &storage, chunk_store, trusted, target_bytes);
-    }
-    run_flat_gc(options, &storage, &trusted, target_bytes, scan)
+    Ok(options.target_bytes.or(options.max_bytes))
 }
 
 fn run_flat_gc(
@@ -343,10 +370,10 @@ fn run_chunked(
     options: GcOptions,
     storage: &Storage,
     chunk_store: &ChunkStore,
-    trusted: TrustedPublicKeys,
+    trusted: &TrustedPublicKeys,
     target_bytes: Option<u64>,
 ) -> Result<GcReport, StorageError> {
-    let mut entries = scan_chunked(storage, chunk_store, &trusted)?;
+    let mut entries = scan_chunked(storage, chunk_store, trusted)?;
     let protection = protect_chunked(&mut entries, options.protected_roots.as_deref())?;
     let now = SystemTime::now();
     let before_bytes = chunked_before_bytes(storage, chunk_store, &entries)?;
@@ -371,7 +398,7 @@ fn run_chunked(
         (0, 0, 0)
     } else {
         let deleted = apply_chunked(storage, chunk_store, &entries, &selected)?;
-        let remaining = scan_chunked(storage, chunk_store, &trusted)?;
+        let remaining = scan_chunked(storage, chunk_store, trusted)?;
         storage.finish_recovery()?;
         let actual_after = chunked_before_bytes(storage, chunk_store, &remaining)?;
         return Ok(chunked_report(ChunkedGcReportInput {

@@ -71,10 +71,11 @@ pub use directory::Directory;
 pub(crate) use egress::{NarReadBody, VerifiedCanonicalNar};
 pub use ids::{InvalidObjectId, StoreHash};
 pub use publication::{NarUploadPolicy, PublishOutcome, StagingReservation, StorageError};
+pub use recovery::RecoveryStatus;
 pub(crate) use state::StorageActivitySnapshot;
 pub use state::{InvalidStorageBackend, Storage, StorageBackend};
 
-pub use operations::{NarInfoDeletion, NarMatch, StorageReadiness};
+pub use operations::{NarInfoDeletion, NarMatch, RecoveredStorage, StorageReadiness};
 pub use population::PopulationCounts;
 pub use reconcile::{CleanupOutcome, ReconcileClass, ReconcileEntry, ReconcileReport};
 
