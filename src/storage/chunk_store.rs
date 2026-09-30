@@ -22,8 +22,9 @@ use super::{
         MANIFEST_RECORD_BYTES, ManifestError, ManifestReader, write_manifest_header,
     },
     fs::{
-        ensure_directory_at, files_equal_at, for_each_dir_name, hard_link_at, open_at,
-        open_directory_at, open_regular_at, read_dir_names, sync_filesystem, unlink_at,
+        DirectoryEntryAction, DirectoryScanOutcome, ensure_directory_at, files_equal_at,
+        for_each_dir_name, hard_link_at, open_at, open_directory_at, open_regular_at,
+        read_dir_names, sync_filesystem, unlink_at,
     },
     publication::{StagingReservation, StorageError},
     state::StorageActivity,
@@ -541,39 +542,40 @@ fn scan_chunk_shards(
     stopping: &AtomicBool,
     counts: &mut ChunkPopulationCounts,
 ) -> io::Result<()> {
-    let mut interrupted = false;
-    for_each_dir_name(chunks_directory, |shard_name| {
+    let outcome = for_each_dir_name(chunks_directory, |shard_name| {
         if stopping.load(Ordering::Relaxed) {
-            interrupted = true;
-            return Ok(false);
+            return Ok(DirectoryEntryAction::Stop);
         }
         counts.scanned_entries = checked_population_add(counts.scanned_entries, 1)?;
         if !is_lower_hex(shard_name, 2) {
             counts.ignored_entries = checked_population_add(counts.ignored_entries, 1)?;
-            return Ok(true);
+            return Ok(DirectoryEntryAction::Continue);
         }
         match open_directory_at(chunks_directory, shard_name) {
-            Ok(shard) => scan_chunk_files(&shard, stopping, counts, &mut interrupted)?,
+            Ok(shard) => {
+                let outcome = scan_chunk_files(&shard, stopping, counts)?;
+                if outcome == DirectoryScanOutcome::StoppedEarly {
+                    return Ok(DirectoryEntryAction::Stop);
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 counts.disappeared_entries = checked_population_add(counts.disappeared_entries, 1)?;
             }
             Err(_) => counts.errors = checked_population_add(counts.errors, 1)?,
         }
-        Ok(!interrupted)
+        Ok(DirectoryEntryAction::Continue)
     })?;
-    population_scan_result(interrupted)
+    population_scan_result(outcome)
 }
 
 fn scan_chunk_files(
     shard: &File,
     stopping: &AtomicBool,
     counts: &mut ChunkPopulationCounts,
-    interrupted: &mut bool,
-) -> io::Result<()> {
+) -> io::Result<DirectoryScanOutcome> {
     for_each_dir_name(shard, |name| {
         if stopping.load(Ordering::Relaxed) {
-            *interrupted = true;
-            return Ok(false);
+            return Ok(DirectoryEntryAction::Stop);
         }
         counts.scanned_entries = checked_population_add(counts.scanned_entries, 1)?;
         if counts.scanned_entries.is_multiple_of(256) {
@@ -581,7 +583,7 @@ fn scan_chunk_files(
         }
         if !is_lower_hex(name, 64) {
             counts.ignored_entries = checked_population_add(counts.ignored_entries, 1)?;
-            return Ok(true);
+            return Ok(DirectoryEntryAction::Continue);
         }
         match open_regular_at(shard, name) {
             Ok(file) => {
@@ -594,7 +596,7 @@ fn scan_chunk_files(
             }
             Err(_) => counts.errors = checked_population_add(counts.errors, 1)?,
         }
-        Ok(true)
+        Ok(DirectoryEntryAction::Continue)
     })
 }
 
@@ -603,11 +605,9 @@ fn scan_manifests(
     stopping: &AtomicBool,
     counts: &mut ChunkPopulationCounts,
 ) -> io::Result<()> {
-    let mut interrupted = false;
-    for_each_dir_name(manifests_directory, |name| {
+    let outcome = for_each_dir_name(manifests_directory, |name| {
         if stopping.load(Ordering::Relaxed) {
-            interrupted = true;
-            return Ok(false);
+            return Ok(DirectoryEntryAction::Stop);
         }
         counts.scanned_entries = checked_population_add(counts.scanned_entries, 1)?;
         if counts.scanned_entries.is_multiple_of(256) {
@@ -619,7 +619,7 @@ fn scan_manifests(
             .and_then(|hash| NarHash::parse(hash).ok())
         else {
             counts.ignored_entries = checked_population_add(counts.ignored_entries, 1)?;
-            return Ok(true);
+            return Ok(DirectoryEntryAction::Continue);
         };
         match open_regular_at(manifests_directory, name) {
             Ok(file) => record_manifest(file, hash, counts)?,
@@ -628,9 +628,9 @@ fn scan_manifests(
             }
             Err(_) => counts.errors = checked_population_add(counts.errors, 1)?,
         }
-        Ok(true)
+        Ok(DirectoryEntryAction::Continue)
     })?;
-    population_scan_result(interrupted)
+    population_scan_result(outcome)
 }
 
 fn record_manifest(
@@ -672,13 +672,13 @@ fn checked_population_add(left: u64, right: u64) -> io::Result<u64> {
         .ok_or_else(|| io::Error::other("chunk population counter overflow"))
 }
 
-fn population_scan_result(interrupted: bool) -> io::Result<()> {
-    match interrupted {
-        true => Err(io::Error::new(
+fn population_scan_result(outcome: DirectoryScanOutcome) -> io::Result<()> {
+    match outcome {
+        DirectoryScanOutcome::Complete => Ok(()),
+        DirectoryScanOutcome::StoppedEarly => Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "population scan cancelled",
         )),
-        false => Ok(()),
     }
 }
 

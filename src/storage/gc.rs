@@ -151,9 +151,19 @@ pub fn run_with_lock_acquired(
     if let PayloadStorage::Chunked(chunk_store) = &storage.payloads {
         return run_chunked(options, &storage, chunk_store, trusted, target_bytes);
     }
-    let mut entries = scan(&storage, &trusted)?;
+    run_flat_gc(options, &storage, &trusted, target_bytes, scan)
+}
+
+fn run_flat_gc(
+    options: GcOptions,
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
+    target_bytes: Option<u64>,
+    mut scan_entries: impl FnMut(&Storage, &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError>,
+) -> Result<GcReport, StorageError> {
+    let mut entries = scan_entries(storage, trusted)?;
     let protection = protect(&mut entries, options.protected_roots.as_deref())?;
-    let orphans = scan_orphans(&storage, &entries)?;
+    let orphans = scan_orphans(storage, &entries)?;
     let protected_bytes = category_bytes(&entries, |entry| entry.protected);
 
     let before_bytes = total_bytes(&entries) + orphan_bytes(&orphans);
@@ -162,7 +172,7 @@ pub fn run_with_lock_acquired(
     let eligible_bytes_total = eligible_bytes(&entries, &orphans, now, options.min_age);
     let shared = shared_count(&entries);
     let shared_bytes_total = shared_bytes(&entries);
-    let (temporary, temporary_bytes) = temporary_inventory(&storage)?;
+    let (temporary, temporary_bytes) = temporary_inventory(storage)?;
     let selected = select(
         &entries,
         before_bytes,
@@ -190,13 +200,13 @@ pub fn run_with_lock_acquired(
         (0, 0, 0)
     } else {
         let result: Result<(usize, usize, usize), StorageError> = (|| {
-            let (deleted_narinfos, deleted_nars) = apply(&storage, &entries, &selected)?;
-            let deleted_orphans = apply_orphans(&storage, &orphans, &selected_orphans)?;
+            let (deleted_narinfos, deleted_nars) = apply(storage, &entries, &selected)?;
+            let deleted_orphans = apply_orphans(storage, &orphans, &selected_orphans)?;
             Ok((deleted_narinfos, deleted_nars, deleted_orphans))
         })();
         let deleted = result?;
-        let remaining_entries = scan(&storage, &trusted)?;
-        let remaining_orphans = scan_orphans(&storage, &remaining_entries)?;
+        let remaining_entries = scan_entries(storage, trusted)?;
+        let remaining_orphans = scan_orphans(storage, &remaining_entries)?;
         after_bytes = total_bytes(&remaining_entries) + orphan_bytes(&remaining_orphans);
         storage.finish_recovery()?;
         deleted
@@ -233,10 +243,18 @@ pub fn run_with_lock_acquired(
 }
 
 fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError> {
+    scan_with_directory_names(storage, trusted, read_dir_names)
+}
+
+fn scan_with_directory_names(
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
+    read_names: impl FnOnce(&File) -> io::Result<Vec<OsString>>,
+) -> Result<Vec<Entry>, StorageError> {
     let mut entries = Vec::new();
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
-    for name in read_dir_names(&root)? {
+    for name in read_names(&root)? {
         let Some(name_str) = name.to_str() else {
             continue;
         };
@@ -1416,6 +1434,45 @@ mod tests {
         symlink(&external, &nar_dir).expect("create NAR directory symlink");
 
         assert!(scan_orphans(&storage, &[]).is_err());
+    }
+
+    #[test]
+    fn scan_error_preserves_published_files_before_gc_can_apply_deletions() {
+        let (directory, storage, entry) = pair_fixture();
+        let trusted = TrustedPublicKeys::load(
+            &Directory::open(directory.path()).expect("storage root should open"),
+        )
+        .expect("default trust configuration should load");
+        let result = run_flat_gc(
+            GcOptions {
+                data_dir: directory.path().to_owned(),
+                max_bytes: None,
+                target_bytes: Some(0),
+                max_age: None,
+                min_age: Duration::ZERO,
+                protected_roots: None,
+                mode: GcMode::Apply,
+                backend: StorageBackend::Flat,
+            },
+            &storage,
+            &trusted,
+            Some(0),
+            |storage, trusted| {
+                scan_with_directory_names(storage, trusted, |_| {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                })
+            },
+        );
+
+        assert!(result.is_err(), "an incomplete GC scan must abort");
+        assert!(
+            directory.path().join(&entry.narinfo_name).exists(),
+            "GC must not delete metadata after a scan error"
+        );
+        assert!(
+            directory.path().join("nar").join(&entry.nar_name).exists(),
+            "GC must not delete a NAR after a scan error"
+        );
     }
 
     const TEST_STORE_HASH: &str = "00000000000000000000000000000000";

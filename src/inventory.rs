@@ -6,7 +6,8 @@ use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file},
     object::NarRepresentation,
     storage::{
-        Directory, FileHash, NarFileName, NarHash, Storage, StoreHash, for_each_dir_name,
+        Directory, DirectoryEntryAction, DirectoryScanOutcome, FileHash, NarFileName, NarHash,
+        Storage, StoreHash, for_each_dir_name,
         inspection::{NarinfoCandidate, NarinfoName, PayloadEntry, ReferencedPayload},
         open_directory_at, read_dir_names,
     },
@@ -534,18 +535,19 @@ fn inspect_unreferenced_payloads(
 impl Inventory {
     pub fn can_serve_streaming(root: &Directory, trusted: &TrustedPublicKeys) -> io::Result<bool> {
         let root = root.file();
-        let mut can_serve = true;
-        for_each_dir_name(root, |name| {
+        let outcome = for_each_dir_name(root, |name| {
             let entry_can_serve = match NarinfoName::classify(name) {
                 None | Some(NarinfoName::Invalid(_)) => true,
                 Some(NarinfoName::Candidate(candidate)) => {
                     validate_narinfo_candidate(root, &candidate, trusted)?.is_ok()
                 }
             };
-            can_serve = can_serve && entry_can_serve;
-            Ok(can_serve)
+            Ok(match entry_can_serve {
+                true => DirectoryEntryAction::Continue,
+                false => DirectoryEntryAction::Stop,
+            })
         })?;
-        Ok(can_serve)
+        Ok(outcome == DirectoryScanOutcome::Complete)
     }
 
     pub fn can_recover(
@@ -556,9 +558,9 @@ impl Inventory {
         let root = storage.root_directory().map_err(storage_error_to_io)?;
         let mut checked = NarInfoCount::default();
         let mut invalid = None;
-        for_each_dir_name(&root, |name| {
+        let outcome = for_each_dir_name(&root, |name| {
             let Some(name) = NarinfoName::classify(name) else {
-                return Ok(true);
+                return Ok(DirectoryEntryAction::Continue);
             };
             let assessment = inspect_narinfo_entry(
                 name,
@@ -575,13 +577,16 @@ impl Inventory {
             progress(checked);
             if entry.class.invalid_published_pair() {
                 invalid = Some(entry);
-                return Ok(false);
+                return Ok(DirectoryEntryAction::Stop);
             }
-            Ok(true)
+            Ok(DirectoryEntryAction::Continue)
         })?;
-        Ok(match invalid {
-            Some(entry) => RecoveryOutcome::Invalid { checked, entry },
-            None => RecoveryOutcome::Ready { checked },
+        Ok(match outcome {
+            DirectoryScanOutcome::Complete => RecoveryOutcome::Ready { checked },
+            DirectoryScanOutcome::StoppedEarly => RecoveryOutcome::Invalid {
+                checked,
+                entry: invalid.expect("invalid publication stops recovery enumeration"),
+            },
         })
     }
 
