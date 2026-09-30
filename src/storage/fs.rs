@@ -405,30 +405,58 @@ pub(crate) fn for_each_dir_name<F>(
 where
     F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
 {
-    let directory = open_at(
-        directory,
-        OsStr::new("."),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-    )?;
-    let fd = directory.into_raw_fd();
-    // SAFETY: fd is a newly opened directory descriptor. On success,
-    // fdopendir transfers ownership to the DIR handle.
-    let stream = unsafe { libc::fdopendir(fd) };
-    if stream.is_null() {
-        // SAFETY: fdopendir failed and did not transfer ownership.
-        unsafe { libc::close(fd) };
-        return Err(io::Error::last_os_error());
+    let stream = DirectoryStream::open(directory)?;
+    let scan_result = visit_readdir_entries(|| next_readdir_entry(stream.as_ptr()), &mut visit);
+    let close_result = stream.close();
+    scan_result.and_then(|outcome| close_result.map(|()| outcome))
+}
+
+struct DirectoryStream(Option<NonNull<libc::DIR>>);
+
+impl DirectoryStream {
+    fn open(directory: &File) -> io::Result<Self> {
+        let directory = open_at(
+            directory,
+            OsStr::new("."),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )?;
+        let fd = directory.into_raw_fd();
+        // SAFETY: fd is a newly opened directory descriptor. On success,
+        // fdopendir transfers ownership to the DIR handle.
+        let stream = unsafe { libc::fdopendir(fd) };
+        let Some(stream) = NonNull::new(stream) else {
+            let error = io::Error::last_os_error();
+            // SAFETY: fdopendir failed and did not transfer ownership.
+            unsafe { libc::close(fd) };
+            return Err(error);
+        };
+        Ok(Self(Some(stream)))
     }
 
-    let scan_result = visit_readdir_entries(|| next_readdir_entry(stream), &mut visit);
-    // SAFETY: stream is the sole owner of the duplicated descriptor now.
-    let close_result = if unsafe { libc::closedir(stream) } != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    };
-    scan_result.and_then(|outcome| close_result.map(|()| outcome))
+    fn as_ptr(&self) -> *mut libc::DIR {
+        self.0.expect("directory stream is open").as_ptr()
+    }
+
+    fn close(mut self) -> io::Result<()> {
+        let stream = self.0.take().expect("directory stream is open");
+        // SAFETY: taking the handle transfers its sole ownership to closedir.
+        if unsafe { libc::closedir(stream.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        if let Some(stream) = self.0.take() {
+            // SAFETY: this guard owns the stream and closes it during
+            // unwinding or when explicit close was not reached.
+            unsafe { libc::closedir(stream.as_ptr()) };
+        }
+    }
 }
 
 fn visit_readdir_entries<F>(
@@ -802,5 +830,36 @@ mod tests {
         .expect_err("visitor error should propagate");
 
         assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn callback_panic_closes_directory_stream() {
+        let directory_path = tempfile::tempdir().expect("directory should be created");
+        std::fs::write(directory_path.path().join("entry"), b"entry")
+            .expect("entry should be written");
+        let directory = open_directory(directory_path.path()).expect("directory should open");
+        let open_handles_for_directory = || {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("process file descriptors should be readable")
+                .filter_map(Result::ok)
+                .filter_map(|descriptor| std::fs::read_link(descriptor.path()).ok())
+                .filter(|target| target == directory_path.path())
+                .count()
+        };
+        let handles_before_scan = open_handles_for_directory();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = for_each_dir_name(&directory, |_| -> io::Result<DirectoryEntryAction> {
+                panic!("injected visitor panic")
+            });
+        }));
+
+        assert!(panic.is_err(), "the injected callback should panic");
+        assert_eq!(
+            open_handles_for_directory(),
+            handles_before_scan,
+            "unwinding must close the owned directory stream"
+        );
     }
 }
