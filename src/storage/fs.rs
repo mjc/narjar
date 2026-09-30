@@ -18,6 +18,7 @@ use std::{
         unix::fs::{OpenOptionsExt, PermissionsExt},
     },
     path::Path,
+    ptr::NonNull,
     sync::{Arc, Mutex},
 };
 
@@ -375,48 +376,34 @@ pub(super) fn open_at(parent: &File, name: &OsStr, flags: i32, mode: u32) -> io:
 }
 
 pub(crate) fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
-    let directory = open_at(
-        directory,
-        OsStr::new("."),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-    )?;
-    let fd = directory.into_raw_fd();
-    // SAFETY: fd is a newly opened directory descriptor. On success,
-    // fdopendir transfers ownership to the DIR handle.
-    let stream = unsafe { libc::fdopendir(fd) };
-    if stream.is_null() {
-        // SAFETY: fdopendir failed and did not transfer ownership.
-        unsafe { libc::close(fd) };
-        return Err(io::Error::last_os_error());
-    }
-
     let mut names = Vec::new();
-    loop {
-        // SAFETY: stream is a live DIR handle and remains valid until the
-        // matching closedir below.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        // SAFETY: d_name is a NUL-terminated entry name owned by stream and is
-        // copied before the next readdir call.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            names.push(OsStr::from_bytes(name.to_bytes()).to_owned());
-        }
-    }
-
-    // SAFETY: stream is the sole owner of the duplicated descriptor now.
-    if unsafe { libc::closedir(stream) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let _outcome = for_each_dir_name(directory, |name| {
+        names.push(name.to_owned());
+        Ok(DirectoryEntryAction::Continue)
+    })?;
     Ok(names)
 }
 
-pub(crate) fn for_each_dir_name<F>(directory: &File, mut visit: F) -> io::Result<()>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryEntryAction {
+    Continue,
+    Stop,
+}
+
+/// Whether directory enumeration reached EOF or the visitor stopped it early.
+#[must_use = "check whether directory enumeration completed or stopped early"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryScanOutcome {
+    Complete,
+    StoppedEarly,
+}
+
+pub(crate) fn for_each_dir_name<F>(
+    directory: &File,
+    mut visit: F,
+) -> io::Result<DirectoryScanOutcome>
 where
-    F: FnMut(&OsStr) -> io::Result<bool>,
+    F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
 {
     let directory = open_at(
         directory,
@@ -434,38 +421,96 @@ where
         return Err(io::Error::last_os_error());
     }
 
-    let mut callback_result = Ok(());
-    loop {
-        // SAFETY: stream is a live DIR handle and remains valid until the
-        // matching closedir below.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        // SAFETY: d_name is a NUL-terminated entry name owned by stream and is
-        // valid for the duration of this callback.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
-            continue;
-        }
-        let name = OsStr::from_bytes(name.to_bytes());
-        match visit(name) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(error) => {
-                callback_result = Err(error);
-                break;
-            }
-        }
-    }
-
+    let scan_result = visit_readdir_entries(|| next_readdir_entry(stream), &mut visit);
     // SAFETY: stream is the sole owner of the duplicated descriptor now.
     let close_result = if unsafe { libc::closedir(stream) } != 0 {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
     };
-    callback_result.and(close_result)
+    scan_result.and_then(|outcome| close_result.map(|()| outcome))
+}
+
+fn visit_readdir_entries<F>(
+    mut next_entry: impl FnMut() -> io::Result<Option<NonNull<libc::dirent>>>,
+    mut visit: F,
+) -> io::Result<DirectoryScanOutcome>
+where
+    F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
+{
+    use std::ops::ControlFlow;
+
+    let mut entries = std::iter::from_fn(|| match next_entry() {
+        Ok(Some(entry)) => Some(Ok(entry)),
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    });
+
+    match entries.try_for_each(|entry| {
+        let action = entry.and_then(|entry| visit_readdir_name(entry, &mut visit));
+        match action {
+            Ok(DirectoryEntryAction::Continue) => ControlFlow::Continue(()),
+            Ok(DirectoryEntryAction::Stop) => {
+                ControlFlow::Break(Ok(DirectoryScanOutcome::StoppedEarly))
+            }
+            Err(error) => ControlFlow::Break(Err(error)),
+        }
+    }) {
+        ControlFlow::Continue(()) => Ok(DirectoryScanOutcome::Complete),
+        ControlFlow::Break(result) => result,
+    }
+}
+
+fn visit_readdir_name<F>(
+    entry: NonNull<libc::dirent>,
+    visit: &mut F,
+) -> io::Result<DirectoryEntryAction>
+where
+    F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
+{
+    // SAFETY: the DIR stream owns this entry and it remains valid until
+    // the next call to readdir.
+    let name = unsafe { CStr::from_ptr(entry.as_ref().d_name.as_ptr()) };
+    if name.to_bytes() == b"." || name.to_bytes() == b".." {
+        return Ok(DirectoryEntryAction::Continue);
+    }
+    visit(OsStr::from_bytes(name.to_bytes()))
+}
+
+fn next_readdir_entry(stream: *mut libc::DIR) -> io::Result<Option<NonNull<libc::dirent>>> {
+    clear_errno();
+    // SAFETY: stream is a live DIR handle and is closed by for_each_dir_name.
+    let entry = unsafe { libc::readdir(stream) };
+    if let Some(entry) = NonNull::new(entry) {
+        return Ok(Some(entry));
+    }
+    let error_code = io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or_default();
+    classify_readdir_result(std::ptr::null_mut(), error_code)
+}
+
+fn classify_readdir_result(
+    entry: *mut libc::dirent,
+    error_code: i32,
+) -> io::Result<Option<NonNull<libc::dirent>>> {
+    match NonNull::new(entry) {
+        Some(entry) => Ok(Some(entry)),
+        None if error_code == 0 => Ok(None),
+        None => Err(io::Error::from_raw_os_error(error_code)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clear_errno() {
+    // SAFETY: this accesses the current thread's errno slot.
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(target_os = "macos")]
+fn clear_errno() {
+    // SAFETY: this accesses the current thread's errno slot.
+    unsafe { *libc::__error() = 0 };
 }
 
 #[cfg(target_os = "linux")]
@@ -698,4 +743,64 @@ pub(super) fn unlink_at(directory: &File, name: &OsStr) -> io::Result<()> {
 
 pub(super) fn remove_temp(temp: &TemporaryFile) -> io::Result<()> {
     unlink_at(&temp.directory, &temp.name).and_then(|()| temp.directory.sync_all())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ptr;
+
+    #[test]
+    fn null_readdir_result_is_eof_only_when_errno_is_clear() {
+        assert!(
+            classify_readdir_result(ptr::null_mut(), 0)
+                .expect("clean null result should be EOF")
+                .is_none()
+        );
+
+        let error = classify_readdir_result(ptr::null_mut(), libc::EIO)
+            .expect_err("readdir error must not be treated as EOF");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn injected_readdir_error_propagates() {
+        let result = visit_readdir_entries(
+            || Err(io::Error::from_raw_os_error(libc::EIO)),
+            |_| Ok(DirectoryEntryAction::Continue),
+        );
+
+        assert_eq!(
+            result
+                .expect_err("incomplete enumeration must fail")
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+    }
+
+    #[test]
+    fn visitor_stop_is_reported_separately_from_successful_eof() {
+        let directory = tempfile::tempdir().expect("directory should be created");
+        std::fs::write(directory.path().join("entry"), b"entry").expect("entry should be written");
+        let directory = open_directory(directory.path()).expect("directory should open");
+
+        let outcome = for_each_dir_name(&directory, |_| Ok(DirectoryEntryAction::Stop))
+            .expect("deliberate stop should not be an enumeration error");
+
+        assert_eq!(outcome, DirectoryScanOutcome::StoppedEarly);
+    }
+
+    #[test]
+    fn visitor_errors_remain_errors() {
+        let directory = tempfile::tempdir().expect("directory should be created");
+        std::fs::write(directory.path().join("entry"), b"entry").expect("entry should be written");
+        let directory = open_directory(directory.path()).expect("directory should open");
+
+        let error = for_each_dir_name(&directory, |_| {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .expect_err("visitor error should propagate");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    }
 }
