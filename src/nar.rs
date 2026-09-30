@@ -197,7 +197,7 @@ pub struct DecodeSummary {
 /// The decoder owns its reader and can be consumed only once by
 /// [`Decoder::decode`].
 pub struct Decoder<R> {
-    reader: R,
+    reader: InterruptedRetryReader<R>,
     limits: Limits,
     digest: Sha256,
     raw_bytes: u64,
@@ -214,7 +214,7 @@ impl<R: Read> Decoder<R> {
     /// Creates a decoder with explicit input and work limits.
     pub fn with_limits(reader: R, limits: Limits) -> Self {
         Self {
-            reader,
+            reader: InterruptedRetryReader(reader),
             limits,
             digest: Sha256::new(),
             raw_bytes: 0,
@@ -519,22 +519,28 @@ fn read_hashed_limited_bytes<R: Read, E>(
             actual: next,
         });
     }
-    let mut offset = 0;
-    while offset < buffer.len() {
-        let read = reader
-            .read(&mut buffer[offset..])
-            .map_err(DecodeError::Io)?;
-        if read == 0 {
-            return Err(DecodeError::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "unexpected end of NAR",
-            )));
-        }
-        digest.update(&buffer[offset..offset + read]);
-        *raw_bytes += read as u64;
-        offset += read;
-    }
+    reader.read_exact(buffer).map_err(DecodeError::Io)?;
+    digest.update(buffer);
+    *raw_bytes = next;
     Ok(())
+}
+
+/// Retries `Interrupted` at the only reader boundary used by the decoder.
+struct InterruptedRetryReader<R>(R);
+
+impl<R: Read> Read for InterruptedRetryReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let result = self.0.read(buffer);
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::Interrupted)
+            {
+                continue;
+            }
+            return result;
+        }
+    }
 }
 
 #[derive(Default)]
