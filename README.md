@@ -201,7 +201,7 @@ variables.
 Compressed uploads are limited by both their encoded size and decoded NAR
 size. XZ dictionary memory and Zstd frame windows are checked against
 `maxDecoderMemoryBytes` before decoder buffers are allocated. Upload decoding
-runs on request workers, so at most `workers` decoders run at once; the
+runs on publication workers, so at most `workers` decoders run at once; the
 configured worst-case decoder working memory is therefore
 `workers × maxDecoderMemoryBytes`.
 

@@ -14,8 +14,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Barrier,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -3488,17 +3488,19 @@ fn compressed_upload_memory_limits_return_422_without_publishing() {
 #[test]
 #[cfg(target_os = "linux")]
 fn concurrent_compressed_uploads_stay_within_the_worker_memory_ceiling() {
+    const PUBLICATION_WORKERS: usize = 2;
+    const UPLOAD_COUNT: usize = 4;
     const DECODER_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
     const ALLOWED_FIXED_PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
     const DICTIONARY_SIZE: usize = 16 * 1024 * 1024;
 
     let server = RunningServer::start_with_workers(
         "concurrent-decoder-memory",
-        2,
+        PUBLICATION_WORKERS,
         &["--max-decoder-memory-bytes", "67108864"],
     );
     let baseline_peak_bytes = server.peak_rss_bytes();
-    let raw_nars = [0x1234_5678_u32, 0x9abc_def0]
+    let raw_nars = [0x1234_5678_u32, 0x9abc_def0, 0x1357_9bdf, 0x2468_ace0]
         .iter()
         .map(|seed| {
             let mut state = *seed;
@@ -3528,22 +3530,55 @@ fn concurrent_compressed_uploads_stay_within_the_worker_memory_ceiling() {
         })
         .collect::<Vec<_>>();
 
+    let start = Barrier::new(UPLOAD_COUNT + 1);
+    let uploads_finished = AtomicBool::new(false);
+    let maximum_active_workers = AtomicU64::new(0);
+    let maximum_queue_depth = AtomicU64::new(0);
     let responses = std::thread::scope(|scope| {
-        let requests = uploads
-            .iter()
-            .map(|(compressed, path)| {
-                scope.spawn(|| server.request_with_body("PUT", path, &[], compressed))
-            })
-            .collect::<Vec<_>>();
-        requests
+        let observer_finished = &uploads_finished;
+        let observer_active_workers = &maximum_active_workers;
+        let observer_queue_depth = &maximum_queue_depth;
+        let metrics_server = &server;
+        let observer = scope.spawn(move || {
+            while !observer_finished.load(Ordering::Acquire) {
+                let (_, metrics) = response_parts(&metrics_server.request("GET", "/metrics"));
+                let metrics = String::from_utf8_lossy(&metrics);
+                observer_active_workers.fetch_max(
+                    metric_value(&metrics, "narjar_publication_workers_active"),
+                    Ordering::Relaxed,
+                );
+                observer_queue_depth.fetch_max(
+                    metric_value(&metrics, "narjar_publication_queue_depth"),
+                    Ordering::Relaxed,
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let mut requests = Vec::with_capacity(UPLOAD_COUNT);
+        for (compressed, path) in &uploads {
+            let start = &start;
+            let upload_server = &server;
+            requests.push(scope.spawn(move || {
+                start.wait();
+                upload_server.request_with_body("PUT", path, &[], compressed)
+            }));
+        }
+        start.wait();
+        let responses = requests
             .into_iter()
             .map(|request| request.join().expect("upload thread should complete"))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        uploads_finished.store(true, Ordering::Release);
+        observer.join().expect("metrics observer should complete");
+        responses
     });
+    let maximum_active_workers = maximum_active_workers.load(Ordering::Relaxed);
+    let maximum_queue_depth = maximum_queue_depth.load(Ordering::Relaxed);
     let peak_rss_bytes = server.peak_rss_bytes();
     eprintln!(
         "compressed upload RSS: baseline={baseline_peak_bytes} B peak={peak_rss_bytes} B, \
-         decoder_limit={DECODER_LIMIT_BYTES} B × 2 publication workers"
+         decoder_limit={DECODER_LIMIT_BYTES} B × {PUBLICATION_WORKERS} publication workers, \
+         observed active={maximum_active_workers}, queued={maximum_queue_depth}"
     );
     let (signal, status) = server.stop();
 
@@ -3555,14 +3590,15 @@ fn concurrent_compressed_uploads_stay_within_the_worker_memory_ceiling() {
         );
         assert!(body.is_empty());
     }
-    let configured_concurrency = 2;
     let configured_peak_bytes = baseline_peak_bytes
-        + DECODER_LIMIT_BYTES * configured_concurrency
+        + DECODER_LIMIT_BYTES * PUBLICATION_WORKERS as u64
         + ALLOWED_FIXED_PROCESS_OVERHEAD;
+    assert_eq!(maximum_active_workers, PUBLICATION_WORKERS as u64);
+    assert!(maximum_queue_depth > 0, "excess uploads should queue");
     assert!(
         peak_rss_bytes <= configured_peak_bytes,
         "observed server peak RSS {peak_rss_bytes} B exceeded baseline {baseline_peak_bytes} B + \
-         {configured_concurrency} × {DECODER_LIMIT_BYTES} B decoder budget + \
+         {PUBLICATION_WORKERS} × {DECODER_LIMIT_BYTES} B decoder budget + \
          {ALLOWED_FIXED_PROCESS_OVERHEAD} B fixed overhead"
     );
     assert!(signal.success());

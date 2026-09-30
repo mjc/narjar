@@ -10,7 +10,7 @@ use std::{
 use lzma_rust2::XzReader;
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::{
-    StreamingDecoder as StructuredZstdDecoder, read_frame_header_info,
+    FrameDecoder, StreamingDecoder as StructuredZstdDecoder, read_frame_header_info,
 };
 
 use crate::object::{
@@ -28,6 +28,7 @@ use super::{
 const RAW_STAGING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 const ZSTD_FRAME_HEADER_MAX_BYTES: usize = 18;
 const ZSTD_BLOCK_BUFFER_BYTES: u64 = 128 * 1024;
+const ZSTD_FIXED_WORKSPACE_ALLOWANCE_BYTES: u64 = 1024 * 1024;
 
 pub(super) struct CheckedUploadReader<R> {
     inner: R,
@@ -365,6 +366,13 @@ fn xz_decoder_memory_limit_kib(max_memory_bytes: u64) -> u32 {
     (max_memory_bytes / 1024).min(u64::from(u32::MAX)) as u32
 }
 
+fn zstd_decoder_memory_requirement(window_bytes: u64) -> Option<u64> {
+    window_bytes
+        .checked_add(ZSTD_BLOCK_BUFFER_BYTES)?
+        .checked_add(ZSTD_FIXED_WORKSPACE_ALLOWANCE_BYTES)?
+        .checked_add(std::mem::size_of::<FrameDecoder>() as u64)
+}
+
 fn preflight_zstd_window<R: Read>(
     mut source: R,
     max_decoder_memory_bytes: u64,
@@ -383,8 +391,8 @@ fn preflight_zstd_window<R: Read>(
     let header_prefix = &header_bytes[..header_length];
     let header = read_frame_header_info(header_prefix, false)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let maximum_window = max_decoder_memory_bytes.saturating_sub(ZSTD_BLOCK_BUFFER_BYTES);
-    if header.window_size > maximum_window {
+    let required_memory = zstd_decoder_memory_requirement(header.window_size);
+    if !required_memory.is_some_and(|required| required <= max_decoder_memory_bytes) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             DecoderMemoryLimitExceeded,

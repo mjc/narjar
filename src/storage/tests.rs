@@ -28,11 +28,14 @@ use crate::object::{
 };
 use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
-use structured_zstd::decoding::read_frame_header_info;
+use structured_zstd::decoding::{
+    StreamingDecoder as StructuredZstdDecoder, read_frame_header_info,
+};
 use structured_zstd::encoding::{CompressionLevel, compress};
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const STORE_HASH: &str = "00000000000000000000000000000000";
+const ZSTD_FIXED_WORKSPACE_ALLOWANCE_BYTES: u64 = 1024 * 1024;
 
 #[test]
 fn egress_receipt_round_trips_through_compact_binary_serialization() {
@@ -999,11 +1002,66 @@ fn zstd_upload_decoder_rejects_windows_above_the_configured_memory_limit() {
     let window_bytes = read_frame_header_info(&compressed, false)
         .expect("fixture has a complete zstd frame header")
         .window_size;
-    let exact_limit = window_bytes + 128 * 1024;
+    let exact_limit = window_bytes
+        + 128 * 1024
+        + ZSTD_FIXED_WORKSPACE_ALLOWANCE_BYTES
+        + std::mem::size_of::<structured_zstd::decoding::FrameDecoder>() as u64;
 
     assert_compressed_upload_memory_limit(encoding, &raw, &compressed, exact_limit - 1, false);
     assert_compressed_upload_memory_limit(encoding, &raw, &compressed, exact_limit, true);
     assert_compressed_upload_memory_limit(encoding, &raw, &compressed, exact_limit + 1, true);
+}
+
+#[test]
+fn zstd_upload_memory_limit_includes_decoder_workspace_beyond_its_window() {
+    let mut state = 0x1234_5678_u32;
+    let seed = (0..512 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect::<Vec<_>>();
+    let raw = seed.repeat(4);
+    let encoding = WireEncoding::Compressed(CompressionCodec::Zstd);
+    let mut compressed = Vec::new();
+    let mut encoder = structured_zstd::encoding::StreamingEncoder::new(
+        &mut compressed,
+        CompressionLevel::Default,
+    );
+    encoder.write_all(&raw).expect("encode zstd fixture");
+    encoder.finish().expect("finish zstd fixture");
+    let header = read_frame_header_info(&compressed, false)
+        .expect("fixture has a complete zstd frame header");
+    let old_window_only_limit = header.window_size + 128 * 1024;
+    let mut decoder = StructuredZstdDecoder::new(Cursor::new(&compressed))
+        .expect("fixture starts a valid zstd decoder");
+    io::copy(&mut decoder, &mut io::sink()).expect("fixture decodes");
+
+    let actual_workspace_bytes =
+        decoder.decoder.workspace_size() as u64 + std::mem::size_of_val(&decoder.decoder) as u64;
+    assert!(
+        actual_workspace_bytes > old_window_only_limit,
+        "fixture workspace {actual_workspace_bytes} must exceed window-only limit \
+         {old_window_only_limit} (window {})",
+        header.window_size
+    );
+    let full_workspace_limit = old_window_only_limit
+        + ZSTD_FIXED_WORKSPACE_ALLOWANCE_BYTES
+        + std::mem::size_of::<structured_zstd::decoding::FrameDecoder>() as u64;
+    assert!(
+        actual_workspace_bytes <= full_workspace_limit,
+        "fixture workspace {actual_workspace_bytes} must fit conservative limit \
+         {full_workspace_limit}"
+    );
+    assert_compressed_upload_memory_limit(
+        encoding,
+        &raw,
+        &compressed,
+        old_window_only_limit,
+        false,
+    );
 }
 
 #[test]
