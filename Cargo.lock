@@ -418,6 +418,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "ureq",
+ "xz4rust",
 ]
 
 [[package]]
@@ -955,6 +956,15 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "xz4rust"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "606930b71bad6379f366994e4e6252a3462fa28bfc3695c33b07bef8f967d6d6"
+dependencies = [
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "zeroize"

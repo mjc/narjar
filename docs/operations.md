@@ -21,6 +21,8 @@ narjar serve
   [--workers 8]
   [--max-in-flight 64]
   [--max-nar-bytes 17179869184]
+  [--max-encoded-nar-bytes 17179869184]
+  [--max-decoder-memory-bytes 134217728]
   [--min-free-bytes 1073741824]
   [--shutdown-grace-seconds 30]
   [--io-timeout-seconds 30]
@@ -206,6 +208,8 @@ NARJAR_LISTEN
 NARJAR_WORKERS
 NARJAR_MAX_IN_FLIGHT
 NARJAR_MAX_NAR_BYTES
+NARJAR_MAX_ENCODED_NAR_BYTES
+NARJAR_MAX_DECODER_MEMORY_BYTES
 NARJAR_MIN_FREE_BYTES
 NARJAR_SHUTDOWN_GRACE_SECONDS
 NARJAR_IO_TIMEOUT_SECONDS
@@ -213,11 +217,19 @@ NARJAR_PUSH_TIMEOUT_SECONDS
 ~~~
 
 The compiled defaults bind to loopback, use 8 workers, admit at most 64
-in-flight requests, cap one NAR at 16 GiB, and preserve a 1 GiB free-space
-reserve. `--data-dir` has no default. A flag or environment value may override
-each numeric policy; the shutdown grace defaults to 30 seconds and must be
+in-flight requests, cap decoded and encoded NARs independently at 16 GiB,
+limit compressed decoder working memory to 128 MiB per upload, and preserve a
+1 GiB free-space reserve. `--data-dir` has no default. A flag or environment
+value may override each numeric policy; the shutdown grace defaults to 30 seconds and must be
 positive, while zero is valid only for the free-space reserve. Listen addresses
 must be numeric IP socket addresses so startup never depends on DNS.
+
+Compressed uploads that exceed the decoder-memory limit are rejected with
+HTTP 422 before the decoder allocates beyond the limit; staged output is
+removed and never published. Encoded-size excess is HTTP 413; decoded-size
+excess is HTTP 422. Decoding runs in the bounded publication
+worker pool, so at most `workers` decoders can be active and their configured
+aggregate memory ceiling is `workers × maxDecoderMemoryBytes`.
 
 A TOML configuration file is an explicit v0.1 non-goal. It would add a parser
 and duplicate the systemd/container environment boundary. If future option

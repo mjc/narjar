@@ -105,7 +105,7 @@ struct RequestWorkerContext {
     metrics: Arc<Metrics>,
     publication_sender: Sender<QueuedPublication>,
     min_free_bytes: u64,
-    max_nar_bytes: u64,
+    max_encoded_nar_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -258,7 +258,9 @@ fn queue_publication(
         return;
     };
     let staging = context.storage.reserve_staging(
-        request.staging_bytes(context.max_nar_bytes).unwrap_or(0),
+        request
+            .staging_bytes(context.max_encoded_nar_bytes)
+            .unwrap_or(0),
         context.min_free_bytes,
     );
     let staging = match staging {
@@ -573,13 +575,16 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     install_signal_handlers(Arc::clone(&stopping), signal_count)?;
 
     println!(
-        "listening http://{} workers={} max_in_flight={} max_nar_bytes={} min_free_bytes={} shutdown_grace_seconds={} io_timeout_seconds={}",
+        "listening http://{} workers={} max_in_flight={} max_nar_bytes={} max_encoded_nar_bytes={} max_decoder_memory_bytes={} max_concurrent_decoders={} min_free_bytes={} shutdown_grace_seconds={} io_timeout_seconds={}",
         listener
             .local_addr()
             .map_err(|error| Error::runtime(format!("cannot inspect listener: {error}")))?,
         config.workers,
         config.max_in_flight,
         config.max_nar_bytes,
+        config.max_encoded_nar_bytes,
+        config.max_decoder_memory_bytes,
+        config.workers,
         config.min_free_bytes,
         config.shutdown_grace_seconds,
         config.io_timeout_seconds
@@ -590,8 +595,13 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
 
     let min_free_bytes = config.min_free_bytes;
     let egress_compression = config.egress_compression;
-    let upload_policy = NarUploadPolicy::new(config.max_nar_bytes.get(), config.min_free_bytes);
-    let max_nar_bytes = config.max_nar_bytes.get();
+    let upload_policy = NarUploadPolicy::with_limits(
+        config.max_encoded_nar_bytes.get(),
+        config.max_nar_bytes.get(),
+        config.max_decoder_memory_bytes.get(),
+        config.min_free_bytes,
+    );
+    let max_encoded_nar_bytes = config.max_encoded_nar_bytes.get();
     let max_in_flight = config.max_in_flight.get();
     metrics.configure_pressure_limits(max_in_flight as u64, config.workers.get() as u64);
     let admissions = Arc::new(Admissions::new(max_in_flight, Arc::clone(&metrics)));
@@ -616,7 +626,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         metrics: Arc::clone(&metrics),
         publication_sender: publication_sender.clone(),
         min_free_bytes,
-        max_nar_bytes,
+        max_encoded_nar_bytes,
     };
     let handles = spawn_request_workers(config.workers.get(), receiver.clone(), request_context);
     drop(receiver);

@@ -14,8 +14,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Barrier,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -2216,6 +2216,34 @@ impl RunningServer {
         self.exchange(method, path, headers, Some(body)).response
     }
 
+    #[cfg(target_os = "linux")]
+    fn peak_rss_bytes(&self) -> u64 {
+        let process_id = self.child.as_ref().expect("server is running").id();
+        let status = fs::read_to_string(format!("/proc/{process_id}/status"))
+            .expect("kernel reports the server process status");
+        let peak_kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("kernel reports the server's peak resident memory");
+        peak_kib * 1024
+    }
+
+    #[cfg(target_os = "linux")]
+    fn peak_virtual_memory_bytes(&self) -> u64 {
+        let process_id = self.child.as_ref().expect("server is running").id();
+        let status = fs::read_to_string(format!("/proc/{process_id}/status"))
+            .expect("kernel reports the server process status");
+        let peak_kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmPeak:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("kernel reports the server's peak virtual memory");
+        peak_kib * 1024
+    }
+
     fn raw_request_with_body(
         &self,
         method: &str,
@@ -2374,7 +2402,7 @@ fn serve_reports_listener_and_stops_on_sigterm() {
     );
     assert!(
         server.startup_line.ends_with(
-            " workers=1 max_in_flight=64 max_nar_bytes=17179869184 min_free_bytes=1073741824 shutdown_grace_seconds=30 io_timeout_seconds=30\n"
+            " workers=1 max_in_flight=64 max_nar_bytes=17179869184 max_encoded_nar_bytes=17179869184 max_decoder_memory_bytes=134217728 max_concurrent_decoders=1 min_free_bytes=1073741824 shutdown_grace_seconds=30 io_timeout_seconds=30\n"
         ),
         "startup line omits effective limits: {:?}",
         server.startup_line
@@ -3430,6 +3458,257 @@ fn nar_put_normalizes_zstd_to_raw_bytes() {
 }
 
 #[test]
+fn compressed_upload_memory_limits_return_422_without_publishing() {
+    for (index, encoding) in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let server = RunningServer::start_with_args(
+            &format!("decoder-memory-{index}"),
+            &["--max-decoder-memory-bytes", "131071"],
+        );
+        let compressed = encode_test_nar_with(encoding);
+        let path = format!(
+            "/nar/{}{}",
+            nix32_sha256(&compressed),
+            compressed_test_suffix(encoding)
+        );
+        let response = server.request_with_body("PUT", &path, &[], &compressed);
+        let published_raw = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
+        let temporary = fs::read_dir(server.data_dir.join(".tmp"))
+            .expect("temporary directory exists")
+            .count();
+        let (signal, status) = server.stop();
+
+        let (headers, body) = response_parts(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+            "{encoding:?}: {headers:?}"
+        );
+        assert!(body.is_empty());
+        assert!(
+            !published_raw.exists(),
+            "{encoding:?} was rejected before commit"
+        );
+        assert_eq!(temporary, 0, "{encoding:?} staging file was removed");
+        assert!(signal.success());
+        assert!(status.success());
+    }
+}
+
+#[test]
+fn decoded_size_limit_returns_422_for_a_large_raw_upload() {
+    const UPLOAD_BYTES: usize = 100_000;
+
+    let server = RunningServer::start_with_args("decoded-size-limit", &["--max-nar-bytes", "5"]);
+    let raw = vec![0; UPLOAD_BYTES];
+    let path = format!("/nar/{}.nar", nix32_sha256(&raw));
+    let response = server.request_with_body("PUT", &path, &[], &raw);
+    let published = server
+        .data_dir
+        .join(format!("nar/{}.nar", nix32_sha256(&raw)));
+    let temporary = fs::read_dir(server.data_dir.join(".tmp"))
+        .expect("temporary directory exists")
+        .count();
+    let (signal, status) = server.stop();
+
+    let (headers, body) = response_parts(&response);
+    assert!(
+        headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{headers:?}"
+    );
+    assert!(body.is_empty());
+    assert!(
+        !published.exists(),
+        "oversized decoded NAR was not published"
+    );
+    assert_eq!(temporary, 0, "staging file was removed");
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn malicious_xz_index_cannot_allocate_from_its_declared_block_count() {
+    const DECLARED_BLOCK_COUNT: u64 = 16_777_216;
+    const ALLOWED_VIRTUAL_MEMORY_GROWTH: u64 = 64 * 1024 * 1024;
+
+    let server = RunningServer::start_with_args(
+        "xz-index-block-count",
+        &["--max-decoder-memory-bytes", "16777216"],
+    );
+    let _ = server.request("GET", "/metrics");
+    let baseline_peak = server.peak_virtual_memory_bytes();
+
+    let mut compressed = encode_test_nar_with(WireEncoding::Compressed(CompressionCodec::Xz));
+    let footer_start = compressed.len() - 12;
+    let backward_size = u32::from_le_bytes(
+        compressed[footer_start + 4..footer_start + 8]
+            .try_into()
+            .expect("XZ footer contains its backward size"),
+    ) as usize;
+    let index_start = footer_start - (backward_size + 1) * 4;
+    assert_eq!(
+        compressed[index_start], 0,
+        "XZ index starts with its marker"
+    );
+    assert_eq!(compressed[index_start + 1], 1, "fixture has one XZ block");
+    compressed.splice(
+        index_start + 1..index_start + 2,
+        encode_xz_variable_integer(DECLARED_BLOCK_COUNT),
+    );
+
+    let path = format!("/nar/{}.nar.xz", nix32_sha256(&compressed));
+    let response = server.request_with_body("PUT", &path, &[], &compressed);
+    let peak_virtual_memory = server.peak_virtual_memory_bytes();
+    let nar_published = server
+        .data_dir
+        .join(format!("nar/{}.nar", NARJAR_HASH))
+        .exists();
+    let (signal, status) = server.stop();
+
+    let (headers, body) = response_parts(&response);
+    assert!(
+        headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{headers:?}"
+    );
+    assert!(body.is_empty());
+    assert!(
+        peak_virtual_memory <= baseline_peak + ALLOWED_VIRTUAL_MEMORY_GROWTH,
+        "malformed XZ index grew VmPeak from {baseline_peak} to {peak_virtual_memory} bytes"
+    );
+    assert!(!nar_published, "malformed XZ input must not publish a NAR");
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn concurrent_compressed_uploads_stay_within_the_worker_memory_ceiling() {
+    const PUBLICATION_WORKERS: usize = 2;
+    const UPLOAD_COUNT: usize = 4;
+    const DECODER_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+    const ALLOWED_FIXED_PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+    const DICTIONARY_SIZE: usize = 16 * 1024 * 1024;
+
+    let server = RunningServer::start_with_workers(
+        "concurrent-decoder-memory",
+        PUBLICATION_WORKERS,
+        &["--max-decoder-memory-bytes", "67108864"],
+    );
+    let baseline_peak_bytes = server.peak_rss_bytes();
+    let raw_nars = [0x1234_5678_u32, 0x9abc_def0, 0x1357_9bdf, 0x2468_ace0]
+        .iter()
+        .map(|seed| {
+            let mut state = *seed;
+            let mut raw = (0..DICTIONARY_SIZE)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect::<Vec<_>>();
+            raw.extend_from_within(..);
+            raw
+        })
+        .collect::<Vec<_>>();
+    let uploads = raw_nars
+        .iter()
+        .map(|raw| {
+            let mut compressed = Vec::new();
+            compress(
+                std::io::Cursor::new(raw),
+                &mut compressed,
+                CompressionLevel::Fastest,
+            );
+            let path = format!("/nar/{}.nar.zst", nix32_sha256(&compressed));
+            (compressed, path)
+        })
+        .collect::<Vec<_>>();
+
+    let start = Barrier::new(UPLOAD_COUNT + 1);
+    let uploads_finished = AtomicBool::new(false);
+    let maximum_active_workers = AtomicU64::new(0);
+    let maximum_queue_depth = AtomicU64::new(0);
+    let responses = std::thread::scope(|scope| {
+        let observer_finished = &uploads_finished;
+        let observer_active_workers = &maximum_active_workers;
+        let observer_queue_depth = &maximum_queue_depth;
+        let metrics_server = &server;
+        let observer = scope.spawn(move || {
+            while !observer_finished.load(Ordering::Acquire) {
+                let (_, metrics) = response_parts(&metrics_server.request("GET", "/metrics"));
+                let metrics = String::from_utf8_lossy(&metrics);
+                observer_active_workers.fetch_max(
+                    metric_value(&metrics, "narjar_publication_workers_active"),
+                    Ordering::Relaxed,
+                );
+                observer_queue_depth.fetch_max(
+                    metric_value(&metrics, "narjar_publication_queue_depth"),
+                    Ordering::Relaxed,
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let mut requests = Vec::with_capacity(UPLOAD_COUNT);
+        for (compressed, path) in &uploads {
+            let start = &start;
+            let upload_server = &server;
+            requests.push(scope.spawn(move || {
+                start.wait();
+                upload_server.request_with_body("PUT", path, &[], compressed)
+            }));
+        }
+        start.wait();
+        let upload_results = requests
+            .into_iter()
+            .map(|request| request.join())
+            .collect::<Vec<_>>();
+        uploads_finished.store(true, Ordering::Release);
+        observer.join().expect("metrics observer should complete");
+        upload_results
+            .into_iter()
+            .map(|result| result.expect("upload thread should complete"))
+            .collect::<Vec<_>>()
+    });
+    let maximum_active_workers = maximum_active_workers.load(Ordering::Relaxed);
+    let maximum_queue_depth = maximum_queue_depth.load(Ordering::Relaxed);
+    let peak_rss_bytes = server.peak_rss_bytes();
+    eprintln!(
+        "compressed upload RSS: baseline={baseline_peak_bytes} B peak={peak_rss_bytes} B, \
+         decoder_limit={DECODER_LIMIT_BYTES} B × {PUBLICATION_WORKERS} publication workers, \
+         observed active={maximum_active_workers}, queued={maximum_queue_depth}"
+    );
+    let (signal, status) = server.stop();
+
+    for response in responses {
+        let (headers, body) = response_parts(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 201 Created\r\n"),
+            "{headers:?}"
+        );
+        assert!(body.is_empty());
+    }
+    let configured_peak_bytes = baseline_peak_bytes
+        + DECODER_LIMIT_BYTES * PUBLICATION_WORKERS as u64
+        + ALLOWED_FIXED_PROCESS_OVERHEAD;
+    assert_eq!(maximum_active_workers, PUBLICATION_WORKERS as u64);
+    assert!(maximum_queue_depth > 0, "excess uploads should queue");
+    assert!(
+        peak_rss_bytes <= configured_peak_bytes,
+        "observed server peak RSS {peak_rss_bytes} B exceeded baseline {baseline_peak_bytes} B + \
+         {PUBLICATION_WORKERS} × {DECODER_LIMIT_BYTES} B decoder budget + \
+         {ALLOWED_FIXED_PROCESS_OVERHEAD} B fixed overhead"
+    );
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
 #[cfg(not(target_os = "macos"))]
 fn chunked_backend_serves_the_reconstructed_raw_nar() {
     let server =
@@ -3583,7 +3862,7 @@ fn stalled_publication_does_not_block_an_independent_put() {
             response
         });
 
-        for _ in 0..100 {
+        for _ in 0..500 {
             if completed.load(Ordering::Acquire) {
                 break;
             }
@@ -4222,6 +4501,16 @@ fn test_encoding_name(encoding: WireEncoding) -> &'static str {
     }
 }
 
+fn encode_xz_variable_integer(mut value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while value >= 0x80 {
+        bytes.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+    bytes
+}
+
 fn compressed_test_suffix(encoding: WireEncoding) -> &'static str {
     match encoding {
         WireEncoding::Compressed(CompressionCodec::Xz) => ".nar.xz",
@@ -4470,7 +4759,8 @@ fn nar_put_rejects_encoded_malformed_oversized_and_truncated_bodies() {
     let metrics = String::from_utf8(metrics_body).expect("metrics should be UTF-8");
     let (signal, status) = server.stop();
 
-    let limited = RunningServer::start_with_args("nar-put-oversized", &["--max-nar-bytes", "5"]);
+    let limited =
+        RunningServer::start_with_args("nar-put-oversized", &["--max-encoded-nar-bytes", "5"]);
     let oversized = limited.request_with_body("PUT", &path, &[], NAR_BYTES);
     let oversized_path = limited.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
     let (limited_signal, limited_status) = limited.stop();

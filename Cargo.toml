@@ -33,6 +33,7 @@ ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["sig
 fluent-uri = { version = "=0.4.1", default-features = false, features = ["std"] }
 libc = { version = "=0.2.189", default-features = false }
 lzma-rust2 = { version = "=0.21.0", default-features = false, features = ["std", "xz", "encoder", "optimization"] }
+xz4rust = { version = "=0.2.3", default-features = false, features = ["std", "bcj", "crc64", "sha256", "delta", "no_unsafe"] }
 memchr = { version = "=2.8.3", default-features = false, features = ["std"] }
 mincdc = "=0.1.0"
 httparse = { version = "=1.10.1", default-features = false, features = ["std"] }

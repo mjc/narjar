@@ -85,7 +85,8 @@ services.narjar = {
 `writeTokens` is a Narjar token-hash file, and `trustedPublicKeys` contains the
 cache signing public keys. Set `privateRead = true` and `auth.readTokens` to
 require read authentication. The module also exposes `cachePriority`,
-`dynamicUser`, `workers`, `maxInFlight`, `maxNarBytes`, `minFreeBytes`,
+`dynamicUser`, `workers`, `maxInFlight`, `maxNarBytes`,
+`maxEncodedNarBytes`, `maxDecoderMemoryBytes`, `minFreeBytes`,
 `shutdownGraceSeconds`, `ioTimeoutSeconds`, `statsInventory`,
 `statsInventoryIntervalSeconds`, `statsFilesystemSample`, and
 `statsZfsDataset`. Scheduled collection is configured under `gc` with
@@ -188,12 +189,21 @@ Server defaults:
 | `--workers` | `8` |
 | `--max-in-flight` | `64` |
 | `--max-nar-bytes` | 16 GiB |
+| `--max-encoded-nar-bytes` | 16 GiB |
+| `--max-decoder-memory-bytes` | 128 MiB per compressed upload |
 | `--min-free-bytes` | 1 GiB |
 | `--egress-compression` | `none` |
 | `--storage-backend` | `flat` |
 
 Run `narjar serve --help` for all options and their `NARJAR_*` environment
 variables.
+
+Compressed uploads are limited by both their encoded size and decoded NAR
+size. XZ dictionary memory and Zstd frame windows are checked against
+`maxDecoderMemoryBytes` before decoder buffers are allocated. Upload decoding
+runs on publication workers, so at most `workers` decoders run at once; the
+configured worst-case decoder working memory is therefore
+`workers × maxDecoderMemoryBytes`.
 
 ## Monitoring
 
