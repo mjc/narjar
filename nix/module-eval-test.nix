@@ -18,6 +18,14 @@ let
     statsInventory ? false,
     statsInventoryIntervalSeconds ? 900,
     statsZfsDataset ? null,
+    statsFilesystemSample ? null,
+    cachePriority ? 30,
+    privateRead ? false,
+    ioTimeoutSeconds ? 30,
+    egressCompression ? "none",
+    storageBackend ? "flat",
+    readTokens ? null,
+    gc ? {},
   }:
     (import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = pkgs.system;
@@ -27,7 +35,20 @@ let
         {
           services.narjar = {
             enable = true;
-            inherit dataDir statsInventory statsInventoryIntervalSeconds statsZfsDataset;
+            inherit
+              dataDir
+              statsInventory
+              statsInventoryIntervalSeconds
+              statsZfsDataset
+              statsFilesystemSample
+              cachePriority
+              privateRead
+              ioTimeoutSeconds
+              egressCompression
+              storageBackend
+              ;
+            auth.readTokens = readTokens;
+            inherit gc;
             minFreeBytes = 0;
             package = package;
           };
@@ -69,9 +90,39 @@ let
     dataDir = "/var/lib/narjar";
     statsZfsDataset = "tank/narjar";
   };
+  externallySampledConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    statsFilesystemSample = "/run/filesystem/sample.json";
+  };
   emptyZfsDatasetConfig = configuration {
     dataDir = "/var/lib/narjar";
     statsZfsDataset = "";
+  };
+  customRuntimeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    cachePriority = 42;
+    privateRead = true;
+    readTokens = "/run/narjar/read.tokens";
+    ioTimeoutSeconds = 9;
+    egressCompression = "zstd";
+    storageBackend = "chunked";
+    gc = {
+      enable = true;
+      maxBytes = 1000;
+    };
+  };
+  invalidCompressionConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    egressCompression = "brotli";
+  };
+  missingPrivateReadTokenConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    privateRead = true;
+  };
+  conflictingFilesystemSamplesConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    statsZfsDataset = "tank/narjar";
+    statsFilesystemSample = "/run/filesystem/sample.json";
   };
 in
 assert builtins.all evaluates valid;
@@ -81,8 +132,19 @@ assert (lib.hasInfix "--stats-inventory-interval-seconds 900" sampledConfig.syst
 assert (lib.hasInfix "--stats-inventory-interval-seconds 30" customIntervalConfig.systemd.services.narjar.serviceConfig.ExecStart);
 assert !(lib.hasInfix "--stats-filesystem-sample" defaultConfig.systemd.services.narjar.serviceConfig.ExecStart);
 assert (lib.hasInfix "--stats-filesystem-sample /run/narjar-zfs-stats/sample.json" zfsSampledConfig.systemd.services.narjar.serviceConfig.ExecStart);
+assert (lib.hasInfix "--stats-filesystem-sample /run/filesystem/sample.json" externallySampledConfig.systemd.services.narjar.serviceConfig.ExecStart);
 assert (lib.hasAttr "narjar-zfs-stats" zfsSampledConfig.systemd.services);
 assert (zfsSampledConfig.systemd.timers.narjar-zfs-stats.timerConfig.OnUnitActiveSec == "60s");
 assert (!(lib.hasAttr "narjar-zfs-stats" defaultConfig.systemd.services));
 assert (!(builtins.tryEval emptyZfsDatasetConfig.system.build.toplevel.drvPath).success);
+assert (lib.hasInfix "--priority 42" customRuntimeConfig.systemd.services.narjar.preStart);
+assert (lib.hasInfix "--private-read" customRuntimeConfig.systemd.services.narjar.preStart);
+assert (lib.hasInfix "--storage-backend chunked" customRuntimeConfig.systemd.services.narjar.preStart);
+assert (lib.hasInfix "--io-timeout-seconds 9" customRuntimeConfig.systemd.services.narjar.serviceConfig.ExecStart);
+assert (lib.hasInfix "--egress-compression zstd" customRuntimeConfig.systemd.services.narjar.serviceConfig.ExecStart);
+assert (lib.hasInfix "--storage-backend chunked" customRuntimeConfig.systemd.services.narjar.serviceConfig.ExecStart);
+assert (lib.hasInfix "--storage-backend chunked" customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.ExecStart);
+assert (!(builtins.tryEval invalidCompressionConfig.system.build.toplevel.drvPath).success);
+assert (!(builtins.tryEval missingPrivateReadTokenConfig.system.build.toplevel.drvPath).success);
+assert (!(builtins.tryEval conflictingFilesystemSamplesConfig.system.build.toplevel.drvPath).success);
 "narjar module dataDir assertions passed"

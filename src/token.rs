@@ -1,4 +1,8 @@
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Subcommand, ValueEnum};
 use data_encoding::HEXLOWER;
@@ -37,7 +41,13 @@ struct Create {
 fn create(options: Create) -> Result<(), Error> {
     let name = options.name.as_deref().unwrap_or("token");
     let path = options.target.path();
-    let mut tokens = TokenFile::load(&path).map_err(runtime)?.unwrap_or_default();
+    let secret = create_secret_token(&path, name)?;
+    println!("{secret}");
+    Ok(())
+}
+
+pub(crate) fn create_secret_token(path: &Path, name: &str) -> Result<String, Error> {
+    let mut tokens = TokenFile::load(path).map_err(runtime)?.unwrap_or_default();
 
     let mut random = [0; TOKEN_BYTES];
     File::open("/dev/urandom")
@@ -52,9 +62,8 @@ fn create(options: Create) -> Result<(), Error> {
             "token label already exists: {name}"
         )));
     }
-    tokens.store(&path).map_err(runtime)?;
-    println!("{secret}");
-    Ok(())
+    tokens.store(path).map_err(runtime)?;
+    Ok(secret)
 }
 
 #[derive(Args)]

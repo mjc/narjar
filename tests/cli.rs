@@ -2074,6 +2074,19 @@ impl RunningServer {
 
     fn start_in_with_workers(temp_dir: TestDir, workers: usize, extra_args: &[&str]) -> Self {
         let data_dir = temp_dir.path().to_owned();
+        Self::start_path_with_owner(data_dir, temp_dir, workers, extra_args)
+    }
+
+    fn start_with_existing_path(data_dir: PathBuf, owner: TestDir, extra_args: &[&str]) -> Self {
+        Self::start_path_with_owner(data_dir, owner, 1, extra_args)
+    }
+
+    fn start_path_with_owner(
+        data_dir: PathBuf,
+        owner: TestDir,
+        workers: usize,
+        extra_args: &[&str],
+    ) -> Self {
         let mut child = Self::spawn(&data_dir, workers, extra_args);
         let mut startup_line = String::new();
         BufReader::new(child.stdout.take().expect("stdout should be piped"))
@@ -2098,7 +2111,7 @@ impl RunningServer {
         Self {
             child: Some(child),
             data_dir,
-            temp_dir: Some(temp_dir),
+            temp_dir: Some(owner),
             startup_line,
             address,
         }
@@ -4825,6 +4838,141 @@ fn init_and_key_generate_create_secure_operator_material() {
             .mode()
             & 0o777,
         0o600
+    );
+}
+
+#[test]
+fn setup_creates_a_ready_cache_and_separate_private_credentials() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let setup_root = data_dir("setup-root");
+    let cache_path = setup_root.path().join("cache");
+    let credentials_dir = setup_root.path().join("credentials");
+    let output = run(&[
+        "setup",
+        "--data-dir",
+        cache_path.to_str().expect("data path should be UTF-8"),
+        "--credentials-dir",
+        credentials_dir
+            .to_str()
+            .expect("credentials path should be UTF-8"),
+        "--cache-url",
+        "https://cache.example/cache",
+        "--listen",
+        "127.0.0.1:0",
+        "--key-name",
+        "test-producer",
+        "--priority",
+        "17",
+        "--storage-backend",
+        "chunked",
+        "--private-read",
+        "--yes",
+    ]);
+    assert!(
+        output.status.success(),
+        "setup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_text = String::from_utf8(output.stdout).expect("setup output should be UTF-8");
+    let secret_key = credentials_dir.join("producer.sec");
+    let public_key = credentials_dir.join("producer.pub");
+    let netrc = credentials_dir.join("narjar.netrc");
+    let write_token = credentials_dir.join("write.token");
+    let read_token = credentials_dir.join("read.token");
+    let write_token_text = fs::read_to_string(&write_token).expect("write token should exist");
+    let read_token_text = fs::read_to_string(&read_token).expect("read token should exist");
+    let netrc_text = fs::read_to_string(&netrc).expect("netrc should exist");
+
+    assert!(output_text.contains("Narjar setup complete"));
+    assert!(output_text.contains("narjar push --to 'https://cache.example/cache'"));
+    assert!(!output_text.contains(write_token_text.trim()));
+    assert!(!output_text.contains(read_token_text.trim()));
+    assert_eq!(
+        fs::read(&public_key).expect("public key should exist"),
+        fs::read(cache_path.join("trusted-public-keys"))
+            .expect("public key should be trusted by this cache")
+    );
+    assert!(netrc_text.contains("machine cache.example login narjar password "));
+    assert!(netrc_text.contains(write_token_text.trim()));
+    assert_eq!(
+        fs::read_to_string(cache_path.join("nix-cache-info")).expect("cache info should exist"),
+        "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 17\n"
+    );
+    assert_eq!(
+        fs::read(cache_path.join(".narjar-layout")).expect("layout should exist"),
+        b"narjar-layout-v1\nbackend=chunked\nprofile=mincdc-hash4-v2\n"
+    );
+    for (path, expected_mode) in [
+        (&secret_key, 0o600),
+        (&write_token, 0o600),
+        (&read_token, 0o600),
+        (&netrc, 0o600),
+        (&credentials_dir, 0o700),
+    ] {
+        assert_eq!(
+            fs::metadata(path)
+                .expect("setup output should exist")
+                .permissions()
+                .mode()
+                & 0o777,
+            expected_mode,
+            "unexpected permissions for {}",
+            path.display()
+        );
+    }
+    assert!(!cache_path.join("producer.sec").exists());
+
+    let server = RunningServer::start_with_existing_path(
+        cache_path,
+        setup_root,
+        &["--storage-backend", "chunked"],
+    );
+    assert!(
+        server
+            .startup_line
+            .starts_with("listening http://127.0.0.1:"),
+        "setup output should be directly servable: {:?}",
+        server.startup_line
+    );
+}
+
+#[test]
+fn setup_refuses_existing_destinations_before_creating_the_other_one() {
+    let parent = data_dir("setup-conflict");
+    let existing_credentials = parent.path().join("credentials");
+    fs::create_dir(&existing_credentials).expect("preexisting credentials directory");
+    fs::write(existing_credentials.join("keep"), b"do not change")
+        .expect("write protected fixture");
+    let new_data_dir = parent.path().join("cache");
+
+    let output = run(&[
+        "setup",
+        "--data-dir",
+        new_data_dir.to_str().expect("data path should be UTF-8"),
+        "--credentials-dir",
+        existing_credentials
+            .to_str()
+            .expect("credentials path should be UTF-8"),
+        "--cache-url",
+        "https://cache.example",
+        "--yes",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("setup destination already exists"),
+        "expected an explicit destination conflict: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !new_data_dir.exists(),
+        "conflict must be found before mutation"
+    );
+    assert_eq!(
+        fs::read(existing_credentials.join("keep")).expect("existing file should remain"),
+        b"do not change"
     );
 }
 

@@ -249,6 +249,14 @@ fn generate_key(options: GenerateKey) -> Result<(), Error> {
         public_key_file: public_path,
     } = options;
 
+    generate_key_pair(&name, &secret_path, &public_path)
+}
+
+pub(crate) fn generate_key_pair(
+    name: &str,
+    secret_path: &Path,
+    public_path: &Path,
+) -> Result<(), Error> {
     let mut seed = [0; 32];
     File::open("/dev/urandom")
         .and_then(|mut source| source.read_exact(&mut seed))
@@ -260,18 +268,18 @@ fn generate_key(options: GenerateKey) -> Result<(), Error> {
     secret[32..].copy_from_slice(public.as_bytes());
 
     create_file(
-        &secret_path,
+        secret_path,
         format!("{name}:{}\n", BASE64.encode(&secret)).as_bytes(),
         0o600,
         false,
     )?;
     if let Err(error) = create_file(
-        &public_path,
+        public_path,
         format!("{name}:{}\n", BASE64.encode(public.as_bytes())).as_bytes(),
         0o644,
         false,
     ) {
-        let _ = fs::remove_file(&secret_path);
+        let _ = fs::remove_file(secret_path);
         return Err(error);
     }
     Ok(())
