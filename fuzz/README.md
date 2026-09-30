@@ -7,6 +7,13 @@ Enter `devenv shell`; it provides `cargo-fuzz` and the pinned nightly compiler
 path in `NARJAR_FUZZ_RUSTC`. Then run:
 
 ```sh
+RUSTC="$NARJAR_FUZZ_RUSTC" cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+```
+
+This compiles every fuzz target without starting a fuzzing campaign. The same
+locked compile runs in the Nix flake checks. To run an individual campaign:
+
+```sh
 cd fuzz
 RUSTC="$NARJAR_FUZZ_RUSTC" cargo fuzz run nar_decode -- \
   -max_len=1048576 \

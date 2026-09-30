@@ -47,6 +47,7 @@ in
 
   tasks."fuzz:list".exec = "cargo fuzz list";
   tasks."fuzz:build".exec = "RUSTC=\"$NARJAR_FUZZ_RUSTC\" cargo fuzz build nar_decode";
+  tasks."check:fuzz".exec = "CARGO_TARGET_DIR=target/fuzz RUSTC=\"$NARJAR_FUZZ_RUSTC\" cargo check --locked --manifest-path fuzz/Cargo.toml --bins";
 
   processes.narjar.exec = ''
     data_dir="$DEVENV_STATE/narjar-data"
