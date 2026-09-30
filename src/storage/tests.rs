@@ -873,6 +873,42 @@ fn normalized_compressed_source_errors_remain_io_errors() {
     }
 }
 
+struct UnsupportedOutputWriter;
+
+impl Write for UnsupportedOutputWriter {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn compressed_output_writer_errors_remain_io_errors() {
+    let raw = b"valid raw NAR bytes";
+    for encoding in [
+        WireEncoding::Compressed(CompressionCodec::Xz),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    ] {
+        let compressed = compressed_bytes(encoding, raw);
+        let file_hash = FileHash::from_digest(Sha256::digest(&compressed).into());
+        let nar_name = NarFileName::new(file_hash, encoding);
+
+        let error = receive_uploaded_nar(
+            Cursor::new(&compressed),
+            nar_name,
+            compressed.len() as u64,
+            u64::MAX,
+            &mut UnsupportedOutputWriter,
+        )
+        .expect_err("output storage failure must not become invalid compressed input");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{encoding:?}");
+    }
+}
+
 #[test]
 fn xz_uploads_are_normalized_to_the_raw_nar() {
     let directory = TestDir::new();
