@@ -1,7 +1,7 @@
 { pkgs, ... }:
 
 let
-  fuzzToolchain = pkgs.rust-bin.nightly."2026-09-11".default;
+  fuzzToolchain = pkgs.rust-bin.nightly.latest.default;
 in
 {
   languages.rust = {
