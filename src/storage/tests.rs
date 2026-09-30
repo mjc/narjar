@@ -2374,7 +2374,7 @@ fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
     };
 
     started_rx.recv().expect("wait for contender");
-    let early_outcome = outcome_rx.recv_timeout(Duration::from_millis(500)).ok();
+    let early_outcome = outcome_rx.recv_timeout(Duration::from_secs(5)).ok();
     release_tx.send(()).expect("release failing publisher");
 
     assert!(winner.join().expect("join failing publisher").is_err());

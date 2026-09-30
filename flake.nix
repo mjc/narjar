@@ -329,6 +329,33 @@
             test -s ${repositorySrc}/devenv.lock
             touch $out
           '';
+          cratePackageCheck = env.pkgs.runCommand "narjar-crate-package-check"
+            {
+              nativeBuildInputs = [
+                env.toolchain
+                env.pkgs.cargo-nextest
+                env.pkgs.coreutils
+                env.pkgs.gnugrep
+                env.pkgs.jq
+                env.pkgs.pkg-config
+              ];
+              buildInputs = [ env.pkgs.nix env.pkgs.sqlite ];
+            }
+            ''
+              export HOME="$TMPDIR/home"
+              export CARGO_HOME="$TMPDIR/cargo-home"
+              mkdir -p "$HOME" "$CARGO_HOME"
+              cat ${env.cargoVendorDir}/config.toml > "$CARGO_HOME/config.toml"
+              cat >> "$CARGO_HOME/config.toml" <<EOF
+              [net]
+              offline = true
+              EOF
+              cp -R ${repositorySrc} source
+              chmod -R u+w source
+              cd source
+              bash ci/check-cargo-package.sh
+              touch "$out"
+            '';
           semantic-descriptor = env.pkgs.runCommand "narjar-semantic-descriptor" { } ''
             ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/semantic-descriptor.sh
             touch $out
@@ -377,6 +404,7 @@
             format
             source-filter
             lock-consistency
+            cratePackageCheck
             semantic-descriptor
             virtual-nar-segments
             publication-lock-benchmark
