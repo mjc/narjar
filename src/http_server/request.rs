@@ -10,7 +10,9 @@ pub(crate) use super::response::FORCE_PORTABLE_FILE_COPY;
 pub(super) use super::response::Response;
 #[cfg(test)]
 pub(super) use super::response::StatusCode;
-use super::response::{CompletedTransfer, TransferFailure, copy_file_to_stream, invalid_data};
+use super::response::{
+    CompletedTransfer, ConnectionDisposition, TransferFailure, copy_file_to_stream, invalid_data,
+};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
@@ -183,7 +185,7 @@ struct ParsedHead {
     url: RequestTargetRange,
     headers: HeaderRanges,
     body_length: Option<usize>,
-    keep_alive: bool,
+    connection: ConnectionDisposition,
 }
 
 pub struct Request {
@@ -195,7 +197,7 @@ pub struct Request {
     headers: HeaderRanges,
     body_length: Option<usize>,
     body_state: BodyState,
-    keep_alive: bool,
+    connection: ConnectionDisposition,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,6 +206,12 @@ pub(crate) enum BodyState {
     Reading,
     Complete,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestBodyDisposition {
+    FullyConsumed,
+    StillOutstanding,
 }
 
 impl BufferedHead {
@@ -268,7 +276,7 @@ impl BufferedHead {
                 Some(_) => BodyState::Unread,
                 None => BodyState::Complete,
             },
-            keep_alive: parsed.keep_alive,
+            connection: parsed.connection,
         })
     }
 }
@@ -294,14 +302,14 @@ impl ParsedHead {
             .ok_or_else(|| invalid_data("request target is outside the request"))?;
         let headers = HeaderRanges::from_httparse(buffered.bytes(), parsed.headers)?;
         let body_length = request_content_length(buffered.bytes(), &headers)?;
-        let keep_alive = request_keeps_connection_alive(version, buffered.bytes(), &headers);
+        let connection = request_connection_disposition(version, buffered.bytes(), &headers);
 
         Ok(Self {
             method: Method::from_http(method),
             url,
             headers,
             body_length,
-            keep_alive,
+            connection,
         })
     }
 }
@@ -318,6 +326,7 @@ impl Method {
 }
 
 fn request_content_length(buffer: &[u8], headers: &HeaderRanges) -> io::Result<Option<usize>> {
+    reject_unsupported_transfer_encoding(buffer, headers)?;
     headers
         .iter()
         .filter(|header| header.name(buffer).eq_ignore_ascii_case("Content-Length"))
@@ -333,15 +342,33 @@ fn request_content_length(buffer: &[u8], headers: &HeaderRanges) -> io::Result<O
         })
 }
 
-fn request_keeps_connection_alive(version: u8, buffer: &[u8], headers: &HeaderRanges) -> bool {
-    version == 1
-        && !headers.iter().any(|header| {
-            header.name(buffer).eq_ignore_ascii_case("Connection")
-                && header
-                    .value(buffer)
-                    .split(',')
-                    .any(|value| value.trim().eq_ignore_ascii_case("close"))
-        })
+fn reject_unsupported_transfer_encoding(buffer: &[u8], headers: &HeaderRanges) -> io::Result<()> {
+    match headers.iter().find(|header| {
+        header
+            .name(buffer)
+            .eq_ignore_ascii_case("Transfer-Encoding")
+    }) {
+        Some(_) => Err(invalid_data("Transfer-Encoding is not supported")),
+        None => Ok(()),
+    }
+}
+
+fn request_connection_disposition(
+    version: u8,
+    buffer: &[u8],
+    headers: &HeaderRanges,
+) -> ConnectionDisposition {
+    let has_close_directive = headers.iter().any(|header| {
+        header.name(buffer).eq_ignore_ascii_case("Connection")
+            && header
+                .value(buffer)
+                .split(',')
+                .any(|value| value.trim().eq_ignore_ascii_case("close"))
+    });
+    match (version, has_close_directive) {
+        (1, false) => ConnectionDisposition::KeepAlive,
+        _ => ConnectionDisposition::Close,
+    }
 }
 
 impl Request {
@@ -395,7 +422,7 @@ impl Request {
     }
 
     pub fn close_after_response(&mut self) {
-        self.keep_alive = false;
+        self.connection = ConnectionDisposition::Close;
     }
 
     pub fn respond<R: Read>(
@@ -403,10 +430,14 @@ impl Request {
         response: Response<R>,
     ) -> Result<CompletedTransfer, TransferFailure> {
         let head = self.method == Method::Head;
+        let connection = self.response_connection_disposition();
         let mut stream = self.stream;
-        let body_bytes = response.write_to(&mut stream, head, self.keep_alive)?;
+        let body_bytes = response.write_to(&mut stream, head, connection)?;
         Ok(CompletedTransfer {
-            connection: self.keep_alive.then_some(stream),
+            connection: match connection {
+                ConnectionDisposition::KeepAlive => Some(stream),
+                ConnectionDisposition::Close => None,
+            },
             body_bytes,
         })
     }
@@ -419,9 +450,10 @@ impl Request {
         length: u64,
     ) -> Result<CompletedTransfer, TransferFailure> {
         let head = self.method == Method::Head;
+        let connection = self.response_connection_disposition();
         let mut stream = self.stream;
         response
-            .write_headers(&mut stream, self.keep_alive)
+            .write_headers(&mut stream, connection)
             .map_err(|error| TransferFailure {
                 error,
                 body_bytes: 0,
@@ -432,9 +464,39 @@ impl Request {
             copy_file_to_stream(&mut file, &mut stream, offset, length)?
         };
         Ok(CompletedTransfer {
-            connection: self.keep_alive.then_some(stream),
+            connection: match connection {
+                ConnectionDisposition::KeepAlive => Some(stream),
+                ConnectionDisposition::Close => None,
+            },
             body_bytes,
         })
+    }
+
+    fn response_connection_disposition(&self) -> ConnectionDisposition {
+        let buffered_bytes_after_body = self
+            .body_prefix
+            .end
+            .saturating_sub(self.body_prefix.start)
+            .saturating_sub(self.body_length.unwrap_or(0));
+        match (
+            self.connection,
+            self.request_body_disposition(),
+            buffered_bytes_after_body,
+        ) {
+            (ConnectionDisposition::KeepAlive, RequestBodyDisposition::FullyConsumed, 0) => {
+                ConnectionDisposition::KeepAlive
+            }
+            _ => ConnectionDisposition::Close,
+        }
+    }
+
+    fn request_body_disposition(&self) -> RequestBodyDisposition {
+        match (self.body_length, self.body_state) {
+            (Some(0), BodyState::Unread) | (_, BodyState::Complete) => {
+                RequestBodyDisposition::FullyConsumed
+            }
+            _ => RequestBodyDisposition::StillOutstanding,
+        }
     }
 }
 
@@ -509,14 +571,14 @@ impl Read for BodyReader<'_> {
 mod tests {
     use std::{
         fs,
-        io::{Read, Write},
+        io::{self, Read, Write},
         net::TcpListener,
         thread,
     };
 
     use super::{
         BufferedHead, FORCE_PORTABLE_FILE_COPY, HeaderBoundary, MAX_HEADER_BYTES, Method,
-        ParsedHead, Request, Response, StatusCode,
+        ParsedHead, Request, Response, StatusCode, find_header_delimiter,
     };
 
     #[test]
@@ -658,6 +720,124 @@ mod tests {
     }
 
     #[test]
+    fn closes_after_response_when_a_second_request_was_read_ahead() {
+        let (request, sender) = request_with_prefetched_bytes(
+            b"GET /first HTTP/1.1\r\n\r\nGET /second HTTP/1.1\r\n\r\n",
+        );
+        let transfer = request
+            .expect("parse the first request")
+            .respond(Response::empty(StatusCode::OK))
+            .expect("write first response");
+
+        assert!(transfer.connection.is_none());
+        assert!(
+            sender
+                .join()
+                .expect("read first response")
+                .windows(b"Connection: close\r\n".len())
+                .any(|window| window == b"Connection: close\r\n")
+        );
+    }
+
+    #[test]
+    fn closes_after_response_when_a_declared_body_was_not_consumed() {
+        let (request, sender) = request_with_prefetched_bytes(
+            b"PUT /nar/example.nar HTTP/1.1\r\nContent-Length: 4\r\n\r\n",
+        );
+        let transfer = request
+            .expect("parse the upload request")
+            .respond(Response::empty(StatusCode::BAD_REQUEST))
+            .expect("write rejection");
+
+        assert!(transfer.connection.is_none());
+        assert!(
+            sender
+                .join()
+                .expect("read rejection")
+                .windows(b"Connection: close\r\n".len())
+                .any(|window| window == b"Connection: close\r\n")
+        );
+    }
+
+    #[test]
+    fn delayed_request_shaped_body_cannot_become_the_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let sender = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            let delayed_body = b"GET /must-not-be-parsed HTTP/1.1\r\n\r\n";
+            write!(
+                stream,
+                "PUT /nar/example.nar HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                delayed_body.len()
+            )
+            .expect("write upload headers without its body");
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response);
+            let _ = stream.write_all(delayed_body);
+            response
+        });
+        let (stream, _) = listener.accept().expect("accept test upload");
+        let request = Request::read(stream).expect("parse upload headers");
+        let transfer = request
+            .respond(Response::empty(StatusCode::BAD_REQUEST))
+            .expect("reject incomplete upload");
+
+        assert!(transfer.connection.is_none());
+        let response = sender.join().expect("read rejection");
+        assert!(
+            response
+                .windows(b"Connection: close\r\n".len())
+                .any(|window| window == b"Connection: close\r\n")
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_transfer_encoding() {
+        let (request, sender) = request_with_prefetched_bytes(
+            b"PUT /nar/example.nar HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+
+        let error = match request {
+            Ok(_) => panic!("chunked request bodies are unsupported"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        sender.join().expect("sender receives request close");
+    }
+
+    fn request_with_prefetched_bytes(
+        bytes: &'static [u8],
+    ) -> (io::Result<Request>, thread::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let sender = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            stream
+                .write_all(bytes)
+                .expect("write pipelined request bytes");
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response);
+            response
+        });
+        let (mut stream, _) = listener.accept().expect("accept test request");
+        let mut received = vec![0; bytes.len()];
+        stream
+            .read_exact(&mut received)
+            .expect("receive request bytes into parser buffer");
+        let mut buffer = [0; MAX_HEADER_BYTES];
+        buffer[..received.len()].copy_from_slice(&received);
+        let end = find_header_delimiter(bytes).expect("request header delimiter") + 4;
+        let buffered = BufferedHead {
+            stream,
+            buffer,
+            received: bytes.len(),
+            boundary: HeaderBoundary::detected(end, bytes.len()),
+        };
+        (buffered.into_request().map_err(|(_, error)| error), sender)
+    }
+
+    #[test]
     fn file_response_streams_an_exact_range() {
         let directory = tempfile::tempdir().expect("create temporary directory");
         let path = directory.path().join("nar");
@@ -689,6 +869,33 @@ mod tests {
         assert_eq!(
             response,
             b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nConnection: close\r\n\r\n2345"
+        );
+    }
+
+    #[test]
+    fn completed_file_response_keeps_an_idle_http11_connection_reusable() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("nar");
+        fs::write(&path, b"nar").expect("write NAR fixture");
+        let (request, sender) =
+            request_with_prefetched_bytes(b"GET /nar/example.nar HTTP/1.1\r\n\r\n");
+        let transfer = request
+            .expect("parse request")
+            .respond_file(
+                Response::new(StatusCode::OK, std::io::empty(), 3),
+                fs::File::open(path).expect("open NAR fixture"),
+                0,
+                3,
+            )
+            .expect("write file response");
+
+        assert!(transfer.connection.is_some());
+        drop(transfer);
+        let response = sender.join().expect("read file response");
+        assert!(
+            response
+                .windows(b"Connection: keep-alive\r\n".len())
+                .any(|window| window == b"Connection: keep-alive\r\n")
         );
     }
 
