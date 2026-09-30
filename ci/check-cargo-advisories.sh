@@ -3,7 +3,7 @@ set -euo pipefail
 
 source ci/cargo-audit-output.sh
 
-if audit_report=$(cargo-audit audit --deny warnings 2>&1); then
+if audit_report=$(cargo-audit audit --file Cargo.lock --deny warnings 2>&1); then
   if cargo_audit_report_has_registry_failure "$audit_report"; then
     printf '%s\n' "$audit_report" >&2
     printf '%s\n' \
