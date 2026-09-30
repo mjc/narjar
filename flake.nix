@@ -32,6 +32,7 @@
         "aarch64-darwin"
         "x86_64-linux"
       ];
+      packageVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
       staticTarget = "x86_64-unknown-linux-musl";
       staticSystem = "x86_64-linux";
       containerUser = "65532:65532";
@@ -81,7 +82,7 @@
           commonArgs = {
             inherit src cargoVendorDir cargoExtraArgs;
             pname = "narjar";
-            version = "0.1.0";
+            version = packageVersion;
             strictDeps = true;
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [ pkgs.sqlite ];
