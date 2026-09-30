@@ -23,21 +23,29 @@
     else if cfg.statsZfsDataset != null
     then zfsSampleFile
     else null;
-  fixedPaths = [
-    runtimeDataDir
+  fixedDirectories = [
     "${runtimeDataDir}/nar"
     "${runtimeDataDir}/nar/.tmp"
     "${runtimeDataDir}/.tmp"
+    "${runtimeDataDir}/.narjar-transactions"
     "${runtimeDataDir}/realisations"
     "${runtimeDataDir}/realisations/.tmp"
     "${runtimeDataDir}/auth"
+    "${runtimeDataDir}/.narjar-validation"
+    "${runtimeDataDir}/.narjar-ingress"
+    "${runtimeDataDir}/.narjar-egress"
+    "${runtimeDataDir}/.narjar-chunks"
+    "${runtimeDataDir}/.narjar-manifests"
+  ];
+  fixedFiles = [
     "${runtimeDataDir}/lock"
-    "${runtimeDataDir}/.narjar-clean"
+    "${runtimeDataDir}/.narjar-layout"
     "${runtimeDataDir}/nix-cache-info"
     "${runtimeDataDir}/trusted-public-keys"
     "${runtimeDataDir}/auth/write.tokens"
   ];
-  optionalFixedPaths = [
+  optionalFixedFiles = [
+    "${runtimeDataDir}/.narjar-clean"
     "${runtimeDataDir}/.narjar-recovery"
     "${runtimeDataDir}/auth/read.tokens"
   ];
@@ -91,27 +99,86 @@
       '')
       credentials}
   '';
-  validateFixedPaths = lib.concatMapStringsSep "\n" (path: ''
-    test ! -L ${lib.escapeShellArg path}
-  '') (fixedPaths ++ optionalFixedPaths);
-  chownFixedPaths =
+  failIfFixedPathHasWrongType = path: testOperator: expectedType: ''
+    if [ -L ${lib.escapeShellArg path} ] || [ ! -${testOperator} ${lib.escapeShellArg path} ]; then
+      ${pkgs.coreutils}/bin/printf '%s\n' ${lib.escapeShellArg "narjar: expected a real ${expectedType} at ${path}"} >&2
+      exit 1
+    fi
+  '';
+  # Lock every path component before a privileged chmod/chown can follow it.
+  secureRuntimeDataDirectory = ''
+    if [ -L ${lib.escapeShellArg runtimeDataDir} ] || { [ -e ${lib.escapeShellArg runtimeDataDir} ] && [ ! -d ${lib.escapeShellArg runtimeDataDir} ]; }; then
+      ${pkgs.coreutils}/bin/printf '%s\n' ${lib.escapeShellArg "narjar: expected a real directory at ${runtimeDataDir}"} >&2
+      exit 1
+    fi
+    ${pkgs.coreutils}/bin/mkdir -p -m 0700 -- ${lib.escapeShellArg runtimeDataDir}
+    ${pkgs.coreutils}/bin/chown --no-dereference root:root -- ${lib.escapeShellArg runtimeDataDir}
+    ${pkgs.coreutils}/bin/chmod --no-dereference 0700 -- ${lib.escapeShellArg runtimeDataDir}
+  '';
+  lockFixedDirectories =
+    lib.concatMapStringsSep "\n" (path: ''
+      ${failIfFixedPathHasWrongType path "d" "directory"}
+      ${pkgs.coreutils}/bin/chmod --no-dereference 0700 -- ${lib.escapeShellArg path}
+      ${pkgs.coreutils}/bin/chown --no-dereference root:root -- ${lib.escapeShellArg path}
+    '')
+    fixedDirectories;
+  validateFixedDirectories = lib.concatMapStringsSep "\n" (path: failIfFixedPathHasWrongType path "d" "directory") fixedDirectories;
+  managedCredentialPaths = map (credential: "${runtimeDataDir}/${credential.target}") credentials;
+  unmanagedFixedFiles = lib.filter (path: !(builtins.elem path managedCredentialPaths)) fixedFiles;
+  validateUnmanagedFixedFiles = lib.concatMapStringsSep "\n" (path: failIfFixedPathHasWrongType path "f" "regular file") unmanagedFixedFiles;
+  validateManagedCredentialTargets =
+    lib.concatMapStringsSep "\n" (path: ''
+      if [ -L ${lib.escapeShellArg path} ] || { [ -e ${lib.escapeShellArg path} ] && [ ! -f ${lib.escapeShellArg path} ]; }; then
+        ${pkgs.coreutils}/bin/printf '%s\n' ${lib.escapeShellArg "narjar: expected a regular managed credential file at ${path}"} >&2
+        exit 1
+      fi
+    '')
+    managedCredentialPaths;
+  validateOptionalFixedFiles =
+    lib.concatMapStringsSep "\n" (path: ''
+      if [ -L ${lib.escapeShellArg path} ] || { [ -e ${lib.escapeShellArg path} ] && [ ! -f ${lib.escapeShellArg path} ]; }; then
+        ${pkgs.coreutils}/bin/printf '%s\n' ${lib.escapeShellArg "narjar: expected an optional regular file at ${path}"} >&2
+        exit 1
+      fi
+    '')
+    optionalFixedFiles;
+  validateFilesBeforeCredentialInstall = "${validateUnmanagedFixedFiles}\n${validateManagedCredentialTargets}\n${validateOptionalFixedFiles}";
+  validateFilesAfterCredentialInstall = "${lib.concatMapStringsSep "\n" (path: failIfFixedPathHasWrongType path "f" "regular file") fixedFiles}\n${validateOptionalFixedFiles}";
+  validateFixedPaths = "${validateFixedDirectories}\n${validateFilesBeforeCredentialInstall}";
+  chownFixedFiles =
     lib.concatMapStringsSep "\n" (path: ''
       ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- ${lib.escapeShellArg path}
     '')
-    fixedPaths;
+    fixedFiles;
+  restoreFixedDirectories = lib.concatMapStringsSep "\n" (path: ''
+    ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- ${lib.escapeShellArg path}
+  '') (lib.reverseList fixedDirectories);
   chownOptionalFixedPaths =
     lib.concatMapStringsSep "\n" (path: ''
       if [ -e ${lib.escapeShellArg path} ]; then
         ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- ${lib.escapeShellArg path}
       fi
     '')
-    optionalFixedPaths;
-  preStartBody = ''
+    optionalFixedFiles;
+  setFixedFileModes =
+    lib.concatMapStringsSep "\n" (path: ''
+      ${pkgs.coreutils}/bin/chmod --no-dereference 0600 -- ${lib.escapeShellArg path}
+    '')
+    fixedFiles;
+  setOptionalFixedFileModes =
+    lib.concatMapStringsSep "\n" (path: ''
+      if [ -e ${lib.escapeShellArg path} ]; then
+        ${pkgs.coreutils}/bin/chmod --no-dereference 0600 -- ${lib.escapeShellArg path}
+      fi
+    '')
+    optionalFixedFiles;
+  initializeIfNeeded = ''
     test ! -L ${lib.escapeShellArg runtimeDataDir}
     if [ ! -e ${lib.escapeShellArg "${runtimeDataDir}/nix-cache-info"} ]; then
       ${executable} ${initArgs}
     fi
-    ${validateFixedPaths}
+  '';
+  prepareCredentials = ''
     ${lib.optionalString (cfg.auth.readTokens == null) ''
       if [ -e ${lib.escapeShellArg "${runtimeDataDir}/auth/read.tokens"} ]; then
         ${pkgs.coreutils}/bin/rm -f -- ${lib.escapeShellArg "${runtimeDataDir}/auth/read.tokens"}
@@ -120,12 +187,21 @@
     ''}
     ${installCredentials}
   '';
-  preStartScript = "set -eu\n${preStartBody}";
+  preStartScript = "set -eu\n${initializeIfNeeded}\n${validateFixedPaths}\n${prepareCredentials}\n${validateFilesAfterCredentialInstall}";
   privilegedPreStartScript = ''
     set -eu
-    ${preStartBody}
-    ${chownFixedPaths}
+    ${secureRuntimeDataDirectory}
+    ${initializeIfNeeded}
+    ${lockFixedDirectories}
+    ${validateFilesBeforeCredentialInstall}
+    ${prepareCredentials}
+    ${validateFilesAfterCredentialInstall}
+    ${chownFixedFiles}
     ${chownOptionalFixedPaths}
+    ${setFixedFileModes}
+    ${setOptionalFixedFileModes}
+    ${restoreFixedDirectories}
+    ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- ${lib.escapeShellArg runtimeDataDir}
   '';
   privilegedPreStart = pkgs.writeShellScript "narjar-pre-start" privilegedPreStartScript;
   initArgs = lib.escapeShellArgs (
