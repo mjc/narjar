@@ -6,7 +6,7 @@ use std::{
 
 use clap::{Args, Subcommand, ValueEnum};
 use data_encoding::HEXLOWER;
-use narjar::token_file::{TOKEN_BYTES, TokenFile, valid_label};
+use narjar::__private::token_file::{TOKEN_BYTES, TokenFile, valid_label};
 use sha2::{Digest, Sha256};
 
 use crate::error::Error;

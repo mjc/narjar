@@ -1,9 +1,9 @@
 use data_encoding::{BASE64, BitOrder, Specification};
 use ed25519_dalek::{Signer, SigningKey};
 use lzma_rust2::{XzOptions, XzWriter};
+use narjar::__private::storage::WireEncoding;
 use narjar::nar_encode::{Encoder, Event as NarEvent};
 use narjar::object::CompressionCodec;
-use narjar::storage::WireEncoding;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -5335,7 +5335,7 @@ fn setup_refuses_existing_destinations_before_creating_the_other_one() {
 
 #[test]
 fn inventory_scan_recognizes_formats_and_keeps_trusted_references() {
-    use narjar::{
+    use narjar::__private::{
         inventory::{Inventory, InventoryClass as Class, VerificationMode as Mode},
         narinfo::TrustedPublicKeys,
         storage::Directory,
@@ -5510,7 +5510,7 @@ fn inventory_scan_recognizes_formats_and_keeps_trusted_references() {
 
 #[test]
 fn metadata_readiness_ignores_unrelated_names_without_opening_payload_directory() {
-    use narjar::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
+    use narjar::__private::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
     let directory = TempDir::new().unwrap();
     let root = directory.path();
     let trusted = TrustedPublicKeys::default();
@@ -5531,7 +5531,7 @@ fn metadata_readiness_ignores_unrelated_names_without_opening_payload_directory(
 
 #[test]
 fn metadata_readiness_remains_false_after_any_invalid_narinfo() {
-    use narjar::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
+    use narjar::__private::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
 
     const OTHER_STORE_HASH: &str = "11111111111111111111111111111111";
     let trusted = TrustedPublicKeys::parse(&format!(
@@ -5562,7 +5562,7 @@ fn metadata_readiness_remains_false_after_any_invalid_narinfo() {
 
 #[test]
 fn inventory_and_trust_keep_using_the_directory_opened_by_run() {
-    use narjar::{
+    use narjar::__private::{
         inventory::{Inventory, InventoryClass, VerificationMode},
         narinfo::TrustedPublicKeys,
         storage::Directory,
@@ -5600,7 +5600,7 @@ fn inventory_and_trust_keep_using_the_directory_opened_by_run() {
 
 #[test]
 fn inventory_scan_classifies_names_and_files_before_inspection() {
-    use narjar::{
+    use narjar::__private::{
         inventory::{Inventory, InventoryClass as Class, VerificationMode},
         narinfo::TrustedPublicKeys,
         storage::Directory,
@@ -5662,7 +5662,7 @@ fn inventory_scan_classifies_names_and_files_before_inspection() {
 
 #[test]
 fn inventory_scan_propagates_payload_open_errors() {
-    use narjar::{
+    use narjar::__private::{
         inventory::{Inventory, VerificationMode},
         narinfo::TrustedPublicKeys,
         storage::Directory,

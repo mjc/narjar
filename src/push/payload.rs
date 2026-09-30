@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use narjar::nar_compression::{encode_and_measure_nar, encode_nar};
+use narjar::__private::nar_compression::{encode_and_measure_nar, encode_nar};
 
 use super::nar_stream::{local_store_path, write_nar};
 use super::{NarInfoMetadata, PushError};

@@ -3,7 +3,7 @@
 use std::io::Cursor;
 
 use libfuzzer_sys::fuzz_target;
-use narjar::storage::{Directory, Storage, StorageBackend};
+use narjar::__private::storage::{Directory, Storage, StorageBackend};
 use tempfile::tempdir;
 
 fuzz_target!(|input: &[u8]| {

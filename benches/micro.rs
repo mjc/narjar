@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use narjar::{
+use narjar::__private::{
     http_server::Request,
     inventory::{Inventory, InventoryClass, VerificationMode},
     nar::{Decoder, Event},

@@ -12,6 +12,7 @@ use data_encoding::BASE64;
 use ed25519_dalek::Signature;
 use fluent_uri::UriRef;
 
+#[path = "narinfo/trust.rs"]
 mod trust;
 
 pub use trust::{TrustError, TrustedPublicKeys};

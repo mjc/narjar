@@ -9,8 +9,8 @@ use std::{
 use clap::{Args, Subcommand};
 use data_encoding::BASE64;
 use ed25519_dalek::SigningKey;
-use narjar::maintenance::FILE_NAMES as MAINTENANCE_FILES;
-use narjar::storage::{
+use narjar::__private::maintenance::FILE_NAMES as MAINTENANCE_FILES;
+use narjar::__private::storage::{
     CHUNK_DIRECTORY, Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY,
     LAYOUT_DESCRIPTOR, MANIFEST_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY, Storage,
     StorageBackend, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
