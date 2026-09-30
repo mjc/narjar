@@ -10,7 +10,7 @@ use crate::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims};
 use crate::object::{NarFileName, WireEncoding};
 
 use super::{
-    Storage, StorageError, StoreHash, for_each_dir_name,
+    DirectoryVisit, Storage, StorageError, StoreHash, for_each_dir_name,
     fs::{open_directory_at, open_regular_at},
 };
 
@@ -206,7 +206,7 @@ fn scan_files(
     for_each_dir_name(directory, |name| {
         if stopping.load(Ordering::Relaxed) {
             interrupted = true;
-            return Ok(false);
+            return Ok(DirectoryVisit::Stop);
         }
         population.scanned_entries = checked_add(population.scanned_entries, 1)?;
         if population.scanned_entries.is_multiple_of(256) {
@@ -214,10 +214,10 @@ fn scan_files(
         }
         let Some(kind) = classify(name) else {
             population.ignored_entries = checked_add(population.ignored_entries, 1)?;
-            return Ok(true);
+            return Ok(DirectoryVisit::Continue);
         };
         record_classified_entry(directory, population, name, kind)?;
-        Ok(true)
+        Ok(DirectoryVisit::Continue)
     })?;
     match interrupted {
         true => Err(io::Error::new(

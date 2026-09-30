@@ -375,97 +375,131 @@ pub(super) fn open_at(parent: &File, name: &OsStr, flags: i32, mode: u32) -> io:
 }
 
 pub(crate) fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
-    let directory = open_at(
-        directory,
-        OsStr::new("."),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-    )?;
-    let fd = directory.into_raw_fd();
-    // SAFETY: fd is a newly opened directory descriptor. On success,
-    // fdopendir transfers ownership to the DIR handle.
-    let stream = unsafe { libc::fdopendir(fd) };
-    if stream.is_null() {
-        // SAFETY: fdopendir failed and did not transfer ownership.
-        unsafe { libc::close(fd) };
-        return Err(io::Error::last_os_error());
-    }
+    read_dir_names_with(directory, read_next_directory_entry)
+}
 
+fn read_dir_names_with(
+    directory: &File,
+    read_entry: impl FnMut(*mut libc::DIR) -> *mut libc::dirent,
+) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
-    loop {
-        // SAFETY: stream is a live DIR handle and remains valid until the
-        // matching closedir below.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        // SAFETY: d_name is a NUL-terminated entry name owned by stream and is
-        // copied before the next readdir call.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            names.push(OsStr::from_bytes(name.to_bytes()).to_owned());
-        }
-    }
-
-    // SAFETY: stream is the sole owner of the duplicated descriptor now.
-    if unsafe { libc::closedir(stream) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let mut stream = DirectoryStream::open(directory)?;
+    let visit_result = stream.visit_names(read_entry, |name| {
+        names.push(name.to_owned());
+        Ok(DirectoryVisit::Continue)
+    });
+    visit_result.and(stream.close())?;
     Ok(names)
 }
 
-pub(crate) fn for_each_dir_name<F>(directory: &File, mut visit: F) -> io::Result<()>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryVisit {
+    Continue,
+    Stop,
+}
+
+pub(crate) fn for_each_dir_name<F>(directory: &File, visit: F) -> io::Result<()>
 where
-    F: FnMut(&OsStr) -> io::Result<bool>,
+    F: FnMut(&OsStr) -> io::Result<DirectoryVisit>,
 {
-    let directory = open_at(
-        directory,
-        OsStr::new("."),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-    )?;
-    let fd = directory.into_raw_fd();
-    // SAFETY: fd is a newly opened directory descriptor. On success,
-    // fdopendir transfers ownership to the DIR handle.
-    let stream = unsafe { libc::fdopendir(fd) };
-    if stream.is_null() {
-        // SAFETY: fdopendir failed and did not transfer ownership.
-        unsafe { libc::close(fd) };
-        return Err(io::Error::last_os_error());
+    let mut stream = DirectoryStream::open(directory)?;
+    let visit_result = stream.visit_names(read_next_directory_entry, visit);
+    visit_result.and(stream.close())
+}
+
+struct DirectoryStream(Option<std::ptr::NonNull<libc::DIR>>);
+
+impl DirectoryStream {
+    fn open(directory: &File) -> io::Result<Self> {
+        let directory = open_at(
+            directory,
+            OsStr::new("."),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )?;
+        let fd = directory.into_raw_fd();
+        // SAFETY: fd is a newly opened directory descriptor. On success,
+        // fdopendir transfers ownership to the DIR handle.
+        let stream = unsafe { libc::fdopendir(fd) };
+        let Some(stream) = std::ptr::NonNull::new(stream) else {
+            let error = io::Error::last_os_error();
+            // SAFETY: fdopendir failed and did not transfer ownership.
+            unsafe { libc::close(fd) };
+            return Err(error);
+        };
+        Ok(Self(Some(stream)))
     }
 
-    let mut callback_result = Ok(());
-    loop {
-        // SAFETY: stream is a live DIR handle and remains valid until the
-        // matching closedir below.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        // SAFETY: d_name is a NUL-terminated entry name owned by stream and is
-        // valid for the duration of this callback.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
-            continue;
-        }
-        let name = OsStr::from_bytes(name.to_bytes());
-        match visit(name) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(error) => {
-                callback_result = Err(error);
-                break;
+    fn visit_names(
+        &mut self,
+        mut read_entry: impl FnMut(*mut libc::DIR) -> *mut libc::dirent,
+        mut visit: impl FnMut(&OsStr) -> io::Result<DirectoryVisit>,
+    ) -> io::Result<()> {
+        loop {
+            clear_errno();
+            let stream = self.0.expect("open directory stream").as_ptr();
+            let entry = read_entry(stream);
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    Some(0) => Ok(()),
+                    _ => Err(error),
+                };
+            }
+            // SAFETY: d_name is NUL-terminated and owned by the DIR stream;
+            // the callback finishes before the next call can invalidate it.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            match name.to_bytes() {
+                b"." | b".." => continue,
+                name => match visit(OsStr::from_bytes(name))? {
+                    DirectoryVisit::Continue => {}
+                    DirectoryVisit::Stop => return Ok(()),
+                },
             }
         }
     }
 
-    // SAFETY: stream is the sole owner of the duplicated descriptor now.
-    let close_result = if unsafe { libc::closedir(stream) } != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    };
-    callback_result.and(close_result)
+    fn close(mut self) -> io::Result<()> {
+        let stream = self.0.take().expect("open directory stream");
+        // SAFETY: taking the handle transfers its sole ownership to closedir.
+        if unsafe { libc::closedir(stream.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        if let Some(stream) = self.0.take() {
+            // SAFETY: this guard owns the handle and closes it during unwinding
+            // or when the caller returns before explicitly calling `close`.
+            unsafe { libc::closedir(stream.as_ptr()) };
+        }
+    }
+}
+
+fn read_next_directory_entry(stream: *mut libc::DIR) -> *mut libc::dirent {
+    // SAFETY: callers pass the live stream owned by DirectoryStream.
+    unsafe { libc::readdir(stream) }
+}
+
+fn clear_errno() {
+    set_errno(0);
+}
+
+fn set_errno(errno: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: errno is thread-local writable storage provided by libc.
+    unsafe {
+        *libc::__errno_location() = errno;
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: errno is thread-local writable storage provided by libc.
+    unsafe {
+        *libc::__error() = errno;
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -698,4 +732,90 @@ pub(super) fn unlink_at(directory: &File, name: &OsStr) -> io::Result<()> {
 
 pub(super) fn remove_temp(temp: &TemporaryFile) -> io::Result<()> {
     unlink_at(&temp.directory, &temp.name).and_then(|()| temp.directory.sync_all())
+}
+
+#[cfg(test)]
+mod directory_scan_tests {
+    use super::{
+        DirectoryStream, read_dir_names, read_dir_names_with, read_next_directory_entry, set_errno,
+    };
+    use std::{
+        ffi::{CStr, OsStr, OsString},
+        fs::File,
+        io,
+        os::unix::ffi::OsStrExt,
+        path::Path,
+    };
+
+    fn directory_with_file(name: &str) -> (tempfile::TempDir, File) {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        std::fs::write(temporary.path().join(name), b"payload").expect("create directory entry");
+        let directory = super::super::fs::open_directory(Path::new(temporary.path()))
+            .expect("open temporary directory");
+        (temporary, directory)
+    }
+
+    #[test]
+    fn directory_scan_returns_readdir_error_instead_of_a_partial_name_list() {
+        let (_temporary, directory) = directory_with_file("live.narinfo");
+        let mut returned_live_name = false;
+        let result = read_dir_names_with(&directory, |stream| {
+            if returned_live_name {
+                set_errno(libc::EIO);
+                return std::ptr::null_mut();
+            }
+            // SAFETY: the callback receives the live DIR handle owned by the
+            // DirectoryStream created by read_dir_names_with.
+            let entry = unsafe { libc::readdir(stream) };
+            if !entry.is_null() {
+                // SAFETY: readdir returned a live dirent with a NUL-terminated
+                // name, valid until the next readdir call.
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+                returned_live_name |= name.to_bytes() == b"live.narinfo";
+            }
+            entry
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn readdir_clears_stale_errno_before_recognizing_eof() {
+        let (_temporary, directory) = directory_with_file("entry");
+        let mut stream = DirectoryStream::open(&directory).expect("open directory stream");
+        set_errno(libc::EIO);
+
+        let result = stream.visit_names(
+            |_| std::ptr::null_mut(),
+            |_| panic!("EOF must not visit a directory entry"),
+        );
+
+        assert!(result.is_ok());
+        stream.close().expect("close directory stream");
+    }
+
+    #[test]
+    fn streaming_scan_borrows_names_and_propagates_visitor_errors() {
+        let (_temporary, directory) = directory_with_file("live.narinfo");
+        let mut stream = DirectoryStream::open(&directory).expect("open directory stream");
+        let mut visited = Vec::new();
+
+        let result = stream.visit_names(read_next_directory_entry, |name| {
+            assert_eq!(name, OsStr::from_bytes(b"live.narinfo"));
+            visited.push(name.as_bytes().to_vec());
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        });
+
+        assert_eq!(visited, [b"live.narinfo".to_vec()]);
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        stream.close().expect("close directory stream");
+    }
+
+    #[test]
+    fn production_directory_scan_skips_dot_entries_and_collects_names() {
+        let (_temporary, directory) = directory_with_file("live.narinfo");
+
+        let names = read_dir_names(&directory).expect("read directory names");
+
+        assert_eq!(names, [OsString::from("live.narinfo")]);
+    }
 }

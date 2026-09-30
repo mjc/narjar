@@ -38,7 +38,7 @@ impl CleanupAction {
 }
 
 pub(crate) use fs::{
-    CapacityErrorKind, StorageCapacity, capacity_error_kind, entry_identity_at,
+    CapacityErrorKind, DirectoryVisit, StorageCapacity, capacity_error_kind, entry_identity_at,
     entry_is_directory_at, entry_is_regular_at, for_each_dir_name, open_directory_at,
     open_regular_at, read_dir_names,
 };

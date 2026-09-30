@@ -22,8 +22,8 @@ use super::{
         MANIFEST_RECORD_BYTES, ManifestError, ManifestReader, write_manifest_header,
     },
     fs::{
-        ensure_directory_at, files_equal_at, for_each_dir_name, hard_link_at, open_at,
-        open_directory_at, open_regular_at, read_dir_names, sync_filesystem, unlink_at,
+        DirectoryVisit, ensure_directory_at, files_equal_at, for_each_dir_name, hard_link_at,
+        open_at, open_directory_at, open_regular_at, read_dir_names, sync_filesystem, unlink_at,
     },
     publication::{StagingReservation, StorageError},
     state::StorageActivity,
@@ -545,12 +545,12 @@ fn scan_chunk_shards(
     for_each_dir_name(chunks_directory, |shard_name| {
         if stopping.load(Ordering::Relaxed) {
             interrupted = true;
-            return Ok(false);
+            return Ok(DirectoryVisit::Stop);
         }
         counts.scanned_entries = checked_population_add(counts.scanned_entries, 1)?;
         if !is_lower_hex(shard_name, 2) {
             counts.ignored_entries = checked_population_add(counts.ignored_entries, 1)?;
-            return Ok(true);
+            return Ok(DirectoryVisit::Continue);
         }
         match open_directory_at(chunks_directory, shard_name) {
             Ok(shard) => scan_chunk_files(&shard, stopping, counts, &mut interrupted)?,
@@ -559,7 +559,10 @@ fn scan_chunk_shards(
             }
             Err(_) => counts.errors = checked_population_add(counts.errors, 1)?,
         }
-        Ok(!interrupted)
+        Ok(match interrupted {
+            true => DirectoryVisit::Stop,
+            false => DirectoryVisit::Continue,
+        })
     })?;
     population_scan_result(interrupted)
 }
@@ -573,7 +576,7 @@ fn scan_chunk_files(
     for_each_dir_name(shard, |name| {
         if stopping.load(Ordering::Relaxed) {
             *interrupted = true;
-            return Ok(false);
+            return Ok(DirectoryVisit::Stop);
         }
         counts.scanned_entries = checked_population_add(counts.scanned_entries, 1)?;
         if counts.scanned_entries.is_multiple_of(256) {
@@ -581,7 +584,7 @@ fn scan_chunk_files(
         }
         if !is_lower_hex(name, 64) {
             counts.ignored_entries = checked_population_add(counts.ignored_entries, 1)?;
-            return Ok(true);
+            return Ok(DirectoryVisit::Continue);
         }
         match open_regular_at(shard, name) {
             Ok(file) => {
@@ -594,7 +597,7 @@ fn scan_chunk_files(
             }
             Err(_) => counts.errors = checked_population_add(counts.errors, 1)?,
         }
-        Ok(true)
+        Ok(DirectoryVisit::Continue)
     })
 }
 
@@ -607,7 +610,7 @@ fn scan_manifests(
     for_each_dir_name(manifests_directory, |name| {
         if stopping.load(Ordering::Relaxed) {
             interrupted = true;
-            return Ok(false);
+            return Ok(DirectoryVisit::Stop);
         }
         counts.scanned_entries = checked_population_add(counts.scanned_entries, 1)?;
         if counts.scanned_entries.is_multiple_of(256) {
@@ -619,7 +622,7 @@ fn scan_manifests(
             .and_then(|hash| NarHash::parse(hash).ok())
         else {
             counts.ignored_entries = checked_population_add(counts.ignored_entries, 1)?;
-            return Ok(true);
+            return Ok(DirectoryVisit::Continue);
         };
         match open_regular_at(manifests_directory, name) {
             Ok(file) => record_manifest(file, hash, counts)?,
@@ -628,7 +631,7 @@ fn scan_manifests(
             }
             Err(_) => counts.errors = checked_population_add(counts.errors, 1)?,
         }
-        Ok(true)
+        Ok(DirectoryVisit::Continue)
     })?;
     population_scan_result(interrupted)
 }

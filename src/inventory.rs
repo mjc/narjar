@@ -6,7 +6,8 @@ use crate::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file},
     object::NarRepresentation,
     storage::{
-        Directory, FileHash, NarFileName, NarHash, Storage, StoreHash, for_each_dir_name,
+        Directory, DirectoryVisit, FileHash, NarFileName, NarHash, Storage, StoreHash,
+        for_each_dir_name,
         inspection::{NarinfoCandidate, NarinfoName, PayloadEntry, ReferencedPayload},
         open_directory_at, read_dir_names,
     },
@@ -543,7 +544,10 @@ impl Inventory {
                 }
             };
             can_serve = can_serve && entry_can_serve;
-            Ok(can_serve)
+            Ok(match can_serve {
+                true => DirectoryVisit::Continue,
+                false => DirectoryVisit::Stop,
+            })
         })?;
         Ok(can_serve)
     }
@@ -558,7 +562,7 @@ impl Inventory {
         let mut invalid = None;
         for_each_dir_name(&root, |name| {
             let Some(name) = NarinfoName::classify(name) else {
-                return Ok(true);
+                return Ok(DirectoryVisit::Continue);
             };
             let assessment = inspect_narinfo_entry(
                 name,
@@ -575,9 +579,9 @@ impl Inventory {
             progress(checked);
             if entry.class.invalid_published_pair() {
                 invalid = Some(entry);
-                return Ok(false);
+                return Ok(DirectoryVisit::Stop);
             }
-            Ok(true)
+            Ok(DirectoryVisit::Continue)
         })?;
         Ok(match invalid {
             Some(entry) => RecoveryOutcome::Invalid { checked, entry },
