@@ -126,6 +126,15 @@
             echo "package=${build.narjar}"
             echo "closure=$(${pkgs.nix}/bin/nix path-info -S ${build.narjar})"
           '';
+          advisoryCheck = pkgs.writeShellApplication {
+            name = "narjar-advisory-check";
+            runtimeInputs = [ pkgs.bash pkgs.cargo pkgs.cargo-audit ];
+            text = ''
+              cd ${repositorySrc}
+              bash ci/test-cargo-advisory-output.sh
+              bash ci/check-cargo-advisories.sh
+            '';
+          };
           nixE2E = pkgs.writeShellApplication {
             name = "narjar-nix-e2e";
             runtimeInputs = [
@@ -179,6 +188,7 @@
             pkgs
             toolchain
             provenance
+            advisoryCheck
             nixE2E
             continuationBenchmark
             ociE2E
@@ -274,6 +284,11 @@
           type = "app";
           program = lib.getExe env.provenance;
           meta.description = "Report the locked Narjar build identity";
+        };
+        advisory-check = {
+          type = "app";
+          program = lib.getExe env.advisoryCheck;
+          meta.description = "Audit locked dependencies against current RustSec advisories";
         };
         nix-e2e = {
           type = "app";

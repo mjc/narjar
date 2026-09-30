@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+printf '%s\n' "error: couldn't check if the package is yanked: registry lookup failed"
