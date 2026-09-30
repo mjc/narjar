@@ -226,6 +226,69 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
 }
 
 #[test]
+fn cli_help_and_version_work_for_the_packaged_binary() {
+    for arguments in [&["--help"][..], &["-h"][..]] {
+        let output = run(arguments);
+        assert!(
+            output.status.success(),
+            "help should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let help = String::from_utf8(output.stdout).expect("help should be UTF-8");
+        assert!(help.contains("Usage: narjar <COMMAND>"), "{help}");
+        assert!(help.contains("setup"), "{help}");
+    }
+
+    for arguments in [&["--version"][..], &["-V"][..]] {
+        let output = run(arguments);
+        assert!(
+            output.status.success(),
+            "version should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("version should be UTF-8"),
+            format!("narjar {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    for subcommand in [
+        "serve",
+        "init",
+        "setup",
+        "key",
+        "reconcile",
+        "cleanup",
+        "verify",
+        "gc",
+        "list-orphans",
+        "delete",
+        "stats",
+        "doctor",
+        "token",
+        "push",
+    ] {
+        let output = run(&[subcommand, "--help"]);
+        assert!(
+            output.status.success(),
+            "{subcommand} help should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let help = String::from_utf8(output.stdout).expect("subcommand help should be UTF-8");
+        assert!(
+            help.contains(&format!("Usage: narjar {subcommand}")),
+            "{subcommand} help omitted its usage: {help}"
+        );
+    }
+
+    let invalid_argument = run(&["serve", "--unknown"]);
+    assert_eq!(invalid_argument.status.code(), Some(2));
+    let error = String::from_utf8(invalid_argument.stderr).expect("error should be UTF-8");
+    assert!(error.contains("error:"), "{error}");
+    assert!(error.contains("Usage: narjar serve"), "{error}");
+}
+
+#[test]
 fn push_uses_native_transfer_without_nix_copy() {
     for (compression, suffix) in [("none", ".nar"), ("zstd", ".nar.zst"), ("xz", ".nar.xz")] {
         assert_native_push_process_boundary(compression, suffix);
@@ -1724,7 +1787,7 @@ fn serve_requires_data_dir() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "error: one or more required arguments were not provided\n"
+        "error: the following required arguments were not provided:\n  --data-dir <DATA_DIR>\n\nUsage: narjar serve --data-dir <DATA_DIR>\n\nFor more information, try '--help'.\n"
     );
 }
 
@@ -1793,7 +1856,7 @@ fn serve_accepts_data_dir_from_environment() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "error: invalid value for one of the arguments\n"
+        "error: invalid value 'not-an-address' for '--listen <LISTEN>': invalid socket address syntax\n\nFor more information, try '--help'.\n"
     );
 }
 
@@ -1811,7 +1874,7 @@ fn serve_rejects_zero_workers() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "error: invalid value for one of the arguments\n"
+        "error: invalid value '0' for '--workers <WORKERS>': number would be zero for non-zero type\n\nFor more information, try '--help'.\n"
     );
 }
 
@@ -1830,7 +1893,7 @@ fn serve_rejects_zero_workers_from_environment() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "error: invalid value for one of the arguments\n"
+        "error: invalid value '0' for '--workers <WORKERS>': number would be zero for non-zero type\n\nFor more information, try '--help'.\n"
     );
 }
 
@@ -1899,7 +1962,7 @@ fn serve_rejects_duplicate_options() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "error: an argument cannot be used with one or more of the other specified arguments\n"
+        "error: the argument '--workers <WORKERS>' cannot be used multiple times\n\nUsage: narjar serve [OPTIONS] --data-dir <DATA_DIR>\n\nFor more information, try '--help'.\n"
     );
 }
 
@@ -1917,7 +1980,7 @@ fn serve_rejects_zero_request_limit() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "error: invalid value for one of the arguments\n"
+        "error: invalid value '0' for '--max-in-flight <MAX_IN_FLIGHT>': number would be zero for non-zero type\n\nFor more information, try '--help'.\n"
     );
 }
 
@@ -1935,7 +1998,7 @@ fn serve_rejects_zero_nar_limit() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-        "error: invalid value for one of the arguments\n"
+        "error: invalid value '0' for '--max-nar-bytes <MAX_NAR_BYTES>': number would be zero for non-zero type\n\nFor more information, try '--help'.\n"
     );
 }
 

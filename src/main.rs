@@ -14,7 +14,7 @@ use config::{ServeArgs, ServeConfig};
 use error::Error;
 
 #[derive(Parser)]
-#[command(name = "narjar")]
+#[command(name = "narjar", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
