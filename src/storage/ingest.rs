@@ -1,14 +1,17 @@
 //! Own the upload resources through receiving, verification, and durable publication.
 
-use std::io::Read;
+use std::{
+    io::{self, Read},
+    os::unix::fs::PermissionsExt,
+};
 
-use crate::object::{NarFileName, NarIdentity};
+use crate::object::NarFileName;
 
 use super::{
     PublishOutcome, StagingReservation, Storage, StorageError,
     compression::{CapacityCheckedStagingWriter, ReceivedNar, receive_uploaded_nar},
-    publication::{NarUploadPolicy, PublishTarget, TemporaryFile},
-    recovery::{PublicationState, PublicationTransaction},
+    publication::{NarUploadPolicy, OwnedPublication, PublishTarget, TemporaryFile},
+    recovery::PublicationState,
     typestate::{Streaming, Validated},
 };
 
@@ -21,34 +24,9 @@ pub(super) struct UploadRequest {
 /// The state and the resource it describes move together. Only streaming uploads
 /// expose a writer; only validated uploads expose publication.
 pub(super) struct Staged<'storage, State> {
-    temporary: UploadTemporary<'storage>,
-    transaction: PublicationTransaction,
+    publication: OwnedPublication<'storage>,
     reservation: StagingReservation,
     state: State,
-}
-
-struct UploadTemporary<'storage> {
-    storage: &'storage Storage,
-    file: TemporaryFile,
-}
-
-impl Drop for UploadTemporary<'_> {
-    fn drop(&mut self) {
-        let _ = self.storage.remove_temp(&self.file);
-    }
-}
-
-impl UploadTemporary<'_> {
-    fn commit(
-        self,
-        identity: NarIdentity,
-        transaction: PublicationTransaction,
-    ) -> Result<PublishOutcome, StorageError> {
-        let target = PublishTarget::Nar(NarFileName::raw(identity.hash()));
-        let destination = target.destination();
-        self.storage
-            .commit_temporary(destination, &self.file, transaction, |_| Ok(()))
-    }
 }
 
 impl Storage {
@@ -59,6 +37,21 @@ impl Storage {
         policy: NarUploadPolicy,
         reservation: StagingReservation,
     ) -> Result<Staged<'_, Streaming<UploadRequest>>, StorageError> {
+        self.begin_upload_with_temp_setup(name, length, policy, reservation, |temporary| {
+            temporary
+                .file
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+        })
+    }
+
+    pub(super) fn begin_upload_with_temp_setup(
+        &self,
+        name: NarFileName,
+        length: u64,
+        policy: NarUploadPolicy,
+        reservation: StagingReservation,
+        setup: impl FnOnce(&TemporaryFile) -> io::Result<()>,
+    ) -> Result<Staged<'_, Streaming<UploadRequest>>, StorageError> {
         let target = PublishTarget::Nar(name);
         let destination = target.destination();
         let temp_name = self.next_temp_name(&target);
@@ -67,13 +60,17 @@ impl Storage {
             &temporary_path.relative_path(),
             &destination.relative_path(),
         )?;
-        let temporary = UploadTemporary {
-            storage: self,
-            file: self.create_temp_named(&target, temp_name)?,
+        let temporary = match self.create_temp_named_owned(&target, temp_name) {
+            Ok(temporary) => temporary,
+            Err(error) => {
+                transaction.cancel();
+                return Err(error);
+            }
         };
+        let publication = OwnedPublication::new(temporary, transaction);
+        setup(publication.temporary().file())?;
         Ok(Staged {
-            temporary,
-            transaction,
+            publication,
             reservation,
             state: Streaming::new(UploadRequest {
                 name,
@@ -89,17 +86,21 @@ impl<'storage> Staged<'storage, Streaming<UploadRequest>> {
         mut self,
         source: impl Read,
     ) -> Result<Staged<'storage, Validated<ReceivedNar>>, StorageError> {
-        self.transaction.transition(PublicationState::Streaming)?;
+        self.publication
+            .transaction_mut()
+            .transition(PublicationState::Streaming)?;
         let received = self.write_and_verify_uploaded_nar(source)?;
-        self.temporary.file.file.sync_all()?;
-        self.transaction.transition(PublicationState::Validated)?;
-        self.temporary
-            .storage
+        self.publication.temporary().file().file.sync_all()?;
+        self.publication
+            .transaction_mut()
+            .transition(PublicationState::Validated)?;
+        self.publication
+            .temporary()
+            .storage()
             .activity
             .record_upload_validated_logical_bytes(received.identity().size().get());
         Ok(Staged {
-            temporary: self.temporary,
-            transaction: self.transaction,
+            publication: self.publication,
             reservation: self.reservation,
             state: Validated::new(received),
         })
@@ -110,7 +111,7 @@ impl<'storage> Staged<'storage, Streaming<UploadRequest>> {
         source: impl Read,
     ) -> Result<ReceivedNar, StorageError> {
         let mut destination = CapacityCheckedStagingWriter::new(
-            &mut self.temporary.file.file,
+            self.publication.temporary_mut().file_mut(),
             &mut self.reservation,
             self.state.value().policy.min_free_bytes,
         );
@@ -145,15 +146,22 @@ impl Staged<'_, Validated<ReceivedNar>> {
         mut checkpoint: impl FnMut(super::publication::PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
         let Staged {
-            temporary,
-            transaction,
+            publication,
             reservation,
             state,
         } = self;
         let received = state.into_inner();
-        let storage = temporary.storage;
+        let storage = publication.temporary().storage();
         let identity = received.identity();
-        let outcome = temporary.commit(identity, transaction)?;
+        let (temporary, transaction) = publication.into_parts();
+        let temporary_file = temporary.into_file();
+        let target = PublishTarget::Nar(NarFileName::raw(identity.hash()));
+        let outcome = storage.commit_temporary(
+            target.destination(),
+            &temporary_file,
+            transaction,
+            &mut checkpoint,
+        )?;
         storage
             .activity
             .record_upload_publication(outcome, identity.size().get());

@@ -43,6 +43,10 @@ impl Layout {
         self.root.join(".tmp")
     }
 
+    pub(crate) fn transaction_dir(&self) -> PathBuf {
+        self.root.join(".narjar-transactions")
+    }
+
     pub(crate) fn ingestion_receipt_dir(&self) -> PathBuf {
         self.root.join(".narjar-ingress")
     }

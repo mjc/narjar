@@ -610,6 +610,12 @@ fn assert_upload_resources_released(storage: &Storage) {
     );
 }
 
+fn transaction_record_count(storage: &Storage) -> usize {
+    fs::read_dir(storage.layout().transaction_dir())
+        .expect("read transaction directory")
+        .count()
+}
+
 #[test]
 fn abandoning_a_receiving_upload_releases_its_file_and_reservation() {
     let directory = TestDir::new();
@@ -787,6 +793,7 @@ fn source_errors_and_unwinding_release_upload_resources() {
         matches!(failed, Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EIO))
     );
     assert_upload_resources_released(&storage);
+    assert_eq!(transaction_record_count(&storage), 0);
 
     struct PanickingReader;
     impl Read for PanickingReader {
@@ -799,6 +806,140 @@ fn source_errors_and_unwinding_release_upload_resources() {
     }));
     assert!(unwound.is_err());
     assert_upload_resources_released(&storage);
+    assert_eq!(transaction_record_count(&storage), 0);
+}
+
+#[test]
+fn rejected_and_disconnected_uploads_do_not_accumulate_transactions() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let bytes = b"rejected NAR";
+    let wrong_hash = FileHash::from_digest(Sha256::digest(b"different NAR").into());
+
+    for _ in 0..8 {
+        let reservation = storage.reserve_staging(bytes.len() as u64, 0).unwrap();
+        let receiving = storage
+            .begin_upload(
+                NarFileName::new(wrong_hash, WireEncoding::Raw),
+                bytes.len() as u64,
+                super::NarUploadPolicy::new(bytes.len() as u64, 0),
+                reservation,
+            )
+            .unwrap();
+        let rejected = receiving.receive(bytes.as_slice());
+        assert!(matches!(
+            rejected,
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(transaction_record_count(&storage), 0);
+
+        let receiving = begin_raw_upload(&storage, bytes);
+        assert!(
+            receiving
+                .receive(BrokenReader::new(libc::ECONNRESET))
+                .is_err()
+        );
+        assert_eq!(transaction_record_count(&storage), 0);
+    }
+
+    assert_upload_resources_released(&storage);
+}
+
+#[test]
+fn uncertain_upload_publication_retains_its_recovery_record() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let raw = b"raw NAR";
+    let complete = begin_raw_upload(&storage, raw)
+        .receive(raw.as_slice())
+        .unwrap();
+
+    assert!(
+        complete
+            .commit_fault(PublishBoundary::BeforeFinalLink)
+            .is_err()
+    );
+    assert_eq!(transaction_record_count(&storage), 1);
+    assert!(
+        fs::read_dir(storage.layout().nar_temp_dir())
+            .unwrap()
+            .next()
+            .is_none(),
+        "a conclusively removable staging file is cleaned even when publication is uncertain"
+    );
+    assert_upload_resources_released(&storage);
+
+    storage.finish_recovery().unwrap();
+    assert_eq!(transaction_record_count(&storage), 0);
+}
+
+#[test]
+fn upload_setup_failure_cancels_transaction_after_temporary_cleanup() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let bytes = b"raw NAR";
+    let name = NarFileName::new(
+        FileHash::from_digest(Sha256::digest(bytes).into()),
+        WireEncoding::Raw,
+    );
+    let reservation = storage.reserve_staging(bytes.len() as u64, 0).unwrap();
+
+    let result = storage.begin_upload_with_temp_setup(
+        name,
+        bytes.len() as u64,
+        super::NarUploadPolicy::new(bytes.len() as u64, 0),
+        reservation,
+        |_| Err(io::Error::other("injected setup failure")),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(transaction_record_count(&storage), 0);
+    assert_upload_resources_released(&storage);
+}
+
+#[test]
+fn upload_setup_failure_retains_transaction_when_temporary_cleanup_fails() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let bytes = b"raw NAR";
+    let name = NarFileName::new(
+        FileHash::from_digest(Sha256::digest(bytes).into()),
+        WireEncoding::Raw,
+    );
+    let reservation = storage.reserve_staging(bytes.len() as u64, 0).unwrap();
+    let temporary_directory = storage.layout().nar_temp_dir();
+    let result = storage.begin_upload_with_temp_setup(
+        name,
+        bytes.len() as u64,
+        super::NarUploadPolicy::new(bytes.len() as u64, 0),
+        reservation,
+        |temporary| {
+            let temporary_path = temporary_directory.join(&temporary.name);
+            fs::remove_file(&temporary_path)?;
+            fs::create_dir(&temporary_path)?;
+            fs::write(temporary_path.join("keep-unlink-failing"), b"block unlink")?;
+            Err(io::Error::other("injected setup failure"))
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(transaction_record_count(&storage), 1);
+    assert_eq!(
+        fs::read_dir(&temporary_directory).unwrap().count(),
+        1,
+        "failed cleanup leaves the replacement path for recovery"
+    );
+
+    let temporary_path = fs::read_dir(&temporary_directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(temporary_path.join("keep-unlink-failing")).unwrap();
+    fs::remove_dir(&temporary_path).unwrap();
+    storage.finish_recovery().unwrap();
+    assert_eq!(transaction_record_count(&storage), 0);
 }
 
 #[test]

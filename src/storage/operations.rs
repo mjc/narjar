@@ -1103,8 +1103,21 @@ impl Storage {
         target: &PublishTarget<'_>,
         name: OsString,
     ) -> Result<TemporaryFile, StorageError> {
+        let temporary = self.create_temp_named_owned(target, name)?;
+        temporary
+            .file()
+            .file
+            .set_permissions(Permissions::from_mode(0o600))?;
+        Ok(temporary.into_file())
+    }
+
+    pub(super) fn create_temp_named_owned(
+        &self,
+        target: &PublishTarget<'_>,
+        name: OsString,
+    ) -> Result<OwnedTemporary<'_>, StorageError> {
         let directory = self.temporary_directory(target.destination().temporary_directory)?;
-        self.create_temp_in_directory(directory, name)
+        self.create_temp_in_directory_owned(directory, name)
     }
 
     pub(super) fn create_temp_in_directory(
@@ -1112,19 +1125,34 @@ impl Storage {
         directory: File,
         name: OsString,
     ) -> Result<TemporaryFile, StorageError> {
+        let temporary = self.create_temp_in_directory_owned(directory, name)?;
+        temporary
+            .file()
+            .file
+            .set_permissions(Permissions::from_mode(0o600))?;
+        Ok(temporary.into_file())
+    }
+
+    fn create_temp_in_directory_owned(
+        &self,
+        directory: File,
+        name: OsString,
+    ) -> Result<OwnedTemporary<'_>, StorageError> {
         let file = open_at(
             &directory,
             &name,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600,
         )?;
-        file.set_permissions(Permissions::from_mode(0o600))?;
         self.temporary_objects.fetch_add(1, Ordering::Relaxed);
-        Ok(TemporaryFile {
-            name,
-            directory,
-            file,
-        })
+        Ok(OwnedTemporary::new(
+            self,
+            TemporaryFile {
+                name,
+                directory,
+                file,
+            },
+        ))
     }
 
     pub(super) fn remove_temp(&self, temp: &TemporaryFile) -> Result<(), StorageError> {
