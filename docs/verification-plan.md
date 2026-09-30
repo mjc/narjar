@@ -180,6 +180,14 @@ tests are required in addition to the flat publication cases:
   leave independently valid orphan chunks, but never a visible incomplete
   manifest or narinfo; the finalized manifest is not durable before the
   filesystem sync covering all of its newly published chunks.
+- Failure of the pre-manifest filesystem sync is injected deterministically;
+  the operation returns the I/O error, removes its private manifest staging
+  record, and leaves no published manifest. Orphan chunks are allowed.
+- Chunked storage is Linux-only. macOS configuration tests verify that parsing
+  the chunked backend is rejected, and storage initialization rejects it
+  before creating layout entries. macOS flat storage remains available.
+  Package compilation on macOS is not evidence that chunked-storage
+  crash durability is supported there.
 - Inventory checks manifest/chunk availability and, in content mode,
   reconstructs and hashes the full logical NAR. A valid compressed derivative
   must not hide missing or corrupt canonical chunks.

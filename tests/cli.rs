@@ -3430,6 +3430,7 @@ fn nar_put_normalizes_zstd_to_raw_bytes() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn chunked_backend_serves_the_reconstructed_raw_nar() {
     let server =
         RunningServer::start_with_args("chunked-raw-read", &["--storage-backend", "chunked"]);
@@ -3473,6 +3474,7 @@ fn chunked_backend_serves_the_reconstructed_raw_nar() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn native_push_and_raw_read_share_one_chunked_cache_url() {
     for compression in ["none", "zstd", "xz"] {
         let server = RunningServer::start_with_workers(
@@ -3849,6 +3851,7 @@ fn configured_compressed_egress_is_independent_of_ingress_encoding() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn chunked_backend_materializes_compressed_egress_from_chunks() {
     let server = RunningServer::start_with_args(
         "chunked-zstd-egress",
@@ -4905,6 +4908,7 @@ fn init_and_key_generate_create_secure_operator_material() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn setup_creates_a_ready_cache_and_separate_private_credentials() {
     use std::os::unix::fs::PermissionsExt as _;
 

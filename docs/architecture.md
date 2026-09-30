@@ -6,7 +6,8 @@ remain subject to the evidence gates recorded below.
 ## Decision
 
 Narjar is a filesystem-only HTTP binary cache with two explicit canonical
-storage backends: flat files and shared content-defined chunks. It does not expose a
+storage backends: flat files and shared content-defined chunks. The flat
+backend is supported on Linux and macOS; chunked storage is Linux-only. It does not expose a
 native /nix/store, invoke Nix, own a signing key, run background workers, or
 perform online garbage collection. It can normalize uploaded NAR
 representations to canonical raw storage and materialize deterministic
@@ -157,7 +158,8 @@ reconcile and GC perform the potentially unbounded scans.
 ## Canonical storage backends
 
 `narjar init --storage-backend flat|chunked` selects the canonical layout for a
-new DATA root; `flat` remains the default. The choice is recorded in the
+new DATA root; `flat` remains the default. Chunked storage is supported only on
+Linux and is rejected on macOS before initialization. The choice is recorded in the
 small `.narjar-layout` descriptor and is immutable for that root. A chunked
 descriptor also records `profile=mincdc-hash4-v2`; this profile identifier is
 part of the storage format, not an advisory tuning value. Startup and offline
@@ -167,7 +169,7 @@ migration, legacy-layout fallback, mixed per-object selection, or automatic
 conversion.
 
 The flat backend stores the complete decoded NAR at `nar/<NarHash>.nar`.
-The chunked backend stores the exact decoded byte stream as immutable
+The Linux chunked backend stores the exact decoded byte stream as immutable
 content-addressed chunks below `.narjar-chunks/` and one bounded ordered
 manifest at `.narjar-manifests/<NarHash>.manifest`. The manifest records the
 profile, logical identity, cumulative chunk ends, and chunk hashes; it is
@@ -211,7 +213,7 @@ PUT /nar/<file-hash>.nar[.zst|.xz]
   -> for `.nar.zst`/`.nar.xz`, stream-decode the stored bytes to validate the raw NAR hash/size
   -> reject length/hash/empty mismatch or an oversized decompressed NAR
   -> sync and no-replace publish the flat file, or publish bounded batches of
-     shared chunks, sync the filesystem before manifest finalization, then
+     shared chunks, sync the Linux filesystem before manifest finalization, then
      publish the ordered manifest
   -> 201 for newly durable object, 200 for identical existing object
 

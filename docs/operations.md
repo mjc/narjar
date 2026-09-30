@@ -111,7 +111,10 @@ immutable layout descriptor and creates the chunk directories when `chunked`
 is selected; it defaults to `flat`. A chunked descriptor records the supported
 `mincdc-hash4-v2` profile (256 KiB minimum, 1 MiB maximum). It refuses a
 non-empty incompatible directory; it does not infer or convert an older
-layout.
+layout. Chunked storage is supported only on Linux. macOS builds support the
+flat backend; `init`, `serve`, and maintenance commands reject a chunked
+selection before opening storage because macOS has no verified durability
+sequence for syncing chunk data and shard entries before manifest publication.
 
 token create generates a random 256-bit token, writes only its SHA-256 hash and
 label atomically to the scope file, and prints the secret once to stdout.

@@ -507,7 +507,7 @@ fn compressed_read_error(error: io::Error) -> io::Error {
             || io::Error::new(source.kind(), source.to_string()),
             io::Error::from_raw_os_error,
         )
-    } else if error.kind() == io::ErrorKind::Other {
+    } else if error.kind() == io::ErrorKind::Other || error.kind() == io::ErrorKind::Unsupported {
         io::Error::new(io::ErrorKind::InvalidData, error)
     } else {
         error

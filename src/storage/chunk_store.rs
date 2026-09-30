@@ -960,8 +960,16 @@ impl CompletedChunkedIngest {
 
 impl ChunkingWriter<'_> {
     pub(crate) fn finish(
+        self,
+        expected: NarIdentity,
+    ) -> Result<CompletedChunkedIngest, ChunkStoreError> {
+        self.finish_with(expected, sync_filesystem)
+    }
+
+    fn finish_with(
         mut self,
         expected: NarIdentity,
+        sync_chunks: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<CompletedChunkedIngest, ChunkStoreError> {
         self.publish_pending_chunk()?;
         let actual = NarIdentity::new(
@@ -987,7 +995,7 @@ impl ChunkingWriter<'_> {
                 actual: self.previous_end,
             });
         }
-        self.sync_new_chunks_before_manifest()?;
+        self.sync_new_chunks_before_manifest(sync_chunks)?;
         let manifest = ChunkManifest::new(actual, self.profile, self.chunk_count);
         let manifest_bytes = MANIFEST_HEADER_BYTES
             .checked_add(
@@ -1190,9 +1198,12 @@ impl ChunkingWriter<'_> {
         })
     }
 
-    fn sync_new_chunks_before_manifest(&mut self) -> io::Result<()> {
+    fn sync_new_chunks_before_manifest(
+        &mut self,
+        sync_chunks: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
         if self.new_chunks_need_sync {
-            sync_filesystem(&self.store.chunks)?;
+            sync_chunks(&self.store.chunks)?;
             self.new_chunks_need_sync = false;
         }
         Ok(())
@@ -1649,6 +1660,39 @@ mod tests {
             store.read_range(hash, invalid_start..invalid_end, 1_000_000, &mut range),
             Err(ChunkStoreError::InvalidRange { .. })
         ));
+    }
+
+    #[test]
+    fn filesystem_sync_failure_never_publishes_the_manifest() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        let mut writer = store
+            .begin_ingest_with_optional_reservation(ChunkProfile::MinCdcHash4V2, None, 0)
+            .unwrap();
+        writer.write_all(&input).unwrap();
+
+        let result = writer.finish_with(identity, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        });
+
+        assert!(matches!(
+            result,
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(libc::EIO)
+        ));
+        assert!(store.open_manifest(identity.hash()).unwrap().is_none());
+        assert!(
+            fs::read_dir(directory.path().join(super::super::MANIFEST_DIRECTORY))
+                .unwrap()
+                .next()
+                .is_none(),
+            "a failed chunk durability barrier must leave no manifest or staging record"
+        );
     }
 
     #[test]

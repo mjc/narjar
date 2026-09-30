@@ -173,6 +173,7 @@ fn population_scan_can_be_cancelled_without_returning_partial_totals() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn chunked_ingestion_publishes_a_verified_manifest() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
@@ -222,6 +223,7 @@ fn chunked_ingestion_publishes_a_verified_manifest() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn chunked_backend_routes_the_complete_nar_publication() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
@@ -282,7 +284,11 @@ fn chunked_backend_routes_the_complete_nar_publication() {
 
 #[test]
 fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
-    for backend in [StorageBackend::Flat, StorageBackend::Chunked] {
+    for backend in [
+        StorageBackend::Flat,
+        #[cfg(not(target_os = "macos"))]
+        StorageBackend::Chunked,
+    ] {
         let directory = TestDir::new();
         let storage =
             Storage::initialize(&Directory::open(directory.path()).unwrap(), backend).unwrap();
@@ -323,6 +329,7 @@ fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
@@ -359,6 +366,7 @@ fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
@@ -844,21 +852,24 @@ fn normalized_compressed_source_errors_remain_io_errors() {
         WireEncoding::Compressed(CompressionCodec::Xz),
         WireEncoding::Compressed(CompressionCodec::Zstd),
     ] {
-        let directory = TestDir::new();
-        let destination = directory.path().join("raw.nar");
-        let mut destination = fs::File::create(destination).expect("create raw staging file");
-        let error = receive_uploaded_nar(
-            BrokenReader::new(libc::EIO),
-            NarFileName::new(
-                FileHash::parse(NAR_ID).expect("file hash is valid"),
-                encoding,
-            ),
-            3,
-            u64::MAX,
-            &mut destination,
-        )
-        .expect_err("source failure must not become invalid content");
-        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{encoding:?}");
+        for source_error in [libc::EIO, libc::EOPNOTSUPP] {
+            let directory = TestDir::new();
+            let destination_path = directory.path().join("raw.nar");
+            let mut destination =
+                fs::File::create(destination_path).expect("create raw staging file");
+            let error = receive_uploaded_nar(
+                BrokenReader::new(source_error),
+                NarFileName::new(
+                    FileHash::parse(NAR_ID).expect("file hash is valid"),
+                    encoding,
+                ),
+                3,
+                u64::MAX,
+                &mut destination,
+            )
+            .expect_err("source failure must not become invalid content");
+            assert_eq!(error.raw_os_error(), Some(source_error), "{encoding:?}");
+        }
     }
 }
 
@@ -926,6 +937,45 @@ fn encoded_verification_precedes_xz_nar_identity_verification() {
             .expect("verify decoded XZ NAR")
             .expect("decoded XZ NAR matches"),
         NarIdentity::new(nar_hash, NarSize::new(raw.len() as u64))
+    );
+}
+
+#[test]
+fn reserved_xz_stream_flags_are_invalid_content() {
+    let directory = TestDir::new();
+    let path = directory.path().join("nar.xz");
+    let raw = b"nar bytes";
+    let mut compressed = Vec::new();
+    let mut writer =
+        XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
+    writer.write_all(raw).expect("compress NAR");
+    writer.finish().expect("finish XZ stream");
+
+    // Keep the stream-header CRC valid while setting a reserved flag bit.
+    compressed[6] = 0x04;
+    compressed[7] = 0x04;
+    compressed[8..12].copy_from_slice(&[0xe2, 0x13, 0xd8, 0x22]);
+    fs::write(&path, &compressed).expect("write malformed XZ NAR");
+    let file = fs::File::open(path).expect("open malformed XZ NAR");
+    let nar_hash = NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).expect("NAR hash is valid");
+    let file_hash =
+        FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).expect("file hash is valid");
+    let expectation = CompressedNarIdentity::new(
+        EncodedIdentity::new(
+            CompressionCodec::Xz,
+            file_hash,
+            EncodedSize::new(compressed.len() as u64),
+        ),
+        NarIdentity::new(nar_hash, NarSize::new(raw.len() as u64)),
+    );
+    let verified = verify_encoded_compressed_file(&file, expectation)
+        .expect("read encoded malformed XZ NAR")
+        .expect("encoded malformed XZ NAR matches its hash");
+
+    assert!(
+        verify_decoded_compressed_file(verified)
+            .expect("malformed XZ is classified as invalid content")
+            .is_none()
     );
 }
 
@@ -1135,6 +1185,7 @@ fn recovery_removes_receipts_without_a_usable_raw_object() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
     let directory = TestDir::new();
     let raw = b"chunked raw NAR for egress recovery";
@@ -1708,6 +1759,7 @@ fn initialization_creates_only_the_fixed_layout() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn initialization_rejects_a_different_storage_backend() {
     let directory = TestDir::new();
     let root = Directory::open(directory.path()).unwrap();
@@ -1717,6 +1769,19 @@ fn initialization_rejects_a_different_storage_backend() {
     let error = Storage::initialize(&root, StorageBackend::Chunked)
         .expect_err("a populated root must retain its selected backend");
     assert!(error.to_string().contains("different storage backend"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn initialization_rejects_chunked_storage_before_creating_layout_entries() {
+    let directory = TestDir::new();
+    let root = Directory::open(directory.path()).unwrap();
+
+    let error = Storage::initialize(&root, StorageBackend::Chunked)
+        .expect_err("chunked storage is unsupported on macOS");
+
+    assert!(error.to_string().contains("not supported on macOS"));
+    assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
 }
 
 #[test]

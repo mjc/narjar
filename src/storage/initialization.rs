@@ -23,6 +23,9 @@ use super::publication::Layout;
 
 impl Storage {
     pub fn initialize(root: &Directory, backend: StorageBackend) -> Result<Self, StorageError> {
+        backend
+            .validate_current_platform()
+            .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
         #[cfg(test)]
         let layout = Layout::new(root.path.clone());
         let root_directory = root.file.try_clone()?;

@@ -47,15 +47,48 @@ pub enum StorageBackend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InvalidStorageBackend;
+pub enum InvalidStorageBackend {
+    /// The value is neither `flat` nor `chunked`.
+    UnknownValue,
+    /// Chunked storage has no verified durability contract on macOS.
+    UnsupportedOnMacOS,
+    /// Chunked storage is supported only on Linux.
+    UnsupportedPlatform,
+}
 
 impl fmt::Display for InvalidStorageBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected one of: flat, chunked")
+        formatter.write_str(match self {
+            Self::UnknownValue => "expected one of: flat, chunked",
+            Self::UnsupportedOnMacOS => "chunked storage is not supported on macOS; choose flat",
+            Self::UnsupportedPlatform => "chunked storage is supported only on Linux",
+        })
     }
 }
 
 impl std::error::Error for InvalidStorageBackend {}
+
+impl StorageBackend {
+    pub(super) fn validate_current_platform(self) -> Result<(), InvalidStorageBackend> {
+        match self {
+            Self::Flat => Ok(()),
+            Self::Chunked => {
+                #[cfg(target_os = "linux")]
+                {
+                    Ok(())
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    Err(InvalidStorageBackend::UnsupportedOnMacOS)
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    Err(InvalidStorageBackend::UnsupportedPlatform)
+                }
+            }
+        }
+    }
+}
 
 impl FromStr for StorageBackend {
     type Err = InvalidStorageBackend;
@@ -63,8 +96,11 @@ impl FromStr for StorageBackend {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "flat" => Ok(Self::Flat),
-            "chunked" => Ok(Self::Chunked),
-            _ => Err(InvalidStorageBackend),
+            "chunked" => {
+                Self::Chunked.validate_current_platform()?;
+                Ok(Self::Chunked)
+            }
+            _ => Err(InvalidStorageBackend::UnknownValue),
         }
     }
 }
@@ -331,5 +367,34 @@ impl Storage {
     #[cfg(test)]
     pub(super) const fn chunk_store(&self) -> Option<&ChunkStore> {
         self.payloads.chunk_store()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InvalidStorageBackend, StorageBackend};
+
+    #[test]
+    fn backend_parsing_applies_the_current_platform_policy() {
+        assert_eq!("flat".parse::<StorageBackend>(), Ok(StorageBackend::Flat));
+        assert_eq!(
+            "unknown".parse::<StorageBackend>(),
+            Err(InvalidStorageBackend::UnknownValue)
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            "chunked".parse::<StorageBackend>(),
+            Ok(StorageBackend::Chunked)
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            "chunked".parse::<StorageBackend>(),
+            Err(InvalidStorageBackend::UnsupportedOnMacOS)
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(
+            "chunked".parse::<StorageBackend>(),
+            Err(InvalidStorageBackend::UnsupportedPlatform)
+        );
     }
 }

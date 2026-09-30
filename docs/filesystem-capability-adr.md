@@ -1,6 +1,6 @@
 # ADR: Portable filesystem capability model
 
-- Status: accepted for the flat and chunked storage implementations
+- Status: accepted for flat storage; chunked storage is Linux-only
 - Scope: DATA filesystem behavior and deployment integration
 - Related work: NARJ-43, NARJ-46, NARJ-68, NARJ-69, NARJ-73
 
@@ -22,8 +22,8 @@ The portable publication contract for both backends requires:
 - unlink and directory synchronization for cleanup; and
 - an exclusive process lease using local `flock` semantics.
 
-The chunked backend additionally requires bounded creation and traversal of
-`.narjar-chunks/` and `.narjar-manifests/`, immutable no-replace chunk and
+The Linux chunked backend additionally requires bounded creation and traversal
+of `.narjar-chunks/` and `.narjar-manifests/`, immutable no-replace chunk and
 manifest publication, and enough file/directory synchronization to make a
 completed manifest reconstructible after restart. Chunk publication uses
 bounded batches: new chunks are written and published while their ordered
@@ -31,6 +31,18 @@ records remain in private staging, then the final batch filesystem sync covers
 all chunks for that NAR before the authoritative manifest is finalized. A
 manifest is authoritative metadata: a chunk directory without its manifest is
 not a readable NAR.
+
+Chunked storage is rejected on macOS before storage initialization. Its current
+publication contract relies on Linux `syncfs` to order newly linked chunks
+before manifest publication. The macOS fallback cannot establish equivalent
+durability for chunk contents and entries spread across shard directories.
+Apple documents that ordinary `fsync` does not provide the write-ordering and
+device-cache guarantees needed for this contract. Narjar does not claim
+crash-durable chunked storage on APFS; macOS builds support the flat backend.
+This decision follows Apple's [fsync(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html)
+and [fcntl(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html)
+documentation, which distinguishes ordinary `fsync` from the stronger
+`F_FULLFSYNC` request.
 
 Transaction-record replacement uses `renameat` inside the transaction
 directory. That is separate from final-object publication. User-uploaded NAR
@@ -60,8 +72,10 @@ and physical space accounting are filesystem observations rather than Narjar
 correctness requirements. The recommended ZFS DATA profile uses
 `compression=zstd` (the OpenZFS alias for `zstd-3`); Narjar does not set or
 verify ZFS properties. XFS, btrfs, ZFS-specific behavior, overlay,
-bind-mount variants, quota/inode exhaustion, read-only remounts, and Darwin
-APFS remain unverified until the corresponding evidence work is complete.
+bind-mount variants, quota/inode exhaustion, and read-only remounts remain
+unverified until the corresponding evidence work is complete. Darwin APFS is
+supported for flat storage only; chunked storage is rejected rather than
+claiming an unverified durability guarantee.
 
 No storage or deployment document should turn an unverified filesystem result
 into a support guarantee. The measured filesystem/ZFS profile belongs in the
