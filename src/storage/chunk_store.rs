@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
+    time::SystemTime,
 };
 
 use mincdc::{MinCdcHash4, SliceChunker};
@@ -59,6 +60,14 @@ pub(crate) struct ChunkSweepReport {
 pub(crate) struct ChunkPhysicalBytes {
     pub(crate) chunks: u64,
     pub(crate) manifests: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChunkManifestFile {
+    pub(crate) name: OsString,
+    pub(crate) hash: NarHash,
+    pub(crate) bytes: u64,
+    pub(crate) modified: SystemTime,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -378,6 +387,32 @@ impl ChunkStore {
                         })
                 })?;
         Ok(ChunkPhysicalBytes { chunks, manifests })
+    }
+
+    pub(crate) fn manifest_files(&self) -> io::Result<Vec<ChunkManifestFile>> {
+        read_dir_names(&self.manifests)?
+            .into_iter()
+            .filter_map(|name| {
+                let hash = name
+                    .to_str()?
+                    .strip_suffix(".manifest")
+                    .and_then(|hash| NarHash::parse(hash).ok())?;
+                Some((name, hash))
+            })
+            .map(|(name, hash)| {
+                if !super::fs::entry_is_regular_at(&self.manifests, &name)? {
+                    return Ok(None);
+                }
+                let metadata = open_regular_at(&self.manifests, &name)?.metadata()?;
+                Ok(Some(ChunkManifestFile {
+                    name,
+                    hash,
+                    bytes: metadata.len(),
+                    modified: metadata.modified()?,
+                }))
+            })
+            .filter_map(Result::transpose)
+            .collect()
     }
 
     fn prepare_gc_marks(&self) -> Result<File, ChunkStoreError> {
