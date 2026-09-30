@@ -2,7 +2,10 @@ use std::{
     env, fs,
     io::{self, Cursor, Read, Write},
     num::NonZeroUsize,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{PermissionsExt, symlink},
+    },
     path::{Path, PathBuf},
     process,
     sync::{Arc, Mutex, mpsc},
@@ -2379,6 +2382,134 @@ fn recovery_cleans_incomplete_publication_transactions() {
             .is_none()
     );
     assert!(!storage.recovery_required().expect("inspect clean state"));
+}
+
+#[test]
+fn recovery_discards_abandoned_transaction_drafts_before_parsing_records() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let temporary = directory.path().join(".tmp/abandoned-draft.part");
+    fs::write(&temporary, b"incomplete publication").expect("create publication temp");
+    drop(
+        storage
+            .recovery
+            .begin(
+                Path::new(".tmp/abandoned-draft.part"),
+                Path::new("nix-cache-info"),
+            )
+            .expect("record interrupted publication"),
+    );
+
+    let transaction_directory = directory.path().join(".narjar-transactions");
+    let record_name = fs::read_dir(&transaction_directory)
+        .expect("read transaction directory")
+        .next()
+        .expect("transaction record exists")
+        .expect("read transaction entry")
+        .file_name();
+    let abandoned_draft = transaction_directory.join(format!(
+        "{}.next-0000000000000001",
+        record_name.to_string_lossy()
+    ));
+    fs::write(&abandoned_draft, b"partial state=")
+        .expect("simulate process termination during draft write");
+    fs::set_permissions(&abandoned_draft, fs::Permissions::from_mode(0o000))
+        .expect("make abandoned draft unreadable");
+
+    storage
+        .finish_recovery()
+        .expect("abandoned draft is not an authoritative transaction");
+
+    assert!(
+        !temporary.exists(),
+        "authoritative record recovers its temp"
+    );
+    assert!(
+        !abandoned_draft.exists(),
+        "recovery removes the abandoned draft"
+    );
+    assert!(
+        fs::read_dir(&transaction_directory)
+            .expect("read recovered transaction directory")
+            .next()
+            .is_none(),
+        "recovery leaves no transaction entries"
+    );
+}
+
+#[test]
+fn recovery_handles_the_initial_record_hard_link_before_draft_unlink() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let temporary = directory.path().join(".tmp/initial-link-window.part");
+    fs::write(&temporary, b"interrupted publication").expect("create publication temp");
+    drop(
+        storage
+            .recovery
+            .begin(
+                Path::new(".tmp/initial-link-window.part"),
+                Path::new("nix-cache-info"),
+            )
+            .expect("record interrupted publication"),
+    );
+
+    let transaction_directory = directory.path().join(".narjar-transactions");
+    let record_path = fs::read_dir(&transaction_directory)
+        .expect("read transaction directory")
+        .next()
+        .expect("transaction record exists")
+        .expect("read transaction entry")
+        .path();
+    let draft_path = transaction_directory.join(format!(
+        "{}.next-0000000000000002",
+        record_path
+            .file_name()
+            .expect("record filename")
+            .to_string_lossy()
+    ));
+    fs::hard_link(&record_path, &draft_path).expect("simulate crash after hard-link install");
+
+    storage
+        .finish_recovery()
+        .expect("recovery handles the complete linked record and its draft");
+
+    assert!(
+        !temporary.exists(),
+        "the authoritative record recovers its temp"
+    );
+    assert!(
+        !draft_path.exists(),
+        "recovery removes the leftover draft link"
+    );
+    assert!(
+        fs::read_dir(&transaction_directory)
+            .expect("read recovered transaction directory")
+            .next()
+            .is_none(),
+        "recovery leaves no transaction entries"
+    );
+}
+
+#[test]
+fn recovery_rejects_invalid_destination_before_creating_a_record() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let invalid_destination = Path::new(std::ffi::OsStr::from_bytes(b"invalid-\xff-name"));
+
+    assert!(
+        storage
+            .recovery
+            .begin(Path::new(".tmp/unrecorded.part"), invalid_destination)
+            .is_err(),
+        "transaction paths must be validated before record publication"
+    );
+    assert!(
+        fs::read_dir(directory.path().join(".narjar-transactions"))
+            .expect("read transaction directory")
+            .next()
+            .is_none(),
+        "a rejected transaction must not leave a partial authoritative record"
+    );
 }
 
 #[test]

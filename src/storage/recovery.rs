@@ -10,7 +10,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use super::fs::{open_at, unlink_at};
+use super::fs::{entry_mode_at, hard_link_at, open_at, unlink_at};
 use super::{
     StorageError, entry_is_regular_at,
     location::{StorePath, TemporaryPath},
@@ -77,6 +77,120 @@ impl PublicationState {
     }
 }
 
+#[derive(Debug)]
+enum TransactionEntry {
+    Record(OsString),
+    Draft(OsString),
+}
+
+impl TransactionEntry {
+    fn parse(name: OsString) -> io::Result<Self> {
+        let name_text = name
+            .to_str()
+            .ok_or_else(|| invalid_transaction_filename("transaction filename is not UTF-8"))?;
+        match name_text.rsplit_once(".next-") {
+            Some((record, sequence)) if is_generated_draft_name(record, sequence) => {
+                Ok(Self::Draft(name))
+            }
+            Some(_) => Err(invalid_transaction_filename(
+                "transaction draft filename is malformed",
+            )),
+            None if name_text.ends_with(".txn") => Ok(Self::Record(name)),
+            None => Err(invalid_transaction_filename(
+                "transaction filename is malformed",
+            )),
+        }
+    }
+
+    fn name(&self) -> &OsStr {
+        match self {
+            Self::Record(name) | Self::Draft(name) => name,
+        }
+    }
+}
+
+fn is_generated_draft_name(record: &str, draft_sequence: &str) -> bool {
+    let Some(record_sequence) = record
+        .strip_prefix("publish-")
+        .and_then(|record| record.strip_suffix(".txn"))
+        .and_then(|record| record.rsplit_once('-'))
+        .and_then(|(process_id, sequence)| {
+            let generated_process_id =
+                !process_id.is_empty() && process_id.bytes().all(|byte| byte.is_ascii_digit());
+            generated_process_id.then_some(sequence)
+        })
+    else {
+        return false;
+    };
+    let has_hex_sequence = |sequence: &str| {
+        sequence.len() == 16 && sequence.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    has_hex_sequence(record_sequence) && has_hex_sequence(draft_sequence)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionInstall {
+    Create,
+    Replace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionRecordBoundary {
+    DraftCreated,
+    DraftWritten,
+    DraftSynchronized,
+    RecordInstalled,
+    DirectorySynchronized,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionRecordOperation {
+    SyncDraft,
+    InstallRecord(TransactionInstall),
+    SyncDirectory,
+}
+
+trait TransactionRecordOperations {
+    fn sync_draft(&mut self, draft: &File) -> io::Result<()>;
+    fn install_record(
+        &mut self,
+        directory: &File,
+        draft_name: &OsStr,
+        record_name: &OsStr,
+        installation: TransactionInstall,
+    ) -> io::Result<()>;
+    fn sync_directory(&mut self, directory: &File) -> io::Result<()>;
+}
+
+struct FilesystemTransactionRecordOperations;
+
+impl TransactionRecordOperations for FilesystemTransactionRecordOperations {
+    fn sync_draft(&mut self, draft: &File) -> io::Result<()> {
+        draft.sync_all()
+    }
+
+    fn install_record(
+        &mut self,
+        directory: &File,
+        draft_name: &OsStr,
+        record_name: &OsStr,
+        installation: TransactionInstall,
+    ) -> io::Result<()> {
+        match installation {
+            TransactionInstall::Create => {
+                hard_link_at(directory, draft_name, directory, record_name)?;
+                unlink_at(directory, draft_name)
+            }
+            TransactionInstall::Replace => rename_at(directory, draft_name, directory, record_name),
+        }
+    }
+
+    fn sync_directory(&mut self, directory: &File) -> io::Result<()> {
+        directory.sync_all()
+    }
+}
+
 impl PublicationTransaction {
     pub(super) fn set_destination(&mut self, destination: &Path) {
         self.destination = destination.to_owned();
@@ -98,47 +212,35 @@ impl PublicationTransaction {
             .name
             .as_ref()
             .expect("active publication transaction has a record name");
-        let temporary_name = OsString::from(format!(
-            "{}.next-{sequence:016x}",
-            name.to_string_lossy(),
-            sequence = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let result = (|| {
-            let mut replacement = open_at(
-                &self.directory,
-                &temporary_name,
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )?;
-            replacement.set_permissions(fs::Permissions::from_mode(0o600))?;
-            let path = self.path.to_str().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "publication transaction path is not UTF-8",
-                )
-            })?;
-            let destination = self.destination.to_str().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "publication destination path is not UTF-8",
-                )
-            })?;
-            write!(
-                replacement,
-                "state={}\npath={path}\ndestination={destination}\n",
-                state.as_str()
-            )?;
-            replacement.sync_all()?;
-            rename_at(&self.directory, &temporary_name, &self.directory, name)?;
-            self.directory.sync_all()?;
-            Ok::<_, io::Error>(())
-        })();
-        if let Err(error) = result {
-            let _ = unlink_at(&self.directory, &temporary_name);
-            return Err(error.into());
-        }
+        let contents = self.record_contents(state)?;
+        publish_transaction_record(
+            &self.directory,
+            name,
+            &contents,
+            TransactionInstall::Replace,
+            no_transaction_fault,
+        )?;
         self.state = state;
         Ok(())
+    }
+
+    fn record_contents(&self, state: PublicationState) -> io::Result<String> {
+        let path = self.path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "publication transaction path is not UTF-8",
+            )
+        })?;
+        let destination = self.destination.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "publication destination path is not UTF-8",
+            )
+        })?;
+        Ok(format!(
+            "state={}\npath={path}\ndestination={destination}\n",
+            state.as_str()
+        ))
     }
 
     pub(super) fn complete(mut self) -> Result<(), StorageError> {
@@ -180,7 +282,7 @@ impl RecoveryState {
     pub(super) fn required(&self) -> Result<bool, StorageError> {
         Ok(!self.marker_exists(OsStr::new(".narjar-clean"))?
             || self.marker_exists(OsStr::new(".narjar-recovery"))?
-            || !self.transaction_names()?.is_empty())
+            || !self.transaction_entries()?.is_empty())
     }
 
     pub(super) fn required_for(&self) -> Result<bool, StorageError> {
@@ -211,29 +313,25 @@ impl RecoveryState {
                 "publication temporary path is not UTF-8",
             )
         })?;
+        let destination_text = destination.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "publication destination path is not UTF-8",
+            )
+        })?;
+        let contents =
+            format!("state=staging\npath={temporary_path_text}\ndestination={destination_text}\n");
         for _ in 0..128 {
             let sequence = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed);
             let name = OsString::from(format!("publish-{}-{sequence:016x}.txn", process::id()));
-            match open_at(
+            match publish_transaction_record(
                 &self.transactions,
                 &name,
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
+                &contents,
+                TransactionInstall::Create,
+                no_transaction_fault,
             ) {
-                Ok(mut record) => {
-                    record.set_permissions(fs::Permissions::from_mode(0o600))?;
-                    let destination_text = destination.to_str().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "publication destination path is not UTF-8",
-                        )
-                    })?;
-                    write!(
-                        record,
-                        "state=staging\npath={temporary_path_text}\ndestination={destination_text}\n"
-                    )?;
-                    record.sync_all()?;
-                    self.transactions.sync_all()?;
+                Ok(()) => {
                     return Ok(PublicationTransaction {
                         directory: self.transactions.try_clone()?,
                         name: Some(name),
@@ -258,33 +356,46 @@ impl RecoveryState {
         self.create_marker(OsStr::new(".narjar-recovery"))
     }
 
-    fn transaction_names(&self) -> Result<Vec<OsString>, StorageError> {
-        let names = read_dir_names(&self.transactions)?;
-        for name in &names {
-            let record = open_regular_at(&self.transactions, name)?;
-            if record.metadata()?.permissions().mode() & 0o133 != 0 {
+    fn transaction_entries(&self) -> Result<Vec<TransactionEntry>, StorageError> {
+        let entries = read_dir_names(&self.transactions)?
+            .into_iter()
+            .map(TransactionEntry::parse)
+            .collect::<io::Result<Vec<_>>>()?;
+        for entry in &entries {
+            let mode = entry_mode_at(&self.transactions, entry.name())?;
+            if mode & libc::S_IFMT != libc::S_IFREG || mode & 0o133 != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "publication transaction has unsafe permissions",
+                    "publication transaction entry has unsafe type or permissions",
                 )
                 .into());
             }
+            if let TransactionEntry::Record(name) = entry {
+                open_regular_at(&self.transactions, name)?;
+            }
         }
-        Ok(names)
+        Ok(entries)
     }
 
     fn clear_transactions(&self) -> Result<(), StorageError> {
-        for name in self.transaction_names()? {
-            let record = open_regular_at(&self.transactions, &name)?;
-            let mut contents = Vec::new();
-            record
-                .take(MAX_TRANSACTION_BYTES + 1)
-                .read_to_end(&mut contents)?;
-            let transaction = parse_transaction(&contents)?;
-            self.recover_transaction(transaction)?;
-            unlink_at(&self.transactions, &name)?;
+        for entry in self.transaction_entries()? {
+            match entry {
+                TransactionEntry::Draft(name) => unlink_at(&self.transactions, &name)?,
+                TransactionEntry::Record(name) => self.recover_named_transaction(&name)?,
+            }
         }
         self.transactions.sync_all()?;
+        Ok(())
+    }
+
+    fn recover_named_transaction(&self, name: &OsStr) -> Result<(), StorageError> {
+        let record = open_regular_at(&self.transactions, name)?;
+        let mut contents = Vec::new();
+        record
+            .take(MAX_TRANSACTION_BYTES + 1)
+            .read_to_end(&mut contents)?;
+        self.recover_transaction(parse_transaction(&contents)?)?;
+        unlink_at(&self.transactions, name)?;
         Ok(())
     }
 
@@ -450,6 +561,78 @@ fn rename_at(
     }
 }
 
+fn publish_transaction_record(
+    directory: &File,
+    name: &OsStr,
+    contents: &str,
+    installation: TransactionInstall,
+    fault: impl FnMut(TransactionRecordBoundary) -> io::Result<()>,
+) -> io::Result<()> {
+    publish_transaction_record_with_operations(
+        directory,
+        name,
+        contents,
+        installation,
+        &mut FilesystemTransactionRecordOperations,
+        fault,
+    )
+}
+
+fn publish_transaction_record_with_operations(
+    directory: &File,
+    name: &OsStr,
+    contents: &str,
+    installation: TransactionInstall,
+    operations: &mut impl TransactionRecordOperations,
+    mut fault: impl FnMut(TransactionRecordBoundary) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut draft_name = name.to_os_string();
+    draft_name.push(format!(
+        ".next-{:016x}",
+        NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        write_transaction_draft(directory, &draft_name, contents, operations, &mut fault)?;
+        operations.install_record(directory, &draft_name, name, installation)?;
+        fault(TransactionRecordBoundary::RecordInstalled)?;
+        operations.sync_directory(directory)?;
+        fault(TransactionRecordBoundary::DirectorySynchronized)
+    })();
+    if result.is_err() {
+        let _ = unlink_at(directory, &draft_name);
+    }
+    result
+}
+
+fn write_transaction_draft(
+    directory: &File,
+    name: &OsStr,
+    contents: &str,
+    operations: &mut impl TransactionRecordOperations,
+    fault: &mut impl FnMut(TransactionRecordBoundary) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut draft = open_at(
+        directory,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )?;
+    fault(TransactionRecordBoundary::DraftCreated)?;
+    draft.set_permissions(fs::Permissions::from_mode(0o600))?;
+    draft.write_all(contents.as_bytes())?;
+    fault(TransactionRecordBoundary::DraftWritten)?;
+    operations.sync_draft(&draft)?;
+    fault(TransactionRecordBoundary::DraftSynchronized)
+}
+
+fn no_transaction_fault(_: TransactionRecordBoundary) -> io::Result<()> {
+    Ok(())
+}
+
+fn invalid_transaction_filename(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
 enum TransactionRecord {
     Legacy {
         temporary: TemporaryPath,
@@ -562,4 +745,209 @@ fn trusted_keys_digest(root: &File) -> Result<[u8; 32], StorageError> {
         Err(error) => return Err(error.into()),
     };
     Ok(Sha256::digest(contents).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, fs::File, io, path::PathBuf};
+
+    use tempfile::TempDir;
+
+    use super::{
+        FilesystemTransactionRecordOperations, TransactionInstall, TransactionRecordBoundary,
+        TransactionRecordOperation, TransactionRecordOperations, no_transaction_fault,
+        parse_transaction, publish_transaction_record, publish_transaction_record_with_operations,
+    };
+
+    const TRANSACTION_NAME: &str = "publish-123-0000000000000001.txn";
+    const OLD_RECORD: &str = "state=staging\npath=.tmp/item.part\ndestination=item\n";
+    const NEW_RECORD: &str = "state=streaming\npath=.tmp/item.part\ndestination=item\n";
+
+    #[test]
+    fn record_publication_failures_leave_only_complete_authoritative_records() {
+        for installation in [TransactionInstall::Create, TransactionInstall::Replace] {
+            for boundary in [
+                TransactionRecordBoundary::DraftCreated,
+                TransactionRecordBoundary::DraftWritten,
+                TransactionRecordBoundary::DraftSynchronized,
+                TransactionRecordBoundary::RecordInstalled,
+                TransactionRecordBoundary::DirectorySynchronized,
+            ] {
+                assert_failure_preserves_a_complete_record(installation, boundary);
+            }
+        }
+    }
+
+    #[test]
+    fn initial_record_collision_preserves_the_existing_record_and_removes_its_draft() {
+        let (_temporary_root, directory_path, directory) = transaction_directory();
+        let name = std::ffi::OsStr::new(TRANSACTION_NAME);
+        publish_transaction_record(
+            &directory,
+            name,
+            OLD_RECORD,
+            TransactionInstall::Create,
+            no_transaction_fault,
+        )
+        .expect("install initial record");
+
+        let error = publish_transaction_record(
+            &directory,
+            name,
+            NEW_RECORD,
+            TransactionInstall::Create,
+            no_transaction_fault,
+        )
+        .expect_err("initial install must not replace an existing record");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(directory_path.join(TRANSACTION_NAME)).expect("read original record"),
+            OLD_RECORD.as_bytes(),
+            "the collision leaves the existing authoritative record intact"
+        );
+        assert!(
+            fs::read_dir(&directory_path)
+                .expect("read transaction directory")
+                .all(|entry| entry
+                    .expect("read transaction entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".txn")),
+            "the failed install removes its temporary draft"
+        );
+    }
+
+    #[test]
+    fn initial_record_syncs_complete_draft_before_install_and_directory_afterward() {
+        let (_temporary_root, _directory_path, directory) = transaction_directory();
+        let mut operations = RecordingTransactionRecordOperations::default();
+        publish_transaction_record_with_operations(
+            &directory,
+            std::ffi::OsStr::new(TRANSACTION_NAME),
+            OLD_RECORD,
+            TransactionInstall::Create,
+            &mut operations,
+            no_transaction_fault,
+        )
+        .expect("publish initial transaction");
+
+        assert_eq!(
+            operations.observed,
+            [
+                TransactionRecordOperation::SyncDraft,
+                TransactionRecordOperation::InstallRecord(TransactionInstall::Create),
+                TransactionRecordOperation::SyncDirectory,
+            ]
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingTransactionRecordOperations {
+        observed: Vec<TransactionRecordOperation>,
+    }
+
+    impl TransactionRecordOperations for RecordingTransactionRecordOperations {
+        fn sync_draft(&mut self, draft: &File) -> io::Result<()> {
+            self.observed.push(TransactionRecordOperation::SyncDraft);
+            FilesystemTransactionRecordOperations.sync_draft(draft)
+        }
+
+        fn install_record(
+            &mut self,
+            directory: &File,
+            draft_name: &std::ffi::OsStr,
+            record_name: &std::ffi::OsStr,
+            installation: TransactionInstall,
+        ) -> io::Result<()> {
+            self.observed
+                .push(TransactionRecordOperation::InstallRecord(installation));
+            FilesystemTransactionRecordOperations.install_record(
+                directory,
+                draft_name,
+                record_name,
+                installation,
+            )
+        }
+
+        fn sync_directory(&mut self, directory: &File) -> io::Result<()> {
+            self.observed
+                .push(TransactionRecordOperation::SyncDirectory);
+            FilesystemTransactionRecordOperations.sync_directory(directory)
+        }
+    }
+
+    fn assert_failure_preserves_a_complete_record(
+        installation: TransactionInstall,
+        failing_boundary: TransactionRecordBoundary,
+    ) {
+        let (_temporary_root, directory_path, directory) = transaction_directory();
+        let record_name = std::ffi::OsStr::new(TRANSACTION_NAME);
+        if installation == TransactionInstall::Replace {
+            publish_transaction_record(
+                &directory,
+                record_name,
+                OLD_RECORD,
+                TransactionInstall::Create,
+                no_transaction_fault,
+            )
+            .expect("install initial record");
+        }
+
+        let result = publish_transaction_record(
+            &directory,
+            record_name,
+            NEW_RECORD,
+            installation,
+            |boundary| {
+                if boundary == failing_boundary {
+                    Err(io::Error::other("injected transaction-record failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err(), "{failing_boundary:?} must fail");
+
+        let expected_record = match (installation, failing_boundary) {
+            (TransactionInstall::Create, TransactionRecordBoundary::RecordInstalled)
+            | (TransactionInstall::Create, TransactionRecordBoundary::DirectorySynchronized)
+            | (TransactionInstall::Replace, TransactionRecordBoundary::RecordInstalled)
+            | (TransactionInstall::Replace, TransactionRecordBoundary::DirectorySynchronized) => {
+                Some(NEW_RECORD)
+            }
+            (TransactionInstall::Create, _) => None,
+            (TransactionInstall::Replace, _) => Some(OLD_RECORD),
+        };
+        match expected_record {
+            Some(expected) => {
+                let contents = fs::read(directory_path.join(TRANSACTION_NAME))
+                    .expect("complete authoritative record remains");
+                assert_eq!(contents, expected.as_bytes());
+                assert!(parse_transaction(&contents).is_ok());
+            }
+            None => assert!(
+                !directory_path.join(TRANSACTION_NAME).exists(),
+                "failed initial creation leaves no authoritative record"
+            ),
+        }
+        assert!(
+            fs::read_dir(&directory_path)
+                .expect("read transaction directory")
+                .all(|entry| entry
+                    .expect("read transaction entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".txn")),
+            "returned errors clean temporary draft files"
+        );
+    }
+
+    fn transaction_directory() -> (TempDir, PathBuf, File) {
+        let root = tempfile::tempdir().expect("create temporary root");
+        let path = root.path().join("transactions");
+        fs::create_dir(&path).expect("create transaction directory");
+        let directory = File::open(&path).expect("open transaction directory");
+        (root, path, directory)
+    }
 }
