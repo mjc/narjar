@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+if [[ -n ${NARJAR_OCI_PODMAN_LIBRARY:-} ]]; then
+  # Packaged Nix app stores the helper separately from this generated script.
+  # shellcheck disable=SC1090,SC1091
+  source "$NARJAR_OCI_PODMAN_LIBRARY"
+else
+  # shellcheck disable=SC1091
+  source "$script_directory/oci-e2e-podman.sh"
+fi
+
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
@@ -35,30 +45,18 @@ expect_failure() {
 image_archive=${NARJAR_OCI_ARCHIVE:?NARJAR_OCI_ARCHIVE must point to an OCI archive}
 image=narjar:latest
 temp_root=$(mktemp -d "${TMPDIR:-/tmp}/narjar-oci-e2e.XXXXXX")
-export HOME="$temp_root"
-config_home="$temp_root/.config"
-run mkdir -p "$config_home/containers"
-printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' >"$config_home/containers/policy.json"
-export XDG_CONFIG_HOME="$config_home"
-export CONTAINERS_POLICY="$config_home/containers/policy.json"
+configure_private_podman_roots "$temp_root"
 volume=narjar-oci-e2e-${RANDOM}-${RANDOM}
 empty_volume=narjar-oci-empty-${RANDOM}-${RANDOM}
 container_name=narjar-oci-e2e-${RANDOM}
 readonly_name=narjar-oci-readonly-${RANDOM}
-container_id=
-readonly_id=
 server_url=
 netrc="$temp_root/netrc"
 secret_key_file="$temp_root/cache-secret-key"
 public_key_file="$temp_root/cache-public-key"
 
 cleanup() {
-  set +e
-  [[ -n "$container_id" ]] && podman rm --force "$container_name" >/dev/null 2>&1
-  [[ -n "$readonly_id" ]] && podman rm --force "$readonly_name" >/dev/null 2>&1
-  podman volume rm --force "$volume" "$empty_volume" >/dev/null 2>&1
-  podman system reset --force >/dev/null 2>&1
-  rm -rf -- "$temp_root"
+  cleanup_podman_e2e "$temp_root" "$container_name" "$readonly_name" "$volume" "$empty_volume"
 }
 trap cleanup EXIT
 
@@ -97,15 +95,9 @@ run chmod 0600 "$netrc"
 
 start_server() {
   local name=$1
-  local id
-  id=$(capture podman run --detach --name "$name" --read-only --cap-drop=ALL \
+  capture podman run --detach --name "$name" --read-only --cap-drop=ALL \
     --security-opt=no-new-privileges --user 65532:65532 --publish 127.0.0.1::5000 \
-    --mount "type=volume,source=$volume,destination=/var/lib/narjar" --tmpfs /tmp "$image")
-  if [[ "$name" == "$container_name" ]]; then
-    container_id=$id
-  else
-    readonly_id=$id
-  fi
+    --mount "type=volume,source=$volume,destination=/var/lib/narjar" --tmpfs /tmp "$image" >/dev/null
 
   local port=
   local status=
@@ -123,7 +115,7 @@ start_server() {
     sleep 0.1
   done
 
-  timeout 3 podman start --attach "$name" >&2 || true
+  podman_with_timeout 3 start --attach "$name" >&2 || true
   podman inspect --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' "$name" >&2 || true
   podman logs "$name" >&2 || true
   fail "$name did not become reachable (state=$status)"
@@ -160,7 +152,6 @@ run nix copy --refresh --option require-sigs true --option trusted-public-keys "
 cmp "$path" "$destination${path}" || fail "substituted path differs from pushed content"
 
 run podman rm --force "$container_name"
-container_id=
 start_server "$container_name"
 restart_destination="$temp_root/restarted"
 run nix copy --refresh --option require-sigs true --option trusted-public-keys "$public_key" \
@@ -180,9 +171,9 @@ expect_failure podman run --rm --read-only --cap-drop=ALL --security-opt=no-new-
   --user 65532:65532 --mount "type=bind,source=$wrong_owner,destination=/var/lib/narjar" \
   --tmpfs /tmp "$image" init --data-dir /var/lib/narjar
 
-readonly_id=$(capture podman run --detach --name "$readonly_name" --read-only --cap-drop=ALL \
+capture podman run --detach --name "$readonly_name" --read-only --cap-drop=ALL \
   --security-opt=no-new-privileges --user 65532:65532 --publish 127.0.0.1::5000 \
-  --mount "type=volume,source=$volume,destination=/var/lib/narjar,ro" --tmpfs /tmp "$image")
+  --mount "type=volume,source=$volume,destination=/var/lib/narjar,ro" --tmpfs /tmp "$image" >/dev/null
 readonly_port=
 readonly_ready=0
 for _ in $(seq 1 100); do
@@ -200,7 +191,6 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 run podman rm --force "$readonly_name" >/dev/null
-readonly_id=
 (( readonly_ready == 1 )) || fail "read-only DATA did not report an unavailable destination"
 
 printf 'PASS OCI image, uid 65532, read-only root, capability drop, init, persistent volume, real-Nix push/substitute, recreate, empty-data, wrong-owner, and read-only-data verification\n'

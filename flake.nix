@@ -167,6 +167,7 @@
             ];
             text = ''
               export NARJAR_OCI_ARCHIVE=${ociImage}
+              export NARJAR_OCI_PODMAN_LIBRARY=${./tests/oci-e2e-podman.sh}
               ${builtins.readFile ./tests/oci-e2e.sh}
             '';
           };
@@ -410,6 +411,14 @@
             ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/virtual-nar-segments.sh
             touch $out
           '';
+          oci-e2e-isolation = env.pkgs.runCommand "narjar-oci-e2e-isolation"
+            {
+              nativeBuildInputs = [ env.pkgs.bash env.pkgs.coreutils env.pkgs.gnugrep ];
+            }
+            ''
+            ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/oci-e2e-isolation.sh
+            touch $out
+          '';
           publication-lock-benchmark = env.pkgs.runCommand "narjar-publication-lock-benchmark" { } ''
             ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/publication-lock-benchmark.sh
             touch $out
@@ -454,6 +463,7 @@
             fuzzTargetCheck
             semantic-descriptor
             virtual-nar-segments
+            oci-e2e-isolation
             publication-lock-benchmark
             runtime-smoke
             runtime-closure
