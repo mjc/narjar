@@ -30,38 +30,70 @@ nix run github:mjc/narjar -- --help
 
 ## Create a cache
 
-Run these commands in a working directory where you want to keep the cache and
-its credentials. The signing key stays outside the cache directory.
+Use `narjar setup` for a standalone first run. It initializes the cache,
+generates a producer key pair and write token, installs the public key in the
+cache, writes a private netrc file, and prints the server and push commands.
+The data and credentials directories must not already exist; their parent
+directories must exist.
 
 ```sh
-umask 077
-
-narjar init --data-dir ./cache
-
-narjar key generate \
-  --name local-producer \
-  --secret-key-file ./producer.sec \
-  --public-key-file ./producer.pub
-
-cp ./producer.pub ./cache/trusted-public-keys
-
-narjar token create \
+narjar setup \
   --data-dir ./cache \
-  --scope write \
-  --name local > ./write.token
-
-printf 'machine 127.0.0.1 login narjar password %s\n' \
-  "$(cat ./write.token)" > ./narjar.netrc
-
-narjar serve --data-dir ./cache --listen 127.0.0.1:5000
+  --credentials-dir ./credentials \
+  --cache-url http://127.0.0.1:5000 \
+  --listen 127.0.0.1:5000
 ```
 
-Reads are public by default; writes require a token. Use `init --private-read`
-and create a read-scoped token to require authentication for reads too.
+In a terminal, setup asks before creating files. Use `--yes` with explicit
+options in scripts. Defaults are `./narjar-data`, `./narjar-credentials`,
+`http://127.0.0.1:5000`, and `127.0.0.1:5000`. Use `--private-read` to create a
+read token as well as the write token. The private signing key, tokens, and
+netrc are stored outside the cache directory with mode `0600`; the credentials
+directory has mode `0700`. Setup does not start the server.
+Keep the credentials directory out of source control and protect its backups.
+The generated netrc is for writes; with `--private-read`, configure consumers
+with the separate `read.token` value.
 
 Narjar speaks HTTP. For remote access, run it behind a TLS reverse proxy and
 use an HTTPS cache URL. The server verifies metadata with the public keys in
-`trusted-public-keys`; the uploader holds the signing key.
+`trusted-public-keys`; the uploader holds `producer.sec`. Setup prints the
+commands to start the server and push a store path. It never prints a secret.
+
+## NixOS service
+
+The NixOS module initializes the data directory before service startup, installs
+credential files from host paths, and configures the server through native
+options. Secret files must be supplied by a secret manager or another path
+outside the Nix store.
+
+```nix
+services.narjar = {
+  enable = true;
+  dataDir = "/var/lib/narjar";
+  listen = "0.0.0.0:5000";
+  egressCompression = "zstd";
+  storageBackend = "flat";
+  auth = {
+    writeTokens = "/run/secrets/narjar-write.tokens";
+    trustedPublicKeys = "/run/secrets/narjar-trusted-public-keys";
+  };
+};
+```
+
+`writeTokens` is a Narjar token-hash file, and `trustedPublicKeys` contains the
+cache signing public keys. Set `privateRead = true` and `auth.readTokens` to
+require read authentication. The module also exposes `cachePriority`,
+`dynamicUser`, `workers`, `maxInFlight`, `maxNarBytes`, `minFreeBytes`,
+`shutdownGraceSeconds`, `ioTimeoutSeconds`, `statsInventory`,
+`statsInventoryIntervalSeconds`, `statsFilesystemSample`, and
+`statsZfsDataset`. Scheduled collection is configured under `gc` with
+`enable`, `schedule`, `maxBytes`, `targetBytes`, `maxAgeSeconds`,
+`minAgeSeconds`, and `protectedRoots`. Initialization, serving, and collection
+use the selected `storageBackend` consistently.
+
+Use `narjar setup` for standalone installs. For NixOS, the module owns service
+lifecycle and data-directory initialization; provide only the credential
+files and settings the deployment needs.
 
 ## Push a closure
 
@@ -73,9 +105,9 @@ store_path=$(nix build --no-link --print-out-paths nixpkgs#hello)
 
 narjar push \
   --to http://127.0.0.1:5000 \
-  --netrc-file ./narjar.netrc \
+  --netrc-file ./credentials/narjar.netrc \
   --insecure-http \
-  --signing-key-file ./producer.sec \
+  --signing-key-file ./credentials/producer.sec \
   --compression zstd \
   --jobs 8 \
   "$store_path"

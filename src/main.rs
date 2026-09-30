@@ -4,6 +4,7 @@ mod http_url;
 mod operator;
 mod push;
 mod server;
+mod setup;
 mod token;
 
 use std::process::ExitCode;
@@ -23,6 +24,7 @@ struct Cli {
 enum Command {
     Serve(ServeArgs),
     Init(operator::Init),
+    Setup(setup::Setup),
     Key(operator::Key),
     Reconcile(operator::Reconcile),
     Cleanup(operator::Cleanup),
@@ -57,6 +59,7 @@ fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
         Command::Serve(args) => server::serve(ServeConfig::from(args)),
         Command::Init(args) => operator::init(args),
+        Command::Setup(args) => setup::run(args),
         Command::Key(args) => operator::key(args),
         Command::Reconcile(args) => operator::reconcile(args),
         Command::Cleanup(args) => operator::cleanup(args),

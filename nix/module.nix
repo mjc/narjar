@@ -17,6 +17,12 @@
     else cfg.dataDir;
   zfsSampleDirectory = "/run/narjar-zfs-stats";
   zfsSampleFile = "${zfsSampleDirectory}/sample.json";
+  filesystemSampleFile =
+    if cfg.statsFilesystemSample != null
+    then cfg.statsFilesystemSample
+    else if cfg.statsZfsDataset != null
+    then zfsSampleFile
+    else null;
   fixedPaths = [
     runtimeDataDir
     "${runtimeDataDir}/nar"
@@ -103,7 +109,7 @@
   preStartBody = ''
     test ! -L ${lib.escapeShellArg runtimeDataDir}
     if [ ! -e ${lib.escapeShellArg "${runtimeDataDir}/nix-cache-info"} ]; then
-      ${executable} init --data-dir ${lib.escapeShellArg runtimeDataDir}
+      ${executable} ${initArgs}
     fi
     ${validateFixedPaths}
     ${lib.optionalString (cfg.auth.readTokens == null) ''
@@ -122,6 +128,18 @@
     ${chownOptionalFixedPaths}
   '';
   privilegedPreStart = pkgs.writeShellScript "narjar-pre-start" privilegedPreStartScript;
+  initArgs = lib.escapeShellArgs (
+    [
+      "init"
+      "--data-dir"
+      runtimeDataDir
+      "--priority"
+      (toString cfg.cachePriority)
+      "--storage-backend"
+      cfg.storageBackend
+    ]
+    ++ lib.optionals cfg.privateRead ["--private-read"]
+  );
   serveArgs = lib.escapeShellArgs (
     [
       "serve"
@@ -139,14 +157,20 @@
       (toString cfg.minFreeBytes)
       "--shutdown-grace-seconds"
       (toString cfg.shutdownGraceSeconds)
+      "--io-timeout-seconds"
+      (toString cfg.ioTimeoutSeconds)
+      "--egress-compression"
+      cfg.egressCompression
+      "--storage-backend"
+      cfg.storageBackend
     ]
       ++ lib.optionals cfg.statsInventory [
         "--stats-inventory-interval-seconds"
         (toString cfg.statsInventoryIntervalSeconds)
       ]
-      ++ lib.optionals (cfg.statsZfsDataset != null) [
+      ++ lib.optionals (filesystemSampleFile != null) [
         "--stats-filesystem-sample"
-        zfsSampleFile
+        filesystemSampleFile
       ]
   );
   zfsProperties = [
@@ -232,6 +256,8 @@
       "--data-dir"
       runtimeDataDir
       "--apply"
+      "--storage-backend"
+      cfg.storageBackend
     ]
     ++ lib.optionals (cfg.gc.maxBytes != null) [
       "--max-bytes"
@@ -277,6 +303,18 @@ in {
       description = "Run with a transient user and systemd-managed state storage.";
     };
 
+    cachePriority = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 30;
+      description = "Nix binary-cache priority written during first-run initialization.";
+    };
+
+    privateRead = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Require read credentials by initializing the cache with private reads.";
+    };
+
     listen = lib.mkOption {
       type = lib.types.str;
       default = "127.0.0.1:5000";
@@ -308,6 +346,24 @@ in {
       default = 30;
     };
 
+    ioTimeoutSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 30;
+      description = "Per-connection I/O timeout passed to narjar serve.";
+    };
+
+    egressCompression = lib.mkOption {
+      type = lib.types.enum ["none" "zstd" "xz"];
+      default = "none";
+      description = "NAR representation advertised to Nix clients.";
+    };
+
+    storageBackend = lib.mkOption {
+      type = lib.types.enum ["flat" "chunked"];
+      default = "flat";
+      description = "Payload storage layout used by initialization, serving, and maintenance.";
+    };
+
     statsInventory = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -324,6 +380,12 @@ in {
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = "Optional ZFS dataset mounted directly at dataDir; enables a bounded one-minute read-only usage sample.";
+    };
+
+    statsFilesystemSample = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Optional externally maintained filesystem sample JSON file passed to narjar serve.";
     };
 
     gc = {
@@ -405,6 +467,14 @@ in {
       {
         assertion = cfg.statsZfsDataset == null || cfg.statsZfsDataset != "";
         message = "services.narjar.statsZfsDataset must be null or a non-empty ZFS dataset name";
+      }
+      {
+        assertion = cfg.statsFilesystemSample == null || cfg.statsZfsDataset == null;
+        message = "services.narjar.statsFilesystemSample and statsZfsDataset are mutually exclusive";
+      }
+      {
+        assertion = !cfg.privateRead || cfg.auth.readTokens != null;
+        message = "services.narjar.privateRead requires services.narjar.auth.readTokens";
       }
     ];
 

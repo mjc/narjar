@@ -1,11 +1,11 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     mem::MaybeUninit,
     num::NonZeroUsize,
     os::{
         fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::fs::{MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -30,7 +30,7 @@ use ureq::Agent;
 use crate::{error::Error, http_url::HttpUrl};
 
 mod lifecycle;
-pub(crate) use lifecycle::{Init, Key, init, key};
+pub(crate) use lifecycle::{Init, Key, generate_key_pair, init, key};
 
 #[derive(Args)]
 pub(crate) struct Reconcile {
@@ -1064,40 +1064,30 @@ fn netrc_authorization_from_str(text: &str, host: &str) -> Result<String, Error>
     Ok(BASE64.encode(format!("{login}:{password}").as_bytes()))
 }
 
-fn create_file(path: &Path, bytes: &[u8], mode: u32, preserve_existing: bool) -> Result<(), Error> {
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-    {
-        Ok(mut file) => {
-            file.write_all(bytes).map_err(runtime)?;
-            file.sync_all().map_err(runtime)?;
+pub(crate) fn create_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    preserve_existing: bool,
+) -> Result<(), Error> {
+    let mut temporary = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .expect("Narjar managed files always have a parent directory"),
+    )
+    .map_err(runtime)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(runtime)?;
+    temporary.write_all(bytes).map_err(runtime)?;
+    temporary.as_file().sync_all().map_err(runtime)?;
+
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_existing_managed_file(path, bytes, mode, preserve_existing)?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(path).map_err(runtime)?;
-            if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != mode {
-                return Err(Error::runtime(format!(
-                    "initialization entry is not a regular {:o} file: {}",
-                    mode,
-                    path.display()
-                )));
-            }
-            if !preserve_existing {
-                let existing = fs::read(path).map_err(runtime)?;
-                if existing != bytes {
-                    return Err(Error::runtime(format!(
-                        "initialization file differs from requested configuration: {}",
-                        path.display()
-                    )));
-                }
-            }
-            File::open(path)
-                .and_then(|file| file.sync_all())
-                .map_err(runtime)?;
-        }
-        Err(error) => return Err(runtime(error)),
+        Err(error) => return Err(runtime(error.error)),
     }
     if let Some(parent) = path.parent() {
         File::open(parent)
@@ -1107,7 +1097,32 @@ fn create_file(path: &Path, bytes: &[u8], mode: u32, preserve_existing: bool) ->
     Ok(())
 }
 
-fn valid_key_name(value: &str) -> Result<String, String> {
+fn validate_existing_managed_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    preserve_existing: bool,
+) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(path).map_err(runtime)?;
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != mode {
+        return Err(Error::runtime(format!(
+            "initialization entry is not a regular {:o} file: {}",
+            mode,
+            path.display()
+        )));
+    }
+    if !preserve_existing && fs::read(path).map_err(runtime)? != bytes {
+        return Err(Error::runtime(format!(
+            "initialization file differs from requested configuration: {}",
+            path.display()
+        )));
+    }
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(runtime)
+}
+
+pub(crate) fn valid_key_name(value: &str) -> Result<String, String> {
     (!value.is_empty()
         && value.len() <= 64
         && value
@@ -1176,6 +1191,27 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use narjar::maintenance::{Operation, Outcome};
+
+    #[test]
+    fn managed_file_conflict_never_replaces_existing_contents_or_leaves_temps() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("credential");
+        create_file(&path, b"original", 0o600, false).expect("initial file should be created");
+
+        assert!(create_file(&path, b"replacement", 0o600, false).is_err());
+
+        assert_eq!(
+            fs::read(path).expect("original file should remain"),
+            b"original"
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("directory should be readable")
+                .count(),
+            1,
+            "the abandoned atomic-write temporary should be removed"
+        );
+    }
 
     #[test]
     fn netrc_entry_does_not_borrow_password_from_next_machine() {
