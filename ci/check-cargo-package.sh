@@ -58,3 +58,22 @@ cd "target/package/narjar-${crate_version}"
 
 cargo check --locked --all-targets
 cargo nextest run --locked
+
+consumer_install_root="$PWD/consumer-install"
+cargo install --force --locked --offline --path . --root "$consumer_install_root"
+
+consumer_binary="$consumer_install_root/bin/narjar"
+help_output=$("$consumer_binary" --help)
+if [[ "$help_output" != *"Usage: narjar <COMMAND>"* ]]; then
+  printf 'installed consumer binary returned unexpected --help output:\n%s\n' \
+    "$help_output" >&2
+  exit 1
+fi
+
+version_output=$("$consumer_binary" --version)
+expected_version="narjar ${crate_version}"
+if [[ "$version_output" != "$expected_version" ]]; then
+  printf 'installed consumer binary reported %q; expected %q\n' \
+    "$version_output" "$expected_version" >&2
+  exit 1
+fi
