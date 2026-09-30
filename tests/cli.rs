@@ -50,7 +50,7 @@ fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
     signed_narinfo_for(STORE_HASH, nar_hash, nar_size)
 }
 
-fn read_http_response(stream: &mut impl BufRead) -> Vec<u8> {
+fn read_http_response_headers(stream: &mut impl BufRead) -> Vec<u8> {
     let mut headers = Vec::new();
     loop {
         let mut line = Vec::new();
@@ -63,6 +63,11 @@ fn read_http_response(stream: &mut impl BufRead) -> Vec<u8> {
             break;
         }
     }
+    headers
+}
+
+fn read_http_response(stream: &mut impl BufRead) -> Vec<u8> {
+    let headers = read_http_response_headers(stream);
     let header_text = std::str::from_utf8(&headers).expect("response headers should be UTF-8");
     let content_length = header_text
         .lines()
@@ -3166,7 +3171,7 @@ fn read_routes_distinguish_bad_methods_names_and_unsupported_surfaces() {
 }
 
 #[test]
-fn nar_reads_survive_unlink_and_aborted_slow_clients_without_exposing_temps() {
+fn nar_reads_survive_unlink_without_exposing_temps() {
     let server = RunningServer::start("nar-read-races");
     let nar_bytes = vec![0x5a; 128 * 1024];
     let nar_hash = nix32_sha256(&nar_bytes);
@@ -3226,31 +3231,71 @@ fn nar_reads_survive_unlink_and_aborted_slow_clients_without_exposing_temps() {
         assert!(!headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
     }
 
-    let sparse = fs::File::create(&nar_path).expect("create sparse NAR");
-    let sparse_length = 64_u64 * 1024 * 1024;
-    sparse.set_len(sparse_length).expect("size sparse NAR");
-    drop(sparse);
+    let (signal, status) = server.stop();
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
 
+#[test]
+fn nar_reads_reject_content_that_does_not_match_its_filename() {
+    let server = RunningServer::start("nar-read-hash-mismatch");
+    let path = format!("/nar/{NARJAR_HASH}.nar");
+    fs::write(server.data_dir.join(&path[1..]), b"wrong!")
+        .expect("write same-size corrupt NAR fixture");
+
+    for method in ["HEAD", "GET"] {
+        let response = server.request(method, &path);
+        let (headers, body) = response_parts(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "{headers:?}"
+        );
+        assert!(body.is_empty());
+    }
+    let (signal, status) = server.stop();
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
+#[test]
+fn nar_reads_release_the_worker_after_a_client_aborts_a_valid_transfer() {
+    let server = RunningServer::start("nar-read-client-abort");
+    let nar_bytes = vec![0; 8 * 1024 * 1024];
+    let path = format!("/nar/{}.nar", nix32_sha256(&nar_bytes));
+    fs::write(server.data_dir.join(&path[1..]), &nar_bytes)
+        .expect("write valid NAR larger than the socket send buffer");
+
+    // Complete validation before testing delivery, not the speed of hashing in
+    // an unoptimized build on a shared runner.
     let head = server.request("HEAD", &path);
     let (head_headers, head_body) = response_parts(&head);
     assert!(
-        head_headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        head_headers.starts_with("HTTP/1.1 200 OK\r\n"),
         "{head_headers:?}"
     );
+    assert!(head_headers.contains(&format!("Content-Length: {}\r\n", nar_bytes.len())));
     assert!(head_body.is_empty());
 
-    let mut aborted = server.open_request("GET", &path, &[]);
+    let aborted = server.open_request("GET", &path, &[]);
     aborted
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
-    let read = aborted
-        .read(&mut chunk)
-        .expect("read initial response bytes");
-    assert_ne!(read, 0, "response should start before abort");
+    let mut aborted = BufReader::new(aborted);
+    let headers = read_http_response_headers(&mut aborted);
+    let headers = std::str::from_utf8(&headers).expect("response headers should be UTF-8");
+    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+    assert!(headers.contains(&format!("Content-Length: {}\r\n", nar_bytes.len())));
     drop(aborted);
 
     let after_abort = server.request("GET", "/nix-cache-info");
     let (after_abort_headers, _) = response_parts(&after_abort);
+    let metrics = server.request("GET", "/metrics");
+    let (_, metrics_body) = response_parts(&metrics);
+    let metrics = std::str::from_utf8(&metrics_body).expect("metrics should be UTF-8");
+    assert!(
+        metrics.contains("narjar_responses_aborted_total 1\n"),
+        "{metrics}"
+    );
     let (signal, status) = server.stop();
 
     assert!(
