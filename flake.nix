@@ -454,6 +454,9 @@
           static-cargo-artifacts = static.cargoArtifacts;
           static-package = static.narjar;
           nixos-module = env.pkgs.testers.runNixOSTest (import ./nix/module-test.nix { inherit self; });
+          nixos-module-static-user = env.pkgs.testers.runNixOSTest (
+            import ./nix/module-static-user-test.nix { inherit self; }
+          );
           oci-archive =
             env.pkgs.runCommand "narjar-oci-archive"
               {
