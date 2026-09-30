@@ -1,7 +1,7 @@
 { pkgs, ... }:
 
 let
-  fuzzToolchain = pkgs.rust-bin.nightly."2026-09-11".default;
+  fuzzToolchain = pkgs.rust-bin.nightly.latest.default;
 in
 {
   languages.rust = {
@@ -16,6 +16,7 @@ in
     sqlite
     curl
     cargo-nextest
+    cargo-audit
     shellcheck
     cargo-fuzz
     # cargo-fuzz requires nightly-only compiler flags. Keep this snapshot
@@ -40,6 +41,7 @@ in
   tasks."check:test".exec = "cargo test --locked";
   tasks."check:corpus".exec = "cargo test --locked --manifest-path scripts/nar-corpus/Cargo.toml --target-dir target";
   tasks."check:nextest".exec = "cargo nextest run --locked";
+  tasks."check:advisories".exec = "bash ci/test-cargo-advisory-output.sh && bash ci/check-cargo-advisories.sh";
   tasks."check:shell".exec = "shellcheck -S error $(find scripts tests -maxdepth 1 -type f -perm -u+x -print)";
   tasks."check:flake".exec = "nix flake check -L --no-update-lock-file";
 

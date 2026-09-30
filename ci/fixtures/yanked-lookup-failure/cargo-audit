@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+case " $* " in
+  *" --file Cargo.lock "*) ;;
+  *)
+    printf '%s\n' 'error: advisory check did not receive the committed Cargo.lock' >&2
+    exit 2
+    ;;
+esac
+
+printf '%s\n' "error: couldn't check if the package is yanked: registry lookup failed"
