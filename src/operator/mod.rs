@@ -1428,6 +1428,7 @@ machine other.example password other-secret
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn init_can_select_the_chunked_storage_backend() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         init(Init {

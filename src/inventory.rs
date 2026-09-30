@@ -716,6 +716,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn chunked_storage_inventory_checks_the_manifest_backed_nar() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();

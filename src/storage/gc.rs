@@ -1308,6 +1308,7 @@ mod tests {
         Storage::initialize(&Directory::open(path)?, StorageBackend::Flat)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn initialize_chunked_storage(path: &Path) -> Result<Storage, StorageError> {
         Storage::initialize(&Directory::open(path)?, StorageBackend::Chunked)
     }
@@ -1632,6 +1633,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn chunked_gc_sweeps_unreferenced_manifests_and_chunks() {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
         let storage =

@@ -317,11 +317,12 @@ fn decode_xz_upload_to_raw_staging<W: Write>(
         UploadCompressedSourceReader::new(input, Rc::clone(&source_error)),
         false,
     );
-    let decoded =
-        copy_decoded_bytes_to_raw_staging(&mut decoder, destination, expectation.max_nar_size)
-            .map_err(|error| {
-                take_upload_source_error(&source_error, compressed_read_error(error))
-            })?;
+    let decoded = copy_decoded_upload_to_raw_staging(
+        &mut decoder,
+        destination,
+        expectation.max_nar_size,
+        &source_error,
+    )?;
     finish_encoded_upload_after_decoding(decoder.into_inner().into_inner(), &source_error)?;
     Ok(decoded)
 }
@@ -339,11 +340,12 @@ fn decode_zstd_upload_to_raw_staging<W: Write>(
         Rc::clone(&source_error),
     ))
     .map_err(|error| take_upload_source_error(&source_error, compressed_decoder_error(error)))?;
-    let decoded =
-        copy_decoded_bytes_to_raw_staging(&mut decoder, destination, expectation.max_nar_size)
-            .map_err(|error| {
-                take_upload_source_error(&source_error, compressed_read_error(error))
-            })?;
+    let decoded = copy_decoded_upload_to_raw_staging(
+        &mut decoder,
+        destination,
+        expectation.max_nar_size,
+        &source_error,
+    )?;
     finish_encoded_upload_after_decoding(decoder.into_inner().into_inner(), &source_error)?;
     Ok(decoded)
 }
@@ -389,6 +391,17 @@ fn copy_decoded_bytes_to_raw_staging<R: Read, W: Write>(
     Ok(output.finish())
 }
 
+fn copy_decoded_upload_to_raw_staging<R: Read, W: Write>(
+    decoder: &mut R,
+    destination: &mut W,
+    max_nar_size: u64,
+    source_error: &RefCell<Option<io::Error>>,
+) -> io::Result<NarIdentity> {
+    let mut normalized_decoder = NormalizeCompressedReadErrors(decoder);
+    copy_decoded_bytes_to_raw_staging(&mut normalized_decoder, destination, max_nar_size)
+        .map_err(|error| take_upload_source_error(source_error, error))
+}
+
 fn finish_encoded_upload_after_decoding<R: Read>(
     input: CheckedUploadReader<R>,
     source_error: &RefCell<Option<io::Error>>,
@@ -401,6 +414,14 @@ fn finish_encoded_upload_after_decoding<R: Read>(
 
 struct StoredCompressedSourceReader<R> {
     inner: R,
+}
+
+struct NormalizeCompressedReadErrors<R>(R);
+
+impl<R: Read> Read for NormalizeCompressedReadErrors<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buffer).map_err(compressed_read_error)
+    }
 }
 
 impl<R> StoredCompressedSourceReader<R> {
@@ -507,7 +528,7 @@ fn compressed_read_error(error: io::Error) -> io::Error {
             || io::Error::new(source.kind(), source.to_string()),
             io::Error::from_raw_os_error,
         )
-    } else if error.kind() == io::ErrorKind::Other {
+    } else if error.kind() == io::ErrorKind::Other || error.kind() == io::ErrorKind::Unsupported {
         io::Error::new(io::ErrorKind::InvalidData, error)
     } else {
         error

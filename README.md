@@ -22,6 +22,8 @@ cargo install --locked --path .
 ```
 
 The repository also provides a Nix package, a NixOS module, and a Linux OCI image.
+The package builds on Linux and macOS. Chunked storage is supported only on
+Linux; macOS must use the flat backend.
 To run the CLI with Nix:
 
 ```sh
@@ -165,7 +167,9 @@ The default `flat` backend stores each canonical, uncompressed NAR as a file.
 The optional `chunked` backend splits NARs into content-defined chunks and
 deduplicates them across objects. Choose it with
 `init --storage-backend chunked`, and pass the same backend to serving and
-maintenance commands.
+maintenance commands. Chunked storage is Linux-only because Narjar has not
+established its crash-durability ordering on macOS; macOS commands reject this
+backend before initialization. The flat backend remains available on macOS.
 
 `push --compression` controls the uploaded representation.
 `serve --egress-compression` controls the representation advertised to Nix

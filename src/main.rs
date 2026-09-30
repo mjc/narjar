@@ -195,6 +195,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn serve_accepts_the_chunked_storage_backend() {
         let cli = Cli::try_parse_from([
             "narjar",
@@ -207,6 +208,24 @@ mod tests {
         .expect("chunked storage backend should parse");
 
         assert!(matches!(cli.command, Command::Serve(_)));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn serve_rejects_the_chunked_storage_backend_on_macos() {
+        let result = Cli::try_parse_from([
+            "narjar",
+            "serve",
+            "--data-dir",
+            "/cache",
+            "--storage-backend",
+            "chunked",
+        ]);
+
+        match result {
+            Err(error) => assert!(error.to_string().contains("not supported on macOS")),
+            Ok(_) => panic!("chunked backend must be rejected on macOS"),
+        }
     }
 
     #[test]
