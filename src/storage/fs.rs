@@ -376,11 +376,23 @@ pub(super) fn open_at(parent: &File, name: &OsStr, flags: i32, mode: u32) -> io:
 }
 
 pub(crate) fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
+    read_dir_names_with(directory, |stream| {
+        // SAFETY: the callback receives the live stream owned by
+        // DirectoryStream.
+        unsafe { libc::readdir(stream) }
+    })
+}
+
+fn read_dir_names_with(
+    directory: &File,
+    read_entry: impl FnMut(*mut libc::DIR) -> *mut libc::dirent,
+) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
-    let _outcome = for_each_dir_name(directory, |name| {
+    let outcome = for_each_dir_name_with(directory, read_entry, |name| {
         names.push(name.to_owned());
         Ok(DirectoryEntryAction::Continue)
     })?;
+    debug_assert_eq!(outcome, DirectoryScanOutcome::Complete);
     Ok(names)
 }
 
@@ -398,15 +410,34 @@ pub(crate) enum DirectoryScanOutcome {
     StoppedEarly,
 }
 
-pub(crate) fn for_each_dir_name<F>(
+pub(crate) fn for_each_dir_name<F>(directory: &File, visit: F) -> io::Result<DirectoryScanOutcome>
+where
+    F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
+{
+    for_each_dir_name_with(
+        directory,
+        |stream| {
+            // SAFETY: the callback receives the live stream owned by
+            // DirectoryStream.
+            unsafe { libc::readdir(stream) }
+        },
+        visit,
+    )
+}
+
+fn for_each_dir_name_with<F>(
     directory: &File,
+    mut read_entry: impl FnMut(*mut libc::DIR) -> *mut libc::dirent,
     mut visit: F,
 ) -> io::Result<DirectoryScanOutcome>
 where
     F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
 {
     let stream = DirectoryStream::open(directory)?;
-    let scan_result = visit_readdir_entries(|| next_readdir_entry(stream.as_ptr()), &mut visit);
+    let scan_result = visit_readdir_entries(
+        || next_readdir_entry_with(|| read_entry(stream.as_ptr())),
+        &mut visit,
+    );
     let close_result = stream.close();
     scan_result.and_then(|outcome| close_result.map(|()| outcome))
 }
@@ -505,10 +536,11 @@ where
     visit(OsStr::from_bytes(name.to_bytes()))
 }
 
-fn next_readdir_entry(stream: *mut libc::DIR) -> io::Result<Option<NonNull<libc::dirent>>> {
+fn next_readdir_entry_with(
+    mut read_entry: impl FnMut() -> *mut libc::dirent,
+) -> io::Result<Option<NonNull<libc::dirent>>> {
     clear_errno();
-    // SAFETY: stream is a live DIR handle and is closed by for_each_dir_name.
-    let entry = unsafe { libc::readdir(stream) };
+    let entry = read_entry();
     if let Some(entry) = NonNull::new(entry) {
         return Ok(Some(entry));
     }
@@ -539,6 +571,20 @@ fn clear_errno() {
 fn clear_errno() {
     // SAFETY: this accesses the current thread's errno slot.
     unsafe { *libc::__error() = 0 };
+}
+
+#[cfg(test)]
+fn set_errno(error_code: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: this sets the current thread's errno slot for a controlled test.
+    unsafe {
+        *libc::__errno_location() = error_code;
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: this sets the current thread's errno slot for a controlled test.
+    unsafe {
+        *libc::__error() = error_code;
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -792,6 +838,16 @@ mod tests {
     }
 
     #[test]
+    fn readdir_eof_clears_errno_left_by_an_unrelated_syscall() {
+        set_errno(libc::EIO);
+
+        let entry = next_readdir_entry_with(std::ptr::null_mut::<libc::dirent>)
+            .expect("EOF must not reuse stale errno as a scan failure");
+
+        assert!(entry.is_none(), "a null result with clear errno is EOF");
+    }
+
+    #[test]
     fn injected_readdir_error_propagates() {
         let result = visit_readdir_entries(
             || Err(io::Error::from_raw_os_error(libc::EIO)),
@@ -804,6 +860,38 @@ mod tests {
                 .raw_os_error(),
             Some(libc::EIO)
         );
+    }
+
+    #[test]
+    fn name_collection_rejects_readdir_error_after_a_real_entry() {
+        let directory_path = tempfile::tempdir().expect("directory should be created");
+        std::fs::write(directory_path.path().join("live.narinfo"), b"metadata")
+            .expect("directory entry should be created");
+        let directory = open_directory(directory_path.path()).expect("directory should open");
+        let mut returned_live_name = false;
+
+        let error = read_dir_names_with(&directory, |stream| {
+            if returned_live_name {
+                set_errno(libc::EIO);
+                return std::ptr::null_mut();
+            }
+            // SAFETY: the callback receives the live stream owned by
+            // DirectoryStream, and the entry is copied before the next read.
+            let entry = unsafe { libc::readdir(stream) };
+            if let Some(entry) = NonNull::new(entry) {
+                // SAFETY: readdir returned a live, NUL-terminated name.
+                let name = unsafe { CStr::from_ptr(entry.as_ref().d_name.as_ptr()) };
+                returned_live_name |= name.to_bytes() == b"live.narinfo";
+            }
+            entry
+        })
+        .expect_err("a partial name list must not be returned as success");
+
+        assert!(
+            returned_live_name,
+            "the real entry must precede the injected error"
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
     }
 
     #[test]
