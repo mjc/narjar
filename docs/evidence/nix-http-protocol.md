@@ -1,7 +1,7 @@
 # Nix HTTP binary-cache protocol evidence
 
-Status: NARJ-2 evidence snapshot. This freezes what was observed, separates it
-from source-derived behavior, and lists the remaining acceptance gaps.
+Status: NARJ-2 evidence snapshot. Captured behavior, source-derived behavior,
+and remaining acceptance gaps are recorded separately.
 
 ## Capture boundary
 

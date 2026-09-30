@@ -1,6 +1,6 @@
 # Gitoxide bounded semantic-object I/O probe
 
-This is the NARJ-93 experiment against the exact graph audited by NARJ-86:
+NARJ-93 tests the exact graph audited by NARJ-86:
 `gix-odb 0.84.0`, `gix-pack 0.74.2`, `gix-object 0.64.1`, `gix-hash 0.26.2`,
 and `gix-features 0.49.1`. The disposable Rust probe is kept outside the
 repository at `/tmp/narjar-gix-probe`; it uses `gix_odb::loose::Store`
@@ -73,9 +73,8 @@ prototype would need bounded chunks, an explicit EOF/length wrapper, a strict
 process concurrency budget, caller-side expected-OID validation, and separate
 tests for packed/delta objects. The current evidence does not justify adding
 gix to Narjar or treating its per-object allocation limit as a process-wide
-memory limit. The result is therefore **no gix for whole-file hot I/O**;
-bounded chunks remain a separately authorized prototype, not an accepted
-configuration.
+memory limit. Bounded chunks remain a separately authorized prototype, not an
+accepted configuration.
 
 Raw probe outputs and the exact commands are summarized in
 [`docs/evidence/gix-bounded-io.tsv`](evidence/gix-bounded-io.tsv). The existing

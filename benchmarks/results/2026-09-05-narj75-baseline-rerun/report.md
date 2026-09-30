@@ -1,5 +1,11 @@
 # Continuation benchmark
 
+> **Superseded:** this run is not decision evidence. The harness accepted
+> `--warmups 3` but executed only one warmup per scenario, and `commands.txt`
+> was reconstructed rather than emitted by the command wrappers. Use the
+> [corrected baseline decision](../2026-09-05-narj75-baseline-corrected/decision.md)
+> instead. The measurements below are retained only as historical raw evidence.
+
 - bincache ref: `556a9c8f97a3c994a9de85f567a2ef16ce6513ab`
 - repetitions: 15
 - random seed: 29030

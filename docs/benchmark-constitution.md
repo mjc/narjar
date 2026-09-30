@@ -10,6 +10,11 @@ The machine-readable thresholds are in
 results must not alter this file; a changed constitution gets a new version,
 reason, and review before measurement.
 
+Scope: frozen NARJ-75 experiment gates. The Rust 1.85 dependency requirement
+below belongs to version 4 of this research constitution. The current package
+requires Rust 1.98, as declared in [Cargo.toml](../Cargo.toml). The frozen
+thresholds are unchanged.
+
 The comparison is the current Narjar binary against a matched raw-NAR cache
 using transparent filesystem compression. Both run on the same Linux builder,
 filesystem, CPU governor, kernel, corpus, proxy, and sample order. HTTP wire

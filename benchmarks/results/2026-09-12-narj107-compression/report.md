@@ -1,7 +1,7 @@
 # NARJ-107 compression evidence
 
-This directory promotes the raw logs from two real-Nix compression runs that
-were previously retained only in temporary directories. The lanes used
+This directory contains the raw logs from two real-Nix compression runs that
+were previously retained only in temporary directories. The runs used
 `compression=none`, `compression=zstd`, and `compression=xz`, with a fresh
 Narjar data directory and cache key for each encoding.
 
@@ -16,7 +16,7 @@ were:
 | zstd | 3,638.418 | 698,704 | 305,617 |
 | xz | 22,038.590 | 698,704 | 237,736 |
 
-The zstd and xz readback lanes completed `nix copy` and `nix store verify`,
+The zstd and xz readback runs completed `nix copy` and `nix store verify`,
 and both returned HTTP 206 with 64 bytes for a range request. Their readback
 wall times were 1,483.470 ms and 1,769.385 ms respectively. The raw NAR
 readback was not included in the readback summary.

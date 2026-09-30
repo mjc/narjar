@@ -12,7 +12,7 @@ compression, storage layout, and download compression are configured separately.
 
 ## Rust API
 
-Narjar is a CLI product, not a storage-library crate. Its supported Rust API is
+Narjar's primary product is the CLI. Its supported Rust API is
 limited to the NAR streaming decoder (`nar`), canonical event encoder
 (`nar_encode`), and typed content identities (`object`). These APIs cover
 reading and writing NAR streams; they do not expose cache storage, HTTP server,

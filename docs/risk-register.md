@@ -69,7 +69,7 @@ Statement and invariant: Treating a write token as signing authority would let
 a compromised uploader publish trusted malware. Only configured producer keys
 may authorize narinfo.
 
-Evidence: Server-signed bincache intentionally grants this authority; client-
+Evidence: Server-signed bincache grants this authority; client-
 signed Kasha demonstrates the alternative.
 
 Owner and mitigation: NARJ-6/NARJ-12. Client-signed only; no server secret key;
@@ -208,7 +208,7 @@ Likelihood: Medium. Impact: Critical for private credentials.
 Statement and invariant: Basic tokens must never traverse an untrusted cleartext
 network or appear in proxy logs; proxy buffering must not defeat streaming.
 
-Evidence: Loopback traces deliberately omit TLS; configuration is unproven.
+Evidence: Loopback traces omit TLS; configuration is unproven.
 
 Owner and mitigation: NARJ-2/NARJ-14/NARJ-17. Bind privately, terminate TLS,
 disable request buffering, preserve Content-Length/Authorization, align limits
@@ -342,9 +342,14 @@ offline. Rejected alternatives: redb and SQLite.
 
 ### D4: Store compression=none byte-for-byte
 
-Accepted provisionally. Raw, zstd, and XZ uploads are retained byte-for-byte;
-compressed forms are stream-validated without canonical recompression. Rejected
-alternative: server-generated canonical compression.
+Superseded by the current [canonical storage contract](architecture.md#canonical-storage-backends)
+and [compressed upload and egress flow](architecture.md#write-flow). The earlier
+proposal retained raw, zstd, and XZ uploads byte-for-byte and rejected
+server-generated compression. The current implementation validates the encoded
+and decoded identities, stores the decoded NAR in the selected flat or chunked
+backend, and materializes reusable compressed egress derivatives when selected.
+Published narinfo transport fields describe the served representation while
+preserving the signed NAR identity.
 
 ### D5: Do not parse NAR semantics
 

@@ -1,6 +1,6 @@
 # Virtual NAR segment stream
 
-This is the NARJ-94 serving-foundation design. A semantic root is exposed to
+In the NARJ-94 serving-foundation design, a semantic root is exposed to
 consumers as an ordered pull stream of logical NAR bytes. The stream is
 representation-neutral: its sources may be semantic objects, raw files,
 chunks, or a future packed store, while HTTP remains unaware of that choice.

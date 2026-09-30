@@ -1,6 +1,6 @@
 # NARJ-83 MinCDC baseline
 
-This is the first frozen-corpus measurement for the storage chunking
+The first frozen-corpus measurement covers the storage chunking
 prototype. It does not authorize or implement a production chunk store, alter
 NAR transport bytes, or change the Nix binary-cache protocol.
 
@@ -85,8 +85,8 @@ Select raw `MinCdcHash4` with the 8–24 KiB window for the next experiment
 slice. The logical sweep alone would choose 2–8 KiB, but the bounded
 ZFS-backed stores reversed that result: 2–8 KiB used 113 MiB, 4–12 KiB used
 99.0 MiB, and 8–24 KiB used 85.6 MiB for the same 100-file sample. The
-larger window avoids enough chunk files and filesystem metadata to win on the
-metric that matters here: allocated storage.
+larger window reduces chunk-file and filesystem-metadata costs enough to use
+less allocated storage.
 
 The full 8–24 KiB store was then materialized on a temporary `zstd-19` ZFS
 dataset. After `zpool sync`, its authoritative dataset usage was
@@ -121,7 +121,7 @@ semantic-index costs. The fixed 64 KiB whole-small/chunk-large hybrid is also
 about 5.2 MiB worse than that original raw Hash4 result, so there is no
 measured reason to add either semantic or hybrid policy here.
 
-The semantic rows are deliberately limited evidence: they chunk regular-file
+The semantic rows provide limited evidence: they chunk regular-file
 contents independently and retain all other NAR bytes as passthrough. They do
 not claim that a semantic manifest can yet reconstruct a NAR byte-for-byte.
 That requires the separate semantic codec/reconstruction work tracked by the
@@ -164,6 +164,6 @@ bytes; ZFS
 on-disk measurement for this experiment.
 
 The store command also reports reconstructed range bytes, range verification
-time and throughput, and Linux peak RSS. These measurements are deliberately
-kept separate from HTTP serving TTFB: the prototype has no production HTTP
+time and throughput, and Linux peak RSS. These measurements are
+separate from HTTP serving TTFB: the prototype has no production HTTP
 chunk route, so it cannot claim a network-serving result.

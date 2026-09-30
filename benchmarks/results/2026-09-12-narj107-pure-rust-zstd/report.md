@@ -20,8 +20,8 @@ selected the AVX2 kernel on the benchmark host.
 The benchmark host was busy (load average was 42.17 at the start of the
 native pass), so these are comparative throughput results rather than a clean
 absolute capacity claim. All candidates ran sequentially, were pinned to CPU
-0, and used the same host and input. The ordering is still decisive: the
-structured decoder's median was 2.13x `zstd-complete` on the medium input and
+0, and used the same host and input. The structured decoder's median was
+2.13x `zstd-complete` on the medium input and
 2.23x on the large input.
 
 ## Setup validation
@@ -33,8 +33,8 @@ structured decoder's median was 2.13x `zstd-complete` on the medium input and
   dependent.
 - `structured-zstd` was built with all relevant x86 runtime kernels enabled:
   `kernel-sse`, `kernel-bmi2`, and `kernel-avx2` (the feature implication chain
-  supplies the lower tiers). Its exact crate defaults were also built once as
-  a sanity check; they selected AVX2 and produced the same output.
+  supplies the lower tiers). A single build with the exact crate defaults also
+  selected AVX2 and produced the same output.
 - Every native build used `RUSTFLAGS='-C target-cpu=native'`.
 - The harness warmed each decoder once, timed only repeated streaming decode,
   used a 64 KiB output buffer, and verified each candidate byte-for-byte

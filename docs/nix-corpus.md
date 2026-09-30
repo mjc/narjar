@@ -57,7 +57,7 @@ scripts/nix-corpus validate \
   --schema-only
 ```
 
-The generated manifest is intentionally kept outside the repository; a
+The generated manifest is kept outside the repository; a
 schema-only pass without `--spec` is not evidence that it matches the current
 candidate.
 
@@ -76,8 +76,8 @@ do not need to remain in the local store.
 
 Keep the spec in version control; keep generated manifests, large NAR exports,
 and regeneration roots outside the repository. The manifest's `requirements` block
-is intentionally enforced during validation so a partial local store cannot
-silently become the headline corpus. When present, `min_generations` and
+is enforced during validation so a partial local store cannot
+silently become the full corpus. When present, `min_generations` and
 `min_nixpkgs_revisions` must be finite nonnegative integers, and
 `required_families` must be a non-empty array of non-empty strings; malformed
 or null requirement values fail schema validation.

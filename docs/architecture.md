@@ -5,14 +5,15 @@ remain subject to the evidence gates recorded below.
 
 ## Decision
 
-Narjar is a filesystem-only HTTP binary cache with two explicit canonical
+Narjar is a filesystem-only HTTP binary cache with two canonical
 storage backends: flat files and shared content-defined chunks. The flat
-backend is supported on Linux and macOS; chunked storage is Linux-only. It does not expose a
-native /nix/store, invoke Nix, own a signing key, run background workers, or
-perform online garbage collection. It can normalize uploaded NAR
+backend is supported on Linux and macOS; chunked storage is Linux-only. The
+server does not expose a native /nix/store, invoke Nix, own a secret signing key,
+or perform online or background garbage collection. It supports optional
+background cache-population sampling for metrics. It can normalize uploaded NAR
 representations to canonical raw storage and materialize deterministic
-compressed egress derivatives on demand. It
-does provide a bounded, operator-invoked offline retention pass. It accepts
+compressed egress derivatives on demand. It provides a bounded,
+operator-invoked offline retention pass. It accepts
 Nix's raw `.nar`, precompressed `.nar.zst`, and `.nar.xz` forms as upload
 transports. A selected backend stores either one canonical raw `.nar` or one
 ordered manifest plus shared raw chunks, together with any requested
@@ -70,11 +71,11 @@ Consequences:
 - A compromised trusted producer can publish arbitrary content under the
   authority of its key. That is inherent in Nix's trust model and must be
   handled by key revocation plus object quarantine/deletion.
-- Narjar never stores a secret signing key and has no signing-key rotation
-  command.
+- The cache server never stores a secret signing key and has no signing-key
+  rotation command.
 - Client key rotation uses overlap: consumers and Narjar trust old plus new
   public keys; producers switch to the new private key; cached old narinfos
-  remain valid until the old key is deliberately removed after the positive
+  remain valid until the old key is removed after the positive
   cache window and operational verification.
 
 Server-signed ingestion is rejected for v0.1 because it makes every write token
@@ -197,7 +198,7 @@ manifests and chunks; shared chunks survive until the last live manifest is
 gone. A crash can therefore leave harmless orphan data but never a durable
 narinfo for a deleted canonical object. Apply marks recovery before mutation
 and clears it only after a fresh validated inventory; startup revalidates a
-marked cache before serving. Logical totals intentionally exclude
+marked cache before serving. Logical totals exclude
 compression, CoW, reflinks, and snapshot-held physical blocks.
 
 There is no HTTP delete/GC endpoint and no online read/delete race.
@@ -237,9 +238,11 @@ PUT /<store-hash>.narinfo
 ~~~
 
 For compression=none, FileHash and NarHash are both SHA-256 over the received
-raw NAR and FileSize equals NarSize. For zstd and xz, FileHash/FileSize describe the
-stored compressed bytes while NarHash/NarSize describe the streamed decoded
-NAR. Narjar deliberately does not parse NAR semantics or framing. The trusted
+raw NAR and FileSize equals NarSize. For uploaded zstd and xz,
+FileHash/FileSize describe the received compressed bytes while NarHash/NarSize
+describe the streamed decoded NAR. Canonical storage retains the decoded byte
+stream; published narinfo transport fields describe the server-selected served
+representation. Narjar does not parse NAR semantics or framing. The trusted
 producer signature authorizes the raw hash and size, and consumer Nix verifies
 and parses the NAR while importing. A second parser would add attack surface
 without adding authenticity.

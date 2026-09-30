@@ -82,7 +82,7 @@ NARJ-46/NARJ-68 evidence artifacts, not in this capability contract.
 
 ## Rejected integrations
 
-The current flat-storage design deliberately does not add:
+The current flat-storage design excludes:
 
 - automatic backend migration, legacy-layout fallback, or mixed-layout reads;
 - libzfs bindings, elevated filesystem privileges, or daemon hooks for
@@ -95,9 +95,8 @@ The current flat-storage design deliberately does not add:
   or
 - unmeasured deduplication, filesystem tuning, or physical-space claims.
 
-These are not hidden extension points. A future integration requires a new
-decision backed by portability, crash-recovery, security, and measured
-operational evidence.
+Adding any of these integrations requires a new decision backed by
+portability, crash-recovery, security, and measured operational evidence.
 
 ## Consequences
 
@@ -106,5 +105,4 @@ database-free startup, destination-local staging, immutable publication, and
 offline maintenance contract. Operators remain responsible for mounting DATA,
 filesystem snapshots/replication, and interpreting physical storage metrics.
 Narjar reports logical object accounting and the capacity observations it can
-read; it does not pretend those values describe compressed or snapshot-held
-physical blocks.
+read. Those values do not describe compressed or snapshot-held physical blocks.

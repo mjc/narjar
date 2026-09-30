@@ -28,7 +28,7 @@ Narjar's peak RSS stayed near 2.2 MiB for both the 100 MiB and 1 GiB streaming u
 
 Read performance is not a Narjar win: bincache has lower median cold and warm single-reader latency, while wider-reader results are mixed. This does not change the continuation gate, but it remains a performance constraint.
 
-The principal follow-up risk is startup scaling. Narjar's 10,000-path startup median is 16.5 times bincache's. Continuation is authorized because the gate is satisfied elsewhere, not because startup scaling is acceptable.
+Startup scaling remains a risk: Narjar's 10,000-path startup median is 16.5 times bincache's. The other results satisfy the continuation gate; they do not establish that startup scaling is acceptable.
 
 ## Evidence
 

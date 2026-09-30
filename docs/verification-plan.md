@@ -1,10 +1,12 @@
 # Narjar v0.1 dependency, test, and benchmark plan
 
-Status: design-gate draft for NARJ-15, NARJ-16, and NARJ-19.
+Status: design-gate draft for NARJ-15, NARJ-16, and NARJ-19. The dependency
+tables and exclusions preserve the historical proposal; they are not an
+inventory of the current package.
 
-## Runtime dependency budget
+## Historical dependency proposal
 
-The initial allowed set is deliberately small:
+The initial proposal allowed the following dependencies:
 
 | Crate | Purpose | Why standard library is insufficient | Rejected alternative |
 | --- | --- | --- | --- |
@@ -36,17 +38,14 @@ gates.
 | libc | 0.2.189 | MIT OR Apache-2.0 | 1.65 | default features off; one documented `flock` call; already present through signal-hook |
 | structured-zstd | 0.0.52 | Apache-2.0 | 1.92 | `hash`, `std`, and runtime SSE/BMI2/AVX2/NEON/SVE kernels; bounded streaming pure-Rust decoder/encoder; no C zstd library or one-shot whole-input buffer |
 
-The project MSRV is Rust 1.98, matching the pinned development toolchain and
-pinned shell. Every candidate is
-permissively licensed and compatible with a musl static build when the rejected
-native/TLS features remain disabled; the Linux static closure check is the
-proof, not this table.
+The candidate table records the earlier license, MSRV, feature, and static-build
+assumptions. Current Linux static-build evidence comes from the static closure
+check rather than those candidate assumptions.
 
-No dependency is approved merely because it is convenient. The implementation
-must start with exact versions pinned by Cargo.lock and default features
-disabled where practical.
+No dependency is approved merely because it is convenient. Dependency versions
+must remain pinned by Cargo.lock, with default features disabled where practical.
 
-Explicitly rejected for v0.1:
+The historical proposal rejected:
 
 - tokio, hyper, axum, tower, async-trait, futures utility stacks.
 - clap, serde, TOML/YAML frameworks, anyhow, thiserror/derive error frameworks.
@@ -59,6 +58,16 @@ Explicitly rejected for v0.1:
 
 A rejected crate may be reconsidered only with a focused benchmark/security
 argument and a risk-register update.
+
+## Current package contract
+
+The package requires Rust 1.98. [Cargo.toml](../Cargo.toml) declares the current
+direct dependencies and features; [Cargo.lock](../Cargo.lock) pins the resolved
+graph. The implementation includes clap, serde/serde_json, postcard, SQLite for
+the push client's local-store metadata, and ureq with rustls for client HTTPS.
+The cache server uses filesystem storage and serves plain HTTP behind a
+TLS proxy. The earlier exclusions do not describe this implemented graph, and
+the manifest does not by itself establish approval of a dependency change.
 
 ## Dependency gates
 

@@ -6,7 +6,7 @@
 > `../2026-09-05-narj75-baseline-corrected/` instead. The measurements below
 > are retained only as historical raw evidence.
 
-This is the fresh current flat-cache baseline required before semantic-storage
+This is the current flat-cache baseline required before semantic-storage
 candidate comparisons. It is not a semantic candidate result and does not
 claim the 25% physical-byte savings gate; the matched raw-NAR transparent
 filesystem-compression baseline remains the later comparison defined by the

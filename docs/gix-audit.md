@@ -1,6 +1,6 @@
 # Gitoxide storage audit
 
-This is the NARJ-86 feasibility audit for the pinned gitoxide graph. It is a
+NARJ-86 audits the feasibility of the pinned gitoxide graph. It is a
 capability audit, not a production dependency proposal. The disposable probe
 used for the API checks lived outside this repository at
 `/tmp/narjar-gix-probe`.
@@ -38,7 +38,7 @@ source was inspected for buffering, limits, and publication behavior.
 | --- | --- | --- |
 | Loose-object streaming write | Supported with constraints | `gix_odb::loose::Store::write_stream` accepts `&mut dyn Read`, hashes while writing a compressed temporary file, and persists the result. Narjar would still own directory creation, file modes, collision policy, and durability. |
 | Loose-object streaming read | Missing at the loose-store API | `try_find` writes the complete decompressed object into a caller-provided `Vec<u8>`. `try_header` avoids the object body but there is no body-to-`Write` or body-stream API in this store. |
-| High-level blob streaming | Reject for Narjar | Gitoxide's high-level `Repository::write_blob_stream` reads the stream into a reusable in-memory buffer before writing. That is the opposite of Narjar's bounded upload path. |
+| High-level blob streaming | Reject for Narjar | Gitoxide's high-level `Repository::write_blob_stream` reads the stream into a reusable in-memory buffer before writing. Its memory use grows with the input size, violating Narjar's bounded-upload requirement. |
 | Loose lookup and SHA-1/SHA-256 | Supported with constraints | The store is parameterized by `gix_hash::Kind`; the feature graph must enable the desired hash implementations. The object format is Git's loose format, not Nix's semantic NAR identity. |
 | Pack lookup and reconstruction | Supported with constraints | `gix-pack` exposes indexed lookup, full/delta decoding, pack caches, and explicit `alloc_limit_bytes` controls. A caller must set limits and decide whether caches are enabled. |
 | Pack/index creation | Supported with constraints | `Bundle::write_to_directory` consumes a pack stream and generates pack/index files, using temporary files. It is a pack ingest/indexing operation, not a NAR-specific object store. The caller owns final durability and publication. |
@@ -59,7 +59,7 @@ core cache path custom either way. Adding the crates would also introduce a
 large maintenance and advisory-tracking surface for a storage format Narjar
 does not serve.
 
-The runtime probe is intentionally small: it does not claim deep-delta,
+The runtime probe has limited coverage: it does not claim deep-delta,
 missing-base, truncated-index, or interrupted-pack restart coverage. Those
 remain required before a hostile-input adoption decision.
 

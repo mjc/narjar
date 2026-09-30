@@ -1,6 +1,6 @@
 # Native Linux static package evidence
 
-Hostnames are intentionally represented by role labels in this repository;
+Hostnames are represented by role labels in this repository;
 they are not part of the reproducibility contract.
 
 Date: 2026-09-01  
@@ -25,7 +25,7 @@ printed `Hello, world!` and exited successfully.
 
 The same flake output was realized in the independent Linux builder's separate Nix store. That builder was also
 running Linux 6.18.44 on x86_64 with Nix 2.35.2. Because its daemon normally
-offloads to the primary Linux builder, the package derivation was then deliberately rebuilt locally
+offloads to the primary Linux builder, the package derivation was then rebuilt locally
 with builders disabled:
 
 ```console

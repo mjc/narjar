@@ -1,17 +1,17 @@
 # Nix binary-cache prior art
 
 Status: NARJ-3 design-gate draft. Sources were checked on 2026-09-01.
-This is a fit analysis for Narjar v0.1, not a popularity ranking.
+Scope: fit for Narjar v0.1.
 
 ## Decision summary
 
-A greenfield Narjar that merely offers a small Rust HTTP binary cache should
-not exist: [bincache](https://github.com/wyattgill9/bincache) already implements
-that product shape, including native nix copy PUTs, netrc auth, server signing,
+[bincache](https://github.com/wyattgill9/bincache) already implements a small Rust
+HTTP binary cache, including native nix copy PUTs, netrc auth, server signing,
 atomic storage, ranges, metrics, reconciliation, real-socket conformance tests,
-and a real-Nix signature-gated end-to-end test.
+and a real-Nix signature-gated end-to-end test. Duplicating that product shape
+does not justify a greenfield Narjar.
 
-There is still a narrower design worth evaluating: a static, single-tenant,
+A narrower candidate is a static, single-tenant,
 filesystem-only cache that stores compression=none, zstd, and xz uploads
 byte-for-byte, requires client-signed narinfo, holds no signing key, has no
 database, no recompression, no online GC, and no background workers. That profile is a
@@ -36,7 +36,7 @@ cost more and preserve fewer invariants.
 ## Nix's built-in stores
 
 The [local binary cache store](https://nix.dev/manual/nix/2.35/store/types/local-binary-cache-store.html)
-is the simplest authoritative layout: file:// reads and writes a flat binary
+defines the reference layout: file:// reads and writes a flat binary
 cache in a directory and creates it when absent. It proves no database is
 required for protocol correctness.
 
@@ -122,8 +122,7 @@ Its extra mechanisms are not automatically defects:
   signing keys.
 - Recompression provides one canonical read codec regardless of upload.
 
-They are nevertheless the exact complexity Narjar proposes to avoid. A valid
-Narjar differential would be:
+Narjar proposes to avoid these mechanisms. The proposed differences are:
 
 - Files are the index; startup validation is a bounded narinfo scan.
 - The server never owns a signing key and never rewrites signatures.
@@ -146,14 +145,13 @@ single-binary boundary.
 
 ## Red-team conclusion
 
-The strongest objection is not technical risk; it is duplication. Two current
+The strongest objection is duplication. Two current
 Rust projects already cover almost all requested behavior:
 
 - bincache covers the small native HTTP cache.
 - Kasha covers the no-Nix, no-DB, client-signing flat cache plus much more.
 
-Therefore NARJ-3 cannot approve "build Narjar as planned." It can approve only
-one of these outcomes:
+NARJ-3 can approve only one of these outcomes:
 
 1. Adopt bincache and contribute any missing constraints upstream.
 2. Add or extract a serve-only profile from Kasha.

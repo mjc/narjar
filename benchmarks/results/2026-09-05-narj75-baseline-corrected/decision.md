@@ -1,6 +1,6 @@
 # NARJ-75 corrected flat baseline
 
-This is the fresh current flat-cache control required before semantic-storage
+This is the current flat-cache control required before semantic-storage
 candidate comparisons. It is not a semantic candidate result and does not
 claim the 25% physical-byte savings gate. Candidate decisions still require
 the six-category corpus and the matched raw-NAR transparent-filesystem-
@@ -43,6 +43,6 @@ Selected current flat-control medians (Bincache is unmatched as noted above):
 `environment.json` records the exact binaries and hashes. `commands.txt` was
 written by the subprocess and HTTP wrappers during execution and records the
 actual commands, URLs, methods, non-secret headers, and identity encoding.
-Generated bearer-token values are intentionally absent. Failure, recovery,
+Generated bearer-token values are omitted. Failure, recovery,
 trust, raw-sample, aggregate, and candidate-log evidence is retained beside
 this file.

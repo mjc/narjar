@@ -1,13 +1,16 @@
 # Semantic NAR threat model
 
-This is the Phase A boundary for the decoder and encoder prototypes. A valid
-producer signature authenticates metadata; it does not make the producer or
-its key holder non-malicious. The codec therefore rejects malformed and
+Phase A covers the decoder and encoder codecs and prototypes. The cache server
+does not parse NAR semantics; publication and serving rows below describe
+caller obligations for a future semantic store.
+
+A valid producer signature authenticates metadata; it does not make the
+producer or its key holder non-malicious. The codec therefore rejects malformed and
 non-canonical input before it can become a reader-visible semantic root.
 
 | Input or actor | Resource/correctness impact | Enforcing boundary | Evidence | Recovery | Residual risk |
 | --- | --- | --- | --- | --- | --- |
-| Authenticated malicious writer | Deep nesting and stack/heap growth | `Limits::max_depth`; iterative encoder/decoder node stacks | decoder limit tests; bounded encoder fuzz target | Reject the object before publication | Limits must remain aligned with deployment budgets |
+| Authenticated malicious writer | Deep nesting and stack/heap growth | `Limits::max_depth`; encoder node stack and depth-limited decoder recursion | decoder limit tests; bounded encoder fuzz target | Reject the object before publication | Limits must remain aligned with deployment budgets |
 | Authenticated malicious writer | Huge names or symlink targets | `max_name_bytes`, `max_symlink_target_bytes`; raw-byte validation | decoder and encoder boundary tests | Reject the object and retain no root | A high limit can still be operationally expensive |
 | Authenticated malicious writer | Entry/inode fan-out | `max_entries` and `max_work` | decoder limit tests; encoder event-work limit | Abort the event stream before object creation | Semantic object/inode quotas are later admission work |
 | Authenticated malicious writer | File/NAR memory or disk exhaustion | `max_file_bytes`, `max_total_bytes`; file bodies stream in chunks | 20 GiB RSS harness; decoder/encoder size checks | Fail closed and discard incomplete output | Publication/storage quotas remain separate |
@@ -17,12 +20,15 @@ non-canonical input before it can become a reader-visible semantic root.
 | Unauthenticated reader | Range or reconstruction CPU amplification | No reconstruction or serving integration in this prototype; raw codec work is bounded | explicit non-goal; future range limits required | Serving layer must reject over-budget work | Serving design must enforce separate read budgets |
 | Compromised producer key | Malicious but correctly signed archives | Same parser/codec limits and canonical checks; signature is not a trust bypass | fuzz and limit targets | Reject malformed objects and rotate/revoke keys operationally | Key rotation and operator response are outside this codec |
 
-## Frozen Phase A limits
+## Current codec defaults
 
-`nar::Limits::default()` is the secure prototype default: depth 1,024;
+`nar::Limits::default()` sets the codec limits: depth 1,024;
 names/targets 1 MiB; 10 million entries; 64 GiB per file; 128 GiB total raw
-NAR bytes; and 2^34 work units. Fuzz targets use substantially smaller
-limits to make boundary transitions frequent and deterministic.
+NAR bytes; and 2^34 work units. Callers can supply their own `Limits`. These
+defaults differ from the earlier [NARJ-76 proposal](nar-semantic-model.md) and
+are separate from the cache server's encoded/decoded upload and decoder-memory
+limits. Fuzz targets use substantially smaller limits to make boundary
+transitions frequent and deterministic.
 
 The encoder uses the same limit structure as the decoder. It checks limits
 before writing the bytes that would exceed them, so a rejected event cannot

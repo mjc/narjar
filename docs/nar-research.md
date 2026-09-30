@@ -79,7 +79,7 @@ target/release/nar-tree-report \
 
 The report emits one `N` row per NAR, a global `G` reconciliation row, and `T`
 rows for unique tree identities. It counts only tree preimage bytes; file and
-symlink payload bytes are intentionally excluded. The NARJ-82 full-corpus
+symlink payload bytes are excluded. The NARJ-82 full-corpus
 result is retained at
 [`benchmarks/results/2026-09-11-narj82-tree-sharing/report.md`](../benchmarks/results/2026-09-11-narj82-tree-sharing/report.md).
 

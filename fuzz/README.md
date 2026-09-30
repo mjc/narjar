@@ -1,6 +1,6 @@
 # NAR decoder fuzz target
 
-This is deliberately a separate fuzz crate. It exercises the research decoder
+The separate fuzz crate exercises the research decoder
 without adding fuzzing dependencies to the Narjar production package.
 
 Enter `devenv shell`; it provides `cargo-fuzz` and the pinned nightly compiler

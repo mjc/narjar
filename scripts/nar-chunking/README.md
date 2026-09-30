@@ -1,6 +1,6 @@
 # NAR chunking experiment
 
-This is an isolated NARJ-83 measurement tool. It does not change Narjar's
+The isolated NARJ-83 measurement tool does not change Narjar's
 storage layout or HTTP protocol.
 
 Run it against the frozen corpus with:
@@ -39,7 +39,7 @@ cargo run --release -p narjar-nar-chunking -- \
   --raw-sweep
 ```
 
-The sweep is deliberately limited to 2–8 KiB, 4–12 KiB, and 8–24 KiB. It is
+The sweep is limited to 2–8 KiB, 4–12 KiB, and 8–24 KiB. It is
 not an open-ended parameter search.
 
 The command walks `.nar` files in sorted path order and prints one stable

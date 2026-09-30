@@ -124,24 +124,26 @@ Callers redirect stdout to a mode-0600 secret store. token revoke removes one
 label by atomic file replacement. The secret itself is never in argv, an
 environment variable, logs, or the hash file.
 
-push is a client-side convenience command for native Rust HTTP uploads. It
-resolves the requested installables with `nix path-info --recursive --json`,
-orders the resulting closure into deterministic dependency waves, and uploads
-each canonical NAR followed by its signed narinfo. Independent paths within a
-wave use the bounded workers. With `--signing-key-file`, it
-first invokes `nix store sign` over the complete closure and refreshes the
-structured metadata before uploading. `--compression` selects the destination
-NAR representation (`none`, `zstd`, or `xz`) and defaults to `none`. Publication
-remains Narjar's existing atomic per-object operation; the client uses
-fixed-length streamed requests and does not invoke `nix copy`. Each native HTTP
-request has a 30-second timeout by default; `--timeout-seconds` or
-`NARJAR_PUSH_TIMEOUT_SECONDS` changes it. The `nix`
-executable remains required for closure enumeration, signing, and canonical NAR
-serialization. `--netrc-file` is parsed by Narjar and its matching credential
-is sent as HTTP Basic authentication only when the target URL uses HTTPS. Plain
-HTTP requests never receive an Authorization header, and an HTTP-to-HTTPS
-redirect does not upgrade credentials; use an HTTPS target from the start. The
-file must already have restrictive permissions. `NARJAR_PUSH_GCROOTS` may point
+`push` takes concrete `/nix/store/...` paths, reads the local Nix store's SQLite
+metadata database, and orders their closures into deterministic dependency
+waves. It serializes NARs directly and uploads each NAR followed by its signed
+narinfo. Independent paths within a wave use up to `--jobs` workers. With
+`--signing-key-file`, it signs the closure's metadata in memory before uploading;
+it does not modify the local store database or invoke Nix subprocesses.
+`--compression` selects the uploaded NAR representation (`none`, `zstd`, or
+`xz`) and defaults to `none`; the server independently selects its stored and
+served representations. Uploads use fixed-length streamed requests and the
+server's atomic per-object publication. The client needs read access to the
+store and its metadata database, plus permission to create temporary GC roots.
+Each native HTTP request has a 30-second timeout by default; `--timeout-seconds` or
+`NARJAR_PUSH_TIMEOUT_SECONDS` changes it.
+
+`--netrc-file` supplies HTTP Basic credentials. They are sent only over HTTPS
+unless `--insecure-http` explicitly permits sending them over plain HTTP. Use
+HTTPS for remote access. A request started over HTTP without that override
+remains unauthenticated after an HTTP-to-HTTPS redirect; use an HTTPS target
+from the start. The netrc file must have restrictive permissions.
+`NARJAR_PUSH_GCROOTS` may point
 to an operator-owned existing `gcroots/auto` directory when the normal Nix
 state directory is not writable; it changes only where Narjar places its
 temporary reachability symlinks, not Nix's store or state database.
@@ -157,7 +159,7 @@ client’s upload contract; use the corresponding stock Nix operation when those
 surfaces are required.
 
 delete is offline-only: it refuses while the serve lock is held, removes the
-published narinfo after validation and directory sync, and deliberately leaves
+published narinfo after validation and directory sync, and leaves
 the canonical object. list-orphans reports unreferenced flat NARs or chunked
 manifests. For chunked storage, `verify` and `reconcile --verify-hashes`
 reconstruct the canonical stream and inspect the referenced chunks.
@@ -580,7 +582,7 @@ published inventory before planning or deleting, protects the transitive
 `References` closure of configured roots, and orders eligible narinfos by
 publication time. Its size accounting is logical file length, so snapshots,
 compression, reflinks, CoW, and sparse allocation remain filesystem/operator
-concerns. NARJ-32 deliberately rejects access-time retention, online GC, a
+concerns. NARJ-32 rejects access-time retention, online GC, a
 resident worker, and an HTTP delete/GC API.
 
 ## Observability
@@ -700,7 +702,7 @@ classes are exported as fixed labels. GC-reclaimed bytes are Narjar's logical
 accounting delta, not a claim about physical blocks freed; unmeasured byte
 counts are omitted.
 
-Some useful measurements intentionally do not appear here. Client-side push
+The following measurements are omitted. Client-side push
 preflight and trusted-cache skips cannot be inferred from server requests.
 Upstream edge-fill outcomes, native-source lease counts, and online-retention
 effects belong with those features when implemented. Per-object popularity and
@@ -716,6 +718,11 @@ directories, no-follow path checks, file and directory sync, same-filesystem
 no-replace hard links, unlink, enumeration, and an exclusive local lease. The
 service does not detect or configure a filesystem-specific backend.
 
+Linux chunked storage additionally requires `syncfs` to make newly linked
+chunks durable before manifest publication. macOS supports flat storage only.
+See the [filesystem capability ADR](filesystem-capability-adr.md) for the
+backend-specific durability requirements and remaining conformance gaps.
+
 | Environment | Current classification | Meaning |
 | --- | --- | --- |
 | NixOS module evaluation | configuration only | Covers module options and generated units, not filesystem or service runtime behavior. |
@@ -726,11 +733,15 @@ service does not detect or configure a filesystem-specific backend.
 
 For a Narjar-only ZFS dataset, the conservative provisional posture is
 `sync=standard`, checksums enabled, `dedup=off`, `atime=off`, the default record
-size and cache topology, and no special vdev or SLOG requirement. `compression=lz4`
-is the conservative candidate; any zstd level, non-default recordsize, ARC
-policy, deduplication, or other tuning is optional and unapproved until the
-corresponding measured evidence exists. `sync=disabled` is a durability
-violation warning, not a performance recommendation.
+size and cache topology, and no special vdev or SLOG requirement. The
+[filesystem capability ADR](filesystem-capability-adr.md#support-boundary) and
+[architecture](architecture.md#canonical-storage-backends) recommend
+`compression=zstd` (the OpenZFS alias for `zstd-3`). Narjar does not set or verify
+ZFS properties. This recommendation does not establish a speed, space-saving,
+or filesystem-conformance guarantee. Other compression levels, non-default
+recordsize, ARC policy, deduplication, and other tuning remain optional and
+unapproved until the corresponding measured evidence exists. `sync=disabled`
+violates the durability contract.
 
 ## Graceful shutdown
 

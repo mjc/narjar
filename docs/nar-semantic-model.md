@@ -1,6 +1,9 @@
 # NAR semantic model and Git ordering mismatch
 
-This note freezes the model for NARJ-76. The primary references are the
+Status: NARJ-76 research proposal. Its proposed codec budgets are historical;
+the current codec defaults are documented below.
+
+The NARJ-76 model uses the
 [versioned Nix 2.35 NAR format](https://nix.dev/manual/nix/2.35/protocols/nix-archive/)
 and the [Nix archive implementation](https://github.com/NixOS/nix/blob/2.35.2/src/libutil/archive.cc).
 NAR begins with `nix-archive-1`; every string is a little-endian u64 byte
@@ -13,8 +16,8 @@ The root descriptor is `(kind, payload)`, where kind is `file`, `executable`,
 `symlink`, or `directory`; a Git tree alone cannot represent a root file or
 symlink, so the descriptor is part of semantic identity. Nix’s parser limits
 tag length to 32, name length to 255, target length to 4095, and nesting depth
-to 64. Narjar’s future parser must use no larger defensive limits unless a
-versioned decision explicitly changes them. Unknown tags/types, duplicate or
+to 64. NARJ-76 proposed using no larger defensive limits for a future parser
+unless a versioned decision changed them. Unknown tags/types, duplicate or
 out-of-order names, bad lengths/padding, forbidden names, truncation, and
 trailing bytes fail closed.
 
@@ -70,9 +73,9 @@ fixture manifest records the malformed forms that must be rejected, including
 duplicates, order violations, padding, unknown tags, truncation, trailing
 bytes, and forbidden names.
 
-## Current parser behavior and Narjar obligations
+## Nix 2.35.2 behavior and proposed codec obligations
 
-| Input property | Nix 2.35.2 behavior | Narjar codec obligation |
+| Input property | Nix 2.35.2 behavior | NARJ-76 proposed codec obligation |
 | --- | --- | --- |
 | non-zero string/content padding | rejected by `readPadding` | reject |
 | oversized tag/name/target | rejected at 32/255/4095 bytes | reject at the same limits unless a later versioned decision changes them |
@@ -81,8 +84,18 @@ bytes, and forbidden names.
 | depth reaching 64 | rejected | reject |
 | bytes after the root node | `parseDump` returns without checking EOF | reject so one object has exactly one canonical byte stream |
 
-The trailing-byte rule is intentionally stricter than the cited Nix parser;
+The trailing-byte rule is stricter than the cited Nix parser;
 it prevents multiple byte streams from representing the same semantic root.
+
+## Current codec limits
+
+`nar::Limits::default()` uses depth 1,024, names and symlink targets up to 1 MiB,
+10 million entries, 64 GiB per file, 128 GiB of total NAR bytes, and 2^34 work
+units. Callers can supply their own `Limits`. These defaults differ from the
+NARJ-76 proposal and do not guarantee that Nix accepts every archive within
+those budgets. The [codec threat model](nar-threat-model.md#current-codec-defaults)
+records the current resource boundary. The cache server's upload limits are
+separate; it validates signed NAR identities without parsing NAR semantics.
 
 The versioned source anchors are the
 [Nix 2.35 NAR manual](https://nix.dev/manual/nix/2.35/protocols/nix-archive/),

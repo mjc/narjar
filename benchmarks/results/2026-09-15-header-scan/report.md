@@ -19,7 +19,7 @@ prefix, not a claimed network-fragment distribution.
 
 The byte-by-byte and delimiter-split inputs remain in the benchmark's
 invariant check. They establish that incremental scanning retains the first
-delimiter across read boundaries; they are deliberately not performance
+delimiter across read boundaries; they are not performance
 workloads.
 
 Five serial release samples are recorded in `raw.txt`. Each row has 100,000

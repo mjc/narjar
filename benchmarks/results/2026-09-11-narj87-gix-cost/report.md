@@ -11,7 +11,7 @@ Four protocol-neutral probes were compared with the current Narjar graph:
 - `pack-write`: the loose probe plus the `gix-pack` bundle-write API.
 - `high-level`: the minimal `gix` facade with `basic`, `sha1`, and `sha256` features.
 
-The high-level probe deliberately disables facade default features. The available index could not resolve the facade's optional `gix-archive ^0.36.1` default dependency. A no-hash-feature variant also correctly failed compilation; the probe was then fixed by selecting both hash features.
+The high-level probe disables facade default features. The available index could not resolve the facade's optional `gix-archive ^0.36.1` default dependency. A no-hash-feature variant also failed compilation as expected; selecting both hash features fixed the probe.
 
 ## Results
 
@@ -35,4 +35,4 @@ The RSS figures are probe RSS, not full Narjar service RSS. They are useful for 
 
 ## Recommendation
 
-Do not replace Narjar's current storage implementation with gix based on this evidence. The narrow loose graph is the only candidate worth preserving for a future prototype, but it is not a production recommendation: it increases dependency breadth and was not tested against Narjar's publication, validation, locking, or HTTP contracts. The high-level facade and pack-writing graph should be rejected for the current cost envelope.
+Do not replace Narjar's current storage implementation with gix based on this evidence. Retain only the loose graph for a future prototype. It increases dependency breadth and was not tested against Narjar's publication, validation, locking, or HTTP contracts, so it is not recommended for production. Reject the high-level facade and pack-writing graph for the current cost envelope.

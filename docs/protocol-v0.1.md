@@ -128,21 +128,23 @@ Accepted metadata must:
 - Be bounded UTF-8 in the line-oriented Nix narinfo format.
 - Contain one StorePath under /nix/store whose hash equals the route.
 - Contain URL nar/<FileHash-nix32>.nar, nar/<FileHash-nix32>.nar.zst, or
-  nar/<NarHash-nix32>.nar.xz.
+  nar/<FileHash-nix32>.nar.xz.
 - Declare Compression matching the URL suffix (`none`, `zstd`, or `xz`).
 - Include FileHash, FileSize, NarHash, NarSize, References, and at least one Sig.
 - Have FileHash equal NarHash and FileSize equal NarSize for compression=none;
-  for zstd and xz, FileHash/FileSize describe the stored compressed object.
+  for uploaded zstd and xz, FileHash/FileSize describe the received compressed
+  representation, which is decoded into canonical storage. Published narinfo
+  transport fields describe the server-selected served representation.
 - Match the durable NAR's computed hash and size.
 - Use only canonical store-path/reference grammar.
 - Verify at least one signature against configured trusted public keys.
 - Reject duplicate singleton fields and conflicting values.
-- Preserve accepted original bytes for signature stability; parsing must not
-  normalize and then verify a different representation.
+- Verify the canonical Nix store-path fingerprint and preserve its signed
+  logical claims and accepted signatures when projecting transport fields.
 
 Deriver and CA are accepted only with Nix-compatible field grammar; they never
 substitute for the required trusted signature. Other field names are rejected
-in v0.1. This deliberately matches the current Nix parser's semantic fields
+in v0.1. This matches the current Nix parser's semantic fields
 without making unsigned future extensions part of Narjar's trust boundary.
 
 ## Caching

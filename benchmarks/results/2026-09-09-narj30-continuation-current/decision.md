@@ -6,8 +6,8 @@ Bincache reference. It used three warmups, 15 measured repetitions, the
 candidates. `commands.txt` contains the commands and requests executed;
 `samples.jsonl` contains the raw measurements.
 
-Narjar completed the full benchmark successfully. `samples.jsonl` contains
-1,336 raw samples. The important medians are:
+Narjar completed the full benchmark. `samples.jsonl` contains
+1,336 raw samples. Selected medians:
 
 | Case | Narjar | Bincache |
 | --- | ---: | ---: |
@@ -24,6 +24,6 @@ publication and request path, not idle arena retention: RSS remains small,
 while metadata/Range and upload latency remain materially behind Bincache.
 The next performance implementation is NARJ-109's dedicated publication
 worker, with the existing streaming and bounded-queue constraints and no
-jemalloc or `MALLOC_ARENA_MAX` workaround. Independently, the tracker’s
+jemalloc or `MALLOC_ARENA_MAX` workaround. The tracker’s
 immediate verification priority is NARJ-112, which unblocks the urgent
 real-Nix corpus issue NARJ-81.

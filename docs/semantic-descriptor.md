@@ -1,6 +1,6 @@
 # Semantic object and root descriptor proposal
 
-This is the NARJ-80 contract proposal. It defines identity and recovery data
+The NARJ-80 contract proposal defines identity and recovery data
 for a future semantic store; it does not select a production file layout or
 Git packing format. Nix's `NarHash` and `NarSize` remain authoritative for the
 served archive.

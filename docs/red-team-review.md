@@ -7,15 +7,15 @@ Status: approved on 2026-08-31 for a conditional thin implementation slice.
 Approve the flat-filesystem, client-signed, compression=none-or-zstd-or-xz architecture and
 its v0.1 protocol contract.
 
-This is not approval for an unconstrained new binary-cache project. bincache
-already occupies the obvious small-Rust-server design point. Narjar may proceed
+Approval is limited to the frozen profile. bincache
+already provides a small Rust binary-cache server. Narjar may proceed
 only because the frozen profile removes the database, recompression, server
 signing key, background workers, startup index, online GC, and native Nix
 runtime. NARJ-30 must measure that differential against pinned bincache after
 the real-Nix thin slice. If it is not material, stop Narjar and adopt bincache.
 
-The design gate is complete. Remaining items below are implementation proof
-obligations, not unanswered architecture questions.
+The design gate is complete. The remaining items are implementation proof
+obligations.
 
 ## Review basis and NARJ-1 deliverables
 
@@ -116,7 +116,7 @@ decompressed output is capped. "Validated" means route, size, hash, metadata,
 and producer signature validated, not that Narjar duplicated Nix's NAR importer.
 A trusted signer can authorize malformed bytes, but consumer Nix still parses
 and rejects them.
-Adding a second NAR parser would enlarge, not reduce, the attack surface.
+Adding a second NAR parser would enlarge the attack surface.
 
 ### Partial visibility and durability
 
@@ -153,7 +153,7 @@ after interruption. There is no online GC or range/delete race.
 Resolved with an explicit boundary. A fixed worker set, bounded admission queue,
 Content-Length, object limits, fixed buffers, and reverse-proxy connection/body
 timeouts bound process resources. The blocking listener and fixed request parser
-do not pretend to offer an in-process socket deadline they cannot enforce. Public internet
+do not enforce an in-process socket deadline. Public internet
 deployment without the required proxy is unsupported.
 
 ### Disk full, EIO, corruption, and crash recovery
