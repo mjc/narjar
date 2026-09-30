@@ -2756,23 +2756,11 @@ fn http11_connection_serves_two_sequential_requests() {
 }
 
 #[test]
-fn published_narinfo_and_nar_get_head_are_pair_gated() {
+fn published_narinfo_and_nar_get_head_are_served() {
     let server = RunningServer::start("published-pair");
     let nar_bytes = b"known NAR bytes";
     let nar_hash = nix32_sha256(nar_bytes);
     let narinfo = signed_narinfo(&nar_hash, nar_bytes.len() as u64);
-    fs::write(
-        server.data_dir.join(format!("{STORE_HASH}.narinfo")),
-        &narinfo,
-    )
-    .expect("write narinfo fixture");
-
-    let missing = String::from_utf8(server.request("GET", &format!("/{STORE_HASH}.narinfo")))
-        .expect("missing response should be UTF-8");
-    assert!(
-        missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
-        "{missing:?}"
-    );
     let _absent_metadata = server.request("GET", &format!("/{ABSENT_STORE_HASH}.narinfo"));
     let _missing_nar = server.request("GET", &format!("/nar/{nar_hash}.nar"));
 
@@ -2781,6 +2769,11 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
         nar_bytes,
     )
     .expect("write NAR fixture");
+    fs::write(
+        server.data_dir.join(format!("{STORE_HASH}.narinfo")),
+        &narinfo,
+    )
+    .expect("write narinfo fixture");
 
     let narinfo_get = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
     let narinfo_head = server.request("HEAD", &format!("/{STORE_HASH}.narinfo"));
@@ -2795,7 +2788,6 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
     for series in [
         "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"GET\",outcome=\"hit\"} 1",
         "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"GET\",outcome=\"miss\"} 1",
-        "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"GET\",outcome=\"failure\"} 1",
         "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"HEAD\",outcome=\"hit\"} 1",
         "narjar_cache_lookup_outcomes_total{object=\"nar\",method=\"GET\",outcome=\"hit\"} 1",
         "narjar_cache_lookup_outcomes_total{object=\"nar\",method=\"GET\",outcome=\"miss\"} 1",
@@ -2863,6 +2855,27 @@ fn published_narinfo_and_nar_get_head_are_pair_gated() {
     assert!(narinfo_head[narinfo_head_body..].is_empty());
     assert_eq!(&nar_get[nar_get_body..], nar_bytes);
     assert!(nar_head[nar_head_body..].is_empty());
+}
+
+#[test]
+fn narinfo_get_trusts_immutable_disk_contents_without_revalidation() {
+    let server = RunningServer::start("narinfo-disk-trust");
+    let nar_hash = nix32_sha256(b"NAR is not re-opened for this metadata GET");
+    let narinfo = signed_narinfo(&nar_hash, 37).replace("Sig: narjar-test:", "Sig: untrusted:");
+    fs::write(
+        server.data_dir.join(format!("{STORE_HASH}.narinfo")),
+        &narinfo,
+    )
+    .expect("on-disk narinfo fixture should be written");
+
+    let response = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
+    let (headers, body) = response_parts(&response);
+    let (signal, status) = server.stop();
+
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+    assert_eq!(body, narinfo.as_bytes());
 }
 fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
     let mut decoded = Vec::new();
@@ -3249,7 +3262,7 @@ fn nar_reads_survive_unlink_and_aborted_slow_clients_without_exposing_temps() {
 }
 
 #[test]
-fn read_misses_do_not_hide_corrupt_or_unreadable_finals() {
+fn narinfo_reads_trust_immutable_metadata_and_reject_symlinked_nars() {
     let server = RunningServer::start("read-errors");
     let narinfo_path = server.data_dir.join(format!("{STORE_HASH}.narinfo"));
     fs::write(&narinfo_path, [0xff]).expect("write corrupt narinfo");
@@ -3257,10 +3270,10 @@ fn read_misses_do_not_hide_corrupt_or_unreadable_finals() {
     let corrupt_narinfo = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
     let (corrupt_headers, corrupt_body) = response_parts(&corrupt_narinfo);
     assert!(
-        corrupt_headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        corrupt_headers.starts_with("HTTP/1.1 200 OK\r\n"),
         "{corrupt_headers:?}"
     );
-    assert!(corrupt_body.is_empty());
+    assert_eq!(corrupt_body, [0xff]);
     fs::remove_file(narinfo_path).expect("remove corrupt narinfo");
 
     let nar_path = server.data_dir.join(format!("nar/{NAR_ID}.nar"));

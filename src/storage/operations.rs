@@ -462,54 +462,6 @@ impl Storage {
             .map_err(|_| StorageError::NarMismatch)
     }
 
-    pub(crate) fn nar_matches(&self, narinfo: &ValidatedNarInfo) -> Result<NarMatch, StorageError> {
-        if let NarRepresentation::Raw(identity) = narinfo.payload() {
-            return self.canonical_nar_matches(identity);
-        }
-        let representation = narinfo.payload();
-        let nar_directory = self.nar_directory()?;
-        let payload_name = representation.file_name();
-        open_optional_at(&nar_directory, &payload_name.os_string())?.map_or(
-            Ok(NarMatch::Missing),
-            |file| {
-                if file.metadata()?.len() != representation.encoded_size().get() {
-                    return Ok(NarMatch::Mismatch);
-                }
-                self.validated_delivery_identity(payload_name, &file)
-                    .map(|identity| match identity == representation.identity() {
-                        true => NarMatch::Match,
-                        false => NarMatch::Mismatch,
-                    })
-            },
-        )
-    }
-
-    fn canonical_nar_matches(&self, identity: NarIdentity) -> Result<NarMatch, StorageError> {
-        match &self.payloads {
-            PayloadStorage::Chunked(store) => Ok(
-                match store
-                    .validate_manifest(identity.hash())
-                    .map_err(storage_error_for_chunk_store)?
-                {
-                    None => NarMatch::Missing,
-                    Some(manifest) if manifest.identity() == identity => NarMatch::Match,
-                    Some(_) => NarMatch::Mismatch,
-                },
-            ),
-            PayloadStorage::Flat => {
-                let nar_directory = self.nar_directory()?;
-                let name = NarFileName::raw(identity.hash());
-                open_optional_at(&nar_directory, &name.os_string())?.map_or(
-                    Ok(NarMatch::Missing),
-                    |file| {
-                        self.validated_delivery_identity(name, &file)
-                            .map(|actual| NarMatch::from_content_match(actual == identity))
-                    },
-                )
-            }
-        }
-    }
-
     #[cfg(test)]
     pub(super) fn publish_narinfo_unchecked(
         &self,

@@ -101,7 +101,6 @@ struct QueuedPublication {
 struct RequestWorkerContext {
     storage: Arc<Storage>,
     authorizer: Arc<Authorizer>,
-    trusted_keys: Arc<TrustedPublicKeys>,
     metrics: Arc<Metrics>,
     publication_sender: Sender<QueuedPublication>,
     min_free_bytes: u64,
@@ -219,7 +218,6 @@ fn process_next_request(
                 request,
                 &context.storage,
                 &context.authorizer,
-                &context.trusted_keys,
                 &context.metrics,
                 context.min_free_bytes,
             ),
@@ -333,8 +331,9 @@ fn try_dispatch(
     }
 }
 
-fn configure_socket_timeouts(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+fn configure_accepted_socket(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
     stream.set_nonblocking(false)?;
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))
 }
@@ -520,7 +519,7 @@ fn run_accept_loop(listener: TcpListener, context: AcceptLoopContext) -> Result<
                     drop(stream);
                     break;
                 }
-                configure_socket_timeouts(&stream, context.io_timeout).map_err(|error| {
+                configure_accepted_socket(&stream, context.io_timeout).map_err(|error| {
                     Error::runtime(format!("cannot configure socket timeouts: {error}"))
                 })?;
                 if let Some(mut stream) = try_dispatch(
@@ -622,7 +621,6 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let request_context = RequestWorkerContext {
         storage: Arc::clone(&storage),
         authorizer: Arc::clone(&authorizer),
-        trusted_keys: Arc::clone(&trusted_keys),
         metrics: Arc::clone(&metrics),
         publication_sender: publication_sender.clone(),
         min_free_bytes,
@@ -732,7 +730,7 @@ mod tests {
     use narjar::__private::{http_server::Request, metrics::Metrics};
 
     use super::{
-        Admissions, configure_socket_timeouts, keep_alive_request_is_waiting,
+        Admissions, configure_accepted_socket, keep_alive_request_is_waiting,
         request_read_failure_outcome,
     };
     use narjar::__private::metrics::ConnectionOutcome;
@@ -783,6 +781,19 @@ mod tests {
     }
 
     #[test]
+    fn accepted_socket_sends_http_headers_and_body_without_nagle_delay() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let _client = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect test listener");
+        let (stream, _) = listener.accept().expect("accept test request");
+
+        configure_accepted_socket(&stream, Duration::from_secs(1))
+            .expect("configure accepted socket");
+
+        assert!(stream.nodelay().expect("read TCP_NODELAY"));
+    }
+
+    #[test]
     fn socket_read_times_out_when_request_headers_stop_progressing() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let address = listener.local_addr().expect("listener address");
@@ -795,7 +806,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().expect("accept test request");
-        configure_socket_timeouts(&stream, Duration::from_millis(50))
+        configure_accepted_socket(&stream, Duration::from_millis(50))
             .expect("configure socket timeouts");
         let error = match Request::read(stream) {
             Ok(_) => panic!("incomplete headers should hit the read deadline"),
@@ -819,7 +830,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().expect("accept idle connection");
-        configure_socket_timeouts(&stream, Duration::from_millis(30))
+        configure_accepted_socket(&stream, Duration::from_millis(30))
             .expect("configure socket timeout");
         assert!(!keep_alive_request_is_waiting(&stream).expect("peek idle connection"));
         client.join().expect("client should finish");
@@ -834,7 +845,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().expect("accept closed connection");
-        configure_socket_timeouts(&stream, Duration::from_millis(100))
+        configure_accepted_socket(&stream, Duration::from_millis(100))
             .expect("configure socket timeout");
         client.join().expect("client should close cleanly");
         assert!(!keep_alive_request_is_waiting(&stream).expect("peek closed connection"));
@@ -851,7 +862,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().expect("accept partial request");
-        configure_socket_timeouts(&stream, Duration::from_millis(30))
+        configure_accepted_socket(&stream, Duration::from_millis(30))
             .expect("configure socket timeout");
         assert!(keep_alive_request_is_waiting(&stream).expect("peek partial request"));
         let error = match Request::read(stream) {

@@ -11,9 +11,9 @@ use crate::{
         CacheLookupOutcome, CacheObject, Metrics, NarRangeOutcome, RequestGuard, RequestMethod,
         RequestRoute, render_prometheus,
     },
-    narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
+    narinfo::MAX_NARINFO_BYTES,
     object::NarFileName,
-    storage::{NarMatch, NarReadBody, Storage, StorageReadiness, StoreHash},
+    storage::{NarReadBody, Storage, StorageReadiness, StoreHash},
 };
 
 use super::write::unauthorized;
@@ -117,19 +117,14 @@ fn respond_narinfo(
     request: Request,
     storage: &Storage,
     store: &StoreHash,
-    trusted: &TrustedPublicKeys,
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
     let lookup_started = Instant::now();
-    let bytes = match load_verified_narinfo(storage, store, trusted) {
+    let bytes = match load_published_narinfo(storage, store) {
         Ok(bytes) => bytes,
         Err(NarInfoReadFailure::Missing) => {
             record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
-            return not_found(guard, request);
-        }
-        Err(NarInfoReadFailure::PayloadUnavailable) => {
-            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
             return not_found(guard, request);
         }
         Err(NarInfoReadFailure::InvalidOrUnreadable) => {
@@ -149,33 +144,18 @@ fn respond_narinfo(
 #[derive(Clone, Copy)]
 enum NarInfoReadFailure {
     Missing,
-    PayloadUnavailable,
     InvalidOrUnreadable,
 }
 
-fn load_verified_narinfo(
+fn load_published_narinfo(
     storage: &Storage,
     store: &StoreHash,
-    trusted: &TrustedPublicKeys,
 ) -> Result<Vec<u8>, NarInfoReadFailure> {
     let narinfo = storage
         .open_narinfo(store)
         .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)?
         .ok_or(NarInfoReadFailure::Missing)?;
-    let bytes = read_bounded_narinfo(narinfo)?;
-    let validated = trusted
-        .validate(store, bytes)
-        .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)?;
-    match storage.nar_matches(&validated) {
-        Ok(NarMatch::Match) => {}
-        Ok(NarMatch::Missing | NarMatch::Mismatch) => {
-            return Err(NarInfoReadFailure::PayloadUnavailable);
-        }
-        Err(_) => return Err(NarInfoReadFailure::InvalidOrUnreadable),
-    }
-    validated
-        .into_bytes()
-        .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)
+    read_bounded_narinfo(narinfo)
 }
 
 fn read_bounded_narinfo(mut narinfo: impl Read) -> Result<Vec<u8>, NarInfoReadFailure> {
@@ -640,7 +620,6 @@ pub fn respond(
     request: Request,
     storage: &Storage,
     authorizer: &Authorizer,
-    trusted: &TrustedPublicKeys,
     metrics: &Metrics,
     min_free_bytes: u64,
 ) -> Option<TcpStream> {
@@ -656,9 +635,9 @@ pub fn respond(
             min_free_bytes,
             &guard,
         ),
-        ReadRoute::Cache(route) => respond_cache_route(
-            route, request, storage, authorizer, trusted, metrics, &guard,
-        ),
+        ReadRoute::Cache(route) => {
+            respond_cache_route(route, request, storage, authorizer, metrics, &guard)
+        }
     }
 }
 
@@ -789,7 +768,6 @@ fn respond_cache_route(
     request: Request,
     storage: &Storage,
     authorizer: &Authorizer,
-    trusted: &TrustedPublicKeys,
     metrics: &Metrics,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
@@ -825,7 +803,7 @@ fn respond_cache_route(
                 }
                 CacheRoute::Nar(name) => respond_nar(request, storage, name, guard, visibility),
                 CacheRoute::NarInfo(store) => {
-                    respond_narinfo(request, storage, &store, trusted, guard, visibility)
+                    respond_narinfo(request, storage, &store, guard, visibility)
                 }
             }
         }
