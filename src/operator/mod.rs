@@ -13,7 +13,7 @@ use std::{
 
 use clap::Args;
 use data_encoding::BASE64;
-use narjar::{
+use narjar::__private::{
     inventory::{Inventory, InventoryClass, InventoryEntry, VerificationMode},
     maintenance::{
         Mode as MaintenanceMode, Operation as MaintenanceOperation, Outcome as MaintenanceOutcome,
@@ -186,7 +186,7 @@ fn report(
     mode: ReportMode,
     verify_hashes: bool,
     json: bool,
-    backend: narjar::storage::StorageBackend,
+    backend: narjar::__private::storage::StorageBackend,
 ) -> Result<(), Error> {
     let recorder = mode.begin_maintenance(&root);
     let inventory = match scan_inventory(&root, mode.verification_mode(verify_hashes), backend) {
@@ -285,7 +285,7 @@ fn structural_report(
     limit: usize,
     min_age_seconds: u64,
     json: bool,
-    backend: narjar::storage::StorageBackend,
+    backend: narjar::__private::storage::StorageBackend,
 ) -> Result<(), Error> {
     structural_scan(
         root,
@@ -308,7 +308,7 @@ fn structural_scan(
     limit: usize,
     min_age_seconds: u64,
     json: bool,
-    backend: narjar::storage::StorageBackend,
+    backend: narjar::__private::storage::StorageBackend,
     action: StructuralAction,
 ) -> Result<(), Error> {
     let options = StructuralScanOptions::new(limit, min_age_seconds)?;
@@ -416,7 +416,7 @@ impl StructuralAction {
 
 fn process_structural_entry(
     storage: &Storage,
-    entry: &narjar::storage::ReconcileEntry,
+    entry: &narjar::__private::storage::ReconcileEntry,
     action: StructuralAction,
     json: bool,
 ) -> Result<StructuralEntryResult, Error> {
@@ -427,7 +427,7 @@ fn process_structural_entry(
 
 fn structural_entry_action(
     storage: &Storage,
-    entry: &narjar::storage::ReconcileEntry,
+    entry: &narjar::__private::storage::ReconcileEntry,
     action: StructuralAction,
 ) -> Result<(&'static str, StructuralEntryResult), Error> {
     match action {
@@ -438,7 +438,7 @@ fn structural_entry_action(
 
 fn cleanup_structural_entry(
     storage: &Storage,
-    entry: &narjar::storage::ReconcileEntry,
+    entry: &narjar::__private::storage::ReconcileEntry,
 ) -> Result<(&'static str, StructuralEntryResult), Error> {
     match entry.class() {
         ReconcileClass::TempStale => match storage.cleanup_stale_temp(entry).map_err(runtime)? {
@@ -1190,7 +1190,7 @@ fn json_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use narjar::maintenance::{Operation, Outcome};
+    use narjar::__private::maintenance::{Operation, Outcome};
 
     #[test]
     fn managed_file_conflict_never_replaces_existing_contents_or_leaves_temps() {
@@ -1251,7 +1251,7 @@ machine other.example password other-secret
         })
         .expect("dry-run GC should complete");
 
-        let history = narjar::maintenance::read_snapshot(directory.path())
+        let history = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should be readable");
         let run = history.last_runs[Operation::Gc.index()].expect("GC result should be recorded");
         assert_eq!(run.outcome, Outcome::Success);
@@ -1293,7 +1293,7 @@ machine other.example password other-secret
             storage_backend: StorageBackend::Flat,
         })
         .expect("cache should initialize");
-        let before = narjar::maintenance::read_snapshot(directory.path())
+        let before = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should be readable");
         let root = Directory::open(directory.path()).expect("cache root should open");
         let _active_storage = Storage::initialize(&root, StorageBackend::Flat)
@@ -1316,7 +1316,7 @@ machine other.example password other-secret
             "a concurrent GC must fail to acquire the lock"
         );
 
-        let after = narjar::maintenance::read_snapshot(directory.path())
+        let after = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should remain readable");
         assert_eq!(
             after.started[Operation::Gc.index()],
@@ -1351,7 +1351,7 @@ machine other.example password other-secret
         .expect_err("malformed metadata should fail verification");
         assert!(error.to_string().contains("invalid published pairs"));
 
-        let history = narjar::maintenance::read_snapshot(directory.path())
+        let history = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should be readable");
         let run = history.last_runs[Operation::Verify.index()]
             .expect("verification result should be recorded");

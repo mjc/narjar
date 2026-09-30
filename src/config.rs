@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::Args;
-use narjar::{object::WireEncoding, storage::StorageBackend};
+use narjar::{__private::storage::StorageBackend, object::WireEncoding};
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {

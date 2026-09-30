@@ -1,25 +1,46 @@
+#[path = "storage/cache_info.rs"]
 mod cache_info;
 #[allow(dead_code)]
+#[path = "storage/chunk_store.rs"]
 pub(crate) mod chunk_store;
 #[allow(dead_code)]
+#[path = "storage/chunked.rs"]
 pub(crate) mod chunked;
+#[path = "storage/compression.rs"]
 mod compression;
+#[path = "storage/directory.rs"]
 mod directory;
+#[path = "storage/egress.rs"]
 mod egress;
+#[path = "storage/fs.rs"]
 mod fs;
+#[path = "storage/gc.rs"]
 pub mod gc;
+#[path = "storage/ids.rs"]
 mod ids;
+#[path = "storage/ingest.rs"]
 mod ingest;
+#[path = "storage/initialization.rs"]
 mod initialization;
+#[path = "storage/inspection.rs"]
 pub(crate) mod inspection;
+#[path = "storage/location.rs"]
 mod location;
+#[path = "storage/operations.rs"]
 mod operations;
+#[path = "storage/population.rs"]
 mod population;
+#[path = "storage/publication/mod.rs"]
 mod publication;
+#[path = "storage/receipt.rs"]
 mod receipt;
+#[path = "storage/reconcile.rs"]
 mod reconcile;
+#[path = "storage/recovery.rs"]
 mod recovery;
+#[path = "storage/state.rs"]
 mod state;
+#[path = "storage/typestate.rs"]
 mod typestate;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -68,4 +89,5 @@ pub const MANIFEST_DIRECTORY: &str = ".narjar-manifests";
 pub const LAYOUT_DESCRIPTOR: &str = ".narjar-layout";
 
 #[cfg(test)]
+#[path = "storage/tests.rs"]
 mod tests;

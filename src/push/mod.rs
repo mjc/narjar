@@ -8,7 +8,7 @@ use std::{
 
 use clap::Args;
 use narjar::{
-    narinfo::{MAX_NARINFO_BYTES, NarInfoMetadata},
+    __private::narinfo::{MAX_NARINFO_BYTES, NarInfoMetadata},
     object::{NarRepresentation, WireEncoding},
 };
 use ureq::{Agent, http::StatusCode};

@@ -2,7 +2,8 @@
 //!
 //! This is deliberately a decoder only. It exposes NAR structure to research
 //! tools while hashing and counting the original byte stream independently of
-//! the semantic events.
+//! the semantic events. Input is read incrementally; file bodies are delivered
+//! as borrowed chunks and are never retained by the decoder.
 
 use std::{fmt, io, io::Read};
 
@@ -12,20 +13,38 @@ const CHUNK_SIZE: usize = 64 * 1024;
 const TOKEN_LIMIT: u64 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The type of a NAR node.
 pub enum RootKind {
+    /// A directory node, which can contain entries.
     Directory,
+    /// A regular file node.
     Regular,
+    /// A symbolic-link node.
     Symlink,
 }
 
 #[derive(Clone, Debug)]
+/// Resource limits applied while decoding a NAR.
+///
+/// `Default` permits up to 1,024 levels of node nesting, 10 million entries,
+/// 64 GiB per file, and 128 GiB of encoded NAR bytes. All limits are checked
+/// while input is read.
 pub struct Limits {
+    /// Maximum node nesting depth. The root is depth zero; each child node
+    /// adds one level, whether it is a directory, file, or symlink.
     pub max_depth: usize,
+    /// Maximum byte length of one directory entry name.
     pub max_name_bytes: u64,
+    /// Maximum byte length of one symbolic-link target.
     pub max_symlink_target_bytes: u64,
+    /// Maximum number of directory entries.
     pub max_entries: u64,
+    /// Maximum byte length of one regular file.
     pub max_file_bytes: u64,
+    /// Maximum byte length of the complete encoded NAR stream, including
+    /// framing, names, file contents, and padding.
     pub max_total_bytes: u64,
+    /// Maximum decoder work units, limiting adversarially expensive structure.
     pub max_work: u64,
 }
 
@@ -48,14 +67,25 @@ impl Default for Limits {
 /// `E` is the error type chosen by the event sink. Input and structural errors
 /// remain represented by the decoder's own variants.
 #[derive(Debug)]
+/// A decoding, validation, resource-limit, or event-sink error.
+///
+/// The generic parameter is the error returned by [`EventSink`].
 pub enum DecodeError<E = io::Error> {
+    /// Reading the encoded NAR failed.
     Io(io::Error),
+    /// The consumer rejected an emitted event.
     Sink(E),
+    /// The NAR has invalid structure or unexpected trailing bytes.
     Invalid(String),
+    /// The NAR is structurally readable but violates canonical encoding rules.
     NonCanonical(&'static str),
+    /// A configured decoder resource limit was exceeded.
     LimitExceeded {
+        /// The resource whose limit was exceeded.
         what: &'static str,
+        /// The configured maximum.
         limit: u64,
+        /// The observed value.
         actual: u64,
     },
 }
@@ -87,30 +117,49 @@ impl<E: std::error::Error + 'static> std::error::Error for DecodeError<E> {
 }
 
 #[derive(Debug)]
+/// One structural event produced by [`Decoder`].
+///
+/// File chunks borrow the decoder's fixed-size buffer and are valid only for
+/// the duration of the sink callback. Names and link targets are owned.
 pub enum Event<'a> {
+    /// A directory node begins at the given nesting depth.
     BeginDirectory {
+        /// Zero identifies the root directory.
         depth: usize,
     },
+    /// A directory entry begins; its name is the following node's basename.
     Entry {
+        /// Raw NAR bytes for the entry name.
         name: Vec<u8>,
     },
+    /// A regular file node begins with its complete declared body size.
     BeginFile {
+        /// Whether the executable marker is present.
         executable: bool,
+        /// Declared number of file-body bytes.
         size: u64,
+        /// Offset of this file's body in the decoded NAR byte stream.
         offset: u64,
     },
+    /// A borrowed segment of the current regular file body.
     FileChunk(&'a [u8]),
+    /// The current regular file node has ended.
     EndFile,
+    /// A symbolic-link node with an owned target.
     Symlink {
+        /// Raw NAR bytes for the link target.
         target: Vec<u8>,
     },
+    /// The current directory node has ended.
     EndDirectory,
 }
 
+/// Receives parsed NAR events and supplies its concrete delivery error type.
 pub trait EventSink {
     /// The error returned when delivering an event fails.
     type Error: std::error::Error + 'static;
 
+    /// Processes one event before the decoder continues reading.
     fn event(&mut self, event: Event<'_>) -> Result<(), Self::Error>;
 }
 
@@ -127,15 +176,26 @@ where
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Measurements computed from the complete decoded NAR byte stream.
 pub struct DecodeSummary {
+    /// Type of the root node.
     pub root: RootKind,
+    /// Number of bytes in the encoded NAR stream.
     pub raw_size: u64,
+    /// SHA-256 digest of the exact encoded NAR bytes.
     pub raw_sha256: [u8; 32],
+    /// Number of directory entries.
     pub entries: u64,
+    /// Number of regular files.
     pub files: u64,
+    /// Number of symbolic links.
     pub symlinks: u64,
 }
 
+/// Incrementally decodes one NAR from a [`Read`] source.
+///
+/// The decoder owns its reader and can be consumed only once by
+/// [`Decoder::decode`].
 pub struct Decoder<R> {
     reader: R,
     limits: Limits,
@@ -146,10 +206,12 @@ pub struct Decoder<R> {
 }
 
 impl<R: Read> Decoder<R> {
+    /// Creates a decoder using [`Limits::default`].
     pub fn new(reader: R) -> Self {
         Self::with_limits(reader, Limits::default())
     }
 
+    /// Creates a decoder with explicit input and work limits.
     pub fn with_limits(reader: R, limits: Limits) -> Self {
         Self {
             reader,
@@ -161,6 +223,11 @@ impl<R: Read> Decoder<R> {
         }
     }
 
+    /// Reads one complete NAR and emits its events to `sink`.
+    ///
+    /// Success means the root is complete and the reader reached EOF; trailing
+    /// bytes are rejected. The summary hashes the original NAR bytes, not a
+    /// re-encoding of the emitted events.
     pub fn decode<S: EventSink>(
         mut self,
         sink: &mut S,

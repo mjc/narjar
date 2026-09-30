@@ -7,7 +7,7 @@ use std::{
 };
 
 use clap::Args;
-use narjar::storage::StorageBackend;
+use narjar::__private::storage::StorageBackend;
 
 use crate::{
     error::Error,
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(setup.priority, 30);
         assert!(matches!(
             setup.storage_backend,
-            narjar::storage::StorageBackend::Flat
+            narjar::__private::storage::StorageBackend::Flat
         ));
         assert!(!setup.private_read);
     }

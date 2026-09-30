@@ -10,6 +10,18 @@ Nix installation or a database.
 Uploads and downloads support uncompressed NARs, Zstd, and XZ. Upload
 compression, storage layout, and download compression are configured separately.
 
+## Rust API
+
+Narjar is a CLI product, not a storage-library crate. Its supported Rust API is
+limited to the NAR streaming decoder (`nar`), canonical event encoder
+(`nar_encode`), and typed content identities (`object`). These APIs cover
+reading and writing NAR streams; they do not expose cache storage, HTTP server,
+authorization, maintenance, or backend lifecycle contracts. Those
+implementation modules are hidden under `narjar::__private` for use by the
+binary and repository integration tests and are not supported for downstream
+consumers. The API may change incompatibly between pre-1.0 minor releases;
+patch releases retain compatibility.
+
 ## Installation
 
 To build from source, install Rust 1.98 or later, a C toolchain, pkg-config, and

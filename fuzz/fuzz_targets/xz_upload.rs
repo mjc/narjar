@@ -4,7 +4,9 @@ use std::io::Cursor;
 
 use libfuzzer_sys::fuzz_target;
 use narjar::object::{CompressionCodec, WireEncoding};
-use narjar::storage::{Directory, FileHash, NarFileName, NarUploadPolicy, Storage, StorageBackend};
+use narjar::__private::storage::{
+    Directory, FileHash, NarFileName, NarUploadPolicy, Storage, StorageBackend,
+};
 use tempfile::tempdir;
 
 fuzz_target!(|input: &[u8]| {

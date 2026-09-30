@@ -11,7 +11,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
-use narjar::{
+use narjar::__private::{
     auth::Authorizer,
     http::{PublicationRequest, prepare_publication, respond},
     http_server::{Method, Request, StatusCode, write_status},
@@ -26,7 +26,7 @@ use signal_hook::{
 };
 
 use crate::{config::ServeConfig, error::Error};
-use narjar::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure};
+use narjar::__private::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure};
 
 struct Admissions {
     limit: usize,
@@ -729,13 +729,13 @@ mod tests {
         time::Duration,
     };
 
-    use narjar::{http_server::Request, metrics::Metrics};
+    use narjar::__private::{http_server::Request, metrics::Metrics};
 
     use super::{
         Admissions, configure_socket_timeouts, keep_alive_request_is_waiting,
         request_read_failure_outcome,
     };
-    use narjar::metrics::ConnectionOutcome;
+    use narjar::__private::metrics::ConnectionOutcome;
 
     #[test]
     fn request_read_failures_keep_disconnect_timeout_and_malformed_distinct() {

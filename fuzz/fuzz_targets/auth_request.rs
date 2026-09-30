@@ -5,9 +5,11 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 
 use libfuzzer_sys::fuzz_target;
-use narjar::auth::{Authorizer, Permission};
-use narjar::http_server::Request;
-use narjar::storage::Directory;
+use narjar::__private::{
+    auth::{Authorizer, Permission},
+    http_server::Request,
+    storage::Directory,
+};
 use tempfile::tempdir;
 
 fn exercise(input: &[u8]) {

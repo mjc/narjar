@@ -1,3 +1,9 @@
+//! Typed identities and representation descriptors used by the NAR API.
+//!
+//! Logical NAR hashes and encoded-file hashes have distinct marker types, as do
+//! their byte counts. This prevents accidentally comparing or substituting
+//! identities for different byte streams.
+
 use std::{ffi::OsString, fmt, marker::PhantomData, str::FromStr, sync::OnceLock};
 
 use data_encoding::{BitOrder, Encoding, Specification};
@@ -7,6 +13,7 @@ const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const NIX32_SHA256_LEN: usize = 52;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A string is not a canonical Nix base-32 SHA-256 identifier.
 pub struct InvalidObjectId;
 
 impl fmt::Display for InvalidObjectId {
@@ -28,6 +35,10 @@ pub enum EncodedFile {}
 /// A SHA-256 digest whose purpose remains part of its compile-time type.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
+/// A SHA-256 digest tagged with the kind of bytes it identifies.
+///
+/// Its textual form is canonical Nix base-32, not hexadecimal or standard
+/// RFC 4648 base-32. Construct from digest bytes or parse that textual form.
 pub struct Sha256Digest<Purpose>([u8; 32], #[serde(skip)] PhantomData<fn() -> Purpose>);
 
 /// SHA-256 identity of the decoded NAR byte stream.
@@ -37,10 +48,12 @@ pub type NarHash = Sha256Digest<LogicalNar>;
 pub type FileHash = Sha256Digest<EncodedFile>;
 
 impl<Purpose> Sha256Digest<Purpose> {
+    /// Parses a canonical 52-character Nix base-32 SHA-256 digest.
     pub fn parse(value: &str) -> Result<Self, InvalidObjectId> {
         decode_sha256(value).map(Self::from_digest)
     }
 
+    /// Creates a typed digest from its 32 raw SHA-256 bytes.
     pub const fn from_digest(digest: [u8; 32]) -> Self {
         Self(digest, PhantomData)
     }
@@ -61,10 +74,16 @@ impl Sha256Digest<EncodedFile> {
         self.bytes() == hash.bytes()
     }
 
+    /// Re-tags a digest after establishing that raw file bytes match a NAR hash.
     pub const fn from_nar_hash(hash: NarHash) -> Self {
         Self::from_digest(hash.bytes())
     }
 
+    /// Re-tags this digest as a NAR hash without decoding or verifying bytes.
+    ///
+    /// Use this only when the hashed file bytes are the uncompressed NAR
+    /// itself. For an XZ- or Zstandard-compressed file, this returns the hash
+    /// of the compressed bytes, not the decoded NAR hash.
     pub const fn as_nar_hash(self) -> NarHash {
         NarHash::from_digest(self.bytes())
     }
@@ -85,20 +104,24 @@ pub struct CompressedNarIdentity {
 }
 
 impl CompressedNarIdentity {
+    /// Binds compressed-file identity to the decoded logical NAR identity.
     pub const fn new(encoded: EncodedIdentity, decoded: NarIdentity) -> Self {
         Self { encoded, decoded }
     }
 
+    /// Returns the compressed file's codec, hash, and encoded size.
     pub const fn encoded(self) -> EncodedIdentity {
         self.encoded
     }
 
+    /// Returns the decoded NAR's logical hash and size.
     pub const fn decoded(self) -> NarIdentity {
         self.decoded
     }
 }
 
 impl EncodedIdentity {
+    /// Describes one compressed representation and its measured file identity.
     pub const fn new(codec: CompressionCodec, hash: FileHash, size: EncodedSize) -> Self {
         Self {
             codec,
@@ -106,18 +129,22 @@ impl EncodedIdentity {
         }
     }
 
+    /// Returns the compression codec used for this file.
     pub const fn codec(self) -> CompressionCodec {
         self.codec
     }
 
+    /// Returns the SHA-256 hash of the encoded file bytes.
     pub const fn hash(self) -> FileHash {
         self.content.hash()
     }
 
+    /// Returns the encoded file length in bytes.
     pub const fn size(self) -> EncodedSize {
         self.content.size()
     }
 
+    /// Returns the immutable cache filename for this compressed file.
     pub const fn file_name(self) -> NarFileName {
         NarFileName::new(self.hash(), WireEncoding::Compressed(self.codec))
     }
@@ -126,13 +153,16 @@ impl EncodedIdentity {
 /// A byte count whose represented content remains part of its compile-time type.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
+/// A byte count tagged with the kind of content it measures.
 pub struct ByteCount<Purpose>(u64, #[serde(skip)] PhantomData<fn() -> Purpose>);
 
 impl<Purpose> ByteCount<Purpose> {
+    /// Creates a count of bytes for the selected content purpose.
     pub const fn new(value: u64) -> Self {
         Self(value, PhantomData)
     }
 
+    /// Returns the byte count as an unsigned integer.
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -159,20 +189,24 @@ pub type EncodedSize = ByteCount<EncodedFile>;
 /// A hash and byte count that necessarily describe the same kind of content.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(bound(serialize = "", deserialize = ""))]
+/// A hash and size that identify the same kind of content.
 pub struct ContentIdentity<Purpose> {
     hash: Sha256Digest<Purpose>,
     size: ByteCount<Purpose>,
 }
 
 impl<Purpose> ContentIdentity<Purpose> {
+    /// Combines a purpose-tagged digest and byte count.
     pub const fn new(hash: Sha256Digest<Purpose>, size: ByteCount<Purpose>) -> Self {
         Self { hash, size }
     }
 
+    /// Returns the digest of this content.
     pub const fn hash(self) -> Sha256Digest<Purpose> {
         self.hash
     }
 
+    /// Returns the byte count of this content.
     pub const fn size(self) -> ByteCount<Purpose> {
         self.size
     }
@@ -193,6 +227,7 @@ pub struct NarFileName {
 }
 
 impl NarFileName {
+    /// Creates a payload filename identity from its hash and wire encoding.
     pub const fn new(file_hash: FileHash, encoding: WireEncoding) -> Self {
         Self {
             file_hash,
@@ -200,6 +235,8 @@ impl NarFileName {
         }
     }
 
+    /// Parses a canonical Nix base-32 hash followed by `.nar`, `.nar.xz`, or
+    /// `.nar.zst`.
     pub fn parse(name: &str) -> Result<Self, InvalidObjectId> {
         [
             WireEncoding::Compressed(CompressionCodec::Zstd),
@@ -214,14 +251,17 @@ impl NarFileName {
         .ok_or(InvalidObjectId)?
     }
 
+    /// Constructs the raw `.nar` filename for a logical NAR hash.
     pub const fn raw(hash: NarHash) -> Self {
         Self::new(FileHash::from_nar_hash(hash), WireEncoding::Raw)
     }
 
+    /// Returns the encoded-file hash used in this pathname.
     pub const fn file_hash(self) -> FileHash {
         self.file_hash
     }
 
+    /// Returns the raw, XZ, or Zstandard encoding selected by this pathname.
     pub const fn encoding(self) -> WireEncoding {
         self.encoding
     }
@@ -245,12 +285,16 @@ impl fmt::Display for NarFileName {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Encoding named by a payload filename or narinfo transport fields.
 pub enum WireEncoding {
+    /// Uncompressed NAR bytes.
     Raw,
+    /// Compressed NAR bytes using the selected codec.
     Compressed(CompressionCodec),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A compression name is not one of the supported wire encodings.
 pub struct InvalidWireEncoding;
 
 impl fmt::Display for InvalidWireEncoding {
@@ -275,12 +319,16 @@ impl FromStr for WireEncoding {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+/// A supported NAR compression codec.
 pub enum CompressionCodec {
+    /// Zstandard compression.
     Zstd,
+    /// XZ/LZMA2 compression.
     Xz,
 }
 
 impl CompressionCodec {
+    /// Returns the NAR payload filename suffix for this codec.
     pub const fn suffix(self) -> &'static str {
         match self {
             Self::Zstd => ".nar.zst",
@@ -298,15 +346,19 @@ impl From<CompressionCodec> for WireEncoding {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 /// The exact payload representation described by a narinfo document.
 pub enum NarRepresentation {
+    /// An uncompressed payload with its logical NAR identity.
     Raw(NarIdentity),
+    /// A compressed file identity bound to the logical NAR it decodes to.
     Compressed(CompressedNarIdentity),
 }
 
 impl NarRepresentation {
+    /// Creates a compressed representation from its encoded and decoded facts.
     pub const fn compressed(encoded: EncodedIdentity, decoded: NarIdentity) -> Self {
         Self::Compressed(CompressedNarIdentity::new(encoded, decoded))
     }
 
+    /// Returns the decoded logical NAR identity.
     pub const fn identity(self) -> NarIdentity {
         match self {
             Self::Raw(identity) => identity,
@@ -314,6 +366,7 @@ impl NarRepresentation {
         }
     }
 
+    /// Returns the immutable filename for the exact payload representation.
     pub const fn file_name(self) -> NarFileName {
         match self {
             Self::Raw(identity) => NarFileName::raw(identity.hash()),
@@ -321,6 +374,7 @@ impl NarRepresentation {
         }
     }
 
+    /// Returns the exact byte length of the served or uploaded representation.
     pub const fn encoded_size(self) -> EncodedSize {
         match self {
             Self::Raw(identity) => EncodedSize::new(identity.size().get()),
@@ -330,6 +384,7 @@ impl NarRepresentation {
 }
 
 impl WireEncoding {
+    /// Returns the Nix narinfo `Compression` field value.
     pub const fn compression(self) -> &'static str {
         match self {
             Self::Raw => "none",
@@ -338,6 +393,7 @@ impl WireEncoding {
         }
     }
 
+    /// Returns the payload filename suffix for this wire encoding.
     pub const fn suffix(self) -> &'static str {
         match self {
             Self::Raw => ".nar",

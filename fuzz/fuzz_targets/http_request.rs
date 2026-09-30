@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 
 use libfuzzer_sys::fuzz_target;
-use narjar::http_server::Request;
+use narjar::__private::http_server::Request;
 
 fn exercise(input: &[u8]) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fuzz listener");

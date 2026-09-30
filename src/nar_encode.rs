@@ -2,7 +2,8 @@
 //!
 //! The encoder consumes semantic events rather than a filesystem or a storage
 //! representation. Directory ordering is checked at the boundary, while file
-//! bodies are written and hashed as they arrive.
+//! bodies are written and hashed as they arrive. The output writer is returned
+//! by [`Encoder::finish`] so callers retain ownership of their destination.
 
 use std::{fmt, io, io::Write};
 
@@ -14,13 +15,26 @@ use crate::nar::RootKind;
 pub const ENCODER_VERSION: u32 = 1;
 
 #[derive(Debug)]
+/// An output, event-sequence, canonicality, or resource-limit error.
+///
+/// An encoding attempt is terminal after any such error. The encoder may have
+/// already written bytes or advanced its event state; discard the encoder and
+/// treat its destination as incomplete rather than retrying or calling
+/// [`Encoder::finish`]. An I/O error can also follow a partial write.
 pub enum EncodeError {
+    /// Writing canonical NAR bytes failed.
     Io(io::Error),
+    /// The event sequence cannot describe a complete NAR.
     Invalid(&'static str),
+    /// An event value violates canonical NAR rules.
     NonCanonical(&'static str),
+    /// A configured encoding resource limit was exceeded.
     LimitExceeded {
+        /// The resource whose limit was exceeded.
         what: &'static str,
+        /// The configured maximum.
         limit: u64,
+        /// The observed value.
         actual: u64,
     },
 }
@@ -54,23 +68,43 @@ impl std::error::Error for EncodeError {
 
 /// Representation-neutral events accepted by [`Encoder`].
 pub enum Event<'a> {
+    /// Begin a directory node.
     BeginDirectory,
+    /// Begin an entry in the current directory using its raw basename bytes.
     Entry(&'a [u8]),
-    BeginFile { executable: bool, size: u64 },
+    /// Begin a regular file with its executable bit and declared body size.
+    BeginFile {
+        /// Whether the encoded file is marked executable.
+        executable: bool,
+        /// Number of body bytes that must be supplied before `EndFile`.
+        size: u64,
+    },
+    /// Write the next bytes of the current regular file body.
     FileChunk(&'a [u8]),
+    /// Finish the current regular file after exactly its declared byte count.
     EndFile,
+    /// Write a symbolic-link node with its raw target bytes.
     Symlink(&'a [u8]),
+    /// Finish the current directory after all entries have ended.
     EndDirectory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Version, root kind, byte identity, and node counts for encoded output.
 pub struct EncodeSummary {
+    /// Event-to-byte compatibility version.
     pub version: u32,
+    /// Type of the root node.
     pub root: RootKind,
+    /// Number of bytes written to the NAR destination.
     pub raw_size: u64,
+    /// SHA-256 digest of the exact bytes written.
     pub raw_sha256: [u8; 32],
+    /// Number of directory entries.
     pub entries: u64,
+    /// Number of regular files.
     pub files: u64,
+    /// Number of symbolic links.
     pub symlinks: u64,
 }
 
@@ -87,7 +121,9 @@ enum Node {
 
 /// Writes canonical NAR bytes without retaining file bodies or the completed
 /// archive. Directory memory is bounded by nesting depth and one previous
-/// entry name per open directory.
+/// entry name per open directory. If any operation returns [`EncodeError`],
+/// discard the encoder and treat the destination as incomplete; output and
+/// event state are not rolled back.
 pub struct Encoder<W> {
     writer: W,
     limits: crate::nar::Limits,
@@ -103,10 +139,12 @@ pub struct Encoder<W> {
 }
 
 impl<W: Write> Encoder<W> {
+    /// Starts a canonical NAR encoder with [`crate::nar::Limits::default`].
     pub fn new(writer: W) -> Result<Self, EncodeError> {
         Self::with_limits(writer, crate::nar::Limits::default())
     }
 
+    /// Starts a canonical NAR encoder with explicit structural and size limits.
     pub fn with_limits(writer: W, limits: crate::nar::Limits) -> Result<Self, EncodeError> {
         let mut encoder = Self {
             writer,
@@ -125,6 +163,11 @@ impl<W: Write> Encoder<W> {
         Ok(encoder)
     }
 
+    /// Applies one event, writing its bytes before returning.
+    ///
+    /// File chunks are borrowed only for this call. Directory entries must be
+    /// in canonical byte order, and each file must receive exactly its declared
+    /// size before [`Event::EndFile`].
     pub fn push(&mut self, event: Event<'_>) -> Result<(), EncodeError> {
         self.bump_work()?;
         match event {
@@ -138,6 +181,10 @@ impl<W: Write> Encoder<W> {
         }
     }
 
+    /// Finishes the root node and returns the original writer and output facts.
+    ///
+    /// Returns [`EncodeError::Invalid`] if the event stream left any node open
+    /// or never supplied a root.
     pub fn finish(self) -> Result<(W, EncodeSummary), EncodeError> {
         if !self.finished || !self.stack.is_empty() {
             return Err(EncodeError::Invalid("the root node is incomplete"));
