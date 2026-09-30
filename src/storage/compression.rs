@@ -7,11 +7,12 @@ use std::{
     rc::Rc,
 };
 
-use lzma_rust2::XzReader;
+use lzma_rust2::XzReader as LzmaRustXzReader;
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::{
     FrameDecoder, StreamingDecoder as StructuredZstdDecoder, read_frame_header_info,
 };
+use xz4rust::{XzDecoder, XzNextBlockResult};
 
 use crate::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
@@ -20,7 +21,8 @@ use crate::object::{
 
 use super::{
     publication::{
-        DecoderMemoryLimit, DecoderMemoryLimitExceeded, StagingReservation, StorageError,
+        DecodedSizeLimitExceeded, DecoderMemoryLimit, DecoderMemoryLimitExceeded,
+        StagingReservation, StorageError,
     },
     receipt::CompressedNarReceipt,
     typestate::Validated,
@@ -241,7 +243,7 @@ impl<W: Write + ?Sized> Write for HashingWriter<'_, W> {
         if next_size > self.max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "decompressed NAR exceeds configured size limit",
+                DecodedSizeLimitExceeded,
             ));
         }
         let written = self.inner.write(buffer)?;
@@ -322,18 +324,25 @@ fn decode_xz_upload_to_raw_staging<W: Write>(
     let input =
         CheckedUploadReader::new(source, expectation.name.file_hash(), expectation.size.get());
     let source_error = Rc::new(RefCell::new(None));
-    let mut decoder = XzReader::new_mem_limit(
+    let mut decoder = BoundedXzReader::new(
         UploadCompressedSourceReader::new(input, Rc::clone(&source_error)),
-        false,
-        xz_decoder_memory_limit_kib(expectation.decoder_memory_limit.get()),
-    );
+        expectation.decoder_memory_limit.get(),
+    )
+    .map_err(|error| take_upload_source_error(&source_error, error))?;
     let decoded = copy_decoded_upload_to_raw_staging(
         &mut decoder,
         destination,
         expectation.max_nar_size,
         &source_error,
     )?;
-    finish_encoded_upload_after_decoding(decoder.into_inner().into_inner(), &source_error)?;
+    let (input, has_trailing_bytes) = decoder.into_parts();
+    if has_trailing_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes after XZ NAR",
+        ));
+    }
+    finish_encoded_upload_after_decoding(input.into_inner(), &source_error)?;
     Ok(decoded)
 }
 
@@ -362,8 +371,105 @@ fn decode_zstd_upload_to_raw_staging<W: Write>(
     Ok(decoded)
 }
 
-fn xz_decoder_memory_limit_kib(max_memory_bytes: u64) -> u32 {
-    (max_memory_bytes / 1024).min(u64::from(u32::MAX)) as u32
+const XZ_INPUT_BUFFER_BYTES: usize = 8 * 1024;
+const XZ_COPY_BUFFER_BYTES: u64 = 8 * 1024;
+const XZ_FIXED_WORKSPACE_ALLOWANCE_BYTES: u64 = 64 * 1024;
+
+struct BoundedXzReader<R> {
+    source: R,
+    decoder: Box<XzDecoder<'static>>,
+    input: [u8; XZ_INPUT_BUFFER_BYTES],
+    input_start: usize,
+    input_end: usize,
+    end_of_stream: bool,
+}
+
+impl<R> BoundedXzReader<R> {
+    fn new(source: R, memory_limit_bytes: u64) -> io::Result<Self> {
+        let fixed_workspace =
+            xz_decoder_memory_requirement(0).ok_or_else(decoder_memory_limit_error)?;
+        let dictionary_limit = memory_limit_bytes
+            .checked_sub(fixed_workspace)
+            .filter(|limit| *limit >= xz4rust::DICT_SIZE_MIN as u64)
+            .ok_or_else(decoder_memory_limit_error)?
+            .min(xz4rust::DICT_SIZE_MAX as u64) as usize;
+
+        Ok(Self {
+            source,
+            decoder: XzDecoder::in_heap_with_alloc_dict_size(
+                xz4rust::DICT_SIZE_MIN,
+                dictionary_limit,
+            ),
+            input: [0; XZ_INPUT_BUFFER_BYTES],
+            input_start: 0,
+            input_end: 0,
+            end_of_stream: false,
+        })
+    }
+
+    fn into_parts(self) -> (R, bool) {
+        (self.source, self.input_start != self.input_end)
+    }
+}
+
+pub(super) fn xz_decoder_memory_requirement(dictionary_bytes: u64) -> Option<u64> {
+    (std::mem::size_of::<XzDecoder<'static>>() as u64)
+        .checked_add(XZ_INPUT_BUFFER_BYTES as u64)?
+        .checked_add(XZ_COPY_BUFFER_BYTES)?
+        .checked_add(XZ_FIXED_WORKSPACE_ALLOWANCE_BYTES)?
+        .checked_add(dictionary_bytes)
+}
+
+impl<R: Read> Read for BoundedXzReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.end_of_stream {
+            return Ok(0);
+        }
+
+        loop {
+            if self.input_start == self.input_end {
+                self.input_end = self.source.read(&mut self.input)?;
+                self.input_start = 0;
+                if self.input_end == 0 {
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                }
+            }
+
+            let result = self
+                .decoder
+                .decode(&self.input[self.input_start..self.input_end], output)
+                .map_err(xz_decoder_error)?;
+            let consumed = result.input_consumed();
+            let produced = result.output_produced();
+            self.input_start += consumed;
+
+            match result {
+                XzNextBlockResult::NeedMoreData(_, _) if consumed == 0 && produced == 0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "XZ decoder made no progress",
+                    ));
+                }
+                XzNextBlockResult::NeedMoreData(_, _) if produced == 0 => continue,
+                XzNextBlockResult::NeedMoreData(_, _) => return Ok(produced),
+                XzNextBlockResult::EndOfStream(_, _) => {
+                    self.end_of_stream = true;
+                    return Ok(produced);
+                }
+            }
+        }
+    }
+}
+
+fn xz_decoder_error(error: xz4rust::XzError) -> io::Error {
+    match error {
+        xz4rust::XzError::DictionaryOverflow => decoder_memory_limit_error(),
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
+    }
+}
+
+fn decoder_memory_limit_error() -> io::Error {
+    io::Error::new(io::ErrorKind::OutOfMemory, DecoderMemoryLimitExceeded)
 }
 
 fn zstd_decoder_memory_requirement(window_bytes: u64) -> Option<u64> {
@@ -692,7 +798,7 @@ fn decode_verified_compressed_payload(
 
 fn decode_verified_xz_payload(verified: &VerifiedCompressedNar<'_>) -> io::Result<NarIdentity> {
     let input = rewound_compressed_file(verified.file)?;
-    let mut decoder = XzReader::new(StoredCompressedSourceReader::new(input), false);
+    let mut decoder = LzmaRustXzReader::new(StoredCompressedSourceReader::new(input), false);
     let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded().size().get())?;
     ensure_decoder_consumed_complete_compressed_file(
         &mut decoder.into_inner().into_inner(),

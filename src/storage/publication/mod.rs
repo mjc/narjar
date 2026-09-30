@@ -421,6 +421,7 @@ pub enum PublishOutcome {
 #[derive(Debug)]
 pub enum StorageError {
     Conflict,
+    DecodedSizeLimitExceeded,
     DecoderMemoryLimitExceeded,
     InsufficientSpace,
     InsufficientInodes,
@@ -433,16 +434,28 @@ pub enum StorageError {
 
 impl From<io::Error> for StorageError {
     fn from(error: io::Error) -> Self {
-        if error
-            .get_ref()
-            .is_some_and(|source| source.is::<DecoderMemoryLimitExceeded>())
-        {
-            Self::DecoderMemoryLimitExceeded
-        } else {
-            Self::Io(error)
+        match error.get_ref() {
+            Some(source) if source.is::<DecoderMemoryLimitExceeded>() => {
+                Self::DecoderMemoryLimitExceeded
+            }
+            Some(source) if source.is::<DecodedSizeLimitExceeded>() => {
+                Self::DecodedSizeLimitExceeded
+            }
+            _ => Self::Io(error),
         }
     }
 }
+
+#[derive(Debug)]
+pub(super) struct DecodedSizeLimitExceeded;
+
+impl std::fmt::Display for DecodedSizeLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("decoded NAR exceeds configured size limit")
+    }
+}
+
+impl std::error::Error for DecodedSizeLimitExceeded {}
 
 #[derive(Debug)]
 pub(super) struct DecoderMemoryLimitExceeded;
@@ -459,6 +472,9 @@ impl std::fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Conflict => formatter.write_str("immutable destination has different contents"),
+            Self::DecodedSizeLimitExceeded => {
+                formatter.write_str("decoded NAR exceeds configured size limit")
+            }
             Self::DecoderMemoryLimitExceeded => formatter
                 .write_str("compressed decoder memory requirement exceeds configured limit"),
             Self::InsufficientSpace => {
@@ -479,6 +495,7 @@ impl std::error::Error for StorageError {
         match self {
             Self::Io(error) => Some(error),
             Self::Conflict
+            | Self::DecodedSizeLimitExceeded
             | Self::DecoderMemoryLimitExceeded
             | Self::InsufficientSpace
             | Self::InsufficientInodes

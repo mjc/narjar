@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     auth::{Authorizer, Permission},
-    http_server::{BodyReader, BodyReaderError, BodyState, Request, Response, StatusCode},
+    http_server::{BodyReader, BodyReaderError, Request, Response, StatusCode},
     metrics::{ConnectionOutcome, Metrics, RequestGuard, RequestMethod, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::{NarFileName, WireEncoding},
@@ -33,6 +33,8 @@ struct CountedUploadReader<'a> {
     failure_observation: SocketFailureObservation,
 }
 
+const MAX_EARLY_REJECTION_DRAIN_BYTES: u64 = 64 * 1024;
+
 #[derive(Clone, Copy)]
 enum SocketFailureObservation {
     NotObserved,
@@ -40,6 +42,10 @@ enum SocketFailureObservation {
 }
 
 impl CountedUploadReader<'_> {
+    fn body_complete(&self) -> bool {
+        self.received_bytes == self.expected_bytes
+    }
+
     fn record_socket_failure(&mut self, outcome: ConnectionOutcome) {
         match self.failure_observation {
             SocketFailureObservation::NotObserved => {
@@ -197,10 +203,6 @@ impl UploadRequest {
         self.length
     }
 
-    fn body_state(&self) -> BodyState {
-        self.request.body_state()
-    }
-
     fn reader<'a>(
         &'a mut self,
         metrics: &'a Metrics,
@@ -326,7 +328,7 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
     let length = upload.length();
     let _upload = metrics.upload(length as u64);
     let started = Instant::now();
-    let reader = match upload.reader(metrics) {
+    let mut reader = match upload.reader(metrics) {
         Ok(reader) => reader,
         Err(_) => {
             metrics.validation_failure(ValidationClass::Nar);
@@ -334,24 +336,24 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
             return None;
         }
     };
-    let result = storage.publish_nar_with_staging(name, reader, length as u64, policy, staging);
+    let result =
+        storage.publish_nar_with_staging(name, &mut reader, length as u64, policy, staging);
+    let incomplete_upload_status = if reader.body_complete() {
+        None
+    } else {
+        metrics.validation_failure(ValidationClass::Nar);
+        response_after_incomplete_upload(&result, &mut reader)
+    };
+    let upload_body_complete = reader.body_complete();
+    drop(reader);
     metrics.publication(started.elapsed());
     metrics.record_publication_result(&result);
-    if matches!(upload.body_state(), BodyState::Reading | BodyState::Failed)
-        && !matches!(
-            result,
-            Err(StorageError::UploadTooLarge | StorageError::DecoderMemoryLimitExceeded)
-        )
-    {
-        metrics.validation_failure(ValidationClass::Nar);
-        if matches!(&result, Err(StorageError::DecoderMemoryLimitExceeded)) {
-            // Decoder limits are checked before consuming the payload. Report
-            // the client error, then close rather than reusing a stream with
-            // unread request-body bytes.
-            drop(upload.respond(guard, StatusCode::UNPROCESSABLE_ENTITY));
-            return None;
+    if !upload_body_complete {
+        if let Some(status) = incomplete_upload_status {
+            drop(upload.respond(guard, status));
+        } else {
+            guard.record_aborted_response();
         }
-        guard.record_aborted_response();
         return None;
     }
     if let Err(error) = &result {
@@ -362,7 +364,9 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
         Ok(PublishOutcome::Identical) => StatusCode::OK,
         Err(StorageError::Conflict) => StatusCode::CONFLICT,
         Err(StorageError::UploadTooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
-        Err(StorageError::DecoderMemoryLimitExceeded) => StatusCode::UNPROCESSABLE_ENTITY,
+        Err(StorageError::DecodedSizeLimitExceeded | StorageError::DecoderMemoryLimitExceeded) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
         Err(StorageError::InsufficientSpace | StorageError::InsufficientInodes) => {
             StatusCode::INSUFFICIENT_STORAGE
         }
@@ -375,6 +379,31 @@ fn respond_nar_put(mut upload: UploadRequest, context: NarPutContext<'_, '_>) ->
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     upload.respond(guard, status)
+}
+
+fn response_after_incomplete_upload(
+    result: &Result<PublishOutcome, StorageError>,
+    reader: &mut CountedUploadReader<'_>,
+) -> Option<StatusCode> {
+    match result {
+        Err(StorageError::UploadTooLarge)
+            if reader.expected_bytes <= MAX_EARLY_REJECTION_DRAIN_BYTES =>
+        {
+            drain_rejected_upload_body(reader)
+                .ok()
+                .map(|()| StatusCode::PAYLOAD_TOO_LARGE)
+        }
+        Err(StorageError::DecodedSizeLimitExceeded | StorageError::DecoderMemoryLimitExceeded) => {
+            drain_rejected_upload_body(reader)
+                .ok()
+                .map(|()| StatusCode::UNPROCESSABLE_ENTITY)
+        }
+        _ => None,
+    }
+}
+
+fn drain_rejected_upload_body(reader: &mut CountedUploadReader<'_>) -> io::Result<()> {
+    io::copy(reader, &mut io::sink()).map(|_| ())
 }
 
 struct NarInfoPutContext<'storage, 'request> {

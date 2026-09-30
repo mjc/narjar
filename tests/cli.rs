@@ -2230,6 +2230,20 @@ impl RunningServer {
         peak_kib * 1024
     }
 
+    #[cfg(target_os = "linux")]
+    fn peak_virtual_memory_bytes(&self) -> u64 {
+        let process_id = self.child.as_ref().expect("server is running").id();
+        let status = fs::read_to_string(format!("/proc/{process_id}/status"))
+            .expect("kernel reports the server process status");
+        let peak_kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmPeak:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("kernel reports the server's peak virtual memory");
+        peak_kib * 1024
+    }
+
     fn raw_request_with_body(
         &self,
         method: &str,
@@ -3486,6 +3500,92 @@ fn compressed_upload_memory_limits_return_422_without_publishing() {
 }
 
 #[test]
+fn decoded_size_limit_returns_422_for_a_large_raw_upload() {
+    const UPLOAD_BYTES: usize = 100_000;
+
+    let server = RunningServer::start_with_args("decoded-size-limit", &["--max-nar-bytes", "5"]);
+    let raw = vec![0; UPLOAD_BYTES];
+    let path = format!("/nar/{}.nar", nix32_sha256(&raw));
+    let response = server.request_with_body("PUT", &path, &[], &raw);
+    let published = server
+        .data_dir
+        .join(format!("nar/{}.nar", nix32_sha256(&raw)));
+    let temporary = fs::read_dir(server.data_dir.join(".tmp"))
+        .expect("temporary directory exists")
+        .count();
+    let (signal, status) = server.stop();
+
+    let (headers, body) = response_parts(&response);
+    assert!(
+        headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{headers:?}"
+    );
+    assert!(body.is_empty());
+    assert!(
+        !published.exists(),
+        "oversized decoded NAR was not published"
+    );
+    assert_eq!(temporary, 0, "staging file was removed");
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn malicious_xz_index_cannot_allocate_from_its_declared_block_count() {
+    const DECLARED_BLOCK_COUNT: u64 = 16_777_216;
+    const ALLOWED_VIRTUAL_MEMORY_GROWTH: u64 = 64 * 1024 * 1024;
+
+    let server = RunningServer::start_with_args(
+        "xz-index-block-count",
+        &["--max-decoder-memory-bytes", "16777216"],
+    );
+    let _ = server.request("GET", "/metrics");
+    let baseline_peak = server.peak_virtual_memory_bytes();
+
+    let mut compressed = encode_test_nar_with(WireEncoding::Compressed(CompressionCodec::Xz));
+    let footer_start = compressed.len() - 12;
+    let backward_size = u32::from_le_bytes(
+        compressed[footer_start + 4..footer_start + 8]
+            .try_into()
+            .expect("XZ footer contains its backward size"),
+    ) as usize;
+    let index_start = footer_start - (backward_size + 1) * 4;
+    assert_eq!(
+        compressed[index_start], 0,
+        "XZ index starts with its marker"
+    );
+    assert_eq!(compressed[index_start + 1], 1, "fixture has one XZ block");
+    compressed.splice(
+        index_start + 1..index_start + 2,
+        encode_xz_variable_integer(DECLARED_BLOCK_COUNT),
+    );
+
+    let path = format!("/nar/{}.nar.xz", nix32_sha256(&compressed));
+    let response = server.request_with_body("PUT", &path, &[], &compressed);
+    let peak_virtual_memory = server.peak_virtual_memory_bytes();
+    let nar_published = server
+        .data_dir
+        .join(format!("nar/{}.nar", NARJAR_HASH))
+        .exists();
+    let (signal, status) = server.stop();
+
+    let (headers, body) = response_parts(&response);
+    assert!(
+        headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{headers:?}"
+    );
+    assert!(body.is_empty());
+    assert!(
+        peak_virtual_memory <= baseline_peak + ALLOWED_VIRTUAL_MEMORY_GROWTH,
+        "malformed XZ index grew VmPeak from {baseline_peak} to {peak_virtual_memory} bytes"
+    );
+    assert!(!nar_published, "malformed XZ input must not publish a NAR");
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn concurrent_compressed_uploads_stay_within_the_worker_memory_ceiling() {
     const PUBLICATION_WORKERS: usize = 2;
@@ -3564,13 +3664,16 @@ fn concurrent_compressed_uploads_stay_within_the_worker_memory_ceiling() {
             }));
         }
         start.wait();
-        let responses = requests
+        let upload_results = requests
             .into_iter()
-            .map(|request| request.join().expect("upload thread should complete"))
+            .map(|request| request.join())
             .collect::<Vec<_>>();
         uploads_finished.store(true, Ordering::Release);
         observer.join().expect("metrics observer should complete");
-        responses
+        upload_results
+            .into_iter()
+            .map(|result| result.expect("upload thread should complete"))
+            .collect::<Vec<_>>()
     });
     let maximum_active_workers = maximum_active_workers.load(Ordering::Relaxed);
     let maximum_queue_depth = maximum_queue_depth.load(Ordering::Relaxed);
@@ -3759,7 +3862,7 @@ fn stalled_publication_does_not_block_an_independent_put() {
             response
         });
 
-        for _ in 0..100 {
+        for _ in 0..500 {
             if completed.load(Ordering::Acquire) {
                 break;
             }
@@ -4396,6 +4499,16 @@ fn test_encoding_name(encoding: WireEncoding) -> &'static str {
         WireEncoding::Compressed(CompressionCodec::Xz) => "xz",
         WireEncoding::Compressed(CompressionCodec::Zstd) => "zstd",
     }
+}
+
+fn encode_xz_variable_integer(mut value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while value >= 0x80 {
+        bytes.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+    bytes
 }
 
 fn compressed_test_suffix(encoding: WireEncoding) -> &'static str {

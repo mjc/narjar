@@ -11,7 +11,7 @@ use std::{
 
 use super::compression::{
     CheckedUploadReader, nar_file_size_matches, receive_uploaded_nar,
-    verify_decoded_compressed_file, verify_encoded_compressed_file,
+    verify_decoded_compressed_file, verify_encoded_compressed_file, xz_decoder_memory_requirement,
 };
 use super::egress::{EgressReceipt, EgressSlot};
 use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sync_dir};
@@ -967,9 +967,9 @@ fn compressed_output_writer_errors_remain_io_errors() {
 fn xz_upload_decoder_rejects_memory_just_below_the_declared_dictionary_requirement() {
     let raw = b"XZ dictionary memory limit fixture";
     let compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
-    let required_kib =
-        lzma_rust2::lzma2_get_memory_usage(XzOptions::with_preset(1).lzma_options.dict_size);
-    let exact_limit = u64::from(required_kib) * 1024;
+    let dictionary_bytes = XzOptions::with_preset(1).lzma_options.dict_size as u64;
+    let exact_limit = xz_decoder_memory_requirement(dictionary_bytes)
+        .expect("fixed XZ workspace plus dictionary size fits u64");
 
     assert_compressed_upload_memory_limit(
         WireEncoding::Compressed(CompressionCodec::Xz),
@@ -992,6 +992,58 @@ fn xz_upload_decoder_rejects_memory_just_below_the_declared_dictionary_requireme
         exact_limit + 1024,
         true,
     );
+}
+
+#[test]
+fn xz_index_block_count_is_rejected_before_allocating_records() {
+    const EXCESSIVE_XZ_BLOCK_COUNT: u64 = 16_777_216;
+
+    let raw = b"a single XZ block";
+    let mut compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
+    let footer_start = compressed.len() - 12;
+    let backward_size = u32::from_le_bytes(
+        compressed[footer_start + 4..footer_start + 8]
+            .try_into()
+            .expect("XZ footer contains its backward size"),
+    ) as usize;
+    let index_start = footer_start - (backward_size + 1) * 4;
+    assert_eq!(
+        compressed[index_start], 0,
+        "XZ index starts with its marker"
+    );
+    assert_eq!(
+        compressed[index_start + 1],
+        1,
+        "fixture has exactly one block"
+    );
+    compressed.splice(
+        index_start + 1..index_start + 2,
+        encode_xz_variable_integer(EXCESSIVE_XZ_BLOCK_COUNT),
+    );
+
+    let encoded_hash = FileHash::from_digest(Sha256::digest(&compressed).into());
+    let mut decoded = Vec::new();
+    let error = receive_uploaded_nar(
+        Cursor::new(&compressed),
+        NarFileName::new(encoded_hash, WireEncoding::Compressed(CompressionCodec::Xz)),
+        compressed.len() as u64,
+        u64::MAX,
+        DecoderMemoryLimit::new(super::NarUploadPolicy::DEFAULT_MAX_DECODER_MEMORY_BYTES),
+        &mut decoded,
+    )
+    .expect_err("index claiming more blocks than decoded must be rejected");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+fn encode_xz_variable_integer(mut value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while value >= 0x80 {
+        bytes.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+    bytes
 }
 
 #[test]

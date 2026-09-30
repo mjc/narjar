@@ -394,10 +394,6 @@ impl Request {
         self.body_state == BodyState::Complete
     }
 
-    pub(crate) const fn body_state(&self) -> BodyState {
-        self.body_state
-    }
-
     pub fn close_after_response(&mut self) {
         self.keep_alive = false;
     }
