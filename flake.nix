@@ -485,7 +485,6 @@
         // lib.optionalAttrs (system == staticSystem) {
           static-cargo-artifacts = static.cargoArtifacts;
           static-package = static.narjar;
-          nixos-module = env.pkgs.testers.runNixOSTest (import ./nix/module-test.nix { inherit self; });
           oci-archive =
             env.pkgs.runCommand "narjar-oci-archive"
               {

@@ -62,10 +62,9 @@ portable read/write path as the required behavior.
 
 ## Support boundary
 
-The repository's [`nixos-module` VM check](../nix/module-test.nix) exercises the
-default `/var/lib/narjar` path on the VM's ext4 root; the
-[`module-eval` check](../nix/module-eval-test.nix) covers valid and invalid
-`dataDir` declarations. There is no dedicated block-device, tmpfs, or
+The repository's [`module-evaluation` check](../nix/module-eval-test.nix) covers
+valid and invalid `dataDir` declarations and the generated service configuration.
+CI does not boot NixOS VMs. There is no dedicated block-device, tmpfs, or
 unmount/remount conformance lane at present. ZFS is the primary
 deployment profile, but compression, copy-on-write, sparse extents, snapshots,
 and physical space accounting are filesystem observations rather than Narjar

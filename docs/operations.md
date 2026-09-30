@@ -718,7 +718,7 @@ service does not detect or configure a filesystem-specific backend.
 
 | Environment | Current classification | Meaning |
 | --- | --- | --- |
-| Linux ext4 root in the NixOS VM check | exercised portable lane | The default module test covers the ordinary `/var/lib/narjar` path and service ordering. |
+| NixOS module evaluation | configuration only | Covers module options and generated units, not filesystem or service runtime behavior. |
 | XFS, btrfs, ZFS, and Darwin APFS | unverified host-specific behavior | Do not turn successful unit tests or a deployment anecdote into a support guarantee. |
 | tmpfs | non-persistent fixture only | Useful for tests; it is not a durable cache or a backup target. |
 | bind-mounted DATA | depends on the mounted underlying filesystem | Validate the mounted DATA path and its ownership; the container/image filesystem is not the storage contract. |
@@ -841,15 +841,10 @@ tested native-ZFS deployment this resolves to the generated
 `var-lib-narjar.mount` unit; filesystems whose mount integration does not
 provide a path mount unit must supply an administrator-owned readiness
 dependency. Narjar never mounts or creates the dataset.
-The NixOS VM check performs state initialization and HTTP requests under those
-restrictions, and verifies the credential and state modes.
-
-The `nixos-module` NixOS VM check exercises the service with its default
-`/var/lib/narjar` DATA path on the VM's ext4 root. It verifies initialization,
-credential/state modes, restart, HTTP health/readiness, and the systemd
-hardening contract. The separate module-evaluation check covers valid and
-invalid `dataDir` declarations. There is currently no dedicated block-device,
-tmpfs, unmount/remount, or cross-filesystem conformance lane. XFS, btrfs, ZFS,
+The `module-evaluation` check covers generated service configuration and valid
+and invalid `dataDir` declarations. CI does not boot NixOS VMs, so it does not
+verify service activation under systemd hardening. There is currently no dedicated
+block-device, tmpfs, unmount/remount, or cross-filesystem conformance lane. XFS, btrfs, ZFS,
 overlay, bind-mount variants, quota/inode exhaustion, read-only remounts, and
 Darwin APFS remain unverified until host-specific lanes provide those fixtures;
 they must not be advertised as covered by the portable checks.
@@ -859,7 +854,7 @@ endpoint and requires a read token when private-read mode is enabled. Socket
 activation is an explicit v0.1 non-goal because Narjar owns the listener.
 
 For public service, terminate TLS and enforce stream timeouts at a reverse
-proxy. This nginx location is also exercised by the NixOS VM check:
+proxy. For example:
 
 ~~~nix
 services.nginx = {
