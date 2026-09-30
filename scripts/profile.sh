@@ -87,7 +87,7 @@ MANIFEST="$OUTPUT/system-store.tsv"
 TARGET_BYTES=$((SIZE_GIB * 1024 * 1024 * 1024))
 HOT_NAR_MAX_BYTES=$((HOT_NAR_MAX_GIB * 1024 * 1024 * 1024))
 MAX_SELECTED_NAR_BYTES=$((MAX_SELECTED_NAR_GIB * 1024 * 1024 * 1024))
-PROFILE_RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes"
+PROFILE_RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes -C link-arg=-Wl,--build-id=sha1"
 SERVER_URI="http://127.0.0.1:$PORT"
 CACHE_URI="$SERVER_URI?compression=none"
 HOT_DATA=""
@@ -134,11 +134,6 @@ echo "output: $OUTPUT"
 echo "cleaning profiling target: $TARGET"
 cargo clean --manifest-path "$ROOT/Cargo.toml"
 cargo clean --manifest-path "$ROOT/Cargo.toml" --target-dir "$TARGET"
-
-if ((${#PRIV_RUNNER[@]})); then
-  printf '%s\n' 0 | "${PRIV_RUNNER[@]}" tee /proc/sys/kernel/kptr_restrict >/dev/null
-  printf '%s\n' -1 | "${PRIV_RUNNER[@]}" tee /proc/sys/kernel/perf_event_paranoid >/dev/null
-fi
 
 echo "building narjar with the profiling profile, frame pointers, and DWARF"
 CARGO_TARGET_DIR="$TARGET" \
@@ -225,7 +220,7 @@ start_perf_server() {
 
   setsid "${PERF_RUNNER[@]}" record \
     -o "$OUTPUT/perf.data" \
-    -g --call-graph fp -F 997 \
+    -e cpu-clock -m 512 -g --call-graph fp -F 997 \
     "$BIN" serve \
       --data-dir "$HOT_DATA" \
       --listen "127.0.0.1:$PORT" \
@@ -382,7 +377,9 @@ if [[ ! -r "$OUTPUT/perf.data" ]]; then
   fi
 fi
 
-perf script -i "$OUTPUT/perf.data" 2> "$OUTPUT/perf-script.log" \
+"${PRIV_RUNNER[@]}" cat /proc/kallsyms > "$OUTPUT/kallsyms.txt"
+"${PERF_RUNNER[@]}" script -f --kallsyms "$OUTPUT/kallsyms.txt" \
+  -i "$OUTPUT/perf.data" 2> "$OUTPUT/perf-script.log" \
   | tee "$OUTPUT/perf.script" \
   | inferno-collapse-perf \
   | tee "$OUTPUT/perf.folded" \
