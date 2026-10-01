@@ -27,6 +27,7 @@ let
     storageBackend ? "flat",
     readTokens ? null,
     nativeStoreEnable ? false,
+    nativeStateDir ? "/nix/var/nix",
     nativeRootsDir ? "/nix/var/nix/gcroots/auto/narjar",
     gc ? {},
   }:
@@ -53,6 +54,7 @@ let
               ;
             auth.readTokens = readTokens;
             nativeStore.enable = nativeStoreEnable;
+            nativeStore.stateDir = nativeStateDir;
             nativeStore.rootsDir = nativeRootsDir;
             inherit gc;
             minFreeBytes = 0;
@@ -147,10 +149,17 @@ let
     dynamicUser = false;
     nativeStoreEnable = true;
   };
+  customNativeStateDirConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    dynamicUser = false;
+    nativeStoreEnable = true;
+    nativeStateDir = "/var/lib/narjar-runtime/nix";
+  };
   nativeStorePreStartCommand = lib.head (
     lib.toList nativeStoreConfig.systemd.services.narjar.serviceConfig.ExecStartPre
   );
   nativeStorePreStartScript = builtins.readFile (lib.removePrefix "+" nativeStorePreStartCommand);
+  customNativeStorePreStartScript = builtins.readFile (lib.removePrefix "+" (lib.head (lib.toList customNativeStateDirConfig.systemd.services.narjar.serviceConfig.ExecStartPre)));
 in
 assert builtins.all evaluates valid;
 assert builtins.all (dataDir: !(evaluates dataDir)) invalid;
@@ -177,6 +186,10 @@ assert (!(builtins.tryEval conflictingFilesystemSamplesConfig.system.build.tople
 assert (!(builtins.tryEval unsafeNativeRootsConfig.system.build.toplevel.drvPath).success);
 assert (!(builtins.tryEval nestedNativeRootsConfig.system.build.toplevel.drvPath).success);
 assert (lib.hasInfix "realpath -m" nativeStorePreStartScript);
+assert (lib.hasInfix "ancestor=$roots_parent" nativeStorePreStartScript);
+assert (lib.hasInfix "ancestor_owner" nativeStorePreStartScript);
+assert (lib.hasInfix "roots ancestors must be root-owned" nativeStorePreStartScript);
+assert (lib.hasInfix "/var/lib/narjar-runtime/nix/gcroots/auto" customNativeStorePreStartScript);
 assert (lib.hasInfix "mkdir -m 0700" nativeStorePreStartScript);
 assert (!(lib.hasInfix "install -d" nativeStorePreStartScript));
 assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules));

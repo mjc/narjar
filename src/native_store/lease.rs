@@ -970,18 +970,30 @@ impl NativeStoreLeaseManager {
                 entries: fs::read_dir(&self.roots_dir).map_err(NativeStoreLeaseError::Io)?,
             });
         }
-        if let Some(scan) = state.record_scan.as_mut() {
-            let (paths, complete) =
-                read_record_path_batch(&mut scan.entries, MAX_EXPIRY_CLEANUP_PER_CALL)?;
-            state.record_paths.extend(paths);
-            if complete {
-                let scanned_generation = scan.generation;
+        let batch = state
+            .record_scan
+            .as_mut()
+            .map(|scan| {
+                read_record_path_batch(&mut scan.entries, MAX_EXPIRY_CLEANUP_PER_CALL)
+                    .map(|batch| (scan.generation, batch))
+            })
+            .transpose();
+        match batch {
+            Err(error) => {
                 state.record_scan = None;
-                state.record_index.refresh(scanned_generation);
-                state
-                    .record_index
-                    .note_generation(read_capacity_record(&self.roots_dir)?.generation);
+                return Err(error);
             }
+            Ok(Some((scanned_generation, (paths, complete)))) => {
+                state.record_paths.extend(paths);
+                if complete {
+                    state.record_scan = None;
+                    state.record_index.refresh(scanned_generation);
+                    state
+                        .record_index
+                        .note_generation(read_capacity_record(&self.roots_dir)?.generation);
+                }
+            }
+            Ok(None) => {}
         }
         Ok(())
     }
@@ -1274,6 +1286,7 @@ fn record_path_from_directory_entry(
             }
         }
         Ok(_) => Err(NativeStoreLeaseError::InvalidRecord),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(NativeStoreLeaseError::Io(error)),
     }
 }
@@ -2108,6 +2121,85 @@ mod tests {
             stale_manager.snapshot().expect("one active lease").active,
             1
         );
+    }
+
+    #[test]
+    fn incremental_scan_skips_a_lease_deleted_by_another_manager() {
+        let fixture = LeaseFixture::new(100);
+        let seeded_paths = (0..MAX_EXPIRY_CLEANUP_PER_CALL + 6)
+            .map(|index| {
+                let hash_digit = NIX32
+                    .chars()
+                    .nth(index % NIX32.len())
+                    .expect("hash digit should be in the Nix32 alphabet");
+                let path = fixture.store_dir.join(format!(
+                    "{}{}-seed-{index}",
+                    "0".repeat(31),
+                    hash_digit
+                ));
+                fs::create_dir(&path).expect("seeded store path should exist");
+                fixture.register_path(&path);
+                let path = NativeStorePath::parse(&fixture.store_dir, &path)
+                    .expect("seeded store path should parse");
+                let record_path = fixture.manager.record_path(&path);
+                fixture.write_record(&record_path, &LeaseRecord::live(&path, 10));
+                std::os::unix::fs::symlink(path.as_path(), fixture.manager.root_path(&path))
+                    .expect("seeded lease root should exist");
+                path
+            })
+            .collect::<Vec<_>>();
+        write_capacity_record(
+            &fixture.roots_dir,
+            CapacityRecord {
+                generation: 1,
+                active: seeded_paths.len() as u64,
+                pending: None,
+            },
+        )
+        .expect("seeded leases should be reflected in capacity");
+        let scanning_manager = fixture.reopen_at(100, 1);
+        let deleting_manager = fixture.reopen_at(100, 1);
+        let retry_path = fixture.store_dir.join(format!("{}-retry", "2".repeat(32)));
+        fs::create_dir(&retry_path).expect("retry store path should exist");
+        fixture.register_path(&retry_path);
+        let retry_path = scanning_manager
+            .validate_store_path(&retry_path)
+            .expect("retry store path should validate");
+
+        deleting_manager
+            .acquire(fixture.store_path.clone(), 1)
+            .expect("second manager should advance the record generation");
+        let record_to_delete = fs::read_dir(&fixture.roots_dir)
+            .expect("roots should be readable")
+            .enumerate()
+            .skip(MAX_EXPIRY_CLEANUP_PER_CALL)
+            .filter_map(|(_, entry)| entry.ok())
+            .filter_map(|entry| record_path_from_directory_entry(entry).ok().flatten())
+            .find(|record_path| {
+                seeded_paths
+                    .iter()
+                    .any(|path| deleting_manager.record_path(path) == *record_path)
+            })
+            .expect("a seeded record should be beyond the first bounded directory batch");
+        let path_to_delete = seeded_paths
+            .iter()
+            .find(|path| deleting_manager.record_path(path) == record_to_delete)
+            .expect("selected record should correspond to a seeded path")
+            .clone();
+
+        scanning_manager
+            .acquire(retry_path.clone(), 2)
+            .expect("first scan batch should finish acquisition");
+        let lease_to_delete = NativeStoreLease {
+            path: path_to_delete,
+            expires_at: 10,
+        };
+        deleting_manager
+            .release(&lease_to_delete, 20)
+            .expect("second manager should delete the expired record");
+        scanning_manager
+            .acquire(retry_path, 21)
+            .expect("stale directory entries should be skipped rather than failing admission");
     }
 
     #[test]

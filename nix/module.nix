@@ -232,13 +232,19 @@
         ${pkgs.coreutils}/bin/printf '%s\n' "narjar: native-store roots path must not traverse symlinks" >&2
         exit 1
       fi
-      parent_metadata=$(${pkgs.coreutils}/bin/stat -c '%u:%a' -- "$roots_parent")
-      parent_owner=''${parent_metadata%%:*}
-      parent_mode=''${parent_metadata#*:}
-      if [ "$parent_owner" != 0 ] || (( (8#$parent_mode & 0022) != 0 )); then
-        ${pkgs.coreutils}/bin/printf '%s\n' "narjar: native-store roots parent must be root-owned and not group/world writable" >&2
-        exit 1
-      fi
+      ancestor=$roots_parent
+      while :; do
+        ancestor_metadata=$(${pkgs.coreutils}/bin/stat -c '%u:%a' -- "$ancestor")
+        ancestor_owner=''${ancestor_metadata%%:*}
+        ancestor_mode=''${ancestor_metadata#*:}
+        if [ "$ancestor_owner" != 0 ] || (( (8#$ancestor_mode & 0022) != 0 )); then
+          ${pkgs.coreutils}/bin/printf '%s\n' "narjar: native-store roots ancestors must be root-owned and not group/world writable" >&2
+          exit 1
+        fi
+        [ "$ancestor" = / ] && break
+        ancestor=''${ancestor%/*}
+        [ -n "$ancestor" ] || ancestor=/
+      done
       if [ -L "$roots_dir" ] || { [ -e "$roots_dir" ] && [ ! -d "$roots_dir" ]; }; then
         ${pkgs.coreutils}/bin/printf '%s\n' "narjar: expected a real directory at $roots_dir" >&2
         exit 1
