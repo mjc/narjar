@@ -72,7 +72,7 @@
         let
           craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
           src = lib.cleanSourceWith {
-            src = ./.;
+            src = repositorySrc;
             filter =
               path: type:
               craneLib.filterCargoSources path type
@@ -354,6 +354,14 @@
             test -s ${repositorySrc}/devenv.lock
             touch $out
           '';
+          cargo-source-filter = env.pkgs.runCommand "narjar-cargo-source-filter" { } ''
+            test -f ${env.src}/Cargo.toml
+            test -f ${env.src}/Cargo.lock
+            test -f ${env.src}/src/main.rs
+            test -f ${env.src}/tests/fixtures/nix-2.31.5-http-v0.1.tsv
+            test ! -e ${env.src}/benchmarks/results
+            touch $out
+          '';
           cratePackageCheck = env.pkgs.runCommand "narjar-crate-package-check"
             {
               nativeBuildInputs = [
@@ -459,6 +467,7 @@
             format
             source-filter
             lock-consistency
+            cargo-source-filter
             cratePackageCheck
             fuzzTargetCheck
             semantic-descriptor
