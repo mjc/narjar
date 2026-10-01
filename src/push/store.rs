@@ -1,30 +1,10 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
-use sqlite::{Connection, OpenFlags, State};
+use sqlite::{Connection, State};
 
 use super::{NarInfoMetadata, PushError};
+use crate::native_store::open_supported_metadata_database;
 use narjar::object::{NarHash, NarIdentity, NarSize};
-
-const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
-    (
-        "ValidPaths",
-        &[
-            "id",
-            "path",
-            "hash",
-            "registrationTime",
-            "deriver",
-            "narSize",
-            "sigs",
-            "ca",
-        ],
-    ),
-    ("Refs", &["referrer", "reference"]),
-    ("SchemaMigrations", &["migration"]),
-];
 
 pub(super) struct LocalStore {
     database: Connection,
@@ -35,17 +15,7 @@ impl LocalStore {
         let state_dir = std::env::var_os("NIX_STATE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nix/var/nix"));
-        let database_path = state_dir.join("db/db.sqlite");
-        let database =
-            Connection::open_with_flags(database_path, OpenFlags::new().with_read_only())
-                .map_err(|error| format!("opening the Nix store database: {error}"))?;
-        database
-            .execute("PRAGMA busy_timeout = 30000")
-            .map_err(|error| format!("configuring the Nix store database wait: {error}"))?;
-        validate_supported_schema(&database)?;
-        database
-            .execute("BEGIN")
-            .map_err(|error| format!("starting the Nix store database snapshot: {error}"))?;
+        let database = open_supported_metadata_database(&state_dir)?;
         Ok(Self { database })
     }
 
@@ -152,42 +122,6 @@ impl LocalStore {
     }
 }
 
-fn validate_supported_schema(database: &Connection) -> Result<(), PushError> {
-    REQUIRED_TABLE_COLUMNS
-        .iter()
-        .try_for_each(|(table, required_columns)| {
-            let present_columns = table_columns(database, table)?;
-            if required_columns
-                .iter()
-                .any(|column| !present_columns.contains(*column))
-            {
-                return Err(format!(
-                    "unsupported or incomplete Nix store database schema: {table}"
-                )
-                .into());
-            }
-            Ok(())
-        })
-}
-
-fn table_columns(database: &Connection, table: &str) -> Result<BTreeSet<String>, PushError> {
-    let mut statement = database
-        .prepare(format!("PRAGMA table_info({table})"))
-        .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?;
-    let mut columns = BTreeSet::new();
-    while let State::Row = statement
-        .next()
-        .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?
-    {
-        columns.insert(
-            statement
-                .read::<String, _>("name")
-                .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?,
-        );
-    }
-    Ok(columns)
-}
-
 fn concrete_store_path(value: &str) -> Result<String, PushError> {
     let relative = value
         .strip_prefix("/nix/store/")
@@ -228,9 +162,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use sqlite::Connection;
-
-    use super::{nar_hash_from_base16, validate_supported_schema};
+    use super::nar_hash_from_base16;
     use narjar::object::NarHash;
 
     #[test]
@@ -251,15 +183,5 @@ mod tests {
     fn rejects_non_hex_bytes_without_slicing_utf8() {
         let value = format!("sha256:0é{}", "0".repeat(61));
         assert!(nar_hash_from_base16(&value).is_err());
-    }
-
-    #[test]
-    fn rejects_an_incomplete_store_schema() {
-        let database = Connection::open(":memory:").expect("open schema test database");
-        database
-            .execute("CREATE TABLE ValidPaths (id INTEGER PRIMARY KEY)")
-            .expect("create incomplete schema");
-        let error = validate_supported_schema(&database).expect_err("schema must be rejected");
-        assert!(error.contains("unsupported or incomplete"));
     }
 }

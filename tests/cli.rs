@@ -1080,6 +1080,8 @@ fn native_push_fixture() -> NativePushFixture {
     fs::create_dir_all(state_dir.join("gcroots/auto"))
         .expect("native automatic roots directory should be created");
     fs::create_dir(state_dir.join("db")).expect("native database directory should be created");
+    fs::write(state_dir.join("db/schema"), "10\n")
+        .expect("supported Nix schema version should be created");
     let native_nar = native_nar_bytes();
     let nar_hash = nix32_sha256(&native_nar);
     let nar_hash_sri = format!("sha256-{}", BASE64.encode(&Sha256::digest(&native_nar)));
@@ -2356,22 +2358,24 @@ impl RunningServer {
             .status()
             .expect("kill should run");
 
-        let mut status = None;
-        for _ in 0..100 {
-            status = child.try_wait().expect("child status should be readable");
-            if status.is_some() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-
-        let status = status.unwrap_or_else(|| {
-            child.kill().expect("hung child should be killed");
-            child.wait().expect("killed child should be reaped")
-        });
+        let status = wait_for_server_shutdown(child);
         self.child.take();
 
         (signal, status)
+    }
+}
+
+fn wait_for_server_shutdown(child: &mut Child) -> ExitStatus {
+    let shutdown_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().expect("child status should be readable") {
+            return status;
+        }
+        if Instant::now() >= shutdown_deadline {
+            child.kill().expect("hung child should be killed");
+            return child.wait().expect("killed child should be reaped");
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }
 

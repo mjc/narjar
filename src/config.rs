@@ -5,7 +5,10 @@ use std::{
 };
 
 use clap::Args;
+use clap::ValueEnum;
 use narjar::{__private::storage::StorageBackend, object::WireEncoding};
+
+use crate::native_store::NativeStoreSettings;
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
@@ -21,8 +24,22 @@ pub(crate) struct ServeConfig {
     pub(crate) io_timeout_seconds: NonZeroU64,
     pub(crate) egress_compression: WireEncoding,
     pub(crate) storage_backend: StorageBackend,
+    pub(crate) source: ServeSource,
     pub(crate) stats_inventory_interval_seconds: Option<NonZeroU64>,
     pub(crate) stats_filesystem_sample: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ServeSource {
+    FlatCache,
+    NativeStore(NativeStoreSettings),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ServeSourceChoice {
+    #[default]
+    FlatCache,
+    NativeStore,
 }
 
 #[derive(Args)]
@@ -60,6 +77,20 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "NARJAR_STORAGE_BACKEND", default_value = "flat")]
     storage_backend: StorageBackend,
     #[arg(
+        long = "serve-source",
+        env = "NARJAR_SERVE_SOURCE",
+        default_value = "flat-cache"
+    )]
+    source: ServeSourceChoice,
+    #[arg(long, env = "NARJAR_NATIVE_STORE_DIR", value_parser = non_empty_path)]
+    native_store_dir: Option<PathBuf>,
+    #[arg(long, env = "NARJAR_NATIVE_STATE_DIR", value_parser = non_empty_path)]
+    native_state_dir: Option<PathBuf>,
+    #[arg(long, env = "NARJAR_NATIVE_ROOTS_DIR", value_parser = non_empty_path)]
+    native_roots_dir: Option<PathBuf>,
+    #[arg(long, env = "NARJAR_NATIVE_MIN_LEASE_SECONDS")]
+    native_min_lease_seconds: Option<NonZeroU64>,
+    #[arg(
         long,
         env = "NARJAR_STATS_INVENTORY_INTERVAL_SECONDS",
         num_args = 0..=1,
@@ -70,9 +101,12 @@ pub(crate) struct ServeArgs {
     stats_filesystem_sample: Option<PathBuf>,
 }
 
-impl From<ServeArgs> for ServeConfig {
-    fn from(args: ServeArgs) -> Self {
-        Self {
+impl TryFrom<ServeArgs> for ServeConfig {
+    type Error = String;
+
+    fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
+        let source = serve_source_from_args(&args)?;
+        Ok(Self {
             data_dir: args.data_dir,
             listen: args.listen,
             workers: args.workers,
@@ -85,9 +119,56 @@ impl From<ServeArgs> for ServeConfig {
             io_timeout_seconds: args.io_timeout_seconds,
             egress_compression: args.egress_compression,
             storage_backend: args.storage_backend,
+            source,
             stats_inventory_interval_seconds: args.stats_inventory_interval_seconds,
             stats_filesystem_sample: args.stats_filesystem_sample,
+        })
+    }
+}
+
+fn serve_source_from_args(args: &ServeArgs) -> Result<ServeSource, String> {
+    let native_store_options = (
+        args.native_store_dir.as_deref(),
+        args.native_state_dir.as_deref(),
+        args.native_roots_dir.as_deref(),
+        args.native_min_lease_seconds,
+    );
+    match (args.source, native_store_options) {
+        (ServeSourceChoice::FlatCache, (None, None, None, None)) => Ok(ServeSource::FlatCache),
+        (ServeSourceChoice::FlatCache, _) => {
+            Err("native-store options require --serve-source native-store".to_owned())
         }
+        (
+            ServeSourceChoice::NativeStore,
+            (Some(store_dir), Some(state_dir), Some(roots_dir), Some(min_lease_seconds)),
+        ) => {
+            require_raw_flat_native_output(args)?;
+            Ok(ServeSource::NativeStore(NativeStoreSettings::new(
+                store_dir.to_owned(),
+                state_dir.to_owned(),
+                roots_dir.to_owned(),
+                min_lease_seconds,
+            )))
+        }
+        (ServeSourceChoice::NativeStore, _) => Err(concat!(
+            "native-store source requires --native-store-dir, --native-state-dir, ",
+            "--native-roots-dir, and --native-min-lease-seconds"
+        )
+        .to_owned()),
+    }
+}
+
+fn require_raw_flat_native_output(args: &ServeArgs) -> Result<(), String> {
+    match (args.egress_compression, args.storage_backend) {
+        (WireEncoding::Raw, StorageBackend::Flat) => Ok(()),
+        (WireEncoding::Raw, StorageBackend::Chunked) => Err(
+            "native-store source requires the flat storage backend during initial raw output support"
+                .to_owned(),
+        ),
+        (WireEncoding::Compressed(_), _) => Err(
+            "native-store source requires uncompressed output (--egress-compression none)"
+                .to_owned(),
+        ),
     }
 }
 
@@ -102,7 +183,7 @@ mod tests {
     use clap::{Args as _, Command, FromArgMatches};
     use std::num::NonZeroU64;
 
-    use super::ServeArgs;
+    use super::{ServeArgs, ServeConfig, ServeSource};
 
     #[test]
     fn inventory_interval_flag_defaults_to_fifteen_minutes_and_remains_optional() {
@@ -169,5 +250,97 @@ mod tests {
         assert_eq!(args.max_nar_bytes.get(), 100);
         assert_eq!(args.max_encoded_nar_bytes.get(), 200);
         assert_eq!(args.max_decoder_memory_bytes.get(), 300);
+    }
+
+    #[test]
+    fn serve_defaults_to_the_existing_flat_cache_source() {
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from(["serve", "--data-dir", "/cache"])
+            .expect("flat-cache arguments should parse");
+        let args = ServeArgs::from_arg_matches(&matches).expect("serve arguments should parse");
+        let config = ServeConfig::try_from(args).expect("flat-cache config should validate");
+
+        assert!(matches!(config.source, ServeSource::FlatCache));
+    }
+
+    #[test]
+    fn flat_cache_rejects_native_store_options() {
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from([
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--native-store-dir",
+                "/nix/store",
+            ])
+            .expect("CLI should parse source options before validating their combination");
+        let args = ServeArgs::from_arg_matches(&matches).expect("serve arguments should parse");
+
+        assert_eq!(
+            ServeConfig::try_from(args).expect_err("mixed source options should be rejected"),
+            "native-store options require --serve-source native-store"
+        );
+    }
+
+    #[test]
+    fn native_store_rejects_incomplete_configuration() {
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from([
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--serve-source",
+                "native-store",
+                "--native-store-dir",
+                "/nix/store",
+            ])
+            .expect("CLI should parse source options before validating completeness");
+        let args = ServeArgs::from_arg_matches(&matches).expect("serve arguments should parse");
+
+        assert_eq!(
+            ServeConfig::try_from(args).expect_err("incomplete native config should be rejected"),
+            "native-store source requires --native-store-dir, --native-state-dir, --native-roots-dir, and --native-min-lease-seconds"
+        );
+    }
+
+    #[test]
+    fn native_store_rejects_compressed_or_chunked_output() {
+        for incompatible_args in [
+            ["--egress-compression", "zstd", "--storage-backend", "flat"],
+            [
+                "--egress-compression",
+                "none",
+                "--storage-backend",
+                "chunked",
+            ],
+        ] {
+            let mut arguments = vec![
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--serve-source",
+                "native-store",
+                "--native-store-dir",
+                "/nix/store",
+                "--native-state-dir",
+                "/nix/var/nix",
+                "--native-roots-dir",
+                "/var/lib/narjar-roots",
+                "--native-min-lease-seconds",
+                "60",
+            ];
+            arguments.extend(incompatible_args);
+            let matches = ServeArgs::augment_args(Command::new("serve"))
+                .try_get_matches_from(arguments)
+                .expect("valid flag values should parse");
+            let args =
+                ServeArgs::from_arg_matches(&matches).expect("serve arguments should deserialize");
+
+            assert!(
+                ServeConfig::try_from(args)
+                    .expect_err("unsupported native output must fail configuration")
+                    .contains("native-store source requires")
+            );
+        }
     }
 }

@@ -23,6 +23,11 @@ const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 pub struct TrustedPublicKeys(BTreeMap<String, VerifyingKey>);
 
 impl TrustedPublicKeys {
+    /// Returns whether this trust store contains no verification keys.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn parse(contents: &str) -> Result<Self, TrustError> {
         if contents.len() as u64 > MAX_TRUST_FILE_BYTES {
             return Err(TrustError::InvalidTrustFile);

@@ -25,7 +25,10 @@ use signal_hook::{
     low_level,
 };
 
-use crate::{config::ServeConfig, error::Error};
+use crate::{
+    config::{ServeConfig, ServeSource},
+    error::Error,
+};
 use narjar::__private::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure};
 
 struct Admissions {
@@ -373,16 +376,30 @@ fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, 
             config.data_dir.display()
         ))
     })?;
-    let storage =
-        Storage::initialize(&root_directory, config.storage_backend).map_err(|error| {
-            Error::runtime(format!(
-                "cannot initialize data directory {}: {error}",
-                config.data_dir.display()
+    match &config.source {
+        ServeSource::FlatCache => initialize_flat_cache_resources(config, &root_directory),
+        ServeSource::NativeStore(settings) => {
+            validate_native_store_source(config, &root_directory, settings)?;
+            Err(Error::runtime(
+                "native-store source passed startup validation, but native-store request serving is not implemented yet",
             ))
-        })?;
-    let authorizer = Authorizer::load(&root_directory)
+        }
+    }
+}
+
+fn initialize_flat_cache_resources(
+    config: &ServeConfig,
+    root_directory: &Directory,
+) -> Result<ServerResources, Error> {
+    let storage = Storage::initialize(root_directory, config.storage_backend).map_err(|error| {
+        Error::runtime(format!(
+            "cannot initialize data directory {}: {error}",
+            config.data_dir.display()
+        ))
+    })?;
+    let authorizer = Authorizer::load(root_directory)
         .map_err(|error| Error::runtime(format!("cannot load authorization policy: {error}")))?;
-    let trusted_keys = TrustedPublicKeys::load(&root_directory)
+    let trusted_keys = TrustedPublicKeys::load(root_directory)
         .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
     finish_required_recovery(&storage, &trusted_keys)?;
     Ok(ServerResources {
@@ -390,6 +407,21 @@ fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, 
         authorizer: Arc::new(authorizer),
         trusted_keys: Arc::new(trusted_keys),
     })
+}
+
+fn validate_native_store_source(
+    config: &ServeConfig,
+    root_directory: &Directory,
+    settings: &crate::native_store::NativeStoreSettings,
+) -> Result<(), Error> {
+    Authorizer::load(root_directory)
+        .map_err(|error| Error::runtime(format!("cannot load authorization policy: {error}")))?;
+    let trusted_keys = TrustedPublicKeys::load(root_directory)
+        .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
+    let _validated_source = settings
+        .validate(&config.data_dir, &trusted_keys)
+        .map_err(Error::runtime)?;
+    Ok(())
 }
 
 fn finish_required_recovery(

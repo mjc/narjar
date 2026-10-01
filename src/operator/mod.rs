@@ -2,7 +2,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     mem::MaybeUninit,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, PermissionsExt},
@@ -26,9 +26,12 @@ use narjar::__private::{
         gc::{self, GcMode, GcOptions},
     },
 };
+use narjar::object::WireEncoding;
 use ureq::Agent;
 
-use crate::{error::Error, http_url::HttpUrl};
+use crate::{
+    config::ServeSourceChoice, error::Error, http_url::HttpUrl, native_store::NativeStoreSettings,
+};
 
 mod lifecycle;
 pub(crate) use lifecycle::{Init, Key, generate_key_pair, init, key};
@@ -657,6 +660,25 @@ pub(crate) struct Doctor {
     data_dir: PathBuf,
     #[arg(long)]
     json: bool,
+    #[arg(
+        long,
+        env = "NARJAR_SERVE_SOURCE",
+        value_enum,
+        default_value = "flat-cache"
+    )]
+    serve_source: ServeSourceChoice,
+    #[arg(long, env = "NARJAR_NATIVE_STORE_DIR")]
+    native_store_dir: Option<PathBuf>,
+    #[arg(long, env = "NARJAR_NATIVE_STATE_DIR")]
+    native_state_dir: Option<PathBuf>,
+    #[arg(long, env = "NARJAR_NATIVE_ROOTS_DIR")]
+    native_roots_dir: Option<PathBuf>,
+    #[arg(long, env = "NARJAR_NATIVE_MIN_LEASE_SECONDS")]
+    native_min_lease_seconds: Option<NonZeroU64>,
+    #[arg(long, env = "NARJAR_EGRESS_COMPRESSION", default_value = "none")]
+    egress_compression: WireEncoding,
+    #[arg(long, env = "NARJAR_STORAGE_BACKEND", default_value = "flat")]
+    storage_backend: StorageBackend,
 }
 
 #[derive(Clone, Copy)]
@@ -710,12 +732,20 @@ struct DoctorReport {
     mount_detail: String,
     lease: DoctorSeverity,
     lease_detail: String,
+    source: DoctorSource,
+}
+
+struct DoctorSource {
+    name: &'static str,
+    severity: DoctorSeverity,
+    detail: &'static str,
 }
 
 impl DoctorReport {
     fn has_failures(&self) -> bool {
         self.mount.is_failure()
             || self.lease.is_failure()
+            || self.source.severity.is_failure()
             || self.paths.iter().any(|path| path.severity.is_failure())
     }
 }
@@ -738,7 +768,8 @@ const DOCTOR_FILES: &[&str] = &[
 ];
 
 pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
-    let report = inspect_doctor(&options.data_dir)?;
+    let mut report = inspect_doctor(&options.data_dir)?;
+    report.source = inspect_doctor_source(&options);
     let failed = report.has_failures();
     if options.json {
         println!("{}", doctor_json(&report));
@@ -812,7 +843,99 @@ fn inspect_doctor(root: &Path) -> Result<DoctorReport, Error> {
         mount_detail: mount.1,
         lease: lease.0,
         lease_detail: lease.1,
+        source: DoctorSource {
+            name: "flat-cache",
+            severity: DoctorSeverity::Ok,
+            detail: "selected",
+        },
     })
+}
+
+fn inspect_doctor_source(options: &Doctor) -> DoctorSource {
+    let native_options = (
+        options.native_store_dir.as_deref(),
+        options.native_state_dir.as_deref(),
+        options.native_roots_dir.as_deref(),
+        options.native_min_lease_seconds,
+    );
+    match (options.serve_source, native_options) {
+        (ServeSourceChoice::FlatCache, (None, None, None, None)) => DoctorSource {
+            name: "flat-cache",
+            severity: DoctorSeverity::Ok,
+            detail: "selected",
+        },
+        (ServeSourceChoice::FlatCache, _) => DoctorSource {
+            name: "flat-cache",
+            severity: DoctorSeverity::Error,
+            detail: "native source options require native-store selection",
+        },
+        (
+            ServeSourceChoice::NativeStore,
+            (Some(store_dir), Some(state_dir), Some(roots_dir), Some(min_lease_seconds)),
+        ) => validate_doctor_native_store(
+            options,
+            store_dir,
+            state_dir,
+            roots_dir,
+            min_lease_seconds,
+        ),
+        (ServeSourceChoice::NativeStore, _) => DoctorSource {
+            name: "native-store",
+            severity: DoctorSeverity::Error,
+            detail: "required native source options are missing",
+        },
+    }
+}
+
+fn validate_doctor_native_store(
+    options: &Doctor,
+    store_dir: &Path,
+    state_dir: &Path,
+    roots_dir: &Path,
+    min_lease_seconds: NonZeroU64,
+) -> DoctorSource {
+    let output_is_raw_flat = options.egress_compression == WireEncoding::Raw
+        && options.storage_backend == StorageBackend::Flat;
+    let data_directory = Directory::open(&options.data_dir);
+    match (output_is_raw_flat, data_directory) {
+        (false, _) => DoctorSource {
+            name: "native-store",
+            severity: DoctorSeverity::Error,
+            detail: "native source requires raw output and flat storage",
+        },
+        (true, Err(_)) => DoctorSource {
+            name: "native-store",
+            severity: DoctorSeverity::Error,
+            detail: "Narjar data directory is unavailable",
+        },
+        (true, Ok(data_directory)) => match TrustedPublicKeys::load(&data_directory) {
+            Err(_) => DoctorSource {
+                name: "native-store",
+                severity: DoctorSeverity::Error,
+                detail: "trusted signature policy is invalid",
+            },
+            Ok(trusted_keys) => {
+                let settings = NativeStoreSettings::new(
+                    store_dir.to_owned(),
+                    state_dir.to_owned(),
+                    roots_dir.to_owned(),
+                    min_lease_seconds,
+                );
+                match settings.validate(&options.data_dir, &trusted_keys) {
+                    Ok(_) => DoctorSource {
+                        name: "native-store",
+                        severity: DoctorSeverity::Ok,
+                        detail: "source configuration is valid",
+                    },
+                    Err(_) => DoctorSource {
+                        name: "native-store",
+                        severity: DoctorSeverity::Error,
+                        detail: "source validation failed; inspect local service logs",
+                    },
+                }
+            }
+        },
+    }
 }
 
 fn inspect_doctor_path(
@@ -932,8 +1055,11 @@ fn doctor_json(report: &DoctorReport) -> String {
     let paths = report.paths.iter().map(|path| format!("{{\"path\":\"{}\",\"required\":{},\"kind\":\"{}\",\"mode\":{},\"uid\":{},\"gid\":{},\"severity\":\"{}\",\"detail\":\"{}\"}}", json_escape(path.path), path.required, json_escape(path.kind), path.mode.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.uid.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.gid.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.severity.as_str(), json_escape(&path.detail))).collect::<Vec<_>>().join(",");
     let capacities = report.capacities.iter().map(|capacity| format!("{{\"path\":\"{}\",\"total_bytes\":{},\"available_bytes\":{},\"total_inodes\":{},\"available_inodes\":{},\"read_only\":{},\"device\":{}}}", capacity.path, capacity.capacity.total_bytes, capacity.capacity.available_bytes, capacity.capacity.total_inodes, capacity.capacity.available_inodes, capacity.capacity.read_only, capacity.device)).collect::<Vec<_>>().join(",");
     format!(
-        "{{\"schema\":1,\"data_dir\":\"{}\",\"mount\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"lease\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"paths\":[{}],\"capacity\":[{}]}}",
+        "{{\"schema\":1,\"data_dir\":\"{}\",\"source\":{{\"name\":\"{}\",\"severity\":\"{}\",\"detail\":\"{}\"}},\"mount\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"lease\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"paths\":[{}],\"capacity\":[{}]}}",
         json_escape(&report.root.to_string_lossy()),
+        report.source.name,
+        report.source.severity.as_str(),
+        json_escape(report.source.detail),
         report.mount.as_str(),
         json_escape(&report.mount_detail),
         report.lease.as_str(),
@@ -945,6 +1071,12 @@ fn doctor_json(report: &DoctorReport) -> String {
 
 fn print_doctor(report: &DoctorReport) {
     println!("data_dir\t{}", report.root.display());
+    println!(
+        "source\t{}\t{}\t{}",
+        report.source.name,
+        report.source.severity.as_str(),
+        report.source.detail
+    );
     println!("mount\t{}\t{}", report.mount.as_str(), report.mount_detail);
     println!("lease\t{}\t{}", report.lease.as_str(), report.lease_detail);
     for capacity in &report.capacities {
@@ -1519,6 +1651,34 @@ machine other.example password other-secret
         assert!(json.contains("\"path\":\"nar\""));
         assert!(json.contains("\"total_bytes\":"));
         assert!(json.contains("\"lease\":{\"severity\":\"ok\""));
+        assert!(json.contains("\"source\":{\"name\":\"flat-cache\""));
+    }
+
+    #[test]
+    fn native_source_doctor_reports_validation_without_echoing_configured_paths() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let options = Doctor {
+            data_dir: directory.path().to_owned(),
+            json: true,
+            serve_source: ServeSourceChoice::NativeStore,
+            native_store_dir: Some(PathBuf::from("/private/store-path")),
+            native_state_dir: Some(PathBuf::from("/private/state-path")),
+            native_roots_dir: Some(PathBuf::from("/private/roots-path")),
+            native_min_lease_seconds: NonZeroU64::new(60),
+            egress_compression: WireEncoding::Raw,
+            storage_backend: StorageBackend::Flat,
+        };
+        let mut report = inspect_doctor(directory.path()).expect("doctor should inspect cache");
+        report.source = inspect_doctor_source(&options);
+        let json = doctor_json(&report);
+
+        assert!(json.contains("\"name\":\"native-store\""));
+        assert!(
+            json.contains("\"detail\":\"source validation failed; inspect local service logs\"")
+        );
+        assert!(!json.contains("/private/store-path"));
+        assert!(!json.contains("/private/state-path"));
+        assert!(!json.contains("/private/roots-path"));
     }
 
     #[test]

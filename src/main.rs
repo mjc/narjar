@@ -1,6 +1,7 @@
 mod config;
 mod error;
 mod http_url;
+mod native_store;
 mod operator;
 mod push;
 mod server;
@@ -57,7 +58,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
-        Command::Serve(args) => server::serve(ServeConfig::from(args)),
+        Command::Serve(args) => server::serve(ServeConfig::try_from(args).map_err(Error::runtime)?),
         Command::Init(args) => operator::init(args),
         Command::Setup(args) => setup::run(args),
         Command::Key(args) => operator::key(args),
@@ -192,6 +193,29 @@ mod tests {
         let Command::Serve(_) = cli.command else {
             panic!("expected serve command");
         };
+    }
+
+    #[test]
+    fn serve_accepts_an_explicit_complete_native_store_source() {
+        let cli = Cli::try_parse_from([
+            "narjar",
+            "serve",
+            "--data-dir",
+            "/var/lib/narjar",
+            "--serve-source",
+            "native-store",
+            "--native-store-dir",
+            "/nix/store",
+            "--native-state-dir",
+            "/nix/var/nix",
+            "--native-roots-dir",
+            "/nix/var/nix/gcroots/auto/narjar",
+            "--native-min-lease-seconds",
+            "3600",
+        ])
+        .expect("native-store source should have explicit startup configuration");
+
+        assert!(matches!(cli.command, Command::Serve(_)));
     }
 
     #[test]
