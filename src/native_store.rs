@@ -686,7 +686,10 @@ mod tests {
 
     use data_encoding::BASE64;
     use ed25519_dalek::SigningKey;
-    use narjar::__private::narinfo::TrustedPublicKeys;
+    use narjar::__private::{
+        narinfo::{NarInfoMetadata, TrustedPublicKeys},
+        storage::StoreHash,
+    };
     use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
     use sqlite::Connection;
     use tempfile::TempDir;
@@ -856,6 +859,246 @@ mod tests {
                 .validated_claims_for("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-missing")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn read_transaction_keeps_path_claims_references_and_signatures_on_one_snapshot() {
+        let fixture = NativeStoreFixture::new(true);
+        let database_path = fixture.settings.state_dir.join("db/db.sqlite");
+        let database = Connection::open(&database_path).expect("fixture database should open");
+        database
+            .execute(
+                "PRAGMA journal_mode=WAL;
+                 INSERT INTO ValidPaths (id, path, hash, registrationTime, deriver, narSize, sigs, ca) VALUES
+                 (1, '/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root',
+                  'sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
+                  1, NULL, 289656, 'old-key:old-signature', NULL),
+                 (2, '/nix/store/11111111111111111111111111111111-old-reference',
+                  'sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
+                  1, NULL, 1, '', NULL),
+                 (3, '/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-new-reference',
+                  'sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
+                  1, NULL, 1, '', NULL);
+                 INSERT INTO Refs (referrer, reference) VALUES (1, 2);",
+            )
+            .expect("initial snapshot rows should be inserted");
+        drop(database);
+
+        let snapshot = super::metadata::NativeMetadataSnapshot::open(&fixture.settings.state_dir)
+            .expect("supported Nix metadata snapshot should open");
+        let writer = Connection::open(&database_path).expect("WAL writer should open");
+        writer
+            .execute(
+                "BEGIN IMMEDIATE;
+                 UPDATE ValidPaths SET narSize=289657, sigs='new-key:new-signature' WHERE id=1;
+                 DELETE FROM Refs WHERE referrer=1;
+                 INSERT INTO Refs (referrer, reference) VALUES (1, 3);
+                 COMMIT;",
+            )
+            .expect("writer should commit one coherent metadata update");
+
+        let existing_snapshot = snapshot
+            .validated_claims_for("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root")
+            .expect("existing snapshot should still read its original path");
+        assert_eq!(existing_snapshot.claims().identity().size().get(), 289_656);
+        assert_eq!(
+            existing_snapshot
+                .claims()
+                .reference_paths()
+                .collect::<Vec<_>>(),
+            ["/nix/store/11111111111111111111111111111111-old-reference"]
+        );
+        assert_eq!(
+            existing_snapshot.into_narinfo_metadata().signatures(),
+            ["old-key:old-signature"]
+        );
+
+        let refreshed_snapshot =
+            super::metadata::NativeMetadataSnapshot::open(&fixture.settings.state_dir)
+                .expect("fresh supported snapshot should open");
+        let refreshed_claims = refreshed_snapshot
+            .validated_claims_for("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root")
+            .expect("fresh snapshot should read the committed path");
+        assert_eq!(refreshed_claims.claims().identity().size().get(), 289_657);
+        assert_eq!(
+            refreshed_claims
+                .claims()
+                .reference_paths()
+                .collect::<Vec<_>>(),
+            ["/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-new-reference"]
+        );
+        assert_eq!(
+            refreshed_claims.into_narinfo_metadata().signatures(),
+            ["new-key:new-signature"]
+        );
+    }
+
+    #[test]
+    fn nix_store_fixtures_verify_signatures_and_project_raw_narinfo() {
+        // Captured from Nix 2.34.8 ValidPaths rows; cache.nixos.org signatures
+        // are verified offline with its published public key.
+        let fixture = NativeStoreFixture::new(true);
+        let database = Connection::open(fixture.settings.state_dir.join("db/db.sqlite"))
+            .expect("fixture database should open");
+        database
+            .execute(
+                "INSERT INTO ValidPaths (id, path, hash, registrationTime, deriver, narSize, sigs, ca) VALUES
+                 (1, '/nix/store/d0d9wqmw5saaynfvmszsda3dmh5q82z8-libidn2-2.3.8',
+                  'sha256:503893073fe39f4b985ee90a4d4b94e56e0f6c46570cf00fb14d5da2cbd364ac',
+                  1, '/nix/store/mpzn77a9867s84iyd1srfwrd64y5awsv-libidn2-2.3.8.drv', 368208,
+                  'cache.nixos.org-1:MPH/F9lUYyvh6VR/Tr8iM/kguaHnt4U5h5Kz6dYc+6agt6qMW4V5rcXw+ykc0BVlz3yoBuwAic/KnSUNdCw8AQ==', NULL),
+                 (2, '/nix/store/pkphs076yz5ajnqczzj0588n6miph269-libunistring-1.4.1',
+                  'sha256:ad10dff2809a0cd2734a9574dddd8df9780a1a2a6dba7769f1eeb5e7b260c1ef',
+                  1, '/nix/store/m8n3ng116gv3id8dm61kx1cqnh99rwaz-libunistring-1.4.1.drv', 2078792,
+                  'cache.nixos.org-1:QKjGZh4tgGKcAKfpuKF+F9rDBgycWirDRk/f3OXKrF+JaCQB9xcw8P83u9BWN2gyyLLTfuK14MTvbYFrTdsJDQ==', NULL),
+                 (3, '/nix/store/xvdf2dnj66vyyi0jjwxr17qjk0v3w8fp-nix-wallpaper-simple-dark-gray_bootloader.png',
+                  'sha256:77fffdbb77e42ed9fb8a14d1462a722a77dc90f669b8795615e35d188c4f59af',
+                  1, '/nix/store/qjpq7vib1plv6lj2hql80yqhn9mdc6by-nix-wallpaper-simple-dark-gray_bootloader.png.drv',
+                  9176,
+                  'cache.nixos.org-1:h0NTWnKoJcfR9vgT499okYa0XnuAOsA/ZVdEcNRYjrdd1y9D1ujs+uIM5ocXiAcTt/n0KnkUIbfOU+xR7EgbCQ==', NULL),
+                 (4, '/nix/store/4d0ix5djms3n2njjdc58l916cwack1rp-empty-directory',
+                  'sha256:a50a5ab6d992f5598edd92105059fae9acfc192981e08bd88534c2167e92526a',
+                  1, '/nix/store/5ncnx3qgzykavgkdvj3gkcdi8q6fnp8j-empty-directory.drv', 96,
+                  'cache.nixos.org-1:TlGxThvFIpDeZdovNZRP3yR/kDYTaOke6wul57doLvldLGHVYzeHiXgrPZd2TrDcLsDPcOP4M8RuEdthhMK3BA==',
+                  'fixed:r:sha256:0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5');
+                 INSERT INTO Refs (referrer, reference) VALUES (1, 1), (1, 2);",
+            )
+            .expect("Nix metadata fixture rows should be inserted");
+        let snapshot = super::metadata::NativeMetadataSnapshot::open(&fixture.settings.state_dir)
+            .expect("supported Nix metadata snapshot should open");
+        let trusted_keys = TrustedPublicKeys::parse(
+            "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+        )
+        .expect("official Nix cache public key should parse");
+
+        let referenced = snapshot
+            .validated_claims_for("/nix/store/d0d9wqmw5saaynfvmszsda3dmh5q82z8-libidn2-2.3.8")
+            .expect("referenced Nix fixture should validate");
+        assert_eq!(
+            referenced.claims().fingerprint(),
+            "1;/nix/store/d0d9wqmw5saaynfvmszsda3dmh5q82z8-libidn2-2.3.8;sha256:1b34sg5s4padn47z032p8rn0yvp5ji5ls2p9bsc4p7z37w3r6f2h;368208;/nix/store/d0d9wqmw5saaynfvmszsda3dmh5q82z8-libidn2-2.3.8,/nix/store/pkphs076yz5ajnqczzj0588n6miph269-libunistring-1.4.1"
+        );
+        assert_eq!(
+            referenced.claims().reference_paths().collect::<Vec<_>>(),
+            [
+                "/nix/store/d0d9wqmw5saaynfvmszsda3dmh5q82z8-libidn2-2.3.8",
+                "/nix/store/pkphs076yz5ajnqczzj0588n6miph269-libunistring-1.4.1",
+            ]
+        );
+        verify_nix_raw_projection(
+            referenced.into_narinfo_metadata(),
+            &trusted_keys,
+            "d0d9wqmw5saaynfvmszsda3dmh5q82z8-libidn2-2.3.8",
+            "1b34sg5s4padn47z032p8rn0yvp5ji5ls2p9bsc4p7z37w3r6f2h",
+            368_208,
+            "d0d9wqmw5saaynfvmszsda3dmh5q82z8-libidn2-2.3.8 pkphs076yz5ajnqczzj0588n6miph269-libunistring-1.4.1",
+        );
+
+        let unreferenced = snapshot
+            .validated_claims_for(
+                "/nix/store/xvdf2dnj66vyyi0jjwxr17qjk0v3w8fp-nix-wallpaper-simple-dark-gray_bootloader.png",
+            )
+            .expect("unreferenced Nix fixture should validate");
+        assert!(unreferenced.claims().reference_paths().next().is_none());
+        assert_eq!(
+            unreferenced.claims().fingerprint(),
+            "1;/nix/store/xvdf2dnj66vyyi0jjwxr17qjk0v3w8fp-nix-wallpaper-simple-dark-gray_bootloader.png;sha256:1bsr9y61hpg32mb7kf39ys8dqxraf8m4dl8libxxjbp4fyxzvzvp;9176;"
+        );
+        verify_nix_raw_projection(
+            unreferenced.into_narinfo_metadata(),
+            &trusted_keys,
+            "xvdf2dnj66vyyi0jjwxr17qjk0v3w8fp-nix-wallpaper-simple-dark-gray_bootloader.png",
+            "1bsr9y61hpg32mb7kf39ys8dqxraf8m4dl8libxxjbp4fyxzvzvp",
+            9_176,
+            "",
+        );
+
+        let content_addressed_info = NarInfoMetadata::from_store_metadata(
+            "/nix/store/4d0ix5djms3n2jnjdc58l916cwack1rp-empty-directory".to_owned(),
+            Some("fixed:r:sha256:0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5".to_owned()),
+            Some("/nix/store/5ncnx3qgzykavgkdvj3gkcdi8q6fnp8j-empty-directory.drv".to_owned()),
+            NarIdentity::new(
+                NarHash::parse("0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5")
+                    .expect("content-addressed Nix hash should parse"),
+                NarSize::new(96),
+            ),
+            Vec::new(),
+            vec!["cache.nixos.org-1:TlGxThvFIpDeZdovNZRP3yR/kDYTaOke6wul57doLvldLGHVYzeHiXgrPZd2TrDcLsDPcOP4M8RuEdthhMK3BA==".to_owned()],
+        )
+        .expect("content-addressed Nix metadata should parse");
+        assert_eq!(
+            content_addressed_info.claims().fingerprint(),
+            "1;/nix/store/4d0ix5djms3n2jnjdc58l916cwack1rp-empty-directory;sha256:0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5;96;"
+        );
+        let content_addressed_raw = content_addressed_info
+            .serialize(NarRepresentation::Raw(
+                content_addressed_info.claims().identity(),
+            ))
+            .expect("content-addressed raw narinfo should serialize");
+        let content_addressed_text =
+            std::str::from_utf8(&content_addressed_raw).expect("narinfo should be UTF-8");
+        assert!(
+            content_addressed_text
+                .contains("URL: nar/0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5.nar\n")
+        );
+        assert!(
+            content_addressed_text.contains(
+                "FileHash: sha256:0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5\n"
+            )
+        );
+        assert!(
+            content_addressed_text
+                .contains("NarHash: sha256:0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5\n")
+        );
+        assert!(content_addressed_text.contains("Compression: none\n"));
+        assert!(content_addressed_text.contains("FileSize: 96\n"));
+        assert!(content_addressed_text.contains("NarSize: 96\n"));
+        assert!(
+            content_addressed_text.contains(
+                "CA: fixed:r:sha256:0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5\n"
+            )
+        );
+        trusted_keys
+            .validate(
+                &StoreHash::parse("4d0ix5djms3n2jnjdc58l916cwack1rp")
+                    .expect("content-addressed route hash should parse"),
+                content_addressed_raw,
+            )
+            .expect("content-addressed Nix signature should accept raw projection");
+    }
+
+    fn verify_nix_raw_projection(
+        metadata: narjar::__private::narinfo::NarInfoMetadata,
+        trusted_keys: &TrustedPublicKeys,
+        route_and_store_path: &str,
+        nar_hash: &str,
+        nar_size: u64,
+        references: &str,
+    ) {
+        let route = route_and_store_path
+            .split_once('-')
+            .expect("fixture route should have a Nix store basename")
+            .0;
+        let path = format!("/nix/store/{route_and_store_path}");
+        let identity = metadata.claims().identity();
+        let bytes = metadata
+            .serialize(NarRepresentation::Raw(identity))
+            .expect("raw Nix narinfo should serialize");
+        let text = std::str::from_utf8(&bytes).expect("narinfo should be UTF-8");
+        assert!(text.contains(&format!("StorePath: {path}\n")));
+        assert!(text.contains(&format!("URL: nar/{nar_hash}.nar\n")));
+        assert!(text.contains(&format!("FileHash: sha256:{nar_hash}\n")));
+        assert!(text.contains(&format!("NarHash: sha256:{nar_hash}\n")));
+        assert!(text.contains(&format!("FileSize: {nar_size}\n")));
+        assert!(text.contains(&format!("NarSize: {nar_size}\n")));
+        assert!(text.contains(&format!("References: {references}\n")));
+        assert!(text.contains("Compression: none\n"));
+        trusted_keys
+            .validate(
+                &StoreHash::parse(route).expect("fixture route hash should parse"),
+                bytes,
+            )
+            .expect("Nix-generated signature should accept the raw projection");
     }
 
     #[test]
