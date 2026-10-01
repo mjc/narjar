@@ -601,18 +601,10 @@ impl NativeStoreLeaseManager {
         path: &NativeStorePath,
         record: &LeaseRecord,
     ) -> Result<(), NativeStoreLeaseError> {
-        let root_path = self.root_path(path);
-        match fs::symlink_metadata(&root_path) {
-            Ok(_) => self.verify_root(&root_path, path),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.ensure_root(&root_path, path)
-            }
-            Err(error) => Err(NativeStoreLeaseError::Io(error)),
-        }?;
         if record.state != PersistedLeaseState::Live {
             return Err(NativeStoreLeaseError::InvalidRecord);
         }
-        Ok(())
+        self.ensure_root(&self.root_path(path), path)
     }
 
     pub(crate) fn release(
@@ -2034,6 +2026,21 @@ mod tests {
 
     #[test]
     fn interrupted_root_recovery_syncs_an_already_existing_root_before_clearing_capacity() {
+        assert_interrupted_root_recovery_retries_directory_sync(CapacityMutationKind::Acquire, 0);
+    }
+
+    #[test]
+    fn interrupted_release_recovery_syncs_an_existing_root_before_clearing_capacity() {
+        assert_interrupted_root_recovery_retries_directory_sync(
+            CapacityMutationKind::ReleaseLive,
+            1,
+        );
+    }
+
+    fn assert_interrupted_root_recovery_retries_directory_sync(
+        mutation_kind: CapacityMutationKind,
+        previous_active: u64,
+    ) {
         let fixture = LeaseFixture::new(1);
         let record_path = fixture.manager.record_path(&fixture.store_path);
         let lease_directory = fixture.manager.lease_directory(&fixture.store_path);
@@ -2045,15 +2052,15 @@ mod tests {
             &fixture.roots_dir,
             CapacityRecord {
                 generation: 1,
-                active: 0,
+                active: previous_active,
                 pending: Some(CapacityMutation {
-                    kind: CapacityMutationKind::Acquire,
+                    kind: mutation_kind,
                     store_basename: fixture.store_path.basename.clone(),
-                    previous_active: 0,
+                    previous_active,
                 }),
             },
         )
-        .expect("interrupted acquisition should be durable");
+        .expect("interrupted capacity mutation should be durable");
         fail_nth_directory_sync(&lease_directory, 1);
 
         assert!(matches!(
