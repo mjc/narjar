@@ -686,10 +686,7 @@ mod tests {
 
     use data_encoding::BASE64;
     use ed25519_dalek::SigningKey;
-    use narjar::__private::{
-        narinfo::{NarInfoMetadata, TrustedPublicKeys},
-        storage::StoreHash,
-    };
+    use narjar::__private::{narinfo::TrustedPublicKeys, storage::StoreHash};
     use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
     use sqlite::Connection;
     use tempfile::TempDir;
@@ -956,7 +953,7 @@ mod tests {
                   1, '/nix/store/qjpq7vib1plv6lj2hql80yqhn9mdc6by-nix-wallpaper-simple-dark-gray_bootloader.png.drv',
                   9176,
                   'cache.nixos.org-1:h0NTWnKoJcfR9vgT499okYa0XnuAOsA/ZVdEcNRYjrdd1y9D1ujs+uIM5ocXiAcTt/n0KnkUIbfOU+xR7EgbCQ==', NULL),
-                 (4, '/nix/store/4d0ix5djms3n2njjdc58l916cwack1rp-empty-directory',
+                 (4, '/nix/store/4d0ix5djms3n2jnjdc58l916cwack1rp-empty-directory',
                   'sha256:a50a5ab6d992f5598edd92105059fae9acfc192981e08bd88534c2167e92526a',
                   1, '/nix/store/5ncnx3qgzykavgkdvj3gkcdi8q6fnp8j-empty-directory.drv', 96,
                   'cache.nixos.org-1:TlGxThvFIpDeZdovNZRP3yR/kDYTaOke6wul57doLvldLGHVYzeHiXgrPZd2TrDcLsDPcOP4M8RuEdthhMK3BA==',
@@ -1013,27 +1010,17 @@ mod tests {
             "",
         );
 
-        let content_addressed_info = NarInfoMetadata::from_store_metadata(
-            "/nix/store/4d0ix5djms3n2jnjdc58l916cwack1rp-empty-directory".to_owned(),
-            Some("fixed:r:sha256:0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5".to_owned()),
-            Some("/nix/store/5ncnx3qgzykavgkdvj3gkcdi8q6fnp8j-empty-directory.drv".to_owned()),
-            NarIdentity::new(
-                NarHash::parse("0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5")
-                    .expect("content-addressed Nix hash should parse"),
-                NarSize::new(96),
-            ),
-            Vec::new(),
-            vec!["cache.nixos.org-1:TlGxThvFIpDeZdovNZRP3yR/kDYTaOke6wul57doLvldLGHVYzeHiXgrPZd2TrDcLsDPcOP4M8RuEdthhMK3BA==".to_owned()],
-        )
-        .expect("content-addressed Nix metadata should parse");
+        let content_addressed = snapshot
+            .validated_claims_for("/nix/store/4d0ix5djms3n2jnjdc58l916cwack1rp-empty-directory")
+            .expect("content-addressed Nix fixture should validate");
         assert_eq!(
-            content_addressed_info.claims().fingerprint(),
+            content_addressed.claims().fingerprint(),
             "1;/nix/store/4d0ix5djms3n2jnjdc58l916cwack1rp-empty-directory;sha256:0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5;96;"
         );
-        let content_addressed_raw = content_addressed_info
-            .serialize(NarRepresentation::Raw(
-                content_addressed_info.claims().identity(),
-            ))
+        let content_addressed_raw = content_addressed
+            .sign_for_trusted_cache(&trusted_keys, None)
+            .expect("Nix signature should be reusable for its exact fingerprint")
+            .serialize_raw()
             .expect("content-addressed raw narinfo should serialize");
         let content_addressed_text =
             std::str::from_utf8(&content_addressed_raw).expect("narinfo should be UTF-8");
