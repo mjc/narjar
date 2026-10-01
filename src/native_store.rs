@@ -226,8 +226,23 @@ fn validate_directory_ancestors(path: &Path) -> Result<(), String> {
     path.ancestors().try_for_each(|ancestor| {
         let metadata = fs::metadata(ancestor)
             .map_err(|error| format!("inspecting native-store path ancestor: {error}"))?;
-        validate_ancestor_owner_and_mode(metadata.uid(), metadata.mode(), effective_user_id())
+        match ancestor == Path::new("/") {
+            true => validate_filesystem_root_permissions(metadata.mode()),
+            false => validate_ancestor_owner_and_mode(
+                metadata.uid(),
+                metadata.mode(),
+                effective_user_id(),
+            )
+            .map_err(|error| format!("{error}: {}", ancestor.display())),
+        }
     })
+}
+
+fn validate_filesystem_root_permissions(mode: u32) -> Result<(), String> {
+    match mode & 0o022 == 0 || mode & 0o1000 != 0 {
+        true => Ok(()),
+        false => Err("filesystem root allows untrusted path replacement".into()),
+    }
 }
 
 fn validate_ancestor_owner_and_mode(
@@ -237,7 +252,11 @@ fn validate_ancestor_owner_and_mode(
 ) -> Result<(), String> {
     match owner_uid == 0 || owner_uid == service_uid {
         true => {}
-        false => return Err("native-store path has an ancestor with untrusted ownership".into()),
+        false => {
+            return Err(format!(
+                "native-store path ancestor has untrusted ownership: uid {owner_uid}, service uid {service_uid}"
+            ));
+        }
     }
     match mode & 0o022 == 0 || mode & 0o1000 != 0 {
         true => Ok(()),
@@ -704,7 +723,7 @@ mod tests {
 
     impl NativeStoreFixture {
         fn new(valid_schema: bool) -> Self {
-            let root = tempfile::tempdir().expect("fixture root should be created");
+            let root = tempfile::tempdir_in(".").expect("fixture root should be created");
             let store_dir = root.path().join("store");
             let state_dir = root.path().join("state");
             let database_dir = state_dir.join("db");
