@@ -13,6 +13,12 @@ thread_local! {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatusCode(u16);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConnectionDisposition {
+    KeepAlive,
+    Close,
+}
+
 impl StatusCode {
     pub const OK: Self = Self(200);
     pub const CREATED: Self = Self(201);
@@ -133,7 +139,11 @@ impl<R> Response<R> {
         self
     }
 
-    pub(super) fn write_headers(&self, stream: &mut TcpStream, keep_alive: bool) -> io::Result<()> {
+    pub(super) fn write_headers(
+        &self,
+        stream: &mut TcpStream,
+        connection: ConnectionDisposition,
+    ) -> io::Result<()> {
         let mut headers = String::new();
         write!(
             &mut headers,
@@ -153,10 +163,9 @@ impl<R> Response<R> {
         }
         writeln!(&mut headers, "Content-Length: {}\r", self.content_length)
             .expect("writing response length to String cannot fail");
-        headers.push_str(if keep_alive {
-            "Connection: keep-alive\r\n\r\n"
-        } else {
-            "Connection: close\r\n\r\n"
+        headers.push_str(match connection {
+            ConnectionDisposition::KeepAlive => "Connection: keep-alive\r\n\r\n",
+            ConnectionDisposition::Close => "Connection: close\r\n\r\n",
         });
         stream.write_all(headers.as_bytes())
     }
@@ -165,12 +174,12 @@ impl<R> Response<R> {
         mut self,
         stream: &mut TcpStream,
         head: bool,
-        keep_alive: bool,
+        connection: ConnectionDisposition,
     ) -> Result<u64, TransferFailure>
     where
         R: Read,
     {
-        self.write_headers(stream, keep_alive)
+        self.write_headers(stream, connection)
             .map_err(|error| TransferFailure {
                 error,
                 body_bytes: 0,
@@ -324,7 +333,7 @@ pub fn static_header(
 
 pub fn write_status(stream: &mut TcpStream, status: StatusCode) -> io::Result<()> {
     Response::empty(status)
-        .write_to(stream, false, false)
+        .write_to(stream, false, ConnectionDisposition::Close)
         .map(|_| ())
         .map_err(|failure| failure.error)
 }
