@@ -141,7 +141,10 @@ fn absolute_destination(path: &Path) -> Result<PathBuf, Error> {
         .file_name()
         .filter(|name| *name != "." && *name != "..")
         .ok_or_else(|| Error::usage("setup destinations must name directories"))?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let parent = fs::canonicalize(parent).map_err(|error| {
         Error::usage(format!(
             "setup destination parent must exist ({}): {error}",
@@ -290,9 +293,11 @@ fn runtime(error: impl std::fmt::Display) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::{Args as _, Command, FromArgMatches};
 
-    use super::Setup;
+    use super::{Setup, absolute_destination};
 
     #[test]
     fn setup_defaults_match_the_documented_local_first_run() {
@@ -315,5 +320,51 @@ mod tests {
             narjar::__private::storage::StorageBackend::Flat
         ));
         assert!(!setup.private_read);
+    }
+
+    #[test]
+    fn bare_destination_resolves_from_the_current_directory() {
+        let current_directory = std::fs::canonicalize(".").unwrap();
+
+        assert_eq!(
+            absolute_destination(Path::new("cache")).unwrap(),
+            current_directory.join("cache")
+        );
+    }
+
+    #[test]
+    fn dot_relative_destination_resolves_from_the_current_directory() {
+        let current_directory = std::fs::canonicalize(".").unwrap();
+
+        assert_eq!(
+            absolute_destination(Path::new("./cache")).unwrap(),
+            current_directory.join("cache")
+        );
+    }
+
+    #[test]
+    fn absolute_destination_keeps_its_canonical_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().canonicalize().unwrap().join("cache");
+
+        assert_eq!(absolute_destination(&destination).unwrap(), destination);
+    }
+
+    #[test]
+    fn destination_requires_an_existing_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("missing").join("cache");
+
+        assert!(absolute_destination(&destination).is_err());
+    }
+
+    #[test]
+    fn root_and_dot_destinations_do_not_name_a_directory_to_create() {
+        for path in ["/", ".", ".."] {
+            assert!(
+                absolute_destination(Path::new(path)).is_err(),
+                "{path:?} must not be accepted as a setup destination"
+            );
+        }
     }
 }
