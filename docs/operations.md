@@ -816,6 +816,10 @@ services.narjar.gc = {
 };
 ~~~
 
+`maxBytes` starts collection above its limit and is also the target when
+`targetBytes` is unset. When both are set, `targetBytes` must not exceed
+`maxBytes`.
+
 Enabling this creates `narjar-gc.timer` and `narjar-gc.service`. The service
 stops `narjar.service`, runs `gc --apply`, and starts the cache again from
 `ExecStopPost`, including after a failed collection. A persistent timer may
