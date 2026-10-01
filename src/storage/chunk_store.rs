@@ -965,6 +965,38 @@ struct ChunkSpecification {
     length: u64,
 }
 
+impl ChunkSpecification {
+    fn from_byte_range(
+        byte_range: Range<usize>,
+        hash: ChunkHash,
+        previous_nar_end: u64,
+        nar_end: u64,
+    ) -> io::Result<Self> {
+        let range_length = byte_range
+            .end
+            .checked_sub(byte_range.start)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk range underflow"))?;
+        let length = u64::try_from(range_length)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk length overflow"))?;
+        let expected_nar_end = previous_nar_end
+            .checked_add(length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end overflow"))?;
+        if expected_nar_end != nar_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk byte range does not match its absolute NAR offsets",
+            ));
+        }
+        Ok(Self {
+            start: byte_range.start,
+            end: byte_range.end,
+            hash,
+            nar_end,
+            length,
+        })
+    }
+}
+
 struct PendingChunk<'a> {
     bytes: &'a [u8],
     hash: ChunkHash,
@@ -1155,6 +1187,7 @@ impl ChunkingWriter<'_> {
     fn next_chunk_specifications(&self, final_batch: bool) -> io::Result<Vec<ChunkSpecification>> {
         let mut specifications = Vec::with_capacity(CHUNK_PUBLICATION_BATCH_SIZE);
         let mut start = 0;
+        let mut previous_end = self.previous_end;
         let mut previous_length = self.previous_length;
         while start < self.pending.len() && specifications.len() < CHUNK_PUBLICATION_BATCH_SIZE {
             let remaining = self.pending.len() - start;
@@ -1179,22 +1212,19 @@ impl ChunkingWriter<'_> {
             let end = start
                 .checked_add(chunk_length)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end overflow"))?;
-            let remaining_after_chunk = self.pending.len() - end;
+            let remaining_after_chunk = u64::try_from(self.pending.len() - end).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "remaining chunk bytes overflow")
+            })?;
             let nar_end = self
                 .size
-                .checked_sub(remaining_after_chunk as u64)
+                .checked_sub(remaining_after_chunk)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end underflow"))?;
-            let length = nar_end.checked_sub(self.previous_end).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "chunk length underflow")
-            })?;
-            specifications.push(ChunkSpecification {
-                start,
-                end,
-                hash: ChunkHash::from_digest(Sha256::digest(&self.pending[start..end]).into()),
-                nar_end,
-                length,
-            });
-            previous_length = Some(length);
+            let hash = ChunkHash::from_digest(Sha256::digest(&self.pending[start..end]).into());
+            let specification =
+                ChunkSpecification::from_byte_range(start..end, hash, previous_end, nar_end)?;
+            previous_end = specification.nar_end;
+            previous_length = Some(specification.length);
+            specifications.push(specification);
             start = end;
         }
         if specifications.is_empty() {
@@ -1647,8 +1677,224 @@ mod tests {
         storage::{
             chunked::{ChunkHash, ChunkProfile, ManifestReader},
             directory::Directory,
+            fs::FilesystemSpace,
+            publication::{StagingBudget, StagingReservation},
+            state::{StorageActivity, StorageBackend},
         },
     };
+
+    #[test]
+    fn chunk_specifications_measure_each_range_not_the_cumulative_batch_end() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let profile = ChunkProfile::MinCdcHash4V2;
+        let mut writer = store
+            .begin_ingest_with_optional_reservation(profile, None, 0)
+            .unwrap();
+        let first_nar_offset = 37;
+        writer.pending = deterministic_chunk_fixture(profile.max_size() as usize * 3);
+        writer.previous_end = first_nar_offset;
+        writer.previous_length = Some(profile.min_size());
+        writer.size = first_nar_offset + writer.pending.len() as u64;
+
+        let specifications = writer.next_chunk_specifications(true).unwrap();
+
+        assert!(
+            specifications.len() >= 3,
+            "fixture must span several chunks"
+        );
+        let exact_capacity = FilesystemSpace {
+            total_bytes: writer.pending.len() as u64,
+            available_bytes: writer.pending.len() as u64,
+            total_inodes: 2,
+            available_inodes: 2,
+            read_only: false,
+        };
+        let mut capacity = StagingBudget::default();
+        specifications
+            .iter()
+            .try_for_each(|specification| capacity.reserve(exact_capacity, 0, specification.length))
+            .unwrap();
+        assert_eq!(
+            capacity.outstanding_bytes(),
+            writer.pending.len() as u64,
+            "each chunk reserves only its own byte range"
+        );
+        assert!(capacity.reserve(exact_capacity, 0, 1).is_err());
+        let mut previous_end = first_nar_offset;
+        let mut previous_range_end = 0;
+        let mut chunk_lengths = Vec::with_capacity(specifications.len());
+        for specification in specifications {
+            assert_eq!(specification.start, previous_range_end);
+            assert_eq!(
+                specification.length,
+                (specification.end - specification.start) as u64
+            );
+            assert_eq!(specification.length, specification.nar_end - previous_end);
+            chunk_lengths.push(specification.length);
+            previous_end = specification.nar_end;
+            previous_range_end = specification.end;
+        }
+        chunk_lengths.sort_unstable();
+        chunk_lengths.dedup();
+        assert!(
+            chunk_lengths.len() > 1,
+            "fixture includes unequal chunk lengths"
+        );
+    }
+
+    #[test]
+    fn multi_batch_ingest_accounts_each_chunk_and_reconstructs_exact_bytes() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let activity = std::sync::Arc::new(StorageActivity::default());
+        let store = ChunkStore::initialize_with_activity(root.file(), activity.clone()).unwrap();
+        let profile = ChunkProfile::MinCdcHash4V2;
+        let input = deterministic_chunk_fixture(profile.max_size() as usize * 18);
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        let staging_budget = std::sync::Arc::new(std::sync::Mutex::new(StagingBudget::default()));
+        let reservation = StagingReservation::empty(staging_budget.clone());
+        let mut writer = store
+            .begin_ingest_with_reservation(profile, reservation, 0)
+            .unwrap();
+        writer.write_all(&input).unwrap();
+        let completed = writer.finish(identity).unwrap();
+        completed.release_reservation();
+
+        let mut manifest_reader = ManifestReader::new(
+            store.open_manifest(identity.hash()).unwrap().unwrap(),
+            super::MAX_CHUNK_MANIFEST_BYTES,
+        )
+        .unwrap();
+        let manifest = manifest_reader.manifest();
+        assert!(
+            manifest.chunk_count() > 16,
+            "fixture crosses publication batches"
+        );
+        let descriptors = (0..manifest.chunk_count())
+            .map(|_| manifest_reader.next_record().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        manifest_reader.finish_remaining().unwrap();
+
+        let mut previous_end = 0;
+        let mut lengths = descriptors
+            .iter()
+            .map(|descriptor| {
+                let length = descriptor.end() - previous_end;
+                previous_end = descriptor.end();
+                length
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(previous_end, input.len() as u64);
+        lengths.sort_unstable();
+        assert!(lengths.windows(2).any(|pair| pair[0] != pair[1]));
+
+        let after_creation = activity.snapshot(StorageBackend::Chunked);
+        assert_eq!(
+            after_creation.chunk_bytes_created + after_creation.chunk_bytes_reused,
+            input.len() as u64
+        );
+        assert_eq!(
+            after_creation.chunks_created + after_creation.chunks_reused,
+            manifest.chunk_count()
+        );
+        assert_eq!(staging_budget.lock().unwrap().outstanding_bytes(), 0);
+
+        let mut reconstructed = Vec::new();
+        store
+            .read_range(
+                identity.hash(),
+                0..identity.size().get(),
+                super::MAX_CHUNK_MANIFEST_BYTES,
+                &mut reconstructed,
+            )
+            .unwrap();
+        assert_eq!(reconstructed, input);
+
+        let first_boundary = descriptors[0].end() as usize;
+        let range = first_boundary - 113..first_boundary + 271;
+        let mut crossing_range = Vec::new();
+        store
+            .read_range(
+                identity.hash(),
+                range.start as u64..range.end as u64,
+                super::MAX_CHUNK_MANIFEST_BYTES,
+                &mut crossing_range,
+            )
+            .unwrap();
+        assert_eq!(crossing_range, input[range]);
+
+        store
+            .store_nar(Cursor::new(&input), identity, profile)
+            .unwrap();
+        let after_reuse = activity.snapshot(StorageBackend::Chunked);
+        assert_eq!(
+            after_reuse.chunk_bytes_reused - after_creation.chunk_bytes_reused,
+            input.len() as u64
+        );
+        assert_eq!(
+            after_reuse.chunks_reused - after_creation.chunks_reused,
+            manifest.chunk_count()
+        );
+        assert_eq!(staging_budget.lock().unwrap().outstanding_bytes(), 0);
+
+        let equal_length_input = vec![0; profile.max_size() as usize * 3];
+        let equal_length_identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&equal_length_input).into()),
+            NarSize::new(equal_length_input.len() as u64),
+        );
+        let equal_length_manifest = store
+            .store_nar(
+                Cursor::new(&equal_length_input),
+                equal_length_identity,
+                profile,
+            )
+            .unwrap();
+        let mut equal_length_reader = ManifestReader::new(
+            store
+                .open_manifest(equal_length_identity.hash())
+                .unwrap()
+                .unwrap(),
+            super::MAX_CHUNK_MANIFEST_BYTES,
+        )
+        .unwrap();
+        let equal_chunk_lengths = (0..equal_length_manifest.chunk_count())
+            .map(|_| {
+                let descriptor = equal_length_reader.next_record().unwrap().unwrap();
+                descriptor.end()
+            })
+            .scan(0, |previous_end, end| {
+                let length = end - *previous_end;
+                *previous_end = end;
+                Some(length)
+            })
+            .collect::<Vec<_>>();
+        equal_length_reader.finish_remaining().unwrap();
+        assert!(equal_chunk_lengths.len() > 1);
+        assert!(
+            equal_chunk_lengths
+                .iter()
+                .all(|length| *length == equal_chunk_lengths[0])
+        );
+    }
+
+    fn deterministic_chunk_fixture(length: usize) -> Vec<u8> {
+        let equal_chunk_prefix = (ChunkProfile::MinCdcHash4V2.min_size() * 2) as usize;
+        let prefix_length = equal_chunk_prefix.min(length);
+        let mut input = vec![0; prefix_length];
+        let mut random_state = 0x31f2_87a4_6c09_5bd1_u64;
+        input.extend((prefix_length..length).map(|_| {
+            random_state ^= random_state << 13;
+            random_state ^= random_state >> 7;
+            random_state ^= random_state << 17;
+            random_state as u8
+        }));
+        input
+    }
 
     #[test]
     fn stores_deduplicated_chunks_and_a_round_trippable_manifest() {
