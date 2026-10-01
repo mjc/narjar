@@ -322,6 +322,10 @@ impl NarInfoMetadata {
         self.signatures.push(signature);
     }
 
+    pub fn replace_signatures(&mut self, signatures: Vec<String>) {
+        self.signatures = signatures;
+    }
+
     pub fn serialize(&self, representation: NarRepresentation) -> Result<Vec<u8>, NarInfoError> {
         if representation.identity() != self.claims.identity() {
             return Err(NarInfoError);
@@ -608,7 +612,8 @@ fn parse_narinfo_text(bytes: Vec<u8>) -> Result<String, NarInfoError> {
     Ok(text)
 }
 
-fn valid_name(name: &str) -> bool {
+/// Checks the Nix signing-key name syntax shared by key and signature parsing.
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
