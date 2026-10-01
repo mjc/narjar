@@ -634,14 +634,7 @@ impl Storage {
 
     pub(crate) fn capacity(&self) -> Result<StorageCapacity, StorageError> {
         let directory = self.nar_directory()?;
-        let space = filesystem_space(&directory)?;
-        Ok(StorageCapacity {
-            total_bytes: space.total_bytes,
-            available_bytes: space.available_bytes,
-            total_inodes: space.total_inodes,
-            available_inodes: space.available_inodes,
-            read_only: space.read_only,
-        })
+        Ok(filesystem_space(&directory)?)
     }
 
     pub(crate) fn capacity_and_staging(&self) -> Result<(StorageCapacity, u64), StorageError> {

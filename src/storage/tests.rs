@@ -14,7 +14,7 @@ use super::compression::{
     verify_decoded_compressed_file, verify_encoded_compressed_file, xz_decoder_memory_requirement,
 };
 use super::egress::{EgressReceipt, EgressSlot};
-use super::fs::{FilesystemSpace, remove_temp, reserve_staging_bytes_for_test, sync_dir};
+use super::fs::{StorageCapacity, remove_temp, reserve_staging_bytes_for_test, sync_dir};
 use super::ids::nix32_sha256;
 use super::publication::{DecoderMemoryLimit, Layout, PublishBoundary, PublishTarget};
 use super::{
@@ -2967,7 +2967,7 @@ fn stream_resource_failures_leave_no_false_publication_state() {
 
 #[test]
 fn destination_capacity_rejects_inode_exhaustion() {
-    let space = FilesystemSpace {
+    let space = StorageCapacity {
         total_bytes: u64::MAX,
         available_bytes: u64::MAX,
         total_inodes: u64::MAX,
@@ -2983,7 +2983,7 @@ fn destination_capacity_rejects_inode_exhaustion() {
 
 #[test]
 fn read_only_filesystems_are_not_ready() {
-    let space = FilesystemSpace {
+    let space = StorageCapacity {
         total_bytes: u64::MAX,
         available_bytes: u64::MAX,
         total_inodes: u64::MAX,
@@ -3013,7 +3013,7 @@ fn capacity_errors_have_stable_categories() {
 #[test]
 fn staging_reservations_are_bounded_and_released() {
     let reservations = Arc::new(Mutex::new(Default::default()));
-    let space = FilesystemSpace {
+    let space = StorageCapacity {
         total_bytes: 100,
         available_bytes: 100,
         total_inodes: 2,
@@ -3035,14 +3035,14 @@ fn staging_reservations_are_bounded_and_released() {
 
 #[test]
 fn staging_admission_rejects_read_only_and_inode_exhausted_filesystems() {
-    let read_only = FilesystemSpace {
+    let read_only = StorageCapacity {
         total_bytes: 100,
         available_bytes: 100,
         total_inodes: 2,
         available_inodes: 2,
         read_only: true,
     };
-    let inode_exhausted = FilesystemSpace {
+    let inode_exhausted = StorageCapacity {
         total_bytes: 100,
         available_bytes: 100,
         total_inodes: 2,

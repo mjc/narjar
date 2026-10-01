@@ -82,24 +82,15 @@ pub(crate) fn capacity_error_kind(raw_error: i32) -> CapacityErrorKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FilesystemSpace {
-    pub(super) total_bytes: u64,
-    pub(super) available_bytes: u64,
-    pub(super) total_inodes: u64,
-    pub(super) available_inodes: u64,
-    pub(super) read_only: bool,
+pub struct StorageCapacity {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub total_inodes: u64,
+    pub available_inodes: u64,
+    pub read_only: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StorageCapacity {
-    pub(crate) total_bytes: u64,
-    pub(crate) available_bytes: u64,
-    pub(crate) total_inodes: u64,
-    pub(crate) available_inodes: u64,
-    pub(crate) read_only: bool,
-}
-
-impl FilesystemSpace {
+impl StorageCapacity {
     pub(super) fn required_capacity(self, required_bytes: u64) -> Result<(), StorageError> {
         if self.read_only {
             return Err(StorageError::Io(io::Error::from_raw_os_error(libc::EROFS)));
@@ -129,7 +120,7 @@ fn reserve_staging_bytes_with_measurement(
     budget: &Arc<Mutex<StagingBudget>>,
     min_free_bytes: u64,
     bytes: u64,
-    measure: impl FnOnce() -> io::Result<FilesystemSpace>,
+    measure: impl FnOnce() -> io::Result<StorageCapacity>,
 ) -> Result<StagingReservation, StorageError> {
     let mut budget_guard = budget
         .lock()
@@ -147,12 +138,12 @@ pub(super) fn reserve_staging_bytes_for_test(
     budget: &Arc<Mutex<StagingBudget>>,
     min_free_bytes: u64,
     bytes: u64,
-    measure: impl FnOnce() -> io::Result<FilesystemSpace>,
+    measure: impl FnOnce() -> io::Result<StorageCapacity>,
 ) -> Result<StagingReservation, StorageError> {
     reserve_staging_bytes_with_measurement(budget, min_free_bytes, bytes, measure)
 }
 
-pub(super) fn filesystem_space(directory: &File) -> io::Result<FilesystemSpace> {
+pub(super) fn filesystem_space(directory: &File) -> io::Result<StorageCapacity> {
     let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
 
     // SAFETY: directory owns a valid descriptor for the duration of the call,
@@ -163,17 +154,23 @@ pub(super) fn filesystem_space(directory: &File) -> io::Result<FilesystemSpace> 
 
     // SAFETY: fstatvfs returned success, so it initialized statistics.
     let statistics = unsafe { statistics.assume_init() };
-    let total = (statistics.f_blocks as u128).saturating_mul(statistics.f_frsize as u128);
-    let available = (statistics.f_bavail as u128).saturating_mul(statistics.f_frsize as u128);
-    let total_inodes = statistics.f_files as u128;
-    let inodes = statistics.f_favail as u128;
-    Ok(FilesystemSpace {
-        total_bytes: total.min(u128::from(u64::MAX)) as u64,
-        available_bytes: available.min(u128::from(u64::MAX)) as u64,
-        total_inodes: total_inodes.min(u128::from(u64::MAX)) as u64,
-        available_inodes: inodes.min(u128::from(u64::MAX)) as u64,
+    Ok(capacity_from_statvfs(&statistics))
+}
+
+pub fn capacity_from_statvfs(statistics: &libc::statvfs) -> StorageCapacity {
+    let scale = statistics.f_frsize as u128;
+    let bytes = |blocks: libc::fsblkcnt_t| {
+        (blocks as u128)
+            .saturating_mul(scale)
+            .min(u128::from(u64::MAX)) as u64
+    };
+    StorageCapacity {
+        total_bytes: bytes(statistics.f_blocks),
+        available_bytes: bytes(statistics.f_bavail),
+        total_inodes: (statistics.f_files as u128).min(u128::from(u64::MAX)) as u64,
+        available_inodes: (statistics.f_favail as u128).min(u128::from(u64::MAX)) as u64,
         read_only: statistics.f_flag & libc::ST_RDONLY != 0,
-    })
+    }
 }
 
 pub(super) fn ensure_directory_at(parent: &File, name: &OsStr, label: &str) -> io::Result<File> {
@@ -823,6 +820,29 @@ pub(super) fn remove_temp(temp: &TemporaryFile) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn statvfs_capacity_conversion_saturates_bytes_and_inode_counts() {
+        // SAFETY: `statvfs` contains only integer fields and integer arrays on
+        // the supported Unix targets; zero is a valid initial value for each.
+        let mut statistics: libc::statvfs = unsafe { std::mem::zeroed() };
+        statistics.f_frsize = libc::c_ulong::MAX;
+        statistics.f_blocks = libc::fsblkcnt_t::MAX;
+        statistics.f_bavail = libc::fsblkcnt_t::MAX;
+        statistics.f_files = libc::fsfilcnt_t::MAX;
+        statistics.f_favail = libc::fsfilcnt_t::MAX;
+        statistics.f_flag = libc::ST_RDONLY;
+
+        let capacity = capacity_from_statvfs(&statistics);
+
+        assert_eq!(capacity.total_bytes, u64::MAX);
+        assert_eq!(capacity.available_bytes, u64::MAX);
+        let maximum_inode_count =
+            u128::from(libc::fsfilcnt_t::MAX).min(u128::from(u64::MAX)) as u64;
+        assert_eq!(capacity.total_inodes, maximum_inode_count);
+        assert_eq!(capacity.available_inodes, maximum_inode_count);
+        assert!(capacity.read_only);
+    }
 
     #[test]
     fn null_readdir_result_is_eof_only_when_errno_is_clear() {

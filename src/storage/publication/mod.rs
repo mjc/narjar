@@ -8,7 +8,7 @@ use std::{
 };
 
 use super::{
-    fs::{FilesystemSpace, filesystem_space, lock_exclusive, open_at},
+    fs::{StorageCapacity, filesystem_space, lock_exclusive, open_at},
     operations::OwnedTemporary,
     recovery::{PublicationState, PublicationTransaction},
     state::Storage,
@@ -324,7 +324,7 @@ pub(super) struct StagingBudget {
 impl StagingBudget {
     pub(super) fn reserve(
         &mut self,
-        space: FilesystemSpace,
+        space: StorageCapacity,
         min_free_bytes: u64,
         bytes: u64,
     ) -> Result<(), StorageError> {

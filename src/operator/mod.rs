@@ -21,7 +21,8 @@ use narjar::__private::{
     },
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
-        CleanupOutcome, Directory, ReconcileClass, Storage, StorageBackend, StoreHash,
+        CleanupOutcome, Directory, ReconcileClass, Storage, StorageBackend, StorageCapacity,
+        StoreHash, capacity_from_statvfs,
         gc::{self, GcMode, GcOptions},
     },
 };
@@ -697,11 +698,7 @@ struct DoctorPath {
 
 struct DoctorCapacity {
     path: &'static str,
-    total_bytes: u64,
-    available_bytes: u64,
-    total_inodes: u64,
-    available_inodes: u64,
-    read_only: bool,
+    capacity: StorageCapacity,
     device: u64,
 }
 
@@ -906,28 +903,24 @@ fn inspect_doctor_path(
 fn doctor_capacity(path: &Path) -> Result<DoctorCapacity, std::io::Error> {
     let file = File::open(path)?;
     let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `file` owns a live descriptor for this call, and `statistics`
+    // points to writable space for one `statvfs` value.
     if unsafe { libc::fstatvfs(file.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: a successful `fstatvfs` call initializes the output structure.
     let statistics = unsafe { statistics.assume_init() };
-    let scale = statistics.f_frsize as u128;
-    let bytes = |blocks: libc::fsblkcnt_t| {
-        (blocks as u128)
-            .saturating_mul(scale)
-            .min(u128::from(u64::MAX)) as u64
-    };
+    let capacity = capacity_from_statvfs(&statistics);
     Ok(DoctorCapacity {
         path: "",
-        total_bytes: bytes(statistics.f_blocks),
-        available_bytes: bytes(statistics.f_bavail),
-        total_inodes: (statistics.f_files as u128).min(u128::from(u64::MAX)) as u64,
-        available_inodes: (statistics.f_favail as u128).min(u128::from(u64::MAX)) as u64,
-        read_only: statistics.f_flag & libc::ST_RDONLY != 0,
+        capacity,
         device: file.metadata()?.dev(),
     })
 }
 
 fn doctor_try_lease(file: &File) -> Result<(), std::io::Error> {
+    // SAFETY: `file` owns a live descriptor for this call; `flock` retains no
+    // pointer or ownership after it returns.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         Ok(())
     } else {
@@ -937,7 +930,7 @@ fn doctor_try_lease(file: &File) -> Result<(), std::io::Error> {
 
 fn doctor_json(report: &DoctorReport) -> String {
     let paths = report.paths.iter().map(|path| format!("{{\"path\":\"{}\",\"required\":{},\"kind\":\"{}\",\"mode\":{},\"uid\":{},\"gid\":{},\"severity\":\"{}\",\"detail\":\"{}\"}}", json_escape(path.path), path.required, json_escape(path.kind), path.mode.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.uid.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.gid.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.severity.as_str(), json_escape(&path.detail))).collect::<Vec<_>>().join(",");
-    let capacities = report.capacities.iter().map(|capacity| format!("{{\"path\":\"{}\",\"total_bytes\":{},\"available_bytes\":{},\"total_inodes\":{},\"available_inodes\":{},\"read_only\":{},\"device\":{}}}", capacity.path, capacity.total_bytes, capacity.available_bytes, capacity.total_inodes, capacity.available_inodes, capacity.read_only, capacity.device)).collect::<Vec<_>>().join(",");
+    let capacities = report.capacities.iter().map(|capacity| format!("{{\"path\":\"{}\",\"total_bytes\":{},\"available_bytes\":{},\"total_inodes\":{},\"available_inodes\":{},\"read_only\":{},\"device\":{}}}", capacity.path, capacity.capacity.total_bytes, capacity.capacity.available_bytes, capacity.capacity.total_inodes, capacity.capacity.available_inodes, capacity.capacity.read_only, capacity.device)).collect::<Vec<_>>().join(",");
     format!(
         "{{\"schema\":1,\"data_dir\":\"{}\",\"mount\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"lease\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"paths\":[{}],\"capacity\":[{}]}}",
         json_escape(&report.root.to_string_lossy()),
@@ -958,11 +951,11 @@ fn print_doctor(report: &DoctorReport) {
         println!(
             "capacity\t{}\t{} bytes available / {} total\t{} inodes available / {} total\tread_only={}",
             capacity.path,
-            capacity.available_bytes,
-            capacity.total_bytes,
-            capacity.available_inodes,
-            capacity.total_inodes,
-            capacity.read_only
+            capacity.capacity.available_bytes,
+            capacity.capacity.total_bytes,
+            capacity.capacity.available_inodes,
+            capacity.capacity.total_inodes,
+            capacity.capacity.read_only
         );
     }
     for path in &report.paths {
