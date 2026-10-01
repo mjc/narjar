@@ -7,7 +7,8 @@ remain subject to the evidence gates recorded below.
 
 Narjar is a filesystem-only HTTP binary cache with two canonical
 storage backends: flat files and shared content-defined chunks. The flat
-backend is supported on Linux and macOS; chunked storage is Linux-only. The
+backend is supported on Linux and Apple Silicon macOS; chunked storage is
+Linux-only. The
 server does not expose a native /nix/store, invoke Nix, own a secret signing key,
 or perform online or background garbage collection. It supports optional
 background cache-population sampling for metrics. It can normalize uploaded NAR

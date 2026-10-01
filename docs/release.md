@@ -38,10 +38,10 @@ version without explicit maintainer consent.
    repository enforces an 8 MiB ceiling to leave room below crates.io's current
    10 MB archive limit. ([Cargo publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html))
 6. Verify the documented platform/toolchain contract: Rust 1.98 or newer;
-   Nix packages for x86_64 Linux and aarch64-darwin; the packaged-archive
-   consumer smoke is currently x86_64 Linux only; chunked storage is Linux
-   only. Do not claim support for other targets without adding and passing
-   their checks.
+   Nix package builds and `narjar` package tests run on x86_64 Linux and native
+   Apple Silicon macOS. The packaged-archive consumer smoke is x86_64 Linux
+   only. Chunked storage remains Linux-only; APFS-specific crash durability is
+   not established by the macOS package/test lane.
 
 ## Publish only with explicit approval
 

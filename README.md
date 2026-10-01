@@ -34,9 +34,10 @@ cargo install --locked --path .
 ```
 
 The repository also provides a Nix package, a NixOS module, and a Linux OCI image.
-The Nix package is provided for x86_64 Linux and Apple-silicon macOS. The
-crates.io consumer smoke test currently runs on x86_64 Linux. Chunked storage is
-supported only on Linux; macOS must use the flat backend.
+The Nix package is provided for x86_64 Linux and Apple Silicon macOS. CI builds
+the Darwin package and runs the `narjar` package tests on an Apple Silicon
+runner. Chunked storage is Linux-only; use the flat backend on macOS. The
+crates.io consumer smoke test runs on x86_64 Linux.
 To run the CLI with Nix:
 
 ```sh
@@ -189,7 +190,8 @@ deduplicates them across objects. Choose it with
 `init --storage-backend chunked`, and pass the same backend to serving and
 maintenance commands. Chunked storage is Linux-only because Narjar has not
 established its crash-durability ordering on macOS; macOS commands reject this
-backend before initialization. The flat backend remains available on macOS.
+backend before initialization. The flat backend is the supported macOS storage
+layout; APFS-specific crash-durability guarantees remain unverified.
 
 `push --compression` controls the uploaded representation.
 `serve --egress-compression` controls the representation advertised to Nix

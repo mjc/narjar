@@ -38,7 +38,10 @@ before manifest publication. The macOS fallback cannot establish equivalent
 durability for chunk contents and entries spread across shard directories.
 Apple documents that ordinary `fsync` does not provide the write-ordering and
 device-cache guarantees needed for this contract. Narjar does not claim
-crash-durable chunked storage on APFS; macOS builds support the flat backend.
+crash-durable chunked storage on APFS. The flat backend is supported on macOS
+and its package tests run on a native Apple Silicon CI runner; this does not
+establish APFS-specific crash-durability guarantees. The flake publishes the
+verified x86_64-linux and aarch64-darwin packages.
 This decision follows Apple's [fsync(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html)
 and [fcntl(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html)
 documentation, which distinguishes ordinary `fsync` from the stronger
@@ -72,9 +75,9 @@ correctness requirements. The recommended ZFS DATA profile uses
 `compression=zstd` (the OpenZFS alias for `zstd-3`); Narjar does not set or
 verify ZFS properties. XFS, btrfs, ZFS-specific behavior, overlay,
 bind-mount variants, quota/inode exhaustion, and read-only remounts remain
-unverified until the corresponding evidence work is complete. Darwin APFS is
-supported for flat storage only; chunked storage is rejected rather than
-claiming an unverified durability guarantee.
+unverified until the corresponding evidence work is complete. Darwin
+APFS-specific crash durability remains unverified; flat storage is covered by
+the native Apple Silicon package test lane, while chunked storage is rejected.
 
 No storage or deployment document should turn an unverified filesystem result
 into a support guarantee. The measured filesystem/ZFS profile belongs in the

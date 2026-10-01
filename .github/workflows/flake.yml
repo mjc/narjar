@@ -23,3 +23,15 @@ jobs:
       - run: nix build -L --no-update-lock-file .#packages.x86_64-linux.narjar-static
       - run: nix build -L --no-update-lock-file .#checks.x86_64-linux.static-elf
       - run: nix run -L --no-update-lock-file .#provenance
+
+  darwin:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+      - name: Build the Darwin package
+        run: nix build -L --no-update-lock-file .#packages.aarch64-darwin.default
+      - name: Run the Darwin Narjar package tests
+        run: nix build -L --no-update-lock-file .#checks.aarch64-darwin.tests

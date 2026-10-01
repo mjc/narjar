@@ -232,9 +232,10 @@ Explicit non-goals:
 
 ## Exact implementation gate
 
-1. Complete NARJ-29: the direnv/Nix shell is authoritative and cached, Darwin
-   checks pass, and a reachable Linux builder proves the static x86_64 artifact
-   and ELF closure. Environment evaluation alone is not artifact proof.
+1. Complete NARJ-29: the direnv/Nix shell is authoritative and cached, native
+   Apple Silicon checks cover the Darwin package and flat-storage behavior,
+   and a reachable Linux builder proves the static x86_64 artifact and ELF
+   closure. Environment evaluation alone is not artifact proof.
 2. RED: add failing protocol/domain/storage tests directly from the frozen
    vectors. The red commit contains tests and fixtures, not production behavior.
 3. GREEN: implement the smallest vertical slice that makes those tests pass:

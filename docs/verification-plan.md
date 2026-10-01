@@ -192,11 +192,11 @@ tests are required in addition to the flat publication cases:
 - Failure of the pre-manifest filesystem sync is injected deterministically;
   the operation returns the I/O error, removes its private manifest staging
   record, and leaves no published manifest. Orphan chunks are allowed.
-- Chunked storage is Linux-only. macOS configuration tests verify that parsing
-  the chunked backend is rejected, and storage initialization rejects it
-  before creating layout entries. macOS flat storage remains available.
-  Package compilation on macOS is not evidence that chunked-storage
-  crash durability is supported there.
+- Chunked storage is Linux-only. Native Apple Silicon CI builds the Darwin
+  package and runs the `narjar` root-package tests, including NAR and flat
+  storage behavior plus macOS-specific checks that reject the chunked backend.
+  Auxiliary workspace crates are not part of this platform check. It does not
+  establish APFS-specific crash-durability guarantees.
 - Inventory checks manifest/chunk availability and, in content mode,
   reconstructs and hashes the full logical NAR. A valid compressed derivative
   must not hide missing or corrupt canonical chunks.

@@ -113,8 +113,9 @@ immutable layout descriptor and creates the chunk directories when `chunked`
 is selected; it defaults to `flat`. A chunked descriptor records the supported
 `mincdc-hash4-v2` profile (256 KiB minimum, 1 MiB maximum). It refuses a
 non-empty incompatible directory; it does not infer or convert an older
-layout. Chunked storage is supported only on Linux. macOS builds support the
-flat backend; `init`, `serve`, and maintenance commands reject a chunked
+layout. Chunked storage is supported only on Linux. Flat storage is supported
+on Apple Silicon macOS and covered by a native CI package/test lane.
+`init`, `serve`, and maintenance commands reject a chunked
 selection before opening storage because macOS has no verified durability
 sequence for syncing chunk data and shard entries before manifest publication.
 
@@ -719,9 +720,10 @@ no-replace hard links, unlink, enumeration, and an exclusive local lease. The
 service does not detect or configure a filesystem-specific backend.
 
 Linux chunked storage additionally requires `syncfs` to make newly linked
-chunks durable before manifest publication. macOS supports flat storage only.
-See the [filesystem capability ADR](filesystem-capability-adr.md) for the
-backend-specific durability requirements and remaining conformance gaps.
+chunks durable before manifest publication. Darwin/APFS has a native package
+and test lane for flat storage; host-specific crash-durability guarantees remain
+unverified. See the [filesystem capability ADR](filesystem-capability-adr.md)
+for backend-specific durability requirements and remaining conformance gaps.
 
 | Environment | Current classification | Meaning |
 | --- | --- | --- |

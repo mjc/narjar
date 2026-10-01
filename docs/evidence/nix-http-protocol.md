@@ -152,8 +152,10 @@ later full-body retry idempotently:
 
 ## Explicit evidence boundaries
 
-- HTTP behavior is proven on real Darwin sockets for Nix 2.31.5 and 2.35.2;
-  Linux remains a release-matrix confirmation, not a different protocol claim.
+- Nix client HTTP behavior is captured on real Darwin sockets for Nix 2.31.5
+  and 2.35.2. This is protocol evidence, not evidence that the Narjar server
+  builds or runs on macOS; the separate native package/test lane provides that
+  server-side evidence for flat storage, not chunked durability.
 - TLS verification and CA selection are libcurl/Nix client responsibilities;
   Narjar terminates plain HTTP behind a trusted proxy. The production proxy
   buffering/timeout test remains an implementation acceptance check:
