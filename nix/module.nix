@@ -680,6 +680,10 @@ in {
         message = "services.narjar.nativeStore requires dynamicUser = false so its GC-root directory has stable ownership";
       }
       {
+        assertion = !cfg.nativeStore.enable;
+        message = "services.narjar.nativeStore cannot be enabled until native-store HTTP serving is implemented";
+      }
+      {
         assertion = !cfg.nativeStore.enable || cfg.storageBackend == "flat";
         message = "services.narjar.nativeStore requires storageBackend = flat";
       }

@@ -185,6 +185,9 @@ assert (!(builtins.tryEval missingPrivateReadTokenConfig.system.build.toplevel.d
 assert (!(builtins.tryEval conflictingFilesystemSamplesConfig.system.build.toplevel.drvPath).success);
 assert (!(builtins.tryEval unsafeNativeRootsConfig.system.build.toplevel.drvPath).success);
 assert (!(builtins.tryEval nestedNativeRootsConfig.system.build.toplevel.drvPath).success);
+assert (!(builtins.tryEval nativeStoreConfig.system.build.toplevel.drvPath).success);
+assert (!(builtins.tryEval customNativeStateDirConfig.system.build.toplevel.drvPath).success);
+assert (lib.any (assertion: assertion.message == "services.narjar.nativeStore cannot be enabled until native-store HTTP serving is implemented" && !assertion.assertion) nativeStoreConfig.assertions);
 assert (lib.hasInfix "realpath -m" nativeStorePreStartScript);
 assert (lib.hasInfix "ancestor=$roots_parent" nativeStorePreStartScript);
 assert (lib.hasInfix "ancestor_owner" nativeStorePreStartScript);

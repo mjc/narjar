@@ -158,7 +158,6 @@ struct LeaseManagerState {
     capacity_rejections: u64,
     record_paths: BTreeSet<PathBuf>,
     cleanup_cursor: Option<PathBuf>,
-    recovery_required: bool,
 }
 
 enum RecordPathIndex {
@@ -305,7 +304,6 @@ impl NativeStoreLeaseManager {
                 capacity_rejections: 0,
                 record_paths: BTreeSet::new(),
                 cleanup_cursor: None,
-                recovery_required: false,
             }),
         };
         manager.recover(now)?;
@@ -338,7 +336,6 @@ impl NativeStoreLeaseManager {
     ) -> Result<NativeStoreLease, NativeStoreLeaseError> {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
-        self.recover_if_required(&mut state)?;
         self.recover_pending_capacity_mutation(&mut state)?;
         let now = clock()?;
         self.refresh_record_paths_if_stale(&mut state)?;
@@ -400,20 +397,12 @@ impl NativeStoreLeaseManager {
         state: &mut LeaseManagerState,
         clock: &mut impl FnMut() -> Result<u64, NativeStoreLeaseError>,
     ) -> Result<u64, NativeStoreLeaseError> {
-        let mut capacity_mutation_started = false;
-        let result = (|| {
-            let _gc_read_lock = self.acquire_gc_read_lock()?;
-            if !self.is_registered_store_path(path)? {
-                return Err(NativeStoreLeaseError::UnregisteredStorePath);
-            }
-            self.ensure_capacity(path, state)?;
-            capacity_mutation_started = true;
-            self.write_pending_root_and_live_record(path, paths, state, clock)
-        })();
-        if result.is_err() && (capacity_mutation_started || state.recovery_required) {
-            self.recover_after_mutation_failure(state, clock());
+        let _gc_read_lock = self.acquire_gc_read_lock()?;
+        if !self.is_registered_store_path(path)? {
+            return Err(NativeStoreLeaseError::UnregisteredStorePath);
         }
-        result
+        self.ensure_capacity(path, state)?;
+        self.write_pending_root_and_live_record(path, paths, state, clock)
     }
 
     fn ensure_capacity(
@@ -430,7 +419,7 @@ impl NativeStoreLeaseManager {
             return Err(NativeStoreLeaseError::CapacityExceeded);
         }
         let generation = next_generation(capacity.generation)?;
-        if let Err(error) = write_capacity_record(
+        write_capacity_record(
             &self.roots_dir,
             CapacityRecord {
                 generation,
@@ -441,11 +430,7 @@ impl NativeStoreLeaseManager {
                     previous_active: capacity.active,
                 }),
             },
-        ) {
-            state.recovery_required = true;
-            return Err(error);
-        }
-        Ok(())
+        )
     }
 
     fn begin_release_mutation(
@@ -502,10 +487,7 @@ impl NativeStoreLeaseManager {
             pending: None,
         };
         let completed_generation = completed.generation;
-        if let Err(error) = write_capacity_record(&self.roots_dir, completed) {
-            state.recovery_required = true;
-            return Err(error);
-        }
+        write_capacity_record(&self.roots_dir, completed)?;
         state.active =
             usize::try_from(active).map_err(|_| NativeStoreLeaseError::InvalidCapacityRecord)?;
         state.record_index.advance_local_index(completed_generation);
@@ -524,7 +506,7 @@ impl NativeStoreLeaseManager {
             return Ok(());
         };
         if mutation.kind == CapacityMutationKind::Reconcile {
-            return self.recover_under_lock(now_unix_seconds()?, state);
+            return Err(NativeStoreLeaseError::RecoveryRequired);
         }
         let _gc_read_lock = self.acquire_gc_read_lock()?;
         let path = NativeStorePath::parse(
@@ -640,7 +622,6 @@ impl NativeStoreLeaseManager {
     ) -> Result<(), NativeStoreLeaseError> {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
-        self.recover_if_required(&mut state)?;
         self.recover_pending_capacity_mutation(&mut state)?;
         #[cfg(test)]
         let now = test_now;
@@ -658,7 +639,7 @@ impl NativeStoreLeaseManager {
         if record.state == PersistedLeaseState::Live && record.expires_at > now {
             return Err(NativeStoreLeaseError::LeaseStillLive);
         }
-        let result = (|| {
+        (|| {
             let _gc_read_lock = self.acquire_gc_read_lock()?;
             self.begin_release_mutation(path, record.state)?;
             self.remove_recorded_root(&root_path, &record)?;
@@ -668,15 +649,7 @@ impl NativeStoreLeaseManager {
             state.record_removed(&record_path);
             self.complete_capacity_mutation(&mut state)?;
             Ok(())
-        })();
-        if result.is_err() {
-            #[cfg(test)]
-            let recovery_time = Ok(test_now);
-            #[cfg(not(test))]
-            let recovery_time = now_unix_seconds();
-            self.recover_after_mutation_failure(&mut state, recovery_time);
-        }
-        result
+        })()
     }
 
     pub(crate) fn snapshot(&self) -> Result<NativeLeaseSnapshot, NativeStoreLeaseError> {
@@ -696,17 +669,16 @@ impl NativeStoreLeaseManager {
     pub(crate) fn cleanup_expired(&self) -> Result<(), NativeStoreLeaseError> {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
-        self.recover_if_required(&mut state)?;
-        self.recover_pending_capacity_mutation(&mut state)?;
+        let now = now_unix_seconds()?;
+        self.recover_interrupted_reconciliation(&mut state, now)?;
         self.refresh_record_paths_if_stale(&mut state)?;
-        self.cleanup_expired_records(now_unix_seconds()?, MAX_EXPIRY_CLEANUP_PER_CALL, &mut state)
+        self.cleanup_expired_records(now, MAX_EXPIRY_CLEANUP_PER_CALL, &mut state)
     }
 
     fn cleanup_expired_at(&self, now: u64) -> Result<(), NativeStoreLeaseError> {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
-        self.recover_if_required(&mut state)?;
-        self.recover_pending_capacity_mutation(&mut state)?;
+        self.recover_interrupted_reconciliation(&mut state, now)?;
         self.refresh_record_paths_if_stale(&mut state)?;
         self.cleanup_expired_records(now, MAX_EXPIRY_CLEANUP_PER_CALL, &mut state)
     }
@@ -715,6 +687,20 @@ impl NativeStoreLeaseManager {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
         self.recover_under_lock(now, &mut state)
+    }
+
+    fn recover_interrupted_reconciliation(
+        &self,
+        state: &mut LeaseManagerState,
+        now: u64,
+    ) -> Result<(), NativeStoreLeaseError> {
+        let pending = read_capacity_record(&self.roots_dir)?.pending;
+        match pending {
+            Some(mutation) if mutation.kind == CapacityMutationKind::Reconcile => {
+                self.recover_under_lock(now, state)
+            }
+            _ => self.recover_pending_capacity_mutation(state),
+        }
     }
 
     fn recover_under_lock(
@@ -736,7 +722,6 @@ impl NativeStoreLeaseManager {
         state.active = 0;
         state.record_paths.clear();
         state.cleanup_cursor = None;
-        state.recovery_required = true;
         let _gc_read_lock = self.acquire_gc_read_lock()?;
         remove_stale_temporary_records(&self.roots_dir)?;
         remove_empty_orphan_lease_directories(&self.roots_dir)?;
@@ -759,7 +744,6 @@ impl NativeStoreLeaseManager {
             },
         )?;
         state.record_index.refresh(generation);
-        state.recovery_required = false;
         Ok(())
     }
 
@@ -934,30 +918,6 @@ impl NativeStoreLeaseManager {
         Ok(())
     }
 
-    fn recover_if_required(
-        &self,
-        state: &mut LeaseManagerState,
-    ) -> Result<(), NativeStoreLeaseError> {
-        if state.recovery_required {
-            self.recover_under_lock(now_unix_seconds()?, state)?;
-        }
-        Ok(())
-    }
-
-    fn recover_after_mutation_failure(
-        &self,
-        state: &mut LeaseManagerState,
-        recovery_time: Result<u64, NativeStoreLeaseError>,
-    ) {
-        state.recovery_required = true;
-        let Ok(now) = recovery_time else {
-            return;
-        };
-        if self.recover_under_lock(now, state).is_err() {
-            state.recovery_required = true;
-        }
-    }
-
     fn refresh_record_paths_if_stale(
         &self,
         state: &mut LeaseManagerState,
@@ -1043,17 +1003,14 @@ impl NativeStoreLeaseManager {
         }
         match fs::symlink_metadata(root_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                self.verify_root(root_path, store_path)
+                self.verify_root(root_path, store_path)?;
+                sync_root_parent_directory(root_path)
             }
             Ok(_) => Err(NativeStoreLeaseError::RootConflict),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 std::os::unix::fs::symlink(&store_path.absolute_path, root_path)
                     .map_err(NativeStoreLeaseError::Io)?;
-                sync_directory(
-                    root_path
-                        .parent()
-                        .ok_or(NativeStoreLeaseError::InvalidRecord)?,
-                )
+                sync_root_parent_directory(root_path)
             }
             Err(error) => Err(NativeStoreLeaseError::Io(error)),
         }
@@ -1119,7 +1076,7 @@ impl NativeStoreLeaseManager {
         maximum_to_remove: usize,
         state: &mut LeaseManagerState,
     ) -> Result<(), NativeStoreLeaseError> {
-        let result = (|| {
+        (|| {
             let _gc_read_lock = self.acquire_gc_read_lock()?;
             state
                 .cleanup_candidates(maximum_to_remove)
@@ -1143,11 +1100,7 @@ impl NativeStoreLeaseManager {
                     self.complete_capacity_mutation(state)?;
                     Ok(())
                 })
-        })();
-        if result.is_err() {
-            state.recovery_required = true;
-        }
-        result
+        })()
     }
 
     fn lease_directory(&self, path: &NativeStorePath) -> PathBuf {
@@ -1462,6 +1415,14 @@ fn remove_record(roots_dir: &Path, path: &Path) -> Result<(), NativeStoreLeaseEr
     sync_directory(path.parent().unwrap_or(roots_dir))
 }
 
+fn sync_root_parent_directory(root_path: &Path) -> Result<(), NativeStoreLeaseError> {
+    sync_directory(
+        root_path
+            .parent()
+            .ok_or(NativeStoreLeaseError::InvalidRecord)?,
+    )
+}
+
 fn sync_directory(path: &Path) -> Result<(), NativeStoreLeaseError> {
     #[cfg(test)]
     if let Ok(mut failure) = FAIL_DIRECTORY_SYNC.lock()
@@ -1589,6 +1550,7 @@ pub(crate) enum NativeStoreLeaseError {
     Poisoned,
     RootConflict,
     RecordTooLarge,
+    RecoveryRequired,
     TemporaryNameExhausted,
     UnregisteredStorePath,
 }
@@ -1613,6 +1575,9 @@ impl std::fmt::Display for NativeStoreLeaseError {
             }
             Self::RecordTooLarge => {
                 formatter.write_str("native-store lease record exceeds its limit")
+            }
+            Self::RecoveryRequired => {
+                formatter.write_str("native-store lease recovery must finish before admission")
             }
             Self::TemporaryNameExhausted => {
                 formatter.write_str("native-store lease temporary names are exhausted")
@@ -2046,15 +2011,74 @@ mod tests {
         );
         assert!(!record_path.exists());
 
+        assert!(matches!(
+            surviving_manager.acquire(
+                fixture.store_path.clone(),
+                lease.expires_at_unix_seconds() + 1
+            ),
+            Err(NativeStoreLeaseError::RecoveryRequired)
+        ));
+        surviving_manager
+            .recover(lease.expires_at_unix_seconds() + 1)
+            .expect("explicit recovery should finish the interrupted reconciliation");
         assert_eq!(
             surviving_manager
                 .snapshot()
-                .expect("surviving manager should reconcile the interrupted deletion")
+                .expect("surviving manager should report reconciled capacity")
                 .active,
             0
         );
         assert!(!record_path.exists());
         assert!(!lease_directory.exists());
+    }
+
+    #[test]
+    fn interrupted_root_recovery_syncs_an_already_existing_root_before_clearing_capacity() {
+        let fixture = LeaseFixture::new(1);
+        let record_path = fixture.manager.record_path(&fixture.store_path);
+        let lease_directory = fixture.manager.lease_directory(&fixture.store_path);
+        fixture.write_record(
+            &record_path,
+            &LeaseRecord::live(&fixture.store_path, u64::MAX),
+        );
+        write_capacity_record(
+            &fixture.roots_dir,
+            CapacityRecord {
+                generation: 1,
+                active: 0,
+                pending: Some(CapacityMutation {
+                    kind: CapacityMutationKind::Acquire,
+                    store_basename: fixture.store_path.basename.clone(),
+                    previous_active: 0,
+                }),
+            },
+        )
+        .expect("interrupted acquisition should be durable");
+        fail_nth_directory_sync(&lease_directory, 1);
+
+        assert!(matches!(
+            fixture.manager.snapshot(),
+            Err(NativeStoreLeaseError::Io(_))
+        ));
+        assert!(fixture.manager.root_path(&fixture.store_path).is_symlink());
+
+        fail_nth_directory_sync(&lease_directory, 1);
+        assert!(matches!(
+            fixture.manager.snapshot(),
+            Err(NativeStoreLeaseError::Io(_))
+        ));
+        assert!(
+            read_capacity_record(&fixture.roots_dir)
+                .expect("pending capacity should remain readable")
+                .pending
+                .is_some(),
+            "recovery must not clear the mutation before syncing the existing root"
+        );
+
+        assert_eq!(
+            fixture.manager.snapshot().expect("recovery retry").active,
+            1
+        );
     }
 
     #[test]
