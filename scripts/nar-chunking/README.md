@@ -3,6 +3,12 @@
 The isolated NARJ-83 measurement tool does not change Narjar's
 storage layout or HTTP protocol.
 
+The semantic measurement uses a small NAR scanner kept in this package to
+find regular-file content ranges. It rejects malformed framing and limits
+strings to 1 MiB and nesting to 256 levels. It is experiment-only, not the
+production NAR validator. The package depends on `mincdc` and `sha2`, not on
+the Narjar application crate.
+
 Run it against the frozen corpus with:
 
 ```console

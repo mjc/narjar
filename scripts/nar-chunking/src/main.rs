@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -8,11 +7,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mincdc::{Cdc, MinCdc4, MinCdcHash4};
-use narjar::nar::{DecodeError, Decoder, Event, EventSink};
 use narjar_nar_chunking::{
     ChunkAlgorithm, ChunkManifest, ChunkParameters, ResearchChunkStore, StoreUsage, chunk_reader,
 };
 use sha2::{Digest, Sha256};
+
+mod nar;
+
+use nar::{NarEvent, NarScanner};
 
 const DEFAULT_FIXED_CHUNK_SIZE: usize = 8 * 1024;
 const DEFAULT_HYBRID_SMALL_FILE_SIZE: u64 = 64 * 1024;
@@ -505,23 +507,16 @@ impl<'a> SemanticCdcSink<'a> {
     }
 }
 
-impl EventSink for SemanticCdcSink<'_> {
-    type Error = Infallible;
-
-    fn event(&mut self, event: Event<'_>) -> Result<(), Self::Error> {
+impl SemanticCdcSink<'_> {
+    fn event(&mut self, event: NarEvent<'_>) {
         match event {
-            Event::BeginFile { size, .. } => {
+            NarEvent::BeginFile { size } => {
                 assert!(self.declared_file_size.is_none());
                 self.declared_file_size = Some(size);
             }
-            Event::FileChunk(bytes) => self.push_file_bytes(bytes),
-            Event::EndFile => self.finish_file(),
-            Event::BeginDirectory { .. }
-            | Event::Entry { .. }
-            | Event::Symlink { .. }
-            | Event::EndDirectory => {}
+            NarEvent::FileBytes(bytes) => self.push_file_bytes(bytes),
+            NarEvent::EndFile => self.finish_file(),
         }
-        Ok(())
     }
 }
 
@@ -534,28 +529,21 @@ fn measure_semantic_cdc(
     for path in files {
         let chunked_bytes_before_file = measurements.chunked_bytes;
         let mut sink = SemanticCdcSink::new(&mut measurements, parameters, algorithm);
-        let summary = Decoder::new(File::open(path)?)
-            .decode(&mut sink)
-            .map_err(nar_decode_error)?;
+        let raw_size = NarScanner::new(File::open(path)?).scan(&mut |event| sink.event(event))?;
         if sink.declared_file_size.is_some() || !sink.pending.is_empty() {
             return Err(invalid_data(format!(
                 "{}: decoder ended inside a regular file",
                 path.display()
             )));
         }
-        measurements.record_input(summary.raw_size);
+        measurements.record_input(raw_size);
         let semantic_bytes = measurements.chunked_bytes - chunked_bytes_before_file;
-        let passthrough_bytes = summary
-            .raw_size
+        let passthrough_bytes = raw_size
             .checked_sub(semantic_bytes)
             .ok_or_else(|| invalid_data("semantic file bytes exceed raw NAR size"))?;
         measurements.record_passthrough(passthrough_bytes);
     }
     Ok(measurements)
-}
-
-fn nar_decode_error(error: DecodeError<Infallible>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 fn measure_fixed_size(files: &[PathBuf], fixed_size: usize) -> io::Result<ChunkMeasurements> {
@@ -850,9 +838,8 @@ fn print_result(result: &MeasurementResult, fixed_size: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkAlgorithm, ChunkMeasurements, ChunkParameters, CommandLine, Event, SemanticCdcSink,
+        ChunkAlgorithm, ChunkMeasurements, ChunkParameters, CommandLine, NarEvent, SemanticCdcSink,
     };
-    use narjar::nar::EventSink;
 
     #[test]
     fn command_line_defaults_to_the_selected_storage_window() {
@@ -896,23 +883,18 @@ mod tests {
             ChunkParameters::selected_window(),
             ChunkAlgorithm::MinCdcHash4,
         );
-        sink.event(Event::BeginFile {
-            executable: false,
+        sink.event(NarEvent::BeginFile {
             size: input.len() as u64,
-            offset: 0,
-        })
-        .expect("infallible sink should accept the event");
+        });
         for segment in input.chunks(segment_size) {
-            sink.event(Event::FileChunk(segment))
-                .expect("infallible sink should accept the event");
+            sink.event(NarEvent::FileBytes(segment));
         }
-        sink.event(Event::EndFile)
-            .expect("infallible sink should accept the event");
+        sink.event(NarEvent::EndFile);
         measurements
     }
 
     #[test]
-    fn semantic_chunking_is_independent_of_decoder_event_sizes() {
+    fn semantic_chunking_is_independent_of_file_chunk_sizes() {
         let input: Vec<_> = (0usize..(256 * 1024))
             .map(|index| index.wrapping_mul(37) as u8)
             .collect();
