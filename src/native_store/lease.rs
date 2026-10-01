@@ -518,7 +518,7 @@ impl NativeStoreLeaseManager {
         let active = match mutation.kind {
             CapacityMutationKind::Acquire => match record.as_ref() {
                 Some(record) if record.state == PersistedLeaseState::Live => {
-                    if self.is_registered_store_path(&path)? {
+                    if self.is_registered_store_path_present(&path)? {
                         self.ensure_root(&self.root_path(&path), &path)?;
                         mutation
                             .previous_active
@@ -538,7 +538,7 @@ impl NativeStoreLeaseManager {
                 match record.as_ref() {
                     Some(record) => {
                         if mutation.kind == CapacityMutationKind::ReleaseLive
-                            && self.is_registered_store_path(&path)?
+                            && self.is_registered_store_path_present(&path)?
                         {
                             self.recover_interrupted_release(&path, record)?;
                             mutation.previous_active
@@ -1147,6 +1147,23 @@ impl NativeStoreLeaseManager {
             .next()
             .map(|state| state == State::Row)
             .map_err(|error| NativeStoreLeaseError::Database(error.to_string()))
+    }
+
+    fn is_registered_store_path_present(
+        &self,
+        path: &NativeStorePath,
+    ) -> Result<bool, NativeStoreLeaseError> {
+        if !self.is_registered_store_path(path)? {
+            return Ok(false);
+        }
+        match NativeStorePath::validate(&self.store_dir, path.as_path()) {
+            Ok(current_path) if current_path == *path => Ok(true),
+            Ok(_) => Err(NativeStoreLeaseError::InvalidStorePath),
+            Err(NativeStoreLeaseError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn lock_state(
@@ -2035,6 +2052,66 @@ mod tests {
             CapacityMutationKind::ReleaseLive,
             1,
         );
+    }
+
+    #[test]
+    fn pending_acquisition_for_a_missing_registered_store_object_is_recovered() {
+        assert_missing_registered_store_object_releases_pending_lease(
+            CapacityMutationKind::Acquire,
+            0,
+        );
+    }
+
+    #[test]
+    fn pending_release_for_a_missing_registered_store_object_is_recovered() {
+        assert_missing_registered_store_object_releases_pending_lease(
+            CapacityMutationKind::ReleaseLive,
+            1,
+        );
+    }
+
+    fn assert_missing_registered_store_object_releases_pending_lease(
+        mutation_kind: CapacityMutationKind,
+        previous_active: u64,
+    ) {
+        let fixture = LeaseFixture::new(1);
+        let root_path = fixture.manager.root_path(&fixture.store_path);
+        let record_path = fixture.manager.record_path(&fixture.store_path);
+        let lease_directory = fixture.manager.lease_directory(&fixture.store_path);
+        fixture.write_record(
+            &record_path,
+            &LeaseRecord::live(&fixture.store_path, u64::MAX),
+        );
+        std::os::unix::fs::symlink(fixture.store_path.as_path(), &root_path)
+            .expect("owned root should be created before the store object disappears");
+        write_capacity_record(
+            &fixture.roots_dir,
+            CapacityRecord {
+                generation: 1,
+                active: previous_active,
+                pending: Some(CapacityMutation {
+                    kind: mutation_kind,
+                    store_basename: fixture.store_path.basename.clone(),
+                    previous_active,
+                }),
+            },
+        )
+        .expect("interrupted capacity mutation should be durable");
+        fs::remove_dir(fixture.store_path.as_path())
+            .expect("store object should disappear while still registered");
+
+        let recovered_manager = fixture.reopen_at(1, 1);
+
+        assert_eq!(
+            recovered_manager
+                .snapshot()
+                .expect("recovered capacity")
+                .active,
+            0
+        );
+        assert!(!root_path.is_symlink());
+        assert!(!record_path.exists());
+        assert!(!lease_directory.exists());
     }
 
     fn assert_interrupted_root_recovery_retries_directory_sync(
