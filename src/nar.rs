@@ -272,112 +272,162 @@ impl<R: Read> Decoder<R> {
         }
         self.expect(b"(")?;
         self.expect(b"type")?;
-        let kind = self.read_string(TOKEN_LIMIT)?;
-        match kind.as_slice() {
-            b"directory" => {
-                sink.event(Event::BeginDirectory { depth })
-                    .map_err(DecodeError::Sink)?;
-                let mut previous_name = None;
-                loop {
-                    self.bump_work()?;
-                    let entry_kind = self.read_string(TOKEN_LIMIT)?;
-                    if entry_kind == b")" {
-                        sink.event(Event::EndDirectory).map_err(DecodeError::Sink)?;
-                        return Ok(RootKind::Directory);
-                    }
-                    if entry_kind != b"entry" {
-                        return Err(DecodeError::Invalid("directory entry expected".into()));
-                    }
-                    counters.entries =
-                        counters
-                            .entries
-                            .checked_add(1)
-                            .ok_or(DecodeError::LimitExceeded {
-                                what: "entry count",
-                                limit: self.limits.max_entries,
-                                actual: u64::MAX,
-                            })?;
-                    if counters.entries > self.limits.max_entries {
-                        return Err(DecodeError::LimitExceeded {
-                            what: "entry count",
-                            limit: self.limits.max_entries,
-                            actual: counters.entries,
-                        });
-                    }
-                    self.expect(b"(")?;
-                    self.expect(b"name")?;
-                    let name = self.read_string(self.limits.max_name_bytes)?;
-                    self.validate_name(&name)?;
-                    if previous_name
-                        .as_ref()
-                        .is_some_and(|previous| previous >= &name)
-                    {
-                        return Err(DecodeError::NonCanonical(
-                            "directory entries are not strictly ordered",
-                        ));
-                    }
-                    previous_name = Some(name.clone());
-                    sink.event(Event::Entry { name })
-                        .map_err(DecodeError::Sink)?;
-                    self.expect(b"node")?;
-                    self.decode_node(depth + 1, sink, counters)?;
-                    self.expect(b")")?;
-                }
-            }
-            b"regular" => {
-                let mut field = self.read_string(TOKEN_LIMIT)?;
-                let executable = if field == b"executable" {
-                    if !self.read_string(TOKEN_LIMIT)?.is_empty() {
-                        return Err(DecodeError::NonCanonical(
-                            "the executable marker must have an empty value",
-                        ));
-                    }
-                    field = self.read_string(TOKEN_LIMIT)?;
-                    true
-                } else {
-                    false
-                };
-                if field != b"contents" {
-                    return Err(DecodeError::Invalid("regular contents expected".into()));
-                }
-                let size = self.read_u64()?;
-                if size > self.limits.max_file_bytes {
-                    return Err(DecodeError::LimitExceeded {
-                        what: "file size",
-                        limit: self.limits.max_file_bytes,
-                        actual: size,
-                    });
-                }
-                let offset = self.raw_bytes;
-                sink.event(Event::BeginFile {
-                    executable,
-                    size,
-                    offset,
-                })
-                .map_err(DecodeError::Sink)?;
-                self.read_file(size, sink)?;
-                sink.event(Event::EndFile).map_err(DecodeError::Sink)?;
-                self.expect(b")")?;
-                counters.files = counters.files.saturating_add(1);
-                Ok(RootKind::Regular)
-            }
-            b"symlink" => {
-                self.expect(b"target")?;
-                let target = self.read_string(self.limits.max_symlink_target_bytes)?;
-                if target.contains(&0) {
-                    return Err(DecodeError::NonCanonical("symlink target contains NUL"));
-                }
-                sink.event(Event::Symlink { target })
-                    .map_err(DecodeError::Sink)?;
-                self.expect(b")")?;
-                counters.symlinks = counters.symlinks.saturating_add(1);
-                Ok(RootKind::Symlink)
-            }
+        match self.read_string(TOKEN_LIMIT)?.as_slice() {
+            b"directory" => self.decode_directory_node(depth, sink, counters),
+            b"regular" => self.decode_regular_file_node(sink, counters),
+            b"symlink" => self.decode_symlink_node(sink, counters),
             _ => Err(DecodeError::Invalid("unknown NAR node type".into())),
         }
     }
 
-    fn read_file<S: EventSink>(
+    fn decode_directory_node<S: EventSink>(
+        &mut self,
+        depth: usize,
+        sink: &mut S,
+        counters: &mut Counters,
+    ) -> Result<RootKind, DecodeError<S::Error>> {
+        sink.event(Event::BeginDirectory { depth })
+            .map_err(DecodeError::Sink)?;
+        let mut previous_name = None;
+        std::iter::from_fn(|| {
+            self.decode_directory_entry_if_present(depth, &mut previous_name, sink, counters)
+                .transpose()
+        })
+        .try_for_each(|result| result)?;
+        sink.event(Event::EndDirectory).map_err(DecodeError::Sink)?;
+        Ok(RootKind::Directory)
+    }
+
+    fn decode_directory_entry_if_present<S: EventSink>(
+        &mut self,
+        depth: usize,
+        previous_name: &mut Option<Vec<u8>>,
+        sink: &mut S,
+        counters: &mut Counters,
+    ) -> Result<Option<()>, DecodeError<S::Error>> {
+        let Some(name) = self.read_next_directory_entry_name(previous_name, counters)? else {
+            return Ok(None);
+        };
+        sink.event(Event::Entry { name })
+            .map_err(DecodeError::Sink)?;
+        self.expect(b"node")?;
+        self.decode_node(depth + 1, sink, counters)?;
+        self.expect(b")")?;
+        Ok(Some(()))
+    }
+
+    fn read_next_directory_entry_name<E>(
+        &mut self,
+        previous_name: &mut Option<Vec<u8>>,
+        counters: &mut Counters,
+    ) -> Result<Option<Vec<u8>>, DecodeError<E>> {
+        self.bump_work()?;
+        let entry_kind = self.read_string(TOKEN_LIMIT)?;
+        if entry_kind == b")" {
+            return Ok(None);
+        }
+        if entry_kind != b"entry" {
+            return Err(DecodeError::Invalid("directory entry expected".into()));
+        }
+        counters.entries = counters
+            .entries
+            .checked_add(1)
+            .ok_or(DecodeError::LimitExceeded {
+                what: "entry count",
+                limit: self.limits.max_entries,
+                actual: u64::MAX,
+            })?;
+        if counters.entries > self.limits.max_entries {
+            return Err(DecodeError::LimitExceeded {
+                what: "entry count",
+                limit: self.limits.max_entries,
+                actual: counters.entries,
+            });
+        }
+        self.expect(b"(")?;
+        self.expect(b"name")?;
+        let name = self.read_string(self.limits.max_name_bytes)?;
+        self.validate_name(&name)?;
+        if previous_name
+            .as_ref()
+            .is_some_and(|previous| previous >= &name)
+        {
+            return Err(DecodeError::NonCanonical(
+                "directory entries are not strictly ordered",
+            ));
+        }
+        *previous_name = Some(name.clone());
+        Ok(Some(name))
+    }
+
+    fn decode_regular_file_node<S: EventSink>(
+        &mut self,
+        sink: &mut S,
+        counters: &mut Counters,
+    ) -> Result<RootKind, DecodeError<S::Error>> {
+        let executable = self.read_regular_file_executable_flag()?;
+        let size = self.read_u64()?;
+        if size > self.limits.max_file_bytes {
+            return Err(DecodeError::LimitExceeded {
+                what: "file size",
+                limit: self.limits.max_file_bytes,
+                actual: size,
+            });
+        }
+        let offset = self.raw_bytes;
+        sink.event(Event::BeginFile {
+            executable,
+            size,
+            offset,
+        })
+        .map_err(DecodeError::Sink)?;
+        self.stream_file_contents(size, sink)?;
+        sink.event(Event::EndFile).map_err(DecodeError::Sink)?;
+        self.expect(b")")?;
+        counters.files = counters.files.saturating_add(1);
+        Ok(RootKind::Regular)
+    }
+
+    fn read_regular_file_executable_flag<E>(&mut self) -> Result<bool, DecodeError<E>> {
+        let field = self.read_string(TOKEN_LIMIT)?;
+        if field == b"contents" {
+            return Ok(false);
+        }
+        if field != b"executable" {
+            return Err(DecodeError::Invalid("regular contents expected".into()));
+        }
+        if !self.read_string(TOKEN_LIMIT)?.is_empty() {
+            return Err(DecodeError::NonCanonical(
+                "the executable marker must have an empty value",
+            ));
+        }
+        self.expect(b"contents")?;
+        Ok(true)
+    }
+
+    fn decode_symlink_node<S: EventSink>(
+        &mut self,
+        sink: &mut S,
+        counters: &mut Counters,
+    ) -> Result<RootKind, DecodeError<S::Error>> {
+        let target = self.read_symlink_target()?;
+        sink.event(Event::Symlink { target })
+            .map_err(DecodeError::Sink)?;
+        self.expect(b")")?;
+        counters.symlinks = counters.symlinks.saturating_add(1);
+        Ok(RootKind::Symlink)
+    }
+
+    fn read_symlink_target<E>(&mut self) -> Result<Vec<u8>, DecodeError<E>> {
+        self.expect(b"target")?;
+        let target = self.read_string(self.limits.max_symlink_target_bytes)?;
+        if target.contains(&0) {
+            return Err(DecodeError::NonCanonical("symlink target contains NUL"));
+        }
+        Ok(target)
+    }
+
+    fn stream_file_contents<S: EventSink>(
         &mut self,
         size: u64,
         sink: &mut S,

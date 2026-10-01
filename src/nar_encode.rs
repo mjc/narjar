@@ -109,14 +109,20 @@ pub struct EncodeSummary {
 }
 
 enum Node {
-    Directory {
-        last_name: Option<Vec<u8>>,
-        child_open: bool,
-    },
-    Regular {
-        remaining: u64,
-        size: u64,
-    },
+    Directory(DirectoryState),
+    Regular { remaining: u64, size: u64 },
+}
+
+enum DirectoryState {
+    Ready { last_name: Option<Vec<u8>> },
+    ChildOpen { name: Vec<u8> },
+}
+
+#[derive(Clone, Copy)]
+enum RootState {
+    Awaiting,
+    Open(RootKind),
+    Complete(RootKind),
 }
 
 /// Writes canonical NAR bytes without retaining file bodies or the completed
@@ -129,9 +135,8 @@ pub struct Encoder<W> {
     limits: crate::nar::Limits,
     digest: Sha256,
     raw_size: u64,
-    root: Option<RootKind>,
+    root: RootState,
     stack: Vec<Node>,
-    finished: bool,
     entries: u64,
     files: u64,
     symlinks: u64,
@@ -151,9 +156,8 @@ impl<W: Write> Encoder<W> {
             limits,
             digest: Sha256::new(),
             raw_size: 0,
-            root: None,
+            root: RootState::Awaiting,
             stack: Vec::new(),
-            finished: false,
             entries: 0,
             files: 0,
             symlinks: 0,
@@ -186,10 +190,9 @@ impl<W: Write> Encoder<W> {
     /// Returns [`EncodeError::Invalid`] if the event stream left any node open
     /// or never supplied a root.
     pub fn finish(self) -> Result<(W, EncodeSummary), EncodeError> {
-        if !self.finished || !self.stack.is_empty() {
+        let RootState::Complete(root) = self.root else {
             return Err(EncodeError::Invalid("the root node is incomplete"));
-        }
-        let root = self.root.ok_or(EncodeError::Invalid("missing root node"))?;
+        };
         let digest = self.digest.finalize();
         let mut raw_sha256 = [0_u8; 32];
         raw_sha256.copy_from_slice(&digest);
@@ -212,10 +215,8 @@ impl<W: Write> Encoder<W> {
         self.string(b"(")?;
         self.string(b"type")?;
         self.string(b"directory")?;
-        self.stack.push(Node::Directory {
-            last_name: None,
-            child_open: false,
-        });
+        self.stack
+            .push(Node::Directory(DirectoryState::Ready { last_name: None }));
         Ok(())
     }
 
@@ -253,26 +254,29 @@ impl<W: Write> Encoder<W> {
             return Err(EncodeError::NonCanonical("invalid directory entry name"));
         }
 
-        let Some(Node::Directory {
-            last_name,
-            child_open,
-        }) = self.stack.last_mut()
-        else {
-            return Err(EncodeError::Invalid("entry outside a directory"));
-        };
-        if *child_open {
-            return Err(EncodeError::Invalid("directory entry is missing its child"));
+        match self.stack.last_mut() {
+            Some(Node::Directory(state)) => match state {
+                DirectoryState::Ready { last_name } => {
+                    if last_name
+                        .as_deref()
+                        .is_some_and(|previous| previous >= name)
+                    {
+                        return Err(EncodeError::NonCanonical(
+                            "directory entries are not strictly ordered",
+                        ));
+                    }
+                    *state = DirectoryState::ChildOpen {
+                        name: name.to_vec(),
+                    };
+                }
+                DirectoryState::ChildOpen { .. } => {
+                    return Err(EncodeError::Invalid("directory entry is missing its child"));
+                }
+            },
+            Some(Node::Regular { .. }) | None => {
+                return Err(EncodeError::Invalid("entry outside a directory"));
+            }
         }
-        if last_name
-            .as_deref()
-            .is_some_and(|previous| previous >= name)
-        {
-            return Err(EncodeError::NonCanonical(
-                "directory entries are not strictly ordered",
-            ));
-        }
-        *last_name = Some(name.to_vec());
-        *child_open = true;
         self.string(b"entry")?;
         self.string(b"(")?;
         self.string(b"name")?;
@@ -358,24 +362,22 @@ impl<W: Write> Encoder<W> {
         self.string(b"symlink")?;
         self.string(b"target")?;
         self.string(target)?;
-        self.finish_atomic(RootKind::Symlink)?;
+        self.finish_atomic()?;
         self.symlinks = self.symlinks.saturating_add(1);
         Ok(())
     }
 
     fn end_directory(&mut self) -> Result<(), EncodeError> {
-        if !matches!(
-            self.stack.last(),
-            Some(Node::Directory {
-                child_open: false,
-                ..
-            })
-        ) {
-            return Err(EncodeError::Invalid(
+        match self.stack.last() {
+            Some(Node::Directory(DirectoryState::Ready { .. })) => {
+                self.finish_node(RootKind::Directory)
+            }
+            Some(Node::Directory(DirectoryState::ChildOpen { .. }))
+            | Some(Node::Regular { .. })
+            | None => Err(EncodeError::Invalid(
                 "directory end is outside a directory or has an open child",
-            ));
+            )),
         }
-        self.finish_node(RootKind::Directory)
     }
 
     fn begin_node(&mut self, kind: RootKind) -> Result<(), EncodeError> {
@@ -389,12 +391,8 @@ impl<W: Write> Encoder<W> {
             });
         }
         match self.stack.last() {
-            Some(Node::Directory {
-                child_open: true, ..
-            }) => {}
-            Some(Node::Directory {
-                child_open: false, ..
-            }) => {
+            Some(Node::Directory(DirectoryState::ChildOpen { .. })) => {}
+            Some(Node::Directory(DirectoryState::Ready { .. })) => {
                 return Err(EncodeError::Invalid(
                     "node is not preceded by a directory entry",
                 ));
@@ -405,19 +403,23 @@ impl<W: Write> Encoder<W> {
             None => {}
         }
         if self.stack.is_empty() {
-            if self.root.is_some() {
-                return Err(EncodeError::Invalid("multiple root nodes"));
+            match self.root {
+                RootState::Awaiting => self.root = RootState::Open(kind),
+                RootState::Open(_) => {
+                    return Err(EncodeError::Invalid("multiple root nodes"));
+                }
+                RootState::Complete(_) => {
+                    return Err(EncodeError::Invalid("events follow the completed root"));
+                }
             }
-            self.root = Some(kind);
         }
         Ok(())
     }
 
     fn ensure_open(&self) -> Result<(), EncodeError> {
-        if self.finished {
-            Err(EncodeError::Invalid("events follow the completed root"))
-        } else {
-            Ok(())
+        match self.root {
+            RootState::Complete(_) => Err(EncodeError::Invalid("events follow the completed root")),
+            RootState::Awaiting | RootState::Open(_) => Ok(()),
         }
     }
 
@@ -433,14 +435,14 @@ impl<W: Write> Encoder<W> {
         Ok(())
     }
 
-    fn finish_atomic(&mut self, kind: RootKind) -> Result<(), EncodeError> {
+    fn finish_atomic(&mut self) -> Result<(), EncodeError> {
         self.string(b")")?;
-        self.finish_parent(kind)
+        self.finish_parent()
     }
 
     fn finish_node(&mut self, kind: RootKind) -> Result<(), EncodeError> {
         let actual = match self.stack.pop() {
-            Some(Node::Directory { .. }) => RootKind::Directory,
+            Some(Node::Directory(_)) => RootKind::Directory,
             Some(Node::Regular { .. }) => RootKind::Regular,
             None => return Err(EncodeError::Invalid("node end without a node")),
         };
@@ -450,33 +452,43 @@ impl<W: Write> Encoder<W> {
             ));
         }
         self.string(b")")?;
-        self.finish_parent(kind)
+        self.finish_parent()
     }
 
-    fn finish_parent(&mut self, _kind: RootKind) -> Result<(), EncodeError> {
-        let has_directory_parent = match self.stack.last() {
-            Some(Node::Directory { child_open, .. }) => {
-                if !*child_open {
-                    return Err(EncodeError::Invalid("completed node has no parent entry"));
-                }
-                true
+    fn finish_parent(&mut self) -> Result<(), EncodeError> {
+        match self.stack.last() {
+            Some(Node::Directory(DirectoryState::ChildOpen { .. })) => self.close_directory_entry(),
+            Some(Node::Directory(DirectoryState::Ready { .. })) => {
+                Err(EncodeError::Invalid("completed node has no parent entry"))
             }
             Some(Node::Regular { .. }) => {
-                return Err(EncodeError::Invalid("node is nested under a regular file"));
+                Err(EncodeError::Invalid("node is nested under a regular file"))
             }
-            None => false,
-        };
-        if has_directory_parent {
-            self.string(b")")?;
-            let Some(Node::Directory { child_open, .. }) = self.stack.last_mut() else {
-                unreachable!("directory parent remains open after writing its entry close");
-            };
-            *child_open = false;
-        } else if self.stack.is_empty() {
-            self.finished = true;
-        } else {
-            return Err(EncodeError::Invalid("node has an invalid parent"));
+            None => self.complete_root(),
         }
+    }
+
+    fn close_directory_entry(&mut self) -> Result<(), EncodeError> {
+        self.string(b")")?;
+        let Some(Node::Directory(state)) = self.stack.last_mut() else {
+            unreachable!("validated parent remains an open directory");
+        };
+        let DirectoryState::ChildOpen { name } =
+            std::mem::replace(state, DirectoryState::Ready { last_name: None })
+        else {
+            unreachable!("validated parent has an open child");
+        };
+        *state = DirectoryState::Ready {
+            last_name: Some(name),
+        };
+        Ok(())
+    }
+
+    fn complete_root(&mut self) -> Result<(), EncodeError> {
+        let RootState::Open(root) = self.root else {
+            return Err(EncodeError::Invalid("the root node is incomplete"));
+        };
+        self.root = RootState::Complete(root);
         Ok(())
     }
 

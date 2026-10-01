@@ -191,6 +191,72 @@ fn rejects_noncanonical_or_incomplete_events() {
 }
 
 #[test]
+fn root_completion_and_directory_children_have_explicit_transitions() {
+    let mut encoder = Encoder::new(Vec::new()).expect("header");
+    encoder.push(Event::BeginDirectory).expect("root directory");
+    encoder
+        .push(Event::EndDirectory)
+        .expect("complete root directory");
+    assert!(matches!(
+        encoder.push(Event::Symlink(b"too-late")),
+        Err(EncodeError::Invalid("events follow the completed root"))
+    ));
+
+    let mut encoder = Encoder::new(Vec::new()).expect("header");
+    encoder.push(Event::BeginDirectory).expect("root directory");
+    encoder
+        .push(Event::Entry(b"child"))
+        .expect("directory entry");
+    assert!(matches!(
+        encoder.push(Event::EndDirectory),
+        Err(EncodeError::Invalid(
+            "directory end is outside a directory or has an open child"
+        ))
+    ));
+}
+
+#[test]
+fn nested_directory_completion_restores_parent_ordering() {
+    let (bytes, summary) = encode([
+        Event::BeginDirectory,
+        Event::Entry(b"b"),
+        Event::BeginDirectory,
+        Event::Entry(b"inside"),
+        Event::Symlink(b"target"),
+        Event::EndDirectory,
+        Event::Entry(b"c"),
+        Event::Symlink(b"target"),
+        Event::EndDirectory,
+    ]);
+
+    let mut sink = Sink::default();
+    Decoder::new(io::Cursor::new(bytes))
+        .decode(&mut sink)
+        .expect("nested directory output is canonical");
+    assert_eq!(summary.entries, 3);
+    assert_eq!(
+        sink.names,
+        [b"b".to_vec(), b"inside".to_vec(), b"c".to_vec()]
+    );
+
+    let mut encoder = Encoder::new(Vec::new()).expect("header");
+    encoder.push(Event::BeginDirectory).expect("root directory");
+    encoder.push(Event::Entry(b"b")).expect("first entry");
+    encoder
+        .push(Event::BeginDirectory)
+        .expect("nested directory");
+    encoder
+        .push(Event::EndDirectory)
+        .expect("complete nested directory");
+    assert!(matches!(
+        encoder.push(Event::Entry(b"a")),
+        Err(EncodeError::NonCanonical(
+            "directory entries are not strictly ordered"
+        ))
+    ));
+}
+
+#[test]
 fn handles_faulting_writers_and_invariant_chunking() {
     let one_chunk = encode([
         Event::BeginFile {
