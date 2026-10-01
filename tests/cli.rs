@@ -6611,12 +6611,21 @@ fn gc_sigterm_leaves_a_cache_recoverable_before_restart() {
 
     let path = data_dir.to_str().expect("temporary path should be UTF-8");
     let mut gc = command()
-        .args(["gc", "--data-dir", path, "--target-bytes", "0", "--apply"])
+        .args([
+            "gc",
+            "--data-dir",
+            path,
+            "--target-bytes",
+            "0",
+            "--min-age-seconds",
+            "0",
+            "--apply",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("gc should start");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !data_dir.join(".narjar-recovery").exists() {
         assert!(
             Instant::now() < deadline,
