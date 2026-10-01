@@ -175,18 +175,25 @@
             name = "narjar-continuation-benchmark";
             runtimeInputs = [
               build.narjar
+              pkgs.bashInteractive
               pkgs.coreutils
               pkgs.findutils
+              pkgs.curl
               pkgs.gawk
+              pkgs.git
+              pkgs.gnugrep
+              pkgs.gnused
+              pkgs.inetutils
               pkgs.jq
               pkgs.nix
               pkgs.vmtouch
-            ];
+            ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.glibc.bin pkgs.util-linux ];
             text = ''
-              export NARJAR_BIN=${lib.getExe build.narjar}
-              export NARJAR_BINCACHE_EXPR=${./benchmarks/bincache.nix}
+              export NARJAR_BIN="''${NARJAR_BIN:-${lib.getExe build.narjar}}"
+              export NARJAR_SOURCE_ROOT=${repositorySrc}
+              export NARJAR_BINCACHE_EXPR="''${NARJAR_BINCACHE_EXPR:-${repositorySrc}/benchmarks/bincache.nix}"
               export NARJAR_BENCHMARK_LAUNCH_COMMAND="nix run .#continuation-benchmark --"
-              exec ${builtins.readFile ./scripts/continuation-benchmark} "$@"
+              exec ${lib.getExe pkgs.bash} ${repositorySrc}/scripts/continuation-benchmark "$@"
             '';
           };
         in
@@ -419,6 +426,16 @@
             ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/oci-e2e-isolation.sh
             touch $out
           '';
+          continuationBenchmarkLauncher = env.pkgs.runCommand "narjar-continuation-benchmark-launcher"
+            {
+              nativeBuildInputs = [ env.pkgs.bash env.pkgs.coreutils env.pkgs.gnugrep ];
+            }
+            ''
+              ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/continuation-benchmark-packaged.sh \
+                ${env.continuationBenchmark}/bin/narjar-continuation-benchmark \
+                ${repositorySrc}
+              touch $out
+            '';
           publication-lock-benchmark = env.pkgs.runCommand "narjar-publication-lock-benchmark" { } ''
             ${env.pkgs.bash}/bin/bash ${repositorySrc}/tests/publication-lock-benchmark.sh
             touch $out
@@ -491,6 +508,9 @@
             }
           );
           package = env.narjar;
+        }
+        // lib.optionalAttrs (system == staticSystem) {
+          continuation-benchmark-launcher = continuationBenchmarkLauncher;
         }
         // lib.optionalAttrs (system == staticSystem) {
           static-cargo-artifacts = static.cargoArtifacts;

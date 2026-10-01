@@ -7,6 +7,8 @@ help=$("$ROOT/scripts/continuation-benchmark" --help)
 [[ "$help" == *"--repetitions"* ]]
 [[ "$help" == *"--quick"* ]]
 rg -q 'candidate_listen' "$ROOT/scripts/continuation-benchmark"
+rg -q 'NARJAR_BINCACHE_EXPR' "$ROOT/scripts/continuation-benchmark"
+rg -q 'NARJAR_SOURCE_ROOT' "$ROOT/scripts/continuation-benchmark"
 rg -q 'BINCACHE_PORT' "$ROOT/scripts/continuation-benchmark"
 rg -q 'BENCHMARK_WORKERS=32' "$ROOT/scripts/continuation-benchmark"
 rg -q "size_download}\\\\n'" "$ROOT/scripts/continuation-benchmark"

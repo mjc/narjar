@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -Ee -o pipefail
 
-ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=${NARJAR_SOURCE_ROOT:-$(cd -- "$(dirname -- "$0")/.." && pwd)}
 BINCACHE_COMMIT=556a9c8f97a3c994a9de85f567a2ef16ce6513ab
 SEED=29030
 FROZEN_WARMUPS=3
 : "${NARJAR_BIN:=}"
-: "${BINCACHE_EXPR:=}"
+: "${NARJAR_BINCACHE_EXPR:=}"
+: "${NARJAR_NIX_BIN:=nix}"
 : "${NARJAR_BENCHMARK_LAUNCH_COMMAND:=scripts/continuation-benchmark}"
 OUTPUT=""
 BINCACHE_BIN=""
 REPETITIONS=15
 WARMUPS=$FROZEN_WARMUPS
 QUICK=0
+RESOLVE_BINCACHE_ONLY=0
 BENCHMARK_WORKERS=32
 
 usage() {
@@ -26,6 +28,8 @@ Options:
   --repetitions N    Measured repetitions (default: 15)
   --warmups N        Warmups per scenario (default: 3)
   --quick            One repetition over a ten-path corpus; not decision evidence
+  --resolve-bincache-only
+                     Resolve and print the pinned Bincache binary, then exit
   -h, --help         Show this help
 EOF
 }
@@ -37,6 +41,7 @@ while (($#)); do
     --repetitions) REPETITIONS=$2; shift 2 ;;
     --warmups) WARMUPS=$2; shift 2 ;;
     --quick) QUICK=1; shift ;;
+    --resolve-bincache-only) RESOLVE_BINCACHE_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -44,6 +49,16 @@ done
 
 [[ -n "$OUTPUT" ]] || { usage >&2; exit 2; }
 [[ ! -e "$OUTPUT" ]] || { echo "output already exists: $OUTPUT" >&2; exit 1; }
+[[ -n "$NARJAR_BINCACHE_EXPR" ]] || NARJAR_BINCACHE_EXPR=$ROOT/benchmarks/bincache.nix
+[[ -r "$NARJAR_BINCACHE_EXPR" ]] || {
+  echo "NARJAR_BINCACHE_EXPR is not readable: $NARJAR_BINCACHE_EXPR" >&2
+  exit 1
+}
+BINCACHE_PATCH=$(dirname -- "$NARJAR_BINCACHE_EXPR")/bincache-no-compression.patch
+[[ -r "$BINCACHE_PATCH" ]] || {
+  echo "Bincache patch is missing beside NARJAR_BINCACHE_EXPR: $BINCACHE_PATCH" >&2
+  exit 1
+}
 [[ -n "$NARJAR_BIN" && -x "$NARJAR_BIN" ]] || {
   echo "NARJAR_BIN must point to an executable release binary" >&2
   exit 1
@@ -57,14 +72,14 @@ if (( ! QUICK && WARMUPS != FROZEN_WARMUPS )); then
   echo "--warmups must be $FROZEN_WARMUPS for decision evidence" >&2
   exit 1
 fi
-for command in awk curl date findmnt jq nix nix-store stat vmtouch; do
+for command in awk bash cat chmod cp cut curl date findmnt getconf git grep head hostname jq \
+  mkdir mktemp nix nix-store rm sed seq sh sleep stat tail uname unshare vmtouch; do
   command -v "$command" >/dev/null || {
     echo "missing '$command'; run inside 'devenv shell'" >&2
     exit 1
   }
 done
 
-[[ -n "$BINCACHE_EXPR" ]] || BINCACHE_EXPR=$ROOT/benchmarks/bincache.nix
 mkdir -p "$OUTPUT"
 OUTPUT=$(cd -- "$OUTPUT" && pwd)
 COMMAND_LOG=$OUTPUT/commands.txt
@@ -147,8 +162,8 @@ resolve_bincache() {
   if [[ -n "$BINCACHE_BIN" ]]; then
     BINCACHE_BIN=$(cd -- "$(dirname -- "$BINCACHE_BIN")" && pwd)/$(basename -- "$BINCACHE_BIN")
   else
-    BINCACHE_BIN=$(run_logged nix build --no-write-lock-file --no-link --print-out-paths \
-      --impure --file "$BINCACHE_EXPR" | tail -1)/bin/bincache
+    BINCACHE_BIN=$(run_logged "$NARJAR_NIX_BIN" build --no-write-lock-file --no-link --print-out-paths \
+      --impure --file "$NARJAR_BINCACHE_EXPR" | tail -1)/bin/bincache
   fi
 }
 
@@ -851,8 +866,8 @@ write_report() {
     p95:(sort_by(.value)|.[(length*0.95|ceil)-1].value),
     min:(map(.value)|min),max:(map(.value)|max)})' "$SAMPLES" > "$OUTPUT/summary.json"
   commit=$(git rev-parse HEAD 2>/dev/null || printf unknown)
-  narjar_sha=$(run_logged nix hash file --type sha256 "$NARJAR_BIN")
-  bincache_sha=$(run_logged nix hash file --type sha256 "$BINCACHE_BIN")
+  narjar_sha=$(run_logged "$NARJAR_NIX_BIN" hash file --type sha256 "$NARJAR_BIN")
+  bincache_sha=$(run_logged "$NARJAR_NIX_BIN" hash file --type sha256 "$BINCACHE_BIN")
   host=$(hostname)
   target=$(uname -m)
   kernel=$(uname -r)
@@ -861,7 +876,7 @@ write_report() {
   cpu_count=$(getconf _NPROCESSORS_ONLN)
   cpu_model=$(awk -F': ' '$1=="model name"{print $2; exit}' /proc/cpuinfo)
   governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)
-  nix_version=$(nix --version)
+  nix_version=$("$NARJAR_NIX_BIN" --version)
   rust_version=$(rustc --version 2>/dev/null || printf unknown)
   git_version=$(git --version 2>/dev/null || printf unknown)
   unshare_version=$(unshare --version 2>/dev/null || printf unknown)
@@ -915,6 +930,10 @@ write_report() {
 }
 
 resolve_bincache
+if (( RESOLVE_BINCACHE_ONLY )); then
+  printf '%s\n' "$BINCACHE_BIN"
+  exit 0
+fi
 select_bincache_port
 for candidate in narjar bincache; do candidate_prepare "$candidate"; done
 benchmark_enospc
