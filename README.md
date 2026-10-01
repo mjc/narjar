@@ -270,13 +270,13 @@ for retention, recovery, and backup procedures.
 
 ## Development
 
-The devenv shell supplies the pinned Rust toolchain and development tools:
+Run the pinned Rust checks through devenv:
 
 ```sh
-devenv shell
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features
-cargo nextest run --locked
+devenv tasks run check:fmt
+devenv tasks run check:clippy
+devenv tasks run check:test
+devenv tasks run check:doc
 nix flake check -L --no-update-lock-file
 ```
 

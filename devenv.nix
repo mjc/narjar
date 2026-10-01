@@ -33,14 +33,10 @@ in
 
   env.NARJAR_FUZZ_RUSTC = "${fuzzToolchain}/bin/rustc";
 
-  tasks."check:fmt".exec = ''
-    cargo fmt --all -- --check
-    cargo fmt --manifest-path scripts/nar-corpus/Cargo.toml --all -- --check
-  '';
-  tasks."check:clippy".exec = "cargo clippy --all-targets --all-features";
-  tasks."check:test".exec = "cargo test --locked";
-  tasks."check:corpus".exec = "cargo test --locked --manifest-path scripts/nar-corpus/Cargo.toml --target-dir target";
-  tasks."check:nextest".exec = "cargo nextest run --locked";
+  tasks."check:fmt".exec = "bash ci/check-rust.sh fmt";
+  tasks."check:clippy".exec = "bash ci/check-rust.sh clippy";
+  tasks."check:test".exec = "bash ci/check-rust.sh test";
+  tasks."check:doc".exec = "bash ci/check-rust.sh doc";
   tasks."check:advisories".exec = "bash ci/test-cargo-advisory-output.sh && bash ci/check-cargo-advisories.sh";
   tasks."check:shell".exec = "shellcheck -S error $(find scripts tests -maxdepth 1 -type f -perm -u+x -print)";
   tasks."check:flake".exec = "nix flake check -L --no-update-lock-file";

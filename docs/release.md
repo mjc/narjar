@@ -25,9 +25,10 @@ version without explicit maintainer consent.
    notes; commit both changes with the repository's required GPG signature.
 2. Confirm the checkout is clean and on the reviewed `main` commit. Verify the
    commit signature with `git verify-commit HEAD`.
-3. Run the locked project checks: formatting, clippy with warnings denied,
-   nextest, doctests, strict rustdoc, `nix run .#advisory-check`, and
-   `nix flake check`.
+3. Run `devenv tasks run check:fmt`, `devenv tasks run check:clippy`,
+   `devenv tasks run check:test`, and `devenv tasks run check:doc`. These cover
+   the workspace; the doc task runs doctests and denies rustdoc warnings. Then
+   run `nix run .#advisory-check` and `nix flake check`.
 4. Inspect the package file list with `cargo package --locked --list`. Run
    `bash ci/check-cargo-package.sh`; it packages the crate, checks the archive
    size, builds and tests the extracted source, then installs from that

@@ -320,16 +320,32 @@
       checks = lib.mapAttrs (
         system: env:
         let
-          format =
-            env.pkgs.runCommand "narjar-format"
-              {
-                nativeBuildInputs = [ env.toolchain ];
+          runRustCheck = command:
+            env.craneLib.mkCargoDerivation (
+              (builtins.removeAttrs env.commonArgs [ "cargoExtraArgs" ])
+              // {
+                inherit (env) cargoArtifacts;
+                pnameSuffix = "-rust-${command}";
+                doCheck = false;
+                doInstallCargoArtifacts = false;
+                nativeBuildInputs = env.commonArgs.nativeBuildInputs ++ [ env.pkgs.cargo-nextest ];
+                buildPhaseCargoCommand = ''
+                  export CARGO_PROFILE
+                  ${env.pkgs.bash}/bin/bash ${repositorySrc}/ci/check-rust.sh ${command}
+                '';
+                installPhaseCommand = "touch $out";
               }
-              ''
-                cd ${env.src}
-                cargo fmt --all -- --check
-                touch $out
-              '';
+            );
+          format = runRustCheck "fmt";
+          clippy = runRustCheck "clippy";
+          tests = runRustCheck "test";
+          docs = runRustCheck "doc";
+          rust-check-contract = env.pkgs.runCommand "narjar-rust-check-contract"
+            { nativeBuildInputs = [ env.pkgs.bash env.pkgs.gnugrep ]; }
+            ''
+              ${env.pkgs.bash}/bin/bash ${repositorySrc}/ci/check-rust-contract.sh
+              touch $out
+            '';
           source-filter = env.pkgs.runCommand "narjar-source-filter" { } ''
             test -f ${repositorySrc}/Cargo.toml
             test -f ${repositorySrc}/Cargo.lock
@@ -457,6 +473,10 @@
         {
           inherit
             format
+            clippy
+            tests
+            docs
+            rust-check-contract
             source-filter
             lock-consistency
             cratePackageCheck
@@ -471,25 +491,6 @@
             ;
           cargo-artifacts = env.cargoArtifacts;
           compile = env.narjar;
-          clippy = env.craneLib.cargoClippy (
-            env.commonArgs
-            // {
-              inherit (env) cargoArtifacts;
-              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-            }
-          );
-          tests = env.craneLib.cargoTest (
-            env.commonArgs
-            // {
-              inherit (env) cargoArtifacts;
-            }
-          );
-          docs = env.craneLib.cargoDoc (
-            env.commonArgs
-            // {
-              inherit (env) cargoArtifacts;
-            }
-          );
           package = env.narjar;
         }
         // lib.optionalAttrs (system == staticSystem) {
