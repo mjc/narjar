@@ -25,7 +25,6 @@ let
     ioTimeoutSeconds ? 30,
     egressCompression ? "none",
     storageBackend ? "flat",
-    dynamicUser ? true,
     readTokens ? null,
     nativeStoreEnable ? false,
     nativeStateDir ? "/nix/var/nix",
@@ -52,7 +51,6 @@ let
               ioTimeoutSeconds
               egressCompression
               storageBackend
-              dynamicUser
               ;
             auth.readTokens = readTokens;
             nativeStore.enable = nativeStoreEnable;
@@ -72,6 +70,11 @@ let
         (configuration {inherit dataDir;}).system.build.toplevel.drvPath
       );
     in result.success;
+  evaluatesConfig = config: (builtins.tryEval config.system.build.toplevel.drvPath).success;
+  gcThresholdMessage = "services.narjar.gc.targetBytes cannot exceed services.narjar.gc.maxBytes";
+  gcThresholdAssertion = lib.findFirst (assertion: assertion.message == gcThresholdMessage) null (
+    invalidGcThresholdConfig.assertions
+  );
 
   valid = [
     "/var/lib/narjar"
@@ -129,6 +132,30 @@ let
       maxBytes = 1000;
     };
   };
+  invalidGcThresholdConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      maxBytes = 1000;
+      targetBytes = 2000;
+    };
+  };
+  equalGcThresholdConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      maxBytes = 1000;
+      targetBytes = 1000;
+    };
+  };
+  lowerGcTargetConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      maxBytes = 2000;
+      targetBytes = 1000;
+    };
+  };
   invalidCompressionConfig = configuration {
     dataDir = "/var/lib/narjar";
     egressCompression = "brotli";
@@ -173,6 +200,12 @@ let
 in
 assert builtins.all evaluates valid;
 assert builtins.all (dataDir: !(evaluates dataDir)) invalid;
+assert !(evaluatesConfig invalidGcThresholdConfig);
+assert gcThresholdAssertion != null;
+assert !gcThresholdAssertion.assertion;
+assert gcThresholdAssertion.message == gcThresholdMessage;
+assert evaluatesConfig equalGcThresholdConfig;
+assert evaluatesConfig lowerGcTargetConfig;
 assert !(lib.hasInfix "--stats-inventory-interval-seconds" defaultConfig.systemd.services.narjar.serviceConfig.ExecStart);
 assert (lib.hasInfix "--stats-inventory-interval-seconds 900" sampledConfig.systemd.services.narjar.serviceConfig.ExecStart);
 assert (lib.hasInfix "--stats-inventory-interval-seconds 30" customIntervalConfig.systemd.services.narjar.serviceConfig.ExecStart);

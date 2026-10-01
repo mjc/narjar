@@ -612,13 +612,13 @@ in {
       maxBytes = lib.mkOption {
         type = lib.types.nullOr lib.types.ints.unsigned;
         default = null;
-        description = "Maximum cache bytes before collection is needed.";
+        description = "Start collection above this size; also the target when targetBytes is unset.";
       };
 
       targetBytes = lib.mkOption {
         type = lib.types.nullOr lib.types.ints.unsigned;
         default = null;
-        description = "Target cache bytes for collection.";
+        description = "Post-collection size target; must not exceed maxBytes when both are set.";
       };
 
       maxAgeSeconds = lib.mkOption {
@@ -675,6 +675,14 @@ in {
           || cfg.gc.targetBytes != null
           || cfg.gc.maxAgeSeconds != null;
         message = "services.narjar.gc requires maxBytes, targetBytes, or maxAgeSeconds";
+      }
+      {
+        assertion =
+          !cfg.gc.enable
+          || cfg.gc.targetBytes == null
+          || cfg.gc.maxBytes == null
+          || cfg.gc.targetBytes <= cfg.gc.maxBytes;
+        message = "services.narjar.gc.targetBytes cannot exceed services.narjar.gc.maxBytes";
       }
       {
         assertion = cfg.statsZfsDataset == null || cfg.statsZfsDataset != "";
