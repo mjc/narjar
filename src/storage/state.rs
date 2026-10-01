@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
     fs::File,
     os::unix::fs::MetadataExt,
@@ -284,7 +284,15 @@ fn increment_saturating(counter: &AtomicU64, amount: u64) {
 
 #[derive(Debug, Default)]
 pub(super) struct DeliveryValidationCache {
-    proofs: Mutex<HashMap<NarFileName, DeliveryProof>>,
+    proofs: Mutex<DeliveryProofs>,
+}
+
+pub(super) const DELIVERY_VALIDATION_CACHE_CAPACITY: usize = 1024;
+
+#[derive(Debug, Default)]
+struct DeliveryProofs {
+    by_name: HashMap<NarFileName, DeliveryProof>,
+    insertion_order: VecDeque<NarFileName>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,6 +339,7 @@ impl DeliveryValidationCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(proofs
+            .by_name
             .get(&name)
             .filter(|proof| proof.stamp == stamp)
             .map(|proof| proof.identity))
@@ -355,6 +364,21 @@ impl DeliveryValidationCache {
     }
 }
 
+impl DeliveryProofs {
+    fn insert(&mut self, name: NarFileName, proof: DeliveryProof) {
+        if self.by_name.insert(name, proof).is_none() {
+            self.insertion_order.push_back(name);
+        }
+        if self.by_name.len() > DELIVERY_VALIDATION_CACHE_CAPACITY {
+            let oldest = self
+                .insertion_order
+                .pop_front()
+                .expect("every cached proof has an insertion-order entry");
+            self.by_name.remove(&oldest);
+        }
+    }
+}
+
 impl Storage {
     pub const fn backend(&self) -> StorageBackend {
         self.payloads.backend()
@@ -372,7 +396,46 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use super::{InvalidStorageBackend, StorageBackend};
+    use super::{
+        DELIVERY_VALIDATION_CACHE_CAPACITY, DeliveryProof, DeliveryProofs, FileStamp,
+        InvalidStorageBackend, StorageBackend,
+    };
+    use crate::object::{NarFileName, NarHash, NarIdentity, NarSize};
+
+    fn delivery_test_name(index: usize) -> NarFileName {
+        let mut digest = [0; 32];
+        digest[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        NarFileName::raw(NarHash::from_digest(digest))
+    }
+
+    #[test]
+    fn delivery_validation_proofs_are_fifo_bounded() {
+        let mut proofs = DeliveryProofs::default();
+        let identity = NarIdentity::new(NarHash::from_digest([1; 32]), NarSize::new(4));
+        let proof = DeliveryProof {
+            stamp: FileStamp {
+                size: 4,
+                device: 1,
+                inode: 1,
+                modified_seconds: 1,
+                modified_nanoseconds: 1,
+                changed_seconds: 1,
+                changed_nanoseconds: 1,
+            },
+            identity,
+        };
+
+        (0..=DELIVERY_VALIDATION_CACHE_CAPACITY)
+            .for_each(|index| proofs.insert(delivery_test_name(index), proof));
+
+        assert_eq!(proofs.by_name.len(), DELIVERY_VALIDATION_CACHE_CAPACITY);
+        assert!(!proofs.by_name.contains_key(&delivery_test_name(0)));
+        assert!(
+            proofs
+                .by_name
+                .contains_key(&delivery_test_name(DELIVERY_VALIDATION_CACHE_CAPACITY))
+        );
+    }
 
     #[test]
     fn backend_parsing_applies_the_current_platform_policy() {

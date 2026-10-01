@@ -499,6 +499,57 @@ fn flat_canonical_nar_rejects_same_size_corruption() {
 }
 
 #[test]
+fn evicted_delivery_validation_proof_is_recomputed() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let raw = vec![b'f'; 4096];
+    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    let identity = NarIdentity::new(hash, NarSize::new(raw.len() as u64));
+    let name = NarFileName::raw(hash);
+    storage
+        .publish_nar(
+            name,
+            Cursor::new(&raw),
+            raw.len() as u64,
+            super::NarUploadPolicy::new(raw.len() as u64, 0),
+        )
+        .expect("raw NAR should be stored");
+    let file = storage
+        .open_nar(name)
+        .expect("stored NAR should open")
+        .expect("stored NAR should exist");
+
+    let incorrect_identity = NarIdentity::new(
+        NarHash::from_digest([0xa5; 32]),
+        NarSize::new(raw.len() as u64),
+    );
+    storage
+        .delivery_validation
+        .insert(name, &file, incorrect_identity)
+        .expect("seed proof for eviction regression");
+
+    (0..super::state::DELIVERY_VALIDATION_CACHE_CAPACITY).for_each(|index| {
+        let mut digest = [0; 32];
+        digest[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        storage
+            .delivery_validation
+            .insert(
+                NarFileName::raw(NarHash::from_digest(digest)),
+                &file,
+                identity,
+            )
+            .expect("additional proof should be cacheable");
+    });
+
+    assert_eq!(
+        storage
+            .validated_delivery_identity(name, &file)
+            .expect("evicted proof should be recomputed"),
+        identity
+    );
+}
+
+#[test]
 fn flat_canonical_nar_rejects_a_claimed_size_mismatch() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).expect("initialize storage");
