@@ -3599,6 +3599,16 @@ fn malicious_xz_index_cannot_allocate_from_its_declared_block_count() {
         &["--max-decoder-memory-bytes", "16777216"],
     );
     let _ = server.request("GET", "/metrics");
+
+    let warmup = encode_xz_payload(b"warmup");
+    let warmup_path = format!("/nar/{}.nar.xz", nix32_sha256(&warmup));
+    let warmup_response = server.request_with_body("PUT", &warmup_path, &[], &warmup);
+    assert!(
+        warmup_response.starts_with(b"HTTP/1.1 201 Created\r\n"),
+        "valid XZ warm-up upload should succeed: {:?}",
+        String::from_utf8_lossy(&warmup_response)
+    );
+
     let baseline_peak = server.peak_virtual_memory_bytes();
 
     let mut compressed = encode_test_nar_with(WireEncoding::Compressed(CompressionCodec::Xz));
@@ -4516,9 +4526,13 @@ fn encode_test_nar_with(encoding: WireEncoding) -> Vec<u8> {
 }
 
 fn encode_test_nar_as_xz() -> Vec<u8> {
+    encode_xz_payload(NAR_BYTES)
+}
+
+fn encode_xz_payload(payload: &[u8]) -> Vec<u8> {
     let mut compressed = Vec::new();
     let mut writer = XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ");
-    writer.write_all(NAR_BYTES).expect("compress NAR");
+    writer.write_all(payload).expect("compress payload");
     writer.finish().expect("finish XZ");
     compressed
 }
