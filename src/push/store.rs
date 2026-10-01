@@ -15,7 +15,8 @@ impl LocalStore {
         let state_dir = std::env::var_os("NIX_STATE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nix/var/nix"));
-        let database = open_supported_metadata_database(&state_dir)?;
+        let database =
+            open_supported_metadata_database(&state_dir).map_err(|error| error.to_string())?;
         Ok(Self { database })
     }
 

@@ -31,9 +31,71 @@ const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
 
 const SUPPORTED_NIX_SCHEMA_VERSION: u32 = 10;
 const SUPPORTED_NIX_MIGRATIONS: &[&str] = &[
+    "20220326-ca-derivations",
     "20251017-ca-derivations",
     "20260309-drop-redundant-indexreferrer",
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeStoreIssue {
+    StorePath,
+    StateDirectory,
+    RootsDirectory,
+    RootsLocation,
+    Database,
+    SchemaVersion,
+    SchemaStructure,
+    SchemaMigration,
+    SignatureTrust,
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeStoreValidationError {
+    issue: NativeStoreIssue,
+    detail: String,
+}
+
+impl NativeStoreValidationError {
+    fn new(issue: NativeStoreIssue, detail: impl Into<String>) -> Self {
+        Self {
+            issue,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn doctor_detail(&self) -> &'static str {
+        match self.issue {
+            NativeStoreIssue::StorePath => "Nix store path is unavailable or unsafe",
+            NativeStoreIssue::StateDirectory => "Nix state directory is unavailable or unsafe",
+            NativeStoreIssue::RootsDirectory => "Narjar roots directory is unavailable or unsafe",
+            NativeStoreIssue::RootsLocation => {
+                "Narjar roots directory overlaps a protected directory"
+            }
+            NativeStoreIssue::Database => "Nix metadata database is unavailable or unsafe",
+            NativeStoreIssue::SchemaVersion => "Nix metadata schema version is unsupported",
+            NativeStoreIssue::SchemaStructure => "Nix metadata schema is incomplete or unsupported",
+            NativeStoreIssue::SchemaMigration => "Nix metadata contains an unsupported migration",
+            NativeStoreIssue::SignatureTrust => {
+                "native-store signature trust policy is unavailable"
+            }
+        }
+    }
+}
+
+fn classify_validation<T>(
+    result: Result<T, String>,
+    issue: NativeStoreIssue,
+) -> Result<T, NativeStoreValidationError> {
+    result.map_err(|detail| NativeStoreValidationError::new(issue, detail))
+}
+
+impl std::fmt::Display for NativeStoreValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for NativeStoreValidationError {}
 
 #[derive(Debug)]
 pub(crate) struct NativeStoreSettings {
@@ -62,20 +124,43 @@ impl NativeStoreSettings {
         &self,
         narjar_data_dir: &Path,
         trusted_keys: &TrustedPublicKeys,
-    ) -> Result<ValidatedNativeStore, String> {
-        let store_directory = open_readable_directory(&self.store_dir, "Nix store")?;
-        let state_directory = open_readable_directory(&self.state_dir, "Nix state directory")?;
-        let roots_directory = open_owned_roots_directory(&self.roots_dir)?;
-        let store_path = canonical_directory_path(&self.store_dir, &store_directory, "Nix store")?;
-        let state_path =
-            canonical_directory_path(&self.state_dir, &state_directory, "Nix state directory")?;
-        let roots_path =
-            canonical_directory_path(&self.roots_dir, &roots_directory, "Narjar roots")?;
-        reject_roots_inside_narjar_data(&roots_path, narjar_data_dir)?;
-        reject_roots_inside_nix_store(&roots_path, &store_path)?;
-        validate_nix_database_path(&state_path)?;
+    ) -> Result<ValidatedNativeStore, NativeStoreValidationError> {
+        let store_directory = classify_validation(
+            open_readable_directory(&self.store_dir, "Nix store"),
+            NativeStoreIssue::StorePath,
+        )?;
+        let state_directory = classify_validation(
+            open_readable_directory(&self.state_dir, "Nix state directory"),
+            NativeStoreIssue::StateDirectory,
+        )?;
+        let roots_directory = classify_validation(
+            open_owned_roots_directory(&self.roots_dir),
+            NativeStoreIssue::RootsDirectory,
+        )?;
+        let store_path = classify_validation(
+            canonical_directory_path(&self.store_dir, &store_directory, "Nix store"),
+            NativeStoreIssue::StorePath,
+        )?;
+        let state_path = classify_validation(
+            canonical_directory_path(&self.state_dir, &state_directory, "Nix state directory"),
+            NativeStoreIssue::StateDirectory,
+        )?;
+        let roots_path = classify_validation(
+            canonical_directory_path(&self.roots_dir, &roots_directory, "Narjar roots"),
+            NativeStoreIssue::RootsDirectory,
+        )?;
+        let roots_location = reject_roots_inside_narjar_data(&roots_path, narjar_data_dir)
+            .and_then(|()| reject_roots_inside_nix_store(&roots_path, &store_path));
+        classify_validation(roots_location, NativeStoreIssue::RootsLocation)?;
+        classify_validation(
+            validate_nix_database_path(&state_path),
+            NativeStoreIssue::Database,
+        )?;
         let metadata_database = open_supported_metadata_database(&state_path)?;
-        require_trusted_signature_key(trusted_keys)?;
+        classify_validation(
+            require_trusted_signature_key(trusted_keys),
+            NativeStoreIssue::SignatureTrust,
+        )?;
 
         Ok(ValidatedNativeStore {
             _store_directory: store_directory,
@@ -134,25 +219,67 @@ pub(crate) struct ValidatedNativeStore {
     _min_lease_seconds: NonZeroU64,
 }
 
-pub(crate) fn open_supported_metadata_database(state_dir: &Path) -> Result<Connection, String> {
+pub(crate) fn open_supported_metadata_database(
+    state_dir: &Path,
+) -> Result<Connection, NativeStoreValidationError> {
     let database_path = state_dir.join("db/db.sqlite");
-    let checked_file = open_read_only_regular_file(&database_path, "Nix store database")?;
-    let checked_identity = descriptor_identity(&checked_file)?;
+    let checked_file = classify_validation(
+        open_read_only_regular_file(&database_path, "Nix store database"),
+        NativeStoreIssue::Database,
+    )?;
+    let checked_identity = classify_validation(
+        descriptor_identity(&checked_file),
+        NativeStoreIssue::Database,
+    )?;
     let database = Connection::open_with_flags(&database_path, OpenFlags::new().with_read_only())
-        .map_err(|error| format!("opening the Nix store database: {error}"))?;
-    require_database_path_matches_open_file(&database_path, checked_identity)?;
+        .map_err(|error| {
+        NativeStoreValidationError::new(
+            NativeStoreIssue::Database,
+            format!("opening the Nix store database: {error}"),
+        )
+    })?;
+    classify_validation(
+        require_database_path_matches_open_file(&database_path, checked_identity),
+        NativeStoreIssue::Database,
+    )?;
     database
         .execute("PRAGMA busy_timeout = 30000")
-        .map_err(|error| format!("configuring the Nix store database wait: {error}"))?;
-    database
-        .execute("BEGIN")
-        .map_err(|error| format!("starting the Nix store database snapshot: {error}"))?;
-    let schema_version = read_nix_schema_version(state_dir)?;
-    validate_supported_schema(&database)?;
-    validate_supported_migrations(&database)?;
-    match read_nix_schema_version(state_dir)? == schema_version {
+        .map_err(|error| {
+            NativeStoreValidationError::new(
+                NativeStoreIssue::Database,
+                format!("configuring the Nix store database wait: {error}"),
+            )
+        })?;
+    database.execute("BEGIN").map_err(|error| {
+        NativeStoreValidationError::new(
+            NativeStoreIssue::Database,
+            format!("starting the Nix store database snapshot: {error}"),
+        )
+    })?;
+    let schema_version = classify_validation(
+        read_nix_schema_version(state_dir),
+        NativeStoreIssue::SchemaVersion,
+    )?;
+    classify_validation(
+        validate_supported_schema(&database),
+        NativeStoreIssue::SchemaStructure,
+    )?;
+    classify_validation(
+        validate_supported_migrations(&database),
+        NativeStoreIssue::SchemaMigration,
+    )?;
+    let confirmed_schema_version = classify_validation(
+        read_nix_schema_version(state_dir),
+        NativeStoreIssue::SchemaVersion,
+    )?;
+    match confirmed_schema_version == schema_version {
         true => {}
-        false => return Err("Nix store schema version changed during validation".to_owned()),
+        false => {
+            return Err(NativeStoreValidationError::new(
+                NativeStoreIssue::SchemaVersion,
+                "Nix store schema version changed during validation",
+            ));
+        }
     }
     Ok(database)
 }
@@ -401,23 +528,25 @@ fn validate_supported_migrations(database: &Connection) -> Result<(), String> {
     let mut statement = database
         .prepare("SELECT migration FROM SchemaMigrations")
         .map_err(|error| format!("reading Nix store schema migrations: {error}"))?;
-    while let State::Row = statement
-        .next()
-        .map_err(|error| format!("reading Nix store schema migrations: {error}"))?
-    {
-        let migration = statement
-            .read::<String, _>("migration")
-            .map_err(|error| format!("reading Nix store schema migrations: {error}"))?;
-        match SUPPORTED_NIX_MIGRATIONS.contains(&migration.as_str()) {
-            true => {}
-            false => {
-                return Err(format!(
-                    "unsupported Nix store schema migration: {migration}"
-                ));
-            }
+    std::iter::from_fn(|| match statement.next() {
+        Ok(State::Row) => Some(
+            statement
+                .read::<String, _>("migration")
+                .map_err(|error| format!("reading Nix store schema migrations: {error}")),
+        ),
+        Ok(State::Done) => None,
+        Err(error) => Some(Err(format!("reading Nix store schema migrations: {error}"))),
+    })
+    .try_for_each(|migration| {
+        let migration = migration?;
+        if SUPPORTED_NIX_MIGRATIONS.contains(&migration.as_str()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "unsupported Nix store schema migration: {migration}"
+            ))
         }
-    }
-    Ok(())
+    })
 }
 
 fn require_trusted_signature_key(trusted_keys: &TrustedPublicKeys) -> Result<(), String> {
@@ -456,18 +585,21 @@ fn table_columns(
     let mut statement = database
         .prepare(format!("PRAGMA table_info({table})"))
         .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?;
-    let mut columns = std::collections::BTreeSet::new();
-    while let State::Row = statement
-        .next()
-        .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?
-    {
-        columns.insert(
+    std::iter::from_fn(|| match statement.next() {
+        Ok(State::Row) => Some(
             statement
                 .read::<String, _>("name")
-                .map_err(|error| format!("reading Nix store schema for {table}: {error}"))?,
-        );
-    }
-    Ok(columns)
+                .map_err(|error| format!("reading Nix store schema for {table}: {error}")),
+        ),
+        Ok(State::Done) => None,
+        Err(error) => Some(Err(format!(
+            "reading Nix store schema for {table}: {error}"
+        ))),
+    })
+    .try_fold(std::collections::BTreeSet::new(), |mut columns, column| {
+        columns.insert(column?);
+        Ok(columns)
+    })
 }
 
 #[cfg(test)]
@@ -480,7 +612,10 @@ mod tests {
     use sqlite::Connection;
     use tempfile::TempDir;
 
-    use super::{NativeStoreSettings, open_supported_metadata_database, validate_supported_schema};
+    use super::{
+        NativeStoreIssue, NativeStoreSettings, open_supported_metadata_database,
+        validate_supported_schema,
+    };
 
     struct NativeStoreFixture {
         _root: TempDir,
@@ -586,7 +721,12 @@ mod tests {
             .err()
             .expect("unsupported Nix schema must fail startup validation");
 
-        assert!(error.contains("unsupported or incomplete Nix store database schema"));
+        assert_eq!(error.issue, NativeStoreIssue::SchemaStructure);
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported or incomplete Nix store database schema")
+        );
     }
 
     #[test]
@@ -601,7 +741,12 @@ mod tests {
             .err()
             .expect("unknown Nix schema version must fail startup");
 
-        assert!(error.contains("unsupported Nix store schema version 11"));
+        assert_eq!(error.issue, NativeStoreIssue::SchemaVersion);
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Nix store schema version 11")
+        );
     }
 
     #[test]
@@ -619,7 +764,51 @@ mod tests {
             .err()
             .expect("unknown Nix migration must fail startup");
 
-        assert!(error.contains("unsupported Nix store schema migration: future-migration"));
+        assert_eq!(error.issue, NativeStoreIssue::SchemaMigration);
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Nix store schema migration: future-migration")
+        );
+    }
+
+    #[test]
+    fn accepts_the_historical_ca_derivations_migration_without_newer_entries() {
+        let fixture = NativeStoreFixture::new(true);
+        let database = Connection::open(fixture.settings.state_dir.join("db/db.sqlite"))
+            .expect("fixture database should open");
+        database
+            .execute("DELETE FROM SchemaMigrations")
+            .expect("newer migration should be removed");
+        database
+            .execute(
+                "INSERT INTO SchemaMigrations (migration) \
+                 VALUES ('20220326-ca-derivations')",
+            )
+            .expect("historical migration should be recorded");
+
+        fixture
+            .settings
+            .validate(&fixture.narjar_data_dir, &trusted_keys())
+            .expect("known historical Nix stores should validate");
+    }
+
+    #[test]
+    fn accepts_historical_and_newer_ca_derivations_migrations_together() {
+        let fixture = NativeStoreFixture::new(true);
+        let database = Connection::open(fixture.settings.state_dir.join("db/db.sqlite"))
+            .expect("fixture database should open");
+        database
+            .execute(
+                "INSERT INTO SchemaMigrations (migration) \
+                 VALUES ('20220326-ca-derivations')",
+            )
+            .expect("historical migration should be recorded");
+
+        fixture
+            .settings
+            .validate(&fixture.narjar_data_dir, &trusted_keys())
+            .expect("stores retaining old and new migration records should validate");
     }
 
     #[test]
@@ -640,7 +829,7 @@ mod tests {
             .err()
             .expect("symlinked store directory must be rejected");
 
-        assert!(error.contains("opening Nix store"));
+        assert!(error.to_string().contains("opening Nix store"));
     }
 
     #[test]
@@ -660,7 +849,7 @@ mod tests {
             .err()
             .expect("wrong store path type must be rejected");
 
-        assert!(error.contains("opening Nix store"));
+        assert!(error.to_string().contains("opening Nix store"));
     }
 
     #[test]
@@ -679,7 +868,7 @@ mod tests {
             .expect("unreadable store must be rejected");
 
         assert!(
-            error.contains("Nix store"),
+            error.to_string().contains("Nix store"),
             "unexpected validation error: {error}"
         );
     }
@@ -699,7 +888,7 @@ mod tests {
             .err()
             .expect("unsearchable store must fail startup validation");
 
-        assert!(error.contains("searchable"));
+        assert!(error.to_string().contains("searchable"));
     }
 
     #[test]
@@ -742,7 +931,7 @@ mod tests {
             .validate(&fixture.narjar_data_dir, &trusted_keys())
             .err()
             .expect("FIFO database must be rejected");
-        assert!(error.contains("not a regular file"));
+        assert!(error.to_string().contains("not a regular file"));
 
         fs::remove_file(&database_path).expect("FIFO database should be removable");
         create_database(&database_path, true);
@@ -755,7 +944,7 @@ mod tests {
             .validate(&fixture.narjar_data_dir, &trusted_keys())
             .err()
             .expect("FIFO schema file must be rejected");
-        assert!(error.contains("not a regular file"));
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     fn create_fifo(path: &std::path::Path) {
@@ -799,7 +988,7 @@ mod tests {
             .err()
             .expect("shared roots directory must be rejected");
 
-        assert!(error.contains("must be mode 0700"));
+        assert!(error.to_string().contains("must be mode 0700"));
     }
 
     #[test]
@@ -820,7 +1009,7 @@ mod tests {
             .err()
             .expect("symlinked roots directory must be rejected");
 
-        assert!(error.contains("opening Narjar roots directory"));
+        assert!(error.to_string().contains("opening Narjar roots directory"));
     }
 
     #[test]
@@ -838,7 +1027,7 @@ mod tests {
             .err()
             .expect("symlinked Nix database must be rejected");
 
-        assert!(error.contains("database must not be a symlink"));
+        assert!(error.to_string().contains("database must not be a symlink"));
     }
 
     #[test]
@@ -861,7 +1050,7 @@ mod tests {
             .expect("native roots must not share the Narjar data directory");
 
         assert_eq!(
-            error,
+            error.to_string(),
             "Narjar roots directory must be outside the Narjar data directory"
         );
     }
@@ -886,7 +1075,7 @@ mod tests {
             .expect("native roots must not share the Nix store");
 
         assert_eq!(
-            error,
+            error.to_string(),
             "Narjar roots directory must be outside the Nix store"
         );
     }
@@ -906,7 +1095,11 @@ mod tests {
             .err()
             .expect("native paths must be absolute");
 
-        assert!(error.contains("Nix store path must be absolute"));
+        assert!(
+            error
+                .to_string()
+                .contains("Nix store path must be absolute")
+        );
     }
 
     #[test]
@@ -920,7 +1113,7 @@ mod tests {
             .expect("native source needs signature policy input");
 
         assert_eq!(
-            error,
+            error.to_string(),
             "native-store source requires at least one trusted public key"
         );
     }

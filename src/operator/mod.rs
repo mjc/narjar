@@ -927,10 +927,10 @@ fn validate_doctor_native_store(
                         severity: DoctorSeverity::Ok,
                         detail: "source configuration is valid",
                     },
-                    Err(_) => DoctorSource {
+                    Err(error) => DoctorSource {
                         name: "native-store",
                         severity: DoctorSeverity::Error,
-                        detail: "source validation failed; inspect local service logs",
+                        detail: error.doctor_detail(),
                     },
                 }
             }
@@ -1673,9 +1673,7 @@ machine other.example password other-secret
         let json = doctor_json(&report);
 
         assert!(json.contains("\"name\":\"native-store\""));
-        assert!(
-            json.contains("\"detail\":\"source validation failed; inspect local service logs\"")
-        );
+        assert!(json.contains("\"detail\":\"Nix store path is unavailable or unsafe\""));
         assert!(!json.contains("/private/store-path"));
         assert!(!json.contains("/private/state-path"));
         assert!(!json.contains("/private/roots-path"));

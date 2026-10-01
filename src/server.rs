@@ -420,7 +420,7 @@ fn validate_native_store_source(
         .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
     let _validated_source = settings
         .validate(&config.data_dir, &trusted_keys)
-        .map_err(Error::runtime)?;
+        .map_err(|error| Error::runtime(error.to_string()))?;
     Ok(())
 }
 
