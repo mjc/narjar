@@ -57,7 +57,7 @@ printf 'Cargo archive: %s bytes compressed\n' "$crate_size_bytes"
 cd "target/package/narjar-${crate_version}"
 
 cargo check --locked --all-targets
-cargo nextest run --locked
+cargo nextest run --locked --package narjar --all-features
 
 consumer_install_root="$PWD/consumer-install"
 cargo install --force --locked --offline --path . --root "$consumer_install_root"

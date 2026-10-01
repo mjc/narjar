@@ -90,7 +90,9 @@ of dependency review, not silently waived.
 
 ### Domain unit tests
 
-Run on every change with cargo nextest:
+Run on every change with `devenv tasks run check:test`; it uses nextest across
+the complete Cargo workspace. The packaged-root test remains a separate part
+of `ci/check-cargo-package.sh`:
 
 - Nix32/Base64 valid and invalid vectors.
 - StoreHash, FileHash, StorePath, NarUrl, ByteCount, and token-hash domain types.
@@ -319,10 +321,11 @@ If that gate fails, stop greenfield work and adopt/contribute upstream.
 The repository shell is entered through devenv:
 
 ~~~sh
-devenv shell -- cargo nextest run
-devenv shell -- cargo clippy --all-targets --all-features -- -D warnings
-devenv shell -- cargo fmt --all --check
-devenv shell -- nix flake check --all-systems --accept-flake-config
+devenv tasks run check:fmt
+devenv tasks run check:clippy
+devenv tasks run check:test
+devenv tasks run check:doc
+nix flake check --all-systems --accept-flake-config
 ~~~
 
 Linux static artifact proof additionally builds packages.x86_64-linux.narjar-static
