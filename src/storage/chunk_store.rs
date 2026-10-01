@@ -1677,7 +1677,7 @@ mod tests {
         storage::{
             chunked::{ChunkHash, ChunkProfile, ManifestReader},
             directory::Directory,
-            fs::FilesystemSpace,
+            fs::StorageCapacity,
             publication::{StagingBudget, StagingReservation},
             state::{StorageActivity, StorageBackend},
         },
@@ -1704,7 +1704,7 @@ mod tests {
             specifications.len() >= 3,
             "fixture must span several chunks"
         );
-        let exact_capacity = FilesystemSpace {
+        let exact_capacity = StorageCapacity {
             total_bytes: writer.pending.len() as u64,
             available_bytes: writer.pending.len() as u64,
             total_inodes: 2,
