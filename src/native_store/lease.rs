@@ -154,6 +154,7 @@ pub(crate) struct NativeStoreLeaseManager {
 struct LeaseManagerState {
     active: usize,
     record_index: RecordPathIndex,
+    record_scan: Option<RecordPathScan>,
     capacity_rejections: u64,
     record_paths: BTreeSet<PathBuf>,
     cleanup_cursor: Option<PathBuf>,
@@ -165,7 +166,19 @@ enum RecordPathIndex {
     NeedsRefresh(u64),
 }
 
+struct RecordPathScan {
+    generation: u64,
+    entries: fs::ReadDir,
+}
+
 impl RecordPathIndex {
+    fn needs_refresh(&self) -> bool {
+        match self {
+            Self::Current(_) => false,
+            Self::NeedsRefresh(_) => true,
+        }
+    }
+
     fn observed_generation(&self) -> u64 {
         match self {
             Self::Current(generation) | Self::NeedsRefresh(generation) => *generation,
@@ -187,13 +200,6 @@ impl RecordPathIndex {
 
     fn refresh(&mut self, generation: u64) {
         *self = Self::Current(generation);
-    }
-
-    fn is_current_at(&self, generation: u64) -> bool {
-        match self {
-            Self::Current(current) => *current == generation,
-            Self::NeedsRefresh(_) => false,
-        }
     }
 }
 
@@ -239,6 +245,7 @@ enum CapacityMutationKind {
     Acquire,
     ReleaseLive,
     RemovePending,
+    Reconcile,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -294,6 +301,7 @@ impl NativeStoreLeaseManager {
             state: Mutex::new(LeaseManagerState {
                 active: 0,
                 record_index: RecordPathIndex::Current(0),
+                record_scan: None,
                 capacity_rejections: 0,
                 record_paths: BTreeSet::new(),
                 cleanup_cursor: None,
@@ -333,6 +341,7 @@ impl NativeStoreLeaseManager {
         self.recover_if_required(&mut state)?;
         self.recover_pending_capacity_mutation(&mut state)?;
         let now = clock()?;
+        self.refresh_record_paths_if_stale(&mut state)?;
         self.cleanup_expired_records(now, MAX_EXPIRY_CLEANUP_PER_CALL, &mut state)?;
         let path = self.validate_store_path(path.as_path())?;
         let paths = LeasePaths {
@@ -402,7 +411,7 @@ impl NativeStoreLeaseManager {
             self.write_pending_root_and_live_record(path, paths, state, clock)
         })();
         if result.is_err() && (capacity_mutation_started || state.recovery_required) {
-            self.recover_after_mutation_failure(state);
+            self.recover_after_mutation_failure(state, clock());
         }
         result
     }
@@ -483,6 +492,9 @@ impl NativeStoreLeaseManager {
                 .checked_sub(1)
                 .ok_or(NativeStoreLeaseError::InvalidCapacityRecord)?,
             CapacityMutationKind::RemovePending => mutation.previous_active,
+            CapacityMutationKind::Reconcile => {
+                return Err(NativeStoreLeaseError::InvalidCapacityRecord);
+            }
         };
         let completed = CapacityRecord {
             generation: capacity.generation,
@@ -511,6 +523,9 @@ impl NativeStoreLeaseManager {
                 .map_err(|_| NativeStoreLeaseError::InvalidCapacityRecord)?;
             return Ok(());
         };
+        if mutation.kind == CapacityMutationKind::Reconcile {
+            return self.recover_under_lock(now_unix_seconds()?, state);
+        }
         let _gc_read_lock = self.acquire_gc_read_lock()?;
         let path = NativeStorePath::parse(
             &self.store_dir,
@@ -560,6 +575,9 @@ impl NativeStoreLeaseManager {
                     }
                 }
             }
+            CapacityMutationKind::Reconcile => {
+                return Err(NativeStoreLeaseError::InvalidCapacityRecord);
+            }
         };
         let recovered = CapacityRecord {
             generation: capacity.generation,
@@ -591,6 +609,7 @@ impl NativeStoreLeaseManager {
         match fs::remove_dir(self.lease_directory(path)) {
             Ok(()) => sync_directory(&self.roots_dir),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
             Err(error) => Err(NativeStoreLeaseError::Io(error)),
         }
     }
@@ -651,7 +670,11 @@ impl NativeStoreLeaseManager {
             Ok(())
         })();
         if result.is_err() {
-            self.recover_after_mutation_failure(&mut state);
+            #[cfg(test)]
+            let recovery_time = Ok(test_now);
+            #[cfg(not(test))]
+            let recovery_time = now_unix_seconds();
+            self.recover_after_mutation_failure(&mut state, recovery_time);
         }
         result
     }
@@ -699,6 +722,17 @@ impl NativeStoreLeaseManager {
         now: u64,
         state: &mut LeaseManagerState,
     ) -> Result<(), NativeStoreLeaseError> {
+        let capacity = read_capacity_record(&self.roots_dir)?;
+        if !capacity
+            .pending
+            .as_ref()
+            .is_some_and(|mutation| mutation.kind == CapacityMutationKind::Reconcile)
+        {
+            if capacity.pending.is_some() {
+                self.recover_pending_capacity_mutation(state)?;
+            }
+            self.begin_recovery_reconciliation()?;
+        }
         state.active = 0;
         state.record_paths.clear();
         state.cleanup_cursor = None;
@@ -727,6 +761,23 @@ impl NativeStoreLeaseManager {
         state.record_index.refresh(generation);
         state.recovery_required = false;
         Ok(())
+    }
+
+    fn begin_recovery_reconciliation(&self) -> Result<(), NativeStoreLeaseError> {
+        let capacity = read_capacity_record(&self.roots_dir)?;
+        let generation = next_generation(capacity.generation)?;
+        write_capacity_record(
+            &self.roots_dir,
+            CapacityRecord {
+                generation,
+                active: capacity.active,
+                pending: Some(CapacityMutation {
+                    kind: CapacityMutationKind::Reconcile,
+                    store_basename: String::new(),
+                    previous_active: capacity.active,
+                }),
+            },
+        )
     }
 
     fn recover_record_at_path(
@@ -767,8 +818,7 @@ impl NativeStoreLeaseManager {
     ) -> Result<(), NativeStoreLeaseError> {
         match cleanup_remaining.checked_sub(1) {
             Some(remaining) => {
-                self.remove_recorded_lease_files(record_path, store_path, record)?;
-                state.record_removed(record_path);
+                self.remove_recovered_lease_files(record_path, store_path, record, state)?;
                 *cleanup_remaining = remaining;
                 Ok(())
             }
@@ -849,9 +899,7 @@ impl NativeStoreLeaseManager {
     ) -> Result<(), NativeStoreLeaseError> {
         match cleanup_remaining.checked_sub(1) {
             Some(remaining) => {
-                self.remove_recorded_lease_files(record_path, store_path, record)?;
-                state.record_removed(record_path);
-                state.active -= 1;
+                self.remove_recovered_lease_files(record_path, store_path, record, state)?;
                 *cleanup_remaining = remaining;
                 Ok(())
             }
@@ -871,6 +919,21 @@ impl NativeStoreLeaseManager {
         sync_directory(&self.roots_dir)
     }
 
+    fn remove_recovered_lease_files(
+        &self,
+        record_path: &Path,
+        store_path: &NativeStorePath,
+        record: &LeaseRecord,
+        state: &mut LeaseManagerState,
+    ) -> Result<(), NativeStoreLeaseError> {
+        self.remove_recorded_lease_files(record_path, store_path, record)?;
+        state.record_removed(record_path);
+        if record.state == PersistedLeaseState::Live {
+            state.active -= 1;
+        }
+        Ok(())
+    }
+
     fn recover_if_required(
         &self,
         state: &mut LeaseManagerState,
@@ -881,12 +944,16 @@ impl NativeStoreLeaseManager {
         Ok(())
     }
 
-    fn recover_after_mutation_failure(&self, state: &mut LeaseManagerState) {
+    fn recover_after_mutation_failure(
+        &self,
+        state: &mut LeaseManagerState,
+        recovery_time: Result<u64, NativeStoreLeaseError>,
+    ) {
         state.recovery_required = true;
-        if self
-            .recover_under_lock(now_unix_seconds().unwrap_or(u64::MAX), state)
-            .is_err()
-        {
+        let Ok(now) = recovery_time else {
+            return;
+        };
+        if self.recover_under_lock(now, state).is_err() {
             state.recovery_required = true;
         }
     }
@@ -896,9 +963,25 @@ impl NativeStoreLeaseManager {
         state: &mut LeaseManagerState,
     ) -> Result<(), NativeStoreLeaseError> {
         let generation = read_capacity_record(&self.roots_dir)?.generation;
-        if !state.record_index.is_current_at(generation) {
-            state.record_paths = read_record_paths(&self.roots_dir)?.into_iter().collect();
-            state.record_index.refresh(generation);
+        state.record_index.note_generation(generation);
+        if state.record_index.needs_refresh() && state.record_scan.is_none() {
+            state.record_scan = Some(RecordPathScan {
+                generation,
+                entries: fs::read_dir(&self.roots_dir).map_err(NativeStoreLeaseError::Io)?,
+            });
+        }
+        if let Some(scan) = state.record_scan.as_mut() {
+            let (paths, complete) =
+                read_record_path_batch(&mut scan.entries, MAX_EXPIRY_CLEANUP_PER_CALL)?;
+            state.record_paths.extend(paths);
+            if complete {
+                let scanned_generation = scan.generation;
+                state.record_scan = None;
+                state.record_index.refresh(scanned_generation);
+                state
+                    .record_index
+                    .note_generation(read_capacity_record(&self.roots_dir)?.generation);
+            }
         }
         Ok(())
     }
@@ -1149,26 +1232,50 @@ fn set_flock_lock_with_mode(
 fn read_record_paths(roots_dir: &Path) -> Result<Vec<PathBuf>, NativeStoreLeaseError> {
     fs::read_dir(roots_dir)
         .map_err(NativeStoreLeaseError::Io)?
-        .filter_map(|entry| match entry {
-            Ok(entry) if is_lease_directory_name(&entry.file_name()) => {
-                let path = entry.path();
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.is_dir() => {
-                        let record = path.join(RECORD_FILE);
-                        match fs::symlink_metadata(&record) {
-                            Ok(_) => Some(Ok(record)),
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                            Err(error) => Some(Err(NativeStoreLeaseError::Io(error))),
-                        }
-                    }
-                    Ok(_) => Some(Err(NativeStoreLeaseError::InvalidRecord)),
-                    Err(error) => Some(Err(NativeStoreLeaseError::Io(error))),
-                }
+        .try_fold(Vec::new(), |mut paths, entry| {
+            let entry = entry.map_err(NativeStoreLeaseError::Io)?;
+            if let Some(path) = record_path_from_directory_entry(entry)? {
+                paths.push(path);
             }
-            Ok(_) => None,
-            Err(error) => Some(Err(NativeStoreLeaseError::Io(error))),
+            Ok(paths)
         })
-        .collect()
+}
+
+fn read_record_path_batch(
+    entries: &mut fs::ReadDir,
+    maximum_entries: usize,
+) -> Result<(Vec<PathBuf>, bool), NativeStoreLeaseError> {
+    let (paths, entries_read) = std::iter::from_fn(|| entries.next())
+        .take(maximum_entries)
+        .try_fold((Vec::new(), 0), |(mut paths, entries_read), entry| {
+            let entry = entry.map_err(NativeStoreLeaseError::Io)?;
+            if let Some(path) = record_path_from_directory_entry(entry)? {
+                paths.push(path);
+            }
+            Ok::<_, NativeStoreLeaseError>((paths, entries_read + 1))
+        })?;
+    Ok((paths, entries_read < maximum_entries))
+}
+
+fn record_path_from_directory_entry(
+    entry: fs::DirEntry,
+) -> Result<Option<PathBuf>, NativeStoreLeaseError> {
+    if !is_lease_directory_name(&entry.file_name()) {
+        return Ok(None);
+    }
+    let directory = entry.path();
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => {
+            let record = directory.join(RECORD_FILE);
+            match fs::symlink_metadata(&record) {
+                Ok(_) => Ok(Some(record)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(NativeStoreLeaseError::Io(error)),
+            }
+        }
+        Ok(_) => Err(NativeStoreLeaseError::InvalidRecord),
+        Err(error) => Err(NativeStoreLeaseError::Io(error)),
+    }
 }
 
 fn remove_empty_orphan_lease_directories(roots_dir: &Path) -> Result<(), NativeStoreLeaseError> {
@@ -1305,7 +1412,9 @@ fn released_active_count(mutation: &CapacityMutation) -> Result<u64, NativeStore
             .checked_sub(1)
             .ok_or(NativeStoreLeaseError::InvalidCapacityRecord),
         CapacityMutationKind::RemovePending => Ok(mutation.previous_active),
-        CapacityMutationKind::Acquire => Err(NativeStoreLeaseError::InvalidCapacityRecord),
+        CapacityMutationKind::Acquire | CapacityMutationKind::Reconcile => {
+            Err(NativeStoreLeaseError::InvalidCapacityRecord)
+        }
     }
 }
 
@@ -1896,6 +2005,132 @@ mod tests {
             assert!(!fixture.manager.root_path(reservation_path).exists());
             assert_eq!(fixture.owned_records().len(), 1);
         });
+    }
+
+    #[test]
+    fn recovery_deletion_is_journaled_for_already_open_managers() {
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .expect("initial lease should be acquired");
+        let surviving_manager = fixture.reopen_at(1, 2);
+        let record_path = fixture.manager.record_path(&fixture.store_path);
+        let lease_directory = fixture.manager.lease_directory(&fixture.store_path);
+        fail_nth_directory_sync(&fixture.roots_dir, 2);
+
+        assert!(
+            NativeStoreLeaseManager::open_at(
+                fixture.store_dir.clone(),
+                fixture.state_dir.clone(),
+                fixture.roots_dir.clone(),
+                NonZeroU64::new(3_600).expect("lease period should be nonzero"),
+                NonZeroUsize::new(1).expect("capacity should be nonzero"),
+                Arc::clone(&fixture.metadata_database),
+                lease.expires_at_unix_seconds() + 1,
+            )
+            .is_err()
+        );
+        assert!(!record_path.exists());
+
+        assert_eq!(
+            surviving_manager
+                .snapshot()
+                .expect("surviving manager should reconcile the interrupted deletion")
+                .active,
+            0
+        );
+        assert!(!record_path.exists());
+        assert!(!lease_directory.exists());
+    }
+
+    #[test]
+    fn clock_failure_during_acquire_recovery_preserves_unrelated_live_roots() {
+        let fixture = LeaseFixture::new(2);
+        fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 10)
+            .expect("unrelated live lease should be acquired");
+        let other_path = fixture.store_dir.join(format!("{}-other", "1".repeat(32)));
+        fs::create_dir(&other_path).expect("second store object should exist");
+        fixture.register_path(&other_path);
+        let other_path = fixture
+            .manager
+            .validate_store_path(&other_path)
+            .expect("second store path should validate");
+        let mut clock_calls = 0;
+        let mut clock = || {
+            clock_calls += 1;
+            match clock_calls {
+                1 | 2 => Ok(10),
+                _ => Err(NativeStoreLeaseError::ClockBeforeEpoch),
+            }
+        };
+
+        assert!(matches!(
+            fixture.manager.acquire_with_clock(other_path, &mut clock),
+            Err(NativeStoreLeaseError::ClockBeforeEpoch)
+        ));
+        assert!(fixture.manager.root_path(&fixture.store_path).is_symlink());
+        assert_eq!(
+            read_required_record(
+                &fixture.manager.record_path(&fixture.store_path),
+                &fixture.store_dir
+            )
+            .expect("unrelated live lease should remain valid")
+            .state,
+            PersistedLeaseState::Live
+        );
+    }
+
+    #[test]
+    fn acquire_reclaims_an_expired_lease_created_by_another_manager() {
+        let fixture = LeaseFixture::new(1);
+        let next_path = fixture.store_dir.join(format!("{}-next", "1".repeat(32)));
+        fs::create_dir(&next_path).expect("next store object should exist");
+        fixture.register_path(&next_path);
+        let next_path = fixture
+            .manager
+            .validate_store_path(&next_path)
+            .expect("next store path should validate");
+        let stale_manager = fixture.reopen_at(1, 1);
+
+        fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .expect("first manager should create the expiring lease");
+        stale_manager
+            .acquire(next_path, 4_000)
+            .expect("acquisition should scan stale paths and reclaim the expired lease");
+
+        assert!(!fixture.manager.root_path(&fixture.store_path).exists());
+        assert_eq!(
+            stale_manager.snapshot().expect("one active lease").active,
+            1
+        );
+    }
+
+    #[test]
+    fn stale_record_index_scans_at_most_one_bounded_batch_per_refresh() {
+        let fixture = LeaseFixture::new(1);
+        (0..3).for_each(|index| {
+            let directory = fixture
+                .roots_dir
+                .join(format!("{LEASE_PREFIX}{index:064x}"));
+            fs::create_dir(&directory).expect("lease directory should be created");
+            File::create(directory.join(RECORD_FILE)).expect("lease record should be created");
+        });
+        let mut entries = fs::read_dir(&fixture.roots_dir).expect("roots directory should open");
+        let batches = (0..8)
+            .map(|_| read_record_path_batch(&mut entries, 1).expect("one batch should read"))
+            .collect::<Vec<_>>();
+
+        assert!(batches.iter().all(|(paths, _)| paths.len() <= 1));
+        assert_eq!(
+            batches.iter().map(|(paths, _)| paths.len()).sum::<usize>(),
+            3
+        );
+        assert!(batches.iter().any(|(_, complete)| *complete));
     }
 
     #[test]

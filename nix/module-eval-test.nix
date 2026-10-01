@@ -136,6 +136,12 @@ let
     nativeStoreEnable = true;
     nativeRootsDir = "/nix/store";
   };
+  nestedNativeRootsConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    dynamicUser = false;
+    nativeStoreEnable = true;
+    nativeRootsDir = "/nix/var/nix/gcroots/auto/narjar/instance/roots";
+  };
   nativeStoreConfig = configuration {
     dataDir = "/var/lib/narjar";
     dynamicUser = false;
@@ -169,6 +175,9 @@ assert (!(builtins.tryEval invalidCompressionConfig.system.build.toplevel.drvPat
 assert (!(builtins.tryEval missingPrivateReadTokenConfig.system.build.toplevel.drvPath).success);
 assert (!(builtins.tryEval conflictingFilesystemSamplesConfig.system.build.toplevel.drvPath).success);
 assert (!(builtins.tryEval unsafeNativeRootsConfig.system.build.toplevel.drvPath).success);
+assert (!(builtins.tryEval nestedNativeRootsConfig.system.build.toplevel.drvPath).success);
 assert (lib.hasInfix "realpath -m" nativeStorePreStartScript);
+assert (lib.hasInfix "mkdir -m 0700" nativeStorePreStartScript);
+assert (!(lib.hasInfix "install -d" nativeStorePreStartScript));
 assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules));
 "narjar module dataDir assertions passed"
