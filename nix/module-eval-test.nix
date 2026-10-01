@@ -15,6 +15,7 @@ let
 
   configuration = {
     dataDir,
+    dynamicUser ? true,
     statsInventory ? false,
     statsInventoryIntervalSeconds ? 900,
     statsZfsDataset ? null,
@@ -25,6 +26,8 @@ let
     egressCompression ? "none",
     storageBackend ? "flat",
     readTokens ? null,
+    nativeStoreEnable ? false,
+    nativeRootsDir ? "/nix/var/nix/gcroots/auto/narjar",
     gc ? {},
   }:
     (import (pkgs.path + "/nixos/lib/eval-config.nix") {
@@ -36,6 +39,7 @@ let
           services.narjar = {
             enable = true;
             inherit
+              dynamicUser
               dataDir
               statsInventory
               statsInventoryIntervalSeconds
@@ -48,6 +52,8 @@ let
               storageBackend
               ;
             auth.readTokens = readTokens;
+            nativeStore.enable = nativeStoreEnable;
+            nativeStore.rootsDir = nativeRootsDir;
             inherit gc;
             minFreeBytes = 0;
             package = package;
@@ -124,6 +130,21 @@ let
     statsZfsDataset = "tank/narjar";
     statsFilesystemSample = "/run/filesystem/sample.json";
   };
+  unsafeNativeRootsConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    dynamicUser = false;
+    nativeStoreEnable = true;
+    nativeRootsDir = "/nix/store";
+  };
+  nativeStoreConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    dynamicUser = false;
+    nativeStoreEnable = true;
+  };
+  nativeStorePreStartCommand = lib.head (
+    lib.toList nativeStoreConfig.systemd.services.narjar.serviceConfig.ExecStartPre
+  );
+  nativeStorePreStartScript = builtins.readFile (lib.removePrefix "+" nativeStorePreStartCommand);
 in
 assert builtins.all evaluates valid;
 assert builtins.all (dataDir: !(evaluates dataDir)) invalid;
@@ -147,4 +168,7 @@ assert (lib.hasInfix "--storage-backend chunked" customRuntimeConfig.systemd.ser
 assert (!(builtins.tryEval invalidCompressionConfig.system.build.toplevel.drvPath).success);
 assert (!(builtins.tryEval missingPrivateReadTokenConfig.system.build.toplevel.drvPath).success);
 assert (!(builtins.tryEval conflictingFilesystemSamplesConfig.system.build.toplevel.drvPath).success);
+assert (!(builtins.tryEval unsafeNativeRootsConfig.system.build.toplevel.drvPath).success);
+assert (lib.hasInfix "realpath -m" nativeStorePreStartScript);
+assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules));
 "narjar module dataDir assertions passed"

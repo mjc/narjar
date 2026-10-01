@@ -71,7 +71,7 @@ pub use crate::object::{
 };
 pub use directory::Directory;
 pub(crate) use egress::{NarReadBody, VerifiedCanonicalNar};
-pub use ids::{InvalidObjectId, StoreHash};
+pub use ids::{InvalidObjectId, StoreHash, validate_store_basename};
 pub use publication::{NarUploadPolicy, PublishOutcome, StagingReservation, StorageError};
 pub(crate) use state::StorageActivitySnapshot;
 pub use state::{InvalidStorageBackend, Storage, StorageBackend};

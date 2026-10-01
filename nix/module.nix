@@ -11,12 +11,32 @@
     lib.match "^/var/lib/[^/]+$" cfg.dataDir
     != null
     && !builtins.elem stateDirectory ["." ".."];
+  isCanonicalAbsoluteDirectory = path:
+    lib.hasPrefix "/" path
+    && path != "/"
+    && builtins.all (component: component != "" && component != "." && component != "..")
+    (lib.drop 1 (lib.splitString "/" path));
+  isStrictChildPath = parent: path:
+    path != parent && lib.hasPrefix "${lib.removeSuffix "/" parent}/" path;
+  isWithinPath = parent: path: path == parent || isStrictChildPath parent path;
+  pathsOverlap = first: second:
+    first == second || isStrictChildPath first second || isStrictChildPath second first;
+  nativeRootsParent = "${cfg.nativeStore.stateDir}/gcroots/auto";
+  nativeRootsBase = "${nativeRootsParent}/narjar";
+  nativeRootsPathIsSafe =
+    isCanonicalAbsoluteDirectory cfg.nativeStore.storeDir
+    && isCanonicalAbsoluteDirectory cfg.nativeStore.stateDir
+    && isCanonicalAbsoluteDirectory cfg.nativeStore.rootsDir
+    && isWithinPath nativeRootsBase cfg.nativeStore.rootsDir
+    && !pathsOverlap cfg.nativeStore.storeDir cfg.nativeStore.rootsDir
+    && !pathsOverlap cfg.dataDir cfg.nativeStore.rootsDir;
   runtimeDataDir =
     if cfg.dynamicUser
     then "/var/lib/private/${stateDirectory}"
     else cfg.dataDir;
   zfsSampleDirectory = "/run/narjar-zfs-stats";
   zfsSampleFile = "${zfsSampleDirectory}/sample.json";
+  nativeGcLock = "${cfg.nativeStore.stateDir}/gc.lock";
   filesystemSampleFile =
     if cfg.statsFilesystemSample != null
     then cfg.statsFilesystemSample
@@ -202,6 +222,37 @@
     ${setOptionalFixedFileModes}
     ${restoreFixedDirectories}
     ${pkgs.coreutils}/bin/chown --no-dereference narjar:narjar -- ${lib.escapeShellArg runtimeDataDir}
+    ${lib.optionalString cfg.nativeStore.enable ''
+      gc_lock=${lib.escapeShellArg nativeGcLock}
+      roots_dir=${lib.escapeShellArg cfg.nativeStore.rootsDir}
+      roots_parent=${lib.escapeShellArg nativeRootsParent}
+      resolved_roots=$(${pkgs.coreutils}/bin/realpath -m -- "$roots_dir")
+      resolved_parent=$(${pkgs.coreutils}/bin/realpath -e -- "$roots_parent")
+      if [ "$resolved_roots" != "$roots_dir" ] || [ "$resolved_parent" != "$roots_parent" ]; then
+        ${pkgs.coreutils}/bin/printf '%s\n' "narjar: native-store roots path must not traverse symlinks" >&2
+        exit 1
+      fi
+      if [ -L "$roots_dir" ] || { [ -e "$roots_dir" ] && [ ! -d "$roots_dir" ]; }; then
+        ${pkgs.coreutils}/bin/printf '%s\n' "narjar: expected a real directory at $roots_dir" >&2
+        exit 1
+      fi
+      if [ -L "$gc_lock" ] || { [ -e "$gc_lock" ] && [ ! -f "$gc_lock" ]; }; then
+        ${pkgs.coreutils}/bin/printf '%s\n' "narjar: expected a regular Nix GC lock at $gc_lock" >&2
+        exit 1
+      fi
+      if [ -e "$roots_dir" ]; then
+        roots_metadata=$(${pkgs.coreutils}/bin/stat -c '%F:%U:%G:%a' -- "$roots_dir")
+        if [ "$roots_metadata" != 'directory:narjar:narjar:700' ]; then
+          ${pkgs.coreutils}/bin/printf '%s\n' "narjar: existing native-store roots directory must already be owned by narjar with mode 0700" >&2
+          exit 1
+        fi
+      else
+        ${pkgs.coreutils}/bin/install -d -m 0700 -o narjar -g narjar -- "$roots_dir"
+      fi
+      ${pkgs.coreutils}/bin/touch -- "$gc_lock"
+      ${pkgs.coreutils}/bin/chown --no-dereference root:narjar-nix-gc -- "$gc_lock"
+      ${pkgs.coreutils}/bin/chmod --no-dereference 0640 -- "$gc_lock"
+    ''}
   '';
   privilegedPreStart = pkgs.writeShellScript "narjar-pre-start" privilegedPreStartScript;
   initArgs = lib.escapeShellArgs (
@@ -244,6 +295,18 @@
       "--storage-backend"
       cfg.storageBackend
     ]
+      ++ lib.optionals cfg.nativeStore.enable [
+        "--serve-source"
+        "native-store"
+        "--native-store-dir"
+        cfg.nativeStore.storeDir
+        "--native-state-dir"
+        cfg.nativeStore.stateDir
+        "--native-roots-dir"
+        cfg.nativeStore.rootsDir
+        "--native-min-lease-seconds"
+        (toString cfg.nativeStore.minLeaseSeconds)
+      ]
       ++ lib.optionals cfg.statsInventory [
         "--stats-inventory-interval-seconds"
         (toString cfg.statsInventoryIntervalSeconds)
@@ -327,7 +390,8 @@
   commonServiceConfig = {
     PrivateTmp = true;
     ProtectSystem = "strict";
-    ReadWritePaths = [runtimeDataDir];
+    ReadWritePaths = [runtimeDataDir]
+      ++ lib.optionals cfg.nativeStore.enable [nativeRootsParent nativeGcLock];
     UMask = "0077";
   };
   gcArgs = lib.escapeShellArgs (
@@ -393,6 +457,34 @@ in {
       type = lib.types.bool;
       default = false;
       description = "Require read credentials by initializing the cache with private reads.";
+    };
+
+    nativeStore = {
+      enable = lib.mkEnableOption "serving paths from the local Nix store";
+
+      storeDir = lib.mkOption {
+        type = lib.types.str;
+        default = "/nix/store";
+        description = "Nix store directory used by the native-store source.";
+      };
+
+      stateDir = lib.mkOption {
+        type = lib.types.str;
+        default = "/nix/var/nix";
+        description = "Nix state directory containing gc.lock and gcroots.";
+      };
+
+      rootsDir = lib.mkOption {
+        type = lib.types.str;
+        default = "${config.services.narjar.nativeStore.stateDir}/gcroots/auto/narjar";
+        description = "Private Narjar-owned directory below Nix's discovered gcroots tree.";
+      };
+
+      minLeaseSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 3600;
+        description = "Minimum lifetime for each Narjar-owned Nix GC root.";
+      };
     };
 
     listen = lib.mkOption {
@@ -569,20 +661,39 @@ in {
         assertion = !cfg.privateRead || cfg.auth.readTokens != null;
         message = "services.narjar.privateRead requires services.narjar.auth.readTokens";
       }
+      {
+        assertion = !cfg.nativeStore.enable || !cfg.dynamicUser;
+        message = "services.narjar.nativeStore requires dynamicUser = false so its GC-root directory has stable ownership";
+      }
+      {
+        assertion = !cfg.nativeStore.enable || cfg.storageBackend == "flat";
+        message = "services.narjar.nativeStore requires storageBackend = flat";
+      }
+      {
+        assertion = !cfg.nativeStore.enable || cfg.egressCompression == "none";
+        message = "services.narjar.nativeStore requires egressCompression = none";
+      }
+      {
+        assertion = !cfg.nativeStore.enable || nativeRootsPathIsSafe;
+        message = "services.narjar.nativeStore.rootsDir must be a canonical path inside stateDir/gcroots/auto/narjar, outside the Nix store and Narjar data directory";
+      }
     ];
 
     users.groups.narjar = lib.mkIf (!cfg.dynamicUser) {};
+    users.groups.narjar-nix-gc = lib.mkIf cfg.nativeStore.enable {};
     users.users.narjar = lib.mkIf (!cfg.dynamicUser) {
       isSystemUser = true;
       group = "narjar";
     };
-    systemd.tmpfiles.rules = lib.optional (!cfg.dynamicUser) "d ${cfg.dataDir} 0700 narjar narjar -";
+    systemd.tmpfiles.rules =
+      lib.optional (!cfg.dynamicUser) "d ${cfg.dataDir} 0700 narjar narjar -";
 
     systemd.services.narjar = {
       description = "Narjar binary cache";
       wantedBy = ["multi-user.target"];
       after = ["network.target"];
-      unitConfig.RequiresMountsFor = [cfg.dataDir];
+      unitConfig.RequiresMountsFor = [cfg.dataDir]
+        ++ lib.optionals cfg.nativeStore.enable [cfg.nativeStore.storeDir cfg.nativeStore.stateDir nativeRootsParent];
 
       preStart = lib.mkIf cfg.dynamicUser preStartScript;
 
@@ -593,6 +704,7 @@ in {
           DynamicUser = lib.mkIf cfg.dynamicUser true;
           User = lib.mkIf (!cfg.dynamicUser) "narjar";
           Group = lib.mkIf (!cfg.dynamicUser) "narjar";
+          SupplementaryGroups = lib.optional cfg.nativeStore.enable "narjar-nix-gc";
           StateDirectory = lib.mkIf cfg.dynamicUser stateDirectory;
           StateDirectoryMode = lib.mkIf cfg.dynamicUser "0700";
           ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";

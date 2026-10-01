@@ -866,15 +866,7 @@ fn parse_content_address(value: &str) -> Result<(), NarInfoError> {
 }
 
 fn validate_store_basename(value: &str) -> Result<(StoreHash, &str), NarInfoError> {
-    let (hash, name) = value.split_once('-').ok_or(NarInfoError)?;
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"+-._?=".contains(&byte))
-    {
-        return Err(NarInfoError);
-    }
-    Ok((StoreHash::parse(hash).map_err(|_| NarInfoError)?, name))
+    crate::storage::validate_store_basename(value).map_err(|_| NarInfoError)
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -1,15 +1,22 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::Read,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     os::fd::AsRawFd,
     os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use narjar::__private::narinfo::TrustedPublicKeys;
-use sqlite::{Connection, OpenFlags, State};
+use sqlite::{Connection, ConnectionThreadSafe, OpenFlags, State};
+
+#[expect(
+    dead_code,
+    reason = "NARJ-142 connects lease capabilities to native-store serving"
+)]
+pub(crate) mod lease;
 
 const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
     (
@@ -41,6 +48,7 @@ pub(crate) enum NativeStoreIssue {
     StorePath,
     StateDirectory,
     RootsDirectory,
+    LeaseState,
     RootsLocation,
     Database,
     SchemaVersion,
@@ -68,6 +76,9 @@ impl NativeStoreValidationError {
             NativeStoreIssue::StorePath => "Nix store path is unavailable or unsafe",
             NativeStoreIssue::StateDirectory => "Nix state directory is unavailable or unsafe",
             NativeStoreIssue::RootsDirectory => "Narjar roots directory is unavailable or unsafe",
+            NativeStoreIssue::LeaseState => {
+                "Narjar native-store lease state is invalid or unavailable"
+            }
             NativeStoreIssue::RootsLocation => {
                 "Narjar roots directory overlaps a protected directory"
             }
@@ -104,6 +115,9 @@ pub(crate) struct NativeStoreSettings {
     roots_dir: PathBuf,
     min_lease_seconds: NonZeroU64,
 }
+
+const MAX_ACTIVE_NATIVE_LEASES: NonZeroUsize =
+    NonZeroUsize::new(100_000).expect("native lease capacity is nonzero");
 
 impl NativeStoreSettings {
     pub(crate) fn new(
@@ -149,25 +163,37 @@ impl NativeStoreSettings {
             canonical_directory_path(&self.roots_dir, &roots_directory, "Narjar roots"),
             NativeStoreIssue::RootsDirectory,
         )?;
-        let roots_location = reject_roots_inside_narjar_data(&roots_path, narjar_data_dir)
-            .and_then(|()| reject_roots_inside_nix_store(&roots_path, &store_path));
+        let roots_location =
+            validate_gc_discoverable_roots(&roots_path, &state_path, narjar_data_dir, &store_path);
         classify_validation(roots_location, NativeStoreIssue::RootsLocation)?;
         classify_validation(
             validate_nix_database_path(&state_path),
             NativeStoreIssue::Database,
         )?;
         let metadata_database = open_supported_metadata_database(&state_path)?;
+        let path_lookup_database = Arc::new(open_native_path_lookup_database(&state_path)?);
         classify_validation(
             require_trusted_signature_key(trusted_keys),
             NativeStoreIssue::SignatureTrust,
         )?;
+        let lease_manager = lease::NativeStoreLeaseManager::open(
+            store_path,
+            state_path,
+            roots_path,
+            self.min_lease_seconds,
+            MAX_ACTIVE_NATIVE_LEASES,
+            path_lookup_database,
+        )
+        .map_err(|error| {
+            NativeStoreValidationError::new(NativeStoreIssue::LeaseState, error.to_string())
+        })?;
 
         Ok(ValidatedNativeStore {
             _store_directory: store_directory,
             _state_directory: state_directory,
             _roots_directory: roots_directory,
             _metadata_database: metadata_database,
-            _min_lease_seconds: self.min_lease_seconds,
+            lease_manager,
         })
     }
 }
@@ -215,41 +241,28 @@ pub(crate) struct ValidatedNativeStore {
     _store_directory: File,
     _state_directory: File,
     _roots_directory: File,
-    _metadata_database: Connection,
-    _min_lease_seconds: NonZeroU64,
+    _metadata_database: ConnectionThreadSafe,
+    #[expect(
+        dead_code,
+        reason = "NARJ-142 consumes this manager before returning native narinfo"
+    )]
+    lease_manager: lease::NativeStoreLeaseManager,
+}
+
+impl ValidatedNativeStore {
+    #[expect(
+        dead_code,
+        reason = "NARJ-142 acquires leases before advertising native paths"
+    )]
+    pub(crate) fn leases(&self) -> &lease::NativeStoreLeaseManager {
+        &self.lease_manager
+    }
 }
 
 pub(crate) fn open_supported_metadata_database(
     state_dir: &Path,
-) -> Result<Connection, NativeStoreValidationError> {
-    let database_path = state_dir.join("db/db.sqlite");
-    let checked_file = classify_validation(
-        open_read_only_regular_file(&database_path, "Nix store database"),
-        NativeStoreIssue::Database,
-    )?;
-    let checked_identity = classify_validation(
-        descriptor_identity(&checked_file),
-        NativeStoreIssue::Database,
-    )?;
-    let database = Connection::open_with_flags(&database_path, OpenFlags::new().with_read_only())
-        .map_err(|error| {
-        NativeStoreValidationError::new(
-            NativeStoreIssue::Database,
-            format!("opening the Nix store database: {error}"),
-        )
-    })?;
-    classify_validation(
-        require_database_path_matches_open_file(&database_path, checked_identity),
-        NativeStoreIssue::Database,
-    )?;
-    database
-        .execute("PRAGMA busy_timeout = 30000")
-        .map_err(|error| {
-            NativeStoreValidationError::new(
-                NativeStoreIssue::Database,
-                format!("configuring the Nix store database wait: {error}"),
-            )
-        })?;
+) -> Result<ConnectionThreadSafe, NativeStoreValidationError> {
+    let database = open_native_path_lookup_database(state_dir)?;
     database.execute("BEGIN").map_err(|error| {
         NativeStoreValidationError::new(
             NativeStoreIssue::Database,
@@ -273,14 +286,46 @@ pub(crate) fn open_supported_metadata_database(
         NativeStoreIssue::SchemaVersion,
     )?;
     match confirmed_schema_version == schema_version {
-        true => {}
-        false => {
-            return Err(NativeStoreValidationError::new(
-                NativeStoreIssue::SchemaVersion,
-                "Nix store schema version changed during validation",
-            ));
-        }
+        true => Ok(database),
+        false => Err(NativeStoreValidationError::new(
+            NativeStoreIssue::SchemaVersion,
+            "Nix store schema version changed during validation",
+        )),
     }
+}
+
+fn open_native_path_lookup_database(
+    state_dir: &Path,
+) -> Result<ConnectionThreadSafe, NativeStoreValidationError> {
+    let database_path = state_dir.join("db/db.sqlite");
+    let checked_file = classify_validation(
+        open_read_only_regular_file(&database_path, "Nix store database"),
+        NativeStoreIssue::Database,
+    )?;
+    let checked_identity = classify_validation(
+        descriptor_identity(&checked_file),
+        NativeStoreIssue::Database,
+    )?;
+    let database =
+        Connection::open_thread_safe_with_flags(&database_path, OpenFlags::new().with_read_only())
+            .map_err(|error| {
+                NativeStoreValidationError::new(
+                    NativeStoreIssue::Database,
+                    format!("opening the Nix store database: {error}"),
+                )
+            })?;
+    classify_validation(
+        require_database_path_matches_open_file(&database_path, checked_identity),
+        NativeStoreIssue::Database,
+    )?;
+    database
+        .execute("PRAGMA busy_timeout = 30000")
+        .map_err(|error| {
+            NativeStoreValidationError::new(
+                NativeStoreIssue::Database,
+                format!("configuring the Nix store database wait: {error}"),
+            )
+        })?;
     Ok(database)
 }
 
@@ -477,6 +522,27 @@ fn reject_roots_inside_nix_store(roots_dir: &Path, store_dir: &Path) -> Result<(
     }
 }
 
+fn validate_gc_discoverable_roots(
+    roots_dir: &Path,
+    state_dir: &Path,
+    narjar_data_dir: &Path,
+    store_dir: &Path,
+) -> Result<(), String> {
+    reject_roots_inside_narjar_data(roots_dir, narjar_data_dir)
+        .and_then(|()| reject_roots_inside_nix_store(roots_dir, store_dir))?;
+    let nix_roots = state_dir.join("gcroots");
+    match roots_dir != nix_roots && roots_dir.starts_with(&nix_roots) {
+        true => {}
+        false => {
+            return Err(format!(
+                "Narjar roots directory must be a child of Nix GC roots at {}",
+                nix_roots.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_nix_database_path(state_dir: &Path) -> Result<(), String> {
     let database_directory_path = state_dir.join("db");
     let database_directory =
@@ -604,7 +670,11 @@ fn table_columns(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+    use std::{
+        fs::{self, File},
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+    };
 
     use data_encoding::BASE64;
     use ed25519_dalek::SigningKey;
@@ -629,11 +699,12 @@ mod tests {
             let store_dir = root.path().join("store");
             let state_dir = root.path().join("state");
             let database_dir = state_dir.join("db");
-            let roots_dir = root.path().join("roots");
+            let roots_dir = state_dir.join("gcroots/auto/narjar");
             let narjar_data_dir = root.path().join("narjar-data");
             for directory in [&store_dir, &database_dir, &roots_dir, &narjar_data_dir] {
                 fs::create_dir_all(directory).expect("fixture directory should be created");
             }
+            File::create(state_dir.join("gc.lock")).expect("Nix GC lock should be created");
             fs::set_permissions(&roots_dir, fs::Permissions::from_mode(0o700))
                 .expect("roots directory should be private");
             create_database(&database_dir.join("db.sqlite"), valid_schema);
@@ -708,6 +779,32 @@ mod tests {
                 ._metadata_database
                 .execute("CREATE TABLE must_not_be_written (id INTEGER)")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_narjar_lease_state_as_its_own_validation_issue() {
+        let fixture = NativeStoreFixture::new(true);
+        let lease_directory = fixture
+            .settings
+            .roots_dir
+            .join(format!(".narjar-lease-{}", "a".repeat(64)));
+        fs::create_dir(&lease_directory).expect("lease directory should be created");
+        fs::write(lease_directory.join("record"), b"not a lease record")
+            .expect("malformed lease record should be written");
+
+        let error = match fixture
+            .settings
+            .validate(&fixture.narjar_data_dir, &trusted_keys())
+        {
+            Ok(_) => panic!("malformed lease state should reject startup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.issue, NativeStoreIssue::LeaseState);
+        assert_eq!(
+            error.doctor_detail(),
+            "Narjar native-store lease state is invalid or unavailable"
         );
     }
 
@@ -1049,9 +1146,10 @@ mod tests {
             .err()
             .expect("native roots must not share the Narjar data directory");
 
-        assert_eq!(
-            error.to_string(),
-            "Narjar roots directory must be outside the Narjar data directory"
+        assert!(
+            error
+                .to_string()
+                .contains("outside the Narjar data directory")
         );
     }
 
@@ -1077,6 +1175,32 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Narjar roots directory must be outside the Nix store"
+        );
+    }
+
+    #[test]
+    fn rejects_roots_outside_nix_discovered_gc_roots() {
+        let fixture = NativeStoreFixture::new(true);
+        let roots_dir = fixture._root.path().join("narjar-roots");
+        fs::create_dir(&roots_dir).expect("external roots directory should be created");
+        fs::set_permissions(&roots_dir, fs::Permissions::from_mode(0o700))
+            .expect("external roots should be private");
+        let settings = NativeStoreSettings::new(
+            fixture.settings.store_dir.clone(),
+            fixture.settings.state_dir.clone(),
+            roots_dir,
+            std::num::NonZeroU64::new(60).expect("nonzero lease"),
+        );
+
+        let error = settings
+            .validate(&fixture.narjar_data_dir, &trusted_keys())
+            .err()
+            .expect("Nix-invisible root directory must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must be a child of Nix GC roots")
         );
     }
 

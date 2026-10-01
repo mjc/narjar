@@ -1,13 +1,13 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use sqlite::{Connection, State};
+use sqlite::{ConnectionThreadSafe, State};
 
 use super::{NarInfoMetadata, PushError};
 use crate::native_store::open_supported_metadata_database;
 use narjar::object::{NarHash, NarIdentity, NarSize};
 
 pub(super) struct LocalStore {
-    database: Connection,
+    database: ConnectionThreadSafe,
 }
 
 impl LocalStore {
