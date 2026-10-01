@@ -25,6 +25,7 @@ let
     ioTimeoutSeconds ? 30,
     egressCompression ? "none",
     storageBackend ? "flat",
+    dynamicUser ? true,
     readTokens ? null,
     nativeStoreEnable ? false,
     nativeStateDir ? "/nix/var/nix",
@@ -51,6 +52,7 @@ let
               ioTimeoutSeconds
               egressCompression
               storageBackend
+              dynamicUser
               ;
             auth.readTokens = readTokens;
             nativeStore.enable = nativeStoreEnable;
@@ -119,6 +121,14 @@ let
       maxBytes = 1000;
     };
   };
+  fixedUserConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    dynamicUser = false;
+    gc = {
+      enable = true;
+      maxBytes = 1000;
+    };
+  };
   invalidCompressionConfig = configuration {
     dataDir = "/var/lib/narjar";
     egressCompression = "brotli";
@@ -180,6 +190,21 @@ assert (lib.hasInfix "--io-timeout-seconds 9" customRuntimeConfig.systemd.servic
 assert (lib.hasInfix "--egress-compression zstd" customRuntimeConfig.systemd.services.narjar.serviceConfig.ExecStart);
 assert (lib.hasInfix "--storage-backend chunked" customRuntimeConfig.systemd.services.narjar.serviceConfig.ExecStart);
 assert (lib.hasInfix "--storage-backend chunked" customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.ExecStart);
+assert customRuntimeConfig.systemd.services.narjar.serviceConfig.DynamicUser;
+assert customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.DynamicUser;
+assert (customRuntimeConfig.systemd.services.narjar.serviceConfig.User == "narjar");
+assert (customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.User == "narjar");
+assert (customRuntimeConfig.systemd.services.narjar.serviceConfig.Group == "narjar");
+assert (customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.Group == "narjar");
+assert (customRuntimeConfig.systemd.services.narjar.serviceConfig.StateDirectory == "narjar");
+assert (customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.StateDirectory == "narjar");
+assert (builtins.substring 0 1 customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.ExecStartPre == "+");
+assert (fixedUserConfig.systemd.services.narjar.serviceConfig.User == "narjar");
+assert (fixedUserConfig.systemd.services.narjar-gc.serviceConfig.User == "narjar");
+assert (fixedUserConfig.systemd.services.narjar.serviceConfig.Group == "narjar");
+assert (fixedUserConfig.systemd.services.narjar-gc.serviceConfig.Group == "narjar");
+assert (!(fixedUserConfig.systemd.services.narjar.serviceConfig.DynamicUser or false));
+assert (!(fixedUserConfig.systemd.services.narjar-gc.serviceConfig.DynamicUser or false));
 assert (!(builtins.tryEval invalidCompressionConfig.system.build.toplevel.drvPath).success);
 assert (!(builtins.tryEval missingPrivateReadTokenConfig.system.build.toplevel.drvPath).success);
 assert (!(builtins.tryEval conflictingFilesystemSamplesConfig.system.build.toplevel.drvPath).success);

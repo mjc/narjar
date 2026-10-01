@@ -2,7 +2,10 @@ use std::{
     env, fs,
     io::{self, Cursor, Read, Write},
     num::NonZeroUsize,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{PermissionsExt, symlink},
+    },
     path::{Path, PathBuf},
     process,
     sync::{Arc, Mutex, mpsc},
@@ -658,6 +661,12 @@ fn assert_upload_resources_released(storage: &Storage) {
     );
 }
 
+fn transaction_record_count(storage: &Storage) -> usize {
+    fs::read_dir(storage.layout().transaction_dir())
+        .expect("read transaction directory")
+        .count()
+}
+
 #[test]
 fn abandoning_a_receiving_upload_releases_its_file_and_reservation() {
     let directory = TestDir::new();
@@ -835,6 +844,7 @@ fn source_errors_and_unwinding_release_upload_resources() {
         matches!(failed, Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EIO))
     );
     assert_upload_resources_released(&storage);
+    assert_eq!(transaction_record_count(&storage), 0);
 
     struct PanickingReader;
     impl Read for PanickingReader {
@@ -847,6 +857,140 @@ fn source_errors_and_unwinding_release_upload_resources() {
     }));
     assert!(unwound.is_err());
     assert_upload_resources_released(&storage);
+    assert_eq!(transaction_record_count(&storage), 0);
+}
+
+#[test]
+fn rejected_and_disconnected_uploads_do_not_accumulate_transactions() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let bytes = b"rejected NAR";
+    let wrong_hash = FileHash::from_digest(Sha256::digest(b"different NAR").into());
+
+    for _ in 0..8 {
+        let reservation = storage.reserve_staging(bytes.len() as u64, 0).unwrap();
+        let receiving = storage
+            .begin_upload(
+                NarFileName::new(wrong_hash, WireEncoding::Raw),
+                bytes.len() as u64,
+                super::NarUploadPolicy::new(bytes.len() as u64, 0),
+                reservation,
+            )
+            .unwrap();
+        let rejected = receiving.receive(bytes.as_slice());
+        assert!(matches!(
+            rejected,
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(transaction_record_count(&storage), 0);
+
+        let receiving = begin_raw_upload(&storage, bytes);
+        assert!(
+            receiving
+                .receive(BrokenReader::new(libc::ECONNRESET))
+                .is_err()
+        );
+        assert_eq!(transaction_record_count(&storage), 0);
+    }
+
+    assert_upload_resources_released(&storage);
+}
+
+#[test]
+fn uncertain_upload_publication_retains_its_recovery_record() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let raw = b"raw NAR";
+    let complete = begin_raw_upload(&storage, raw)
+        .receive(raw.as_slice())
+        .unwrap();
+
+    assert!(
+        complete
+            .commit_fault(PublishBoundary::BeforeFinalLink)
+            .is_err()
+    );
+    assert_eq!(transaction_record_count(&storage), 1);
+    assert!(
+        fs::read_dir(storage.layout().nar_temp_dir())
+            .unwrap()
+            .next()
+            .is_none(),
+        "a conclusively removable staging file is cleaned even when publication is uncertain"
+    );
+    assert_upload_resources_released(&storage);
+
+    storage.finish_recovery().unwrap();
+    assert_eq!(transaction_record_count(&storage), 0);
+}
+
+#[test]
+fn upload_setup_failure_cancels_transaction_after_temporary_cleanup() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let bytes = b"raw NAR";
+    let name = NarFileName::new(
+        FileHash::from_digest(Sha256::digest(bytes).into()),
+        WireEncoding::Raw,
+    );
+    let reservation = storage.reserve_staging(bytes.len() as u64, 0).unwrap();
+
+    let result = storage.begin_upload_with_temp_setup(
+        name,
+        bytes.len() as u64,
+        super::NarUploadPolicy::new(bytes.len() as u64, 0),
+        reservation,
+        |_| Err(io::Error::other("injected setup failure")),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(transaction_record_count(&storage), 0);
+    assert_upload_resources_released(&storage);
+}
+
+#[test]
+fn upload_setup_failure_retains_transaction_when_temporary_cleanup_fails() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).unwrap();
+    let bytes = b"raw NAR";
+    let name = NarFileName::new(
+        FileHash::from_digest(Sha256::digest(bytes).into()),
+        WireEncoding::Raw,
+    );
+    let reservation = storage.reserve_staging(bytes.len() as u64, 0).unwrap();
+    let temporary_directory = storage.layout().nar_temp_dir();
+    let result = storage.begin_upload_with_temp_setup(
+        name,
+        bytes.len() as u64,
+        super::NarUploadPolicy::new(bytes.len() as u64, 0),
+        reservation,
+        |temporary| {
+            let temporary_path = temporary_directory.join(&temporary.name);
+            fs::remove_file(&temporary_path)?;
+            fs::create_dir(&temporary_path)?;
+            fs::write(temporary_path.join("keep-unlink-failing"), b"block unlink")?;
+            Err(io::Error::other("injected setup failure"))
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(transaction_record_count(&storage), 1);
+    assert_eq!(
+        fs::read_dir(&temporary_directory).unwrap().count(),
+        1,
+        "failed cleanup leaves the replacement path for recovery"
+    );
+
+    let temporary_path = fs::read_dir(&temporary_directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(temporary_path.join("keep-unlink-failing")).unwrap();
+    fs::remove_dir(&temporary_path).unwrap();
+    storage.finish_recovery().unwrap();
+    assert_eq!(transaction_record_count(&storage), 0);
 }
 
 #[test]
@@ -2430,6 +2574,134 @@ fn recovery_cleans_incomplete_publication_transactions() {
             .is_none()
     );
     assert!(!storage.recovery_required().expect("inspect clean state"));
+}
+
+#[test]
+fn recovery_discards_abandoned_transaction_drafts_before_parsing_records() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let temporary = directory.path().join(".tmp/abandoned-draft.part");
+    fs::write(&temporary, b"incomplete publication").expect("create publication temp");
+    drop(
+        storage
+            .recovery
+            .begin(
+                Path::new(".tmp/abandoned-draft.part"),
+                Path::new("nix-cache-info"),
+            )
+            .expect("record interrupted publication"),
+    );
+
+    let transaction_directory = directory.path().join(".narjar-transactions");
+    let record_name = fs::read_dir(&transaction_directory)
+        .expect("read transaction directory")
+        .next()
+        .expect("transaction record exists")
+        .expect("read transaction entry")
+        .file_name();
+    let abandoned_draft = transaction_directory.join(format!(
+        "{}.next-0000000000000001",
+        record_name.to_string_lossy()
+    ));
+    fs::write(&abandoned_draft, b"partial state=")
+        .expect("simulate process termination during draft write");
+    fs::set_permissions(&abandoned_draft, fs::Permissions::from_mode(0o000))
+        .expect("make abandoned draft unreadable");
+
+    storage
+        .finish_recovery()
+        .expect("abandoned draft is not an authoritative transaction");
+
+    assert!(
+        !temporary.exists(),
+        "authoritative record recovers its temp"
+    );
+    assert!(
+        !abandoned_draft.exists(),
+        "recovery removes the abandoned draft"
+    );
+    assert!(
+        fs::read_dir(&transaction_directory)
+            .expect("read recovered transaction directory")
+            .next()
+            .is_none(),
+        "recovery leaves no transaction entries"
+    );
+}
+
+#[test]
+fn recovery_handles_the_initial_record_hard_link_before_draft_unlink() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let temporary = directory.path().join(".tmp/initial-link-window.part");
+    fs::write(&temporary, b"interrupted publication").expect("create publication temp");
+    drop(
+        storage
+            .recovery
+            .begin(
+                Path::new(".tmp/initial-link-window.part"),
+                Path::new("nix-cache-info"),
+            )
+            .expect("record interrupted publication"),
+    );
+
+    let transaction_directory = directory.path().join(".narjar-transactions");
+    let record_path = fs::read_dir(&transaction_directory)
+        .expect("read transaction directory")
+        .next()
+        .expect("transaction record exists")
+        .expect("read transaction entry")
+        .path();
+    let draft_path = transaction_directory.join(format!(
+        "{}.next-0000000000000002",
+        record_path
+            .file_name()
+            .expect("record filename")
+            .to_string_lossy()
+    ));
+    fs::hard_link(&record_path, &draft_path).expect("simulate crash after hard-link install");
+
+    storage
+        .finish_recovery()
+        .expect("recovery handles the complete linked record and its draft");
+
+    assert!(
+        !temporary.exists(),
+        "the authoritative record recovers its temp"
+    );
+    assert!(
+        !draft_path.exists(),
+        "recovery removes the leftover draft link"
+    );
+    assert!(
+        fs::read_dir(&transaction_directory)
+            .expect("read recovered transaction directory")
+            .next()
+            .is_none(),
+        "recovery leaves no transaction entries"
+    );
+}
+
+#[test]
+fn recovery_rejects_invalid_destination_before_creating_a_record() {
+    let directory = TestDir::new();
+    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let invalid_destination = Path::new(std::ffi::OsStr::from_bytes(b"invalid-\xff-name"));
+
+    assert!(
+        storage
+            .recovery
+            .begin(Path::new(".tmp/unrecorded.part"), invalid_destination)
+            .is_err(),
+        "transaction paths must be validated before record publication"
+    );
+    assert!(
+        fs::read_dir(directory.path().join(".narjar-transactions"))
+            .expect("read transaction directory")
+            .next()
+            .is_none(),
+        "a rejected transaction must not leave a partial authoritative record"
+    );
 }
 
 #[test]

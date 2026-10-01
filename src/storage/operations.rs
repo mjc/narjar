@@ -12,12 +12,17 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::narinfo::{BoundNarInfo, NarInfoClaims, ValidatedNarInfo, read_narinfo_file};
 #[cfg(test)]
 use crate::object::NarHash;
 use crate::object::{
     CompressedNarIdentity, EncodedIdentity, NarFileName, NarIdentity, NarRepresentation,
     WireEncoding,
+};
+use crate::{
+    inventory::{Inventory, RecoveryOutcome},
+    narinfo::{
+        BoundNarInfo, NarInfoClaims, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file,
+    },
 };
 
 use super::{
@@ -44,7 +49,7 @@ use super::{
         StorageError, TemporaryDirectory, TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
-    recovery::{PublicationState, PublicationTransaction},
+    recovery::{PublicationState, PublicationTransaction, RecoveryStatus},
     state::{PayloadStorage, Storage},
     typestate::Streaming,
 };
@@ -327,12 +332,55 @@ impl Storage {
         self.recovery.required_for()
     }
 
+    /// Validates published references and completes pending recovery while this storage lease is held.
+    pub fn recover_if_required(
+        &self,
+        trusted_keys: &TrustedPublicKeys,
+        mut report_progress: impl FnMut(crate::inventory::NarInfoCount),
+    ) -> Result<RecoveryStatus, StorageError> {
+        let status = match self.recovery_required_for()? {
+            false => RecoveryStatus::NotRequired,
+            true => match Inventory::can_recover(self, trusted_keys, &mut report_progress)? {
+                RecoveryOutcome::Ready { checked } => RecoveryStatus::Completed(checked),
+                RecoveryOutcome::Invalid { checked, entry } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "published inventory contains an invalid narinfo/NAR pair after checking {checked} entries: {} ({})",
+                            entry.identifier(),
+                            entry.class().as_str()
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+        self.finish_recovery()?;
+        Ok(status)
+    }
+
+    /// Complete recovery and return the capability required for cache mutation.
+    pub fn recover_for_mutation(
+        &self,
+        trusted_keys: &TrustedPublicKeys,
+    ) -> Result<RecoveredStorage<'_>, StorageError> {
+        let status = self.recover_if_required(trusted_keys, |_| {})?;
+        Ok(RecoveredStorage {
+            storage: self,
+            status,
+        })
+    }
+
     /// Cleans abandoned publication state after published references were checked.
     pub fn finish_recovery(&self) -> Result<(), StorageError> {
         self.remove_orphan_validation_evidence()?;
         self.remove_orphan_ingestion_receipts()?;
         self.remove_orphan_egress_receipts()?;
-        self.recovery.finish()
+        self.recovery.finish()?;
+        if let PayloadStorage::Chunked(chunk_store) = &self.payloads {
+            chunk_store.remove_abandoned_temporary_files()?;
+        }
+        Ok(())
     }
 
     pub fn reserve_staging(
@@ -1048,8 +1096,21 @@ impl Storage {
         target: &PublishTarget<'_>,
         name: OsString,
     ) -> Result<TemporaryFile, StorageError> {
+        let temporary = self.create_temp_named_owned(target, name)?;
+        temporary
+            .file()
+            .file
+            .set_permissions(Permissions::from_mode(0o600))?;
+        Ok(temporary.into_file())
+    }
+
+    pub(super) fn create_temp_named_owned(
+        &self,
+        target: &PublishTarget<'_>,
+        name: OsString,
+    ) -> Result<OwnedTemporary<'_>, StorageError> {
         let directory = self.temporary_directory(target.destination().temporary_directory)?;
-        self.create_temp_in_directory(directory, name)
+        self.create_temp_in_directory_owned(directory, name)
     }
 
     pub(super) fn create_temp_in_directory(
@@ -1057,19 +1118,34 @@ impl Storage {
         directory: File,
         name: OsString,
     ) -> Result<TemporaryFile, StorageError> {
+        let temporary = self.create_temp_in_directory_owned(directory, name)?;
+        temporary
+            .file()
+            .file
+            .set_permissions(Permissions::from_mode(0o600))?;
+        Ok(temporary.into_file())
+    }
+
+    fn create_temp_in_directory_owned(
+        &self,
+        directory: File,
+        name: OsString,
+    ) -> Result<OwnedTemporary<'_>, StorageError> {
         let file = open_at(
             &directory,
             &name,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600,
         )?;
-        file.set_permissions(Permissions::from_mode(0o600))?;
         self.temporary_objects.fetch_add(1, Ordering::Relaxed);
-        Ok(TemporaryFile {
-            name,
-            directory,
-            file,
-        })
+        Ok(OwnedTemporary::new(
+            self,
+            TemporaryFile {
+                name,
+                directory,
+                file,
+            },
+        ))
     }
 
     pub(super) fn remove_temp(&self, temp: &TemporaryFile) -> Result<(), StorageError> {
@@ -1279,5 +1355,21 @@ impl Storage {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(key, Arc::downgrade(&lock));
         lock
+    }
+}
+
+/// A storage lease whose pending recovery has been validated and completed.
+pub struct RecoveredStorage<'storage> {
+    storage: &'storage Storage,
+    status: RecoveryStatus,
+}
+
+impl RecoveredStorage<'_> {
+    pub const fn storage(&self) -> &Storage {
+        self.storage
+    }
+
+    pub const fn recovery_status(&self) -> RecoveryStatus {
+        self.status
     }
 }

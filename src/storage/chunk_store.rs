@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
+    time::SystemTime,
 };
 
 use mincdc::{MinCdcHash4, SliceChunker};
@@ -61,6 +62,14 @@ pub(crate) struct ChunkPhysicalBytes {
     pub(crate) manifests: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChunkManifestFile {
+    pub(crate) name: OsString,
+    pub(crate) hash: NarHash,
+    pub(crate) bytes: u64,
+    pub(crate) modified: SystemTime,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ChunkPopulationCounts {
     pub(crate) scanned_entries: u64,
@@ -89,14 +98,17 @@ impl ChunkStore {
             OsStr::new(MANIFEST_DIRECTORY),
             "chunk manifest directory",
         )?;
-        remove_abandoned_manifest_temps(&manifests)?;
         let chunks = ensure_directory_at(root, OsStr::new(CHUNK_DIRECTORY), "chunk directory")?;
-        remove_abandoned_chunk_temps(&chunks)?;
         Ok(Self {
             chunks,
             manifests,
             activity,
         })
+    }
+
+    pub(crate) fn remove_abandoned_temporary_files(&self) -> io::Result<()> {
+        remove_abandoned_manifest_temps(&self.manifests)?;
+        remove_abandoned_chunk_temps(&self.chunks)
     }
 
     pub(crate) fn population_counts(
@@ -375,6 +387,32 @@ impl ChunkStore {
                         })
                 })?;
         Ok(ChunkPhysicalBytes { chunks, manifests })
+    }
+
+    pub(crate) fn manifest_files(&self) -> io::Result<Vec<ChunkManifestFile>> {
+        read_dir_names(&self.manifests)?
+            .into_iter()
+            .filter_map(|name| {
+                let hash = name
+                    .to_str()?
+                    .strip_suffix(".manifest")
+                    .and_then(|hash| NarHash::parse(hash).ok())?;
+                Some((name, hash))
+            })
+            .map(|(name, hash)| {
+                if !super::fs::entry_is_regular_at(&self.manifests, &name)? {
+                    return Ok(None);
+                }
+                let metadata = open_regular_at(&self.manifests, &name)?.metadata()?;
+                Ok(Some(ChunkManifestFile {
+                    name,
+                    hash,
+                    bytes: metadata.len(),
+                    modified: metadata.modified()?,
+                }))
+            })
+            .filter_map(Result::transpose)
+            .collect()
     }
 
     fn prepare_gc_marks(&self) -> Result<File, ChunkStoreError> {
@@ -1953,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_removes_abandoned_chunk_and_manifest_temps() {
+    fn recovery_completion_removes_abandoned_chunk_and_manifest_temps() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
         let store = ChunkStore::initialize(root.file()).unwrap();
@@ -1984,6 +2022,11 @@ mod tests {
         let shard = restarted
             .open_shard(ChunkHash::from_digest([0; 32]))
             .unwrap();
+        assert!(
+            super::super::fs::open_regular_at(&shard, chunk_temp).is_ok(),
+            "storage construction must leave journal-owned staging intact"
+        );
+        restarted.remove_abandoned_temporary_files().unwrap();
         assert!(super::super::fs::open_regular_at(&shard, chunk_temp).is_err());
         assert!(super::super::fs::open_regular_at(&restarted.manifests, manifest_temp).is_err());
     }

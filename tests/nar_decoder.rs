@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -158,6 +159,67 @@ struct Chunked<'a> {
     data: &'a [u8],
     offset: usize,
     chunk: usize,
+}
+
+enum ReadAction {
+    Interruptions(usize),
+    Failure(io::ErrorKind),
+}
+
+struct ScriptedReader {
+    data: Vec<u8>,
+    offset: usize,
+    actions: BTreeMap<usize, ReadAction>,
+}
+
+impl ScriptedReader {
+    fn with_actions(data: Vec<u8>, actions: impl IntoIterator<Item = (usize, ReadAction)>) -> Self {
+        Self {
+            data,
+            offset: 0,
+            actions: actions.into_iter().collect(),
+        }
+    }
+}
+
+impl ReadAction {
+    fn interruptions(count: usize) -> Self {
+        Self::Interruptions(count)
+    }
+
+    fn failure(kind: io::ErrorKind) -> Self {
+        Self::Failure(kind)
+    }
+}
+
+impl Read for ScriptedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if let Some(action) = self.actions.get_mut(&self.offset) {
+            match action {
+                ReadAction::Interruptions(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                ReadAction::Failure(kind) => return Err(io::Error::from(*kind)),
+                ReadAction::Interruptions(_) => {}
+            }
+        }
+        if self.offset == self.data.len() {
+            return Ok(0);
+        }
+        let next_action = self
+            .actions
+            .range((self.offset + 1)..)
+            .next()
+            .map_or(self.data.len(), |(&offset, _)| offset);
+        let length = buffer
+            .len()
+            .min(self.data.len() - self.offset)
+            .min(next_action - self.offset);
+        buffer[..length].copy_from_slice(&self.data[self.offset..self.offset + length]);
+        self.offset += length;
+        Ok(length)
+    }
 }
 
 #[test]
@@ -347,6 +409,76 @@ fn hashes_the_complete_canonical_byte_stream() {
     let expected = Sha256::digest(&data);
     assert_eq!(summary.raw_size, data.len() as u64);
     assert_eq!(summary.raw_sha256.as_slice(), expected.as_slice());
+}
+
+#[test]
+fn retries_interrupted_reads_in_tokens_file_chunks_and_the_final_eof_probe() {
+    let contents = b"interrupt-retry-file-contents";
+    let data = archive(regular(contents, false));
+    let contents_offset = data
+        .windows(contents.len())
+        .position(|window| window == contents)
+        .expect("locate file payload");
+    let reader = ScriptedReader::with_actions(
+        data.clone(),
+        [
+            (0, ReadAction::interruptions(3)),
+            (contents_offset, ReadAction::interruptions(2)),
+            (data.len(), ReadAction::interruptions(4)),
+        ],
+    );
+    let mut events = Events::default();
+    let summary = Decoder::new(reader)
+        .decode(&mut events)
+        .expect("Interrupted is retried at every NAR input boundary");
+
+    assert_eq!(events.file_chunks.concat(), contents);
+    assert_eq!(summary.raw_size, data.len() as u64);
+    assert_eq!(
+        summary.raw_sha256.as_slice(),
+        Sha256::digest(&data).as_slice()
+    );
+}
+
+#[test]
+fn non_interrupted_reader_errors_remain_io_errors_at_each_read_boundary() {
+    let contents = b"reader-error-file-contents";
+    let data = archive(regular(contents, false));
+    let contents_offset = data
+        .windows(contents.len())
+        .position(|window| window == contents)
+        .expect("locate file payload");
+
+    for error_offset in [0, contents_offset, data.len()] {
+        let reader = ScriptedReader::with_actions(
+            data.clone(),
+            [(error_offset, ReadAction::failure(io::ErrorKind::BrokenPipe))],
+        );
+        let error = Decoder::new(reader)
+            .decode(&mut Events::default())
+            .expect_err("a non-interruption source error must propagate");
+        assert!(
+            matches!(error, DecodeError::Io(ref error) if error.kind() == io::ErrorKind::BrokenPipe),
+            "source error at offset {error_offset} must remain an I/O error: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn trailing_bytes_remain_a_structural_error_after_eof_retries() {
+    let mut data = archive(regular(b"contents", false));
+    let archive_length = data.len();
+    data.push(b'!');
+    let mut events = Events::default();
+
+    assert!(matches!(
+        Decoder::new(ScriptedReader::with_actions(
+            data,
+            [(archive_length, ReadAction::interruptions(3))],
+        ))
+        .decode(&mut events),
+        Err(DecodeError::Invalid(message)) if message == "trailing bytes after root node"
+    ));
 }
 
 #[test]

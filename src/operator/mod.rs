@@ -17,13 +17,13 @@ use narjar::__private::{
     inventory::{Inventory, InventoryClass, InventoryEntry, VerificationMode},
     maintenance::{
         Mode as MaintenanceMode, Operation as MaintenanceOperation, Outcome as MaintenanceOutcome,
-        Recorder as MaintenanceRecorder, RunValues as MaintenanceValues,
+        RunValues as MaintenanceValues,
     },
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
         CleanupOutcome, Directory, ReconcileClass, Storage, StorageBackend, StorageCapacity,
         StoreHash, capacity_from_statvfs,
-        gc::{self, GcMode, GcOptions},
+        gc::{self, GcMode, GcOptions, GcReport},
     },
 };
 use narjar::object::WireEncoding;
@@ -34,7 +34,9 @@ use crate::{
 };
 
 mod lifecycle;
+mod maintenance_session;
 pub(crate) use lifecycle::{Init, Key, generate_key_pair, init, key};
+use maintenance_session::{MaintenanceRecord, MaintenanceSession};
 
 #[derive(Args)]
 pub(crate) struct Reconcile {
@@ -163,16 +165,16 @@ impl ReportMode {
         }
     }
 
-    fn begin_maintenance(self, root: &Path) -> Option<MaintenanceRecorder> {
+    fn maintenance_record(self) -> Option<MaintenanceRecord> {
         match self {
-            Self::Reconcile => begin_maintenance(
-                root,
+            Self::Reconcile => Some(MaintenanceRecord::new(
                 MaintenanceOperation::Reconcile,
                 MaintenanceMode::Reconcile,
-            ),
-            Self::Verify => {
-                begin_maintenance(root, MaintenanceOperation::Verify, MaintenanceMode::Verify)
-            }
+            )),
+            Self::Verify => Some(MaintenanceRecord::new(
+                MaintenanceOperation::Verify,
+                MaintenanceMode::Verify,
+            )),
             Self::Orphans => None,
         }
     }
@@ -192,51 +194,40 @@ fn report(
     json: bool,
     backend: narjar::__private::storage::StorageBackend,
 ) -> Result<(), Error> {
-    let recorder = mode.begin_maintenance(&root);
-    let inventory = match scan_inventory(&root, mode.verification_mode(verify_hashes), backend) {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            finish_maintenance(
-                recorder,
-                MaintenanceOutcome::Failure,
-                MaintenanceValues::default(),
-            );
-            return Err(error);
-        }
-    };
-    let inventory_class_counts = inventory_class_counts(&inventory);
-    let invalid_pairs = invalid_published_pair_count(&inventory);
-    print_inventory_findings(&inventory, mode, json);
+    let session = MaintenanceSession::open(&root, backend, mode.maintenance_record())?;
+    session.run_inspection(|storage, trusted| {
+        let inventory = scan_inventory(storage, trusted, mode.verification_mode(verify_hashes))?;
+        let inventory_class_counts = inventory_class_counts(&inventory);
+        let invalid_pairs = invalid_published_pair_count(&inventory);
+        print_inventory_findings(&inventory, mode, json);
 
-    let failed_verification = mode.verification_failed(invalid_pairs);
-    finish_maintenance(
-        recorder,
-        if failed_verification {
-            MaintenanceOutcome::Failure
-        } else {
-            MaintenanceOutcome::Success
-        },
-        MaintenanceValues {
-            objects_examined: Some(inventory.entries().len() as u64),
-            inventory_class_counts: Some(inventory_class_counts),
-            ..MaintenanceValues::default()
-        },
-    );
-    if failed_verification {
-        return Err(Error::runtime("verification found invalid published pairs"));
-    }
-    Ok(())
+        let failed_verification = mode.verification_failed(invalid_pairs);
+        Ok((
+            if failed_verification {
+                Err(Error::runtime("verification found invalid published pairs"))
+            } else {
+                Ok(())
+            },
+            if failed_verification {
+                MaintenanceOutcome::Failure
+            } else {
+                MaintenanceOutcome::Success
+            },
+            MaintenanceValues {
+                objects_examined: Some(inventory.entries().len() as u64),
+                inventory_class_counts: Some(inventory_class_counts),
+                ..MaintenanceValues::default()
+            },
+        ))
+    })?
 }
 
 fn scan_inventory(
-    root: &Path,
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
     verification: VerificationMode,
-    backend: StorageBackend,
 ) -> Result<Inventory, Error> {
-    let root_directory = Directory::open(root).map_err(runtime)?;
-    let trusted = TrustedPublicKeys::load(&root_directory).map_err(runtime)?;
-    let storage = Storage::initialize(&root_directory, backend).map_err(runtime)?;
-    Inventory::scan_storage(&storage, &trusted, verification).map_err(runtime)
+    Inventory::scan_storage(storage, trusted, verification).map_err(runtime)
 }
 
 fn inventory_class_counts(inventory: &Inventory) -> [u64; InventoryClass::ALL.len()] {
@@ -316,24 +307,18 @@ fn structural_scan(
     action: StructuralAction,
 ) -> Result<(), Error> {
     let options = StructuralScanOptions::new(limit, min_age_seconds)?;
-    let recorder = begin_maintenance(
-        &root,
-        MaintenanceOperation::Reconcile,
-        action.maintenance_mode(),
-    );
-    let result = run_structural_scan(root, options, json, backend, action);
-    match result {
-        Ok(values) => finish_maintenance(recorder, MaintenanceOutcome::Success, values),
-        Err(error) => {
-            finish_maintenance(
-                recorder,
-                MaintenanceOutcome::Failure,
-                MaintenanceValues::default(),
-            );
-            return Err(error);
-        }
+    let record = MaintenanceRecord::new(MaintenanceOperation::Reconcile, action.maintenance_mode());
+    let session = MaintenanceSession::open(&root, backend, Some(record))?;
+    match action {
+        StructuralAction::Inspect => session.run_inspection(|storage, _| {
+            run_structural_scan(storage, options, json, action)
+                .map(|values| ((), MaintenanceOutcome::Success, values))
+        }),
+        StructuralAction::Cleanup => session.run_mutation(|recovered, _| {
+            run_structural_scan(recovered.storage(), options, json, action)
+                .map(|values| ((), MaintenanceOutcome::Success, values))
+        }),
     }
-    Ok(())
 }
 
 struct StructuralScanOptions {
@@ -365,19 +350,16 @@ impl StructuralAction {
 }
 
 fn run_structural_scan(
-    root: PathBuf,
+    storage: &Storage,
     options: StructuralScanOptions,
     json: bool,
-    backend: StorageBackend,
     action: StructuralAction,
 ) -> Result<MaintenanceValues, Error> {
-    let root_directory = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize(&root_directory, backend).map_err(runtime)?;
     let report = storage
         .reconcile(options.limit, options.stale_before)
         .map_err(runtime)?;
     let removed_entries = report.entries().iter().try_fold(0_u64, |removed, entry| {
-        process_structural_entry(&storage, entry, action, json)
+        process_structural_entry(storage, entry, action, json)
             .map(|result| removed.saturating_add(result.removed_count()))
     })?;
 
@@ -503,47 +485,34 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         json,
         storage_backend,
     } = options;
-    let maintenance_mode = if apply {
-        MaintenanceMode::GcApply
+    let maintenance_record = if apply {
+        MaintenanceRecord::new(MaintenanceOperation::Gc, MaintenanceMode::GcApply)
     } else {
-        MaintenanceMode::GcDryRun
+        MaintenanceRecord::new(MaintenanceOperation::Gc, MaintenanceMode::GcDryRun)
     };
-    let mut recorder = None;
-    let report = match gc::run_with_lock_acquired(
-        GcOptions {
-            data_dir: data_dir.clone(),
-            max_bytes,
-            target_bytes,
-            max_age: max_age_seconds.map(std::time::Duration::from_secs),
-            min_age: std::time::Duration::from_secs(min_age_seconds),
-            protected_roots,
-            mode: if apply { GcMode::Apply } else { GcMode::DryRun },
-            backend: storage_backend,
-        },
-        || {
-            recorder = begin_maintenance(&data_dir, MaintenanceOperation::Gc, maintenance_mode);
-        },
-    ) {
-        Ok(report) => report,
-        Err(error) => {
-            finish_maintenance(
-                recorder,
-                MaintenanceOutcome::Failure,
-                MaintenanceValues::default(),
-            );
-            return Err(runtime(error));
-        }
+    let session = MaintenanceSession::open(&data_dir, storage_backend, Some(maintenance_record))?;
+    let options = GcOptions {
+        data_dir,
+        max_bytes,
+        target_bytes,
+        max_age: max_age_seconds.map(std::time::Duration::from_secs),
+        min_age: std::time::Duration::from_secs(min_age_seconds),
+        protected_roots,
+        mode: if apply { GcMode::Apply } else { GcMode::DryRun },
+        backend: storage_backend,
     };
-    finish_maintenance(
-        recorder,
-        MaintenanceOutcome::Success,
-        MaintenanceValues {
-            objects_selected: Some(report.candidates as u64),
-            objects_reclaimed: apply.then_some(report.evicted as u64),
-            bytes_reclaimed: apply.then_some(report.evicted_bytes),
-            ..MaintenanceValues::default()
-        },
-    );
+    let report = match apply {
+        true => session.run_mutation(|recovered, trusted| {
+            gc::run_apply(options, recovered, trusted)
+                .map_err(runtime)
+                .map(gc_successful_maintenance_result)
+        })?,
+        false => session.run_inspection(|storage, trusted| {
+            gc::run_dry_run(options, storage, trusted)
+                .map_err(runtime)
+                .map(gc_successful_maintenance_result)
+        })?,
+    };
 
     if json {
         println!(
@@ -607,6 +576,19 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
     Ok(())
 }
 
+fn gc_successful_maintenance_result(
+    report: GcReport,
+) -> (GcReport, MaintenanceOutcome, MaintenanceValues) {
+    let reclaimed = !report.dry_run;
+    let values = MaintenanceValues {
+        objects_selected: Some(report.candidates as u64),
+        objects_reclaimed: reclaimed.then_some(report.evicted as u64),
+        bytes_reclaimed: reclaimed.then_some(report.evicted_bytes),
+        ..MaintenanceValues::default()
+    };
+    (report, MaintenanceOutcome::Success, values)
+}
+
 #[derive(Args)]
 pub(crate) struct Delete {
     #[arg(long)]
@@ -627,21 +609,27 @@ pub(crate) fn delete(options: Delete) -> Result<(), Error> {
         storage_backend,
     } = options;
     let store = StoreHash::parse(&route).map_err(|_| Error::usage("--store-hash is invalid"))?;
-    let root = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize(&root, storage_backend).map_err(runtime)?;
-    let trusted = TrustedPublicKeys::load(&root).map_err(runtime)?;
-    let file = storage
-        .open_narinfo(&store)
-        .map_err(runtime)?
-        .ok_or_else(|| Error::runtime("narinfo is not published"))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_NARINFO_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(runtime)?;
-    if trusted.validate(&store, bytes).is_err() {
-        return Err(Error::runtime("narinfo is malformed or untrusted"));
-    }
-    storage.delete_narinfo(&store).map_err(runtime)?;
+    let session = MaintenanceSession::open(&root, storage_backend, None)?;
+    session.run_mutation(|recovered, trusted| {
+        let storage = recovered.storage();
+        let file = storage
+            .open_narinfo(&store)
+            .map_err(runtime)?
+            .ok_or_else(|| Error::runtime("narinfo is not published"))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_NARINFO_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(runtime)?;
+        if trusted.validate(&store, bytes).is_err() {
+            return Err(Error::runtime("narinfo is malformed or untrusted"));
+        }
+        storage.delete_narinfo(&store).map_err(runtime)?;
+        Ok((
+            (),
+            MaintenanceOutcome::Success,
+            MaintenanceValues::default(),
+        ))
+    })?;
 
     if json {
         println!(
@@ -1261,38 +1249,6 @@ fn runtime(error: impl std::fmt::Display) -> Error {
     Error::runtime(error.to_string())
 }
 
-fn begin_maintenance(
-    data_dir: &Path,
-    operation: MaintenanceOperation,
-    mode: MaintenanceMode,
-) -> Option<MaintenanceRecorder> {
-    if Directory::open(data_dir)
-        .and_then(|directory| directory.validate_initialized())
-        .is_err()
-    {
-        return None;
-    }
-    match MaintenanceRecorder::begin(data_dir, operation, mode) {
-        Ok(recorder) => Some(recorder),
-        Err(error) => {
-            eprintln!("could not record maintenance start: {error}");
-            None
-        }
-    }
-}
-
-fn finish_maintenance(
-    recorder: Option<MaintenanceRecorder>,
-    outcome: MaintenanceOutcome,
-    values: MaintenanceValues,
-) {
-    if let Some(recorder) = recorder
-        && let Err(error) = recorder.finish(outcome, values)
-    {
-        eprintln!("could not record maintenance completion: {error}");
-    }
-}
-
 fn json_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -1316,6 +1272,7 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use narjar::__private::maintenance::{Operation, Outcome};
+    use narjar::__private::storage::Directory;
 
     #[test]
     fn managed_file_conflict_never_replaces_existing_contents_or_leaves_temps() {
@@ -1450,6 +1407,141 @@ machine other.example password other-secret
         assert_eq!(
             after.last_runs[Operation::Gc.index()],
             before.last_runs[Operation::Gc.index()]
+        );
+    }
+
+    #[test]
+    fn verify_lock_conflict_does_not_write_maintenance_history() {
+        let directory = tempfile::tempdir().expect("cache directory should be created");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+            storage_backend: StorageBackend::Flat,
+        })
+        .expect("cache should initialize");
+        let before = narjar::__private::maintenance::read_snapshot(directory.path())
+            .expect("maintenance history should be readable");
+        let root = Directory::open(directory.path()).expect("cache root should open");
+        let _active_storage = Storage::initialize(&root, StorageBackend::Flat)
+            .expect("first operation should hold the cache lock");
+
+        let result = verify(Verify {
+            data_dir: directory.path().to_owned(),
+            json: false,
+            storage_backend: StorageBackend::Flat,
+        });
+        assert!(
+            result.is_err(),
+            "concurrent verify must fail to acquire the lock"
+        );
+
+        let after = narjar::__private::maintenance::read_snapshot(directory.path())
+            .expect("maintenance history should remain readable");
+        assert_eq!(
+            after, before,
+            "failed lock acquisition must not write history"
+        );
+    }
+
+    #[test]
+    fn delete_lock_conflict_preserves_published_metadata() {
+        let directory = tempfile::tempdir().expect("cache directory should be created");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+            storage_backend: StorageBackend::Flat,
+        })
+        .expect("cache should initialize");
+        let store_hash = "1".repeat(32);
+        let narinfo = directory.path().join(format!("{store_hash}.narinfo"));
+        fs::write(&narinfo, b"published metadata fixture").expect("fixture should be written");
+        let root = Directory::open(directory.path()).expect("cache root should open");
+        let _active_storage = Storage::initialize(&root, StorageBackend::Flat)
+            .expect("first operation should hold the cache lock");
+
+        let result = delete(Delete {
+            data_dir: directory.path().to_owned(),
+            store_hash,
+            json: false,
+            storage_backend: StorageBackend::Flat,
+        });
+        assert!(
+            result.is_err(),
+            "concurrent delete must fail to acquire the lock"
+        );
+        assert_eq!(
+            fs::read(narinfo).expect("published metadata must remain readable"),
+            b"published metadata fixture",
+            "failed lock acquisition must not reach the deletion"
+        );
+    }
+
+    #[test]
+    fn maintenance_session_finishes_published_recovery_before_mutation() {
+        let directory = tempfile::tempdir().expect("cache directory should be created");
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+            storage_backend: StorageBackend::Flat,
+        })
+        .expect("cache should initialize");
+        let staging_path = directory.path().join(".tmp/recovered-publication.part");
+        fs::write(&staging_path, b"published transaction staging")
+            .expect("staged publication should exist");
+        let transaction_path = directory
+            .path()
+            .join(".narjar-transactions/publish-maintenance.txn");
+        fs::write(
+            &transaction_path,
+            b"state=published\npath=.tmp/recovered-publication.part\ndestination=nix-cache-info\n",
+        )
+        .expect("published transaction should be durable on disk");
+        fs::set_permissions(&transaction_path, fs::Permissions::from_mode(0o600))
+            .expect("transaction should have private permissions");
+        let recovery_marker = directory.path().join(".narjar-recovery");
+        fs::write(&recovery_marker, b"interrupted\n").expect("recovery marker should be present");
+        fs::set_permissions(&recovery_marker, fs::Permissions::from_mode(0o600))
+            .expect("recovery marker should have private permissions");
+
+        let published_destination = directory.path().join("nix-cache-info");
+
+        gc(Gc {
+            data_dir: directory.path().to_owned(),
+            max_bytes: None,
+            target_bytes: Some(u64::MAX),
+            max_age_seconds: None,
+            min_age_seconds: 0,
+            protected_roots: None,
+            dry_run: false,
+            apply: true,
+            json: false,
+            storage_backend: StorageBackend::Flat,
+        })
+        .expect("GC must recover before applying maintenance");
+        assert!(
+            published_destination.exists(),
+            "recovery keeps its published destination before the GC pass"
+        );
+        assert!(
+            !transaction_path.exists(),
+            "recovery removes its completed journal"
+        );
+        assert!(
+            !staging_path.exists(),
+            "recovery removes abandoned staging bytes"
+        );
+
+        let root = Directory::open(directory.path()).expect("cache root should reopen");
+        let storage =
+            Storage::initialize(&root, StorageBackend::Flat).expect("cache storage should reopen");
+        assert!(
+            !storage
+                .recovery_required()
+                .expect("recovery state should be readable"),
+            "restart must not encounter a journal whose destination maintenance removed"
         );
     }
 

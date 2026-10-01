@@ -29,32 +29,35 @@ pub(super) struct TemporaryFile {
     pub(super) file: File,
 }
 
-struct OwnedPublication<'storage> {
+pub(super) struct OwnedPublication<'storage> {
     temporary: Option<OwnedTemporary<'storage>>,
     transaction: Option<PublicationTransaction>,
 }
 
 impl<'storage> OwnedPublication<'storage> {
-    fn new(temporary: OwnedTemporary<'storage>, transaction: PublicationTransaction) -> Self {
+    pub(super) fn new(
+        temporary: OwnedTemporary<'storage>,
+        transaction: PublicationTransaction,
+    ) -> Self {
         Self {
             temporary: Some(temporary),
             transaction: Some(transaction),
         }
     }
 
-    fn temporary(&self) -> &OwnedTemporary<'storage> {
+    pub(super) fn temporary(&self) -> &OwnedTemporary<'storage> {
         self.temporary
             .as_ref()
             .expect("owned publication temporary is present")
     }
 
-    fn temporary_mut(&mut self) -> &mut OwnedTemporary<'storage> {
+    pub(super) fn temporary_mut(&mut self) -> &mut OwnedTemporary<'storage> {
         self.temporary
             .as_mut()
             .expect("owned publication temporary is present")
     }
 
-    fn transaction_mut(&mut self) -> &mut PublicationTransaction {
+    pub(super) fn transaction_mut(&mut self) -> &mut PublicationTransaction {
         self.transaction
             .as_mut()
             .expect("owned publication transaction is present")
@@ -64,7 +67,7 @@ impl<'storage> OwnedPublication<'storage> {
         let _ = self.transaction.take();
     }
 
-    fn into_parts(mut self) -> (OwnedTemporary<'storage>, PublicationTransaction) {
+    pub(super) fn into_parts(mut self) -> (OwnedTemporary<'storage>, PublicationTransaction) {
         (
             self.temporary
                 .take()
