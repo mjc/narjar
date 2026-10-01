@@ -65,7 +65,8 @@ impl<Purpose> Sha256Digest<Purpose> {
 
 impl<Purpose> fmt::Display for Sha256Digest<Purpose> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&encode_nix32(&self.0))
+        let encoded = encode_nix32(&self.0);
+        formatter.write_str(std::str::from_utf8(&encoded).expect("Nix base32 encoding is ASCII"))
     }
 }
 
@@ -406,21 +407,26 @@ fn decode_sha256(value: &str) -> Result<[u8; 32], InvalidObjectId> {
     if value.len() != NIX32_SHA256_LEN {
         return Err(InvalidObjectId);
     }
-    let mut encoded = value.as_bytes().to_vec();
+
+    let mut encoded = [0; NIX32_SHA256_LEN];
+    encoded.copy_from_slice(value.as_bytes());
     encoded.reverse();
-    nix32_encoding()
-        .decode(&encoded)
-        .ok()
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or(InvalidObjectId)
+
+    let mut digest = [0; 32];
+    let decoded_length = nix32_encoding()
+        .decode_mut(&encoded, &mut digest)
+        .map_err(|_| InvalidObjectId)?;
+    if decoded_length != digest.len() {
+        return Err(InvalidObjectId);
+    }
+    Ok(digest)
 }
 
-fn encode_nix32(bytes: &[u8]) -> String {
-    let encoding = nix32_encoding();
-    let mut output = vec![0; encoding.encode_len(bytes.len())];
-    encoding.encode_mut(bytes, &mut output);
+fn encode_nix32(digest: &[u8; 32]) -> [u8; NIX32_SHA256_LEN] {
+    let mut output = [0; NIX32_SHA256_LEN];
+    nix32_encoding().encode_mut(digest, &mut output);
     output.reverse();
-    String::from_utf8(output).expect("Nix base32 encoding is ASCII")
+    output
 }
 
 fn nix32_encoding() -> &'static Encoding {
@@ -433,4 +439,48 @@ fn nix32_encoding() -> &'static Encoding {
             .encoding()
             .expect("Nix base32 specification is valid")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileHash, NarHash};
+
+    const SHA256_NIX32_WIDTH: usize = 52;
+
+    #[test]
+    fn sha256_nix32_round_trips_zero_and_high_bit_boundary_hashes() {
+        let zero_hash = "0".repeat(SHA256_NIX32_WIDTH);
+        assert_digest_round_trip(&zero_hash, [0; 32]);
+
+        let highest_canonical_leading_symbol = format!("1{}", "0".repeat(51));
+        let decoded = super::decode_sha256(&highest_canonical_leading_symbol)
+            .expect("the highest canonical first symbol has no unused high bits");
+        assert_digest_round_trip(&highest_canonical_leading_symbol, decoded);
+    }
+
+    #[test]
+    fn sha256_nix32_rejects_unused_high_bits_and_wrong_widths() {
+        let noncanonical_high_bits = format!("2{}", "0".repeat(51));
+        assert!(NarHash::parse(&noncanonical_high_bits).is_err());
+
+        let zero_hash = "0".repeat(SHA256_NIX32_WIDTH);
+        assert!(NarHash::parse(&zero_hash[..SHA256_NIX32_WIDTH - 1]).is_err());
+        assert!(NarHash::parse(&format!("{zero_hash}0")).is_err());
+    }
+
+    #[test]
+    fn sha256_nix32_rejects_symbols_outside_the_nix_alphabet() {
+        let invalid_symbol = format!("e{}", "0".repeat(51));
+        assert!(FileHash::parse(&invalid_symbol).is_err());
+    }
+
+    fn assert_digest_round_trip(encoded: &str, expected: [u8; 32]) {
+        let nar_hash = NarHash::parse(encoded).expect("canonical NAR hash");
+        let file_hash = FileHash::parse(encoded).expect("canonical file hash");
+
+        assert_eq!(nar_hash.bytes(), expected);
+        assert_eq!(file_hash.bytes(), expected);
+        assert_eq!(nar_hash.to_string(), encoded);
+        assert_eq!(file_hash.to_string(), encoded);
+    }
 }
