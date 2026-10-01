@@ -3455,21 +3455,28 @@ fn independent_publications_do_not_wait_for_another_body() {
     };
 
     started_rx.recv().expect("wait for first publication body");
-    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let (staged_tx, staged_rx) = mpsc::channel();
     let contender = {
         let storage = Arc::clone(&storage);
         std::thread::spawn(move || {
-            let outcome = storage.publish(
+            storage.publish_with(
                 PublishTarget::Nar(NarFileName::raw(second)),
                 Cursor::new(b"nar"),
-            );
-            outcome_tx
-                .send(outcome)
-                .expect("send second publication outcome");
+                |boundary| match boundary {
+                    PublishBoundary::AfterTempCreate => {
+                        staged_tx
+                            .send(())
+                            .expect("signal second publication staged");
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                },
+            )
         })
     };
 
-    let early_outcome = outcome_rx.recv_timeout(Duration::from_millis(500)).ok();
+    let staged_while_first_body_is_blocked =
+        staged_rx.recv_timeout(Duration::from_secs(30)).is_ok();
     release_tx.send(()).expect("release first publication");
     assert_eq!(
         publisher
@@ -3478,15 +3485,14 @@ fn independent_publications_do_not_wait_for_another_body() {
             .expect("publish first NAR"),
         PublishOutcome::Created
     );
-    contender.join().expect("join second publication");
     assert!(
-        early_outcome.is_some(),
-        "second publication waited for the first body to finish"
+        staged_while_first_body_is_blocked,
+        "second publication could not stage while the first body was blocked"
     );
     assert_eq!(
-        early_outcome
-            .or_else(|| outcome_rx.recv().ok())
-            .expect("second publication outcome")
+        contender
+            .join()
+            .expect("join second publication")
             .expect("publish second NAR"),
         PublishOutcome::Created
     );

@@ -723,7 +723,7 @@ mod tests {
 
     impl NativeStoreFixture {
         fn new(valid_schema: bool) -> Self {
-            let root = tempfile::tempdir_in(".").expect("fixture root should be created");
+            let root = tempfile::tempdir().expect("fixture root should be created");
             let store_dir = root.path().join("store");
             let state_dir = root.path().join("state");
             let database_dir = state_dir.join("db");
