@@ -1,6 +1,7 @@
 mod config;
 mod error;
 mod http_url;
+mod narinfo_signing;
 mod native_store;
 mod operator;
 mod push;

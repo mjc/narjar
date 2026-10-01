@@ -28,6 +28,12 @@ impl TrustedPublicKeys {
         self.0.is_empty()
     }
 
+    /// Checks whether a single named signature is trusted for this fingerprint.
+    pub fn verifies_signature(&self, fingerprint: &[u8], signature: &str) -> bool {
+        NamedSignature::parse(signature)
+            .is_ok_and(|signature| self.verifies(fingerprint, std::slice::from_ref(&signature)))
+    }
+
     pub fn parse(contents: &str) -> Result<Self, TrustError> {
         if contents.len() as u64 > MAX_TRUST_FILE_BYTES {
             return Err(TrustError::InvalidTrustFile);

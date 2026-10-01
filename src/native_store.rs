@@ -17,6 +17,14 @@ use sqlite::{Connection, ConnectionThreadSafe, OpenFlags, State};
     reason = "NARJ-142 connects lease capabilities to native-store serving"
 )]
 pub(crate) mod lease;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "NARJ-141 connects native metadata projection to HTTP"
+    )
+)]
+pub(crate) mod metadata;
 
 const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
     (
@@ -679,6 +687,7 @@ mod tests {
     use data_encoding::BASE64;
     use ed25519_dalek::SigningKey;
     use narjar::__private::narinfo::TrustedPublicKeys;
+    use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
     use sqlite::Connection;
     use tempfile::TempDir;
 
@@ -780,6 +789,96 @@ mod tests {
                 .execute("CREATE TABLE must_not_be_written (id INTEGER)")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reads_one_consistent_typed_path_record_and_its_references() {
+        let fixture = NativeStoreFixture::new(true);
+        let database = Connection::open(fixture.settings.state_dir.join("db/db.sqlite"))
+            .expect("fixture database should open");
+        database
+            .execute(
+                "INSERT INTO ValidPaths (id, path, hash, registrationTime, deriver, narSize, sigs, ca) VALUES
+                 (1, '/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root',
+                  'sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
+                  1, '/nix/store/11111111111111111111111111111111-builder.drv', 289656, '',
+                  'fixed:sha256:0000000000000000000000000000000000000000000000000000000000000000'),
+                 (2, '/nix/store/11111111111111111111111111111111-z-reference',
+                  'sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
+                  1, NULL, 1, '', NULL),
+                 (3, '/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-a-reference',
+                  'sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
+                  1, NULL, 1, '', NULL);
+                 INSERT INTO Refs (referrer, reference) VALUES (1, 2), (1, 3), (1, 2);",
+            )
+            .expect("native path and reference rows should be inserted");
+
+        let snapshot = super::metadata::NativeMetadataSnapshot::open(&fixture.settings.state_dir)
+            .expect("supported Nix metadata snapshot should open");
+        let metadata = snapshot
+            .validated_claims_for("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root")
+            .expect("exact valid path should resolve");
+        let claims = metadata.claims();
+
+        assert_eq!(
+            claims.store_path(),
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root"
+        );
+        assert_eq!(
+            claims.identity(),
+            NarIdentity::new(
+                NarHash::from_digest([
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                    22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+                ]),
+                NarSize::new(289_656),
+            )
+        );
+        assert_eq!(
+            claims.reference_paths().collect::<Vec<_>>(),
+            [
+                "/nix/store/11111111111111111111111111111111-z-reference",
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-a-reference",
+            ]
+        );
+        let identity = claims.identity();
+        let narinfo = metadata
+            .into_narinfo_metadata()
+            .serialize(NarRepresentation::Raw(identity))
+            .expect("native metadata should project through the raw representation");
+        let narinfo = std::str::from_utf8(&narinfo).expect("narinfo should be UTF-8");
+        assert!(narinfo.contains("Deriver: 11111111111111111111111111111111-builder.drv\n"));
+        assert!(narinfo.contains(
+            "CA: fixed:sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+        ));
+        assert!(
+            snapshot
+                .validated_claims_for("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-missing")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_a_dangling_native_store_reference() {
+        let fixture = NativeStoreFixture::new(true);
+        let database = Connection::open(fixture.settings.state_dir.join("db/db.sqlite"))
+            .expect("fixture database should open");
+        database
+            .execute(
+                "INSERT INTO ValidPaths (id, path, hash, registrationTime, deriver, narSize, sigs, ca) VALUES
+                 (1, '/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root',
+                  'sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
+                  1, NULL, 289656, '', NULL);
+                 INSERT INTO Refs (referrer, reference) VALUES (1, 999);",
+            )
+            .expect("dangling reference fixture should be inserted");
+
+        let snapshot = super::metadata::NativeMetadataSnapshot::open(&fixture.settings.state_dir)
+            .expect("supported Nix metadata snapshot should open");
+        let result =
+            snapshot.validated_claims_for("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root");
+
+        assert!(result.is_err());
     }
 
     #[test]
