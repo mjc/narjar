@@ -305,16 +305,11 @@ mod tests {
 
     #[test]
     fn native_store_rejects_compressed_or_chunked_output() {
-        for incompatible_args in [
-            ["--egress-compression", "zstd", "--storage-backend", "flat"],
-            [
-                "--egress-compression",
-                "none",
-                "--storage-backend",
-                "chunked",
-            ],
-        ] {
-            let mut arguments = vec![
+        use narjar::__private::storage::StorageBackend;
+        use narjar::object::{CompressionCodec, WireEncoding};
+
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from([
                 "serve",
                 "--data-dir",
                 "/cache",
@@ -328,18 +323,35 @@ mod tests {
                 "/var/lib/narjar-roots",
                 "--native-min-lease-seconds",
                 "60",
-            ];
-            arguments.extend(incompatible_args);
-            let matches = ServeArgs::augment_args(Command::new("serve"))
-                .try_get_matches_from(arguments)
-                .expect("valid flag values should parse");
-            let args =
-                ServeArgs::from_arg_matches(&matches).expect("serve arguments should deserialize");
+            ])
+            .expect("raw flat native-store flags are valid on every supported platform");
 
-            assert!(
+        for (encoding, backend, expected_error) in [
+            (
+                WireEncoding::Compressed(CompressionCodec::Xz),
+                StorageBackend::Flat,
+                "native-store source requires uncompressed output (--egress-compression none)",
+            ),
+            (
+                WireEncoding::Compressed(CompressionCodec::Zstd),
+                StorageBackend::Flat,
+                "native-store source requires uncompressed output (--egress-compression none)",
+            ),
+            (
+                WireEncoding::Raw,
+                StorageBackend::Chunked,
+                "native-store source requires the flat storage backend during initial raw output support",
+            ),
+        ] {
+            let mut args =
+                ServeArgs::from_arg_matches(&matches).expect("serve arguments should deserialize");
+            args.egress_compression = encoding;
+            args.storage_backend = backend;
+
+            assert_eq!(
                 ServeConfig::try_from(args)
-                    .expect_err("unsupported native output must fail configuration")
-                    .contains("native-store source requires")
+                    .expect_err("unsupported native output must fail configuration"),
+                expected_error,
             );
         }
     }
