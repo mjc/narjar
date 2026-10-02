@@ -6997,8 +6997,8 @@ fn gc_refuses_to_apply_while_the_cache_is_serving() {
 }
 
 #[test]
-fn gc_sigterm_leaves_a_cache_recoverable_before_restart() {
-    let data_dir = init_data_dir("operator-gc-sigterm");
+fn interrupted_gc_deletion_is_recovered_before_serving_shared_payloads() {
+    let data_dir = init_data_dir("operator-gc-interrupted-deletion");
     fs::write(
         data_dir.join("trusted-public-keys"),
         format!(
@@ -7009,7 +7009,7 @@ fn gc_sigterm_leaves_a_cache_recoverable_before_restart() {
     .expect("trusted key should be written");
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("shared NAR should be written");
-    for index in 0..100 {
+    for index in 0..2 {
         let store = format!("{index:032o}");
         fs::write(
             data_dir.join(format!("{store}.narinfo")),
@@ -7018,80 +7018,31 @@ fn gc_sigterm_leaves_a_cache_recoverable_before_restart() {
         .expect("narinfo should be written");
     }
 
-    let path = data_dir.to_str().expect("temporary path should be UTF-8");
-    let mut gc = command()
-        .args([
-            "gc",
-            "--data-dir",
-            path,
-            "--target-bytes",
-            "0",
-            "--min-age-seconds",
-            "0",
-            "--apply",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("gc should start");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !data_dir.join(".narjar-recovery").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "gc did not create the recovery marker"
-        );
-        assert!(
-            gc.try_wait().expect("gc should be waitable").is_none(),
-            "gc finished before the interruption fixture observed recovery"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    let pid = gc.id().to_string();
-    assert!(
-        Command::new("kill")
-            .args(["-TERM", &pid])
-            .status()
-            .expect("SIGTERM should be sent")
-            .success()
-    );
-    assert!(
-        !gc.wait().expect("gc should exit after SIGTERM").success(),
-        "interrupted GC must not claim successful completion"
-    );
-    assert!(
-        data_dir.join(".narjar-recovery").exists(),
-        "interrupted GC must retain the recovery marker"
-    );
+    // State after syncing one metadata deletion, before completing GC.
+    fs::remove_file(data_dir.join(format!("{STORE_HASH}.narinfo")))
+        .expect("first metadata entry should be deleted");
+    let marker = data_dir.join(".narjar-recovery");
+    fs::write(&marker, b"").expect("GC recovery marker should be written");
+    fs::set_permissions(marker, fs::Permissions::from_mode(0o600))
+        .expect("GC recovery marker should be private");
 
-    let mut server = command()
-        .args(["serve", "--data-dir", path, "--listen", "127.0.0.1:0"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("server should start");
-    let mut line = String::new();
-    BufReader::new(server.stdout.take().expect("server stdout should be piped"))
-        .read_line(&mut line)
-        .expect("server startup line should be readable");
-    assert!(line.starts_with("listening http://127.0.0.1:"), "{line}");
+    let server = RunningServer::start_in(data_dir, &[]);
     assert!(
-        !data_dir.join(".narjar-recovery").exists(),
+        !server.data_dir.join(".narjar-recovery").exists(),
         "server recovery should clear the marker after a valid inventory"
     );
-    let server_pid = server.id().to_string();
-    assert!(
-        Command::new("kill")
-            .args(["-TERM", &server_pid])
-            .status()
-            .expect("SIGTERM should be sent")
-            .success()
-    );
-    assert!(
-        server
-            .wait()
-            .expect("server should exit after SIGTERM")
-            .success()
-    );
+    let (ready, _) = response_parts(&server.request("GET", "/readyz"));
+    assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+    let (metadata, _) =
+        response_parts(&server.request("GET", "/00000000000000000000000000000001.narinfo"));
+    assert!(metadata.starts_with("HTTP/1.1 200"), "{metadata}");
+    let (payload, bytes) =
+        response_parts(&server.request("GET", &format!("/nar/{NARJAR_HASH}.nar")));
+    assert!(payload.starts_with("HTTP/1.1 200"), "{payload}");
+    assert_eq!(bytes, NAR_BYTES);
+    let (signal, status) = server.stop();
+    assert!(signal.success());
+    assert!(status.success());
 }
 
 #[test]

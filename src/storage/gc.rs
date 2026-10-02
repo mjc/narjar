@@ -2554,6 +2554,97 @@ mod tests {
     }
 
     #[test]
+    fn sigterm_after_synced_gc_deletions_retains_recovery_state() {
+        use std::{os::unix::process::ExitStatusExt, process::Command};
+
+        let directory = tempfile::tempdir().expect("fixture directory should be created");
+        let storage = initialize_storage(directory.path()).expect("storage should initialize");
+        let orphan = storage
+            .layout
+            .nar_path(NarHash::parse(TEST_NAR_ID).unwrap());
+        fs::write(&orphan, b"orphan").expect("orphan should be written");
+        drop(storage);
+
+        let output =
+            Command::new(std::env::current_exe().expect("test executable should be available"))
+                .args(["sigterm_at_post_deletion_scan_probe", "--nocapture"])
+                .env("NARJAR_GC_SIGTERM_PROBE_DATA", directory.path())
+                .output()
+                .expect("GC interruption child should start");
+        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+        assert!(
+            !orphan.exists(),
+            "GC must delete the orphan before interruption"
+        );
+        assert!(
+            directory.path().join(".narjar-recovery").exists(),
+            "interrupted GC must retain recovery state"
+        );
+
+        let root = Directory::open(directory.path()).expect("storage root should reopen");
+        let reopened = Storage::open(&root, SupportedStorageBackend::FLAT)
+            .expect("lease should be released when the child terminates");
+        assert!(reopened.recovery_required().unwrap());
+        reopened
+            .recover_for_mutation(&TrustedPublicKeys::default())
+            .expect("interrupted GC should be recoverable");
+        assert!(!reopened.recovery_required().unwrap());
+        assert!(!directory.path().join(".narjar-recovery").exists());
+    }
+
+    #[test]
+    fn sigterm_at_post_deletion_scan_probe() {
+        let Some(path) = std::env::var_os("NARJAR_GC_SIGTERM_PROBE_DATA") else {
+            return;
+        };
+        let root = Directory::open(Path::new(&path)).expect("probe root should open");
+        let storage =
+            Storage::open(&root, SupportedStorageBackend::FLAT).expect("probe storage should open");
+        let trusted = TrustedPublicKeys::default();
+        let recovered = storage
+            .recover_for_mutation(&trusted)
+            .expect("probe should start with recovered storage");
+        let options = GcOptions {
+            data_dir: path.into(),
+            max_bytes: None,
+            target_bytes: Some(0),
+            max_age: None,
+            min_age: Duration::ZERO,
+            protected_roots: None,
+            mode: GcMode::Apply,
+            backend: StorageBackend::Flat,
+        };
+        let mut scanned_before_deletion = false;
+        run_flat_gc(
+            options,
+            recovered.storage(),
+            &trusted,
+            Some(0),
+            |storage, trusted| {
+                match scanned_before_deletion {
+                    false => {
+                        scanned_before_deletion = true;
+                        scan(storage, trusted)
+                    }
+                    true => {
+                        assert!(
+                            storage.recovery_required().unwrap(),
+                            "GC cannot clear recovery before its post-deletion scan"
+                        );
+                        // SAFETY: this probe runs only in its own child process. `raise`
+                        // takes no pointers and delivers SIGTERM to that process;
+                        // the parent and parallel tests are not signaled.
+                        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                        panic!("SIGTERM must terminate the GC probe before completion");
+                    }
+                }
+            },
+        )
+        .expect("probe must not complete GC");
+        panic!("probe must terminate at the post-deletion scan");
+    }
+
+    #[test]
     fn deletion_boundaries_preserve_published_pair_invariant() {
         let points = [
             FailurePoint::BeforeNarinfoDelete,
