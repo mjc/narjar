@@ -72,6 +72,7 @@ struct ConfiguredUpstream {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PushDisposition {
     DestinationPresent,
+    DestinationConflict,
     TrustedUpstreamPresent(HttpUrl),
     UploadRequired,
 }
@@ -103,7 +104,8 @@ impl<'a> CacheLookup<'a> {
                     DestinationNarinfoState::MatchesExpected => {
                         Ok(PushDisposition::DestinationPresent)
                     }
-                    DestinationNarinfoState::Different => Ok(PushDisposition::UploadRequired),
+                    DestinationNarinfoState::Different => Ok(PushDisposition::DestinationConflict),
+                    DestinationNarinfoState::Unusable => Ok(PushDisposition::UploadRequired),
                     DestinationNarinfoState::Missing => Ok(self.classify_upstream(info)),
                 }
             }

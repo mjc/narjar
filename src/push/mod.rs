@@ -8,7 +8,7 @@ use std::{
 
 use clap::Args;
 use narjar::{
-    __private::narinfo::{MAX_NARINFO_BYTES, NarInfoMetadata},
+    __private::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, NarInfoMetadata},
     object::{NarRepresentation, WireEncoding},
 };
 use ureq::{Agent, http::StatusCode};
@@ -416,9 +416,9 @@ impl DestinationClient {
             (_, StatusCode::OK | StatusCode::CREATED) => Ok(PushOutcome::Uploaded),
             (UploadArtifact::Narinfo, StatusCode::CONFLICT) => match self.narinfo_state(info)? {
                 DestinationNarinfoState::MatchesExpected => Ok(PushOutcome::DestinationPresent),
-                DestinationNarinfoState::Different | DestinationNarinfoState::Missing => {
-                    Ok(PushOutcome::Conflict)
-                }
+                DestinationNarinfoState::Different
+                | DestinationNarinfoState::Unusable
+                | DestinationNarinfoState::Missing => Ok(PushOutcome::Conflict),
             },
             _ => Err(format!(
                 "{artifact} upload for {} returned HTTP {status}",
@@ -438,10 +438,23 @@ impl DestinationClient {
         )?;
         match response {
             transfer::GetResponse::Found(body) => {
-                let state = if info.claims().matches_external_narinfo(body) {
-                    DestinationNarinfoState::MatchesExpected
-                } else {
-                    DestinationNarinfoState::Different
+                let state = match NarInfoClaims::parse_external_narinfo(info.claims().store(), body)
+                {
+                    Ok(claims) => match info.claims().compare_logical_claims(&claims) {
+                        Ok(()) => DestinationNarinfoState::MatchesExpected,
+                        Err(mismatch) => {
+                            eprintln!(
+                                "narjar push: destination conflict for {}: {mismatch}; local NAR sha256:{} ({} bytes), destination NAR sha256:{} ({} bytes)",
+                                info.claims().store_path(),
+                                info.claims().identity().hash(),
+                                info.claims().identity().size().get(),
+                                claims.identity().hash(),
+                                claims.identity().size().get(),
+                            );
+                            DestinationNarinfoState::Different
+                        }
+                    },
+                    Err(_) => DestinationNarinfoState::Unusable,
                 };
                 Ok(state)
             }
@@ -475,25 +488,19 @@ fn copy_path(
     options: &NativeCopyOptions,
     info: &NarInfoMetadata,
 ) -> Result<PushOutcome, PushError> {
-    match lookup.classify(info)? {
-        PushDisposition::DestinationPresent => Ok(PushOutcome::DestinationPresent),
+    let outcome = match lookup.classify(info)? {
+        PushDisposition::DestinationPresent => PushOutcome::DestinationPresent,
+        PushDisposition::DestinationConflict => PushOutcome::Conflict,
         PushDisposition::TrustedUpstreamPresent(upstream) => {
             println!(
                 "skipped {}: trusted upstream {upstream}",
                 info.claims().store_path()
             );
-            Ok(PushOutcome::TrustedUpstreamPresent)
+            PushOutcome::TrustedUpstreamPresent
         }
-        PushDisposition::UploadRequired => upload_required_path(client, options, info),
-    }
-}
-
-fn upload_required_path(
-    client: &DestinationClient,
-    options: &NativeCopyOptions,
-    info: &NarInfoMetadata,
-) -> Result<PushOutcome, PushError> {
-    match client.upload_path(options.compression, info)? {
+        PushDisposition::UploadRequired => client.upload_path(options.compression, info)?,
+    };
+    match outcome {
         PushOutcome::Conflict if options.ignore_conflicts => {
             eprintln!(
                 "narjar push: skipping immutable conflict for {}",
@@ -502,7 +509,7 @@ fn upload_required_path(
             Ok(PushOutcome::Conflict)
         }
         PushOutcome::Conflict => Err(format!(
-            "narinfo upload for {} returned HTTP 409",
+            "immutable destination conflict for {}",
             info.claims().store_path()
         )
         .into()),
@@ -531,6 +538,7 @@ enum UploadArtifact {
 enum DestinationNarinfoState {
     MatchesExpected,
     Different,
+    Unusable,
     Missing,
 }
 
@@ -579,6 +587,129 @@ mod tests {
         .expect("valid narinfo metadata fixture")
     }
     use std::time::Duration;
+
+    #[test]
+    fn known_destination_conflict_is_handled_before_reading_or_uploading_nar() {
+        use super::{
+            CacheLookup, DestinationNarinfoPolicy, NativeCopyOptions, PushOutcome, copy_path,
+        };
+        use narjar::object::{CompressionCodec, WireEncoding};
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+            num::NonZeroU64,
+            path::Path,
+            thread,
+            time::Instant,
+        };
+
+        let path = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package";
+        assert!(
+            !Path::new(path).exists(),
+            "the test must not have a NAR to read"
+        );
+        let info = test_narinfo_metadata(path, Vec::new());
+        let different = NarInfoMetadata::from_store_metadata(
+            path.to_owned(),
+            None,
+            None,
+            NarIdentity::new(NarHash::parse(&"0".repeat(52)).unwrap(), NarSize::new(123)),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let body = different
+            .serialize(NarRepresentation::Raw(different.claims().identity()))
+            .unwrap();
+
+        for compression in [
+            WireEncoding::Raw,
+            WireEncoding::Compressed(CompressionCodec::Xz),
+            WireEncoding::Compressed(CompressionCodec::Zstd),
+        ] {
+            for ignore_conflicts in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let target = http_url(format!("http://{}", listener.local_addr().unwrap()));
+                let response_body = body.clone();
+                let server = thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let (mut stream, _) = std::iter::repeat_with(|| {
+                        thread::sleep(Duration::from_millis(1));
+                        listener.accept()
+                    })
+                    .take_while(|_| Instant::now() < deadline)
+                    .find_map(|result| match result {
+                        Ok(connection) => Some(connection),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                        Err(error) => panic!("accept preflight GET: {error}"),
+                    })
+                    .expect("push must perform its preflight GET before the deadline");
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let headers: Vec<_> = BufReader::new(&mut stream)
+                        .lines()
+                        .map(Result::unwrap)
+                        .take_while(|line| !line.is_empty())
+                        .collect();
+                    assert_eq!(
+                        headers[0],
+                        "GET /0123456789abcdfghijklmnpqrsvwxyz.narinfo HTTP/1.1"
+                    );
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response_body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&response_body).unwrap();
+                    listener
+                });
+                let options = NativeCopyOptions {
+                    target: target.clone(),
+                    netrc_file: None,
+                    insecure_http: true,
+                    destination_narinfo: DestinationNarinfoPolicy::ReuseExisting,
+                    ignore_conflicts,
+                    compression,
+                    timeout_seconds: NonZeroU64::new(5).unwrap(),
+                    trusted_upstreams: TrustedUpstreams::from_configuration(&[], &[]).unwrap(),
+                };
+                let client = DestinationClient {
+                    base_url: target,
+                    agent: Agent::config_builder()
+                        .timeout_global(Some(Duration::from_secs(5)))
+                        .http_status_as_error(false)
+                        .build()
+                        .into(),
+                    authorization: None,
+                };
+                let lookup = CacheLookup::new(
+                    &client,
+                    options.destination_narinfo,
+                    &options.trusted_upstreams,
+                );
+                let outcome = copy_path(&lookup, &client, &options, &info);
+                let listener = server.join().unwrap();
+                listener.set_nonblocking(true).unwrap();
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "a known conflict must never send a PUT"
+                );
+                match ignore_conflicts {
+                    true => assert_eq!(outcome.unwrap(), PushOutcome::Conflict),
+                    false => {
+                        let error = outcome.unwrap_err();
+                        assert!(error.contains("immutable destination conflict"), "{error}");
+                        assert!(error.contains(path), "{error}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn serializes_signed_narinfo_from_shared_metadata() {
@@ -775,7 +906,7 @@ mod tests {
             (
                 200,
                 different.serialize(raw).unwrap(),
-                PushDisposition::UploadRequired,
+                PushDisposition::DestinationConflict,
                 PushOutcome::Conflict,
             ),
             (
@@ -906,7 +1037,7 @@ mod tests {
         let lookup = CacheLookup::new(&client, DestinationNarinfoPolicy::ReuseExisting, &upstreams);
         let result = lookup.classify(&info);
         server.join().unwrap();
-        assert_eq!(result.unwrap(), PushDisposition::UploadRequired);
+        assert_eq!(result.unwrap(), PushDisposition::DestinationConflict);
         assert_eq!(
             upstream_listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock,
