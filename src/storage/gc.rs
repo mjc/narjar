@@ -228,7 +228,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
         .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
     let root = Directory::open(&options.data_dir)?;
     let storage = Storage::open(&root, backend)?;
-    let trusted = TrustedPublicKeys::load(&root).map_err(|error| invalid(error.to_string()))?;
+    let (_, trusted) = super::CachePolicies::load(&root)?.into_parts();
     match options.mode {
         GcMode::DryRun => run_dry_run(options, &storage, &trusted),
         GcMode::Apply => {
@@ -1692,11 +1692,27 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     fn initialize_chunked_storage(path: &Path) -> Result<Storage, StorageError> {
-        CacheCreation::prepare(
+        use std::os::unix::fs::PermissionsExt;
+
+        let storage = CacheCreation::prepare(
             &Directory::open(path)?,
             StorageBackend::Chunked.try_into().unwrap(),
         )
-        .and_then(|creation| creation.create_or_complete())
+        .and_then(|creation| creation.create_or_complete())?;
+        fs::create_dir_all(path.join("auth"))?;
+        fs::set_permissions(path.join("auth"), fs::Permissions::from_mode(0o700))?;
+        for (name, contents) in [
+            (
+                "nix-cache-info",
+                "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n",
+            ),
+            ("trusted-public-keys", ""),
+            ("auth/write.tokens", ""),
+        ] {
+            fs::write(path.join(name), contents)?;
+            fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(storage)
     }
 
     fn select_candidates(

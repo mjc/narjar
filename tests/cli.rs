@@ -7274,6 +7274,53 @@ fn gc_rejects_symlinked_narinfo_without_removing_it() {
 }
 
 #[test]
+fn library_gc_requires_the_same_private_policies_as_startup_before_either_mode() {
+    let data_dir = init_data_dir("library-gc-required-policies");
+    let collect = |mode| {
+        narjar::__private::storage::gc::run(GcOptions {
+            data_dir: data_dir.path().to_owned(),
+            max_bytes: None,
+            target_bytes: Some(0),
+            max_age: None,
+            min_age: Duration::ZERO,
+            protected_roots: None,
+            mode,
+            backend: narjar::__private::storage::StorageBackend::Flat,
+        })
+    };
+    let clean = data_dir.join(".narjar-clean");
+    let original_marker = fs::read(&clean).unwrap();
+    for name in narjar::__private::storage::CACHE_POLICY_FILES {
+        let path = data_dir.join(name);
+        let original = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        for mode in [GcMode::DryRun, GcMode::Apply] {
+            assert!(collect(mode).is_err(), "{mode:?} accepted missing {name}");
+            assert!(!path.exists(), "GC must not recreate {name}");
+            assert_eq!(fs::read(&clean).unwrap(), original_marker);
+            assert!(!data_dir.join(".narjar-recovery").exists());
+        }
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        for mode in [GcMode::DryRun, GcMode::Apply] {
+            assert!(
+                collect(mode).is_err(),
+                "{mode:?} accepted non-private {name}"
+            );
+            assert_eq!(fs::read(&clean).unwrap(), original_marker);
+            assert!(!data_dir.join(".narjar-recovery").exists());
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    for mode in [GcMode::DryRun, GcMode::Apply] {
+        assert!(
+            collect(mode).is_ok(),
+            "{mode:?} should accept complete private policies"
+        );
+    }
+}
+
+#[test]
 fn library_gc_dry_run_preserves_pending_recovery_state() {
     let data_dir = init_data_dir("library-gc-dry-run-recovery");
     let staging = data_dir.join(".tmp/gc-pending.part");
