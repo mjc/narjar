@@ -22,7 +22,7 @@ use super::ids::nix32_sha256;
 use super::publication::{DecoderMemoryLimit, Layout, PublishBoundary, PublishTarget};
 use super::{
     CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageBackend,
-    StorageError, StoreHash, capacity_error_kind,
+    StorageError, StoreHash, SupportedStorageBackend, capacity_error_kind,
 };
 use crate::narinfo::NarInfoClaims;
 use crate::object::{
@@ -61,7 +61,7 @@ fn egress_receipt_round_trips_through_compact_binary_serialization() {
 }
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
-    Storage::initialize(&Directory::open(path)?, StorageBackend::Flat)
+    Storage::initialize(&Directory::open(path)?, SupportedStorageBackend::FLAT)
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn chunked_ingestion_publishes_a_verified_manifest() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked,
+        StorageBackend::Chunked.try_into().unwrap(),
     )
     .unwrap();
     let raw = vec![b'x'; 100_000];
@@ -235,7 +235,7 @@ fn chunked_backend_routes_the_complete_nar_publication() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked,
+        StorageBackend::Chunked.try_into().unwrap(),
     )
     .unwrap();
     let raw = vec![b'c'; 100_000];
@@ -295,7 +295,7 @@ fn chunked_upload_enforces_encoded_size_before_creating_staging() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked,
+        StorageBackend::Chunked.try_into().unwrap(),
     )
     .unwrap();
     let raw = b"compressed body larger than encoded upload limit";
@@ -345,8 +345,11 @@ fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
         StorageBackend::Chunked,
     ] {
         let directory = TestDir::new();
-        let storage =
-            Storage::initialize(&Directory::open(directory.path()).unwrap(), backend).unwrap();
+        let storage = Storage::initialize(
+            &Directory::open(directory.path()).unwrap(),
+            backend.try_into().unwrap(),
+        )
+        .unwrap();
         let raw = vec![b'u'; 100_000];
         let hash = NarHash::from_digest(Sha256::digest(&raw).into());
         let name = NarFileName::raw(hash);
@@ -389,7 +392,7 @@ fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked,
+        StorageBackend::Chunked.try_into().unwrap(),
     )
     .unwrap();
     let raw = vec![b'm'; 100_000];
@@ -426,7 +429,7 @@ fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked,
+        StorageBackend::Chunked.try_into().unwrap(),
     )
     .unwrap();
     let raw = vec![b's'; 100_000];
@@ -470,7 +473,7 @@ fn flat_canonical_nar_rejects_same_size_corruption() {
     let directory = TestDir::new();
     let storage = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Flat,
+        SupportedStorageBackend::FLAT,
     )
     .unwrap();
     let raw = vec![b'f'; 4096];
@@ -1715,7 +1718,7 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
     let output = {
         let storage = Storage::initialize(
             &Directory::open(directory.path()).unwrap(),
-            StorageBackend::Chunked,
+            StorageBackend::Chunked.try_into().unwrap(),
         )
         .unwrap();
         storage
@@ -1735,7 +1738,7 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
 
     let restarted = Storage::initialize(
         &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked,
+        StorageBackend::Chunked.try_into().unwrap(),
     )
     .unwrap();
     restarted.finish_recovery().unwrap();
@@ -2284,21 +2287,19 @@ fn initialization_creates_only_the_fixed_layout() {
 fn initialization_rejects_a_different_storage_backend() {
     let directory = TestDir::new();
     let root = Directory::open(directory.path()).unwrap();
-    let storage = Storage::initialize(&root, StorageBackend::Flat).unwrap();
+    let storage = Storage::initialize(&root, SupportedStorageBackend::FLAT).unwrap();
     drop(storage);
 
-    let error = Storage::initialize(&root, StorageBackend::Chunked)
+    let error = Storage::initialize(&root, StorageBackend::Chunked.try_into().unwrap())
         .expect_err("a populated root must retain its selected backend");
     assert!(error.to_string().contains("different storage backend"));
 }
 
 #[test]
 #[cfg(target_os = "macos")]
-fn initialization_rejects_chunked_storage_before_creating_layout_entries() {
+fn unsupported_backend_cannot_be_prepared_for_storage_initialization() {
     let directory = TestDir::new();
-    let root = Directory::open(directory.path()).unwrap();
-
-    let error = Storage::initialize(&root, StorageBackend::Chunked)
+    let error = SupportedStorageBackend::try_from(StorageBackend::Chunked)
         .expect_err("chunked storage is unsupported on macOS");
 
     assert!(error.to_string().contains("not supported on macOS"));

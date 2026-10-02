@@ -1,3 +1,5 @@
+#[path = "storage/backend.rs"]
+mod backend;
 #[path = "storage/cache_info.rs"]
 mod cache_info;
 #[allow(dead_code)]
@@ -69,13 +71,16 @@ pub(crate) use fs::{
 pub use crate::object::{
     EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize, WireEncoding,
 };
+pub use backend::{
+    InvalidStorageBackend, StorageBackend, SupportedStorageBackend, UnsupportedStorageBackend,
+};
 pub use directory::Directory;
 pub(crate) use egress::{NarReadBody, VerifiedCanonicalNar};
 pub use ids::{InvalidObjectId, StoreHash, validate_store_basename};
 pub use publication::{NarUploadPolicy, PublishOutcome, StagingReservation, StorageError};
 pub use recovery::RecoveryStatus;
+pub use state::Storage;
 pub(crate) use state::StorageActivitySnapshot;
-pub use state::{InvalidStorageBackend, Storage, StorageBackend};
 
 pub use operations::{NarInfoDeletion, NarMatch, RecoveredStorage, StorageReadiness};
 pub use population::PopulationCounts;

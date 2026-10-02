@@ -6,7 +6,10 @@ use narjar::__private::{
         Recorder as MaintenanceRecorder, RunValues as MaintenanceValues,
     },
     narinfo::TrustedPublicKeys,
-    storage::{Directory, RecoveredStorage, RecoveryStatus, Storage, StorageBackend},
+    storage::{
+        Directory, RecoveredStorage, RecoveryStatus, Storage, StorageBackend,
+        SupportedStorageBackend,
+    },
 };
 
 use crate::error::Error;
@@ -38,6 +41,8 @@ impl MaintenanceSession {
         backend: StorageBackend,
         record: Option<MaintenanceRecord>,
     ) -> Result<Self, Error> {
+        let backend = SupportedStorageBackend::try_from(backend)
+            .map_err(|error| Error::usage(error.to_string()))?;
         let directory = Directory::open(data_dir).map_err(runtime)?;
         directory.validate_initialized().map_err(runtime)?;
         let storage = Storage::initialize(&directory, backend).map_err(runtime)?;

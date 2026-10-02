@@ -6,7 +6,10 @@ use std::{
 
 use clap::Args;
 use clap::ValueEnum;
-use narjar::{__private::storage::StorageBackend, object::WireEncoding};
+use narjar::{
+    __private::storage::{StorageBackend, SupportedStorageBackend},
+    object::WireEncoding,
+};
 
 use crate::native_store::NativeStoreSettings;
 
@@ -23,7 +26,7 @@ pub(crate) struct ServeConfig {
     pub(crate) shutdown_grace_seconds: NonZeroU64,
     pub(crate) io_timeout_seconds: NonZeroU64,
     pub(crate) egress_compression: WireEncoding,
-    pub(crate) storage_backend: StorageBackend,
+    pub(crate) storage_backend: SupportedStorageBackend,
     pub(crate) source: ServeSource,
     pub(crate) stats_inventory_interval_seconds: Option<NonZeroU64>,
     pub(crate) stats_filesystem_sample: Option<PathBuf>,
@@ -118,7 +121,8 @@ impl TryFrom<ServeArgs> for ServeConfig {
             shutdown_grace_seconds: args.shutdown_grace_seconds,
             io_timeout_seconds: args.io_timeout_seconds,
             egress_compression: args.egress_compression,
-            storage_backend: args.storage_backend,
+            storage_backend: SupportedStorageBackend::try_from(args.storage_backend)
+                .map_err(|error| error.to_string())?,
             source,
             stats_inventory_interval_seconds: args.stats_inventory_interval_seconds,
             stats_filesystem_sample: args.stats_filesystem_sample,

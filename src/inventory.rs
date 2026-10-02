@@ -652,9 +652,13 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{NarUploadPolicy, PublishOutcome, StorageBackend};
+    use crate::storage::{NarUploadPolicy, SupportedStorageBackend};
+    #[cfg(not(target_os = "macos"))]
+    use crate::storage::{PublishOutcome, StorageBackend};
     use sha2::{Digest, Sha256};
-    use std::{io::Cursor, path::Path};
+    use std::io::Cursor;
+    #[cfg(not(target_os = "macos"))]
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn assert_canonical_nar_class(
@@ -673,7 +677,7 @@ mod tests {
     fn flat_availability_checks_size_without_reading_contents() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
-        let storage = Storage::initialize(&root, StorageBackend::Flat).unwrap();
+        let storage = Storage::initialize(&root, SupportedStorageBackend::FLAT).unwrap();
         let raw = b"canonical raw nar";
         let hash = NarHash::from_digest(Sha256::digest(raw).into());
         let identity = crate::object::NarIdentity::new(hash, (raw.len() as u64).into());
@@ -722,7 +726,8 @@ mod tests {
     fn chunked_storage_inventory_checks_the_manifest_backed_nar() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
-        let storage = Storage::initialize(&root, StorageBackend::Chunked).unwrap();
+        let storage =
+            Storage::initialize(&root, StorageBackend::Chunked.try_into().unwrap()).unwrap();
         let raw = vec![b'i'; 100_000];
         let hash = NarHash::from_digest(Sha256::digest(&raw).into());
         let name = NarFileName::raw(hash);

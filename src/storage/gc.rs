@@ -17,7 +17,7 @@ use crate::{
     object::{NarHash, NarRepresentation},
     storage::{
         Directory, NarFileName, RecoveredStorage, Storage, StorageBackend, StorageError, StoreHash,
-        open_regular_at, read_dir_names,
+        SupportedStorageBackend, open_regular_at, read_dir_names,
     },
 };
 
@@ -224,8 +224,10 @@ impl RetentionPolicy {
 }
 
 pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
+    let backend = SupportedStorageBackend::try_from(options.backend)
+        .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
     let root = Directory::open(&options.data_dir)?;
-    let storage = Storage::initialize(&root, options.backend)?;
+    let storage = Storage::initialize(&root, backend)?;
     let trusted = TrustedPublicKeys::load(&root).map_err(|error| invalid(error.to_string()))?;
     match options.mode {
         GcMode::DryRun => run_dry_run(options, &storage, &trusted),
@@ -1684,12 +1686,15 @@ mod tests {
     }
 
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
-        Storage::initialize(&Directory::open(path)?, StorageBackend::Flat)
+        Storage::initialize(&Directory::open(path)?, SupportedStorageBackend::FLAT)
     }
 
     #[cfg(not(target_os = "macos"))]
     fn initialize_chunked_storage(path: &Path) -> Result<Storage, StorageError> {
-        Storage::initialize(&Directory::open(path)?, StorageBackend::Chunked)
+        Storage::initialize(
+            &Directory::open(path)?,
+            StorageBackend::Chunked.try_into().unwrap(),
+        )
     }
 
     fn select_candidates(

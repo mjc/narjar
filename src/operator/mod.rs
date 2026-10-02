@@ -22,7 +22,7 @@ use narjar::__private::{
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
         CleanupOutcome, Directory, ReconcileClass, Storage, StorageBackend, StorageCapacity,
-        StoreHash, capacity_from_statvfs,
+        StoreHash, SupportedStorageBackend, capacity_from_statvfs,
         gc::{self, GcMode, GcOptions, GcReport},
     },
 };
@@ -35,7 +35,7 @@ use crate::{
 
 mod lifecycle;
 mod maintenance_session;
-pub(crate) use lifecycle::{Init, Key, generate_key_pair, init, key};
+pub(crate) use lifecycle::{Init, Key, generate_key_pair, init, initialize_cache, key};
 use maintenance_session::{MaintenanceRecord, MaintenanceSession};
 
 #[derive(Args)]
@@ -756,8 +756,10 @@ const DOCTOR_FILES: &[&str] = &[
 ];
 
 pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
+    let backend = SupportedStorageBackend::try_from(options.storage_backend)
+        .map_err(|error| Error::usage(error.to_string()))?;
     let mut report = inspect_doctor(&options.data_dir)?;
-    report.source = inspect_doctor_source(&options);
+    report.source = inspect_doctor_source(&options, backend);
     let failed = report.has_failures();
     if options.json {
         println!("{}", doctor_json(&report));
@@ -839,7 +841,7 @@ fn inspect_doctor(root: &Path) -> Result<DoctorReport, Error> {
     })
 }
 
-fn inspect_doctor_source(options: &Doctor) -> DoctorSource {
+fn inspect_doctor_source(options: &Doctor, backend: SupportedStorageBackend) -> DoctorSource {
     let native_options = (
         options.native_store_dir.as_deref(),
         options.native_state_dir.as_deref(),
@@ -862,6 +864,7 @@ fn inspect_doctor_source(options: &Doctor) -> DoctorSource {
             (Some(store_dir), Some(state_dir), Some(roots_dir), Some(min_lease_seconds)),
         ) => validate_doctor_native_store(
             options,
+            backend,
             store_dir,
             state_dir,
             roots_dir,
@@ -877,13 +880,14 @@ fn inspect_doctor_source(options: &Doctor) -> DoctorSource {
 
 fn validate_doctor_native_store(
     options: &Doctor,
+    backend: SupportedStorageBackend,
     store_dir: &Path,
     state_dir: &Path,
     roots_dir: &Path,
     min_lease_seconds: NonZeroU64,
 ) -> DoctorSource {
     let output_is_raw_flat = options.egress_compression == WireEncoding::Raw
-        && options.storage_backend == StorageBackend::Flat;
+        && backend.backend() == StorageBackend::Flat;
     let data_directory = Directory::open(&options.data_dir);
     match (output_is_raw_flat, data_directory) {
         (false, _) => DoctorSource {
@@ -1272,7 +1276,7 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use narjar::__private::maintenance::{Operation, Outcome};
-    use narjar::__private::storage::Directory;
+    use narjar::__private::storage::{Directory, SupportedStorageBackend};
 
     #[test]
     fn managed_file_conflict_never_replaces_existing_contents_or_leaves_temps() {
@@ -1349,7 +1353,7 @@ machine other.example password other-secret
         })
         .expect("maintenance records should be accepted by repeated initialization");
         let root = Directory::open(directory.path()).expect("cache root should open");
-        let storage = Storage::initialize(&root, StorageBackend::Flat)
+        let storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
             .expect("cache storage should initialize");
         let report = storage
             .reconcile(
@@ -1378,7 +1382,7 @@ machine other.example password other-secret
         let before = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should be readable");
         let root = Directory::open(directory.path()).expect("cache root should open");
-        let _active_storage = Storage::initialize(&root, StorageBackend::Flat)
+        let _active_storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
             .expect("first operation should hold the cache lock");
 
         let result = gc(Gc {
@@ -1423,7 +1427,7 @@ machine other.example password other-secret
         let before = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should be readable");
         let root = Directory::open(directory.path()).expect("cache root should open");
-        let _active_storage = Storage::initialize(&root, StorageBackend::Flat)
+        let _active_storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
             .expect("first operation should hold the cache lock");
 
         let result = verify(Verify {
@@ -1458,7 +1462,7 @@ machine other.example password other-secret
         let narinfo = directory.path().join(format!("{store_hash}.narinfo"));
         fs::write(&narinfo, b"published metadata fixture").expect("fixture should be written");
         let root = Directory::open(directory.path()).expect("cache root should open");
-        let _active_storage = Storage::initialize(&root, StorageBackend::Flat)
+        let _active_storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
             .expect("first operation should hold the cache lock");
 
         let result = delete(Delete {
@@ -1535,8 +1539,8 @@ machine other.example password other-secret
         );
 
         let root = Directory::open(directory.path()).expect("cache root should reopen");
-        let storage =
-            Storage::initialize(&root, StorageBackend::Flat).expect("cache storage should reopen");
+        let storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
+            .expect("cache storage should reopen");
         assert!(
             !storage
                 .recovery_required()
@@ -1761,7 +1765,7 @@ machine other.example password other-secret
             storage_backend: StorageBackend::Flat,
         };
         let mut report = inspect_doctor(directory.path()).expect("doctor should inspect cache");
-        report.source = inspect_doctor_source(&options);
+        report.source = inspect_doctor_source(&options, SupportedStorageBackend::FLAT);
         let json = doctor_json(&report);
 
         assert!(json.contains("\"name\":\"native-store\""));

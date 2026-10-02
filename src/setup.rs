@@ -7,12 +7,12 @@ use std::{
 };
 
 use clap::Args;
-use narjar::__private::storage::StorageBackend;
+use narjar::__private::storage::{StorageBackend, SupportedStorageBackend};
 
 use crate::{
     error::Error,
     http_url::HttpUrl,
-    operator::{self, Init, generate_key_pair},
+    operator::{self, generate_key_pair},
     token,
 };
 
@@ -39,6 +39,8 @@ pub(crate) struct Setup {
 }
 
 pub(crate) fn run(mut options: Setup) -> Result<(), Error> {
+    let backend = SupportedStorageBackend::try_from(options.storage_backend)
+        .map_err(|error| Error::usage(error.to_string()))?;
     let destinations = SetupDestinations::new(&options.data_dir, &options.credentials_dir)?;
     destinations.ensure_available()?;
     options.data_dir = destinations.data_dir;
@@ -47,12 +49,12 @@ pub(crate) fn run(mut options: Setup) -> Result<(), Error> {
 
     create_setup_directories(&options.data_dir, &options.credentials_dir)?;
 
-    operator::init(Init {
-        data_dir: options.data_dir.clone(),
-        priority: options.priority,
-        private_read: options.private_read,
-        storage_backend: options.storage_backend,
-    })?;
+    operator::initialize_cache(
+        options.data_dir.clone(),
+        options.priority,
+        options.private_read,
+        backend,
+    )?;
 
     let secret_key = options.credentials_dir.join("producer.sec");
     let public_key = options.credentials_dir.join("producer.pub");

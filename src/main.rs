@@ -59,7 +59,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
-        Command::Serve(args) => server::serve(ServeConfig::try_from(args).map_err(Error::runtime)?),
+        Command::Serve(args) => server::serve(ServeConfig::try_from(args).map_err(Error::usage)?),
         Command::Init(args) => operator::init(args),
         Command::Setup(args) => setup::run(args),
         Command::Key(args) => operator::key(args),
@@ -220,8 +220,47 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn serve_accepts_the_chunked_storage_backend() {
+    fn invalid_native_configuration_is_a_usage_error_before_storage_access() {
+        let cli = Cli::try_parse_from([
+            "narjar",
+            "serve",
+            "--data-dir",
+            "/cache",
+            "--serve-source",
+            "native-store",
+        ])
+        .expect("the command contains recognized argument values");
+        let error = super::run(cli).expect_err("incomplete configuration must fail preparation");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("native-store source requires"));
+    }
+
+    #[test]
+    fn commands_parse_known_backends_before_validating_platform_support() {
+        for command in [
+            "init",
+            "setup",
+            "serve",
+            "reconcile",
+            "cleanup",
+            "verify",
+            "doctor",
+        ] {
+            Cli::try_parse_from([
+                "narjar",
+                command,
+                "--data-dir",
+                "/cache",
+                "--storage-backend",
+                "chunked",
+            ])
+            .expect("a recognized backend name must parse on every platform");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn serve_preparation_rejects_chunked_storage_on_macos_before_opening_storage() {
         let cli = Cli::try_parse_from([
             "narjar",
             "serve",
@@ -230,27 +269,10 @@ mod tests {
             "--storage-backend",
             "chunked",
         ])
-        .expect("chunked storage backend should parse");
-
-        assert!(matches!(cli.command, Command::Serve(_)));
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn serve_rejects_the_chunked_storage_backend_on_macos() {
-        let result = Cli::try_parse_from([
-            "narjar",
-            "serve",
-            "--data-dir",
-            "/cache",
-            "--storage-backend",
-            "chunked",
-        ]);
-
-        match result {
-            Err(error) => assert!(error.to_string().contains("not supported on macOS")),
-            Ok(_) => panic!("chunked backend must be rejected on macOS"),
-        }
+        .expect("chunked is a recognized backend name");
+        let error = super::run(cli).expect_err("unsupported backend cannot start serving");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("not supported on macOS"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use narjar::__private::maintenance::FILE_NAMES as MAINTENANCE_FILES;
 use narjar::__private::storage::{
     CHUNK_DIRECTORY, Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY,
     LAYOUT_DESCRIPTOR, MANIFEST_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY, Storage,
-    StorageBackend, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+    StorageBackend, SupportedStorageBackend, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
 };
 
 use crate::error::Error;
@@ -39,7 +39,17 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
         private_read,
         storage_backend,
     } = options;
+    let backend = SupportedStorageBackend::try_from(storage_backend)
+        .map_err(|error| Error::usage(error.to_string()))?;
+    initialize_cache(root, priority, private_read, backend)
+}
 
+pub(crate) fn initialize_cache(
+    root: PathBuf,
+    priority: u32,
+    private_read: bool,
+    backend: SupportedStorageBackend,
+) -> Result<(), Error> {
     if root.exists() {
         reject_unexpected_init_entries(&root)?;
         reject_unexpected_auth_entries(&root)?;
@@ -51,12 +61,12 @@ pub(crate) fn init(options: Init) -> Result<(), Error> {
     create_recovery_marker(&root)?;
     create_file(
         &root.join(LAYOUT_DESCRIPTOR),
-        storage_backend.layout_descriptor(),
+        backend.backend().layout_descriptor(),
         0o600,
         true,
     )?;
     let directory = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize(&directory, storage_backend).map_err(runtime)?;
+    let storage = Storage::initialize(&directory, backend).map_err(runtime)?;
     for directory in [
         NAR_DIRECTORY,
         TEMPORARY_DIRECTORY,

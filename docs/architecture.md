@@ -170,6 +170,12 @@ disagrees with the requested backend or supported profile. There is no
 migration, legacy-layout fallback, mixed per-object selection, or automatic
 conversion.
 
+Backend-name parsing is platform-independent. Preparing a storage operation
+converts the selected `StorageBackend` into `SupportedStorageBackend`;
+unsupported selections fail before directory creation or modification.
+`Storage::initialize` requires that capability rather than checking support
+again. `init` and `setup` share the same capability-requiring cache initializer.
+
 The flat backend stores the complete decoded NAR at `nar/<NarHash>.nar`.
 The Linux chunked backend stores the exact decoded byte stream as immutable
 content-addressed chunks below `.narjar-chunks/` and one bounded ordered

@@ -1675,11 +1675,12 @@ mod tests {
     use crate::{
         object::{NarHash, NarIdentity, NarSize},
         storage::{
+            StorageBackend,
             chunked::{ChunkHash, ChunkProfile, ManifestReader},
             directory::Directory,
             fs::StorageCapacity,
             publication::{StagingBudget, StagingReservation},
-            state::{StorageActivity, StorageBackend},
+            state::StorageActivity,
         },
     };
 

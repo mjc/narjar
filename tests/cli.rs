@@ -5327,6 +5327,66 @@ fn init_data_dir(test: &str) -> TestDir {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn unsupported_backends_fail_before_commands_create_or_modify_cache_data() {
+    let parent = tempfile::tempdir().unwrap();
+    let cache = parent.path().join("cache");
+    let credentials = parent.path().join("credentials");
+    for operation in [
+        "init",
+        "setup",
+        "serve",
+        "reconcile",
+        "cleanup",
+        "verify",
+        "doctor",
+    ] {
+        let mut process = command();
+        process
+            .args([operation, "--storage-backend", "chunked", "--data-dir"])
+            .arg(&cache);
+        if operation == "setup" {
+            process
+                .arg("--credentials-dir")
+                .arg(&credentials)
+                .arg("--yes");
+        }
+        let output = process.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{operation} must reject unsupported storage as a usage error"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("not supported on macOS"),
+            "{operation}: {output:?}"
+        );
+        assert!(!cache.exists(), "{operation} must not create cache data");
+        assert!(
+            !credentials.exists(),
+            "{operation} must not create credentials"
+        );
+    }
+
+    fs::create_dir(&cache).unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(cache.join("sentinel"), b"existing data").unwrap();
+    let output = command()
+        .args(["init", "--storage-backend", "chunked", "--data-dir"])
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not supported on macOS"));
+    assert_eq!(fs::read(cache.join("sentinel")).unwrap(), b"existing data");
+    assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+    assert_eq!(
+        fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
 fn init_and_key_generate_create_secure_operator_material() {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -6442,7 +6502,7 @@ fn gc_recovers_a_published_nar_before_eviction_and_restart() {
         .expect("cache root should reopen after GC");
     let storage = narjar::__private::storage::Storage::initialize(
         &root,
-        narjar::__private::storage::StorageBackend::Flat,
+        narjar::__private::storage::SupportedStorageBackend::FLAT,
     )
     .expect("cache storage should restart after GC");
     assert!(
@@ -6523,7 +6583,7 @@ fn delete_recovers_a_published_narinfo_before_removing_it() {
         .expect("cache root should reopen after delete");
     let storage = narjar::__private::storage::Storage::initialize(
         &root,
-        narjar::__private::storage::StorageBackend::Flat,
+        narjar::__private::storage::SupportedStorageBackend::FLAT,
     )
     .expect("cache storage should restart after delete");
     assert!(

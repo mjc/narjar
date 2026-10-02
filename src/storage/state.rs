@@ -1,15 +1,12 @@
 use std::{
     collections::{HashMap, VecDeque},
-    fmt,
     fs::File,
     os::unix::fs::MetadataExt,
     path::PathBuf,
-    str::FromStr,
     sync::{Arc, Mutex, Weak, atomic::AtomicU64},
 };
 
-use serde::{Deserialize, Serialize};
-
+use super::backend::StorageBackend;
 use super::chunk_store::ChunkStore;
 #[cfg(test)]
 use super::publication::Layout;
@@ -35,81 +32,6 @@ impl PayloadStorage {
         match self {
             Self::Flat => None,
             Self::Chunked(store) => Some(store),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageBackend {
-    Flat,
-    Chunked,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InvalidStorageBackend {
-    /// The value is neither `flat` nor `chunked`.
-    UnknownValue,
-    /// Chunked storage has no verified durability contract on macOS.
-    UnsupportedOnMacOS,
-    /// Chunked storage is supported only on Linux.
-    UnsupportedPlatform,
-}
-
-impl fmt::Display for InvalidStorageBackend {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::UnknownValue => "expected one of: flat, chunked",
-            Self::UnsupportedOnMacOS => "chunked storage is not supported on macOS; choose flat",
-            Self::UnsupportedPlatform => "chunked storage is supported only on Linux",
-        })
-    }
-}
-
-impl std::error::Error for InvalidStorageBackend {}
-
-impl StorageBackend {
-    pub(super) fn validate_current_platform(self) -> Result<(), InvalidStorageBackend> {
-        match self {
-            Self::Flat => Ok(()),
-            Self::Chunked => {
-                #[cfg(target_os = "linux")]
-                {
-                    Ok(())
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    Err(InvalidStorageBackend::UnsupportedOnMacOS)
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                {
-                    Err(InvalidStorageBackend::UnsupportedPlatform)
-                }
-            }
-        }
-    }
-}
-
-impl FromStr for StorageBackend {
-    type Err = InvalidStorageBackend;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "flat" => Ok(Self::Flat),
-            "chunked" => {
-                Self::Chunked.validate_current_platform()?;
-                Ok(Self::Chunked)
-            }
-            _ => Err(InvalidStorageBackend::UnknownValue),
-        }
-    }
-}
-
-impl StorageBackend {
-    pub const fn layout_descriptor(self) -> &'static [u8] {
-        match self {
-            Self::Flat => b"narjar-layout-v1\nbackend=flat\n",
-            Self::Chunked => b"narjar-layout-v1\nbackend=chunked\nprofile=mincdc-hash4-v2\n",
         }
     }
 }
@@ -396,10 +318,7 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DELIVERY_VALIDATION_CACHE_CAPACITY, DeliveryProof, DeliveryProofs, FileStamp,
-        InvalidStorageBackend, StorageBackend,
-    };
+    use super::{DELIVERY_VALIDATION_CACHE_CAPACITY, DeliveryProof, DeliveryProofs, FileStamp};
     use crate::object::{NarFileName, NarHash, NarIdentity, NarSize};
 
     fn delivery_test_name(index: usize) -> NarFileName {
@@ -434,30 +353,6 @@ mod tests {
             proofs
                 .by_name
                 .contains_key(&delivery_test_name(DELIVERY_VALIDATION_CACHE_CAPACITY))
-        );
-    }
-
-    #[test]
-    fn backend_parsing_applies_the_current_platform_policy() {
-        assert_eq!("flat".parse::<StorageBackend>(), Ok(StorageBackend::Flat));
-        assert_eq!(
-            "unknown".parse::<StorageBackend>(),
-            Err(InvalidStorageBackend::UnknownValue)
-        );
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            "chunked".parse::<StorageBackend>(),
-            Ok(StorageBackend::Chunked)
-        );
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            "chunked".parse::<StorageBackend>(),
-            Err(InvalidStorageBackend::UnsupportedOnMacOS)
-        );
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        assert_eq!(
-            "chunked".parse::<StorageBackend>(),
-            Err(InvalidStorageBackend::UnsupportedPlatform)
         );
     }
 }

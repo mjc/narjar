@@ -14,7 +14,7 @@ use narjar::__private::{
     nar::{Decoder, Event},
     nar_encode::{self, Encoder},
     narinfo::TrustedPublicKeys,
-    storage::{Directory, NarFileName, NarHash, Storage, StorageBackend},
+    storage::{Directory, NarFileName, NarHash, Storage, SupportedStorageBackend},
 };
 
 const OBJECT_ID: &str = "19rci548pgfshmx7rd3wzw2mhkq2dg8x3mq4q1kfkikgb2raqzxd";
@@ -41,7 +41,7 @@ fn initialized_storage(root: &Path) -> Storage {
     fs::create_dir_all(root).expect("create storage directory");
     Storage::initialize(
         &Directory::open(root).expect("open storage directory"),
-        StorageBackend::Flat,
+        SupportedStorageBackend::FLAT,
     )
     .expect("initialize storage")
 }

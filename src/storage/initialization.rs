@@ -9,23 +9,25 @@ use std::{
 
 use super::{
     EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, LAYOUT_DESCRIPTOR, NAR_DIRECTORY,
-    REALISATIONS_DIRECTORY, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+    REALISATIONS_DIRECTORY, StorageBackend, SupportedStorageBackend, TEMPORARY_DIRECTORY,
+    VALIDATION_DIRECTORY,
     chunk_store::ChunkStore,
     directory::Directory,
     fs::{directory_is_empty, ensure_directory_at, open_at, open_optional_at},
     publication::{ProcessLock, StorageError},
     recovery::RecoveryState,
-    state::{DeliveryValidationCache, PayloadStorage, Storage, StorageActivity, StorageBackend},
+    state::{DeliveryValidationCache, PayloadStorage, Storage, StorageActivity},
 };
 
 #[cfg(test)]
 use super::publication::Layout;
 
 impl Storage {
-    pub fn initialize(root: &Directory, backend: StorageBackend) -> Result<Self, StorageError> {
-        backend
-            .validate_current_platform()
-            .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
+    pub fn initialize(
+        root: &Directory,
+        backend: SupportedStorageBackend,
+    ) -> Result<Self, StorageError> {
+        let backend = backend.backend();
         #[cfg(test)]
         let layout = Layout::new(root.path.clone());
         let root_directory = root.file.try_clone()?;
