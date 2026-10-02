@@ -531,6 +531,123 @@ fn native_push_skips_payload_generation_when_the_destination_is_present() {
 }
 
 #[test]
+fn native_push_keeps_the_first_valid_publication_of_a_store_path() {
+    let server = RunningServer::start("first-store-path-publication-wins");
+    let published_nar = native_nar_bytes_with_contents(b"the previously published build");
+    let published_hash = nix32_sha256(&published_nar);
+    let published_narinfo = signed_narinfo(&published_hash, published_nar.len() as u64);
+    let narinfo_path = format!("/{STORE_HASH}.narinfo");
+    let published_nar_path = format!("/nar/{published_hash}.nar");
+    for (path, body) in [
+        (published_nar_path.as_str(), published_nar.as_slice()),
+        (narinfo_path.as_str(), published_narinfo.as_bytes()),
+    ] {
+        let response = server.request_with_body("PUT", path, &[], body);
+        assert!(
+            response_parts(&response)
+                .0
+                .starts_with("HTTP/1.1 201 Created\r\n")
+        );
+    }
+
+    let local_nar = native_nar_bytes();
+    let local_hash = nix32_sha256(&local_nar);
+    assert_ne!(local_hash, published_hash);
+    assert_ne!(local_nar.len(), published_nar.len());
+
+    for compression in ["none", "xz", "zstd"] {
+        let fixture = native_push_fixture();
+        let local_file = fixture.store_dir.join(format!("{STORE_HASH}-narjar"));
+        fs::remove_file(&local_file).expect("make payload generation fail if preflight tries it");
+        let payloads_before = fs::read_dir(server.data_dir.join("nar")).unwrap().count();
+
+        let skipped = run_native_push_fixture(
+            &fixture,
+            &format!("http://{}", server.address),
+            compression,
+            false,
+        );
+        assert!(
+            skipped.status.success(),
+            "{}",
+            String::from_utf8_lossy(&skipped.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&skipped.stdout).contains("uploaded 0, destination-present 1")
+        );
+        assert_eq!(
+            fs::read_dir(server.data_dir.join("nar")).unwrap().count(),
+            payloads_before,
+            "preflight must not create another payload"
+        );
+
+        fs::write(&local_file, NAR_BYTES).expect("restore the different local build for refresh");
+        let refreshed = run_native_push_fixture_with_options(
+            &fixture,
+            &format!("http://{}", server.address),
+            compression,
+            NativePushRunOptions {
+                refresh: true,
+                signing: true,
+                insecure_http: true,
+                ..NativePushRunOptions::default()
+            },
+        );
+        assert!(
+            refreshed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&refreshed.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&refreshed.stdout)
+                .contains("uploaded 0, destination-present 1")
+        );
+        assert_eq!(
+            fs::read(server.data_dir.join(format!("nar/{local_hash}.nar"))).unwrap(),
+            local_nar,
+            "the alternative payload keeps its own content identity"
+        );
+        assert_eq!(
+            response_parts(&server.request("GET", &narinfo_path)).1,
+            published_narinfo.as_bytes()
+        );
+        assert_eq!(
+            response_parts(&server.request("GET", &published_nar_path)).1,
+            published_nar
+        );
+        assert!(!fixture.invocation_log.exists(), "push must not invoke Nix");
+    }
+
+    let wrong_payload_claim = signed_narinfo(&local_hash, local_nar.len() as u64)
+        .replace(
+            &format!("URL: nar/{local_hash}.nar"),
+            &format!("URL: nar/{published_hash}.nar"),
+        )
+        .replace(
+            &format!("FileHash: sha256:{local_hash}"),
+            &format!("FileHash: sha256:{published_hash}"),
+        )
+        .replace(
+            &format!("FileSize: {}", local_nar.len()),
+            &format!("FileSize: {}", published_nar.len()),
+        );
+    let rejected =
+        server.request_with_body("PUT", &narinfo_path, &[], wrong_payload_claim.as_bytes());
+    assert!(
+        response_parts(&rejected)
+            .0
+            .starts_with("HTTP/1.1 422 Unprocessable Entity\r\n")
+    );
+    assert_eq!(
+        response_parts(&server.request("GET", &narinfo_path)).1,
+        published_narinfo.as_bytes()
+    );
+    let (signal, status) = server.stop();
+    assert!(signal.success());
+    assert!(status.success());
+}
+
+#[test]
 fn native_push_uploads_when_upstream_metadata_is_not_an_exact_trusted_match() {
     let nar_bytes = native_nar_bytes();
     let nar_hash = nix32_sha256(&nar_bytes);
@@ -1051,16 +1168,20 @@ struct NativePushFixture {
 }
 
 fn native_nar_bytes() -> Vec<u8> {
+    native_nar_bytes_with_contents(NAR_BYTES)
+}
+
+fn native_nar_bytes_with_contents(contents: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
     let mut encoder = Encoder::new(&mut output).expect("create native NAR fixture encoder");
     encoder
         .push(NarEvent::BeginFile {
             executable: false,
-            size: NAR_BYTES.len() as u64,
+            size: contents.len() as u64,
         })
         .expect("begin native NAR fixture file");
     encoder
-        .push(NarEvent::FileChunk(NAR_BYTES))
+        .push(NarEvent::FileChunk(contents))
         .expect("write native NAR fixture file");
     encoder
         .push(NarEvent::EndFile)

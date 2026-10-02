@@ -101,10 +101,10 @@ impl<'a> CacheLookup<'a> {
             DestinationNarinfoPolicy::Refresh => Ok(PushDisposition::UploadRequired),
             DestinationNarinfoPolicy::ReuseExisting => {
                 match self.destination.narinfo_state(info)? {
-                    DestinationNarinfoState::MatchesExpected => {
-                        Ok(PushDisposition::DestinationPresent)
+                    DestinationNarinfoState::Present => Ok(PushDisposition::DestinationPresent),
+                    DestinationNarinfoState::DifferentStorePath => {
+                        Ok(PushDisposition::DestinationConflict)
                     }
-                    DestinationNarinfoState::Different => Ok(PushDisposition::DestinationConflict),
                     DestinationNarinfoState::Unusable => Ok(PushDisposition::UploadRequired),
                     DestinationNarinfoState::Missing => Ok(self.classify_upstream(info)),
                 }

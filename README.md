@@ -149,9 +149,11 @@ Netrc credentials are sent over HTTPS unless `--insecure-http` is supplied.
 That flag is needed for the local HTTP example above. Upload requests have a
 30-second timeout by default; change it with `--timeout-seconds`.
 
-Matching paths already at the destination are skipped. `--refresh` forces
-uploads. Conflicting metadata fails the push; `--ignore-conflicts` skips those
-paths and continues.
+Valid publications for the same full store path are skipped, even when a local
+build has a different NAR hash, size, or references. The first valid publication
+wins. `--refresh` forces uploads but does not replace existing metadata; a
+concurrent publication of the same path is also treated as destination-present.
+Other immutable conflicts fail the push; `--ignore-conflicts` skips them.
 
 ### Skip paths available from another cache
 
