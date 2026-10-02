@@ -41,6 +41,7 @@ const DESCRIPTOR_DRAFT: &str = ".narjar-layout.next";
 pub const CACHE_POLICY_DIRECTORIES: &[&str] = &["auth"];
 pub const CACHE_POLICY_FILES: &[&str] =
     &["nix-cache-info", "trusted-public-keys", "auth/write.tokens"];
+pub const CACHE_RECOVERY_MARKERS: [&str; 2] = [".narjar-clean", ".narjar-recovery"];
 
 pub fn storage_directories(backend: SupportedStorageBackend) -> impl Iterator<Item = &'static str> {
     let backend_directories = match backend.0 {
@@ -259,9 +260,11 @@ impl CacheLayout {
             require_directory_at(&parent, leaf).map(drop)
         })?;
         require_private_file_at(&self.root, "lock", true)?;
-        let clean = require_private_file_at(&self.root, ".narjar-clean", false)?;
-        let recovery = require_private_file_at(&self.root, ".narjar-recovery", false)?;
-        match (clean, recovery) {
+        let [clean, recovery] = CACHE_RECOVERY_MARKERS;
+        match (
+            require_private_file_at(&self.root, clean, false)?,
+            require_private_file_at(&self.root, recovery, false)?,
+        ) {
             (false, false) => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "data directory is not initialized",

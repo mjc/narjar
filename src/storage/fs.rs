@@ -215,13 +215,18 @@ pub(super) fn require_directory_at(parent: &File, name: &str) -> io::Result<File
     validate_directory(&directory, name)
 }
 
+/// Required permission bits for private layout and policy files.
+pub const fn private_file_mode_is_valid(mode: u32) -> bool {
+    mode & 0o777 == 0o600
+}
+
 pub(super) fn require_private_file_at(
     parent: &File,
     name: &str,
     required: bool,
 ) -> io::Result<bool> {
     match open_regular_at(parent, OsStr::new(name)) {
-        Ok(file) if file.metadata()?.permissions().mode() & 0o777 == 0o600 => Ok(true),
+        Ok(file) if private_file_mode_is_valid(file.metadata()?.permissions().mode()) => Ok(true),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{name} must have 0600 permissions"),

@@ -21,11 +21,11 @@ use narjar::__private::{
     },
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
-        CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, CleanupOutcome, Directory, LAYOUT_DESCRIPTOR,
-        ReconcileClass, Storage, StorageBackend, StorageCapacity, StoreHash,
-        SupportedStorageBackend, capacity_from_statvfs,
+        CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, CACHE_RECOVERY_MARKERS, CachePolicies,
+        CleanupOutcome, Directory, LAYOUT_DESCRIPTOR, ReconcileClass, Storage, StorageBackend,
+        StorageCapacity, StoreHash, SupportedStorageBackend, capacity_from_statvfs,
         gc::{self, GcMode, GcOptions, GcReport},
-        storage_directories,
+        private_file_mode_is_valid, storage_directories,
     },
 };
 use narjar::object::WireEncoding;
@@ -803,6 +803,7 @@ fn inspect_doctor(root: &Path, backend: SupportedStorageBackend) -> Result<Docto
         paths.push(inspect_doctor_path(root, path, true, false));
     }
     paths.push(inspect_doctor_path(root, "auth/read.tokens", false, false));
+    paths.extend(inspect_doctor_recovery_markers(root));
 
     let mut capacities = Vec::new();
     for (path, relative) in [("root", Path::new("")), ("nar", Path::new("nar"))] {
@@ -891,12 +892,25 @@ fn validate_doctor_native_store(
 ) -> Result<(), &'static str> {
     let data_directory =
         Directory::open(data_dir).map_err(|_| "Narjar data directory is unavailable")?;
-    let trusted_keys = TrustedPublicKeys::load(&data_directory)
-        .map_err(|_| "trusted signature policy is invalid")?;
+    let (_, trusted_keys) = CachePolicies::load(&data_directory)
+        .map_err(|_| "cache policy is invalid")?
+        .into_parts();
     settings
         .validate(data_dir, &trusted_keys)
         .map(drop)
         .map_err(|error| error.doctor_detail())
+}
+
+fn inspect_doctor_recovery_markers(root: &Path) -> [DoctorPath; 2] {
+    let markers = CACHE_RECOVERY_MARKERS.map(|name| inspect_doctor_path(root, name, false, false));
+    match markers.each_ref().map(|marker| marker.mode) {
+        [None, None] => markers.map(|mut marker| {
+            marker.severity = DoctorSeverity::Error;
+            marker.detail = "cache requires a clean or recovery marker".to_owned();
+            marker
+        }),
+        [Some(_), _] | [None, Some(_)] => markers,
+    }
 }
 
 fn inspect_doctor_path(
@@ -951,7 +965,7 @@ fn inspect_doctor_path(
     let unsafe_mode = if directory {
         mode & 0o022 != 0
     } else {
-        mode & 0o133 != 0
+        !private_file_mode_is_valid(mode)
     };
     let severity = if wrong_type || unsafe_mode {
         DoctorSeverity::Error
@@ -1686,6 +1700,115 @@ machine other.example password other-secret
     }
 
     #[test]
+    fn doctor_rejects_private_file_modes_that_startup_rejects() {
+        let directory = initialized_doctor_cache();
+        for name in ["lock", LAYOUT_DESCRIPTOR]
+            .into_iter()
+            .chain(CACHE_POLICY_FILES.iter().copied())
+        {
+            let path = directory.path().join(name);
+            for mode in [0o400, 0o644, 0o660] {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                let report =
+                    inspect_doctor(directory.path(), SupportedStorageBackend::FLAT).unwrap();
+                let entry = report
+                    .paths
+                    .iter()
+                    .find(|entry| entry.path == name)
+                    .unwrap();
+                assert!(
+                    entry.severity.is_failure(),
+                    "doctor accepted {name} with mode {mode:04o}"
+                );
+                assert!(report.has_failures());
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(
+            !inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
+                .unwrap()
+                .has_failures()
+        );
+    }
+
+    #[test]
+    fn doctor_requires_one_private_recovery_marker_and_checks_both_when_present() {
+        let directory = initialized_doctor_cache();
+        let clean = directory.path().join(".narjar-clean");
+        let recovery = directory.path().join(".narjar-recovery");
+        let report = || inspect_doctor(directory.path(), SupportedStorageBackend::FLAT).unwrap();
+        assert!(!report().has_failures(), "a clean cache is complete");
+        fs::remove_file(&clean).unwrap();
+        assert!(
+            report().has_failures(),
+            "neither marker is not an initialized cache"
+        );
+        fs::write(&recovery, b"interrupted\n").unwrap();
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!report().has_failures(), "a recovery marker is sufficient");
+        fs::write(&clean, b"").unwrap();
+        fs::set_permissions(&clean, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            report().has_failures(),
+            "a valid recovery marker cannot hide an unsafe clean marker"
+        );
+        fs::set_permissions(&clean, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            !report().has_failures(),
+            "both private markers are permitted"
+        );
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            report().has_failures(),
+            "a valid clean marker cannot hide an unsafe recovery marker"
+        );
+    }
+
+    #[test]
+    fn native_doctor_loads_the_same_required_policies_as_startup() {
+        let directory = initialized_doctor_cache();
+        let settings = NativeStoreSettings::new(
+            directory.path().join("missing-store"),
+            directory.path().join("native-state"),
+            directory.path().join("native-roots"),
+            NonZeroU64::new(60).unwrap(),
+        );
+        for name in CACHE_POLICY_FILES {
+            let path = directory.path().join(name);
+            let original = fs::read(&path).unwrap();
+            fs::remove_file(&path).unwrap();
+            assert_eq!(
+                validate_doctor_native_store(directory.path(), &settings),
+                Err("cache policy is invalid")
+            );
+            assert!(!path.exists(), "doctor must not recreate {name}");
+            fs::write(&path, original).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::write(
+            directory.path().join("auth/write.tokens"),
+            b"invalid token record\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_doctor_native_store(directory.path(), &settings),
+            Err("cache policy is invalid")
+        );
+    }
+
+    fn initialized_doctor_cache() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+            storage_backend: StorageBackend::Flat,
+        })
+        .unwrap();
+        directory
+    }
+
+    #[test]
     fn doctor_requires_the_same_receipt_and_transaction_directories_as_storage_open() {
         let directory = tempfile::tempdir().unwrap();
         init(Init {
@@ -1886,7 +2009,7 @@ machine other.example password other-secret
 
     #[test]
     fn native_source_doctor_reports_validation_without_echoing_configured_paths() {
-        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let directory = initialized_doctor_cache();
         let options = Doctor {
             data_dir: directory.path().to_owned(),
             json: true,

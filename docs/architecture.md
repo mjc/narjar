@@ -114,6 +114,8 @@ Exact v0.1 layout:
 ~~~text
 DATA/
   .narjar-layout                    selected canonical backend descriptor
+  .narjar-clean or .narjar-recovery  recovery state; at least one is required
+  .narjar-transactions/             publication recovery journal
   .narjar-chunks/                   chunked backend only: sharded raw chunks
     <hex-shard>/<chunk-sha256>
   .narjar-manifests/                chunked backend only: ordered manifests
@@ -140,6 +142,9 @@ DATA/
   .narjar-egress/
     <raw-hash>.nar.zst.receipt           raw-to-egress identity binding
     <raw-hash>.nar.xz.receipt
+  .narjar-ingress/
+    <encoded-hash>.nar.zst.receipt       upload-to-raw identity binding
+    <encoded-hash>.nar.xz.receipt
   trusted-public-keys                   mode 0600
   lock                                  single-writer process lock
 ~~~
@@ -151,11 +156,13 @@ access. Paths are constructed from validated identifiers, never joined from a
 raw request path.
 
 No startup index or full scan is needed to serve: an exact route maps to an
-exact file or logical manifest. Startup creates required directories, validates
-the selected layout descriptor and modes, acquires the process lock, and
-removes no data. `nix-cache-info` is validated when it is read or published;
-offline inventory commands validate it as part of their own work. Offline
-reconcile and GC perform the potentially unbounded scans.
+exact file or logical manifest. Startup acquires the process lock and requires
+the existing layout descriptor, directories, private lock file, and a clean or
+recovery marker. Opening the layout creates or repairs no entries; use
+`narjar init` to complete interrupted initialization. `nix-cache-info` is
+validated when it is read or published; offline inventory commands validate it
+as part of their own work. Offline reconcile and GC perform the potentially
+unbounded scans.
 
 ## Canonical storage backends
 
