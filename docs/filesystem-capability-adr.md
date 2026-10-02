@@ -34,8 +34,9 @@ not a readable NAR.
 
 Chunked storage is rejected on macOS before storage initialization. Its current
 publication contract relies on Linux `syncfs` to order newly linked chunks
-before manifest publication. The macOS fallback cannot establish equivalent
-durability for chunk contents and entries spread across shard directories.
+before manifest publication. Backend preparation supplies that barrier to the
+chunk store; manifest publication requires a completed durability transition.
+There is no single-file synchronization fallback for chunk publication.
 Apple documents that ordinary `fsync` does not provide the write-ordering and
 device-cache guarantees needed for this contract. Narjar does not claim
 crash-durable chunked storage on APFS. The flat backend is supported on macOS

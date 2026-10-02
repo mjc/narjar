@@ -1939,7 +1939,7 @@ fn serve_rejects_uninitialized_data_dir() {
     assert!(
         String::from_utf8(output.stderr)
             .expect("stderr should be UTF-8")
-            .contains("nar is unavailable")
+            .contains("missing its storage-layout descriptor")
     );
 }
 
@@ -1969,7 +1969,69 @@ fn serve_rejects_partial_data_dir() {
     assert!(
         String::from_utf8(output.stderr)
             .expect("stderr should be UTF-8")
-            .contains("nix-cache-info is unavailable")
+            .contains("missing its storage-layout descriptor")
+    );
+}
+
+#[test]
+fn serve_requires_each_startup_policy_file_without_recreating_it() {
+    for relative in ["nix-cache-info", "trusted-public-keys", "auth/write.tokens"] {
+        let root = init_data_dir("missing-startup-policy");
+        let missing = root.join(relative);
+        fs::remove_file(&missing).unwrap();
+        let output = run(&[
+            "serve",
+            "--data-dir",
+            root.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+        ]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains(relative.rsplit('/').next().unwrap())
+        );
+        assert!(
+            !missing.exists(),
+            "opening cannot silently replace {relative}"
+        );
+    }
+}
+
+#[test]
+fn initialization_creates_a_private_root_even_with_a_group_writable_umask() {
+    use std::os::unix::process::CommandExt;
+    let parent = data_dir("group-writable-umask");
+    let root = parent.join("cache");
+    let mut child = command();
+    child.args(["init", "--data-dir", root.to_str().unwrap()]);
+    // SAFETY: pre_exec changes only the child process; umask is an async-signal-safe
+    // syscall with no allocation or access to inherited locks. The parent and
+    // parallel tests retain their own masks.
+    unsafe {
+        child.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let opened = narjar::__private::storage::Directory::open(&root).unwrap();
+    assert!(
+        narjar::__private::storage::Storage::open(
+            &opened,
+            narjar::__private::storage::SupportedStorageBackend::FLAT
+        )
+        .is_ok()
     );
 }
 
@@ -6335,18 +6397,7 @@ fn restored_cache_verifies_before_serving() {
     )
     .expect("narinfo should be written");
 
-    let restored = data_dir("backup-restored");
-    for directory in [
-        "nar",
-        "nar/.tmp",
-        ".tmp",
-        "realisations",
-        "realisations/.tmp",
-        "auth",
-        ".narjar-validation",
-    ] {
-        fs::create_dir_all(restored.join(directory)).expect("restore directory should be created");
-    }
+    let restored = init_data_dir("backup-restored");
     for relative in [
         ".narjar-clean",
         ".narjar-layout",
@@ -6500,10 +6551,11 @@ fn gc_recovers_a_published_nar_before_eviction_and_restart() {
 
     let root = narjar::__private::storage::Directory::open(data_dir.path())
         .expect("cache root should reopen after GC");
-    let storage = narjar::__private::storage::Storage::initialize(
+    let storage = narjar::__private::storage::CacheCreation::prepare(
         &root,
         narjar::__private::storage::SupportedStorageBackend::FLAT,
     )
+    .and_then(|creation| creation.create_or_complete())
     .expect("cache storage should restart after GC");
     assert!(
         !storage
@@ -6581,10 +6633,11 @@ fn delete_recovers_a_published_narinfo_before_removing_it() {
 
     let root = narjar::__private::storage::Directory::open(data_dir.path())
         .expect("cache root should reopen after delete");
-    let storage = narjar::__private::storage::Storage::initialize(
+    let storage = narjar::__private::storage::CacheCreation::prepare(
         &root,
         narjar::__private::storage::SupportedStorageBackend::FLAT,
     )
+    .and_then(|creation| creation.create_or_complete())
     .expect("cache storage should restart after delete");
     assert!(
         !storage

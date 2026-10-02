@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::Read,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -11,9 +11,7 @@ use data_encoding::BASE64;
 use ed25519_dalek::SigningKey;
 use narjar::__private::maintenance::FILE_NAMES as MAINTENANCE_FILES;
 use narjar::__private::storage::{
-    CHUNK_DIRECTORY, Directory, EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY,
-    LAYOUT_DESCRIPTOR, MANIFEST_DIRECTORY, NAR_DIRECTORY, REALISATIONS_DIRECTORY, Storage,
-    StorageBackend, SupportedStorageBackend, TEMPORARY_DIRECTORY, VALIDATION_DIRECTORY,
+    CacheCreation, Directory, StorageBackend, SupportedStorageBackend, storage_root_entries,
 };
 
 use crate::error::Error;
@@ -54,31 +52,18 @@ pub(crate) fn initialize_cache(
         reject_unexpected_init_entries(&root)?;
         reject_unexpected_auth_entries(&root)?;
     } else {
-        fs::create_dir_all(&root).map_err(runtime)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&root)
+            .map_err(runtime)?;
     }
 
+    let directory = Directory::open(&root).map_err(runtime)?;
+    let creation = CacheCreation::prepare(&directory, backend).map_err(runtime)?;
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(runtime)?;
     create_recovery_marker(&root)?;
-    create_file(
-        &root.join(LAYOUT_DESCRIPTOR),
-        backend.backend().layout_descriptor(),
-        0o600,
-        true,
-    )?;
-    let directory = Directory::open(&root).map_err(runtime)?;
-    let storage = Storage::initialize(&directory, backend).map_err(runtime)?;
-    for directory in [
-        NAR_DIRECTORY,
-        TEMPORARY_DIRECTORY,
-        REALISATIONS_DIRECTORY,
-        VALIDATION_DIRECTORY,
-        INGESTION_RECEIPT_DIRECTORY,
-        EGRESS_RECEIPT_DIRECTORY,
-        CHUNK_DIRECTORY,
-        MANIFEST_DIRECTORY,
-    ] {
-        ensure_directory(&root.join(directory), 0o700)?;
-    }
+    let storage = creation.create_or_complete().map_err(runtime)?;
     ensure_directory(&root.join("auth"), 0o700)?;
     create_file(
         &root.join("nix-cache-info"),
@@ -96,24 +81,7 @@ pub(crate) fn initialize_cache(
     Ok(())
 }
 
-const INIT_ROOT_ENTRIES: &[&str] = &[
-    ".narjar-clean",
-    INGESTION_RECEIPT_DIRECTORY,
-    EGRESS_RECEIPT_DIRECTORY,
-    CHUNK_DIRECTORY,
-    MANIFEST_DIRECTORY,
-    ".narjar-recovery",
-    LAYOUT_DESCRIPTOR,
-    ".narjar-transactions",
-    VALIDATION_DIRECTORY,
-    TEMPORARY_DIRECTORY,
-    "auth",
-    NAR_DIRECTORY,
-    "nix-cache-info",
-    "lock",
-    REALISATIONS_DIRECTORY,
-    "trusted-public-keys",
-];
+const INIT_ROOT_ENTRIES: &[&str] = &["auth", "nix-cache-info", "trusted-public-keys"];
 
 fn reject_unexpected_init_entries(root: &Path) -> Result<(), Error> {
     let mut unexpected = BTreeSet::new();
@@ -122,6 +90,8 @@ fn reject_unexpected_init_entries(root: &Path) -> Result<(), Error> {
         let name = entry.file_name();
         let allowed = INIT_ROOT_ENTRIES
             .iter()
+            .copied()
+            .chain(storage_root_entries())
             .any(|allowed| name == std::ffi::OsStr::new(allowed))
             || MAINTENANCE_FILES
                 .iter()

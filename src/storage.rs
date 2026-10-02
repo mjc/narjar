@@ -77,6 +77,10 @@ pub use backend::{
 pub use directory::Directory;
 pub(crate) use egress::{NarReadBody, VerifiedCanonicalNar};
 pub use ids::{InvalidObjectId, StoreHash, validate_store_basename};
+pub use initialization::{
+    CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, CacheCreation, CachePolicies,
+    storage_directories, storage_root_entries,
+};
 pub use publication::{NarUploadPolicy, PublishOutcome, StagingReservation, StorageError};
 pub use recovery::RecoveryStatus;
 pub use state::Storage;

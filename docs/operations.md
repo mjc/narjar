@@ -462,8 +462,9 @@ policy. A corrupt or incomplete copy must remain offline: `doctor`,
 
 Executable backup/restore coverage is the
 [`restored_cache_verifies_before_serving`](../tests/cli.rs) integration test;
-it copies a cache into a new DATA directory, runs reconciliation, verification,
-and doctor, then starts the restored service before accepting readiness.
+it initializes a fresh destination layout, restores the cache files, runs
+reconciliation, verification, and doctor, then starts the restored service before
+accepting readiness.
 
 ### Optional ZFS snapshot and replication workflow
 

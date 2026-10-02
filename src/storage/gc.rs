@@ -227,7 +227,7 @@ pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
     let backend = SupportedStorageBackend::try_from(options.backend)
         .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
     let root = Directory::open(&options.data_dir)?;
-    let storage = Storage::initialize(&root, backend)?;
+    let storage = Storage::open(&root, backend)?;
     let trusted = TrustedPublicKeys::load(&root).map_err(|error| invalid(error.to_string()))?;
     match options.mode {
         GcMode::DryRun => run_dry_run(options, &storage, &trusted),
@@ -1664,7 +1664,7 @@ fn invalid(message: impl Into<String>) -> StorageError {
 mod tests {
     use super::*;
     use crate::object::NarFileName;
-    use crate::storage::{Directory, NarUploadPolicy};
+    use crate::storage::{CacheCreation, Directory, NarUploadPolicy};
     use sha2::Digest;
     use std::{
         fs,
@@ -1686,15 +1686,17 @@ mod tests {
     }
 
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
-        Storage::initialize(&Directory::open(path)?, SupportedStorageBackend::FLAT)
+        CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
+            .and_then(|creation| creation.create_or_complete())
     }
 
     #[cfg(not(target_os = "macos"))]
     fn initialize_chunked_storage(path: &Path) -> Result<Storage, StorageError> {
-        Storage::initialize(
+        CacheCreation::prepare(
             &Directory::open(path)?,
             StorageBackend::Chunked.try_into().unwrap(),
         )
+        .and_then(|creation| creation.create_or_complete())
     }
 
     fn select_candidates(

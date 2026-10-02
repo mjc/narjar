@@ -21,16 +21,21 @@ use narjar::__private::{
     },
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     storage::{
-        CleanupOutcome, Directory, ReconcileClass, Storage, StorageBackend, StorageCapacity,
-        StoreHash, SupportedStorageBackend, capacity_from_statvfs,
+        CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, CleanupOutcome, Directory, LAYOUT_DESCRIPTOR,
+        ReconcileClass, Storage, StorageBackend, StorageCapacity, StoreHash,
+        SupportedStorageBackend, capacity_from_statvfs,
         gc::{self, GcMode, GcOptions, GcReport},
+        storage_directories,
     },
 };
 use narjar::object::WireEncoding;
 use ureq::Agent;
 
 use crate::{
-    config::ServeSourceChoice, error::Error, http_url::HttpUrl, native_store::NativeStoreSettings,
+    config::{ServeSource, ServeSourceChoice, SourcePreparationError},
+    error::Error,
+    http_url::HttpUrl,
+    native_store::{NativeStoreOptions, NativeStoreSettings},
 };
 
 mod lifecycle;
@@ -669,6 +674,22 @@ pub(crate) struct Doctor {
     storage_backend: StorageBackend,
 }
 
+impl Doctor {
+    fn prepare_source(&self) -> Result<ServeSource, SourcePreparationError> {
+        ServeSource::prepare(
+            self.serve_source,
+            self.storage_backend,
+            self.egress_compression,
+            NativeStoreOptions {
+                store_dir: self.native_store_dir.as_deref(),
+                state_dir: self.native_state_dir.as_deref(),
+                roots_dir: self.native_roots_dir.as_deref(),
+                min_lease_seconds: self.native_min_lease_seconds,
+            },
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DoctorSeverity {
     Ok,
@@ -738,28 +759,23 @@ impl DoctorReport {
     }
 }
 
-const DOCTOR_DIRECTORIES: &[&str] = &[
-    "",
-    "nar",
-    "nar/.tmp",
-    ".tmp",
-    "realisations",
-    "realisations/.tmp",
-    "auth",
-    ".narjar-validation",
-];
-const DOCTOR_FILES: &[&str] = &[
-    "lock",
-    "nix-cache-info",
-    "trusted-public-keys",
-    "auth/write.tokens",
-];
-
 pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
-    let backend = SupportedStorageBackend::try_from(options.storage_backend)
-        .map_err(|error| Error::usage(error.to_string()))?;
-    let mut report = inspect_doctor(&options.data_dir)?;
-    report.source = inspect_doctor_source(&options, backend);
+    let source = options.prepare_source();
+    let backend = match &source {
+        Err(SourcePreparationError::UnsupportedBackend(error)) => {
+            return Err(Error::usage(error.to_string()));
+        }
+        Err(
+            SourcePreparationError::NativeOptionsForCache
+            | SourcePreparationError::MissingNativeOptions
+            | SourcePreparationError::NativeCompressedOutput
+            | SourcePreparationError::NativeChunkedBackend,
+        ) => SupportedStorageBackend::try_from(options.storage_backend)
+            .map_err(|error| Error::usage(error.to_string()))?,
+        Ok(source) => source.storage_backend(),
+    };
+    let mut report = inspect_doctor(&options.data_dir, backend)?;
+    report.source = inspect_doctor_source(&options, source);
     let failed = report.has_failures();
     if options.json {
         println!("{}", doctor_json(&report));
@@ -772,14 +788,18 @@ pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
     Ok(())
 }
 
-fn inspect_doctor(root: &Path) -> Result<DoctorReport, Error> {
+fn inspect_doctor(root: &Path, backend: SupportedStorageBackend) -> Result<DoctorReport, Error> {
     let mut paths = Vec::new();
-    for path in DOCTOR_DIRECTORIES {
+    for path in std::iter::once("")
+        .chain(storage_directories(backend))
+        .chain(CACHE_POLICY_DIRECTORIES.iter().copied())
+    {
         paths.push(inspect_doctor_path(root, path, true, true));
     }
-    paths.push(inspect_doctor_path(root, ".narjar-ingress", false, true));
-    paths.push(inspect_doctor_path(root, ".narjar-egress", false, true));
-    for path in DOCTOR_FILES {
+    for path in ["lock", LAYOUT_DESCRIPTOR]
+        .into_iter()
+        .chain(CACHE_POLICY_FILES.iter().copied())
+    {
         paths.push(inspect_doctor_path(root, path, true, false));
     }
     paths.push(inspect_doctor_path(root, "auth/read.tokens", false, false));
@@ -841,93 +861,42 @@ fn inspect_doctor(root: &Path) -> Result<DoctorReport, Error> {
     })
 }
 
-fn inspect_doctor_source(options: &Doctor, backend: SupportedStorageBackend) -> DoctorSource {
-    let native_options = (
-        options.native_store_dir.as_deref(),
-        options.native_state_dir.as_deref(),
-        options.native_roots_dir.as_deref(),
-        options.native_min_lease_seconds,
-    );
-    match (options.serve_source, native_options) {
-        (ServeSourceChoice::FlatCache, (None, None, None, None)) => DoctorSource {
-            name: "flat-cache",
-            severity: DoctorSeverity::Ok,
-            detail: "selected",
-        },
-        (ServeSourceChoice::FlatCache, _) => DoctorSource {
-            name: "flat-cache",
-            severity: DoctorSeverity::Error,
-            detail: "native source options require native-store selection",
-        },
-        (
-            ServeSourceChoice::NativeStore,
-            (Some(store_dir), Some(state_dir), Some(roots_dir), Some(min_lease_seconds)),
-        ) => validate_doctor_native_store(
-            options,
-            backend,
-            store_dir,
-            state_dir,
-            roots_dir,
-            min_lease_seconds,
+fn inspect_doctor_source(
+    options: &Doctor,
+    source: Result<ServeSource, SourcePreparationError>,
+) -> DoctorSource {
+    let (name, validation) = match source {
+        Ok(ServeSource::FlatCache { .. }) => ("flat-cache", Ok("selected")),
+        Err(error) => (options.serve_source.name(), Err(error.doctor_detail())),
+        Ok(ServeSource::NativeStore(settings)) => (
+            "native-store",
+            validate_doctor_native_store(&options.data_dir, &settings)
+                .map(|()| "source configuration is valid"),
         ),
-        (ServeSourceChoice::NativeStore, _) => DoctorSource {
-            name: "native-store",
-            severity: DoctorSeverity::Error,
-            detail: "required native source options are missing",
-        },
+    };
+    let (severity, detail) = match validation {
+        Ok(detail) => (DoctorSeverity::Ok, detail),
+        Err(detail) => (DoctorSeverity::Error, detail),
+    };
+    DoctorSource {
+        name,
+        severity,
+        detail,
     }
 }
 
 fn validate_doctor_native_store(
-    options: &Doctor,
-    backend: SupportedStorageBackend,
-    store_dir: &Path,
-    state_dir: &Path,
-    roots_dir: &Path,
-    min_lease_seconds: NonZeroU64,
-) -> DoctorSource {
-    let output_is_raw_flat = options.egress_compression == WireEncoding::Raw
-        && backend.backend() == StorageBackend::Flat;
-    let data_directory = Directory::open(&options.data_dir);
-    match (output_is_raw_flat, data_directory) {
-        (false, _) => DoctorSource {
-            name: "native-store",
-            severity: DoctorSeverity::Error,
-            detail: "native source requires raw output and flat storage",
-        },
-        (true, Err(_)) => DoctorSource {
-            name: "native-store",
-            severity: DoctorSeverity::Error,
-            detail: "Narjar data directory is unavailable",
-        },
-        (true, Ok(data_directory)) => match TrustedPublicKeys::load(&data_directory) {
-            Err(_) => DoctorSource {
-                name: "native-store",
-                severity: DoctorSeverity::Error,
-                detail: "trusted signature policy is invalid",
-            },
-            Ok(trusted_keys) => {
-                let settings = NativeStoreSettings::new(
-                    store_dir.to_owned(),
-                    state_dir.to_owned(),
-                    roots_dir.to_owned(),
-                    min_lease_seconds,
-                );
-                match settings.validate(&options.data_dir, &trusted_keys) {
-                    Ok(_) => DoctorSource {
-                        name: "native-store",
-                        severity: DoctorSeverity::Ok,
-                        detail: "source configuration is valid",
-                    },
-                    Err(error) => DoctorSource {
-                        name: "native-store",
-                        severity: DoctorSeverity::Error,
-                        detail: error.doctor_detail(),
-                    },
-                }
-            }
-        },
-    }
+    data_dir: &Path,
+    settings: &NativeStoreSettings,
+) -> Result<(), &'static str> {
+    let data_directory =
+        Directory::open(data_dir).map_err(|_| "Narjar data directory is unavailable")?;
+    let trusted_keys = TrustedPublicKeys::load(&data_directory)
+        .map_err(|_| "trusted signature policy is invalid")?;
+    settings
+        .validate(data_dir, &trusted_keys)
+        .map(drop)
+        .map_err(|error| error.doctor_detail())
 }
 
 fn inspect_doctor_path(
@@ -1276,7 +1245,7 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use narjar::__private::maintenance::{Operation, Outcome};
-    use narjar::__private::storage::{Directory, SupportedStorageBackend};
+    use narjar::__private::storage::{CacheCreation, Directory, SupportedStorageBackend};
 
     #[test]
     fn managed_file_conflict_never_replaces_existing_contents_or_leaves_temps() {
@@ -1353,7 +1322,8 @@ machine other.example password other-secret
         })
         .expect("maintenance records should be accepted by repeated initialization");
         let root = Directory::open(directory.path()).expect("cache root should open");
-        let storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
+        let storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .and_then(|creation| creation.create_or_complete())
             .expect("cache storage should initialize");
         let report = storage
             .reconcile(
@@ -1382,7 +1352,8 @@ machine other.example password other-secret
         let before = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should be readable");
         let root = Directory::open(directory.path()).expect("cache root should open");
-        let _active_storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
+        let _active_storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .and_then(|creation| creation.create_or_complete())
             .expect("first operation should hold the cache lock");
 
         let result = gc(Gc {
@@ -1427,7 +1398,8 @@ machine other.example password other-secret
         let before = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should be readable");
         let root = Directory::open(directory.path()).expect("cache root should open");
-        let _active_storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
+        let _active_storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .and_then(|creation| creation.create_or_complete())
             .expect("first operation should hold the cache lock");
 
         let result = verify(Verify {
@@ -1462,7 +1434,8 @@ machine other.example password other-secret
         let narinfo = directory.path().join(format!("{store_hash}.narinfo"));
         fs::write(&narinfo, b"published metadata fixture").expect("fixture should be written");
         let root = Directory::open(directory.path()).expect("cache root should open");
-        let _active_storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
+        let _active_storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .and_then(|creation| creation.create_or_complete())
             .expect("first operation should hold the cache lock");
 
         let result = delete(Delete {
@@ -1539,7 +1512,8 @@ machine other.example password other-secret
         );
 
         let root = Directory::open(directory.path()).expect("cache root should reopen");
-        let storage = Storage::initialize(&root, SupportedStorageBackend::FLAT)
+        let storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .and_then(|creation| creation.create_or_complete())
             .expect("cache storage should reopen");
         assert!(
             !storage
@@ -1712,6 +1686,35 @@ machine other.example password other-secret
     }
 
     #[test]
+    fn doctor_requires_the_same_receipt_and_transaction_directories_as_storage_open() {
+        let directory = tempfile::tempdir().unwrap();
+        init(Init {
+            data_dir: directory.path().to_owned(),
+            priority: 30,
+            private_read: false,
+            storage_backend: StorageBackend::Flat,
+        })
+        .unwrap();
+        for missing in [".narjar-transactions", ".narjar-ingress", ".narjar-egress"] {
+            let path = directory.path().join(missing);
+            fs::remove_dir(&path).unwrap();
+            let report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT).unwrap();
+            let entry = report
+                .paths
+                .iter()
+                .find(|entry| entry.path == missing)
+                .unwrap();
+            assert!(entry.required);
+            assert!(
+                entry.severity.is_failure(),
+                "doctor cannot approve a layout Storage::open refuses: {missing}"
+            );
+            assert!(report.has_failures());
+            fs::create_dir(path).unwrap();
+        }
+    }
+
+    #[test]
     fn init_rejects_unknown_entries_before_creating_recovery_state() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         fs::write(directory.path().join("unexpected"), b"do not touch")
@@ -1740,7 +1743,8 @@ machine other.example password other-secret
         })
         .expect("cache should initialize");
 
-        let report = inspect_doctor(directory.path()).expect("doctor should inspect cache");
+        let report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
+            .expect("doctor should inspect cache");
         let json = doctor_json(&report);
         assert!(json.contains("\"schema\":1"));
         assert!(json.contains("\"mount\":{\"severity\":\"ok\""));
@@ -1748,6 +1752,136 @@ machine other.example password other-secret
         assert!(json.contains("\"total_bytes\":"));
         assert!(json.contains("\"lease\":{\"severity\":\"ok\""));
         assert!(json.contains("\"source\":{\"name\":\"flat-cache\""));
+    }
+
+    #[test]
+    fn doctor_source_policy_errors_keep_the_existing_static_details() {
+        use narjar::object::CompressionCodec;
+
+        let complete = NativeStoreOptions {
+            store_dir: Some(Path::new("/private/store-path")),
+            state_dir: Some(Path::new("/private/state-path")),
+            roots_dir: Some(Path::new("/private/roots-path")),
+            min_lease_seconds: NonZeroU64::new(60),
+        };
+        for (choice, native, encoding, backend, expected_error, detail) in [
+            (
+                ServeSourceChoice::FlatCache,
+                complete,
+                WireEncoding::Raw,
+                StorageBackend::Flat,
+                SourcePreparationError::NativeOptionsForCache,
+                "native source options require native-store selection",
+            ),
+            (
+                ServeSourceChoice::NativeStore,
+                NativeStoreOptions {
+                    state_dir: None,
+                    ..complete
+                },
+                WireEncoding::Raw,
+                StorageBackend::Flat,
+                SourcePreparationError::MissingNativeOptions,
+                "required native source options are missing",
+            ),
+            (
+                ServeSourceChoice::NativeStore,
+                complete,
+                WireEncoding::Compressed(CompressionCodec::Xz),
+                StorageBackend::Flat,
+                SourcePreparationError::NativeCompressedOutput,
+                "native source requires raw output and flat storage",
+            ),
+            (
+                ServeSourceChoice::NativeStore,
+                complete,
+                WireEncoding::Compressed(CompressionCodec::Zstd),
+                StorageBackend::Flat,
+                SourcePreparationError::NativeCompressedOutput,
+                "native source requires raw output and flat storage",
+            ),
+            (
+                ServeSourceChoice::NativeStore,
+                complete,
+                WireEncoding::Raw,
+                StorageBackend::Chunked,
+                SourcePreparationError::NativeChunkedBackend,
+                "native source requires raw output and flat storage",
+            ),
+        ] {
+            let options = Doctor {
+                data_dir: PathBuf::from("/unavailable/narjar-cache"),
+                json: true,
+                serve_source: choice,
+                native_store_dir: native.store_dir.map(Path::to_owned),
+                native_state_dir: native.state_dir.map(Path::to_owned),
+                native_roots_dir: native.roots_dir.map(Path::to_owned),
+                native_min_lease_seconds: native.min_lease_seconds,
+                egress_compression: encoding,
+                storage_backend: backend,
+            };
+            let source = options.prepare_source();
+            assert_eq!(
+                source.as_ref().unwrap_err(),
+                &expected_error,
+                "doctor must use the same source policy as serve"
+            );
+            let diagnostic = inspect_doctor_source(&options, source);
+            assert_eq!(diagnostic.name, choice.name());
+            assert!(matches!(diagnostic.severity, DoctorSeverity::Error));
+            assert_eq!(
+                diagnostic.detail, detail,
+                "policy errors must retain static details instead of inspecting unavailable paths"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn doctor_rejects_unsupported_backend_before_reporting_other_source_errors() {
+        use narjar::object::CompressionCodec;
+
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        for (choice, complete, encoding) in [
+            (ServeSourceChoice::FlatCache, true, WireEncoding::Raw),
+            (ServeSourceChoice::NativeStore, false, WireEncoding::Raw),
+            (ServeSourceChoice::NativeStore, true, WireEncoding::Raw),
+            (
+                ServeSourceChoice::NativeStore,
+                true,
+                WireEncoding::Compressed(CompressionCodec::Xz),
+            ),
+            (
+                ServeSourceChoice::NativeStore,
+                true,
+                WireEncoding::Compressed(CompressionCodec::Zstd),
+            ),
+        ] {
+            let options = Doctor {
+                data_dir: directory.path().to_owned(),
+                json: true,
+                serve_source: choice,
+                native_store_dir: Some(directory.path().join("private-store")),
+                native_state_dir: complete.then(|| directory.path().join("private-state")),
+                native_roots_dir: Some(directory.path().join("private-roots")),
+                native_min_lease_seconds: NonZeroU64::new(60),
+                egress_compression: encoding,
+                storage_backend: StorageBackend::Chunked,
+            };
+            let error = doctor(options).expect_err("unsupported backend must be a usage error");
+            assert_eq!(error.exit_code(), 2);
+            assert_eq!(
+                error.to_string(),
+                "chunked storage is not supported on macOS; choose flat"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("cache should remain readable")
+                .count(),
+            0,
+            "failed source preparation must not create cache or native directories"
+        );
     }
 
     #[test]
@@ -1764,8 +1898,9 @@ machine other.example password other-secret
             egress_compression: WireEncoding::Raw,
             storage_backend: StorageBackend::Flat,
         };
-        let mut report = inspect_doctor(directory.path()).expect("doctor should inspect cache");
-        report.source = inspect_doctor_source(&options, SupportedStorageBackend::FLAT);
+        let mut report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
+            .expect("doctor should inspect cache");
+        report.source = inspect_doctor_source(&options, options.prepare_source());
         let json = doctor_json(&report);
 
         assert!(json.contains("\"name\":\"native-store\""));
@@ -1790,7 +1925,8 @@ machine other.example password other-secret
         fs::write(directory.path().join("nar"), b"wrong type")
             .expect("replacement should be writable");
 
-        let report = inspect_doctor(directory.path()).expect("doctor should inspect cache");
+        let report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
+            .expect("doctor should inspect cache");
         let nar = report
             .paths
             .iter()
@@ -1813,7 +1949,8 @@ machine other.example password other-secret
         let held = File::open(directory.path()).expect("data directory should open");
         doctor_try_lease(&held).expect("test should hold the lease");
 
-        let report = inspect_doctor(directory.path()).expect("doctor should inspect cache");
+        let report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
+            .expect("doctor should inspect cache");
         assert!(matches!(report.lease, DoctorSeverity::Warning));
         assert!(report.lease_detail.contains("held"));
     }

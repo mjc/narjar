@@ -173,8 +173,31 @@ conversion.
 Backend-name parsing is platform-independent. Preparing a storage operation
 converts the selected `StorageBackend` into `SupportedStorageBackend`;
 unsupported selections fail before directory creation or modification.
-`Storage::initialize` requires that capability rather than checking support
-again. `init` and `setup` share the same capability-requiring cache initializer.
+`CacheCreation::prepare` binds that capability to an exclusively locked root.
+Its consuming `create_or_complete` operation creates the selected payload
+layout and completes interrupted initialization. Flat creation does not create
+chunk or manifest directories. The layout descriptor is staged, synced, and
+installed with a no-replace hard link; an interrupted descriptor draft is
+removed when initialization resumes.
+
+`Storage::open` requires the existing descriptor, directories, private lock
+file, and recovery marker. It does not create missing entries or change their
+permissions. Serving and maintenance load authorization and trusted keys
+through `CachePolicies`, which requires the complete private policy layout.
+Storage recovery remains a separate operation.
+
+The chunk store owns its supported publication barrier. Chunk completion
+consumes the receiving writer, verifies the measured NAR identity and record
+coverage, makes newly published chunks durable, then publishes the manifest.
+Only the durable state exposes manifest publication. Reusing chunks skips the
+filesystem barrier only when a verified completed manifest proves their prior
+durability. Identical chunks left by an interrupted or failed upload still
+require synchronization.
+
+Serve configuration stores backend and output selection in the prepared cache
+source. The native-store source has fixed raw output and flat storage; those
+choices cannot contradict its source selection. Serve and doctor use the same
+source-preparation rules.
 
 The flat backend stores the complete decoded NAR at `nar/<NarHash>.nar`.
 The Linux chunked backend stores the exact decoded byte stream as immutable

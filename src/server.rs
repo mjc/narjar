@@ -18,7 +18,8 @@ use narjar::__private::{
     narinfo::TrustedPublicKeys,
     object::WireEncoding,
     storage::{
-        Directory, NarUploadPolicy, RecoveryStatus, StagingReservation, Storage, StorageError,
+        CachePolicies, Directory, NarUploadPolicy, RecoveryStatus, StagingReservation, Storage,
+        StorageError,
     },
 };
 use signal_hook::{
@@ -367,16 +368,25 @@ struct ServerResources {
 fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, Error> {
     let root_directory =
         Directory::open(&config.data_dir).map_err(|error| Error::runtime(error.to_string()))?;
-    root_directory.validate_initialized().map_err(|error| {
+    let storage = Storage::open(&root_directory, config.storage_backend()).map_err(|error| {
         Error::runtime(format!(
             "data directory is not initialized at {}: {error}",
             config.data_dir.display()
         ))
     })?;
+    let (authorizer, trusted_keys) = CachePolicies::load(&root_directory)
+        .map_err(|error| {
+            Error::runtime(format!("cannot load initialized cache policies: {error}"))
+        })?
+        .into_parts();
     match &config.source {
-        ServeSource::FlatCache => initialize_flat_cache_resources(config, &root_directory),
+        ServeSource::FlatCache { .. } => {
+            initialize_flat_cache_resources(storage, authorizer, trusted_keys)
+        }
         ServeSource::NativeStore(settings) => {
-            validate_native_store_source(config, &root_directory, settings)?;
+            settings
+                .validate(&config.data_dir, &trusted_keys)
+                .map_err(|error| Error::runtime(error.to_string()))?;
             Err(Error::runtime(
                 "native-store source passed startup validation, but native-store request serving is not implemented yet",
             ))
@@ -385,40 +395,16 @@ fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, 
 }
 
 fn initialize_flat_cache_resources(
-    config: &ServeConfig,
-    root_directory: &Directory,
+    storage: Storage,
+    authorizer: Authorizer,
+    trusted_keys: TrustedPublicKeys,
 ) -> Result<ServerResources, Error> {
-    let storage = Storage::initialize(root_directory, config.storage_backend).map_err(|error| {
-        Error::runtime(format!(
-            "cannot initialize data directory {}: {error}",
-            config.data_dir.display()
-        ))
-    })?;
-    let authorizer = Authorizer::load(root_directory)
-        .map_err(|error| Error::runtime(format!("cannot load authorization policy: {error}")))?;
-    let trusted_keys = TrustedPublicKeys::load(root_directory)
-        .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
     recover_server_storage(&storage, &trusted_keys)?;
     Ok(ServerResources {
         storage: Arc::new(storage),
         authorizer: Arc::new(authorizer),
         trusted_keys: Arc::new(trusted_keys),
     })
-}
-
-fn validate_native_store_source(
-    config: &ServeConfig,
-    root_directory: &Directory,
-    settings: &crate::native_store::NativeStoreSettings,
-) -> Result<(), Error> {
-    Authorizer::load(root_directory)
-        .map_err(|error| Error::runtime(format!("cannot load authorization policy: {error}")))?;
-    let trusted_keys = TrustedPublicKeys::load(root_directory)
-        .map_err(|error| Error::runtime(format!("cannot load trusted public keys: {error}")))?;
-    let _validated_source = settings
-        .validate(&config.data_dir, &trusted_keys)
-        .map_err(|error| Error::runtime(error.to_string()))?;
-    Ok(())
 }
 
 fn recover_server_storage(
@@ -589,7 +575,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .map_err(|error| Error::runtime(format!("cannot report listener: {error}")))?;
 
     let min_free_bytes = config.min_free_bytes;
-    let egress_compression = config.egress_compression;
+    let egress_compression = config.egress_compression();
     let upload_policy = NarUploadPolicy::with_limits(
         config.max_encoded_nar_bytes.get(),
         config.max_nar_bytes.get(),

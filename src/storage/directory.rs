@@ -3,7 +3,7 @@ use std::{fs::File, io, os::unix::fs::PermissionsExt, path::Path};
 #[cfg(test)]
 use std::path::PathBuf;
 
-use super::fs::{open_directory, require_directory_at, require_private_file_at};
+use super::fs::open_directory;
 
 #[derive(Debug)]
 pub struct Directory {
@@ -42,28 +42,5 @@ impl Directory {
 
     pub(crate) fn file(&self) -> &File {
         &self.file
-    }
-
-    pub fn validate_initialized(&self) -> io::Result<()> {
-        let nar = require_directory_at(&self.file, "nar")?;
-        require_directory_at(&nar, ".tmp")?;
-        require_directory_at(&self.file, ".tmp")?;
-        let realisations = require_directory_at(&self.file, "realisations")?;
-        require_directory_at(&realisations, ".tmp")?;
-        let auth = require_directory_at(&self.file, "auth")?;
-        for name in ["nix-cache-info", "trusted-public-keys"] {
-            require_private_file_at(&self.file, name, true)?;
-        }
-        require_private_file_at(&auth, "write.tokens", true)?;
-        let clean = require_private_file_at(&self.file, ".narjar-clean", false)?;
-        let recovery = require_private_file_at(&self.file, ".narjar-recovery", false)?;
-        if clean || recovery {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "data directory is not initialized",
-            ))
-        }
     }
 }

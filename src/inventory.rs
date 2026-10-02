@@ -652,7 +652,7 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{NarUploadPolicy, SupportedStorageBackend};
+    use crate::storage::{CacheCreation, NarUploadPolicy, SupportedStorageBackend};
     #[cfg(not(target_os = "macos"))]
     use crate::storage::{PublishOutcome, StorageBackend};
     use sha2::{Digest, Sha256};
@@ -677,7 +677,9 @@ mod tests {
     fn flat_availability_checks_size_without_reading_contents() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
-        let storage = Storage::initialize(&root, SupportedStorageBackend::FLAT).unwrap();
+        let storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .and_then(|creation| creation.create_or_complete())
+            .unwrap();
         let raw = b"canonical raw nar";
         let hash = NarHash::from_digest(Sha256::digest(raw).into());
         let identity = crate::object::NarIdentity::new(hash, (raw.len() as u64).into());
@@ -726,8 +728,9 @@ mod tests {
     fn chunked_storage_inventory_checks_the_manifest_backed_nar() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
-        let storage =
-            Storage::initialize(&root, StorageBackend::Chunked.try_into().unwrap()).unwrap();
+        let storage = CacheCreation::prepare(&root, StorageBackend::Chunked.try_into().unwrap())
+            .and_then(|creation| creation.create_or_complete())
+            .unwrap();
         let raw = vec![b'i'; 100_000];
         let hash = NarHash::from_digest(Sha256::digest(&raw).into());
         let name = NarFileName::raw(hash);

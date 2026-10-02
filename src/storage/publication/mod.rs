@@ -235,7 +235,7 @@ impl ProcessLock {
                 io::Error::new(io::ErrorKind::InvalidData, "lock is not a regular file").into(),
             );
         }
-        if metadata.permissions().mode() & 0o133 != 0 {
+        if metadata.permissions().mode() & 0o777 != 0o600 {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidData, "lock has unsafe permissions").into(),
             );
