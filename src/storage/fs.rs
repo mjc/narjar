@@ -215,13 +215,18 @@ pub(super) fn require_directory_at(parent: &File, name: &str) -> io::Result<File
     validate_directory(&directory, name)
 }
 
+/// Required permission bits for private layout and policy files.
+pub const fn private_file_mode_is_valid(mode: u32) -> bool {
+    mode & 0o777 == 0o600
+}
+
 pub(super) fn require_private_file_at(
     parent: &File,
     name: &str,
     required: bool,
 ) -> io::Result<bool> {
     match open_regular_at(parent, OsStr::new(name)) {
-        Ok(file) if file.metadata()?.permissions().mode() & 0o777 == 0o600 => Ok(true),
+        Ok(file) if private_file_mode_is_valid(file.metadata()?.permissions().mode()) => Ok(true),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{name} must have 0600 permissions"),
@@ -584,68 +589,6 @@ fn set_errno(error_code: libc::c_int) {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(super) fn directory_is_empty(directory: &File) -> io::Result<bool> {
-    let directory = open_at(
-        directory,
-        OsStr::new("."),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-    )?;
-    let mut buffer = [0u8; 1024];
-
-    loop {
-        // SAFETY: directory owns a live directory descriptor and buffer is
-        // valid writable storage for the requested byte count.
-        let bytes = unsafe {
-            libc::syscall(
-                libc::SYS_getdents64,
-                directory.as_raw_fd(),
-                buffer.as_mut_ptr(),
-                buffer.len(),
-            )
-        };
-        if bytes < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let bytes = bytes as usize;
-        if bytes == 0 {
-            return Ok(true);
-        }
-
-        let mut offset = 0;
-        while offset < bytes {
-            if bytes - offset < 19 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "short getdents64 record",
-                ));
-            }
-            let reclen = u16::from_ne_bytes([buffer[offset + 16], buffer[offset + 17]]) as usize;
-            if reclen < 19 || reclen > bytes - offset {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid getdents64 record length",
-                ));
-            }
-            let name = &buffer[offset + 19..offset + reclen];
-            let name = name
-                .iter()
-                .position(|byte| *byte == 0)
-                .map_or(name, |end| &name[..end]);
-            if name != b"." && name != b".." {
-                return Ok(false);
-            }
-            offset += reclen;
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn directory_is_empty(directory: &File) -> io::Result<bool> {
-    read_dir_names(directory).map(|names| names.is_empty())
-}
-
 pub(super) fn rollback_link_at(directory: &File, name: &OsStr) -> Result<(), StorageError> {
     unlink_at(directory, name)?;
     directory.sync_all()?;
@@ -685,11 +628,6 @@ pub(super) fn sync_filesystem(file: &File) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn sync_filesystem(file: &File) -> io::Result<()> {
-    file.sync_all()
 }
 
 #[cfg(test)]

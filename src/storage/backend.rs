@@ -45,17 +45,47 @@ impl std::error::Error for UnsupportedStorageBackend {}
 /// ```compile_fail
 /// use narjar::__private::storage::{Directory, Storage, StorageBackend};
 /// fn initialize(root: &Directory) {
-///     let _ = Storage::initialize(root, StorageBackend::Chunked);
+///     let _ = Storage::open(root, StorageBackend::Chunked);
 /// }
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SupportedStorageBackend(StorageBackend);
+pub struct SupportedStorageBackend(pub(super) BackendSupport);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BackendSupport {
+    Flat,
+    Chunked(ChunkDurability),
+}
+
+/// Construction capability for the implemented whole-filesystem publication barrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ChunkDurability(());
+
+impl ChunkDurability {
+    pub(super) fn synchronize(self, directory: &std::fs::File) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            super::fs::sync_filesystem(directory)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = directory;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "chunk publication has no supported durability barrier",
+            ))
+        }
+    }
+}
 
 impl SupportedStorageBackend {
-    pub const FLAT: Self = Self(StorageBackend::Flat);
+    pub const FLAT: Self = Self(BackendSupport::Flat);
 
     pub const fn backend(self) -> StorageBackend {
-        self.0
+        match self.0 {
+            BackendSupport::Flat => StorageBackend::Flat,
+            BackendSupport::Chunked(_) => StorageBackend::Chunked,
+        }
     }
 }
 
@@ -68,7 +98,7 @@ impl TryFrom<StorageBackend> for SupportedStorageBackend {
             StorageBackend::Chunked => {
                 #[cfg(target_os = "linux")]
                 {
-                    Ok(Self(backend))
+                    Ok(Self(BackendSupport::Chunked(ChunkDurability(()))))
                 }
                 #[cfg(target_os = "macos")]
                 {

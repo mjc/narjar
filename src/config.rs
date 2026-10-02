@@ -7,11 +7,11 @@ use std::{
 use clap::Args;
 use clap::ValueEnum;
 use narjar::{
-    __private::storage::{StorageBackend, SupportedStorageBackend},
+    __private::storage::{StorageBackend, SupportedStorageBackend, UnsupportedStorageBackend},
     object::WireEncoding,
 };
 
-use crate::native_store::NativeStoreSettings;
+use crate::native_store::{NativeStoreOptions, NativeStoreSettings};
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
@@ -25,17 +25,153 @@ pub(crate) struct ServeConfig {
     pub(crate) min_free_bytes: u64,
     pub(crate) shutdown_grace_seconds: NonZeroU64,
     pub(crate) io_timeout_seconds: NonZeroU64,
-    pub(crate) egress_compression: WireEncoding,
-    pub(crate) storage_backend: SupportedStorageBackend,
     pub(crate) source: ServeSource,
     pub(crate) stats_inventory_interval_seconds: Option<NonZeroU64>,
     pub(crate) stats_filesystem_sample: Option<PathBuf>,
 }
 
+/// Prepared source selection; native-store output is inherently flat/raw.
 #[derive(Debug)]
 pub(crate) enum ServeSource {
-    FlatCache,
+    FlatCache {
+        storage_backend: SupportedStorageBackend,
+        egress_compression: WireEncoding,
+    },
     NativeStore(NativeStoreSettings),
+}
+
+impl ServeConfig {
+    pub(crate) const fn storage_backend(&self) -> SupportedStorageBackend {
+        self.source.storage_backend()
+    }
+
+    pub(crate) const fn egress_compression(&self) -> WireEncoding {
+        self.source.egress_compression()
+    }
+}
+
+impl ServeSource {
+    pub(crate) fn prepare(
+        choice: ServeSourceChoice,
+        storage_backend: StorageBackend,
+        egress_compression: WireEncoding,
+        native: NativeStoreOptions<'_>,
+    ) -> Result<Self, SourcePreparationError> {
+        match (choice, native) {
+            (
+                ServeSourceChoice::FlatCache,
+                NativeStoreOptions {
+                    store_dir: None,
+                    state_dir: None,
+                    roots_dir: None,
+                    min_lease_seconds: None,
+                },
+            ) => Ok(Self::FlatCache {
+                storage_backend: SupportedStorageBackend::try_from(storage_backend)
+                    .map_err(SourcePreparationError::UnsupportedBackend)?,
+                egress_compression,
+            }),
+            (ServeSourceChoice::FlatCache, _) => Err(SourcePreparationError::NativeOptionsForCache),
+            (
+                ServeSourceChoice::NativeStore,
+                NativeStoreOptions {
+                    store_dir: Some(store_dir),
+                    state_dir: Some(state_dir),
+                    roots_dir: Some(roots_dir),
+                    min_lease_seconds: Some(min_lease_seconds),
+                },
+            ) => match (egress_compression, storage_backend) {
+                (WireEncoding::Raw, StorageBackend::Flat) => {
+                    Ok(Self::NativeStore(NativeStoreSettings::new(
+                        store_dir.to_owned(),
+                        state_dir.to_owned(),
+                        roots_dir.to_owned(),
+                        min_lease_seconds,
+                    )))
+                }
+                (WireEncoding::Raw, StorageBackend::Chunked) => {
+                    Err(SourcePreparationError::NativeChunkedBackend)
+                }
+                (WireEncoding::Compressed(_), _) => {
+                    Err(SourcePreparationError::NativeCompressedOutput)
+                }
+            },
+            (ServeSourceChoice::NativeStore, _) => {
+                Err(SourcePreparationError::MissingNativeOptions)
+            }
+        }
+    }
+
+    pub(crate) const fn storage_backend(&self) -> SupportedStorageBackend {
+        match self {
+            Self::FlatCache {
+                storage_backend, ..
+            } => *storage_backend,
+            Self::NativeStore(_) => SupportedStorageBackend::FLAT,
+        }
+    }
+
+    pub(crate) const fn egress_compression(&self) -> WireEncoding {
+        match self {
+            Self::FlatCache {
+                egress_compression, ..
+            } => *egress_compression,
+            Self::NativeStore(_) => WireEncoding::Raw,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourcePreparationError {
+    NativeOptionsForCache,
+    MissingNativeOptions,
+    NativeCompressedOutput,
+    NativeChunkedBackend,
+    UnsupportedBackend(UnsupportedStorageBackend),
+}
+
+impl SourcePreparationError {
+    pub(crate) const fn doctor_detail(self) -> &'static str {
+        match self {
+            Self::NativeOptionsForCache => "native source options require native-store selection",
+            Self::MissingNativeOptions => "required native source options are missing",
+            Self::NativeCompressedOutput | Self::NativeChunkedBackend => {
+                "native source requires raw output and flat storage"
+            }
+            Self::UnsupportedBackend(_) => "storage backend is unsupported on this platform",
+        }
+    }
+}
+
+impl std::fmt::Display for SourcePreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NativeOptionsForCache => "native-store options require --serve-source native-store",
+            Self::MissingNativeOptions => concat!(
+                "native-store source requires --native-store-dir, --native-state-dir, ",
+                "--native-roots-dir, and --native-min-lease-seconds"
+            ),
+            Self::NativeCompressedOutput => {
+                "native-store source requires uncompressed output (--egress-compression none)"
+            }
+            Self::NativeChunkedBackend => {
+                "native-store source requires the flat storage backend during initial raw output support"
+            }
+            Self::UnsupportedBackend(error) => return std::fmt::Display::fmt(error, formatter),
+        })
+    }
+}
+
+impl std::error::Error for SourcePreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnsupportedBackend(error) => Some(error),
+            Self::NativeOptionsForCache
+            | Self::MissingNativeOptions
+            | Self::NativeCompressedOutput
+            | Self::NativeChunkedBackend => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -43,6 +179,15 @@ pub(crate) enum ServeSourceChoice {
     #[default]
     FlatCache,
     NativeStore,
+}
+
+impl ServeSourceChoice {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::FlatCache => "flat-cache",
+            Self::NativeStore => "native-store",
+        }
+    }
 }
 
 #[derive(Args)]
@@ -108,7 +253,18 @@ impl TryFrom<ServeArgs> for ServeConfig {
     type Error = String;
 
     fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
-        let source = serve_source_from_args(&args)?;
+        let source = ServeSource::prepare(
+            args.source,
+            args.storage_backend,
+            args.egress_compression,
+            NativeStoreOptions {
+                store_dir: args.native_store_dir.as_deref(),
+                state_dir: args.native_state_dir.as_deref(),
+                roots_dir: args.native_roots_dir.as_deref(),
+                min_lease_seconds: args.native_min_lease_seconds,
+            },
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             data_dir: args.data_dir,
             listen: args.listen,
@@ -120,59 +276,10 @@ impl TryFrom<ServeArgs> for ServeConfig {
             min_free_bytes: args.min_free_bytes,
             shutdown_grace_seconds: args.shutdown_grace_seconds,
             io_timeout_seconds: args.io_timeout_seconds,
-            egress_compression: args.egress_compression,
-            storage_backend: SupportedStorageBackend::try_from(args.storage_backend)
-                .map_err(|error| error.to_string())?,
             source,
             stats_inventory_interval_seconds: args.stats_inventory_interval_seconds,
             stats_filesystem_sample: args.stats_filesystem_sample,
         })
-    }
-}
-
-fn serve_source_from_args(args: &ServeArgs) -> Result<ServeSource, String> {
-    let native_store_options = (
-        args.native_store_dir.as_deref(),
-        args.native_state_dir.as_deref(),
-        args.native_roots_dir.as_deref(),
-        args.native_min_lease_seconds,
-    );
-    match (args.source, native_store_options) {
-        (ServeSourceChoice::FlatCache, (None, None, None, None)) => Ok(ServeSource::FlatCache),
-        (ServeSourceChoice::FlatCache, _) => {
-            Err("native-store options require --serve-source native-store".to_owned())
-        }
-        (
-            ServeSourceChoice::NativeStore,
-            (Some(store_dir), Some(state_dir), Some(roots_dir), Some(min_lease_seconds)),
-        ) => {
-            require_raw_flat_native_output(args)?;
-            Ok(ServeSource::NativeStore(NativeStoreSettings::new(
-                store_dir.to_owned(),
-                state_dir.to_owned(),
-                roots_dir.to_owned(),
-                min_lease_seconds,
-            )))
-        }
-        (ServeSourceChoice::NativeStore, _) => Err(concat!(
-            "native-store source requires --native-store-dir, --native-state-dir, ",
-            "--native-roots-dir, and --native-min-lease-seconds"
-        )
-        .to_owned()),
-    }
-}
-
-fn require_raw_flat_native_output(args: &ServeArgs) -> Result<(), String> {
-    match (args.egress_compression, args.storage_backend) {
-        (WireEncoding::Raw, StorageBackend::Flat) => Ok(()),
-        (WireEncoding::Raw, StorageBackend::Chunked) => Err(
-            "native-store source requires the flat storage backend during initial raw output support"
-                .to_owned(),
-        ),
-        (WireEncoding::Compressed(_), _) => Err(
-            "native-store source requires uncompressed output (--egress-compression none)"
-                .to_owned(),
-        ),
     }
 }
 
@@ -186,8 +293,140 @@ fn non_empty_path(value: &str) -> Result<PathBuf, String> {
 mod tests {
     use clap::{Args as _, Command, FromArgMatches};
     use std::num::NonZeroU64;
+    use std::path::Path;
 
-    use super::{ServeArgs, ServeConfig, ServeSource};
+    use narjar::__private::storage::{StorageBackend, SupportedStorageBackend};
+    use narjar::object::{CompressionCodec, WireEncoding};
+
+    use super::{ServeArgs, ServeConfig, ServeSource, ServeSourceChoice, SourcePreparationError};
+    use crate::native_store::NativeStoreOptions;
+
+    fn native_options() -> NativeStoreOptions<'static> {
+        NativeStoreOptions {
+            store_dir: Some(Path::new("/nix/store")),
+            state_dir: Some(Path::new("/nix/var/nix")),
+            roots_dir: Some(Path::new("/var/lib/narjar-roots")),
+            min_lease_seconds: NonZeroU64::new(60),
+        }
+    }
+
+    #[test]
+    fn source_preparation_checks_all_native_options_before_output_policy() {
+        let complete = native_options();
+        for present in 0..16 {
+            let options = NativeStoreOptions {
+                store_dir: (present & 1 != 0).then_some(complete.store_dir).flatten(),
+                state_dir: (present & 2 != 0).then_some(complete.state_dir).flatten(),
+                roots_dir: (present & 4 != 0).then_some(complete.roots_dir).flatten(),
+                min_lease_seconds: (present & 8 != 0)
+                    .then_some(complete.min_lease_seconds)
+                    .flatten(),
+            };
+            let native = ServeSource::prepare(
+                ServeSourceChoice::NativeStore,
+                StorageBackend::Flat,
+                WireEncoding::Raw,
+                options,
+            );
+            match present {
+                15 => {
+                    let source = native.expect("complete native options should prepare");
+                    assert!(matches!(source, ServeSource::NativeStore(_)));
+                    assert_eq!(source.storage_backend(), SupportedStorageBackend::FLAT);
+                    assert_eq!(source.egress_compression(), WireEncoding::Raw);
+                }
+                _ => assert_eq!(
+                    native.unwrap_err(),
+                    SourcePreparationError::MissingNativeOptions,
+                    "native preparation requires all four options (present mask: {present:#06b})"
+                ),
+            }
+
+            let cache = ServeSource::prepare(
+                ServeSourceChoice::FlatCache,
+                StorageBackend::Flat,
+                WireEncoding::Raw,
+                options,
+            );
+            match present {
+                0 => assert!(matches!(cache.unwrap(), ServeSource::FlatCache { .. })),
+                _ => assert_eq!(
+                    cache.unwrap_err(),
+                    SourcePreparationError::NativeOptionsForCache,
+                    "cache preparation must reject every native option (present mask: {present:#06b})"
+                ),
+            }
+        }
+
+        assert_eq!(
+            ServeSource::prepare(
+                ServeSourceChoice::NativeStore,
+                StorageBackend::Chunked,
+                WireEncoding::Compressed(CompressionCodec::Zstd),
+                NativeStoreOptions::default(),
+            )
+            .unwrap_err(),
+            SourcePreparationError::MissingNativeOptions,
+            "serve reports missing source options before incompatible backend/output choices"
+        );
+    }
+
+    #[test]
+    fn prepared_cache_retains_the_selected_backend_and_output() {
+        for backend in [
+            StorageBackend::Flat,
+            #[cfg(target_os = "linux")]
+            StorageBackend::Chunked,
+        ] {
+            for encoding in [
+                WireEncoding::Raw,
+                WireEncoding::Compressed(CompressionCodec::Xz),
+                WireEncoding::Compressed(CompressionCodec::Zstd),
+            ] {
+                let source = ServeSource::prepare(
+                    ServeSourceChoice::FlatCache,
+                    backend,
+                    encoding,
+                    NativeStoreOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(source.storage_backend().backend(), backend);
+                assert_eq!(source.egress_compression(), encoding);
+            }
+        }
+    }
+
+    #[test]
+    fn native_output_policy_has_typed_errors_and_static_doctor_details() {
+        for backend in [StorageBackend::Flat, StorageBackend::Chunked] {
+            for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
+                let error = ServeSource::prepare(
+                    ServeSourceChoice::NativeStore,
+                    backend,
+                    WireEncoding::Compressed(codec),
+                    native_options(),
+                )
+                .unwrap_err();
+                assert_eq!(error, SourcePreparationError::NativeCompressedOutput);
+                assert_eq!(
+                    error.doctor_detail(),
+                    "native source requires raw output and flat storage"
+                );
+            }
+        }
+        let error = ServeSource::prepare(
+            ServeSourceChoice::NativeStore,
+            StorageBackend::Chunked,
+            WireEncoding::Raw,
+            native_options(),
+        )
+        .unwrap_err();
+        assert_eq!(error, SourcePreparationError::NativeChunkedBackend);
+        assert_eq!(
+            error.doctor_detail(),
+            "native source requires raw output and flat storage"
+        );
+    }
 
     #[test]
     fn inventory_interval_flag_defaults_to_fifteen_minutes_and_remains_optional() {
@@ -264,7 +503,9 @@ mod tests {
         let args = ServeArgs::from_arg_matches(&matches).expect("serve arguments should parse");
         let config = ServeConfig::try_from(args).expect("flat-cache config should validate");
 
-        assert!(matches!(config.source, ServeSource::FlatCache));
+        assert!(matches!(config.source, ServeSource::FlatCache { .. }));
+        assert_eq!(config.storage_backend(), SupportedStorageBackend::FLAT);
+        assert_eq!(config.egress_compression(), WireEncoding::Raw);
     }
 
     #[test]

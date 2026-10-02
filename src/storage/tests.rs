@@ -21,8 +21,8 @@ use super::fs::{StorageCapacity, remove_temp, reserve_staging_bytes_for_test, sy
 use super::ids::nix32_sha256;
 use super::publication::{DecoderMemoryLimit, Layout, PublishBoundary, PublishTarget};
 use super::{
-    CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage, StorageBackend,
-    StorageError, StoreHash, SupportedStorageBackend, capacity_error_kind,
+    CacheCreation, CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage,
+    StorageBackend, StorageError, StoreHash, SupportedStorageBackend, capacity_error_kind,
 };
 use crate::narinfo::NarInfoClaims;
 use crate::object::{
@@ -61,7 +61,8 @@ fn egress_receipt_round_trips_through_compact_binary_serialization() {
 }
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
-    Storage::initialize(&Directory::open(path)?, SupportedStorageBackend::FLAT)
+    CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
+        .and_then(|creation| creation.create_or_complete())
 }
 
 #[test]
@@ -183,10 +184,11 @@ fn population_scan_can_be_cancelled_without_returning_partial_totals() {
 #[cfg(not(target_os = "macos"))]
 fn chunked_ingestion_publishes_a_verified_manifest() {
     let directory = TestDir::new();
-    let storage = Storage::initialize(
+    let storage = CacheCreation::prepare(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked.try_into().unwrap(),
     )
+    .and_then(|creation| creation.create_or_complete())
     .unwrap();
     let raw = vec![b'x'; 100_000];
     let hash = NarHash::from_digest(Sha256::digest(&raw).into());
@@ -233,10 +235,11 @@ fn chunked_ingestion_publishes_a_verified_manifest() {
 #[cfg(not(target_os = "macos"))]
 fn chunked_backend_routes_the_complete_nar_publication() {
     let directory = TestDir::new();
-    let storage = Storage::initialize(
+    let storage = CacheCreation::prepare(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked.try_into().unwrap(),
     )
+    .and_then(|creation| creation.create_or_complete())
     .unwrap();
     let raw = vec![b'c'; 100_000];
     let hash = NarHash::from_digest(Sha256::digest(&raw).into());
@@ -293,10 +296,11 @@ fn chunked_backend_routes_the_complete_nar_publication() {
 #[cfg(not(target_os = "macos"))]
 fn chunked_upload_enforces_encoded_size_before_creating_staging() {
     let directory = TestDir::new();
-    let storage = Storage::initialize(
+    let storage = CacheCreation::prepare(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked.try_into().unwrap(),
     )
+    .and_then(|creation| creation.create_or_complete())
     .unwrap();
     let raw = b"compressed body larger than encoded upload limit";
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
@@ -345,10 +349,11 @@ fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
         StorageBackend::Chunked,
     ] {
         let directory = TestDir::new();
-        let storage = Storage::initialize(
+        let storage = CacheCreation::prepare(
             &Directory::open(directory.path()).unwrap(),
             backend.try_into().unwrap(),
         )
+        .and_then(|creation| creation.create_or_complete())
         .unwrap();
         let raw = vec![b'u'; 100_000];
         let hash = NarHash::from_digest(Sha256::digest(&raw).into());
@@ -390,10 +395,11 @@ fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
 #[cfg(not(target_os = "macos"))]
 fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     let directory = TestDir::new();
-    let storage = Storage::initialize(
+    let storage = CacheCreation::prepare(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked.try_into().unwrap(),
     )
+    .and_then(|creation| creation.create_or_complete())
     .unwrap();
     let raw = vec![b'm'; 100_000];
     let hash = NarHash::from_digest(Sha256::digest(&raw).into());
@@ -427,10 +433,11 @@ fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
 #[cfg(not(target_os = "macos"))]
 fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
     let directory = TestDir::new();
-    let storage = Storage::initialize(
+    let storage = CacheCreation::prepare(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked.try_into().unwrap(),
     )
+    .and_then(|creation| creation.create_or_complete())
     .unwrap();
     let raw = vec![b's'; 100_000];
     let hash = NarHash::from_digest(Sha256::digest(&raw).into());
@@ -471,10 +478,11 @@ fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
 #[test]
 fn flat_canonical_nar_rejects_same_size_corruption() {
     let directory = TestDir::new();
-    let storage = Storage::initialize(
+    let storage = CacheCreation::prepare(
         &Directory::open(directory.path()).unwrap(),
         SupportedStorageBackend::FLAT,
     )
+    .and_then(|creation| creation.create_or_complete())
     .unwrap();
     let raw = vec![b'f'; 4096];
     let hash = NarHash::from_digest(Sha256::digest(&raw).into());
@@ -1716,10 +1724,11 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     let output = {
-        let storage = Storage::initialize(
+        let storage = CacheCreation::prepare(
             &Directory::open(directory.path()).unwrap(),
             StorageBackend::Chunked.try_into().unwrap(),
         )
+        .and_then(|creation| creation.create_or_complete())
         .unwrap();
         storage
             .publish_nar(
@@ -1736,10 +1745,11 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
         output
     };
 
-    let restarted = Storage::initialize(
+    let restarted = CacheCreation::prepare(
         &Directory::open(directory.path()).unwrap(),
         StorageBackend::Chunked.try_into().unwrap(),
     )
+    .and_then(|creation| creation.create_or_complete())
     .unwrap();
     restarted.finish_recovery().unwrap();
     assert_eq!(
@@ -2279,7 +2289,74 @@ fn initialization_creates_only_the_fixed_layout() {
     assert!(directory.path().join(".tmp").is_dir());
     assert!(directory.path().join("realisations").is_dir());
     assert!(directory.path().join("realisations/.tmp").is_dir());
+    assert!(!directory.path().join(super::CHUNK_DIRECTORY).exists());
+    assert!(!directory.path().join(super::MANIFEST_DIRECTORY).exists());
     assert_eq!(storage.layout(), &Layout::new(directory.path().to_owned()));
+}
+
+#[test]
+fn interrupted_descriptor_staging_is_replaced_before_completing_creation() {
+    let directory = TestDir::new();
+    let staging = directory.path().join(".narjar-layout.next");
+    fs::write(&staging, b"partial descriptor").unwrap();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(initialize_storage(directory.path()).unwrap());
+    assert!(
+        !staging.exists(),
+        "initialization must not leave its abandoned descriptor draft"
+    );
+    let root = Directory::open(directory.path()).unwrap();
+    assert!(Storage::open(&root, SupportedStorageBackend::FLAT).is_ok());
+}
+
+#[test]
+fn explicit_creation_can_complete_a_layout_that_opening_refuses() {
+    let directory = TestDir::new();
+    drop(initialize_storage(directory.path()).unwrap());
+    let receipts = directory.path().join(super::EGRESS_RECEIPT_DIRECTORY);
+    fs::remove_dir(&receipts).unwrap();
+    let root = Directory::open(directory.path()).unwrap();
+    assert!(Storage::open(&root, SupportedStorageBackend::FLAT).is_err());
+    assert!(!receipts.exists());
+    drop(
+        CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .unwrap()
+            .create_or_complete()
+            .unwrap(),
+    );
+    assert!(receipts.is_dir());
+    assert!(Storage::open(&root, SupportedStorageBackend::FLAT).is_ok());
+}
+
+#[test]
+fn opening_a_mismatched_layout_does_not_create_storage_entries() {
+    let directory = TestDir::new();
+    fs::write(
+        directory.path().join(super::LAYOUT_DESCRIPTOR),
+        b"wrong layout\n",
+    )
+    .unwrap();
+    let root = Directory::open(directory.path()).unwrap();
+    assert!(Storage::open(&root, SupportedStorageBackend::FLAT).is_err());
+    let entries = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        [std::ffi::OsString::from(super::LAYOUT_DESCRIPTOR)]
+    );
+}
+
+#[test]
+fn opening_existing_storage_does_not_recreate_a_missing_receipt_directory() {
+    let directory = TestDir::new();
+    drop(initialize_storage(directory.path()).unwrap());
+    let receipt_directory = directory.path().join(super::EGRESS_RECEIPT_DIRECTORY);
+    fs::remove_dir(&receipt_directory).unwrap();
+    let root = Directory::open(directory.path()).unwrap();
+    assert!(Storage::open(&root, SupportedStorageBackend::FLAT).is_err());
+    assert!(!receipt_directory.exists());
 }
 
 #[test]
@@ -2287,10 +2364,13 @@ fn initialization_creates_only_the_fixed_layout() {
 fn initialization_rejects_a_different_storage_backend() {
     let directory = TestDir::new();
     let root = Directory::open(directory.path()).unwrap();
-    let storage = Storage::initialize(&root, SupportedStorageBackend::FLAT).unwrap();
+    let storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+        .and_then(|creation| creation.create_or_complete())
+        .unwrap();
     drop(storage);
 
-    let error = Storage::initialize(&root, StorageBackend::Chunked.try_into().unwrap())
+    let error = CacheCreation::prepare(&root, StorageBackend::Chunked.try_into().unwrap())
+        .and_then(|creation| creation.create_or_complete())
         .expect_err("a populated root must retain its selected backend");
     assert!(error.to_string().contains("different storage backend"));
 }
@@ -2335,6 +2415,22 @@ fn initialization_rejects_a_symlinked_lock() {
 
     let error = initialize_storage(directory.path()).expect_err("symlinked lock must fail");
     assert!(error.to_string().contains("lock"));
+}
+
+#[test]
+fn creation_rejects_a_lock_whose_permissions_opening_would_reject() {
+    let directory = TestDir::new();
+    let lock = directory.path().join("lock");
+    fs::write(&lock, b"").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        initialize_storage(directory.path()).is_err(),
+        "creation cannot approve a non-private lock"
+    );
+    assert_eq!(
+        fs::metadata(lock).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
 }
 
 #[test]

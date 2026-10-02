@@ -18,6 +18,7 @@ use crate::object::{NarHash, NarIdentity};
 
 use super::{
     CHUNK_DIRECTORY, MANIFEST_DIRECTORY,
+    backend::ChunkDurability,
     chunked::{
         ChunkHash, ChunkManifest, ChunkProfile, MANIFEST_CHECKSUM_BYTES, MANIFEST_HEADER_BYTES,
         MANIFEST_RECORD_BYTES, ManifestError, ManifestReader, write_manifest_header,
@@ -25,7 +26,7 @@ use super::{
     fs::{
         DirectoryEntryAction, DirectoryScanOutcome, ensure_directory_at, files_equal_at,
         for_each_dir_name, hard_link_at, open_at, open_directory_at, open_regular_at,
-        read_dir_names, sync_filesystem, unlink_at,
+        read_dir_names, require_directory_at, unlink_at,
     },
     publication::{StagingReservation, StorageError},
     state::StorageActivity,
@@ -48,6 +49,7 @@ pub(crate) struct ChunkStore {
     chunks: File,
     manifests: File,
     activity: Arc<StorageActivity>,
+    durability: ChunkDurability,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -85,24 +87,44 @@ pub(crate) struct ChunkPopulationCounts {
 }
 
 impl ChunkStore {
-    pub(crate) fn initialize(root: &File) -> io::Result<Self> {
+    #[cfg(all(test, target_os = "linux"))]
+    fn initialize(root: &File) -> io::Result<Self> {
         Self::initialize_with_activity(root, Arc::new(StorageActivity::default()))
     }
 
-    pub(crate) fn initialize_with_activity(
-        root: &File,
-        activity: Arc<StorageActivity>,
-    ) -> io::Result<Self> {
+    #[cfg(all(test, target_os = "linux"))]
+    fn initialize_with_activity(root: &File, activity: Arc<StorageActivity>) -> io::Result<Self> {
         let manifests = ensure_directory_at(
             root,
             OsStr::new(MANIFEST_DIRECTORY),
             "chunk manifest directory",
         )?;
         let chunks = ensure_directory_at(root, OsStr::new(CHUNK_DIRECTORY), "chunk directory")?;
+        let super::backend::BackendSupport::Chunked(durability) =
+            super::SupportedStorageBackend::try_from(super::StorageBackend::Chunked)
+                .expect("Linux supports chunk publication")
+                .0
+        else {
+            unreachable!("chunked selection must contain a chunk capability")
+        };
         Ok(Self {
             chunks,
             manifests,
             activity,
+            durability,
+        })
+    }
+
+    pub(super) fn open(
+        root: &File,
+        durability: ChunkDurability,
+        activity: Arc<StorageActivity>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            chunks: require_directory_at(root, CHUNK_DIRECTORY)?,
+            manifests: require_directory_at(root, MANIFEST_DIRECTORY)?,
+            activity,
+            durability,
         })
     }
 
@@ -170,7 +192,7 @@ impl ChunkStore {
             size: 0,
             reservation,
             min_free_bytes,
-            new_chunks_need_sync: false,
+            durability: ChunkDurabilityObligation::Empty,
         })
     }
 
@@ -954,7 +976,189 @@ pub(crate) struct ChunkingWriter<'store> {
     size: u64,
     reservation: Option<StagingReservation>,
     min_free_bytes: u64,
-    new_chunks_need_sync: bool,
+    durability: ChunkDurabilityObligation,
+}
+
+#[derive(Clone, Copy)]
+enum ChunkDurabilityObligation {
+    Empty,
+    Reused,
+    NewlyPublished,
+}
+
+impl ChunkDurabilityObligation {
+    fn record_publication(&mut self, outcome: super::publication::PublishOutcome) {
+        *self = match outcome {
+            super::publication::PublishOutcome::Created => Self::NewlyPublished,
+            super::publication::PublishOutcome::Identical => match *self {
+                Self::Empty | Self::Reused => Self::Reused,
+                Self::NewlyPublished => Self::NewlyPublished,
+            },
+        };
+    }
+}
+
+struct FinishedChunks<'store> {
+    writer: ChunkingWriter<'store>,
+}
+struct VerifiedChunks<'store> {
+    writer: ChunkingWriter<'store>,
+    manifest: ChunkManifest,
+}
+struct DurableChunks<'store> {
+    writer: ChunkingWriter<'store>,
+    manifest: ChunkManifest,
+}
+
+impl<'store> FinishedChunks<'store> {
+    fn verify_identity_and_record_coverage(
+        mut self,
+        expected: NarIdentity,
+    ) -> Result<VerifiedChunks<'store>, ChunkStoreError> {
+        let actual = NarIdentity::new(
+            NarHash::from_digest(std::mem::take(&mut self.writer.hasher).finalize().into()),
+            self.writer.size.into(),
+        );
+        verify_streamed_nar_identity(actual, expected)?;
+        verify_chunk_record_coverage(self.writer.previous_end, actual)?;
+        let manifest = ChunkManifest::new(actual, self.writer.profile, self.writer.chunk_count);
+        Ok(VerifiedChunks {
+            writer: self.writer,
+            manifest,
+        })
+    }
+}
+
+impl<'store> VerifiedChunks<'store> {
+    fn make_chunks_durable(
+        self,
+        synchronize: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<DurableChunks<'store>, ChunkStoreError> {
+        match self.writer.durability {
+            ChunkDurabilityObligation::Empty => {}
+            ChunkDurabilityObligation::Reused => {
+                self.synchronize_unless_a_completed_manifest_proves_durability(synchronize)?;
+            }
+            ChunkDurabilityObligation::NewlyPublished => synchronize(&self.writer.store.chunks)?,
+        }
+        Ok(DurableChunks {
+            writer: self.writer,
+            manifest: self.manifest,
+        })
+    }
+
+    fn synchronize_unless_a_completed_manifest_proves_durability(
+        &self,
+        synchronize: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<(), ChunkStoreError> {
+        match self
+            .writer
+            .store
+            .validate_manifest(self.manifest.identity().hash())?
+        {
+            Some(existing) if existing == self.manifest => Ok(()),
+            Some(_) | None => synchronize(&self.writer.store.chunks).map_err(Into::into),
+        }
+    }
+}
+
+impl DurableChunks<'_> {
+    fn publish_manifest(mut self) -> Result<CompletedChunkedIngest, ChunkStoreError> {
+        let bytes = encoded_manifest_size(self.manifest.chunk_count())?;
+        self.writer
+            .reserve_before_materialization(&self.writer.store.manifests, bytes)?;
+        let outcome = self.publish_manifest_from_records()?;
+        self.writer.release_materialized_bytes(bytes);
+        Ok(CompletedChunkedIngest {
+            manifest: self.manifest,
+            outcome,
+            reservation: self.writer.reservation.take(),
+        })
+    }
+
+    fn publish_manifest_from_records(
+        &mut self,
+    ) -> Result<super::publication::PublishOutcome, ChunkStoreError> {
+        self.writer.record_file.sync_all()?;
+        self.writer.record_file.seek(SeekFrom::Start(0))?;
+        let directory = &self.writer.store.manifests;
+        let name = temporary_name(MANIFEST_TEMP_PREFIX);
+        let result = (|| {
+            let mut temporary = open_at(
+                directory,
+                &name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )?;
+            write_complete_manifest(&mut temporary, self.manifest, &mut self.writer.record_file)?;
+            temporary.sync_all()?;
+            Ok(publish_temporary_file(
+                directory,
+                &name,
+                &manifest_name(self.manifest.identity().hash()),
+            )?)
+        })();
+        let cleanup = remove_temporary_file(directory, &name);
+        match (result, cleanup) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
+    }
+}
+
+fn verify_streamed_nar_identity(
+    actual: NarIdentity,
+    expected: NarIdentity,
+) -> Result<(), ChunkStoreError> {
+    match (
+        actual.hash() == expected.hash(),
+        actual.size() == expected.size(),
+    ) {
+        (false, _) => Err(ChunkStoreError::NarHashMismatch {
+            expected: expected.hash(),
+            actual: actual.hash(),
+        }),
+        (true, false) => Err(ChunkStoreError::NarSizeMismatch {
+            expected: expected.size().get(),
+            actual: actual.size().get(),
+        }),
+        (true, true) => Ok(()),
+    }
+}
+
+fn verify_chunk_record_coverage(end: u64, identity: NarIdentity) -> Result<(), ChunkStoreError> {
+    match end == identity.size().get() {
+        true => Ok(()),
+        false => Err(ChunkStoreError::NarSizeMismatch {
+            expected: identity.size().get(),
+            actual: end,
+        }),
+    }
+}
+
+fn encoded_manifest_size(chunk_count: u64) -> Result<u64, ManifestError> {
+    chunk_count
+        .checked_mul(MANIFEST_RECORD_BYTES as u64)
+        .and_then(|bytes| {
+            bytes.checked_add((MANIFEST_HEADER_BYTES + MANIFEST_CHECKSUM_BYTES) as u64)
+        })
+        .ok_or(ManifestError::LengthOverflow)
+}
+
+fn write_complete_manifest(
+    destination: &mut File,
+    manifest: ChunkManifest,
+    records: &mut File,
+) -> Result<(), ChunkStoreError> {
+    let checksum = {
+        let mut digesting = DigestingWriter::new(&mut *destination);
+        write_manifest_header(&mut digesting, manifest)?;
+        io::copy(records, &mut digesting)?;
+        digesting.finish()
+    };
+    destination.write_all(&checksum)?;
+    Ok(())
 }
 
 struct ChunkSpecification {
@@ -1028,98 +1232,29 @@ impl CompletedChunkedIngest {
     }
 }
 
-impl ChunkingWriter<'_> {
+impl<'store> ChunkingWriter<'store> {
     pub(crate) fn finish(
         self,
         expected: NarIdentity,
     ) -> Result<CompletedChunkedIngest, ChunkStoreError> {
-        self.finish_with(expected, sync_filesystem)
+        let durability = self.store.durability;
+        self.finish_with(expected, |directory| durability.synchronize(directory))
     }
 
     fn finish_with(
-        mut self,
+        self,
         expected: NarIdentity,
         sync_chunks: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<CompletedChunkedIngest, ChunkStoreError> {
-        self.publish_pending_chunk()?;
-        let actual = NarIdentity::new(
-            NarHash::from_digest(self.hasher.clone().finalize().into()),
-            self.size.into(),
-        );
-        if actual != expected {
-            return Err(if actual.hash() != expected.hash() {
-                ChunkStoreError::NarHashMismatch {
-                    expected: expected.hash(),
-                    actual: actual.hash(),
-                }
-            } else {
-                ChunkStoreError::NarSizeMismatch {
-                    expected: expected.size().get(),
-                    actual: actual.size().get(),
-                }
-            });
-        }
-        if self.previous_end != actual.size().get() {
-            return Err(ChunkStoreError::NarSizeMismatch {
-                expected: actual.size().get(),
-                actual: self.previous_end,
-            });
-        }
-        self.sync_new_chunks_before_manifest(sync_chunks)?;
-        let manifest = ChunkManifest::new(actual, self.profile, self.chunk_count);
-        let manifest_bytes = MANIFEST_HEADER_BYTES
-            .checked_add(
-                usize::try_from(self.chunk_count)
-                    .map_err(|_| ChunkStoreError::Manifest(ManifestError::LengthOverflow))?
-                    .checked_mul(MANIFEST_RECORD_BYTES)
-                    .ok_or(ChunkStoreError::Manifest(ManifestError::LengthOverflow))?,
-            )
-            .and_then(|bytes| bytes.checked_add(MANIFEST_CHECKSUM_BYTES))
-            .ok_or(ChunkStoreError::Manifest(ManifestError::LengthOverflow))?;
-        self.reserve_before_materialization(&self.store.manifests, manifest_bytes as u64)?;
-        let outcome = self.publish_manifest_from_records(&manifest)?;
-        self.release_materialized_bytes(manifest_bytes as u64);
-        Ok(CompletedChunkedIngest {
-            manifest,
-            outcome,
-            reservation: self.reservation.take(),
-        })
+        self.finish_pending_chunks()?
+            .verify_identity_and_record_coverage(expected)?
+            .make_chunks_durable(sync_chunks)?
+            .publish_manifest()
     }
 
-    fn publish_manifest_from_records(
-        &mut self,
-        manifest: &ChunkManifest,
-    ) -> Result<super::publication::PublishOutcome, ChunkStoreError> {
-        self.record_file.sync_all()?;
-        self.record_file.seek(SeekFrom::Start(0))?;
-        let temporary_name = temporary_name(MANIFEST_TEMP_PREFIX);
-        let result = (|| -> Result<_, ChunkStoreError> {
-            let mut temporary = open_at(
-                &self.store.manifests,
-                &temporary_name,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )?;
-            let checksum = {
-                let mut digesting = DigestingWriter::new(&mut temporary);
-                write_manifest_header(&mut digesting, *manifest)?;
-                io::copy(&mut self.record_file, &mut digesting)?;
-                digesting.finish()
-            };
-            temporary.write_all(&checksum)?;
-            temporary.sync_all()?;
-            Ok(publish_temporary_file(
-                &self.store.manifests,
-                &temporary_name,
-                &manifest_name(manifest.identity().hash()),
-            )?)
-        })();
-        let cleanup = remove_temporary_file(&self.store.manifests, &temporary_name);
-        match (result, cleanup) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error.into()),
-        }
+    fn finish_pending_chunks(mut self) -> Result<FinishedChunks<'store>, ChunkStoreError> {
+        self.publish_pending_chunk()?;
+        Ok(FinishedChunks { writer: self })
     }
 
     fn publish_complete_chunks(&mut self) -> io::Result<()> {
@@ -1169,9 +1304,9 @@ impl ChunkingWriter<'_> {
                     .activity
                     .record_chunk_publication(publication.outcome, specification.length);
             });
-        self.new_chunks_need_sync |= publications
+        publications
             .iter()
-            .any(|publication| publication.outcome == super::publication::PublishOutcome::Created);
+            .for_each(|publication| self.durability.record_publication(publication.outcome));
         drop(batch);
         for specification in &specifications {
             self.release_materialized_bytes(specification.length);
@@ -1264,17 +1399,6 @@ impl ChunkingWriter<'_> {
                 })
                 .collect()
         })
-    }
-
-    fn sync_new_chunks_before_manifest(
-        &mut self,
-        sync_chunks: impl FnOnce(&File) -> io::Result<()>,
-    ) -> io::Result<()> {
-        if self.new_chunks_need_sync {
-            sync_chunks(&self.store.chunks)?;
-            self.new_chunks_need_sync = false;
-        }
-        Ok(())
     }
 
     fn record_published_chunk(&mut self, specification: &ChunkSpecification) -> io::Result<()> {
@@ -1661,7 +1785,7 @@ impl std::error::Error for ChunkStoreError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
         fs,
@@ -1977,6 +2101,157 @@ mod tests {
                 .next()
                 .is_none(),
             "a failed chunk durability barrier must leave no manifest or staging record"
+        );
+    }
+
+    #[test]
+    fn reusing_durable_chunks_does_not_require_another_filesystem_barrier() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        store
+            .store_nar(input.as_slice(), identity, ChunkProfile::MinCdcHash4V2)
+            .unwrap();
+        let mut writer = store
+            .begin_ingest_with_optional_reservation(ChunkProfile::MinCdcHash4V2, None, 0)
+            .unwrap();
+        writer.write_all(&input).unwrap();
+        let completed = writer
+            .finish_with(identity, |_| {
+                panic!("existing durable chunks must not request a barrier")
+            })
+            .unwrap();
+        assert_eq!(
+            completed.outcome(),
+            super::super::publication::PublishOutcome::Identical
+        );
+    }
+
+    #[test]
+    fn chunks_left_by_a_failed_barrier_must_be_synchronized_on_retry() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        let mut failed = store
+            .begin_ingest_with_optional_reservation(ChunkProfile::MinCdcHash4V2, None, 0)
+            .unwrap();
+        failed.write_all(&input).unwrap();
+        assert!(
+            failed
+                .finish_with(identity, |_| Err(std::io::Error::from_raw_os_error(
+                    libc::EIO
+                )))
+                .is_err()
+        );
+        let mut retry = store
+            .begin_ingest_with_optional_reservation(ChunkProfile::MinCdcHash4V2, None, 0)
+            .unwrap();
+        retry.write_all(&input).unwrap();
+        let synchronized = std::cell::Cell::new(false);
+        retry
+            .finish_with(identity, |directory| {
+                synchronized.set(true);
+                store.durability.synchronize(directory)
+            })
+            .unwrap();
+        assert!(
+            synchronized.get(),
+            "identical chunk bytes left by a failed barrier are not durability evidence"
+        );
+        assert!(store.validate_manifest(identity.hash()).unwrap().is_some());
+    }
+
+    #[test]
+    fn chunks_linked_by_an_unfinished_upload_are_not_durability_evidence() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        let mut first = store
+            .begin_ingest_with_optional_reservation(ChunkProfile::MinCdcHash4V2, None, 0)
+            .unwrap();
+        first.write_all(&input).unwrap();
+        let unfinished = first
+            .finish_pending_chunks()
+            .unwrap()
+            .verify_identity_and_record_coverage(identity)
+            .unwrap();
+        assert!(store.open_manifest(identity.hash()).unwrap().is_none());
+        let mut second = store
+            .begin_ingest_with_optional_reservation(ChunkProfile::MinCdcHash4V2, None, 0)
+            .unwrap();
+        second.write_all(&input).unwrap();
+        let synchronized = std::cell::Cell::new(false);
+        second
+            .finish_with(identity, |directory| {
+                synchronized.set(true);
+                store.durability.synchronize(directory)
+            })
+            .unwrap();
+        assert!(
+            synchronized.get(),
+            "the second upload cannot inherit the first upload's incomplete durability transition"
+        );
+        drop(unfinished);
+        assert!(store.validate_manifest(identity.hash()).unwrap().is_some());
+    }
+
+    #[test]
+    fn incorrect_identity_or_record_coverage_cannot_reach_the_durability_barrier() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        for expected in [
+            NarIdentity::new(NarHash::from_digest([0; 32]), identity.size()),
+            NarIdentity::new(identity.hash(), NarSize::new(1)),
+        ] {
+            let mut writer = store
+                .begin_ingest_with_optional_reservation(ChunkProfile::MinCdcHash4V2, None, 0)
+                .unwrap();
+            writer.write_all(&input).unwrap();
+            assert!(
+                writer
+                    .finish_with(expected, |_| panic!(
+                        "invalid identities cannot synchronize or publish"
+                    ))
+                    .is_err()
+            );
+        }
+        let mut writer = store
+            .begin_ingest_with_optional_reservation(ChunkProfile::MinCdcHash4V2, None, 0)
+            .unwrap();
+        writer.write_all(&input).unwrap();
+        let mut finished = writer.finish_pending_chunks().unwrap();
+        finished.writer.previous_end -= 1;
+        assert!(matches!(
+            finished.verify_identity_and_record_coverage(identity),
+            Err(super::ChunkStoreError::NarSizeMismatch { .. })
+        ));
+        assert!(store.open_manifest(identity.hash()).unwrap().is_none());
+        assert!(
+            fs::read_dir(directory.path().join(super::super::MANIFEST_DIRECTORY))
+                .unwrap()
+                .next()
+                .is_none()
         );
     }
 

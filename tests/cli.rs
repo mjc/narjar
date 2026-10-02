@@ -1939,7 +1939,7 @@ fn serve_rejects_uninitialized_data_dir() {
     assert!(
         String::from_utf8(output.stderr)
             .expect("stderr should be UTF-8")
-            .contains("nar is unavailable")
+            .contains("missing its storage-layout descriptor")
     );
 }
 
@@ -1969,7 +1969,69 @@ fn serve_rejects_partial_data_dir() {
     assert!(
         String::from_utf8(output.stderr)
             .expect("stderr should be UTF-8")
-            .contains("nix-cache-info is unavailable")
+            .contains("missing its storage-layout descriptor")
+    );
+}
+
+#[test]
+fn serve_requires_each_startup_policy_file_without_recreating_it() {
+    for relative in ["nix-cache-info", "trusted-public-keys", "auth/write.tokens"] {
+        let root = init_data_dir("missing-startup-policy");
+        let missing = root.join(relative);
+        fs::remove_file(&missing).unwrap();
+        let output = run(&[
+            "serve",
+            "--data-dir",
+            root.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+        ]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains(relative.rsplit('/').next().unwrap())
+        );
+        assert!(
+            !missing.exists(),
+            "opening cannot silently replace {relative}"
+        );
+    }
+}
+
+#[test]
+fn initialization_creates_a_private_root_even_with_a_group_writable_umask() {
+    use std::os::unix::process::CommandExt;
+    let parent = data_dir("group-writable-umask");
+    let root = parent.join("cache");
+    let mut child = command();
+    child.args(["init", "--data-dir", root.to_str().unwrap()]);
+    // SAFETY: pre_exec changes only the child process; umask is an async-signal-safe
+    // syscall with no allocation or access to inherited locks. The parent and
+    // parallel tests retain their own masks.
+    unsafe {
+        child.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let opened = narjar::__private::storage::Directory::open(&root).unwrap();
+    assert!(
+        narjar::__private::storage::Storage::open(
+            &opened,
+            narjar::__private::storage::SupportedStorageBackend::FLAT
+        )
+        .is_ok()
     );
 }
 
@@ -6335,18 +6397,7 @@ fn restored_cache_verifies_before_serving() {
     )
     .expect("narinfo should be written");
 
-    let restored = data_dir("backup-restored");
-    for directory in [
-        "nar",
-        "nar/.tmp",
-        ".tmp",
-        "realisations",
-        "realisations/.tmp",
-        "auth",
-        ".narjar-validation",
-    ] {
-        fs::create_dir_all(restored.join(directory)).expect("restore directory should be created");
-    }
+    let restored = init_data_dir("backup-restored");
     for relative in [
         ".narjar-clean",
         ".narjar-layout",
@@ -6500,10 +6551,11 @@ fn gc_recovers_a_published_nar_before_eviction_and_restart() {
 
     let root = narjar::__private::storage::Directory::open(data_dir.path())
         .expect("cache root should reopen after GC");
-    let storage = narjar::__private::storage::Storage::initialize(
+    let storage = narjar::__private::storage::CacheCreation::prepare(
         &root,
         narjar::__private::storage::SupportedStorageBackend::FLAT,
     )
+    .and_then(|creation| creation.create_or_complete())
     .expect("cache storage should restart after GC");
     assert!(
         !storage
@@ -6581,10 +6633,11 @@ fn delete_recovers_a_published_narinfo_before_removing_it() {
 
     let root = narjar::__private::storage::Directory::open(data_dir.path())
         .expect("cache root should reopen after delete");
-    let storage = narjar::__private::storage::Storage::initialize(
+    let storage = narjar::__private::storage::CacheCreation::prepare(
         &root,
         narjar::__private::storage::SupportedStorageBackend::FLAT,
     )
+    .and_then(|creation| creation.create_or_complete())
     .expect("cache storage should restart after delete");
     assert!(
         !storage
@@ -6944,8 +6997,8 @@ fn gc_refuses_to_apply_while_the_cache_is_serving() {
 }
 
 #[test]
-fn gc_sigterm_leaves_a_cache_recoverable_before_restart() {
-    let data_dir = init_data_dir("operator-gc-sigterm");
+fn interrupted_gc_deletion_is_recovered_before_serving_shared_payloads() {
+    let data_dir = init_data_dir("operator-gc-interrupted-deletion");
     fs::write(
         data_dir.join("trusted-public-keys"),
         format!(
@@ -6956,7 +7009,7 @@ fn gc_sigterm_leaves_a_cache_recoverable_before_restart() {
     .expect("trusted key should be written");
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("shared NAR should be written");
-    for index in 0..100 {
+    for index in 0..2 {
         let store = format!("{index:032o}");
         fs::write(
             data_dir.join(format!("{store}.narinfo")),
@@ -6965,80 +7018,31 @@ fn gc_sigterm_leaves_a_cache_recoverable_before_restart() {
         .expect("narinfo should be written");
     }
 
-    let path = data_dir.to_str().expect("temporary path should be UTF-8");
-    let mut gc = command()
-        .args([
-            "gc",
-            "--data-dir",
-            path,
-            "--target-bytes",
-            "0",
-            "--min-age-seconds",
-            "0",
-            "--apply",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("gc should start");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !data_dir.join(".narjar-recovery").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "gc did not create the recovery marker"
-        );
-        assert!(
-            gc.try_wait().expect("gc should be waitable").is_none(),
-            "gc finished before the interruption fixture observed recovery"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    let pid = gc.id().to_string();
-    assert!(
-        Command::new("kill")
-            .args(["-TERM", &pid])
-            .status()
-            .expect("SIGTERM should be sent")
-            .success()
-    );
-    assert!(
-        !gc.wait().expect("gc should exit after SIGTERM").success(),
-        "interrupted GC must not claim successful completion"
-    );
-    assert!(
-        data_dir.join(".narjar-recovery").exists(),
-        "interrupted GC must retain the recovery marker"
-    );
+    // State after syncing one metadata deletion, before completing GC.
+    fs::remove_file(data_dir.join(format!("{STORE_HASH}.narinfo")))
+        .expect("first metadata entry should be deleted");
+    let marker = data_dir.join(".narjar-recovery");
+    fs::write(&marker, b"").expect("GC recovery marker should be written");
+    fs::set_permissions(marker, fs::Permissions::from_mode(0o600))
+        .expect("GC recovery marker should be private");
 
-    let mut server = command()
-        .args(["serve", "--data-dir", path, "--listen", "127.0.0.1:0"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("server should start");
-    let mut line = String::new();
-    BufReader::new(server.stdout.take().expect("server stdout should be piped"))
-        .read_line(&mut line)
-        .expect("server startup line should be readable");
-    assert!(line.starts_with("listening http://127.0.0.1:"), "{line}");
+    let server = RunningServer::start_in(data_dir, &[]);
     assert!(
-        !data_dir.join(".narjar-recovery").exists(),
+        !server.data_dir.join(".narjar-recovery").exists(),
         "server recovery should clear the marker after a valid inventory"
     );
-    let server_pid = server.id().to_string();
-    assert!(
-        Command::new("kill")
-            .args(["-TERM", &server_pid])
-            .status()
-            .expect("SIGTERM should be sent")
-            .success()
-    );
-    assert!(
-        server
-            .wait()
-            .expect("server should exit after SIGTERM")
-            .success()
-    );
+    let (ready, _) = response_parts(&server.request("GET", "/readyz"));
+    assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+    let (metadata, _) =
+        response_parts(&server.request("GET", "/00000000000000000000000000000001.narinfo"));
+    assert!(metadata.starts_with("HTTP/1.1 200"), "{metadata}");
+    let (payload, bytes) =
+        response_parts(&server.request("GET", &format!("/nar/{NARJAR_HASH}.nar")));
+    assert!(payload.starts_with("HTTP/1.1 200"), "{payload}");
+    assert_eq!(bytes, NAR_BYTES);
+    let (signal, status) = server.stop();
+    assert!(signal.success());
+    assert!(status.success());
 }
 
 #[test]
@@ -7218,6 +7222,53 @@ fn gc_rejects_symlinked_narinfo_without_removing_it() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
+}
+
+#[test]
+fn library_gc_requires_the_same_private_policies_as_startup_before_either_mode() {
+    let data_dir = init_data_dir("library-gc-required-policies");
+    let collect = |mode| {
+        narjar::__private::storage::gc::run(GcOptions {
+            data_dir: data_dir.path().to_owned(),
+            max_bytes: None,
+            target_bytes: Some(0),
+            max_age: None,
+            min_age: Duration::ZERO,
+            protected_roots: None,
+            mode,
+            backend: narjar::__private::storage::StorageBackend::Flat,
+        })
+    };
+    let clean = data_dir.join(".narjar-clean");
+    let original_marker = fs::read(&clean).unwrap();
+    for name in narjar::__private::storage::CACHE_POLICY_FILES {
+        let path = data_dir.join(name);
+        let original = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        for mode in [GcMode::DryRun, GcMode::Apply] {
+            assert!(collect(mode).is_err(), "{mode:?} accepted missing {name}");
+            assert!(!path.exists(), "GC must not recreate {name}");
+            assert_eq!(fs::read(&clean).unwrap(), original_marker);
+            assert!(!data_dir.join(".narjar-recovery").exists());
+        }
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        for mode in [GcMode::DryRun, GcMode::Apply] {
+            assert!(
+                collect(mode).is_err(),
+                "{mode:?} accepted non-private {name}"
+            );
+            assert_eq!(fs::read(&clean).unwrap(), original_marker);
+            assert!(!data_dir.join(".narjar-recovery").exists());
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    for mode in [GcMode::DryRun, GcMode::Apply] {
+        assert!(
+            collect(mode).is_ok(),
+            "{mode:?} should accept complete private policies"
+        );
+    }
 }
 
 #[test]

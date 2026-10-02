@@ -8,96 +8,287 @@ use std::{
 };
 
 use super::{
-    EGRESS_RECEIPT_DIRECTORY, INGESTION_RECEIPT_DIRECTORY, LAYOUT_DESCRIPTOR, NAR_DIRECTORY,
-    REALISATIONS_DIRECTORY, StorageBackend, SupportedStorageBackend, TEMPORARY_DIRECTORY,
-    VALIDATION_DIRECTORY,
+    LAYOUT_DESCRIPTOR, SupportedStorageBackend,
+    backend::BackendSupport,
     chunk_store::ChunkStore,
     directory::Directory,
-    fs::{directory_is_empty, ensure_directory_at, open_at, open_optional_at},
+    fs::{
+        ensure_directory_at, hard_link_at, open_at, open_optional_at, require_directory_at,
+        require_private_file_at, unlink_at,
+    },
     publication::{ProcessLock, StorageError},
     recovery::RecoveryState,
     state::{DeliveryValidationCache, PayloadStorage, Storage, StorageActivity},
 };
+use crate::{auth::Authorizer, narinfo::TrustedPublicKeys};
 
 #[cfg(test)]
 use super::publication::Layout;
 
-impl Storage {
-    pub fn initialize(
+const COMMON_DIRECTORIES: &[&str] = &[
+    "nar",
+    "nar/.tmp",
+    ".tmp",
+    "realisations",
+    "realisations/.tmp",
+    ".narjar-transactions",
+    ".narjar-validation",
+    ".narjar-ingress",
+    ".narjar-egress",
+];
+const CHUNK_DIRECTORIES: &[&str] = &[".narjar-chunks", ".narjar-manifests"];
+const DESCRIPTOR_DRAFT: &str = ".narjar-layout.next";
+pub const CACHE_POLICY_DIRECTORIES: &[&str] = &["auth"];
+pub const CACHE_POLICY_FILES: &[&str] =
+    &["nix-cache-info", "trusted-public-keys", "auth/write.tokens"];
+pub const CACHE_RECOVERY_MARKERS: [&str; 2] = [".narjar-clean", ".narjar-recovery"];
+
+pub fn storage_directories(backend: SupportedStorageBackend) -> impl Iterator<Item = &'static str> {
+    let backend_directories = match backend.0 {
+        BackendSupport::Flat => &[][..],
+        BackendSupport::Chunked(_) => CHUNK_DIRECTORIES,
+    };
+    COMMON_DIRECTORIES
+        .iter()
+        .chain(backend_directories)
+        .copied()
+}
+
+pub fn storage_root_entries() -> impl Iterator<Item = &'static str> {
+    COMMON_DIRECTORIES
+        .iter()
+        .copied()
+        .filter(|name| !name.contains('/'))
+        .chain(CHUNK_DIRECTORIES.iter().copied())
+        .chain([
+            LAYOUT_DESCRIPTOR,
+            DESCRIPTOR_DRAFT,
+            ".narjar-clean",
+            ".narjar-recovery",
+            "lock",
+        ])
+}
+
+/// Startup policies loaded only from a complete, private policy layout.
+pub struct CachePolicies {
+    authorizer: Authorizer,
+    trusted_keys: TrustedPublicKeys,
+}
+
+impl CachePolicies {
+    pub fn load(root: &Directory) -> Result<Self, StorageError> {
+        CACHE_POLICY_DIRECTORIES
+            .iter()
+            .try_for_each(|name| require_directory_at(&root.file, name).map(drop))?;
+        CACHE_POLICY_FILES.iter().try_for_each(|name| {
+            let (parent, leaf) = directory_parent(&root.file, name)?;
+            require_private_file_at(&parent, leaf, true).map(|_| ())
+        })?;
+        let invalid_policy = |error| io::Error::new(io::ErrorKind::InvalidData, error);
+        Ok(Self {
+            authorizer: Authorizer::load(root).map_err(invalid_policy)?,
+            trusted_keys: TrustedPublicKeys::load(root)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        })
+    }
+
+    pub fn into_parts(self) -> (Authorizer, TrustedPublicKeys) {
+        (self.authorizer, self.trusted_keys)
+    }
+}
+
+/// Owns the exclusive directory lease while completing an initialization.
+/// A prepared creation cannot be reused after transferring its lease to storage.
+/// ```compile_fail
+/// use narjar::__private::storage::{CacheCreation, Directory, SupportedStorageBackend};
+/// fn initialize_twice(root: &Directory) {
+///     let creation = CacheCreation::prepare(root, SupportedStorageBackend::FLAT).unwrap();
+///     let _ = creation.create_or_complete();
+///     let _ = creation.create_or_complete();
+/// }
+/// ```
+pub struct CacheCreation {
+    layout: CacheLayout,
+    descriptor: DescriptorInstallation,
+}
+
+impl CacheCreation {
+    pub fn prepare(
         root: &Directory,
         backend: SupportedStorageBackend,
     ) -> Result<Self, StorageError> {
-        let backend = backend.backend();
-        #[cfg(test)]
-        let layout = Layout::new(root.path.clone());
-        let root_directory = root.file.try_clone()?;
-        let root_is_empty = directory_is_empty(&root_directory)?;
+        let layout = CacheLayout::lock(root, backend)?;
+        let descriptor = layout.prepare_descriptor()?;
+        Ok(Self { layout, descriptor })
+    }
+
+    pub fn create_or_complete(self) -> Result<Storage, StorageError> {
+        self.descriptor.install(&self.layout)?;
+        self.layout.create_directories()?;
+        ProcessLock::validate_lock_file(&self.layout.root)?;
+        let storage = self.layout.into_storage()?;
+        storage.recovery.initialize_clean()?;
+        Ok(storage)
+    }
+}
+
+enum DescriptorInstallation {
+    Existing(File),
+    Create,
+}
+
+impl DescriptorInstallation {
+    fn install(self, layout: &CacheLayout) -> Result<(), StorageError> {
+        remove_descriptor_draft(&layout.root)?;
+        match self {
+            Self::Existing(file) => file.sync_all().map_err(Into::into),
+            Self::Create => install_complete_descriptor(&layout.root, layout.backend),
+        }
+    }
+}
+
+fn remove_descriptor_draft(root: &File) -> Result<(), StorageError> {
+    match open_optional_at(root, OsStr::new(DESCRIPTOR_DRAFT))? {
+        None => Ok(()),
+        Some(_) => {
+            require_private_file_at(root, DESCRIPTOR_DRAFT, true)?;
+            unlink_at(root, OsStr::new(DESCRIPTOR_DRAFT))?;
+            root.sync_all()?;
+            Ok(())
+        }
+    }
+}
+
+fn install_complete_descriptor(
+    root: &File,
+    backend: SupportedStorageBackend,
+) -> Result<(), StorageError> {
+    let draft = OsStr::new(DESCRIPTOR_DRAFT);
+    let result = (|| -> Result<(), StorageError> {
+        let mut file = open_at(
+            root,
+            draft,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )?;
+        file.write_all(backend.backend().layout_descriptor())?;
+        file.sync_all()?;
+        hard_link_at(root, draft, root, OsStr::new(LAYOUT_DESCRIPTOR))?;
+        root.sync_all()?;
+        Ok(())
+    })();
+    let cleanup = remove_descriptor_draft(root);
+    result.and(cleanup)
+}
+
+struct CacheLayout {
+    root: File,
+    backend: SupportedStorageBackend,
+    lock: ProcessLock,
+    #[cfg(test)]
+    test_layout: Layout,
+}
+
+impl CacheLayout {
+    fn lock(root: &Directory, backend: SupportedStorageBackend) -> Result<Self, StorageError> {
+        let directory = root.file.try_clone()?;
         let lock = ProcessLock::acquire(open_at(
-            &root_directory,
+            &directory,
             OsStr::new("."),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             0,
         )?)?;
-        ProcessLock::validate_lock_file(&root_directory)?;
-        let nar_directory =
-            ensure_directory_at(&root_directory, OsStr::new(NAR_DIRECTORY), "nar directory")?;
-        ensure_directory_at(
-            &nar_directory,
-            OsStr::new(TEMPORARY_DIRECTORY),
-            "NAR temporary directory",
-        )?;
-        ensure_directory_at(
-            &root_directory,
-            OsStr::new(TEMPORARY_DIRECTORY),
-            "temporary directory",
-        )?;
-        let transactions = ensure_directory_at(
-            &root_directory,
-            OsStr::new(".narjar-transactions"),
-            "publication transaction directory",
-        )?;
-        transactions.set_permissions(Permissions::from_mode(0o700))?;
-        let realisations_directory = ensure_directory_at(
-            &root_directory,
-            OsStr::new(REALISATIONS_DIRECTORY),
-            "realisations directory",
-        )?;
-        ensure_directory_at(
-            &realisations_directory,
-            OsStr::new(".tmp"),
-            "realisation temporary directory",
-        )?;
-        ensure_directory_at(
-            &root_directory,
-            OsStr::new(VALIDATION_DIRECTORY),
-            "validation evidence directory",
-        )?;
-        ensure_directory_at(
-            &root_directory,
-            OsStr::new(INGESTION_RECEIPT_DIRECTORY),
-            "compressed ingestion receipt directory",
-        )?;
-        ensure_directory_at(
-            &root_directory,
-            OsStr::new(EGRESS_RECEIPT_DIRECTORY),
-            "compressed egress receipt directory",
-        )?;
-        ensure_backend_layout(&root_directory, backend, root_is_empty)?;
-        let activity = Arc::new(StorageActivity::default());
-        let payloads = match backend {
-            StorageBackend::Flat => PayloadStorage::Flat,
-            StorageBackend::Chunked => PayloadStorage::Chunked(
-                ChunkStore::initialize_with_activity(&root_directory, Arc::clone(&activity))?,
-            ),
-        };
-
-        root_directory.sync_all()?;
-
-        let recovery = RecoveryState::new(&root_directory)?;
-        let storage = Self {
+        Ok(Self {
+            root: directory,
+            backend,
+            lock,
             #[cfg(test)]
-            layout,
-            root: root_directory,
+            test_layout: Layout::new(root.path.clone()),
+        })
+    }
+
+    fn prepare_descriptor(&self) -> Result<DescriptorInstallation, StorageError> {
+        match open_optional_at(&self.root, OsStr::new(LAYOUT_DESCRIPTOR))? {
+            None => Ok(DescriptorInstallation::Create),
+            Some(mut descriptor) => {
+                let mut bytes = Vec::new();
+                (&mut descriptor).take(64).read_to_end(&mut bytes)?;
+                self.check_descriptor(&bytes)?;
+                require_private_file_at(&self.root, LAYOUT_DESCRIPTOR, true)?;
+                Ok(DescriptorInstallation::Existing(descriptor))
+            }
+        }
+    }
+
+    fn check_descriptor(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        match bytes == self.backend.backend().layout_descriptor() {
+            true => Ok(()),
+            false => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "data directory uses a different storage backend",
+            )
+            .into()),
+        }
+    }
+
+    fn require_descriptor(&self) -> Result<(), StorageError> {
+        match self.prepare_descriptor()? {
+            DescriptorInstallation::Existing(_) => Ok(()),
+            DescriptorInstallation::Create => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "initialized data directory is missing its storage-layout descriptor",
+            )
+            .into()),
+        }
+    }
+
+    fn create_directories(&self) -> io::Result<()> {
+        storage_directories(self.backend).try_for_each(|name| {
+            let (parent, leaf) = directory_parent(&self.root, name)?;
+            let directory =
+                ensure_directory_at(&parent, OsStr::new(leaf), &format!("{name} directory"))?;
+            directory.set_permissions(Permissions::from_mode(0o700))?;
+            directory.sync_all()?;
+            parent.sync_all()
+        })
+    }
+
+    fn validate_existing(&self) -> Result<(), StorageError> {
+        self.require_descriptor()?;
+        storage_directories(self.backend).try_for_each(|name| {
+            let (parent, leaf) = directory_parent(&self.root, name)?;
+            require_directory_at(&parent, leaf).map(drop)
+        })?;
+        require_private_file_at(&self.root, "lock", true)?;
+        let [clean, recovery] = CACHE_RECOVERY_MARKERS;
+        match (
+            require_private_file_at(&self.root, clean, false)?,
+            require_private_file_at(&self.root, recovery, false)?,
+        ) {
+            (false, false) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "data directory is not initialized",
+            )
+            .into()),
+            _ => Ok(()),
+        }
+    }
+
+    fn into_storage(self) -> Result<Storage, StorageError> {
+        let activity = Arc::new(StorageActivity::default());
+        let payloads = match self.backend.0 {
+            BackendSupport::Flat => PayloadStorage::Flat,
+            BackendSupport::Chunked(durability) => PayloadStorage::Chunked(ChunkStore::open(
+                &self.root,
+                durability,
+                Arc::clone(&activity),
+            )?),
+        };
+        let recovery = RecoveryState::new(&self.root)?;
+        Ok(Storage {
+            #[cfg(test)]
+            layout: self.test_layout,
+            root: self.root,
             payloads,
             recovery,
             delivery_validation: DeliveryValidationCache::default(),
@@ -107,59 +298,27 @@ impl Storage {
             activity,
             #[cfg(test)]
             egress_generations: AtomicU64::new(0),
-            _lock: lock,
-        };
-        if root_is_empty {
-            storage.recovery.initialize_clean()?;
-        }
-        Ok(storage)
+            _lock: self.lock,
+        })
+    }
+}
+
+fn directory_parent<'name>(root: &File, name: &'name str) -> io::Result<(File, &'name str)> {
+    match name.split_once('/') {
+        Some((parent, leaf)) => Ok((require_directory_at(root, parent)?, leaf)),
+        None => Ok((root.try_clone()?, name)),
+    }
+}
+
+impl Storage {
+    pub fn open(root: &Directory, backend: SupportedStorageBackend) -> Result<Self, StorageError> {
+        let layout = CacheLayout::lock(root, backend)?;
+        layout.validate_existing()?;
+        layout.into_storage()
     }
 
     #[cfg(test)]
     pub(super) fn layout(&self) -> &Layout {
         &self.layout
-    }
-}
-
-fn ensure_backend_layout(
-    root: &File,
-    backend: StorageBackend,
-    root_is_empty: bool,
-) -> io::Result<()> {
-    let name = OsStr::new(LAYOUT_DESCRIPTOR);
-    match open_optional_at(root, name).map_err(storage_error_as_io)? {
-        Some(descriptor) => {
-            let mut bytes = Vec::new();
-            descriptor.take(64).read_to_end(&mut bytes)?;
-            match bytes == backend.layout_descriptor() {
-                true => Ok(()),
-                false => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "data directory uses a different storage backend",
-                )),
-            }
-        }
-        None if !root_is_empty => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "initialized data directory is missing its storage-layout descriptor",
-        )),
-        None => {
-            let mut descriptor = open_at(
-                root,
-                name,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-                0o600,
-            )?;
-            descriptor.write_all(backend.layout_descriptor())?;
-            descriptor.sync_all()?;
-            root.sync_all()
-        }
-    }
-}
-
-fn storage_error_as_io(error: StorageError) -> io::Error {
-    match error {
-        StorageError::Io(error) => error,
-        error => io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
     }
 }

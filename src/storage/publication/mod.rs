@@ -8,7 +8,7 @@ use std::{
 };
 
 use super::{
-    fs::{StorageCapacity, filesystem_space, lock_exclusive, open_at},
+    fs::{StorageCapacity, filesystem_space, lock_exclusive, open_at, private_file_mode_is_valid},
     operations::OwnedTemporary,
     recovery::{PublicationState, PublicationTransaction},
     state::Storage,
@@ -235,7 +235,7 @@ impl ProcessLock {
                 io::Error::new(io::ErrorKind::InvalidData, "lock is not a regular file").into(),
             );
         }
-        if metadata.permissions().mode() & 0o133 != 0 {
+        if !private_file_mode_is_valid(metadata.permissions().mode()) {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidData, "lock has unsafe permissions").into(),
             );

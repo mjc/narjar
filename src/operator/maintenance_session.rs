@@ -7,7 +7,7 @@ use narjar::__private::{
     },
     narinfo::TrustedPublicKeys,
     storage::{
-        Directory, RecoveredStorage, RecoveryStatus, Storage, StorageBackend,
+        CachePolicies, Directory, RecoveredStorage, RecoveryStatus, Storage, StorageBackend,
         SupportedStorageBackend,
     },
 };
@@ -44,9 +44,10 @@ impl MaintenanceSession {
         let backend = SupportedStorageBackend::try_from(backend)
             .map_err(|error| Error::usage(error.to_string()))?;
         let directory = Directory::open(data_dir).map_err(runtime)?;
-        directory.validate_initialized().map_err(runtime)?;
-        let storage = Storage::initialize(&directory, backend).map_err(runtime)?;
-        let trusted_keys = TrustedPublicKeys::load(&directory).map_err(runtime)?;
+        let storage = Storage::open(&directory, backend).map_err(runtime)?;
+        let (_, trusted_keys) = CachePolicies::load(&directory)
+            .map_err(runtime)?
+            .into_parts();
         Ok(Self {
             data_dir: data_dir.to_owned(),
             storage,

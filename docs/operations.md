@@ -429,10 +429,10 @@ serving process is stopped and the DATA lease is released. A live `rsync` is
 convergent synchronization, not a point-in-time backup: it may capture a NAR
 and its narinfo at different moments.
 
-For a live convergent copy when downtime is not available, exclude all `.tmp`
-directories and run `verify` on the destination before using it. This is not a
-substitute for the stopped-service procedure when a strict point-in-time
-boundary is required.
+For a live convergent copy when downtime is not available, exclude the contents
+of every `.tmp` directory, preserving the directories themselves, and run
+`verify` on the destination before using it. This is not a substitute for the
+stopped-service procedure when a strict point-in-time boundary is required.
 
 For a consistent portable copy:
 
@@ -441,7 +441,8 @@ For a consistent portable copy:
    `.narjar-recovery`, `.narjar-transactions/`, `.narjar-layout`,
    `.narjar-chunks/` and `.narjar-manifests/` for a chunked root, `lock`,
    `nar/`, `.tmp/`, `realisations/`, `.narjar-validation/`,
-   `.narjar-egress/`, `nix-cache-info`, `trusted-public-keys`, and `auth/`.
+   `.narjar-ingress/`, `.narjar-egress/`, `nix-cache-info`,
+   `trusted-public-keys`, and `auth/`.
 3. Preserve the directory and file permissions; do not expose the copy while
    it contains credentials.
 4. On the destination, require `doctor` to exit successfully, then run
@@ -462,8 +463,9 @@ policy. A corrupt or incomplete copy must remain offline: `doctor`,
 
 Executable backup/restore coverage is the
 [`restored_cache_verifies_before_serving`](../tests/cli.rs) integration test;
-it copies a cache into a new DATA directory, runs reconciliation, verification,
-and doctor, then starts the restored service before accepting readiness.
+it initializes a fresh destination layout, restores the cache files, runs
+reconciliation, verification, and doctor, then starts the restored service before
+accepting readiness.
 
 ### Optional ZFS snapshot and replication workflow
 

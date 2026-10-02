@@ -124,6 +124,14 @@ pub(crate) struct NativeStoreSettings {
     min_lease_seconds: NonZeroU64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NativeStoreOptions<'a> {
+    pub(crate) store_dir: Option<&'a Path>,
+    pub(crate) state_dir: Option<&'a Path>,
+    pub(crate) roots_dir: Option<&'a Path>,
+    pub(crate) min_lease_seconds: Option<NonZeroU64>,
+}
+
 const MAX_ACTIVE_NATIVE_LEASES: NonZeroUsize =
     NonZeroUsize::new(100_000).expect("native lease capacity is nonzero");
 
