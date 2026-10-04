@@ -21,6 +21,10 @@ use sha2::{Digest, Sha256};
 
 use super::lease::NativeStoreLease;
 
+#[path = "directory_entry.rs"]
+mod directory_entry;
+use directory_entry::NativeDirectoryEntry;
+
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 const DISCARD_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -382,27 +386,6 @@ fn sorted_directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryE
     Ok(entries)
 }
 
-struct NativeDirectoryEntry {
-    filesystem_name: OsString,
-    nar_name_length: usize,
-}
-
-impl NativeDirectoryEntry {
-    fn new(filesystem_name: OsString) -> Self {
-        let nar_name_length = nar_entry_name_for_filesystem_name(&filesystem_name).len();
-        Self {
-            filesystem_name,
-            nar_name_length,
-        }
-    }
-
-    fn nar_name(&self) -> &OsStr {
-        // Construction measures a prefix of this same owned name. Sorting
-        // doesn't need to rescan case-hack suffixes or own another allocation.
-        OsStr::from_bytes(&self.filesystem_name.as_bytes()[..self.nar_name_length])
-    }
-}
-
 fn directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryEntry>> {
     let mut entries = Vec::new();
     for entry in Dir::read_from(directory)? {
@@ -414,36 +397,6 @@ fn directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryEntry>> 
         }
     }
     Ok(entries)
-}
-
-fn nar_entry_name_for_filesystem_name(name: &OsStr) -> &OsStr {
-    OsStr::from_bytes(nar_entry_name_bytes_for_filesystem_name(name.as_bytes()))
-}
-
-fn darwin_case_hack_decoded_name(name: &[u8]) -> &[u8] {
-    const CASE_HACK_MARKER: &[u8] = b"~nix~case~hack~";
-    let Some(marker_start) = name
-        .windows(CASE_HACK_MARKER.len())
-        .rposition(|window| window == CASE_HACK_MARKER)
-    else {
-        return name;
-    };
-    let suffix_start = marker_start + CASE_HACK_MARKER.len();
-    if suffix_start < name.len() && name[suffix_start..].iter().all(u8::is_ascii_digit) {
-        &name[..marker_start]
-    } else {
-        name
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn nar_entry_name_bytes_for_filesystem_name(name: &[u8]) -> &[u8] {
-    darwin_case_hack_decoded_name(name)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn nar_entry_name_bytes_for_filesystem_name(name: &[u8]) -> &[u8] {
-    name
 }
 
 fn open_directory(path: &Path) -> io::Result<File> {
@@ -519,30 +472,18 @@ mod tests {
 
     #[test]
     fn native_name_projection_borrows_filesystem_bytes() {
-        use std::{hint::black_box, time::Instant};
+        use std::hint::black_box;
         let names: Vec<_> = (0..4096)
             .map(|index| OsString::from(format!("package-{index:06}-payload")))
             .collect();
         let run = || {
             for name in &names {
-                black_box(super::nar_entry_name_for_filesystem_name(black_box(name)));
+                black_box(super::directory_entry::nar_entry_name_for_filesystem_name(
+                    black_box(name),
+                ));
             }
         };
         let (_, counts) = super::test_allocations::measure(run);
-        let mut samples = [0_u128; 9];
-        for sample in &mut samples {
-            let start = Instant::now();
-            run();
-            *sample = start.elapsed().as_nanos();
-        }
-        samples.sort_unstable();
-        eprintln!(
-            "native projection: {} names, min/median/max {}/{}/{} ns, allocations {counts:?}",
-            names.len(),
-            samples[0],
-            samples[4],
-            samples[8]
-        );
         assert_eq!(
             counts.calls, 0,
             "projecting a filesystem name must not allocate: {counts:?}"
@@ -810,26 +751,6 @@ mod tests {
             .expect("decode raw-byte symlink NAR");
 
         assert_eq!(targets, [target]);
-    }
-
-    #[test]
-    fn darwin_case_hack_suffix_is_removed_only_when_it_has_decimal_disambiguator() {
-        assert_eq!(
-            super::darwin_case_hack_decoded_name(b"README~nix~case~hack~1"),
-            b"README"
-        );
-        assert_eq!(
-            super::darwin_case_hack_decoded_name(b"README~nix~case~hack~12"),
-            b"README"
-        );
-        assert_eq!(
-            super::darwin_case_hack_decoded_name(b"README~nix~case~hack~"),
-            b"README~nix~case~hack~"
-        );
-        assert_eq!(
-            super::darwin_case_hack_decoded_name(b"README~nix~case~hack~x"),
-            b"README~nix~case~hack~x"
-        );
     }
 
     #[test]

@@ -3,6 +3,15 @@
 #[path = "../../tests/support/nar_fixture.rs"]
 mod nar_fixture;
 
+#[cfg(unix)]
+#[path = "../../src/native_store/directory_entry.rs"]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared unit tests are not run by this harness-free benchmark"
+)]
+mod native_names;
+
 use nar_fixture::Node;
 use narjar::nar::{Decoder, Event};
 use sha2::{Digest, Sha256};
@@ -70,4 +79,50 @@ pub fn run(mut report: impl FnMut(&str, &str, usize, &mut dyn FnMut())) {
             black_box(node.encode(io::sink()));
         });
     }
+    #[cfg(unix)]
+    benchmark_native_names(&mut report);
+}
+
+#[cfg(unix)]
+fn benchmark_native_names(report: &mut impl FnMut(&str, &str, usize, &mut dyn FnMut())) {
+    use std::{ffi::OsString, os::unix::ffi::OsStrExt};
+    let names: Vec<_> = (0..4096)
+        .map(|index| OsString::from(format!("package-{:06}-payload", index * 1543 % 4096)))
+        .collect();
+    let mut expected: Vec<_> = names.iter().map(|name| name.as_bytes()).collect();
+    expected.sort_unstable();
+    let mut checked: Vec<_> = names
+        .iter()
+        .cloned()
+        .map(native_names::NativeDirectoryEntry::new)
+        .collect();
+    checked.sort_unstable_by(|left, right| {
+        left.nar_name().as_bytes().cmp(right.nar_name().as_bytes())
+    });
+    assert_eq!(
+        checked
+            .iter()
+            .map(|entry| entry.nar_name().as_bytes())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let bytes = names.iter().map(|name| name.len()).sum();
+    report("native-4096", "project", bytes, &mut || {
+        for name in &names {
+            black_box(native_names::nar_entry_name_for_filesystem_name(black_box(
+                name,
+            )));
+        }
+    });
+    report("native-4096", "collect-sort", bytes, &mut || {
+        let mut entries: Vec<_> = names
+            .iter()
+            .cloned()
+            .map(native_names::NativeDirectoryEntry::new)
+            .collect();
+        entries.sort_unstable_by(|left, right| {
+            left.nar_name().as_bytes().cmp(right.nar_name().as_bytes())
+        });
+        black_box(entries);
+    });
 }
