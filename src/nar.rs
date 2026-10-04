@@ -12,6 +12,18 @@ use sha2::{Digest, Sha256};
 const CHUNK_SIZE: usize = 64 * 1024;
 const TOKEN_LIMIT: u64 = 256;
 
+/// Owns only grammar bytes; variable-length metadata uses separate storage.
+struct ControlToken {
+    bytes: [u8; TOKEN_LIMIT as usize],
+    length: usize,
+}
+
+impl ControlToken {
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// The type of a NAR node.
 pub enum RootKind {
@@ -272,7 +284,7 @@ impl<R: Read> Decoder<R> {
         }
         self.expect(b"(")?;
         self.expect(b"type")?;
-        match self.read_string(TOKEN_LIMIT)?.as_slice() {
+        match self.read_control_token()?.as_bytes() {
             b"directory" => self.decode_directory_node(depth, sink, counters),
             b"regular" => self.decode_regular_file_node(sink, counters),
             b"symlink" => self.decode_symlink_node(sink, counters),
@@ -322,11 +334,11 @@ impl<R: Read> Decoder<R> {
         counters: &mut Counters,
     ) -> Result<Option<Vec<u8>>, DecodeError<E>> {
         self.bump_work()?;
-        let entry_kind = self.read_string(TOKEN_LIMIT)?;
-        if entry_kind == b")" {
+        let entry_kind = self.read_control_token()?;
+        if entry_kind.as_bytes() == b")" {
             return Ok(None);
         }
-        if entry_kind != b"entry" {
+        if entry_kind.as_bytes() != b"entry" {
             return Err(DecodeError::Invalid("directory entry expected".into()));
         }
         counters.entries = counters
@@ -389,14 +401,14 @@ impl<R: Read> Decoder<R> {
     }
 
     fn read_regular_file_executable_flag<E>(&mut self) -> Result<bool, DecodeError<E>> {
-        let field = self.read_string(TOKEN_LIMIT)?;
-        if field == b"contents" {
+        let field = self.read_control_token()?;
+        if field.as_bytes() == b"contents" {
             return Ok(false);
         }
-        if field != b"executable" {
+        if field.as_bytes() != b"executable" {
             return Err(DecodeError::Invalid("regular contents expected".into()));
         }
-        if !self.read_string(TOKEN_LIMIT)?.is_empty() {
+        if !self.read_control_token()?.as_bytes().is_empty() {
             return Err(DecodeError::NonCanonical(
                 "the executable marker must have an empty value",
             ));
@@ -470,6 +482,25 @@ impl<R: Read> Decoder<R> {
     }
 
     fn read_string<E>(&mut self, max: u64) -> Result<Vec<u8>, DecodeError<E>> {
+        let length = self.read_bounded_string_length(max)?;
+        let mut value = vec![0_u8; length];
+        self.read_raw(&mut value)?;
+        self.read_padding(length as u64)?;
+        Ok(value)
+    }
+
+    fn read_control_token<E>(&mut self) -> Result<ControlToken, DecodeError<E>> {
+        let length = self.read_bounded_string_length(TOKEN_LIMIT)?;
+        let mut token = ControlToken {
+            bytes: [0; TOKEN_LIMIT as usize],
+            length,
+        };
+        self.read_raw(&mut token.bytes[..length])?;
+        self.read_padding(length as u64)?;
+        Ok(token)
+    }
+
+    fn read_bounded_string_length<E>(&mut self, max: u64) -> Result<usize, DecodeError<E>> {
         let length = self.read_u64()?;
         if length > max {
             return Err(DecodeError::LimitExceeded {
@@ -478,12 +509,8 @@ impl<R: Read> Decoder<R> {
                 actual: length,
             });
         }
-        let length = usize::try_from(length)
-            .map_err(|_| DecodeError::Invalid("string does not fit in memory".into()))?;
-        let mut value = vec![0_u8; length];
-        self.read_raw(&mut value)?;
-        self.read_padding(length as u64)?;
-        Ok(value)
+        usize::try_from(length)
+            .map_err(|_| DecodeError::Invalid("string does not fit in memory".into()))
     }
 
     fn read_padding<E>(&mut self, length: u64) -> Result<(), DecodeError<E>> {
@@ -500,14 +527,14 @@ impl<R: Read> Decoder<R> {
     }
 
     fn expect<E>(&mut self, expected: &[u8]) -> Result<(), DecodeError<E>> {
-        let actual = self.read_string(TOKEN_LIMIT)?;
-        if actual == expected {
+        let actual = self.read_control_token()?;
+        if actual.as_bytes() == expected {
             Ok(())
         } else {
             Err(DecodeError::Invalid(format!(
                 "expected {:?}, got {:?}",
                 String::from_utf8_lossy(expected),
-                String::from_utf8_lossy(&actual)
+                String::from_utf8_lossy(actual.as_bytes())
             )))
         }
     }

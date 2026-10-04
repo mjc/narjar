@@ -68,6 +68,42 @@ fn archive(root: Vec<u8>) -> Vec<u8> {
         .collect()
 }
 
+#[test]
+fn stack_tokens_preserve_the_grammar_limit_and_input_error_boundaries() {
+    // Invalid tokens below the existing limit must still be consumed completely;
+    // a shorter implementation-specific stack buffer must not change the policy.
+    for length in [16, 17, 255, 256] {
+        let token = vec![b'x'; length];
+        let mut bytes = string(b"nix-archive-1");
+        bytes.extend(string(&token));
+        let result =
+            Decoder::new(bytes.as_slice()).decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()));
+        assert!(
+            matches!(result, Err(DecodeError::Invalid(_))),
+            "length {length}: {result:?}"
+        );
+
+        // Truncation takes precedence over mismatched-token classification.
+        bytes.truncate(bytes.len() - 1);
+        let result =
+            Decoder::new(bytes.as_slice()).decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()));
+        assert!(
+            matches!(result, Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+        );
+    }
+    let bytes = (257_u64).to_le_bytes();
+    let result =
+        Decoder::new(bytes.as_slice()).decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()));
+    assert!(matches!(
+        result,
+        Err(DecodeError::LimitExceeded {
+            what: "string length",
+            limit: 256,
+            actual: 257
+        })
+    ));
+}
+
 #[derive(Default)]
 struct Events {
     names: Vec<Vec<u8>>,
