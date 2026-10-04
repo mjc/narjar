@@ -437,7 +437,7 @@ impl NativeStoreLeaseManager {
         clock: &mut impl FnMut() -> Result<u64, NativeStoreLeaseError>,
     ) -> Result<u64, NativeStoreLeaseError> {
         match read_optional_record(&paths.record, &self.store_dir)? {
-            Some(record) => self.acquire_from_existing_record(path, record, paths, clock),
+            Some(record) => self.acquire_from_existing_record(path, record, paths, state, clock),
             None => self.create_first_lease(path, paths, state, clock),
         }
     }
@@ -447,6 +447,7 @@ impl NativeStoreLeaseManager {
         path: &NativeStorePath,
         record: LeaseRecord,
         paths: &LeasePaths,
+        state: &mut LeaseManagerState,
         clock: &mut impl FnMut() -> Result<u64, NativeStoreLeaseError>,
     ) -> Result<u64, NativeStoreLeaseError> {
         if record.store_path(&self.store_dir)? != *path {
@@ -462,6 +463,7 @@ impl NativeStoreLeaseManager {
                     &paths.record,
                     &LeaseRecord::live(path, renewed_expiry),
                 )?;
+                state.record_added(paths.record.clone());
                 Ok(renewed_expiry)
             }
             PersistedLeaseState::Pending => Err(NativeStoreLeaseError::InvalidRecord),
@@ -2933,6 +2935,36 @@ mod tests {
         let state = fixture.manager.lock_state().expect("lease state");
         assert!(!state.has_active_delivery(&lease.record_path));
         assert_eq!(state.active, 0);
+    }
+
+    #[test]
+    fn renewing_a_live_lease_not_yet_scanned_registers_it_for_delivery() {
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .expect("durable live lease");
+        let paths = LeasePaths {
+            directory: fixture.manager.lease_directory(&fixture.store_path),
+            record: fixture.manager.record_path(&fixture.store_path),
+            root: fixture.manager.root_path(&fixture.store_path),
+        };
+        {
+            let mut state = fixture.manager.lock_state().expect("lease state");
+            // A bounded cross-manager refresh has not reached this live record.
+            state.record_paths.remove(&paths.record);
+            state.record_index = RecordPathIndex::NeedsRefresh(0);
+            fixture
+                .manager
+                .acquire_existing_or_new_lease(&fixture.store_path, &paths, &mut state, &mut || {
+                    Ok(2)
+                })
+                .expect("renewal does not need the scan to reach the record first");
+        }
+
+        let _delivery = lease
+            .begin_active_delivery()
+            .expect("successful renewal must make the live lease usable for delivery");
     }
 
     #[test]
