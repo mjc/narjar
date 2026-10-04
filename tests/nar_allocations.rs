@@ -42,3 +42,19 @@ fn generated_nested_and_symlink_fixtures_preserve_summary_identity() {
     assert_eq!(actual.entries, 20);
     assert_eq!(actual.symlinks, 16);
 }
+
+#[test]
+fn sibling_names_reuse_two_buffers_instead_of_allocating_per_entry() {
+    let (bytes, expected) = Node::directory(4096, |_| Node::File(0)).encode(Vec::new());
+    let (actual, measured) = allocations::measure(|| {
+        Decoder::new(bytes.as_slice()).decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()))
+    });
+    assert_eq!(
+        actual.expect("ordered siblings").raw_sha256,
+        expected.raw_sha256
+    );
+    assert_eq!(
+        measured.calls, 2,
+        "only the two directory-name buffers may allocate: {measured:?}"
+    );
+}

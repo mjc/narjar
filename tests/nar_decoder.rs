@@ -118,7 +118,7 @@ impl EventSink for Events {
     fn event(&mut self, event: Event<'_>) -> io::Result<()> {
         match event {
             Event::BeginDirectory { depth: 0 } => self.root = Some(RootKind::Directory),
-            Event::Entry { name } => self.names.push(name),
+            Event::Entry { name } => self.names.push(name.to_vec()),
             Event::FileChunk(chunk) => self.file_chunks.push(chunk.to_vec()),
             Event::Symlink { target } => self.symlinks.push(target),
             _ => {}
@@ -405,6 +405,41 @@ fn sink_failure_after_progress_stops_event_delivery() {
         DecodeError::Sink(EncodeError::Invalid("late sink failure"))
     ));
     assert_eq!(sink.events, 2, "no event should follow the failed chunk");
+}
+
+#[test]
+fn borrowed_names_remain_distinct_across_buffer_swaps_and_nested_siblings() {
+    let data = archive(directory([
+        (b"a".as_slice(), regular(b"first", false)),
+        (
+            b"b-longer-name".as_slice(),
+            directory([
+                (b"inside-a".as_slice(), regular(b"nested", false)),
+                (b"inside-b-longer".as_slice(), regular(b"", false)),
+            ]),
+        ),
+        (b"c".as_slice(), regular(b"last", false)),
+    ]));
+    let mut events = Events::default();
+    let summary = Decoder::new(Chunked {
+        data: &data,
+        offset: 0,
+        chunk: 1,
+    })
+    .decode(&mut events)
+    .expect("nested short-read stream");
+    assert_eq!(
+        events.names,
+        [
+            b"a".as_slice(),
+            b"b-longer-name",
+            b"inside-a",
+            b"inside-b-longer",
+            b"c"
+        ]
+    );
+    assert_eq!(summary.entries, 5);
+    assert_eq!(summary.raw_sha256, <[u8; 32]>::from(Sha256::digest(&data)));
 }
 
 #[test]

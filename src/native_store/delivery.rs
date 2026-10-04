@@ -601,7 +601,7 @@ mod tests {
         let mut names = Vec::new();
         let mut sink = |event: Event<'_>| -> Result<(), std::convert::Infallible> {
             if let Event::Entry { name } = event {
-                names.push(name);
+                names.push(name.to_vec());
             }
             Ok(())
         };
@@ -635,7 +635,7 @@ mod tests {
                     if name == b"empty" {
                         empty_depth = Some(1);
                     }
-                    names.push(name);
+                    names.push(name.to_vec());
                 }
                 Event::BeginFile {
                     executable: true, ..
@@ -700,7 +700,7 @@ mod tests {
         let mut names = Vec::new();
         let mut sink = |event: Event<'_>| -> Result<(), std::convert::Infallible> {
             if let Event::Entry { name } = event {
-                names.push(name);
+                names.push(name.to_vec());
             }
             Ok(())
         };
@@ -1001,7 +1001,7 @@ mod tests {
         let mut executable_by_name = std::collections::BTreeMap::new();
         let mut sink = |event: Event<'_>| -> Result<(), std::convert::Infallible> {
             match event {
-                Event::Entry { name } => current_entry = Some(name),
+                Event::Entry { name } => current_entry = Some(name.to_vec()),
                 Event::BeginFile { executable, .. } => {
                     let name = current_entry
                         .take()

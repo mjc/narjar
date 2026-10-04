@@ -24,6 +24,24 @@ impl ControlToken {
     }
 }
 
+#[derive(Default)]
+struct DirectoryNames {
+    previous: Vec<u8>,
+    incoming: Vec<u8>,
+}
+
+impl DirectoryNames {
+    fn accept_ordered_name<E>(&mut self) -> Result<&[u8], DecodeError<E>> {
+        if self.previous >= self.incoming {
+            return Err(DecodeError::NonCanonical(
+                "directory entries are not strictly ordered",
+            ));
+        }
+        std::mem::swap(&mut self.previous, &mut self.incoming);
+        Ok(&self.previous)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// The type of a NAR node.
 pub enum RootKind {
@@ -132,7 +150,8 @@ impl<E: std::error::Error + 'static> std::error::Error for DecodeError<E> {
 /// One structural event produced by [`Decoder`].
 ///
 /// File chunks borrow the decoder's fixed-size buffer and are valid only for
-/// the duration of the sink callback. Names and link targets are owned.
+/// the duration of the sink callback. Names also borrow reusable metadata
+/// storage; sinks that retain names must explicitly copy them.
 pub enum Event<'a> {
     /// A directory node begins at the given nesting depth.
     BeginDirectory {
@@ -142,7 +161,7 @@ pub enum Event<'a> {
     /// A directory entry begins; its name is the following node's basename.
     Entry {
         /// Raw NAR bytes for the entry name.
-        name: Vec<u8>,
+        name: &'a [u8],
     },
     /// A regular file node begins with its complete declared body size.
     BeginFile {
@@ -300,9 +319,9 @@ impl<R: Read> Decoder<R> {
     ) -> Result<RootKind, DecodeError<S::Error>> {
         sink.event(Event::BeginDirectory { depth })
             .map_err(DecodeError::Sink)?;
-        let mut previous_name = None;
+        let mut names = DirectoryNames::default();
         std::iter::from_fn(|| {
-            self.decode_directory_entry_if_present(depth, &mut previous_name, sink, counters)
+            self.decode_directory_entry_if_present(depth, &mut names, sink, counters)
                 .transpose()
         })
         .try_for_each(|result| result)?;
@@ -313,11 +332,11 @@ impl<R: Read> Decoder<R> {
     fn decode_directory_entry_if_present<S: EventSink>(
         &mut self,
         depth: usize,
-        previous_name: &mut Option<Vec<u8>>,
+        names: &mut DirectoryNames,
         sink: &mut S,
         counters: &mut Counters,
     ) -> Result<Option<()>, DecodeError<S::Error>> {
-        let Some(name) = self.read_next_directory_entry_name(previous_name, counters)? else {
+        let Some(name) = self.read_next_directory_entry_name(names, counters)? else {
             return Ok(None);
         };
         sink.event(Event::Entry { name })
@@ -328,11 +347,11 @@ impl<R: Read> Decoder<R> {
         Ok(Some(()))
     }
 
-    fn read_next_directory_entry_name<E>(
+    fn read_next_directory_entry_name<'a, E>(
         &mut self,
-        previous_name: &mut Option<Vec<u8>>,
+        names: &'a mut DirectoryNames,
         counters: &mut Counters,
-    ) -> Result<Option<Vec<u8>>, DecodeError<E>> {
+    ) -> Result<Option<&'a [u8]>, DecodeError<E>> {
         self.bump_work()?;
         let entry_kind = self.read_control_token()?;
         if entry_kind.as_bytes() == b")" {
@@ -358,18 +377,9 @@ impl<R: Read> Decoder<R> {
         }
         self.expect(b"(")?;
         self.expect(b"name")?;
-        let name = self.read_string(self.limits.max_name_bytes)?;
-        self.validate_name(&name)?;
-        if previous_name
-            .as_ref()
-            .is_some_and(|previous| previous >= &name)
-        {
-            return Err(DecodeError::NonCanonical(
-                "directory entries are not strictly ordered",
-            ));
-        }
-        *previous_name = Some(name.clone());
-        Ok(Some(name))
+        self.read_string_into(self.limits.max_name_bytes, &mut names.incoming)?;
+        self.validate_name(&names.incoming)?;
+        names.accept_ordered_name().map(Some)
     }
 
     fn decode_regular_file_node<S: EventSink>(
@@ -482,11 +492,16 @@ impl<R: Read> Decoder<R> {
     }
 
     fn read_string<E>(&mut self, max: u64) -> Result<Vec<u8>, DecodeError<E>> {
-        let length = self.read_bounded_string_length(max)?;
-        let mut value = vec![0_u8; length];
-        self.read_raw(&mut value)?;
-        self.read_padding(length as u64)?;
+        let mut value = Vec::new();
+        self.read_string_into(max, &mut value)?;
         Ok(value)
+    }
+
+    fn read_string_into<E>(&mut self, max: u64, value: &mut Vec<u8>) -> Result<(), DecodeError<E>> {
+        let length = self.read_bounded_string_length(max)?;
+        value.resize(length, 0);
+        self.read_raw(value)?;
+        self.read_padding(length as u64)
     }
 
     fn read_control_token<E>(&mut self) -> Result<ControlToken, DecodeError<E>> {

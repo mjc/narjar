@@ -324,7 +324,7 @@ mod tests {
         let mut names = Vec::<Vec<u8>>::new();
         let mut sink = |event: Event<'_>| -> Result<(), Infallible> {
             if let Event::Entry { name } = event {
-                names.push(name);
+                names.push(name.to_vec());
             }
             Ok(())
         };
