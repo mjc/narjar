@@ -265,9 +265,10 @@ impl<W: Write> Encoder<W> {
                             "directory entries are not strictly ordered",
                         ));
                     }
-                    *state = DirectoryState::ChildOpen {
-                        name: name.to_vec(),
-                    };
+                    let mut owned_name = last_name.take().unwrap_or_default();
+                    owned_name.clear();
+                    owned_name.extend_from_slice(name);
+                    *state = DirectoryState::ChildOpen { name: owned_name };
                 }
                 DirectoryState::ChildOpen { .. } => {
                     return Err(EncodeError::Invalid("directory entry is missing its child"));

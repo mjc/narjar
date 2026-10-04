@@ -74,3 +74,15 @@ fn symlink_targets_reuse_one_buffer_across_sibling_nodes() {
         "two name buffers and one target buffer: {measured:?}"
     );
 }
+
+#[test]
+fn encoder_reuses_one_ordering_buffer_for_thousands_of_siblings() {
+    let node = Node::directory(4096, |_| Node::File(0));
+    let (_, expected) = node.encode(Vec::new());
+    let ((_, actual), measured) = allocations::measure(|| node.encode(std::io::sink()));
+    assert_eq!(actual, expected);
+    assert_eq!(
+        measured.calls, 2,
+        "one node stack and one ordering-name buffer: {measured:?}"
+    );
+}
