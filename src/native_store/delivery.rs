@@ -746,7 +746,7 @@ mod tests {
         let mut targets = Vec::new();
         let mut sink = |event: Event<'_>| -> Result<(), std::convert::Infallible> {
             if let Event::Symlink { target } = event {
-                targets.push(target);
+                targets.push(target.to_vec());
             }
             Ok(())
         };
@@ -785,7 +785,7 @@ mod tests {
         let mut directories = 0;
         let mut sink = |event: Event<'_>| -> Result<(), std::convert::Infallible> {
             match event {
-                Event::Symlink { target } => symlink_targets.push(target),
+                Event::Symlink { target } => symlink_targets.push(target.to_vec()),
                 Event::BeginDirectory { .. } => directories += 1,
                 _ => {}
             }

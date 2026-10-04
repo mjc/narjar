@@ -58,3 +58,19 @@ fn sibling_names_reuse_two_buffers_instead_of_allocating_per_entry() {
         "only the two directory-name buffers may allocate: {measured:?}"
     );
 }
+
+#[test]
+fn symlink_targets_reuse_one_buffer_across_sibling_nodes() {
+    let (bytes, expected) =
+        Node::directory(4096, |_| Node::Symlink(b"../target".to_vec())).encode(Vec::new());
+    let (actual, measured) = allocations::measure(|| {
+        Decoder::new(bytes.as_slice()).decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()))
+    });
+    let actual = actual.expect("valid symlinks");
+    assert_eq!(actual.symlinks, 4096);
+    assert_eq!(actual.raw_sha256, expected.raw_sha256);
+    assert_eq!(
+        measured.calls, 3,
+        "two name buffers and one target buffer: {measured:?}"
+    );
+}

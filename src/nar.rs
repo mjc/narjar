@@ -150,8 +150,8 @@ impl<E: std::error::Error + 'static> std::error::Error for DecodeError<E> {
 /// One structural event produced by [`Decoder`].
 ///
 /// File chunks borrow the decoder's fixed-size buffer and are valid only for
-/// the duration of the sink callback. Names also borrow reusable metadata
-/// storage; sinks that retain names must explicitly copy them.
+/// the duration of the sink callback. Names and link targets also borrow
+/// reusable metadata storage; sinks that retain them must explicitly copy them.
 pub enum Event<'a> {
     /// A directory node begins at the given nesting depth.
     BeginDirectory {
@@ -176,10 +176,10 @@ pub enum Event<'a> {
     FileChunk(&'a [u8]),
     /// The current regular file node has ended.
     EndFile,
-    /// A symbolic-link node with an owned target.
+    /// A symbolic-link node with a borrowed target.
     Symlink {
         /// Raw NAR bytes for the link target.
-        target: Vec<u8>,
+        target: &'a [u8],
     },
     /// The current directory node has ended.
     EndDirectory,
@@ -234,6 +234,7 @@ pub struct Decoder<R> {
     raw_bytes: u64,
     work: u64,
     file_buffer: [u8; CHUNK_SIZE],
+    symlink_target: Vec<u8>,
 }
 
 impl<R: Read> Decoder<R> {
@@ -251,6 +252,7 @@ impl<R: Read> Decoder<R> {
             raw_bytes: 0,
             work: 0,
             file_buffer: [0; CHUNK_SIZE],
+            symlink_target: Vec::new(),
         }
     }
 
@@ -432,21 +434,32 @@ impl<R: Read> Decoder<R> {
         sink: &mut S,
         counters: &mut Counters,
     ) -> Result<RootKind, DecodeError<S::Error>> {
-        let target = self.read_symlink_target()?;
-        sink.event(Event::Symlink { target })
-            .map_err(DecodeError::Sink)?;
+        self.read_symlink_target()?;
+        sink.event(Event::Symlink {
+            target: &self.symlink_target,
+        })
+        .map_err(DecodeError::Sink)?;
         self.expect(b")")?;
         counters.symlinks = counters.symlinks.saturating_add(1);
         Ok(RootKind::Symlink)
     }
 
-    fn read_symlink_target<E>(&mut self) -> Result<Vec<u8>, DecodeError<E>> {
+    fn read_symlink_target<E>(&mut self) -> Result<(), DecodeError<E>> {
         self.expect(b"target")?;
-        let target = self.read_string(self.limits.max_symlink_target_bytes)?;
-        if target.contains(&0) {
+        let length = self.read_bounded_string_length(self.limits.max_symlink_target_bytes)?;
+        self.symlink_target.resize(length, 0);
+        read_hashed_limited_bytes(
+            &mut self.reader,
+            &mut self.digest,
+            &mut self.raw_bytes,
+            &self.limits,
+            &mut self.symlink_target,
+        )?;
+        self.read_padding(length as u64)?;
+        if self.symlink_target.contains(&0) {
             return Err(DecodeError::NonCanonical("symlink target contains NUL"));
         }
-        Ok(target)
+        Ok(())
     }
 
     fn stream_file_contents<S: EventSink>(
@@ -489,12 +502,6 @@ impl<R: Read> Decoder<R> {
         let mut bytes = [0_u8; 8];
         self.read_raw(&mut bytes)?;
         Ok(u64::from_le_bytes(bytes))
-    }
-
-    fn read_string<E>(&mut self, max: u64) -> Result<Vec<u8>, DecodeError<E>> {
-        let mut value = Vec::new();
-        self.read_string_into(max, &mut value)?;
-        Ok(value)
     }
 
     fn read_string_into<E>(&mut self, max: u64, value: &mut Vec<u8>) -> Result<(), DecodeError<E>> {
