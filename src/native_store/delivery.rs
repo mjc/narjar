@@ -1,23 +1,21 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
-    io::{self, PipeReader, Read, Take, Write},
+    io::{self, Read, Write},
     ops::Range,
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         fs::MetadataExt,
     },
     path::Path,
-    sync::mpsc::{self, Receiver},
-    thread,
 };
 
+use crate::verified_stream::{VerifiedStream, read_uninterrupted_chunk};
 use narjar::{
     nar_encode::{EncodeSummary, Encoder, Event},
-    object::{NarHash, NarIdentity},
+    object::{LogicalNar, NarIdentity},
 };
 use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags};
-use sha2::{Digest, Sha256};
 
 use super::lease::NativeStoreLease;
 
@@ -38,12 +36,18 @@ static TEST_ALLOCATOR: test_allocations::CountingAllocator = test_allocations::C
 
 pub(crate) struct NativeNarDelivery {
     identity: NarIdentity,
-    reader: VerifiedNativeNarReader,
+    reader: VerifiedStream<LogicalNar>,
 }
 
 impl NativeNarDelivery {
     pub(crate) fn new(lease: NativeStoreLease, identity: NarIdentity) -> io::Result<Self> {
-        let reader = VerifiedNativeNarReader::spawn(identity, lease)?;
+        let active_delivery = lease
+            .begin_active_delivery()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let reader = VerifiedStream::spawn(identity, "narjar-native-nar", move |writer| {
+            let _active_delivery = active_delivery;
+            write_leased_nar(&lease, writer).map(|_| ())
+        })?;
         Ok(Self { identity, reader })
     }
 
@@ -67,7 +71,7 @@ impl NativeNarDelivery {
 }
 
 struct NativeNarRangeReader {
-    source: VerifiedNativeNarReader,
+    source: VerifiedStream<LogicalNar>,
     range: Range<u64>,
     position: u64,
     state: RangeReadState,
@@ -166,128 +170,6 @@ fn validate_delivery_range(range: Range<u64>, length: u64) -> io::Result<()> {
     }
 }
 
-enum VerifiedNativeNarReader<R: Read = PipeReader> {
-    Streaming(StreamingNativeNar<R>),
-    Complete,
-    Failed,
-}
-
-struct StreamingNativeNar<R: Read> {
-    reader: Take<R>,
-    producer: Receiver<io::Result<()>>,
-    expected: NarIdentity,
-    digest: Sha256,
-}
-
-impl VerifiedNativeNarReader {
-    fn spawn(expected: NarIdentity, lease: NativeStoreLease) -> io::Result<Self> {
-        let active_delivery = lease
-            .begin_active_delivery()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let (reader, mut writer) = io::pipe()?;
-        let (sender, producer) = mpsc::channel();
-        thread::Builder::new()
-            .name("narjar-native-nar".into())
-            .spawn(move || {
-                let _active_delivery = active_delivery;
-                let result = write_leased_nar(&lease, &mut writer);
-                drop(writer);
-                let _ = sender.send(result.map(|_| ()));
-            })?;
-        Ok(Self::Streaming(StreamingNativeNar {
-            reader: reader.take(expected.size().get()),
-            producer,
-            expected,
-            digest: Sha256::new(),
-        }))
-    }
-}
-
-impl<R: Read> VerifiedNativeNarReader<R> {
-    fn read_next(self, buffer: &mut [u8]) -> io::Result<(Self, usize)> {
-        match self {
-            Self::Streaming(mut stream) => {
-                let length = stream.read_chunk(buffer)?;
-                let next = match stream.reader.limit() {
-                    0 => {
-                        stream.finish()?;
-                        Self::Complete
-                    }
-                    _ => Self::Streaming(stream),
-                };
-                Ok((next, length))
-            }
-            Self::Complete => Ok((Self::Complete, 0)),
-            Self::Failed => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "verified native NAR stream is in a failed state",
-            )),
-        }
-    }
-}
-
-impl<R: Read> Read for VerifiedNativeNarReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        let current = std::mem::replace(self, Self::Failed);
-        let (next, length) = current.read_next(buffer)?;
-        *self = next;
-        Ok(length)
-    }
-}
-
-impl<R: Read> StreamingNativeNar<R> {
-    fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let length = read_uninterrupted_chunk(&mut self.reader, buffer)?;
-        if length == 0 && self.reader.limit() != 0 {
-            wait_for_native_nar_producer(&self.producer)?;
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "native NAR producer ended before the declared size",
-            ));
-        }
-        self.digest.update(&buffer[..length]);
-        Ok(length)
-    }
-
-    fn finish(self) -> io::Result<()> {
-        let Self {
-            reader: mut bounded_reader,
-            producer,
-            expected,
-            digest,
-        } = self;
-        let actual_hash = NarHash::from_digest(digest.finalize().into());
-        if actual_hash != expected.hash() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "native NAR identity mismatch: expected {}/{}; got {}/{}",
-                    expected.hash(),
-                    expected.size(),
-                    actual_hash,
-                    expected.size(),
-                ),
-            ));
-        }
-        if read_uninterrupted_chunk(bounded_reader.get_mut(), &mut [0; 1])? != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "native NAR producer exceeded the declared size",
-            ));
-        }
-        wait_for_native_nar_producer(&producer)
-    }
-}
-
-fn wait_for_native_nar_producer(producer: &Receiver<io::Result<()>>) -> io::Result<()> {
-    producer
-        .recv()
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native NAR result was dropped"))?
-}
-
 fn write_leased_nar<W: Write>(lease: &NativeStoreLease, output: W) -> io::Result<EncodeSummary> {
     let path = lease.store_path().as_path();
     let parent = path
@@ -376,15 +258,6 @@ fn encode_regular_file_contents<W: Write>(
         Err(error) => Some(Err(error)),
     })
     .try_for_each(std::convert::identity)
-}
-
-fn read_uninterrupted_chunk(source: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
-    std::iter::repeat_with(|| source.read(buffer))
-        .find(|result| match result {
-            Ok(_) => true,
-            Err(error) => error.kind() != io::ErrorKind::Interrupted,
-        })
-        .expect("repeat_with yields until the read is not interrupted")
 }
 
 fn emit_symlink_at<W: Write>(
@@ -639,12 +512,7 @@ mod tests {
                 source: io::Cursor::new(bytes.clone()),
                 interrupt_at: Some(offset),
             };
-            let mut reader = super::VerifiedNativeNarReader::Streaming(super::StreamingNativeNar {
-                reader: source.take(expected.size().get()),
-                producer,
-                expected,
-                digest: sha2::Sha256::new(),
-            });
+            let mut reader = super::VerifiedStream::new(expected, source, producer);
             let mut actual = Vec::new();
             let mut chunk = [0; 3];
             for _ in 0..2 {
