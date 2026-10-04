@@ -3,6 +3,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, PipeReader, Read, Take, Write},
     mem::MaybeUninit,
+    ops::Range,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd},
         unix::{
@@ -24,6 +25,7 @@ use sha2::{Digest, Sha256};
 use super::lease::NativeStoreLease;
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
+const DISCARD_BUFFER_SIZE: usize = 64 * 1024;
 
 pub(crate) struct NativeNarDelivery {
     identity: NarIdentity,
@@ -42,6 +44,86 @@ impl NativeNarDelivery {
 
     pub(crate) fn into_reader(self) -> impl Read + Send {
         self.reader
+    }
+
+    pub(crate) fn into_range_reader(self, range: Range<u64>) -> io::Result<impl Read + Send> {
+        validate_delivery_range(range.clone(), self.identity.size().get())?;
+        Ok(NativeNarRangeReader {
+            source: self.reader,
+            range,
+            position: 0,
+            finished: false,
+        })
+    }
+}
+
+struct NativeNarRangeReader {
+    source: VerifiedNativeNarReader,
+    range: Range<u64>,
+    position: u64,
+    finished: bool,
+}
+
+impl Read for NativeNarRangeReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.finished {
+            return Ok(0);
+        }
+        self.discard_until(self.range.start)?;
+        if self.position == self.range.end {
+            self.discard_until_end()?;
+            self.finished = true;
+            return Ok(0);
+        }
+        let range_remaining = usize::try_from(self.range.end - self.position).unwrap_or(usize::MAX);
+        let read_capacity = buffer.len().min(range_remaining);
+        let length = self.source.read(&mut buffer[..read_capacity])?;
+        self.position = self.position.saturating_add(length as u64);
+        Ok(length)
+    }
+}
+
+impl NativeNarRangeReader {
+    fn discard_until(&mut self, target: u64) -> io::Result<()> {
+        let mut buffer = [0; DISCARD_BUFFER_SIZE];
+        while self.position < target {
+            let remaining = usize::try_from(target - self.position).unwrap_or(usize::MAX);
+            let read_capacity = buffer.len().min(remaining);
+            let length = self.source.read(&mut buffer[..read_capacity])?;
+            if length == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "native NAR ended while skipping to requested range",
+                ));
+            }
+            self.position = self.position.saturating_add(length as u64);
+        }
+        Ok(())
+    }
+
+    fn discard_until_end(&mut self) -> io::Result<()> {
+        let mut buffer = [0; DISCARD_BUFFER_SIZE];
+        loop {
+            let length = self.source.read(&mut buffer)?;
+            if length == 0 {
+                return Ok(());
+            }
+            self.position = self.position.saturating_add(length as u64);
+        }
+    }
+}
+
+fn validate_delivery_range(range: Range<u64>, length: u64) -> io::Result<()> {
+    if range.start <= range.end && range.end <= length {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "native NAR response range is outside the declared identity",
+        ))
     }
 }
 
@@ -626,6 +708,55 @@ mod tests {
         let error = io::copy(&mut reader, &mut io::sink())
             .expect_err("changed native source should fail delivery");
 
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn range_delivery_yields_only_the_requested_bytes_and_still_finishes_the_nar() {
+        let fixture = NativeDeliveryFixture::new();
+        let bytes = raw_nar_bytes(fixture.lease());
+        let identity = NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(&bytes).into()),
+            NarSize::new(bytes.len() as u64),
+        );
+        let ranges = [0..1, 2..6, bytes.len() as u64 - 3..bytes.len() as u64];
+
+        for range in ranges {
+            let delivery =
+                NativeNarDelivery::new(fixture.lease(), identity).expect("open native delivery");
+            let mut reader = delivery
+                .into_range_reader(range.clone())
+                .expect("open native range delivery");
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).expect("read native range");
+
+            assert_eq!(actual, bytes[range.start as usize..range.end as usize]);
+        }
+    }
+
+    #[test]
+    fn range_delivery_rejects_corruption_after_the_requested_prefix() {
+        let fixture = NativeDeliveryFixture::new();
+        let bytes = raw_nar_bytes(fixture.lease());
+        let identity = NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(&bytes).into()),
+            NarSize::new(bytes.len() as u64),
+        );
+        fs::write(fixture.physical_path.join("z"), b"changed after prefix")
+            .expect("mutate native source after measured prefix");
+        let delivery =
+            NativeNarDelivery::new(fixture.lease(), identity).expect("open native delivery");
+        let mut reader = delivery
+            .into_range_reader(0..1)
+            .expect("open native prefix range");
+        let mut actual = Vec::new();
+
+        let error = reader
+            .read_to_end(&mut actual)
+            .expect_err("corrupt suffix should fail range completion");
+
+        assert_eq!(actual, bytes[..1]);
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("identity mismatch"));
     }
