@@ -498,9 +498,14 @@ fn encode_io_error(error: narjar::nar_encode::EncodeError) -> io::Error {
 #[cfg(unix)]
 mod tests {
     use std::{
+        ffi::OsString,
         fs::{self, File},
         io::{self, Read},
         num::{NonZeroU64, NonZeroUsize},
+        os::unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs::PermissionsExt,
+        },
         path::{Path, PathBuf},
         sync::Arc,
     };
@@ -528,6 +533,11 @@ mod tests {
                 fs::create_dir(path).expect("create store object");
                 fs::write(path.join("z"), b"last").expect("write z");
                 fs::write(path.join("a"), b"first").expect("write a");
+                fs::create_dir(path.join("empty")).expect("create empty directory");
+                let executable = path.join("run");
+                fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+                    .expect("mark executable");
                 std::os::unix::fs::symlink("a", path.join("link")).expect("write symlink");
             })
         }
@@ -626,7 +636,78 @@ mod tests {
             .decode(&mut sink)
             .expect("decode native NAR");
 
-        assert_eq!(names, [b"a".to_vec(), b"link".to_vec(), b"z".to_vec()]);
+        assert_eq!(
+            names,
+            [
+                b"a".to_vec(),
+                b"empty".to_vec(),
+                b"link".to_vec(),
+                b"run".to_vec(),
+                b"z".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_empty_directories_and_executable_bits() {
+        let fixture = NativeDeliveryFixture::new();
+        let bytes = raw_nar_bytes(fixture.lease());
+        let mut names = Vec::new();
+        let mut executable_files = 0;
+        let mut empty_depth = None;
+        let mut sink = |event: Event<'_>| -> Result<(), std::convert::Infallible> {
+            match event {
+                Event::Entry { name } => {
+                    if name == b"empty" {
+                        empty_depth = Some(1);
+                    }
+                    names.push(name);
+                }
+                Event::BeginFile {
+                    executable: true, ..
+                } => executable_files += 1,
+                _ => {}
+            }
+            Ok(())
+        };
+
+        Decoder::new(&bytes[..])
+            .decode(&mut sink)
+            .expect("decode native NAR");
+
+        assert!(names.contains(&b"empty".to_vec()));
+        assert_eq!(executable_files, 1);
+        assert_eq!(empty_depth, Some(1));
+    }
+
+    #[test]
+    fn preserves_raw_entry_names_when_the_filesystem_accepts_them() {
+        let raw_name = OsString::from_vec(vec![0xff, b'-', b'r', b'a', b'w']);
+        let fixture = NativeDeliveryFixture::with_store_object(|path| {
+            fs::create_dir(path).expect("create store object");
+            match fs::write(path.join(&raw_name), b"raw") {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => (),
+                Err(error) => panic!("write raw-byte filename: {error}"),
+            }
+        });
+        if !fixture.physical_path.join(&raw_name).exists() {
+            return;
+        }
+        let bytes = raw_nar_bytes(fixture.lease());
+        let mut names = Vec::new();
+        let mut sink = |event: Event<'_>| -> Result<(), std::convert::Infallible> {
+            if let Event::Entry { name } = event {
+                names.push(name);
+            }
+            Ok(())
+        };
+
+        Decoder::new(&bytes[..])
+            .decode(&mut sink)
+            .expect("decode raw-byte native NAR");
+
+        assert_eq!(names, [vec![0xff, b'-', b'r', b'a', b'w']]);
     }
 
     #[test]
@@ -759,5 +840,31 @@ mod tests {
         assert_eq!(actual, bytes[..1]);
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn unsupported_native_filesystem_objects_fail_closed() {
+        let fixture = NativeDeliveryFixture::with_store_object(|path| {
+            fs::create_dir(path).expect("create store object");
+            make_fifo(&path.join("fifo"));
+        });
+
+        let error = write_leased_nar(&fixture.lease(), io::sink())
+            .expect_err("FIFO store object should not be representable as NAR");
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    fn make_fifo(path: &Path) {
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .expect("fixture path should not contain NUL");
+        // SAFETY: name is NUL-terminated and mkfifo does not retain it.
+        let result = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo fixture failed: {}",
+            io::Error::last_os_error()
+        );
     }
 }
