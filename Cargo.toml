@@ -12,6 +12,9 @@ include = [
     "/LICENSE-MIT",
     "/README.md",
     "benches/micro.rs",
+    "benches/nar_codec.rs",
+    "tests/support/**",
+    "tests/nar_allocations.rs",
     "src/**",
     "tests/cli.rs",
     "tests/fixtures/nix-2.31.5-http-v0.1.tsv",
@@ -51,6 +54,10 @@ ureq = { version = "=3.4.2", default-features = false, features = ["rustls"] }
 
 [[bench]]
 name = "micro"
+harness = false
+
+[[bench]]
+name = "nar_codec"
 harness = false
 
 [profile.profiling]
