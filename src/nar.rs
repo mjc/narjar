@@ -237,6 +237,7 @@ pub struct Decoder<R> {
     work: u64,
     file_buffer: [u8; CHUNK_SIZE],
     symlink_target: Vec<u8>,
+    control_token: ControlToken,
 }
 
 impl<R: Read> Decoder<R> {
@@ -255,6 +256,10 @@ impl<R: Read> Decoder<R> {
             work: 0,
             file_buffer: [0; CHUNK_SIZE],
             symlink_target: Vec::new(),
+            control_token: ControlToken {
+                bytes: [0; TOKEN_LIMIT as usize],
+                length: 0,
+            },
         }
     }
 
@@ -523,15 +528,18 @@ impl<R: Read> Decoder<R> {
         self.read_padding(length as u64)
     }
 
-    fn read_control_token<E>(&mut self) -> Result<ControlToken, DecodeError<E>> {
+    fn read_control_token<E>(&mut self) -> Result<&ControlToken, DecodeError<E>> {
         let length = self.read_bounded_string_length(TOKEN_LIMIT)?;
-        let mut token = ControlToken {
-            bytes: [0; TOKEN_LIMIT as usize],
-            length,
-        };
-        self.read_raw(&mut token.bytes[..length])?;
+        read_hashed_limited_bytes(
+            &mut self.reader,
+            &mut self.digest,
+            &mut self.raw_bytes,
+            &self.limits,
+            &mut self.control_token.bytes[..length],
+        )?;
         self.read_padding(length as u64)?;
-        Ok(token)
+        self.control_token.length = length;
+        Ok(&self.control_token)
     }
 
     fn read_bounded_string_length<E>(&mut self, max: u64) -> Result<usize, DecodeError<E>> {
@@ -668,4 +676,38 @@ struct Counters {
     entries: u64,
     files: u64,
     symlinks: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+
+    #[test]
+    fn grammar_reads_reuse_one_buffer_and_ignore_previous_token_tails() {
+        let mut bytes = Vec::new();
+        for token in [b"nix-archive-1".as_slice(), b"(", b"", b"type"] {
+            bytes.extend_from_slice(&(token.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(token);
+            bytes.resize(bytes.len() + (8 - token.len() % 8) % 8, 0);
+        }
+        let mut decoder = Decoder::new(bytes.as_slice());
+        let first = decoder.read_control_token::<Infallible>().unwrap();
+        let buffer = first.as_bytes().as_ptr();
+        assert_eq!(first.as_bytes(), b"nix-archive-1");
+        for expected in [b"(".as_slice(), b"", b"type"] {
+            let token = decoder.read_control_token::<Infallible>().unwrap();
+            assert_eq!(token.as_bytes(), expected);
+            assert_eq!(
+                token.as_bytes().as_ptr(),
+                buffer,
+                "grammar parsing must borrow the same bounded scratch, not move a full token"
+            );
+        }
+        assert_eq!(decoder.raw_bytes, bytes.len() as u64);
+        assert_eq!(
+            decoder.digest.finalize().as_slice(),
+            Sha256::digest(&bytes).as_slice()
+        );
+    }
 }
