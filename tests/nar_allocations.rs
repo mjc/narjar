@@ -86,3 +86,35 @@ fn encoder_reuses_one_ordering_buffer_for_thousands_of_siblings() {
         "one node stack and one ordering-name buffer: {measured:?}"
     );
 }
+
+#[test]
+fn oversized_sibling_names_do_not_accumulate_down_a_short_named_subtree() {
+    // Valid but hostile metadata: each level finishes huge a/b siblings before
+    // entering z. Neither previous-name ordering nor spare scratch needs those
+    // historical capacities while walking z's children.
+    let node = (0..12).fold(Node::File(0), |child, _| {
+        Node::Directory(vec![
+            (vec![b'a'; 65_536], Node::File(0)),
+            (vec![b'b'; 65_536], Node::File(0)),
+            (b"z".to_vec(), child),
+        ])
+    });
+    let (bytes, expected) = node.encode(Vec::new());
+    let ((_, encoded), encoder_heap) = allocations::measure(|| node.encode(std::io::sink()));
+    let (decoded, decoder_heap) = allocations::measure(|| {
+        Decoder::new(bytes.as_slice()).decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()))
+    });
+    assert_eq!(encoded, expected);
+    assert_eq!(
+        decoded.expect("deep valid metadata").raw_sha256,
+        expected.raw_sha256
+    );
+    assert!(
+        encoder_heap.peak_bytes < 3 * 65_536,
+        "encoder retained historical capacities: {encoder_heap:?}"
+    );
+    assert!(
+        decoder_heap.peak_bytes < 3 * 65_536,
+        "decoder retained historical capacities: {decoder_heap:?}"
+    );
+}

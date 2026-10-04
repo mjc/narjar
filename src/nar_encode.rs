@@ -268,6 +268,7 @@ impl<W: Write> Encoder<W> {
                     let mut owned_name = last_name.take().unwrap_or_default();
                     owned_name.clear();
                     owned_name.extend_from_slice(name);
+                    crate::nar::release_oversized_metadata_capacity(&mut owned_name);
                     *state = DirectoryState::ChildOpen { name: owned_name };
                 }
                 DirectoryState::ChildOpen { .. } => {

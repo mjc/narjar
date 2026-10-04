@@ -38,6 +38,8 @@ impl DirectoryNames {
             ));
         }
         std::mem::swap(&mut self.previous, &mut self.incoming);
+        self.incoming.clear();
+        release_oversized_metadata_capacity(&mut self.incoming);
         Ok(&self.previous)
     }
 }
@@ -303,12 +305,20 @@ impl<R: Read> Decoder<R> {
                 actual: depth as u64,
             });
         }
+        match self.read_node_kind()? {
+            RootKind::Directory => self.decode_directory_node(depth, sink, counters),
+            RootKind::Regular => self.decode_regular_file_node(sink, counters),
+            RootKind::Symlink => self.decode_symlink_node(sink, counters),
+        }
+    }
+
+    fn read_node_kind<E>(&mut self) -> Result<RootKind, DecodeError<E>> {
         self.expect(b"(")?;
         self.expect(b"type")?;
         match self.read_control_token()?.as_bytes() {
-            b"directory" => self.decode_directory_node(depth, sink, counters),
-            b"regular" => self.decode_regular_file_node(sink, counters),
-            b"symlink" => self.decode_symlink_node(sink, counters),
+            b"directory" => Ok(RootKind::Directory),
+            b"regular" => Ok(RootKind::Regular),
+            b"symlink" => Ok(RootKind::Symlink),
             _ => Err(DecodeError::Invalid("unknown NAR node type".into())),
         }
     }
@@ -448,6 +458,7 @@ impl<R: Read> Decoder<R> {
         self.expect(b"target")?;
         let length = self.read_bounded_string_length(self.limits.max_symlink_target_bytes)?;
         self.symlink_target.resize(length, 0);
+        release_oversized_metadata_capacity(&mut self.symlink_target);
         read_hashed_limited_bytes(
             &mut self.reader,
             &mut self.digest,
@@ -507,6 +518,7 @@ impl<R: Read> Decoder<R> {
     fn read_string_into<E>(&mut self, max: u64, value: &mut Vec<u8>) -> Result<(), DecodeError<E>> {
         let length = self.read_bounded_string_length(max)?;
         value.resize(length, 0);
+        release_oversized_metadata_capacity(value);
         self.read_raw(value)?;
         self.read_padding(length as u64)
     }
@@ -593,6 +605,15 @@ impl<R: Read> Decoder<R> {
             &self.limits,
             buffer,
         )
+    }
+}
+
+/// Ordinary filesystem metadata fits within 4 KiB. Retain that scratch, but
+/// don't carry historical huge names down a short-named subtree. A large value
+/// still in use keeps its capacity; only substantial shrink triggers release.
+pub(crate) fn release_oversized_metadata_capacity(bytes: &mut Vec<u8>) {
+    if bytes.capacity() > 4096 && bytes.capacity() / 4 > bytes.len() {
+        bytes.shrink_to_fit();
     }
 }
 

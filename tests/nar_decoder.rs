@@ -419,6 +419,14 @@ fn borrowed_names_remain_distinct_across_buffer_swaps_and_nested_siblings() {
             ]),
         ),
         (b"c".as_slice(), regular(b"last", false)),
+        (
+            b"d-longer-than-either-initial-buffer".as_slice(),
+            regular(b"growth", false),
+        ),
+        (
+            b"e-even-longer-than-the-other-reallocated-buffer".as_slice(),
+            regular(b"growth again", false),
+        ),
     ]));
     let mut events = Events::default();
     let summary = Decoder::new(Chunked {
@@ -435,24 +443,27 @@ fn borrowed_names_remain_distinct_across_buffer_swaps_and_nested_siblings() {
             b"b-longer-name",
             b"inside-a",
             b"inside-b-longer",
-            b"c"
+            b"c",
+            b"d-longer-than-either-initial-buffer",
+            b"e-even-longer-than-the-other-reallocated-buffer"
         ]
     );
-    assert_eq!(summary.entries, 5);
+    assert_eq!(summary.entries, 7);
     assert_eq!(summary.raw_sha256, <[u8; 32]>::from(Sha256::digest(&data)));
 }
 
 #[test]
 fn retained_symlink_targets_survive_reuse_shrinking_and_growth() {
     let long = vec![b'x'; 65_537];
+    let longer = vec![b'y'; 131_075];
     let data = archive(directory([
-        (b"a".as_slice(), symlink(&long)),
-        (b"b".as_slice(), symlink(b"")),
+        (b"a".as_slice(), symlink(b"short")),
+        (b"b".as_slice(), symlink(&long)),
         (
             b"c".as_slice(),
-            directory([(b"nested".as_slice(), symlink(b"../other"))]),
+            directory([(b"nested".as_slice(), symlink(b""))]),
         ),
-        (b"d".as_slice(), symlink(&long)),
+        (b"d".as_slice(), symlink(&longer)),
     ]));
     let mut events = Events::default();
     let summary = Decoder::new(Chunked {
@@ -462,12 +473,46 @@ fn retained_symlink_targets_survive_reuse_shrinking_and_growth() {
     })
     .decode(&mut events)
     .expect("short-read symlink stream");
-    assert_eq!(
-        events.symlinks,
-        [long.clone(), vec![], b"../other".to_vec(), long]
-    );
+    assert_eq!(events.symlinks, [b"short".to_vec(), long, vec![], longer]);
     assert_eq!(summary.symlinks, 4);
     assert_eq!(summary.raw_sha256, <[u8; 32]>::from(Sha256::digest(&data)));
+}
+
+#[test]
+fn rejecting_later_borrowed_metadata_preserves_the_sink_error_and_stops_events() {
+    let data = archive(directory([
+        (b"a".as_slice(), symlink(b"first")),
+        (b"b".as_slice(), symlink(b"second")),
+        (b"c".as_slice(), symlink(b"never delivered")),
+    ]));
+    for fail_on_entry in [true, false] {
+        let mut calls = 0;
+        let mut sink = |event: Event<'_>| {
+            calls += 1;
+            let refused = match event {
+                Event::Entry { name } => fail_on_entry && name == b"b",
+                Event::Symlink { target } => !fail_on_entry && target == b"second",
+                _ => false,
+            };
+            if refused {
+                Err(EncodeError::Invalid("metadata sink failure"))
+            } else {
+                Ok(())
+            }
+        };
+        let error = Decoder::new(data.as_slice())
+            .decode(&mut sink)
+            .expect_err("sink refused metadata");
+        assert!(matches!(
+            error,
+            DecodeError::Sink(EncodeError::Invalid("metadata sink failure"))
+        ));
+        assert_eq!(
+            calls,
+            if fail_on_entry { 4 } else { 5 },
+            "no events after rejected metadata"
+        );
+    }
 }
 
 #[test]
