@@ -12,6 +12,7 @@ use std::{
         },
     },
     path::Path,
+    ptr::NonNull,
     sync::mpsc::{self, Receiver},
     thread,
 };
@@ -52,7 +53,7 @@ impl NativeNarDelivery {
             source: self.reader,
             range,
             position: 0,
-            finished: false,
+            state: RangeReadState::Serving,
         })
     }
 }
@@ -61,7 +62,14 @@ struct NativeNarRangeReader {
     source: VerifiedNativeNarReader,
     range: Range<u64>,
     position: u64,
-    finished: bool,
+    state: RangeReadState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeReadState {
+    Serving,
+    Complete,
+    Failed,
 }
 
 impl Read for NativeNarRangeReader {
@@ -69,24 +77,34 @@ impl Read for NativeNarRangeReader {
         if buffer.is_empty() {
             return Ok(0);
         }
-        if self.finished {
-            return Ok(0);
+        match self.state {
+            RangeReadState::Serving => self.read_serving_range(buffer),
+            RangeReadState::Complete => Ok(0),
+            RangeReadState::Failed => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native NAR range stream is in a failed state",
+            )),
         }
+    }
+}
+
+impl NativeNarRangeReader {
+    fn read_serving_range(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.discard_until(self.range.start)?;
         if self.position == self.range.end {
-            self.discard_until_end()?;
-            self.finished = true;
+            self.finish_range()?;
             return Ok(0);
         }
         let range_remaining = usize::try_from(self.range.end - self.position).unwrap_or(usize::MAX);
         let read_capacity = buffer.len().min(range_remaining);
         let length = self.source.read(&mut buffer[..read_capacity])?;
         self.position = self.position.saturating_add(length as u64);
+        if self.position == self.range.end {
+            self.finish_range()?;
+        }
         Ok(length)
     }
-}
 
-impl NativeNarRangeReader {
     fn discard_until(&mut self, target: u64) -> io::Result<()> {
         let mut buffer = [0; DISCARD_BUFFER_SIZE];
         while self.position < target {
@@ -102,6 +120,19 @@ impl NativeNarRangeReader {
             self.position = self.position.saturating_add(length as u64);
         }
         Ok(())
+    }
+
+    fn finish_range(&mut self) -> io::Result<()> {
+        match self.discard_until_end() {
+            Ok(()) => {
+                self.state = RangeReadState::Complete;
+                Ok(())
+            }
+            Err(error) => {
+                self.state = RangeReadState::Failed;
+                Err(error)
+            }
+        }
     }
 
     fn discard_until_end(&mut self) -> io::Result<()> {
@@ -142,11 +173,15 @@ struct StreamingNativeNar {
 
 impl VerifiedNativeNarReader {
     fn spawn(expected: NarIdentity, lease: NativeStoreLease) -> io::Result<Self> {
+        let active_delivery = lease
+            .begin_active_delivery()
+            .map_err(|error| io::Error::other(error.to_string()))?;
         let (reader, mut writer) = io::pipe()?;
         let (sender, producer) = mpsc::channel();
         thread::Builder::new()
             .name("narjar-native-nar".into())
             .spawn(move || {
+                let _active_delivery = active_delivery;
                 let result = write_leased_nar(&lease, &mut writer);
                 drop(writer);
                 let _ = sender.send(result.map(|_| ()));
@@ -286,11 +321,11 @@ fn emit_directory_at<W: Write>(
     encoder
         .push(Event::BeginDirectory)
         .map_err(encode_io_error)?;
-    for entry in sorted_directory_entry_names(&directory)? {
+    for entry in sorted_directory_entries(&directory)? {
         encoder
-            .push(Event::Entry(entry.as_bytes()))
+            .push(Event::Entry(entry.nar_name.as_bytes()))
             .map_err(encode_io_error)?;
-        emit_node_at(encoder, &directory, &entry)?;
+        emit_node_at(encoder, &directory, &entry.filesystem_name)?;
     }
     encoder.push(Event::EndDirectory).map_err(encode_io_error)
 }
@@ -308,7 +343,7 @@ fn emit_regular_file_at<W: Write>(
             "native file changed type before it could be read",
         ));
     }
-    let executable = metadata.mode() & 0o111 != 0;
+    let executable = metadata.mode() & 0o100 != 0;
     encoder
         .push(Event::BeginFile {
             executable,
@@ -339,13 +374,18 @@ fn emit_symlink_at<W: Write>(
         .map_err(encode_io_error)
 }
 
-fn sorted_directory_entry_names(directory: &File) -> io::Result<Vec<OsString>> {
-    let mut names = directory_entry_names(directory)?;
-    names.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    Ok(names)
+fn sorted_directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryEntry>> {
+    let mut entries = directory_entries(directory)?;
+    entries.sort_unstable_by(|left, right| left.nar_name.as_bytes().cmp(right.nar_name.as_bytes()));
+    Ok(entries)
 }
 
-fn directory_entry_names(directory: &File) -> io::Result<Vec<OsString>> {
+struct NativeDirectoryEntry {
+    filesystem_name: OsString,
+    nar_name: OsString,
+}
+
+fn directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryEntry>> {
     let fd = duplicate_fd(directory)?;
     // SAFETY: fdopendir takes ownership of the duplicated descriptor on success.
     let stream = unsafe { libc::fdopendir(fd) };
@@ -356,7 +396,7 @@ fn directory_entry_names(directory: &File) -> io::Result<Vec<OsString>> {
         }
         return Err(io::Error::last_os_error());
     }
-    DirectoryStream { stream }.read_entry_names()
+    DirectoryStream { stream }.read_entries()
 }
 
 struct DirectoryStream {
@@ -364,22 +404,64 @@ struct DirectoryStream {
 }
 
 impl DirectoryStream {
-    fn read_entry_names(&mut self) -> io::Result<Vec<OsString>> {
-        let mut names = Vec::new();
-        loop {
-            // SAFETY: stream is a valid DIR* owned by DirectoryStream.
-            let entry = unsafe { libc::readdir(self.stream) };
-            if entry.is_null() {
-                break;
-            }
+    fn read_entries(&mut self) -> io::Result<Vec<NativeDirectoryEntry>> {
+        let mut entries = Vec::new();
+        while let Some(entry) = self.next_entry()? {
             // SAFETY: d_name is NUL-terminated for the returned directory entry.
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let name = unsafe { CStr::from_ptr(entry.as_ref().d_name.as_ptr()) };
             if name.to_bytes() != b"." && name.to_bytes() != b".." {
-                names.push(OsString::from_vec(name.to_bytes().to_vec()));
+                let filesystem_name = OsString::from_vec(name.to_bytes().to_vec());
+                entries.push(NativeDirectoryEntry {
+                    nar_name: nar_entry_name_for_filesystem_name(&filesystem_name),
+                    filesystem_name,
+                });
             }
         }
-        Ok(names)
+        Ok(entries)
     }
+
+    fn next_entry(&mut self) -> io::Result<Option<NonNull<libc::dirent>>> {
+        clear_errno();
+        // SAFETY: stream is a valid DIR* owned by DirectoryStream.
+        let entry = unsafe { libc::readdir(self.stream) };
+        match NonNull::new(entry) {
+            Some(entry) => Ok(Some(entry)),
+            None => match current_errno() {
+                0 => Ok(None),
+                error => Err(io::Error::from_raw_os_error(error)),
+            },
+        }
+    }
+}
+
+fn nar_entry_name_for_filesystem_name(name: &OsStr) -> OsString {
+    OsString::from_vec(nar_entry_name_bytes_for_filesystem_name(name.as_bytes()).to_vec())
+}
+
+fn darwin_case_hack_decoded_name(name: &[u8]) -> &[u8] {
+    const CASE_HACK_MARKER: &[u8] = b"~nix~case~hack~";
+    let Some(marker_start) = name
+        .windows(CASE_HACK_MARKER.len())
+        .rposition(|window| window == CASE_HACK_MARKER)
+    else {
+        return name;
+    };
+    let suffix_start = marker_start + CASE_HACK_MARKER.len();
+    if suffix_start < name.len() && name[suffix_start..].iter().all(u8::is_ascii_digit) {
+        &name[..marker_start]
+    } else {
+        name
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn nar_entry_name_bytes_for_filesystem_name(name: &[u8]) -> &[u8] {
+    darwin_case_hack_decoded_name(name)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn nar_entry_name_bytes_for_filesystem_name(name: &[u8]) -> &[u8] {
+    name
 }
 
 impl Drop for DirectoryStream {
@@ -457,11 +539,19 @@ fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
 }
 
 fn open_regular_at(parent: &File, name: &OsStr) -> io::Result<File> {
-    open_at(
+    let file = open_at(
         parent,
         name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-    )
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )?;
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native file changed type before it could be read",
+        ))
+    }
 }
 
 fn open_at(parent: &File, name: &OsStr, flags: i32) -> io::Result<File> {
@@ -490,6 +580,26 @@ fn invalid_path(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+#[cfg(target_os = "linux")]
+fn clear_errno() {
+    // SAFETY: errno is thread-local on Linux.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_errno() {
+    // SAFETY: errno is thread-local on macOS.
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+fn current_errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
 fn encode_io_error(error: narjar::nar_encode::EncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -498,7 +608,7 @@ fn encode_io_error(error: narjar::nar_encode::EncodeError) -> io::Error {
 #[cfg(unix)]
 mod tests {
     use std::{
-        ffi::OsString,
+        ffi::{OsStr, OsString},
         fs::{self, File},
         io::{self, Read},
         num::{NonZeroU64, NonZeroUsize},
@@ -517,7 +627,7 @@ mod tests {
     use sha2::Digest;
     use sqlite::Connection;
 
-    use super::{NativeNarDelivery, write_leased_nar};
+    use super::{NativeNarDelivery, open_directory, open_regular_at, write_leased_nar};
     use crate::native_store::lease::NativeStoreLeaseManager;
 
     struct NativeDeliveryFixture {
@@ -681,6 +791,34 @@ mod tests {
     }
 
     #[test]
+    fn only_owner_execute_bit_marks_a_native_file_executable() {
+        let fixture = NativeDeliveryFixture::with_store_object(|path| {
+            fs::create_dir(path).expect("create store object");
+            write_file_with_mode(&path.join("group-exec"), 0o654);
+            write_file_with_mode(&path.join("owner-exec"), 0o744);
+            write_file_with_mode(&path.join("other-exec"), 0o645);
+            write_file_with_mode(&path.join("plain"), 0o644);
+        });
+        let bytes = raw_nar_bytes(fixture.lease());
+
+        let executable_by_name = decoded_file_executable_flags(&bytes);
+
+        assert_eq!(
+            executable_by_name.get(b"owner-exec".as_slice()),
+            Some(&true)
+        );
+        assert_eq!(
+            executable_by_name.get(b"group-exec".as_slice()),
+            Some(&false)
+        );
+        assert_eq!(
+            executable_by_name.get(b"other-exec".as_slice()),
+            Some(&false)
+        );
+        assert_eq!(executable_by_name.get(b"plain".as_slice()), Some(&false));
+    }
+
+    #[test]
     fn preserves_raw_entry_names_when_the_filesystem_accepts_them() {
         let raw_name = OsString::from_vec(vec![0xff, b'-', b'r', b'a', b'w']);
         let fixture = NativeDeliveryFixture::with_store_object(|path| {
@@ -708,6 +846,26 @@ mod tests {
             .expect("decode raw-byte native NAR");
 
         assert_eq!(names, [vec![0xff, b'-', b'r', b'a', b'w']]);
+    }
+
+    #[test]
+    fn darwin_case_hack_suffix_is_removed_only_when_it_has_decimal_disambiguator() {
+        assert_eq!(
+            super::darwin_case_hack_decoded_name(b"README~nix~case~hack~1"),
+            b"README"
+        );
+        assert_eq!(
+            super::darwin_case_hack_decoded_name(b"README~nix~case~hack~12"),
+            b"README"
+        );
+        assert_eq!(
+            super::darwin_case_hack_decoded_name(b"README~nix~case~hack~"),
+            b"README~nix~case~hack~"
+        );
+        assert_eq!(
+            super::darwin_case_hack_decoded_name(b"README~nix~case~hack~x"),
+            b"README~nix~case~hack~x"
+        );
     }
 
     #[test]
@@ -837,9 +995,64 @@ mod tests {
             .read_to_end(&mut actual)
             .expect_err("corrupt suffix should fail range completion");
 
-        assert_eq!(actual, bytes[..1]);
+        assert_eq!(actual, Vec::<u8>::new());
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn range_delivery_rejects_corrupt_suffix_before_bounded_consumers_get_the_prefix() {
+        let fixture = NativeDeliveryFixture::new();
+        let bytes = raw_nar_bytes(fixture.lease());
+        let identity = NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(&bytes).into()),
+            NarSize::new(bytes.len() as u64),
+        );
+        fs::write(fixture.physical_path.join("z"), b"changed after prefix")
+            .expect("mutate native source after measured prefix");
+        let delivery =
+            NativeNarDelivery::new(fixture.lease(), identity).expect("open native delivery");
+        let mut reader = delivery
+            .into_range_reader(0..1)
+            .expect("open native prefix range")
+            .take(1);
+        let mut actual = Vec::new();
+
+        let error = reader
+            .read_to_end(&mut actual)
+            .expect_err("corrupt suffix should fail before bounded prefix delivery");
+
+        assert_eq!(actual, Vec::<u8>::new());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn failed_range_reader_stays_failed_on_later_reads() {
+        let fixture = NativeDeliveryFixture::new();
+        let bytes = raw_nar_bytes(fixture.lease());
+        let identity = NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(&bytes).into()),
+            NarSize::new(bytes.len() as u64),
+        );
+        fs::write(fixture.physical_path.join("z"), b"changed after prefix")
+            .expect("mutate native source after measured prefix");
+        let delivery =
+            NativeNarDelivery::new(fixture.lease(), identity).expect("open native delivery");
+        let mut reader = delivery
+            .into_range_reader(0..1)
+            .expect("open native prefix range");
+        let mut byte = [0; 1];
+
+        let first_error = reader
+            .read(&mut byte)
+            .expect_err("corrupt suffix should fail first read");
+        let second_error = reader
+            .read(&mut byte)
+            .expect_err("failed range should remain failed");
+
+        assert_eq!(first_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(second_error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -853,6 +1066,47 @@ mod tests {
             .expect_err("FIFO store object should not be representable as NAR");
 
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn regular_file_open_fails_closed_when_a_child_path_is_a_fifo() {
+        let temporary = tempfile::tempdir().expect("create fixture root");
+        let parent = temporary.path().join("parent");
+        fs::create_dir(&parent).expect("create parent directory");
+        make_fifo(&parent.join("fifo"));
+        let parent = open_directory(&parent).expect("open fixture parent");
+
+        let error = open_regular_at(&parent, OsStr::new("fifo"))
+            .expect_err("FIFO should not open as a regular native file");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn write_file_with_mode(path: &Path, mode: u32) {
+        fs::write(path, b"content").expect("write fixture file");
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set fixture mode");
+    }
+
+    fn decoded_file_executable_flags(bytes: &[u8]) -> std::collections::BTreeMap<Vec<u8>, bool> {
+        let mut current_entry = None;
+        let mut executable_by_name = std::collections::BTreeMap::new();
+        let mut sink = |event: Event<'_>| -> Result<(), std::convert::Infallible> {
+            match event {
+                Event::Entry { name } => current_entry = Some(name),
+                Event::BeginFile { executable, .. } => {
+                    let name = current_entry
+                        .take()
+                        .expect("file event should be preceded by entry event");
+                    executable_by_name.insert(name, executable);
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+        Decoder::new(bytes)
+            .decode(&mut sink)
+            .expect("decode native NAR executable flags");
+        executable_by_name
     }
 
     fn make_fifo(path: &Path) {
