@@ -153,6 +153,14 @@ impl NativeStoreLease {
             .state
             .lock()
             .map_err(|_| NativeStoreLeaseError::Poisoned)?;
+        if !state.record_paths.contains(&self.record_path) {
+            return Err(NativeStoreLeaseError::InvalidRecord);
+        }
+        let root = fs::read_link(self.record_path.with_file_name(ROOT_FILE))
+            .map_err(NativeStoreLeaseError::Io)?;
+        if root != self.path.as_path() {
+            return Err(NativeStoreLeaseError::RootConflict);
+        }
         state.active_delivery_started(&self.record_path);
         Ok(NativeStoreActiveDelivery {
             record_path: self.record_path.clone(),
@@ -2906,6 +2914,59 @@ mod tests {
             .expect("expiration cleanup should release inactive delivery");
         assert!(!fixture.manager.root_path(&fixture.store_path).exists());
         assert!(fixture.owned_records().is_empty());
+    }
+
+    #[test]
+    fn cleaned_up_lease_cannot_start_an_unrooted_delivery() {
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .expect("lease should be acquired");
+        fixture
+            .manager
+            .cleanup_expired_at(lease.expires_at_unix_seconds())
+            .expect("expire the root before delivery starts");
+        assert!(!fixture.manager.root_path(&fixture.store_path).exists());
+
+        assert!(lease.begin_active_delivery().is_err());
+        let state = fixture.manager.lock_state().expect("lease state");
+        assert!(!state.has_active_delivery(&lease.record_path));
+        assert_eq!(state.active, 0);
+    }
+
+    #[test]
+    fn activation_rejects_a_missing_or_retargeted_root_without_recording_delivery() {
+        for replacement in [None, Some("wrong-store-object")] {
+            let fixture = LeaseFixture::new(1);
+            let lease = fixture
+                .manager
+                .acquire(fixture.store_path.clone(), 1)
+                .expect("lease should be acquired");
+            let root = fixture.manager.root_path(&fixture.store_path);
+            fs::remove_file(&root).expect("simulate a missing root");
+            if let Some(target) = replacement {
+                std::os::unix::fs::symlink(target, &root).expect("simulate a retargeted root");
+            }
+
+            let error = lease
+                .begin_active_delivery()
+                .err()
+                .expect("invalid root must reject delivery");
+            match replacement {
+                None => assert!(matches!(
+                    error,
+                    NativeStoreLeaseError::Io(ref error) if error.kind() == io::ErrorKind::NotFound
+                )),
+                Some(_) => assert!(matches!(error, NativeStoreLeaseError::RootConflict)),
+            }
+            let state = fixture.manager.lock_state().expect("lease state");
+            assert!(!state.has_active_delivery(&lease.record_path));
+            assert_eq!(
+                state.active, 1,
+                "rejection must not change lease accounting"
+            );
+        }
     }
 
     #[test]
