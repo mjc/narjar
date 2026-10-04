@@ -24,6 +24,14 @@ use super::lease::NativeStoreLease;
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 const DISCARD_BUFFER_SIZE: usize = 64 * 1024;
 
+#[cfg(test)]
+#[path = "../../tests/support/allocations.rs"]
+mod test_allocations;
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: test_allocations::CountingAllocator = test_allocations::CountingAllocator;
+
 pub(crate) struct NativeNarDelivery {
     identity: NarIdentity,
     reader: VerifiedNativeNarReader,
@@ -315,7 +323,7 @@ fn emit_directory_at<W: Write>(
         .map_err(encode_io_error)?;
     for entry in sorted_directory_entries(&directory)? {
         encoder
-            .push(Event::Entry(entry.nar_name.as_bytes()))
+            .push(Event::Entry(entry.nar_name().as_bytes()))
             .map_err(encode_io_error)?;
         emit_node_at(encoder, &directory, &entry.filesystem_name)?;
     }
@@ -368,13 +376,31 @@ fn emit_symlink_at<W: Write>(
 
 fn sorted_directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryEntry>> {
     let mut entries = directory_entries(directory)?;
-    entries.sort_unstable_by(|left, right| left.nar_name.as_bytes().cmp(right.nar_name.as_bytes()));
+    entries.sort_unstable_by(|left, right| {
+        left.nar_name().as_bytes().cmp(right.nar_name().as_bytes())
+    });
     Ok(entries)
 }
 
 struct NativeDirectoryEntry {
     filesystem_name: OsString,
-    nar_name: OsString,
+    nar_name_length: usize,
+}
+
+impl NativeDirectoryEntry {
+    fn new(filesystem_name: OsString) -> Self {
+        let nar_name_length = nar_entry_name_for_filesystem_name(&filesystem_name).len();
+        Self {
+            filesystem_name,
+            nar_name_length,
+        }
+    }
+
+    fn nar_name(&self) -> &OsStr {
+        // Construction measures a prefix of this same owned name. Sorting
+        // doesn't need to rescan case-hack suffixes or own another allocation.
+        OsStr::from_bytes(&self.filesystem_name.as_bytes()[..self.nar_name_length])
+    }
 }
 
 fn directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryEntry>> {
@@ -384,17 +410,14 @@ fn directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryEntry>> 
         let name = entry.file_name().to_bytes();
         if name != b"." && name != b".." {
             let filesystem_name = OsString::from_vec(name.to_vec());
-            entries.push(NativeDirectoryEntry {
-                nar_name: nar_entry_name_for_filesystem_name(&filesystem_name),
-                filesystem_name,
-            });
+            entries.push(NativeDirectoryEntry::new(filesystem_name));
         }
     }
     Ok(entries)
 }
 
-fn nar_entry_name_for_filesystem_name(name: &OsStr) -> OsString {
-    OsString::from_vec(nar_entry_name_bytes_for_filesystem_name(name.as_bytes()).to_vec())
+fn nar_entry_name_for_filesystem_name(name: &OsStr) -> &OsStr {
+    OsStr::from_bytes(nar_entry_name_bytes_for_filesystem_name(name.as_bytes()))
 }
 
 fn darwin_case_hack_decoded_name(name: &[u8]) -> &[u8] {
@@ -493,6 +516,38 @@ mod tests {
 
     use super::{NativeNarDelivery, open_directory, open_regular_at, write_leased_nar};
     use crate::native_store::lease::NativeStoreLeaseManager;
+
+    #[test]
+    fn native_name_projection_borrows_filesystem_bytes() {
+        use std::{hint::black_box, time::Instant};
+        let names: Vec<_> = (0..4096)
+            .map(|index| OsString::from(format!("package-{index:06}-payload")))
+            .collect();
+        let run = || {
+            for name in &names {
+                black_box(super::nar_entry_name_for_filesystem_name(black_box(name)));
+            }
+        };
+        let (_, counts) = super::test_allocations::measure(run);
+        let mut samples = [0_u128; 9];
+        for sample in &mut samples {
+            let start = Instant::now();
+            run();
+            *sample = start.elapsed().as_nanos();
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "native projection: {} names, min/median/max {}/{}/{} ns, allocations {counts:?}",
+            names.len(),
+            samples[0],
+            samples[4],
+            samples[8]
+        );
+        assert_eq!(
+            counts.calls, 0,
+            "projecting a filesystem name must not allocate: {counts:?}"
+        );
+    }
 
     struct NativeDeliveryFixture {
         _temporary: tempfile::TempDir,
