@@ -10,6 +10,8 @@ use std::{
     time::SystemTime,
 };
 
+use rustix::fs::OFlags;
+
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -1134,7 +1136,7 @@ impl Storage {
         let file = open_at(
             &directory,
             &name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             0o600,
         )?;
         self.temporary_objects.fetch_add(1, Ordering::Relaxed);

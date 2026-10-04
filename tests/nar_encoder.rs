@@ -50,7 +50,7 @@ impl EventSink for Sink {
 
     fn event(&mut self, event: DecodeEvent<'_>) -> io::Result<()> {
         match event {
-            DecodeEvent::Entry { name } => self.names.push(name),
+            DecodeEvent::Entry { name } => self.names.push(name.to_vec()),
             DecodeEvent::FileChunk(chunk) => self.chunks.push(chunk.to_vec()),
             _ => {}
         }

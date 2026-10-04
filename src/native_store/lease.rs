@@ -1,18 +1,19 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     num::{NonZeroU64, NonZeroUsize},
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use data_encoding::HEXLOWER;
+use rustix::{fs::FlockOperation, io::Errno};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlite::{ConnectionThreadSafe, State};
@@ -118,10 +119,22 @@ impl LeaseRecord {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct NativeStoreLease {
     path: NativeStorePath,
     expires_at: u64,
+    record_path: PathBuf,
+    state: Arc<Mutex<LeaseManagerState>>,
+}
+
+impl std::fmt::Debug for NativeStoreLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeStoreLease")
+            .field("path", &self.path)
+            .field("expires_at", &self.expires_at)
+            .field("record_path", &self.record_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NativeStoreLease {
@@ -131,6 +144,44 @@ impl NativeStoreLease {
 
     pub(crate) const fn expires_at_unix_seconds(&self) -> u64 {
         self.expires_at
+    }
+
+    pub(crate) fn begin_active_delivery(
+        &self,
+    ) -> Result<NativeStoreActiveDelivery, NativeStoreLeaseError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| NativeStoreLeaseError::Poisoned)?;
+        if !state.record_paths.contains(&self.record_path) {
+            return Err(NativeStoreLeaseError::InvalidRecord);
+        }
+        let root = fs::read_link(self.record_path.with_file_name(ROOT_FILE))
+            .map_err(NativeStoreLeaseError::Io)?;
+        if root != self.path.as_path() {
+            return Err(NativeStoreLeaseError::RootConflict);
+        }
+        state.active_delivery_started(&self.record_path);
+        Ok(NativeStoreActiveDelivery {
+            record_path: self.record_path.clone(),
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+/// Protects a root from cleanup by its serving manager. All deliveries and
+/// maintenance for a live service must share that manager; this is not a
+/// cross-process pin for independently opened managers.
+pub(crate) struct NativeStoreActiveDelivery {
+    record_path: PathBuf,
+    state: Arc<Mutex<LeaseManagerState>>,
+}
+
+impl Drop for NativeStoreActiveDelivery {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active_delivery_finished(&self.record_path);
+        }
     }
 }
 
@@ -148,7 +199,7 @@ pub(crate) struct NativeStoreLeaseManager {
     minimum_lease_seconds: NonZeroU64,
     maximum_active: NonZeroUsize,
     metadata_database: std::sync::Arc<ConnectionThreadSafe>,
-    state: Mutex<LeaseManagerState>,
+    state: Arc<Mutex<LeaseManagerState>>,
 }
 
 struct LeaseManagerState {
@@ -158,6 +209,7 @@ struct LeaseManagerState {
     capacity_rejections: u64,
     record_paths: BTreeSet<PathBuf>,
     cleanup_cursor: Option<PathBuf>,
+    active_deliveries: BTreeMap<PathBuf, usize>,
 }
 
 enum RecordPathIndex {
@@ -231,6 +283,26 @@ impl LeaseManagerState {
     fn record_added(&mut self, path: PathBuf) {
         self.record_paths.insert(path);
     }
+
+    fn active_delivery_started(&mut self, path: &Path) {
+        *self
+            .active_deliveries
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
+
+    fn active_delivery_finished(&mut self, path: &Path) {
+        if let Some(count) = self.active_deliveries.get_mut(path) {
+            *count -= 1;
+            if *count == 0 {
+                self.active_deliveries.remove(path);
+            }
+        }
+    }
+
+    fn has_active_delivery(&self, path: &Path) -> bool {
+        self.active_deliveries.contains_key(path)
+    }
 }
 
 struct LeasePaths {
@@ -297,14 +369,15 @@ impl NativeStoreLeaseManager {
             minimum_lease_seconds,
             maximum_active,
             metadata_database,
-            state: Mutex::new(LeaseManagerState {
+            state: Arc::new(Mutex::new(LeaseManagerState {
                 active: 0,
                 record_index: RecordPathIndex::Current(0),
                 record_scan: None,
                 capacity_rejections: 0,
                 record_paths: BTreeSet::new(),
                 cleanup_cursor: None,
-            }),
+                active_deliveries: BTreeMap::new(),
+            })),
         };
         manager.recover(now)?;
         Ok(manager)
@@ -348,7 +421,12 @@ impl NativeStoreLeaseManager {
         };
         let expires_at = self.acquire_existing_or_new_lease(&path, &paths, &mut state, clock)?;
 
-        Ok(NativeStoreLease { path, expires_at })
+        Ok(NativeStoreLease {
+            record_path: self.record_path(&path),
+            path,
+            expires_at,
+            state: Arc::clone(&self.state),
+        })
     }
 
     fn acquire_existing_or_new_lease(
@@ -359,7 +437,7 @@ impl NativeStoreLeaseManager {
         clock: &mut impl FnMut() -> Result<u64, NativeStoreLeaseError>,
     ) -> Result<u64, NativeStoreLeaseError> {
         match read_optional_record(&paths.record, &self.store_dir)? {
-            Some(record) => self.acquire_from_existing_record(path, record, paths, clock),
+            Some(record) => self.acquire_from_existing_record(path, record, paths, state, clock),
             None => self.create_first_lease(path, paths, state, clock),
         }
     }
@@ -369,6 +447,7 @@ impl NativeStoreLeaseManager {
         path: &NativeStorePath,
         record: LeaseRecord,
         paths: &LeasePaths,
+        state: &mut LeaseManagerState,
         clock: &mut impl FnMut() -> Result<u64, NativeStoreLeaseError>,
     ) -> Result<u64, NativeStoreLeaseError> {
         if record.store_path(&self.store_dir)? != *path {
@@ -384,6 +463,7 @@ impl NativeStoreLeaseManager {
                     &paths.record,
                     &LeaseRecord::live(path, renewed_expiry),
                 )?;
+                state.record_added(paths.record.clone());
                 Ok(renewed_expiry)
             }
             PersistedLeaseState::Pending => Err(NativeStoreLeaseError::InvalidRecord),
@@ -627,6 +707,9 @@ impl NativeStoreLeaseManager {
         };
         if record.store_path(&self.store_dir)? != *path {
             return Err(NativeStoreLeaseError::InvalidRecord);
+        }
+        if state.has_active_delivery(&record_path) {
+            return Err(NativeStoreLeaseError::LeaseStillLive);
         }
         if record.state == PersistedLeaseState::Live && record.expires_at > now {
             return Err(NativeStoreLeaseError::LeaseStillLive);
@@ -873,6 +956,9 @@ impl NativeStoreLeaseManager {
         cleanup_remaining: &mut usize,
         state: &mut LeaseManagerState,
     ) -> Result<(), NativeStoreLeaseError> {
+        if state.has_active_delivery(record_path) {
+            return Ok(());
+        }
         match cleanup_remaining.checked_sub(1) {
             Some(remaining) => {
                 self.remove_recovered_lease_files(record_path, store_path, record, state)?;
@@ -1081,6 +1167,9 @@ impl NativeStoreLeaseManager {
                     if record.state != PersistedLeaseState::Pending && record.expires_at > now {
                         return Ok(());
                     }
+                    if state.has_active_delivery(&record_path) {
+                        return Ok(());
+                    }
                     let store_path = record.store_path(&self.store_dir)?;
                     self.begin_release_mutation(&store_path, record.state)?;
                     self.remove_recorded_root(&self.root_path(&store_path), &record)?;
@@ -1128,7 +1217,7 @@ impl NativeStoreLeaseManager {
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)
             .map_err(NativeStoreLeaseError::Io)?;
-        set_flock_lock_with_mode(&file, libc::LOCK_SH)?;
+        set_flock_lock_with_mode(&file, FlockOperation::LockShared)?;
         Ok(GcReadLock { _file: file })
     }
 
@@ -1184,23 +1273,17 @@ struct GcReadLock {
 }
 
 fn set_flock_lock(file: &File) -> Result<(), NativeStoreLeaseError> {
-    set_flock_lock_with_mode(file, libc::LOCK_EX)
+    set_flock_lock_with_mode(file, FlockOperation::LockExclusive)
 }
 
 fn set_flock_lock_with_mode(
     file: &File,
-    lock_mode: libc::c_int,
+    lock_mode: FlockOperation,
 ) -> Result<(), NativeStoreLeaseError> {
-    let result = std::iter::repeat_with(|| {
-        // SAFETY: `file` is an open descriptor and flock takes no pointer arguments.
-        unsafe { libc::flock(file.as_raw_fd(), lock_mode) }
-    })
-    .find(|result| *result == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted)
-    .unwrap_or(-1);
-    match result {
-        0 => Ok(()),
-        _ => Err(NativeStoreLeaseError::Io(io::Error::last_os_error())),
-    }
+    std::iter::repeat_with(|| rustix::fs::flock(file, lock_mode))
+        .find(|result| *result != Err(Errno::INTR))
+        .unwrap_or(Err(Errno::INTR))
+        .map_err(|error| NativeStoreLeaseError::Io(error.into()))
 }
 
 fn read_record_paths(roots_dir: &Path) -> Result<Vec<PathBuf>, NativeStoreLeaseError> {
@@ -1613,6 +1696,7 @@ mod tests {
     use sqlite::Connection;
     use std::{
         num::NonZeroUsize,
+        os::fd::AsRawFd,
         process::{Command, Output},
         sync::{Arc, Barrier},
         thread,
@@ -2299,8 +2383,10 @@ mod tests {
             .acquire(retry_path.clone(), 2)
             .expect("first scan batch should finish acquisition");
         let lease_to_delete = NativeStoreLease {
+            record_path: deleting_manager.record_path(&path_to_delete),
             path: path_to_delete,
             expires_at: 10,
+            state: Arc::clone(&deleting_manager.state),
         };
         deleting_manager
             .release(&lease_to_delete, 20)
@@ -2805,6 +2891,167 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_expired_keeps_a_root_with_an_active_native_delivery() {
+        let fixture = LeaseFixture::new(1);
+        let now = now_unix_seconds().expect("clock should be available");
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), now)
+            .expect("lease should be acquired");
+        let active_delivery = lease
+            .begin_active_delivery()
+            .expect("active delivery should be recorded");
+
+        fixture
+            .manager
+            .cleanup_expired_at(lease.expires_at_unix_seconds())
+            .expect("expiration cleanup should skip active delivery");
+
+        assert!(fixture.manager.root_path(&fixture.store_path).exists());
+        assert_eq!(fixture.owned_records().len(), 1);
+        drop(active_delivery);
+        fixture
+            .manager
+            .cleanup_expired_at(lease.expires_at_unix_seconds())
+            .expect("expiration cleanup should release inactive delivery");
+        assert!(!fixture.manager.root_path(&fixture.store_path).exists());
+        assert!(fixture.owned_records().is_empty());
+    }
+
+    #[test]
+    fn cleaned_up_lease_cannot_start_an_unrooted_delivery() {
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .expect("lease should be acquired");
+        fixture
+            .manager
+            .cleanup_expired_at(lease.expires_at_unix_seconds())
+            .expect("expire the root before delivery starts");
+        assert!(!fixture.manager.root_path(&fixture.store_path).exists());
+
+        assert!(lease.begin_active_delivery().is_err());
+        let state = fixture.manager.lock_state().expect("lease state");
+        assert!(!state.has_active_delivery(&lease.record_path));
+        assert_eq!(state.active, 0);
+    }
+
+    #[test]
+    fn renewing_a_live_lease_not_yet_scanned_registers_it_for_delivery() {
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .expect("durable live lease");
+        let paths = LeasePaths {
+            directory: fixture.manager.lease_directory(&fixture.store_path),
+            record: fixture.manager.record_path(&fixture.store_path),
+            root: fixture.manager.root_path(&fixture.store_path),
+        };
+        {
+            let mut state = fixture.manager.lock_state().expect("lease state");
+            // A bounded cross-manager refresh has not reached this live record.
+            state.record_paths.remove(&paths.record);
+            state.record_index = RecordPathIndex::NeedsRefresh(0);
+            fixture
+                .manager
+                .acquire_existing_or_new_lease(&fixture.store_path, &paths, &mut state, &mut || {
+                    Ok(2)
+                })
+                .expect("renewal does not need the scan to reach the record first");
+        }
+
+        let _delivery = lease
+            .begin_active_delivery()
+            .expect("successful renewal must make the live lease usable for delivery");
+    }
+
+    #[test]
+    fn activation_rejects_a_missing_or_retargeted_root_without_recording_delivery() {
+        for replacement in [None, Some("wrong-store-object")] {
+            let fixture = LeaseFixture::new(1);
+            let lease = fixture
+                .manager
+                .acquire(fixture.store_path.clone(), 1)
+                .expect("lease should be acquired");
+            let root = fixture.manager.root_path(&fixture.store_path);
+            fs::remove_file(&root).expect("simulate a missing root");
+            if let Some(target) = replacement {
+                std::os::unix::fs::symlink(target, &root).expect("simulate a retargeted root");
+            }
+
+            let error = lease
+                .begin_active_delivery()
+                .err()
+                .expect("invalid root must reject delivery");
+            match replacement {
+                None => assert!(matches!(
+                    error,
+                    NativeStoreLeaseError::Io(ref error) if error.kind() == io::ErrorKind::NotFound
+                )),
+                Some(_) => assert!(matches!(error, NativeStoreLeaseError::RootConflict)),
+            }
+            let state = fixture.manager.lock_state().expect("lease state");
+            assert!(!state.has_active_delivery(&lease.record_path));
+            assert_eq!(
+                state.active, 1,
+                "rejection must not change lease accounting"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_reconciliation_keeps_expired_roots_until_active_delivery_finishes() {
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .expect("lease should be acquired");
+        let active_delivery = lease
+            .begin_active_delivery()
+            .expect("delivery should protect its root");
+        fixture
+            .manager
+            .begin_recovery_reconciliation()
+            .expect("simulate an interrupted recovery journal");
+
+        fixture
+            .manager
+            .cleanup_expired_at(lease.expires_at_unix_seconds())
+            .expect("cleanup should finish recovery without removing active delivery");
+
+        assert!(fixture.manager.root_path(&fixture.store_path).exists());
+        assert_eq!(fixture.owned_records().len(), 1);
+        assert_eq!(
+            fixture.manager.snapshot().expect("live root count").active,
+            1
+        );
+        assert!(
+            read_capacity_record(&fixture.roots_dir)
+                .expect("completed recovery journal")
+                .pending
+                .is_none()
+        );
+
+        drop(active_delivery);
+        fixture
+            .manager
+            .cleanup_expired_at(lease.expires_at_unix_seconds())
+            .expect("completed delivery should permit expiry cleanup");
+        assert!(!fixture.manager.root_path(&fixture.store_path).exists());
+        assert!(fixture.owned_records().is_empty());
+        assert_eq!(
+            fixture
+                .manager
+                .snapshot()
+                .expect("released root count")
+                .active,
+            0
+        );
+    }
+
+    #[test]
     fn recovery_recreates_a_missing_live_root_for_an_existing_store_path() {
         let fixture = LeaseFixture::new(1);
         let now = now_unix_seconds().expect("clock should be available");
@@ -2868,7 +3115,7 @@ mod tests {
             unsafe { libc::flock(nix_gc_lock.as_raw_fd(), libc::LOCK_UN) },
             0
         );
-        set_flock_lock_with_mode(&narjar_gc_lock, libc::LOCK_SH)
+        set_flock_lock_with_mode(&narjar_gc_lock, FlockOperation::LockShared)
             .expect("shared Narjar-style flock should succeed after GC unlocks");
     }
 

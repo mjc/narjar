@@ -68,6 +68,42 @@ fn archive(root: Vec<u8>) -> Vec<u8> {
         .collect()
 }
 
+#[test]
+fn stack_tokens_preserve_the_grammar_limit_and_input_error_boundaries() {
+    // Invalid tokens below the existing limit must still be consumed completely;
+    // a shorter implementation-specific stack buffer must not change the policy.
+    for length in [16, 17, 255, 256] {
+        let token = vec![b'x'; length];
+        let mut bytes = string(b"nix-archive-1");
+        bytes.extend(string(&token));
+        let result =
+            Decoder::new(bytes.as_slice()).decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()));
+        assert!(
+            matches!(result, Err(DecodeError::Invalid(_))),
+            "length {length}: {result:?}"
+        );
+
+        // Truncation takes precedence over mismatched-token classification.
+        bytes.truncate(bytes.len() - 1);
+        let result =
+            Decoder::new(bytes.as_slice()).decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()));
+        assert!(
+            matches!(result, Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+        );
+    }
+    let bytes = (257_u64).to_le_bytes();
+    let result =
+        Decoder::new(bytes.as_slice()).decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()));
+    assert!(matches!(
+        result,
+        Err(DecodeError::LimitExceeded {
+            what: "string length",
+            limit: 256,
+            actual: 257
+        })
+    ));
+}
+
 #[derive(Default)]
 struct Events {
     names: Vec<Vec<u8>>,
@@ -82,9 +118,9 @@ impl EventSink for Events {
     fn event(&mut self, event: Event<'_>) -> io::Result<()> {
         match event {
             Event::BeginDirectory { depth: 0 } => self.root = Some(RootKind::Directory),
-            Event::Entry { name } => self.names.push(name),
+            Event::Entry { name } => self.names.push(name.to_vec()),
             Event::FileChunk(chunk) => self.file_chunks.push(chunk.to_vec()),
-            Event::Symlink { target } => self.symlinks.push(target),
+            Event::Symlink { target } => self.symlinks.push(target.to_vec()),
             _ => {}
         }
         Ok(())
@@ -369,6 +405,192 @@ fn sink_failure_after_progress_stops_event_delivery() {
         DecodeError::Sink(EncodeError::Invalid("late sink failure"))
     ));
     assert_eq!(sink.events, 2, "no event should follow the failed chunk");
+}
+
+#[test]
+fn borrowed_names_remain_distinct_across_buffer_swaps_and_nested_siblings() {
+    let data = archive(directory([
+        (b"a".as_slice(), regular(b"first", false)),
+        (
+            b"b-longer-name".as_slice(),
+            directory([
+                (b"inside-a".as_slice(), regular(b"nested", false)),
+                (b"inside-b-longer".as_slice(), regular(b"", false)),
+            ]),
+        ),
+        (b"c".as_slice(), regular(b"last", false)),
+        (
+            b"d-longer-than-either-initial-buffer".as_slice(),
+            regular(b"growth", false),
+        ),
+        (
+            b"e-even-longer-than-the-other-reallocated-buffer".as_slice(),
+            regular(b"growth again", false),
+        ),
+    ]));
+    let mut events = Events::default();
+    let summary = Decoder::new(Chunked {
+        data: &data,
+        offset: 0,
+        chunk: 1,
+    })
+    .decode(&mut events)
+    .expect("nested short-read stream");
+    assert_eq!(
+        events.names,
+        [
+            b"a".as_slice(),
+            b"b-longer-name",
+            b"inside-a",
+            b"inside-b-longer",
+            b"c",
+            b"d-longer-than-either-initial-buffer",
+            b"e-even-longer-than-the-other-reallocated-buffer"
+        ]
+    );
+    assert_eq!(summary.entries, 7);
+    assert_eq!(summary.raw_sha256, <[u8; 32]>::from(Sha256::digest(&data)));
+}
+
+#[test]
+fn retained_symlink_targets_survive_reuse_shrinking_and_growth() {
+    let long = vec![b'x'; 65_537];
+    let longer = vec![b'y'; 131_075];
+    let data = archive(directory([
+        (b"a".as_slice(), symlink(b"short")),
+        (b"b".as_slice(), symlink(&long)),
+        (
+            b"c".as_slice(),
+            directory([(b"nested".as_slice(), symlink(b""))]),
+        ),
+        (b"d".as_slice(), symlink(&longer)),
+    ]));
+    let mut events = Events::default();
+    let summary = Decoder::new(Chunked {
+        data: &data,
+        offset: 0,
+        chunk: 3,
+    })
+    .decode(&mut events)
+    .expect("short-read symlink stream");
+    assert_eq!(events.symlinks, [b"short".to_vec(), long, vec![], longer]);
+    assert_eq!(summary.symlinks, 4);
+    assert_eq!(summary.raw_sha256, <[u8; 32]>::from(Sha256::digest(&data)));
+}
+
+#[test]
+fn rejecting_later_borrowed_metadata_preserves_the_sink_error_and_stops_events() {
+    let data = archive(directory([
+        (b"a".as_slice(), symlink(b"first")),
+        (b"b".as_slice(), symlink(b"second")),
+        (b"c".as_slice(), symlink(b"never delivered")),
+    ]));
+    for fail_on_entry in [true, false] {
+        let mut calls = 0;
+        let mut sink = |event: Event<'_>| {
+            calls += 1;
+            let refused = match event {
+                Event::Entry { name } => fail_on_entry && name == b"b",
+                Event::Symlink { target } => !fail_on_entry && target == b"second",
+                _ => false,
+            };
+            if refused {
+                Err(EncodeError::Invalid("metadata sink failure"))
+            } else {
+                Ok(())
+            }
+        };
+        let error = Decoder::new(data.as_slice())
+            .decode(&mut sink)
+            .expect_err("sink refused metadata");
+        assert!(matches!(
+            error,
+            DecodeError::Sink(EncodeError::Invalid("metadata sink failure"))
+        ));
+        assert_eq!(
+            calls,
+            if fail_on_entry { 4 } else { 5 },
+            "no events after rejected metadata"
+        );
+    }
+}
+
+#[test]
+fn reused_metadata_buffers_preserve_name_target_and_depth_limits() {
+    for name in [b"".as_slice(), b".", b"..", b"a/b", b"a\0b"] {
+        let data = archive(directory([(name, symlink(b"target"))]));
+        assert!(matches!(
+            Decoder::new(data.as_slice()).decode(&mut Events::default()),
+            Err(DecodeError::NonCanonical(_))
+        ));
+    }
+    let duplicate = archive(directory([
+        (b"a".as_slice(), regular(b"", false)),
+        (b"a".as_slice(), regular(b"", false)),
+    ]));
+    assert!(matches!(
+        Decoder::new(duplicate.as_slice()).decode(&mut Events::default()),
+        Err(DecodeError::NonCanonical(_))
+    ));
+
+    let invalid_target = archive(symlink(b"a\0b"));
+    assert!(matches!(
+        Decoder::new(invalid_target.as_slice()).decode(&mut Events::default()),
+        Err(DecodeError::NonCanonical(_))
+    ));
+    let long_target = archive(symlink(b"long"));
+    let limits = Limits {
+        max_symlink_target_bytes: 3,
+        ..Limits::default()
+    };
+    assert!(matches!(
+        Decoder::with_limits(long_target.as_slice(), limits).decode(&mut Events::default()),
+        Err(DecodeError::LimitExceeded {
+            what: "string length",
+            limit: 3,
+            actual: 4
+        })
+    ));
+    let long_name = archive(directory([(b"long".as_slice(), regular(b"", false))]));
+    let limits = Limits {
+        max_name_bytes: 3,
+        ..Limits::default()
+    };
+    assert!(matches!(
+        Decoder::with_limits(long_name.as_slice(), limits).decode(&mut Events::default()),
+        Err(DecodeError::LimitExceeded {
+            what: "string length",
+            limit: 3,
+            actual: 4
+        })
+    ));
+
+    // Unlike upstream's fixed 64-level implementation, our configured bound
+    // remains authoritative. No capacity optimization may silently lower it.
+    let root = (0..80).fold(regular(b"body", false), |child, _| {
+        directory([(b"nested".as_slice(), child)])
+    });
+    let data = archive(root);
+    let mut sink = |_: Event<'_>| Ok::<(), Infallible>(());
+    let limits = Limits {
+        max_depth: 80,
+        ..Limits::default()
+    };
+    Decoder::with_limits(data.as_slice(), limits)
+        .decode(&mut sink)
+        .expect("configured depth above 64");
+    let limits = Limits {
+        max_depth: 79,
+        ..Limits::default()
+    };
+    assert!(matches!(
+        Decoder::with_limits(data.as_slice(), limits).decode(&mut sink),
+        Err(DecodeError::LimitExceeded {
+            what: "directory depth",
+            limit: 79,
+            actual: 80
+        })
+    ));
 }
 
 #[test]

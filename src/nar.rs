@@ -12,6 +12,38 @@ use sha2::{Digest, Sha256};
 const CHUNK_SIZE: usize = 64 * 1024;
 const TOKEN_LIMIT: u64 = 256;
 
+/// Owns only grammar bytes; variable-length metadata uses separate storage.
+struct ControlToken {
+    bytes: [u8; TOKEN_LIMIT as usize],
+    length: usize,
+}
+
+impl ControlToken {
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+}
+
+#[derive(Default)]
+struct DirectoryNames {
+    previous: Vec<u8>,
+    incoming: Vec<u8>,
+}
+
+impl DirectoryNames {
+    fn accept_ordered_name<E>(&mut self) -> Result<&[u8], DecodeError<E>> {
+        if self.previous >= self.incoming {
+            return Err(DecodeError::NonCanonical(
+                "directory entries are not strictly ordered",
+            ));
+        }
+        std::mem::swap(&mut self.previous, &mut self.incoming);
+        self.incoming.clear();
+        release_oversized_metadata_capacity(&mut self.incoming);
+        Ok(&self.previous)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// The type of a NAR node.
 pub enum RootKind {
@@ -120,7 +152,8 @@ impl<E: std::error::Error + 'static> std::error::Error for DecodeError<E> {
 /// One structural event produced by [`Decoder`].
 ///
 /// File chunks borrow the decoder's fixed-size buffer and are valid only for
-/// the duration of the sink callback. Names and link targets are owned.
+/// the duration of the sink callback. Names and link targets also borrow
+/// reusable metadata storage; sinks that retain them must explicitly copy them.
 pub enum Event<'a> {
     /// A directory node begins at the given nesting depth.
     BeginDirectory {
@@ -130,7 +163,7 @@ pub enum Event<'a> {
     /// A directory entry begins; its name is the following node's basename.
     Entry {
         /// Raw NAR bytes for the entry name.
-        name: Vec<u8>,
+        name: &'a [u8],
     },
     /// A regular file node begins with its complete declared body size.
     BeginFile {
@@ -145,10 +178,10 @@ pub enum Event<'a> {
     FileChunk(&'a [u8]),
     /// The current regular file node has ended.
     EndFile,
-    /// A symbolic-link node with an owned target.
+    /// A symbolic-link node with a borrowed target.
     Symlink {
         /// Raw NAR bytes for the link target.
-        target: Vec<u8>,
+        target: &'a [u8],
     },
     /// The current directory node has ended.
     EndDirectory,
@@ -203,6 +236,8 @@ pub struct Decoder<R> {
     raw_bytes: u64,
     work: u64,
     file_buffer: [u8; CHUNK_SIZE],
+    symlink_target: Vec<u8>,
+    control_token: ControlToken,
 }
 
 impl<R: Read> Decoder<R> {
@@ -220,6 +255,11 @@ impl<R: Read> Decoder<R> {
             raw_bytes: 0,
             work: 0,
             file_buffer: [0; CHUNK_SIZE],
+            symlink_target: Vec::new(),
+            control_token: ControlToken {
+                bytes: [0; TOKEN_LIMIT as usize],
+                length: 0,
+            },
         }
     }
 
@@ -270,12 +310,20 @@ impl<R: Read> Decoder<R> {
                 actual: depth as u64,
             });
         }
+        match self.read_node_kind()? {
+            RootKind::Directory => self.decode_directory_node(depth, sink, counters),
+            RootKind::Regular => self.decode_regular_file_node(sink, counters),
+            RootKind::Symlink => self.decode_symlink_node(sink, counters),
+        }
+    }
+
+    fn read_node_kind<E>(&mut self) -> Result<RootKind, DecodeError<E>> {
         self.expect(b"(")?;
         self.expect(b"type")?;
-        match self.read_string(TOKEN_LIMIT)?.as_slice() {
-            b"directory" => self.decode_directory_node(depth, sink, counters),
-            b"regular" => self.decode_regular_file_node(sink, counters),
-            b"symlink" => self.decode_symlink_node(sink, counters),
+        match self.read_control_token()?.as_bytes() {
+            b"directory" => Ok(RootKind::Directory),
+            b"regular" => Ok(RootKind::Regular),
+            b"symlink" => Ok(RootKind::Symlink),
             _ => Err(DecodeError::Invalid("unknown NAR node type".into())),
         }
     }
@@ -288,9 +336,9 @@ impl<R: Read> Decoder<R> {
     ) -> Result<RootKind, DecodeError<S::Error>> {
         sink.event(Event::BeginDirectory { depth })
             .map_err(DecodeError::Sink)?;
-        let mut previous_name = None;
+        let mut names = DirectoryNames::default();
         std::iter::from_fn(|| {
-            self.decode_directory_entry_if_present(depth, &mut previous_name, sink, counters)
+            self.decode_directory_entry_if_present(depth, &mut names, sink, counters)
                 .transpose()
         })
         .try_for_each(|result| result)?;
@@ -301,11 +349,11 @@ impl<R: Read> Decoder<R> {
     fn decode_directory_entry_if_present<S: EventSink>(
         &mut self,
         depth: usize,
-        previous_name: &mut Option<Vec<u8>>,
+        names: &mut DirectoryNames,
         sink: &mut S,
         counters: &mut Counters,
     ) -> Result<Option<()>, DecodeError<S::Error>> {
-        let Some(name) = self.read_next_directory_entry_name(previous_name, counters)? else {
+        let Some(name) = self.read_next_directory_entry_name(names, counters)? else {
             return Ok(None);
         };
         sink.event(Event::Entry { name })
@@ -316,17 +364,17 @@ impl<R: Read> Decoder<R> {
         Ok(Some(()))
     }
 
-    fn read_next_directory_entry_name<E>(
+    fn read_next_directory_entry_name<'a, E>(
         &mut self,
-        previous_name: &mut Option<Vec<u8>>,
+        names: &'a mut DirectoryNames,
         counters: &mut Counters,
-    ) -> Result<Option<Vec<u8>>, DecodeError<E>> {
+    ) -> Result<Option<&'a [u8]>, DecodeError<E>> {
         self.bump_work()?;
-        let entry_kind = self.read_string(TOKEN_LIMIT)?;
-        if entry_kind == b")" {
+        let entry_kind = self.read_control_token()?;
+        if entry_kind.as_bytes() == b")" {
             return Ok(None);
         }
-        if entry_kind != b"entry" {
+        if entry_kind.as_bytes() != b"entry" {
             return Err(DecodeError::Invalid("directory entry expected".into()));
         }
         counters.entries = counters
@@ -346,18 +394,9 @@ impl<R: Read> Decoder<R> {
         }
         self.expect(b"(")?;
         self.expect(b"name")?;
-        let name = self.read_string(self.limits.max_name_bytes)?;
-        self.validate_name(&name)?;
-        if previous_name
-            .as_ref()
-            .is_some_and(|previous| previous >= &name)
-        {
-            return Err(DecodeError::NonCanonical(
-                "directory entries are not strictly ordered",
-            ));
-        }
-        *previous_name = Some(name.clone());
-        Ok(Some(name))
+        self.read_string_into(self.limits.max_name_bytes, &mut names.incoming)?;
+        self.validate_name(&names.incoming)?;
+        names.accept_ordered_name().map(Some)
     }
 
     fn decode_regular_file_node<S: EventSink>(
@@ -389,14 +428,14 @@ impl<R: Read> Decoder<R> {
     }
 
     fn read_regular_file_executable_flag<E>(&mut self) -> Result<bool, DecodeError<E>> {
-        let field = self.read_string(TOKEN_LIMIT)?;
-        if field == b"contents" {
+        let field = self.read_control_token()?;
+        if field.as_bytes() == b"contents" {
             return Ok(false);
         }
-        if field != b"executable" {
+        if field.as_bytes() != b"executable" {
             return Err(DecodeError::Invalid("regular contents expected".into()));
         }
-        if !self.read_string(TOKEN_LIMIT)?.is_empty() {
+        if !self.read_control_token()?.as_bytes().is_empty() {
             return Err(DecodeError::NonCanonical(
                 "the executable marker must have an empty value",
             ));
@@ -410,21 +449,33 @@ impl<R: Read> Decoder<R> {
         sink: &mut S,
         counters: &mut Counters,
     ) -> Result<RootKind, DecodeError<S::Error>> {
-        let target = self.read_symlink_target()?;
-        sink.event(Event::Symlink { target })
-            .map_err(DecodeError::Sink)?;
+        self.read_symlink_target()?;
+        sink.event(Event::Symlink {
+            target: &self.symlink_target,
+        })
+        .map_err(DecodeError::Sink)?;
         self.expect(b")")?;
         counters.symlinks = counters.symlinks.saturating_add(1);
         Ok(RootKind::Symlink)
     }
 
-    fn read_symlink_target<E>(&mut self) -> Result<Vec<u8>, DecodeError<E>> {
+    fn read_symlink_target<E>(&mut self) -> Result<(), DecodeError<E>> {
         self.expect(b"target")?;
-        let target = self.read_string(self.limits.max_symlink_target_bytes)?;
-        if target.contains(&0) {
+        let length = self.read_bounded_string_length(self.limits.max_symlink_target_bytes)?;
+        self.symlink_target.resize(length, 0);
+        release_oversized_metadata_capacity(&mut self.symlink_target);
+        read_hashed_limited_bytes(
+            &mut self.reader,
+            &mut self.digest,
+            &mut self.raw_bytes,
+            &self.limits,
+            &mut self.symlink_target,
+        )?;
+        self.read_padding(length as u64)?;
+        if self.symlink_target.contains(&0) {
             return Err(DecodeError::NonCanonical("symlink target contains NUL"));
         }
-        Ok(target)
+        Ok(())
     }
 
     fn stream_file_contents<S: EventSink>(
@@ -469,7 +520,29 @@ impl<R: Read> Decoder<R> {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    fn read_string<E>(&mut self, max: u64) -> Result<Vec<u8>, DecodeError<E>> {
+    fn read_string_into<E>(&mut self, max: u64, value: &mut Vec<u8>) -> Result<(), DecodeError<E>> {
+        let length = self.read_bounded_string_length(max)?;
+        value.resize(length, 0);
+        release_oversized_metadata_capacity(value);
+        self.read_raw(value)?;
+        self.read_padding(length as u64)
+    }
+
+    fn read_control_token<E>(&mut self) -> Result<&ControlToken, DecodeError<E>> {
+        let length = self.read_bounded_string_length(TOKEN_LIMIT)?;
+        read_hashed_limited_bytes(
+            &mut self.reader,
+            &mut self.digest,
+            &mut self.raw_bytes,
+            &self.limits,
+            &mut self.control_token.bytes[..length],
+        )?;
+        self.read_padding(length as u64)?;
+        self.control_token.length = length;
+        Ok(&self.control_token)
+    }
+
+    fn read_bounded_string_length<E>(&mut self, max: u64) -> Result<usize, DecodeError<E>> {
         let length = self.read_u64()?;
         if length > max {
             return Err(DecodeError::LimitExceeded {
@@ -478,12 +551,8 @@ impl<R: Read> Decoder<R> {
                 actual: length,
             });
         }
-        let length = usize::try_from(length)
-            .map_err(|_| DecodeError::Invalid("string does not fit in memory".into()))?;
-        let mut value = vec![0_u8; length];
-        self.read_raw(&mut value)?;
-        self.read_padding(length as u64)?;
-        Ok(value)
+        usize::try_from(length)
+            .map_err(|_| DecodeError::Invalid("string does not fit in memory".into()))
     }
 
     fn read_padding<E>(&mut self, length: u64) -> Result<(), DecodeError<E>> {
@@ -500,14 +569,14 @@ impl<R: Read> Decoder<R> {
     }
 
     fn expect<E>(&mut self, expected: &[u8]) -> Result<(), DecodeError<E>> {
-        let actual = self.read_string(TOKEN_LIMIT)?;
-        if actual == expected {
+        let actual = self.read_control_token()?;
+        if actual.as_bytes() == expected {
             Ok(())
         } else {
             Err(DecodeError::Invalid(format!(
                 "expected {:?}, got {:?}",
                 String::from_utf8_lossy(expected),
-                String::from_utf8_lossy(&actual)
+                String::from_utf8_lossy(actual.as_bytes())
             )))
         }
     }
@@ -544,6 +613,15 @@ impl<R: Read> Decoder<R> {
             &self.limits,
             buffer,
         )
+    }
+}
+
+/// Ordinary filesystem metadata fits within 4 KiB. Retain that scratch, but
+/// don't carry historical huge names down a short-named subtree. A large value
+/// still in use keeps its capacity; only substantial shrink triggers release.
+pub(crate) fn release_oversized_metadata_capacity(bytes: &mut Vec<u8>) {
+    if bytes.capacity() > 4096 && bytes.capacity() / 4 > bytes.len() {
+        bytes.shrink_to_fit();
     }
 }
 
@@ -598,4 +676,38 @@ struct Counters {
     entries: u64,
     files: u64,
     symlinks: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+
+    #[test]
+    fn grammar_reads_reuse_one_buffer_and_ignore_previous_token_tails() {
+        let mut bytes = Vec::new();
+        for token in [b"nix-archive-1".as_slice(), b"(", b"", b"type"] {
+            bytes.extend_from_slice(&(token.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(token);
+            bytes.resize(bytes.len() + (8 - token.len() % 8) % 8, 0);
+        }
+        let mut decoder = Decoder::new(bytes.as_slice());
+        let first = decoder.read_control_token::<Infallible>().unwrap();
+        let buffer = first.as_bytes().as_ptr();
+        assert_eq!(first.as_bytes(), b"nix-archive-1");
+        for expected in [b"(".as_slice(), b"", b"type"] {
+            let token = decoder.read_control_token::<Infallible>().unwrap();
+            assert_eq!(token.as_bytes(), expected);
+            assert_eq!(
+                token.as_bytes().as_ptr(),
+                buffer,
+                "grammar parsing must borrow the same bounded scratch, not move a full token"
+            );
+        }
+        assert_eq!(decoder.raw_bytes, bytes.len() as u64);
+        assert_eq!(
+            decoder.digest.finalize().as_slice(),
+            Sha256::digest(&bytes).as_slice()
+        );
+    }
 }

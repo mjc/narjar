@@ -11,6 +11,8 @@ use std::{
     time::SystemTime,
 };
 
+use rustix::fs::OFlags;
+
 use mincdc::{MinCdcHash4, SliceChunker};
 use sha2::{Digest, Sha256};
 
@@ -176,7 +178,7 @@ impl ChunkStore {
         let record_file = open_at(
             &self.manifests,
             &record_name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             0o600,
         )?;
         Ok(ChunkingWriter {
@@ -1087,7 +1089,7 @@ impl DurableChunks<'_> {
             let mut temporary = open_at(
                 directory,
                 &name,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 0o600,
             )?;
             write_complete_manifest(&mut temporary, self.manifest, &mut self.writer.record_file)?;
@@ -1562,7 +1564,7 @@ fn write_temporary_file(directory: &File, name: &OsStr, bytes: &[u8]) -> io::Res
     let mut file = open_at(
         directory,
         name,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         0o600,
     )?;
     file.write_all(bytes)
@@ -1589,7 +1591,7 @@ fn mark_gc_file(directory: &File, name: &OsStr) -> io::Result<()> {
     match open_at(
         directory,
         name,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         0o600,
     ) {
         Ok(_file) => Ok(()),
@@ -1795,7 +1797,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use super::{ChunkStore, ChunkStoreError};
+    use super::{ChunkStore, ChunkStoreError, OFlags};
     use crate::{
         object::{NarHash, NarIdentity, NarSize},
         storage::{
@@ -2525,7 +2527,7 @@ mod tests {
         let mut chunk = super::super::fs::open_at(
             &shard,
             chunk_temp,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             0o600,
         )
         .unwrap();
@@ -2533,7 +2535,7 @@ mod tests {
         let mut manifest = super::super::fs::open_at(
             &store.manifests,
             manifest_temp,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             0o600,
         )
         .unwrap();
