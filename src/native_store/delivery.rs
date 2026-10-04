@@ -166,14 +166,14 @@ fn validate_delivery_range(range: Range<u64>, length: u64) -> io::Result<()> {
     }
 }
 
-enum VerifiedNativeNarReader {
-    Streaming(StreamingNativeNar),
+enum VerifiedNativeNarReader<R: Read = PipeReader> {
+    Streaming(StreamingNativeNar<R>),
     Complete,
     Failed,
 }
 
-struct StreamingNativeNar {
-    reader: Take<PipeReader>,
+struct StreamingNativeNar<R: Read> {
+    reader: Take<R>,
     producer: Receiver<io::Result<()>>,
     expected: NarIdentity,
     digest: Sha256,
@@ -201,7 +201,9 @@ impl VerifiedNativeNarReader {
             digest: Sha256::new(),
         }))
     }
+}
 
+impl<R: Read> VerifiedNativeNarReader<R> {
     fn read_next(self, buffer: &mut [u8]) -> io::Result<(Self, usize)> {
         match self {
             Self::Streaming(mut stream) => {
@@ -224,7 +226,7 @@ impl VerifiedNativeNarReader {
     }
 }
 
-impl Read for VerifiedNativeNarReader {
+impl<R: Read> Read for VerifiedNativeNarReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
@@ -236,9 +238,9 @@ impl Read for VerifiedNativeNarReader {
     }
 }
 
-impl StreamingNativeNar {
+impl<R: Read> StreamingNativeNar<R> {
     fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let length = self.reader.read(buffer)?;
+        let length = read_uninterrupted_chunk(&mut self.reader, buffer)?;
         if length == 0 && self.reader.limit() != 0 {
             wait_for_native_nar_producer(&self.producer)?;
             return Err(io::Error::new(
@@ -270,7 +272,7 @@ impl StreamingNativeNar {
                 ),
             ));
         }
-        if bounded_reader.get_mut().read(&mut [0; 1])? != 0 {
+        if read_uninterrupted_chunk(bounded_reader.get_mut(), &mut [0; 1])? != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "native NAR producer exceeded the declared size",
@@ -355,16 +357,34 @@ fn emit_regular_file_at<W: Write>(
         })
         .map_err(encode_io_error)?;
     let mut buffer = [0; FILE_BUFFER_SIZE];
-    loop {
-        let length = file.read(&mut buffer)?;
-        if length == 0 {
-            break;
-        }
-        encoder
-            .push(Event::FileChunk(&buffer[..length]))
-            .map_err(encode_io_error)?;
-    }
+    encode_regular_file_contents(encoder, &mut file, &mut buffer)?;
     encoder.push(Event::EndFile).map_err(encode_io_error)
+}
+
+fn encode_regular_file_contents<W: Write>(
+    encoder: &mut Encoder<W>,
+    source: &mut impl Read,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    std::iter::from_fn(|| match read_uninterrupted_chunk(source, buffer) {
+        Ok(0) => None,
+        Ok(length) => Some(
+            encoder
+                .push(Event::FileChunk(&buffer[..length]))
+                .map_err(encode_io_error),
+        ),
+        Err(error) => Some(Err(error)),
+    })
+    .try_for_each(std::convert::identity)
+}
+
+fn read_uninterrupted_chunk(source: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    std::iter::repeat_with(|| source.read(buffer))
+        .find(|result| match result {
+            Ok(_) => true,
+            Err(error) => error.kind() != io::ErrorKind::Interrupted,
+        })
+        .expect("repeat_with yields until the read is not interrupted")
 }
 
 fn emit_symlink_at<W: Write>(
@@ -588,6 +608,134 @@ mod tests {
         let mut bytes = Vec::new();
         write_leased_nar(&lease, &mut bytes).expect("write native NAR");
         bytes
+    }
+
+    struct InterruptAtOffset {
+        source: io::Cursor<Vec<u8>>,
+        interrupt_at: Option<u64>,
+    }
+
+    impl Read for InterruptAtOffset {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.interrupt_at == Some(self.source.position()) {
+                self.interrupt_at = None;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.source.read(buffer)
+        }
+    }
+
+    #[test]
+    fn verified_delivery_retries_interrupted_chunk_reads_and_final_eof_probe() {
+        for offset in [0, 3, 6] {
+            let bytes = b"narjar".to_vec();
+            let expected = NarIdentity::new(
+                NarHash::from_digest(sha2::Sha256::digest(&bytes).into()),
+                NarSize::new(bytes.len() as u64),
+            );
+            let (sender, producer) = std::sync::mpsc::channel();
+            sender.send(Ok(())).expect("successful producer completion");
+            let source = InterruptAtOffset {
+                source: io::Cursor::new(bytes.clone()),
+                interrupt_at: Some(offset),
+            };
+            let mut reader = super::VerifiedNativeNarReader::Streaming(super::StreamingNativeNar {
+                reader: source.take(expected.size().get()),
+                producer,
+                expected,
+                digest: sha2::Sha256::new(),
+            });
+            let mut actual = Vec::new();
+            let mut chunk = [0; 3];
+            for _ in 0..2 {
+                let length = reader
+                    .read(&mut chunk)
+                    .expect("interruption is retried internally");
+                actual.extend_from_slice(&chunk[..length]);
+            }
+            assert_eq!(actual, bytes);
+            assert_eq!(reader.read(&mut chunk).expect("verified EOF"), 0);
+        }
+    }
+
+    #[test]
+    fn native_regular_file_encoding_retries_interruption_after_progress() {
+        let mut source = InterruptAtOffset {
+            source: io::Cursor::new(b"narjar".to_vec()),
+            interrupt_at: Some(3),
+        };
+        let mut encoder = narjar::nar_encode::Encoder::new(Vec::new()).expect("encoder");
+        encoder
+            .push(narjar::nar_encode::Event::BeginFile {
+                executable: false,
+                size: 6,
+            })
+            .expect("file declaration");
+        super::encode_regular_file_contents(&mut encoder, &mut source, &mut [0; 3])
+            .expect("interruption must not abort a file after the first chunk");
+        encoder
+            .push(narjar::nar_encode::Event::EndFile)
+            .expect("complete body");
+        let (bytes, _) = encoder.finish().expect("complete NAR");
+        let mut body = Vec::new();
+        Decoder::new(bytes.as_slice())
+            .decode(&mut |event: Event<'_>| {
+                if let Event::FileChunk(chunk) = event {
+                    body.extend_from_slice(chunk);
+                }
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .expect("encoded stream is valid");
+        assert_eq!(body, b"narjar");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_dump_uses_canonical_case_hacked_names_and_rejects_collisions() {
+        let files = [
+            ("empty", "empty~nix~case~hack~"),
+            ("nonnumeric", "nonnumeric~nix~case~hack~x"),
+            ("repeated", "repeated~nix~case~hack~1~nix~case~hack~2"),
+        ];
+        let fixture = NativeDeliveryFixture::with_store_object(|path| {
+            fs::create_dir(path).expect("directory");
+            for (_, name) in files {
+                fs::write(path.join(name), name.as_bytes()).expect("case-hacked file");
+            }
+        });
+        // Explicit canonical names are independent of the projection helper.
+        let mut encoder = narjar::nar_encode::Encoder::new(Vec::new()).expect("encoder");
+        encoder
+            .push(narjar::nar_encode::Event::BeginDirectory)
+            .expect("directory");
+        for (name, contents) in files {
+            encoder
+                .push(narjar::nar_encode::Event::Entry(name.as_bytes()))
+                .expect("entry");
+            encoder
+                .push(narjar::nar_encode::Event::BeginFile {
+                    executable: false,
+                    size: contents.len() as u64,
+                })
+                .expect("file");
+            encoder
+                .push(narjar::nar_encode::Event::FileChunk(contents.as_bytes()))
+                .expect("body");
+            encoder
+                .push(narjar::nar_encode::Event::EndFile)
+                .expect("end file");
+        }
+        encoder
+            .push(narjar::nar_encode::Event::EndDirectory)
+            .expect("end directory");
+        let (expected, _) = encoder.finish().expect("canonical NAR");
+        assert_eq!(raw_nar_bytes(fixture.lease()), expected);
+
+        fs::write(fixture.physical_path.join("empty"), b"colliding name")
+            .expect("case-hack collision");
+        let error = write_leased_nar(&fixture.lease(), io::sink())
+            .expect_err("distinct filesystem names cannot share one NAR name");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

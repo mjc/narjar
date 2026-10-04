@@ -35,18 +35,13 @@ pub(super) fn nar_entry_name_for_filesystem_name(name: &OsStr) -> &OsStr {
 #[cfg(any(target_os = "macos", test))]
 fn darwin_case_hack_decoded_name(name: &[u8]) -> &[u8] {
     const CASE_HACK_MARKER: &[u8] = b"~nix~case~hack~";
-    let Some(marker_start) = name
+    let marker_start = name
         .windows(CASE_HACK_MARKER.len())
-        .rposition(|window| window == CASE_HACK_MARKER)
-    else {
-        return name;
-    };
-    let suffix_start = marker_start + CASE_HACK_MARKER.len();
-    if suffix_start < name.len() && name[suffix_start..].iter().all(u8::is_ascii_digit) {
-        &name[..marker_start]
-    } else {
-        name
-    }
+        .position(|window| window == CASE_HACK_MARKER)
+        .unwrap_or(name.len());
+    // Match Nix's default Darwin dump: the first marker ends the NAR name,
+    // even when its suffix is empty, nonnumeric, or contains another marker.
+    &name[..marker_start]
 }
 
 #[cfg(test)]
@@ -55,23 +50,17 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
-    fn darwin_case_hack_suffix_is_removed_only_when_it_has_decimal_disambiguator() {
-        assert_eq!(
-            darwin_case_hack_decoded_name(b"README~nix~case~hack~1"),
-            b"README"
-        );
-        assert_eq!(
-            darwin_case_hack_decoded_name(b"README~nix~case~hack~12"),
-            b"README"
-        );
-        assert_eq!(
-            darwin_case_hack_decoded_name(b"README~nix~case~hack~"),
-            b"README~nix~case~hack~"
-        );
-        assert_eq!(
-            darwin_case_hack_decoded_name(b"README~nix~case~hack~x"),
-            b"README~nix~case~hack~x"
-        );
+    fn darwin_dump_removes_the_first_case_hack_marker_regardless_of_suffix() {
+        for name in [
+            b"README~nix~case~hack~1".as_slice(),
+            b"README~nix~case~hack~12",
+            b"README~nix~case~hack~",
+            b"README~nix~case~hack~x",
+            b"README~nix~case~hack~1~nix~case~hack~2",
+        ] {
+            assert_eq!(darwin_case_hack_decoded_name(name), b"README");
+        }
+        assert_eq!(darwin_case_hack_decoded_name(b"README"), b"README");
     }
 
     #[test]
