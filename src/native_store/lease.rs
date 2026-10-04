@@ -161,6 +161,9 @@ impl NativeStoreLease {
     }
 }
 
+/// Protects a root from cleanup by its serving manager. All deliveries and
+/// maintenance for a live service must share that manager; this is not a
+/// cross-process pin for independently opened managers.
 pub(crate) struct NativeStoreActiveDelivery {
     record_path: PathBuf,
     state: Arc<Mutex<LeaseManagerState>>,
@@ -943,6 +946,9 @@ impl NativeStoreLeaseManager {
         cleanup_remaining: &mut usize,
         state: &mut LeaseManagerState,
     ) -> Result<(), NativeStoreLeaseError> {
+        if state.has_active_delivery(record_path) {
+            return Ok(());
+        }
         match cleanup_remaining.checked_sub(1) {
             Some(remaining) => {
                 self.remove_recovered_lease_files(record_path, store_path, record, state)?;
@@ -2900,6 +2906,56 @@ mod tests {
             .expect("expiration cleanup should release inactive delivery");
         assert!(!fixture.manager.root_path(&fixture.store_path).exists());
         assert!(fixture.owned_records().is_empty());
+    }
+
+    #[test]
+    fn interrupted_reconciliation_keeps_expired_roots_until_active_delivery_finishes() {
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .expect("lease should be acquired");
+        let active_delivery = lease
+            .begin_active_delivery()
+            .expect("delivery should protect its root");
+        fixture
+            .manager
+            .begin_recovery_reconciliation()
+            .expect("simulate an interrupted recovery journal");
+
+        fixture
+            .manager
+            .cleanup_expired_at(lease.expires_at_unix_seconds())
+            .expect("cleanup should finish recovery without removing active delivery");
+
+        assert!(fixture.manager.root_path(&fixture.store_path).exists());
+        assert_eq!(fixture.owned_records().len(), 1);
+        assert_eq!(
+            fixture.manager.snapshot().expect("live root count").active,
+            1
+        );
+        assert!(
+            read_capacity_record(&fixture.roots_dir)
+                .expect("completed recovery journal")
+                .pending
+                .is_none()
+        );
+
+        drop(active_delivery);
+        fixture
+            .manager
+            .cleanup_expired_at(lease.expires_at_unix_seconds())
+            .expect("completed delivery should permit expiry cleanup");
+        assert!(!fixture.manager.root_path(&fixture.store_path).exists());
+        assert!(fixture.owned_records().is_empty());
+        assert_eq!(
+            fixture
+                .manager
+                .snapshot()
+                .expect("released root count")
+                .active,
+            0
+        );
     }
 
     #[test]
