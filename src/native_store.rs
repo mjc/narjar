@@ -12,6 +12,11 @@ use std::{
 use narjar::__private::narinfo::TrustedPublicKeys;
 use sqlite::{Connection, ConnectionThreadSafe, OpenFlags, State};
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "NARJ-141 connects native NAR delivery to HTTP")
+)]
+pub(crate) mod delivery;
 #[expect(
     dead_code,
     reason = "NARJ-142 connects lease capabilities to native-store serving"
