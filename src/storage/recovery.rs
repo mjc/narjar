@@ -2,15 +2,17 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, Read, Write},
-    os::{fd::AsRawFd, unix::ffi::OsStrExt, unix::fs::PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use rustix::fs::OFlags;
+
 use sha2::{Digest, Sha256};
 
-use super::fs::{entry_mode_at, hard_link_at, open_at, unlink_at};
+use super::fs::{entry_mode_at, hard_link_at, open_at, rename_at, unlink_at};
 use super::{
     StorageError, entry_is_regular_at,
     location::{StorePath, TemporaryPath},
@@ -465,7 +467,7 @@ impl RecoveryState {
         match open_at(
             &self.root,
             name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             0o600,
         ) {
             Ok(file) => {
@@ -488,7 +490,7 @@ impl RecoveryState {
         let mut marker = open_at(
             &self.root,
             name,
-            libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            OFlags::WRONLY | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             0,
         )?;
         if !marker.metadata()?.is_file() {
@@ -532,41 +534,6 @@ impl RecoveryState {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
         }
-    }
-}
-
-fn rename_at(
-    from_directory: &File,
-    from_name: &OsStr,
-    to_directory: &File,
-    to_name: &OsStr,
-) -> io::Result<()> {
-    let from_name = std::ffi::CString::new(from_name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "publication transaction name contains a NUL byte",
-        )
-    })?;
-    let to_name = std::ffi::CString::new(to_name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "publication transaction name contains a NUL byte",
-        )
-    })?;
-    // SAFETY: all descriptors and NUL-terminated names are live for the call;
-    // renameat does not retain either pointer.
-    let result = unsafe {
-        libc::renameat(
-            from_directory.as_raw_fd(),
-            from_name.as_ptr(),
-            to_directory.as_raw_fd(),
-            to_name.as_ptr(),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
     }
 }
 
@@ -623,7 +590,7 @@ fn write_transaction_draft(
     let mut draft = open_at(
         directory,
         name,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         0o600,
     )?;
     fault(TransactionRecordBoundary::DraftCreated)?;

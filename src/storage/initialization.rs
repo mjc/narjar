@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
+use rustix::fs::OFlags;
+
 use super::{
     LAYOUT_DESCRIPTOR, SupportedStorageBackend,
     backend::BackendSupport,
@@ -168,7 +170,7 @@ fn install_complete_descriptor(
         let mut file = open_at(
             root,
             draft,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             0o600,
         )?;
         file.write_all(backend.backend().layout_descriptor())?;
@@ -195,7 +197,7 @@ impl CacheLayout {
         let lock = ProcessLock::acquire(open_at(
             &directory,
             OsStr::new("."),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             0,
         )?)?;
         Ok(Self {

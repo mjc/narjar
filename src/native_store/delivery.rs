@@ -1,18 +1,13 @@
 use std::{
-    ffi::{CStr, CString, OsStr, OsString},
-    fs::{File, OpenOptions},
+    ffi::{OsStr, OsString},
+    fs::File,
     io::{self, PipeReader, Read, Take, Write},
-    mem::MaybeUninit,
     ops::Range,
-    os::{
-        fd::{AsRawFd, FromRawFd, IntoRawFd},
-        unix::{
-            ffi::{OsStrExt, OsStringExt},
-            fs::{MetadataExt, OpenOptionsExt},
-        },
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::MetadataExt,
     },
     path::Path,
-    ptr::NonNull,
     sync::mpsc::{self, Receiver},
     thread,
 };
@@ -21,6 +16,7 @@ use narjar::{
     nar_encode::{EncodeSummary, Encoder, Event},
     object::{NarHash, NarIdentity},
 };
+use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
 use super::lease::NativeStoreLease;
@@ -296,19 +292,15 @@ fn write_leased_nar<W: Write>(lease: &NativeStoreLease, output: W) -> io::Result
 }
 
 fn emit_node_at<W: Write>(encoder: &mut Encoder<W>, parent: &File, name: &OsStr) -> io::Result<()> {
-    let metadata = symlink_metadata_at(parent, name)?;
-    let mode = metadata.st_mode;
-    if mode & libc::S_IFMT == libc::S_IFDIR {
-        emit_directory_at(encoder, parent, name)
-    } else if mode & libc::S_IFMT == libc::S_IFREG {
-        emit_regular_file_at(encoder, parent, name)
-    } else if mode & libc::S_IFMT == libc::S_IFLNK {
-        emit_symlink_at(encoder, parent, name)
-    } else {
-        Err(io::Error::new(
+    let metadata = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    match FileType::from_raw_mode(metadata.st_mode) {
+        FileType::Directory => emit_directory_at(encoder, parent, name),
+        FileType::RegularFile => emit_regular_file_at(encoder, parent, name),
+        FileType::Symlink => emit_symlink_at(encoder, parent, name),
+        _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "NAR cannot represent this native filesystem object",
-        ))
+        )),
     }
 }
 
@@ -368,9 +360,9 @@ fn emit_symlink_at<W: Write>(
     parent: &File,
     name: &OsStr,
 ) -> io::Result<()> {
-    let target = read_link_at(parent, name)?;
+    let target = fs::readlinkat(parent, name, Vec::new())?;
     encoder
-        .push(Event::Symlink(&target))
+        .push(Event::Symlink(target.as_bytes()))
         .map_err(encode_io_error)
 }
 
@@ -386,52 +378,19 @@ struct NativeDirectoryEntry {
 }
 
 fn directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryEntry>> {
-    let fd = duplicate_fd(directory)?;
-    // SAFETY: fdopendir takes ownership of the duplicated descriptor on success.
-    let stream = unsafe { libc::fdopendir(fd) };
-    if stream.is_null() {
-        // SAFETY: fdopendir failed, so ownership was not transferred.
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(io::Error::last_os_error());
-    }
-    DirectoryStream { stream }.read_entries()
-}
-
-struct DirectoryStream {
-    stream: *mut libc::DIR,
-}
-
-impl DirectoryStream {
-    fn read_entries(&mut self) -> io::Result<Vec<NativeDirectoryEntry>> {
-        let mut entries = Vec::new();
-        while let Some(entry) = self.next_entry()? {
-            // SAFETY: d_name is NUL-terminated for the returned directory entry.
-            let name = unsafe { CStr::from_ptr(entry.as_ref().d_name.as_ptr()) };
-            if name.to_bytes() != b"." && name.to_bytes() != b".." {
-                let filesystem_name = OsString::from_vec(name.to_bytes().to_vec());
-                entries.push(NativeDirectoryEntry {
-                    nar_name: nar_entry_name_for_filesystem_name(&filesystem_name),
-                    filesystem_name,
-                });
-            }
-        }
-        Ok(entries)
-    }
-
-    fn next_entry(&mut self) -> io::Result<Option<NonNull<libc::dirent>>> {
-        clear_errno();
-        // SAFETY: stream is a valid DIR* owned by DirectoryStream.
-        let entry = unsafe { libc::readdir(self.stream) };
-        match NonNull::new(entry) {
-            Some(entry) => Ok(Some(entry)),
-            None => match current_errno() {
-                0 => Ok(None),
-                error => Err(io::Error::from_raw_os_error(error)),
-            },
+    let mut entries = Vec::new();
+    for entry in Dir::read_from(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            let filesystem_name = OsString::from_vec(name.to_vec());
+            entries.push(NativeDirectoryEntry {
+                nar_name: nar_entry_name_for_filesystem_name(&filesystem_name),
+                filesystem_name,
+            });
         }
     }
+    Ok(entries)
 }
 
 fn nar_entry_name_for_filesystem_name(name: &OsStr) -> OsString {
@@ -464,86 +423,33 @@ fn nar_entry_name_bytes_for_filesystem_name(name: &[u8]) -> &[u8] {
     name
 }
 
-impl Drop for DirectoryStream {
-    fn drop(&mut self) {
-        // SAFETY: stream is owned by this guard and closed exactly once here.
-        unsafe {
-            libc::closedir(self.stream);
-        }
-    }
-}
-
-fn symlink_metadata_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
-    let name = c_string(name)?;
-    let mut metadata = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: parent fd and C string are valid for the call; fstatat initializes
-    // metadata when it succeeds.
-    let result = unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            metadata.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result == 0 {
-        // SAFETY: fstatat succeeded and initialized metadata.
-        Ok(unsafe { metadata.assume_init() })
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn read_link_at(parent: &File, name: &OsStr) -> io::Result<Vec<u8>> {
-    let name = c_string(name)?;
-    let mut capacity = 256;
-    loop {
-        let mut buffer = vec![0; capacity];
-        // SAFETY: parent fd, C string, and buffer are valid for the call.
-        let length = unsafe {
-            libc::readlinkat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-            )
-        };
-        if length < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let length = usize::try_from(length)
-            .map_err(|_| io::Error::other("native symlink target length overflowed usize"))?;
-        if length < capacity {
-            buffer.truncate(length);
-            return Ok(buffer);
-        }
-        capacity = capacity
-            .checked_mul(2)
-            .ok_or_else(|| io::Error::other("native symlink target is too large"))?;
-    }
-}
-
 fn open_directory(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    Ok(fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into())
 }
 
 fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
-    open_at(
+    Ok(fs::openat(
         parent,
         name,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-    )
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into())
 }
 
 fn open_regular_at(parent: &File, name: &OsStr) -> io::Result<File> {
-    let file = open_at(
+    let file: File = fs::openat(
         parent,
         name,
-        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-    )?;
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
     if file.metadata()?.is_file() {
         Ok(file)
     } else {
@@ -554,50 +460,8 @@ fn open_regular_at(parent: &File, name: &OsStr) -> io::Result<File> {
     }
 }
 
-fn open_at(parent: &File, name: &OsStr, flags: i32) -> io::Result<File> {
-    let name = c_string(name)?;
-    // SAFETY: parent fd and C string are valid for the call; on success the fd is
-    // owned by the returned File.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0) };
-    if fd >= 0 {
-        // SAFETY: openat returned a fresh owned descriptor.
-        Ok(unsafe { File::from_raw_fd(fd) })
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn duplicate_fd(file: &File) -> io::Result<i32> {
-    let duplicate = file.try_clone()?.into_raw_fd();
-    Ok(duplicate)
-}
-
-fn c_string(name: &OsStr) -> io::Result<CString> {
-    CString::new(name.as_bytes()).map_err(|_| invalid_path("native path contains a NUL byte"))
-}
-
 fn invalid_path(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-#[cfg(target_os = "linux")]
-fn clear_errno() {
-    // SAFETY: errno is thread-local on Linux.
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn clear_errno() {
-    // SAFETY: errno is thread-local on macOS.
-    unsafe {
-        *libc::__error() = 0;
-    }
-}
-
-fn current_errno() -> i32 {
-    io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 fn encode_io_error(error: narjar::nar_encode::EncodeError) -> io::Error {
@@ -846,6 +710,51 @@ mod tests {
             .expect("decode raw-byte native NAR");
 
         assert_eq!(names, [vec![0xff, b'-', b'r', b'a', b'w']]);
+    }
+
+    #[test]
+    fn directory_enumeration_restarts_without_consuming_the_borrowed_descriptor() {
+        let fixture = NativeDeliveryFixture::new();
+        let directory = open_directory(&fixture.physical_path).expect("open store directory");
+        let names = || {
+            super::sorted_directory_entries(&directory)
+                .expect("enumerate store directory")
+                .into_iter()
+                .map(|entry| entry.filesystem_name)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names(),
+            ["a", "empty", "link", "run", "z"].map(OsString::from)
+        );
+        assert_eq!(
+            names(),
+            ["a", "empty", "link", "run", "z"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn preserves_long_non_utf8_symlink_targets() {
+        let mut target = b"segment/".repeat(80);
+        target.push(0xff);
+        let fixture = NativeDeliveryFixture::with_store_object(|path| {
+            std::os::unix::fs::symlink(OsStr::from_bytes(&target), path)
+                .expect("create raw-byte symlink");
+        });
+        let bytes = raw_nar_bytes(fixture.lease());
+        let mut targets = Vec::new();
+        let mut sink = |event: Event<'_>| -> Result<(), std::convert::Infallible> {
+            if let Event::Symlink { target } = event {
+                targets.push(target);
+            }
+            Ok(())
+        };
+        Decoder::new(&bytes[..])
+            .decode(&mut sink)
+            .expect("decode raw-byte symlink NAR");
+
+        assert_eq!(targets, [target]);
     }
 
     #[test]

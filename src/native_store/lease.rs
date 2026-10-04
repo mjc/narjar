@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     num::{NonZeroU64, NonZeroUsize},
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -13,6 +13,7 @@ use std::{
 };
 
 use data_encoding::HEXLOWER;
+use rustix::{fs::FlockOperation, io::Errno};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlite::{ConnectionThreadSafe, State};
@@ -1200,7 +1201,7 @@ impl NativeStoreLeaseManager {
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)
             .map_err(NativeStoreLeaseError::Io)?;
-        set_flock_lock_with_mode(&file, libc::LOCK_SH)?;
+        set_flock_lock_with_mode(&file, FlockOperation::LockShared)?;
         Ok(GcReadLock { _file: file })
     }
 
@@ -1256,23 +1257,17 @@ struct GcReadLock {
 }
 
 fn set_flock_lock(file: &File) -> Result<(), NativeStoreLeaseError> {
-    set_flock_lock_with_mode(file, libc::LOCK_EX)
+    set_flock_lock_with_mode(file, FlockOperation::LockExclusive)
 }
 
 fn set_flock_lock_with_mode(
     file: &File,
-    lock_mode: libc::c_int,
+    lock_mode: FlockOperation,
 ) -> Result<(), NativeStoreLeaseError> {
-    let result = std::iter::repeat_with(|| {
-        // SAFETY: `file` is an open descriptor and flock takes no pointer arguments.
-        unsafe { libc::flock(file.as_raw_fd(), lock_mode) }
-    })
-    .find(|result| *result == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted)
-    .unwrap_or(-1);
-    match result {
-        0 => Ok(()),
-        _ => Err(NativeStoreLeaseError::Io(io::Error::last_os_error())),
-    }
+    std::iter::repeat_with(|| rustix::fs::flock(file, lock_mode))
+        .find(|result| *result != Err(Errno::INTR))
+        .unwrap_or(Err(Errno::INTR))
+        .map_err(|error| NativeStoreLeaseError::Io(error.into()))
 }
 
 fn read_record_paths(roots_dir: &Path) -> Result<Vec<PathBuf>, NativeStoreLeaseError> {
@@ -1685,6 +1680,7 @@ mod tests {
     use sqlite::Connection;
     use std::{
         num::NonZeroUsize,
+        os::fd::AsRawFd,
         process::{Command, Output},
         sync::{Arc, Barrier},
         thread,
@@ -2970,7 +2966,7 @@ mod tests {
             unsafe { libc::flock(nix_gc_lock.as_raw_fd(), libc::LOCK_UN) },
             0
         );
-        set_flock_lock_with_mode(&narjar_gc_lock, libc::LOCK_SH)
+        set_flock_lock_with_mode(&narjar_gc_lock, FlockOperation::LockShared)
             .expect("shared Narjar-style flock should succeed after GC unlocks");
     }
 

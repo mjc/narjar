@@ -8,18 +8,16 @@ pub(crate) enum CapacityErrorKind {
 }
 
 use std::{
-    ffi::{CStr, CString, OsStr, OsString},
-    fs::{File, OpenOptions},
+    ffi::{OsStr, OsString},
+    fs::File,
     io::{self, Read},
-    mem::MaybeUninit,
-    os::{
-        fd::{AsRawFd, FromRawFd, IntoRawFd},
-        unix::ffi::OsStrExt,
-        unix::fs::{OpenOptionsExt, PermissionsExt},
-    },
+    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
     path::Path,
-    ptr::NonNull,
     sync::{Arc, Mutex},
+};
+
+use rustix::fs::{
+    self, AtFlags, Dir, FlockOperation, Mode, OFlags, RawMode, Stat, StatVfs, StatVfsMountFlags,
 };
 
 use super::publication::{StagingBudget, TemporaryFile};
@@ -144,32 +142,23 @@ pub(super) fn reserve_staging_bytes_for_test(
 }
 
 pub(super) fn filesystem_space(directory: &File) -> io::Result<StorageCapacity> {
-    let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
-
-    // SAFETY: directory owns a valid descriptor for the duration of the call,
-    // and statistics points to writable storage for one statvfs value.
-    if unsafe { libc::fstatvfs(directory.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: fstatvfs returned success, so it initialized statistics.
-    let statistics = unsafe { statistics.assume_init() };
+    let statistics = fs::fstatvfs(directory)?;
     Ok(capacity_from_statvfs(&statistics))
 }
 
-pub fn capacity_from_statvfs(statistics: &libc::statvfs) -> StorageCapacity {
-    let scale = statistics.f_frsize as u128;
-    let bytes = |blocks: libc::fsblkcnt_t| {
-        (blocks as u128)
+pub fn capacity_from_statvfs(statistics: &StatVfs) -> StorageCapacity {
+    let scale = u128::from(statistics.f_frsize);
+    let bytes = |blocks: u64| {
+        u128::from(blocks)
             .saturating_mul(scale)
             .min(u128::from(u64::MAX)) as u64
     };
     StorageCapacity {
         total_bytes: bytes(statistics.f_blocks),
         available_bytes: bytes(statistics.f_bavail),
-        total_inodes: (statistics.f_files as u128).min(u128::from(u64::MAX)) as u64,
-        available_inodes: (statistics.f_favail as u128).min(u128::from(u64::MAX)) as u64,
-        read_only: statistics.f_flag & libc::ST_RDONLY != 0,
+        total_inodes: statistics.f_files,
+        available_inodes: statistics.f_favail,
+        read_only: statistics.f_flag.contains(StatVfsMountFlags::RDONLY),
     }
 }
 
@@ -177,22 +166,12 @@ pub(super) fn ensure_directory_at(parent: &File, name: &OsStr, label: &str) -> i
     match open_directory_at(parent, name) {
         Ok(directory) => validate_directory(&directory, label),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let name = CString::new(name.as_bytes()).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "storage entry name contains a NUL byte",
-                )
-            })?;
-            // SAFETY: parent owns a live directory descriptor, name is
-            // NUL-terminated, and mkdirat does not retain the pointer.
-            let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
-            if result != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::AlreadyExists {
-                    return Err(error);
-                }
+            if let Err(error) = fs::mkdirat(parent, name, Mode::from_raw_mode(0o755))
+                && error != rustix::io::Errno::EXIST
+            {
+                return Err(error.into());
             }
-            let directory = open_directory_at(parent, OsStr::from_bytes(name.as_bytes()))?;
+            let directory = open_directory_at(parent, name)?;
             validate_directory(&directory, label)
         }
         Err(error) => Err(error),
@@ -240,10 +219,12 @@ pub(super) fn require_private_file_at(
 }
 
 pub(super) fn open_directory(path: &Path) -> io::Result<File> {
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let directory: File = fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
     if !directory.metadata()?.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -257,7 +238,7 @@ pub(crate) fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File>
     let directory = open_at(
         parent,
         name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         0,
     )?;
     if !directory.metadata()?.is_dir() {
@@ -273,7 +254,7 @@ pub(crate) fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File
     let file = open_at(
         directory,
         name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         0,
     )?;
     if !file.metadata()?.is_file() {
@@ -307,8 +288,13 @@ pub(crate) fn entry_identity_at(
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn metadata_change_time(metadata: &libc::stat) -> (i64, i64) {
+#[cfg(target_os = "linux")]
+pub(super) fn metadata_change_time(metadata: &Stat) -> (i64, i64) {
+    (metadata.st_ctime, metadata.st_ctime_nsec as i64)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn metadata_change_time(metadata: &Stat) -> (i64, i64) {
     (metadata.st_ctime, metadata.st_ctime_nsec)
 }
 
@@ -316,30 +302,8 @@ pub(super) fn entry_mode_at(directory: &File, name: &OsStr) -> io::Result<libc::
     Ok(entry_stat_at(directory, name)?.st_mode as libc::mode_t)
 }
 
-pub(super) fn entry_stat_at(directory: &File, name: &OsStr) -> io::Result<libc::stat> {
-    let name = CString::new(name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "storage entry name contains a NUL byte",
-        )
-    })?;
-    let mut metadata = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: directory owns a live descriptor, name is NUL-terminated, and
-    // metadata points to writable storage for one stat value.
-    let result = unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            metadata.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fstatat returned success, so it initialized metadata.
-    let metadata = unsafe { metadata.assume_init() };
-    Ok(metadata)
+pub(super) fn entry_stat_at(directory: &File, name: &OsStr) -> io::Result<Stat> {
+    fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(Into::into)
 }
 
 pub(super) fn open_optional_at(
@@ -353,49 +317,43 @@ pub(super) fn open_optional_at(
     }
 }
 
-pub(super) fn open_at(parent: &File, name: &OsStr, flags: i32, mode: u32) -> io::Result<File> {
-    let name = CString::new(name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "storage entry name contains a NUL byte",
-        )
-    })?;
-    // SAFETY: parent owns a live directory descriptor, name is NUL-terminated,
-    // and the returned descriptor is transferred to File exactly once.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            flags,
-            mode as libc::c_uint,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: openat returned a new owned descriptor.
-    Ok(unsafe { File::from_raw_fd(fd) })
+pub(super) fn open_at(
+    parent: &File,
+    name: &OsStr,
+    flags: OFlags,
+    mode: RawMode,
+) -> io::Result<File> {
+    Ok(fs::openat(parent, name, flags, Mode::from_raw_mode(mode))?.into())
 }
 
 pub(crate) fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
-    read_dir_names_with(directory, |stream| {
-        // SAFETY: the callback receives the live stream owned by
-        // DirectoryStream.
-        unsafe { libc::readdir(stream) }
-    })
+    read_dir_names_with(directory_names(directory)?)
+}
+
+fn directory_names(directory: &File) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
+    // read_from opens an independent cursor, so repeated scans do not consume
+    // the borrowed descriptor's position. Dir closes this read-only stream on
+    // drop without reporting close errors; read and visitor errors propagate.
+    Ok(Dir::read_from(directory)?.map(|entry| {
+        entry
+            .map(|entry| OsString::from_vec(entry.file_name().to_bytes().to_vec()))
+            .map_err(Into::into)
+    }))
 }
 
 fn read_dir_names_with(
-    directory: &File,
-    read_entry: impl FnMut(*mut libc::DIR) -> *mut libc::dirent,
+    entries: impl Iterator<Item = io::Result<OsString>>,
 ) -> io::Result<Vec<OsString>> {
-    let mut names = Vec::new();
-    let outcome = for_each_dir_name_with(directory, read_entry, |name| {
-        names.push(name.to_owned());
-        Ok(DirectoryEntryAction::Continue)
-    })?;
-    debug_assert_eq!(outcome, DirectoryScanOutcome::Complete);
-    Ok(names)
+    exclude_dot_directory_entries(entries).collect()
+}
+
+fn exclude_dot_directory_entries(
+    entries: impl Iterator<Item = io::Result<OsString>>,
+) -> impl Iterator<Item = io::Result<OsString>> {
+    entries.filter(|entry| match entry {
+        Ok(name) => name != "." && name != "..",
+        Err(_) => true,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,177 +374,21 @@ pub(crate) fn for_each_dir_name<F>(directory: &File, visit: F) -> io::Result<Dir
 where
     F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
 {
-    for_each_dir_name_with(
-        directory,
-        |stream| {
-            // SAFETY: the callback receives the live stream owned by
-            // DirectoryStream.
-            unsafe { libc::readdir(stream) }
-        },
-        visit,
-    )
+    visit_directory_names(directory_names(directory)?, visit)
 }
 
-fn for_each_dir_name_with<F>(
-    directory: &File,
-    mut read_entry: impl FnMut(*mut libc::DIR) -> *mut libc::dirent,
-    mut visit: F,
-) -> io::Result<DirectoryScanOutcome>
-where
-    F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
-{
-    let stream = DirectoryStream::open(directory)?;
-    let scan_result = visit_readdir_entries(
-        || next_readdir_entry_with(|| read_entry(stream.as_ptr())),
-        &mut visit,
-    );
-    let close_result = stream.close();
-    scan_result.and_then(|outcome| close_result.map(|()| outcome))
-}
-
-struct DirectoryStream(Option<NonNull<libc::DIR>>);
-
-impl DirectoryStream {
-    fn open(directory: &File) -> io::Result<Self> {
-        let directory = open_at(
-            directory,
-            OsStr::new("."),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            0,
-        )?;
-        let fd = directory.into_raw_fd();
-        // SAFETY: fd is a newly opened directory descriptor. On success,
-        // fdopendir transfers ownership to the DIR handle.
-        let stream = unsafe { libc::fdopendir(fd) };
-        let Some(stream) = NonNull::new(stream) else {
-            let error = io::Error::last_os_error();
-            // SAFETY: fdopendir failed and did not transfer ownership.
-            unsafe { libc::close(fd) };
-            return Err(error);
-        };
-        Ok(Self(Some(stream)))
-    }
-
-    fn as_ptr(&self) -> *mut libc::DIR {
-        self.0.expect("directory stream is open").as_ptr()
-    }
-
-    fn close(mut self) -> io::Result<()> {
-        let stream = self.0.take().expect("directory stream is open");
-        // SAFETY: taking the handle transfers its sole ownership to closedir.
-        if unsafe { libc::closedir(stream.as_ptr()) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+fn visit_directory_names(
+    entries: impl Iterator<Item = io::Result<OsString>>,
+    mut visit: impl FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
+) -> io::Result<DirectoryScanOutcome> {
+    for name in exclude_dot_directory_entries(entries) {
+        let name = name?;
+        match visit(&name)? {
+            DirectoryEntryAction::Continue => {}
+            DirectoryEntryAction::Stop => return Ok(DirectoryScanOutcome::StoppedEarly),
         }
     }
-}
-
-impl Drop for DirectoryStream {
-    fn drop(&mut self) {
-        if let Some(stream) = self.0.take() {
-            // SAFETY: this guard owns the stream and closes it during
-            // unwinding or when explicit close was not reached.
-            unsafe { libc::closedir(stream.as_ptr()) };
-        }
-    }
-}
-
-fn visit_readdir_entries<F>(
-    mut next_entry: impl FnMut() -> io::Result<Option<NonNull<libc::dirent>>>,
-    mut visit: F,
-) -> io::Result<DirectoryScanOutcome>
-where
-    F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
-{
-    use std::ops::ControlFlow;
-
-    let mut entries = std::iter::from_fn(|| match next_entry() {
-        Ok(Some(entry)) => Some(Ok(entry)),
-        Ok(None) => None,
-        Err(error) => Some(Err(error)),
-    });
-
-    match entries.try_for_each(|entry| {
-        let action = entry.and_then(|entry| visit_readdir_name(entry, &mut visit));
-        match action {
-            Ok(DirectoryEntryAction::Continue) => ControlFlow::Continue(()),
-            Ok(DirectoryEntryAction::Stop) => {
-                ControlFlow::Break(Ok(DirectoryScanOutcome::StoppedEarly))
-            }
-            Err(error) => ControlFlow::Break(Err(error)),
-        }
-    }) {
-        ControlFlow::Continue(()) => Ok(DirectoryScanOutcome::Complete),
-        ControlFlow::Break(result) => result,
-    }
-}
-
-fn visit_readdir_name<F>(
-    entry: NonNull<libc::dirent>,
-    visit: &mut F,
-) -> io::Result<DirectoryEntryAction>
-where
-    F: FnMut(&OsStr) -> io::Result<DirectoryEntryAction>,
-{
-    // SAFETY: the DIR stream owns this entry and it remains valid until
-    // the next call to readdir.
-    let name = unsafe { CStr::from_ptr(entry.as_ref().d_name.as_ptr()) };
-    if name.to_bytes() == b"." || name.to_bytes() == b".." {
-        return Ok(DirectoryEntryAction::Continue);
-    }
-    visit(OsStr::from_bytes(name.to_bytes()))
-}
-
-fn next_readdir_entry_with(
-    mut read_entry: impl FnMut() -> *mut libc::dirent,
-) -> io::Result<Option<NonNull<libc::dirent>>> {
-    clear_errno();
-    let entry = read_entry();
-    if let Some(entry) = NonNull::new(entry) {
-        return Ok(Some(entry));
-    }
-    let error_code = io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or_default();
-    classify_readdir_result(std::ptr::null_mut(), error_code)
-}
-
-fn classify_readdir_result(
-    entry: *mut libc::dirent,
-    error_code: i32,
-) -> io::Result<Option<NonNull<libc::dirent>>> {
-    match NonNull::new(entry) {
-        Some(entry) => Ok(Some(entry)),
-        None if error_code == 0 => Ok(None),
-        None => Err(io::Error::from_raw_os_error(error_code)),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn clear_errno() {
-    // SAFETY: this accesses the current thread's errno slot.
-    unsafe { *libc::__errno_location() = 0 };
-}
-
-#[cfg(target_os = "macos")]
-fn clear_errno() {
-    // SAFETY: this accesses the current thread's errno slot.
-    unsafe { *libc::__error() = 0 };
-}
-
-#[cfg(test)]
-fn set_errno(error_code: libc::c_int) {
-    #[cfg(target_os = "linux")]
-    // SAFETY: this sets the current thread's errno slot for a controlled test.
-    unsafe {
-        *libc::__errno_location() = error_code;
-    }
-    #[cfg(target_os = "macos")]
-    // SAFETY: this sets the current thread's errno slot for a controlled test.
-    unsafe {
-        *libc::__error() = error_code;
-    }
+    Ok(DirectoryScanOutcome::Complete)
 }
 
 pub(super) fn rollback_link_at(directory: &File, name: &OsStr) -> Result<(), StorageError> {
@@ -596,22 +398,10 @@ pub(super) fn rollback_link_at(directory: &File, name: &OsStr) -> Result<(), Sto
 }
 
 pub(super) fn lock_exclusive(file: &File) -> Result<(), StorageError> {
-    // SAFETY: file owns this live descriptor for the entire call. flock neither
-    // dereferences Rust memory nor retains the descriptor after returning.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        return Ok(());
-    }
-
-    let error = io::Error::last_os_error();
-    let code = error.raw_os_error();
-    if error.kind() == io::ErrorKind::WouldBlock
-        || code == Some(libc::EAGAIN)
-        || code == Some(libc::EWOULDBLOCK)
-    {
-        Err(StorageError::Locked)
-    } else {
-        Err(error.into())
+    match fs::flock(file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::AGAIN) => Err(StorageError::Locked),
+        Err(error) => Err(io::Error::from(error).into()),
     }
 }
 
@@ -620,14 +410,7 @@ pub(super) fn lock_exclusive(file: &File) -> Result<(), StorageError> {
 /// chunks and before publishing the authoritative manifest.
 #[cfg(target_os = "linux")]
 pub(super) fn sync_filesystem(file: &File) -> io::Result<()> {
-    // SAFETY: `file` owns a live descriptor for the duration of this call.
-    // `syncfs` only reads that descriptor, does not retain it, and does not
-    // dereference any Rust-managed memory.
-    if unsafe { libc::syncfs(file.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    fs::syncfs(file).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -668,34 +451,14 @@ pub(super) fn hard_link_at(
     destination_directory: &File,
     destination_name: &OsStr,
 ) -> io::Result<()> {
-    let source_name = CString::new(source_name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "storage entry name contains a NUL byte",
-        )
-    })?;
-    let destination_name = CString::new(destination_name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "storage entry name contains a NUL byte",
-        )
-    })?;
-    // SAFETY: both directory descriptors are live, both names are
-    // NUL-terminated, and linkat does not retain either pointer.
-    let result = unsafe {
-        libc::linkat(
-            source_directory.as_raw_fd(),
-            source_name.as_ptr(),
-            destination_directory.as_raw_fd(),
-            destination_name.as_ptr(),
-            0,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    fs::linkat(
+        source_directory,
+        source_name,
+        destination_directory,
+        destination_name,
+        AtFlags::empty(),
+    )
+    .map_err(Into::into)
 }
 
 pub(super) fn rename_at(
@@ -704,50 +467,17 @@ pub(super) fn rename_at(
     destination_directory: &File,
     destination_name: &OsStr,
 ) -> io::Result<()> {
-    let source_name = CString::new(source_name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "storage entry name contains a NUL byte",
-        )
-    })?;
-    let destination_name = CString::new(destination_name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "storage entry name contains a NUL byte",
-        )
-    })?;
-    // SAFETY: both directory descriptors are live, both names are
-    // NUL-terminated, and renameat does not retain either pointer.
-    let result = unsafe {
-        libc::renameat(
-            source_directory.as_raw_fd(),
-            source_name.as_ptr(),
-            destination_directory.as_raw_fd(),
-            destination_name.as_ptr(),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    fs::renameat(
+        source_directory,
+        source_name,
+        destination_directory,
+        destination_name,
+    )
+    .map_err(Into::into)
 }
 
 pub(super) fn unlink_at(directory: &File, name: &OsStr) -> io::Result<()> {
-    let name = CString::new(name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "storage entry name contains a NUL byte",
-        )
-    })?;
-    // SAFETY: directory owns a live descriptor, name is NUL-terminated, and
-    // unlinkat does not retain the pointer.
-    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    fs::unlinkat(directory, name, AtFlags::empty()).map_err(Into::into)
 }
 
 pub(super) fn remove_temp(temp: &TemporaryFile) -> io::Result<()> {
@@ -757,58 +487,130 @@ pub(super) fn remove_temp(temp: &TemporaryFile) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ptr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn relative_filesystem_operations_preserve_bytes_and_symlinks_after_directory_rename() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let root = tempfile::tempdir().expect("create root");
+        let directory_path = root.path().join("original");
+        std::fs::create_dir(&directory_path).expect("create directory");
+        let directory = open_directory(&directory_path).expect("open directory");
+        std::fs::rename(&directory_path, root.path().join("moved")).expect("move directory");
+        let moved = root.path().join("moved");
+        let source = OsStr::new("source");
+        symlink("missing-target", moved.join(source)).expect("create dangling symlink");
+        let (link, renamed) = match hard_link_at(
+            &directory,
+            source,
+            &directory,
+            OsStr::from_bytes(b"link-\xff"),
+        ) {
+            Ok(()) => (
+                OsStr::from_bytes(b"link-\xff"),
+                OsStr::from_bytes(b"renamed-\xff"),
+            ),
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                hard_link_at(&directory, source, &directory, OsStr::new("link"))
+                    .expect("hard link symlink itself");
+                (OsStr::new("link"), OsStr::new("renamed"))
+            }
+            Err(error) => panic!("hard link raw-byte name: {error}"),
+        };
+        let metadata = std::fs::symlink_metadata(moved.join(source)).expect("stat symlink");
+        let identity = entry_identity_at(&directory, link).expect("relative nofollow stat");
+        assert_eq!(
+            identity,
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec()
+            )
+        );
+        assert!(!entry_is_regular_at(&directory, link).expect("classify symlink"));
+        assert_eq!(
+            open_regular_at(&directory, link)
+                .expect_err("must not follow symlink")
+                .raw_os_error(),
+            Some(libc::ELOOP),
+        );
+
+        rename_at(&directory, link, &directory, renamed).expect("rename raw-byte link");
+        assert_eq!(
+            std::fs::read_link(moved.join(renamed)).expect("read symlink"),
+            Path::new("missing-target")
+        );
+        unlink_at(&directory, renamed).expect("unlink raw-byte link");
+        assert_eq!(
+            entry_stat_at(&directory, renamed)
+                .expect_err("link removed")
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert!(
+            entry_stat_at(&directory, source).is_ok(),
+            "original link survives"
+        );
+    }
+
+    #[test]
+    fn stat_change_time_preserves_signed_seconds_and_nanoseconds() {
+        let root = tempfile::tempdir().expect("create directory");
+        let directory = open_directory(root.path()).expect("open directory");
+        let mut metadata = entry_stat_at(&directory, OsStr::new(".")).expect("stat directory");
+        metadata.st_ctime = -7;
+        metadata.st_ctime_nsec = 456_123_987;
+
+        assert_eq!(metadata_change_time(&metadata), (-7, 456_123_987));
+    }
 
     #[test]
     fn statvfs_capacity_conversion_saturates_bytes_and_inode_counts() {
-        // SAFETY: `statvfs` contains only integer fields and integer arrays on
-        // the supported Unix targets; zero is a valid initial value for each.
-        let mut statistics: libc::statvfs = unsafe { std::mem::zeroed() };
-        statistics.f_frsize = libc::c_ulong::MAX;
-        statistics.f_blocks = libc::fsblkcnt_t::MAX;
-        statistics.f_bavail = libc::fsblkcnt_t::MAX;
-        statistics.f_files = libc::fsfilcnt_t::MAX;
-        statistics.f_favail = libc::fsfilcnt_t::MAX;
-        statistics.f_flag = libc::ST_RDONLY;
+        let statistics = StatVfs {
+            f_bsize: 0,
+            f_frsize: u64::MAX,
+            f_blocks: u64::MAX,
+            f_bfree: 0,
+            f_bavail: u64::MAX,
+            f_files: u64::MAX,
+            f_ffree: 0,
+            f_favail: u64::MAX,
+            f_fsid: 0,
+            f_flag: StatVfsMountFlags::RDONLY,
+            f_namemax: 0,
+        };
 
         let capacity = capacity_from_statvfs(&statistics);
 
         assert_eq!(capacity.total_bytes, u64::MAX);
         assert_eq!(capacity.available_bytes, u64::MAX);
-        let maximum_inode_count =
-            u128::from(libc::fsfilcnt_t::MAX).min(u128::from(u64::MAX)) as u64;
-        assert_eq!(capacity.total_inodes, maximum_inode_count);
-        assert_eq!(capacity.available_inodes, maximum_inode_count);
+        assert_eq!(capacity.total_inodes, u64::MAX);
+        assert_eq!(capacity.available_inodes, u64::MAX);
         assert!(capacity.read_only);
     }
 
     #[test]
-    fn null_readdir_result_is_eof_only_when_errno_is_clear() {
-        assert!(
-            classify_readdir_result(ptr::null_mut(), 0)
-                .expect("clean null result should be EOF")
-                .is_none()
-        );
-
-        let error = classify_readdir_result(ptr::null_mut(), libc::EIO)
-            .expect_err("readdir error must not be treated as EOF");
-        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    fn name_iterator_eof_completes_scan() {
+        let outcome = visit_directory_names(std::iter::empty(), |_| {
+            panic!("empty iterator must not visit a name");
+        })
+        .expect("EOF completes scan");
+        assert_eq!(outcome, DirectoryScanOutcome::Complete);
     }
 
     #[test]
-    fn readdir_eof_clears_errno_left_by_an_unrelated_syscall() {
-        set_errno(libc::EIO);
-
-        let entry = next_readdir_entry_with(std::ptr::null_mut::<libc::dirent>)
-            .expect("EOF must not reuse stale errno as a scan failure");
-
-        assert!(entry.is_none(), "a null result with clear errno is EOF");
+    fn dot_entries_are_skipped() {
+        let entries = [".", "..", "entry"].map(|name| Ok(OsString::from(name)));
+        let names = read_dir_names_with(entries.into_iter()).expect("collect names");
+        assert_eq!(names, [OsString::from("entry")]);
     }
 
     #[test]
     fn injected_readdir_error_propagates() {
-        let result = visit_readdir_entries(
-            || Err(io::Error::from_raw_os_error(libc::EIO)),
+        let result = visit_directory_names(
+            std::iter::once(Err(io::Error::from_raw_os_error(libc::EIO))),
             |_| Ok(DirectoryEntryAction::Continue),
         );
 
@@ -826,23 +628,19 @@ mod tests {
         std::fs::write(directory_path.path().join("live.narinfo"), b"metadata")
             .expect("directory entry should be created");
         let directory = open_directory(directory_path.path()).expect("directory should open");
+        let mut entries = directory_names(&directory).expect("open directory iterator");
         let mut returned_live_name = false;
 
-        let error = read_dir_names_with(&directory, |stream| {
+        let error = read_dir_names_with(std::iter::from_fn(|| {
             if returned_live_name {
-                set_errno(libc::EIO);
-                return std::ptr::null_mut();
+                return Some(Err(io::Error::from_raw_os_error(libc::EIO)));
             }
-            // SAFETY: the callback receives the live stream owned by
-            // DirectoryStream, and the entry is copied before the next read.
-            let entry = unsafe { libc::readdir(stream) };
-            if let Some(entry) = NonNull::new(entry) {
-                // SAFETY: readdir returned a live, NUL-terminated name.
-                let name = unsafe { CStr::from_ptr(entry.as_ref().d_name.as_ptr()) };
-                returned_live_name |= name.to_bytes() == b"live.narinfo";
+            let entry = entries.next()?;
+            if let Ok(name) = &entry {
+                returned_live_name |= name == "live.narinfo";
             }
-            entry
-        })
+            Some(entry)
+        }))
         .expect_err("a partial name list must not be returned as success");
 
         assert!(
@@ -850,6 +648,24 @@ mod tests {
             "the real entry must precede the injected error"
         );
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn repeated_enumeration_restarts_after_early_stop() {
+        let directory = tempfile::tempdir().expect("create directory");
+        std::fs::write(directory.path().join("entry"), b"entry").expect("write entry");
+        let directory = open_directory(directory.path()).expect("open directory");
+        assert_eq!(
+            for_each_dir_name(&directory, |_| Ok(DirectoryEntryAction::Stop))
+                .expect("stop enumeration"),
+            DirectoryScanOutcome::StoppedEarly,
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                read_dir_names(&directory).expect("rescan"),
+                [OsString::from("entry")]
+            );
+        }
     }
 
     #[test]

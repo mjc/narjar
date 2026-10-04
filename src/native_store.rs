@@ -2,14 +2,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Read,
     num::{NonZeroU64, NonZeroUsize},
-    os::fd::AsRawFd,
-    os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use narjar::__private::narinfo::TrustedPublicKeys;
+use rustix::fs::{Access, AtFlags, CWD, StatVfsMountFlags};
 use sqlite::{Connection, ConnectionThreadSafe, OpenFlags, State};
 
 #[cfg_attr(
@@ -402,24 +401,18 @@ fn require_read_and_search_access(
         };
     }
 
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| format!("{description} path contains a NUL byte"))?;
-    // SAFETY: c_path is NUL-terminated and faccessat does not retain its pointer.
-    let result = unsafe {
-        libc::faccessat(
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            libc::R_OK | libc::X_OK,
-            libc::AT_EACCESS,
-        )
-    };
-    match result {
-        0 => Ok(()),
-        _ => Err(format!(
+    rustix::fs::accessat(
+        CWD,
+        path,
+        Access::READ_OK | Access::EXEC_OK,
+        AtFlags::EACCESS,
+    )
+    .map_err(|error| {
+        format!(
             "{description} is not readable and searchable by the service user: {}",
-            std::io::Error::last_os_error()
-        )),
-    }
+            std::io::Error::from(error)
+        )
+    })
 }
 
 fn open_owned_roots_directory(path: &Path) -> Result<File, String> {
@@ -508,21 +501,18 @@ enum FilesystemWriteability {
 }
 
 fn filesystem_writeability(directory: &File) -> Result<FilesystemWriteability, String> {
-    // SAFETY: fstatvfs only writes to the initialized output struct and reads the live fd.
-    let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
-    // SAFETY: directory owns a valid descriptor; stats points to writable storage.
-    let result = unsafe { libc::fstatvfs(directory.as_raw_fd(), &mut stats) };
-    match result {
-        0 => Ok(filesystem_writeability_from_flags(stats.f_flag)),
-        _ => Err(format!(
-            "checking Narjar roots filesystem: {}",
-            std::io::Error::last_os_error()
-        )),
-    }
+    rustix::fs::fstatvfs(directory)
+        .map(|stats| filesystem_writeability_from_flags(stats.f_flag))
+        .map_err(|error| {
+            format!(
+                "checking Narjar roots filesystem: {}",
+                std::io::Error::from(error)
+            )
+        })
 }
 
-fn filesystem_writeability_from_flags(flags: libc::c_ulong) -> FilesystemWriteability {
-    match flags & libc::ST_RDONLY != 0 {
+fn filesystem_writeability_from_flags(flags: StatVfsMountFlags) -> FilesystemWriteability {
+    match flags.contains(StatVfsMountFlags::RDONLY) {
         true => FilesystemWriteability::ReadOnly,
         false => FilesystemWriteability::Writable,
     }
@@ -1418,11 +1408,11 @@ mod tests {
     #[test]
     fn detects_read_only_roots_filesystem_capability() {
         assert_eq!(
-            super::filesystem_writeability_from_flags(libc::ST_RDONLY),
+            super::filesystem_writeability_from_flags(super::StatVfsMountFlags::RDONLY),
             super::FilesystemWriteability::ReadOnly
         );
         assert_eq!(
-            super::filesystem_writeability_from_flags(0),
+            super::filesystem_writeability_from_flags(super::StatVfsMountFlags::empty()),
             super::FilesystemWriteability::Writable
         );
         assert_eq!(

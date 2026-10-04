@@ -2,10 +2,11 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read},
-    os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
+
+use rustix::fs::OFlags;
 
 use super::{
     fs::{StorageCapacity, filesystem_space, lock_exclusive, open_at, private_file_mode_is_valid},
@@ -225,7 +226,7 @@ impl ProcessLock {
         let file = open_at(
             root,
             OsStr::new("lock"),
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             0o600,
         )
         .map_err(|error| io::Error::new(error.kind(), format!("lock: {error}")))?;
@@ -246,13 +247,10 @@ impl ProcessLock {
 
 impl Drop for ProcessLock {
     fn drop(&mut self) {
-        // SAFETY: `file` owns the live descriptor until this method returns.
         // Releasing explicitly makes the lease transition independent of any
         // unrelated directory descriptors and occurs before the descriptor is
         // closed by `File::drop`.
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
     }
 }
 

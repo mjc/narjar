@@ -1,12 +1,8 @@
 use std::{
     fs::{self, File},
     io::{Read, Write},
-    mem::MaybeUninit,
     num::{NonZeroU64, NonZeroUsize},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{MetadataExt, PermissionsExt},
-    },
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -1000,14 +996,7 @@ fn inspect_doctor_path(
 
 fn doctor_capacity(path: &Path) -> Result<DoctorCapacity, std::io::Error> {
     let file = File::open(path)?;
-    let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `file` owns a live descriptor for this call, and `statistics`
-    // points to writable space for one `statvfs` value.
-    if unsafe { libc::fstatvfs(file.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: a successful `fstatvfs` call initializes the output structure.
-    let statistics = unsafe { statistics.assume_init() };
+    let statistics = rustix::fs::fstatvfs(&file)?;
     let capacity = capacity_from_statvfs(&statistics);
     Ok(DoctorCapacity {
         path: "",
@@ -1017,13 +1006,8 @@ fn doctor_capacity(path: &Path) -> Result<DoctorCapacity, std::io::Error> {
 }
 
 fn doctor_try_lease(file: &File) -> Result<(), std::io::Error> {
-    // SAFETY: `file` owns a live descriptor for this call; `flock` retains no
-    // pointer or ownership after it returns.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(Into::into)
 }
 
 fn doctor_json(report: &DoctorReport) -> String {
