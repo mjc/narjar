@@ -17,6 +17,7 @@ include = [
     "benches/support/**",
     "tests/support/**",
     "tests/nar_allocations.rs",
+    "tests/nar_benchmark_options.rs",
     "src/**",
     "tests/cli.rs",
     "tests/fixtures/nix-2.31.5-http-v0.1.tsv",

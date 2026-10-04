@@ -1,16 +1,31 @@
 //! Throughput only: compiled without allocation instrumentation.
 
+#[path = "support/nar_codec_options.rs"]
+mod options;
 #[path = "support/nar_codec.rs"]
 mod suite;
 
+use clap::Parser;
+use options::Options;
 use std::time::Instant;
 
 fn main() {
+    let options = Options::parse();
+    let mut selected = 0;
     println!("fixture\toperation\tbytes\titerations\tmin_ns\tmedian_ns\tmax_ns\tMiB_per_second");
     suite::run(|name, operation, bytes, run| {
-        let warmup = Instant::now();
-        run();
-        let iterations = (20_000_000 / warmup.elapsed().as_nanos().max(1)).clamp(1, 100_000);
+        if !options.selects(name, operation) {
+            return;
+        }
+        selected += 1;
+        let iterations = options.iterations.map_or_else(
+            || {
+                let warmup = Instant::now();
+                run();
+                (20_000_000 / warmup.elapsed().as_nanos().max(1)).clamp(1, 100_000)
+            },
+            |iterations| u128::from(iterations.get()),
+        );
         let mut samples = [0_u128; 9];
         for sample in &mut samples {
             let started = Instant::now();
@@ -26,4 +41,5 @@ fn main() {
             samples[0], samples[4], samples[8]
         );
     });
+    assert!(selected > 0, "no fixture/operation matched --filter");
 }
