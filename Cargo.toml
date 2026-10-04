@@ -13,6 +13,8 @@ include = [
     "/README.md",
     "benches/micro.rs",
     "benches/nar_codec.rs",
+    "benches/nar_codec_allocations.rs",
+    "benches/support/**",
     "tests/support/**",
     "tests/nar_allocations.rs",
     "src/**",
@@ -58,6 +60,10 @@ harness = false
 
 [[bench]]
 name = "nar_codec"
+harness = false
+
+[[bench]]
+name = "nar_codec_allocations"
 harness = false
 
 [profile.profiling]

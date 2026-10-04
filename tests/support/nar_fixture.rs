@@ -41,7 +41,7 @@ impl Node {
                 encoder.push(Event::EndDirectory).expect("directory end");
             }
             Self::File(size) => {
-                const CONTENTS: [u8; 64 * 1024] = [b'x'; 64 * 1024];
+                static CONTENTS: [u8; 64 * 1024] = [b'x'; 64 * 1024];
                 encoder
                     .push(Event::BeginFile {
                         executable: true,
