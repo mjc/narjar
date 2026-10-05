@@ -1501,12 +1501,19 @@ fn publish_temporary_file(
     temporary_name: &OsStr,
     name: &OsStr,
 ) -> io::Result<super::publication::PublishOutcome> {
+    publish_temporary_file_with_sync(directory, temporary_name, name, || directory.sync_all())
+}
+
+fn publish_temporary_file_with_sync(
+    directory: &File,
+    temporary_name: &OsStr,
+    name: &OsStr,
+    sync_directory: impl FnOnce() -> io::Result<()>,
+) -> io::Result<super::publication::PublishOutcome> {
     let result = publish_temporary_file_without_directory_sync(directory, temporary_name, name)
         .and_then(|outcome| {
-            match outcome {
-                super::publication::PublishOutcome::Created => directory.sync_all()?,
-                super::publication::PublishOutcome::Identical => {}
-            }
+            // An identical entry may have been left by a failed durability barrier.
+            sync_directory()?;
             Ok(outcome)
         });
     let cleanup = unlink_at(directory, temporary_name);
@@ -1690,6 +1697,7 @@ pub(crate) enum ChunkStoreError {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
+        ffi::OsStr,
         fs,
         io::{Cursor, Read, Write},
     };
@@ -1995,6 +2003,46 @@ mod tests {
             let length = self.fragment.min(output.len());
             self.reader.read(&mut output[..length])
         }
+    }
+
+    #[test]
+    fn identical_manifests_still_require_a_successful_directory_sync() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let temporary_name = OsStr::new("manifest.part");
+        let final_name = OsStr::new("manifest");
+        std::fs::write(directory.path().join(final_name), b"manifest bytes").unwrap();
+        std::fs::write(directory.path().join(temporary_name), b"manifest bytes").unwrap();
+
+        let error = super::publish_temporary_file_with_sync(
+            root.file(),
+            temporary_name,
+            final_name,
+            || Err(std::io::Error::other("injected directory sync failure")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected directory sync failure");
+        assert!(!directory.path().join(temporary_name).exists());
+        assert_eq!(
+            std::fs::read(directory.path().join(final_name)).unwrap(),
+            b"manifest bytes"
+        );
+
+        std::fs::write(directory.path().join(temporary_name), b"manifest bytes").unwrap();
+        let syncs = std::cell::Cell::new(0);
+        let outcome = super::publish_temporary_file_with_sync(
+            root.file(),
+            temporary_name,
+            final_name,
+            || {
+                syncs.set(syncs.get() + 1);
+                root.file().sync_all()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, crate::storage::PublishOutcome::Identical);
+        assert_eq!(syncs.get(), 1);
+        assert!(!directory.path().join(temporary_name).exists());
     }
 
     #[test]
