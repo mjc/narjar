@@ -38,10 +38,10 @@ use super::{
     },
     egress::NarReadBody,
     fs::{
-        BoundedRegularFile, StorageCapacity, entry_is_regular_at, files_equal_at, filesystem_space,
-        hard_link_at, open_at, open_directory_at, open_optional_at, open_regular_at,
-        read_bounded_regular_file, read_dir_names, remove_temp, rename_at, reserve_staging_bytes,
-        rollback_link_at, unlink_at,
+        BoundedRegularFile, ImmutableLinkOutcome, StorageCapacity, entry_is_regular_at,
+        filesystem_space, link_or_compare_immutable, open_at, open_directory_at, open_optional_at,
+        open_regular_at, read_bounded_regular_file, read_dir_names, remove_temp, rename_at,
+        reserve_staging_bytes, rollback_link_at, unlink_at,
     },
     ids::StoreHash,
     location::TemporaryPath,
@@ -551,7 +551,7 @@ impl Storage {
             PayloadStorage::Flat => {
                 let nar_directory = self.nar_directory()?;
                 let nar_name = NarFileName::raw(*nar);
-                match open_regular_at(&nar_directory, &nar_name.os_string()) {
+                match open_regular_at(&nar_directory, nar_name.os_string()) {
                     Ok(_) => Ok(()),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         Err(StorageError::MissingNar)
@@ -942,40 +942,17 @@ impl Storage {
         destination_directory: &File,
         temp: &TemporaryFile,
     ) -> Result<DestinationPublicationAttempt, StorageError> {
-        match hard_link_at(
-            &temp.directory,
-            &temp.name,
-            destination_directory,
-            destination.path.name(),
-        ) {
-            Ok(()) => Ok(DestinationPublicationAttempt::Created(
-                TemporaryLocation::Staging,
-            )),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => self
-                .compare_temporary_with_existing_destination(
-                    destination,
-                    destination_directory,
-                    temp,
-                ),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn compare_temporary_with_existing_destination(
-        &self,
-        destination: &PublicationDestination,
-        destination_directory: &File,
-        temp: &TemporaryFile,
-    ) -> Result<DestinationPublicationAttempt, StorageError> {
-        if files_equal_at(
+        match link_or_compare_immutable(
             &temp.directory,
             &temp.name,
             destination_directory,
             destination.path.name(),
         )? {
-            Ok(DestinationPublicationAttempt::Existing)
-        } else {
-            Err(StorageError::Conflict)
+            ImmutableLinkOutcome::Created => Ok(DestinationPublicationAttempt::Created(
+                TemporaryLocation::Staging,
+            )),
+            ImmutableLinkOutcome::Identical => Ok(DestinationPublicationAttempt::Existing),
+            ImmutableLinkOutcome::Collision => Err(StorageError::Conflict),
         }
     }
 

@@ -1540,7 +1540,14 @@ machine other.example password other-secret
             .join(".narjar-transactions/publish-maintenance.txn");
         fs::write(
             &transaction_path,
-            b"state=published\npath=.tmp/recovered-publication.part\ndestination=nix-cache-info\n",
+            // Postcard enum discriminants: TransactionRecord::V1 = 0, Published = 4.
+            postcard::to_allocvec(&(
+                0_u32,
+                ".tmp/recovered-publication.part",
+                4_u32,
+                "nix-cache-info",
+            ))
+            .expect("published recovery fixture should encode"),
         )
         .expect("published transaction should be durable on disk");
         fs::set_permissions(&transaction_path, fs::Permissions::from_mode(0o600))

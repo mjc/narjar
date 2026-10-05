@@ -1,21 +1,20 @@
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs::File,
     io::{self, Read, Write},
     ops::Range,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::MetadataExt,
-    },
-    path::Path,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
 };
 
 use crate::verified_stream::{VerifiedStream, read_uninterrupted_chunk};
+use narjar::__private::filesystem::{
+    open_directory, open_directory_at, open_regular_at, read_dir_names,
+};
 use narjar::{
     nar_encode::{EncodeSummary, Encoder, Event},
     object::{LogicalNar, NarIdentity},
 };
-use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags};
+use rustix::fs::{self, AtFlags, FileType};
 
 use super::lease::NativeStoreLease;
 
@@ -280,53 +279,10 @@ fn sorted_directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryE
 }
 
 fn directory_entries(directory: &File) -> io::Result<Vec<NativeDirectoryEntry>> {
-    let mut entries = Vec::new();
-    for entry in Dir::read_from(directory)? {
-        let entry = entry?;
-        let name = entry.file_name().to_bytes();
-        if name != b"." && name != b".." {
-            let filesystem_name = OsString::from_vec(name.to_vec());
-            entries.push(NativeDirectoryEntry::new(filesystem_name));
-        }
-    }
-    Ok(entries)
-}
-
-fn open_directory(path: &Path) -> io::Result<File> {
-    Ok(fs::open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?
-    .into())
-}
-
-fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
-    Ok(fs::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?
-    .into())
-}
-
-fn open_regular_at(parent: &File, name: &OsStr) -> io::Result<File> {
-    let file: File = fs::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?
-    .into();
-    if file.metadata()?.is_file() {
-        Ok(file)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "native file changed type before it could be read",
-        ))
-    }
+    Ok(read_dir_names(directory)?
+        .into_iter()
+        .map(NativeDirectoryEntry::new)
+        .collect())
 }
 
 fn invalid_path(message: &'static str) -> io::Error {

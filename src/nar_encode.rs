@@ -170,9 +170,7 @@ impl<W: Write> Encoder<W> {
         let RootState::Complete(root) = self.root else {
             return Err(EncodeError::Invalid("the root node is incomplete"));
         };
-        let digest = self.digest.finalize();
-        let mut raw_sha256 = [0_u8; 32];
-        raw_sha256.copy_from_slice(&digest);
+        let raw_sha256: [u8; 32] = self.digest.finalize().into();
         Ok((
             self.writer,
             EncodeSummary {

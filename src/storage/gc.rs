@@ -87,6 +87,78 @@ struct Entry {
     protected: bool,
 }
 
+struct TrustedGcPublication {
+    store: StoreHash,
+    store_path: String,
+    references: Vec<String>,
+    narinfo_name: OsString,
+    narinfo_bytes: u64,
+    modified: SystemTime,
+    representation: NarRepresentation,
+}
+
+fn scan_trusted_gc_publications<'a>(
+    root: &'a File,
+    trusted: &'a TrustedPublicKeys,
+    names: Vec<OsString>,
+) -> impl Iterator<Item = Result<TrustedGcPublication, StorageError>> + 'a {
+    names.into_iter().filter_map(move |name| {
+        let route = name.to_str()?.strip_suffix(".narinfo")?;
+        Some(
+            StoreHash::parse(route)
+                .map_err(|_| {
+                    invalid(format!(
+                        "invalid narinfo filename: {}",
+                        name.to_string_lossy()
+                    ))
+                })
+                .and_then(|store| inspect_trusted_gc_publication(root, trusted, store, name)),
+        )
+    })
+}
+
+fn inspect_trusted_gc_publication(
+    root: &File,
+    trusted: &TrustedPublicKeys,
+    store: StoreHash,
+    name: OsString,
+) -> Result<TrustedGcPublication, StorageError> {
+    let name_str = name.to_string_lossy();
+    let file = open_regular_at(root, &name).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => invalid(format!("narinfo disappeared during scan: {name_str}")),
+        io::ErrorKind::InvalidData => invalid(format!("narinfo is not a regular file: {name_str}")),
+        _ if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            invalid(format!("narinfo is not a regular file: {name_str}"))
+        }
+        _ => error.into(),
+    })?;
+    let metadata = file.metadata()?;
+    let validated =
+        trusted
+            .inspect(&store, read_narinfo_file(file)?)
+            .map_err(|error| match error {
+                PublishedNarInfoError::Malformed => {
+                    invalid(format!("malformed narinfo: {name_str}"))
+                }
+                PublishedNarInfoError::UntrustedSignature => {
+                    invalid(format!("untrusted narinfo: {name_str}"))
+                }
+            })?;
+    Ok(TrustedGcPublication {
+        store,
+        store_path: validated.claims().store_path().to_owned(),
+        references: validated
+            .claims()
+            .reference_paths()
+            .map(str::to_owned)
+            .collect(),
+        narinfo_name: name,
+        narinfo_bytes: metadata.len(),
+        modified: metadata.modified()?,
+        representation: validated.payload(),
+    })
+}
+
 struct ChunkedEntry {
     store: StoreHash,
     store_path: String,
@@ -384,46 +456,17 @@ fn scan_with_directory_names(
     let mut entries = Vec::new();
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
-    for name in read_names(&root)? {
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        let Some(route) = name_str.strip_suffix(".narinfo") else {
-            continue;
-        };
-        let store = StoreHash::parse(route)
-            .map_err(|_| invalid(format!("invalid narinfo filename: {name_str}")))?;
-        let narinfo = match open_regular_at(&root, &name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(invalid(format!(
-                    "narinfo disappeared during scan: {name_str}"
-                )));
-            }
-            Err(error)
-                if error.kind() == io::ErrorKind::InvalidData
-                    || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
-            {
-                return Err(invalid(format!(
-                    "narinfo is not a regular file: {name_str}"
-                )));
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let metadata = narinfo.metadata()?;
-
-        let bytes = read_narinfo_file(narinfo)?;
-        let validated = trusted
-            .inspect(&store, bytes)
-            .map_err(|error| match error {
-                PublishedNarInfoError::Malformed => {
-                    invalid(format!("malformed narinfo: {name_str}"))
-                }
-                PublishedNarInfoError::UntrustedSignature => {
-                    invalid(format!("untrusted narinfo: {name_str}"))
-                }
-            })?;
-        let representation = validated.payload();
+    for publication in scan_trusted_gc_publications(&root, trusted, read_names(&root)?) {
+        let TrustedGcPublication {
+            store,
+            store_path,
+            references,
+            narinfo_name: name,
+            narinfo_bytes,
+            modified,
+            representation,
+        } = publication?;
+        let name_str = name.to_string_lossy();
         let nar_name = OsString::from(representation.file_name().to_string());
         let nar_metadata = open_regular_at(&nar_directory, &nar_name)
             .and_then(|file| file.metadata())
@@ -450,19 +493,15 @@ fn scan_with_directory_names(
 
         entries.push(Entry {
             store,
-            store_path: validated.claims().store_path().to_owned(),
-            references: validated
-                .claims()
-                .reference_paths()
-                .map(str::to_owned)
-                .collect(),
+            store_path,
+            references,
             narinfo_name: name,
             nar_name,
-            narinfo_bytes: metadata.len(),
+            narinfo_bytes,
             nar_bytes: nar_metadata.len(),
             raw_nar_name,
             raw_nar_bytes,
-            modified: metadata.modified()?,
+            modified,
             protected: false,
         });
     }
@@ -694,34 +733,17 @@ fn scan_chunked(
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
     let mut entries = Vec::new();
-    for name in read_dir_names(&root)? {
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        let Some(route) = name_str.strip_suffix(".narinfo") else {
-            continue;
-        };
-        let store = StoreHash::parse(route)
-            .map_err(|_| invalid(format!("invalid narinfo filename: {name_str}")))?;
-        let narinfo = open_regular_at(&root, &name).map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => {
-                invalid(format!("narinfo disappeared during scan: {name_str}"))
-            }
-            _ => error.into(),
-        })?;
-        let metadata = narinfo.metadata()?;
-        let bytes = read_narinfo_file(narinfo)?;
-        let validated = trusted
-            .inspect(&store, bytes)
-            .map_err(|error| match error {
-                PublishedNarInfoError::Malformed => {
-                    invalid(format!("malformed narinfo: {name_str}"))
-                }
-                PublishedNarInfoError::UntrustedSignature => {
-                    invalid(format!("untrusted narinfo: {name_str}"))
-                }
-            })?;
-        let representation = validated.payload();
+    for publication in scan_trusted_gc_publications(&root, trusted, read_dir_names(&root)?) {
+        let TrustedGcPublication {
+            store,
+            store_path,
+            references,
+            narinfo_name: name,
+            narinfo_bytes,
+            modified,
+            representation,
+        } = publication?;
+        let name_str = name.to_string_lossy();
         let raw_hash = representation.identity().hash();
         let manifest = chunk_store
             .validate_manifest(raw_hash)
@@ -760,19 +782,15 @@ fn scan_chunked(
         };
         entries.push(ChunkedEntry {
             store,
-            store_path: validated.claims().store_path().to_owned(),
-            references: validated
-                .claims()
-                .reference_paths()
-                .map(str::to_owned)
-                .collect(),
+            store_path,
+            references,
             narinfo_name: name,
             output_name,
             output_bytes,
             raw_hash,
             manifest_bytes,
-            narinfo_bytes: metadata.len(),
-            modified: metadata.modified()?,
+            narinfo_bytes,
+            modified,
             protected: false,
         });
     }

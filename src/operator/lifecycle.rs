@@ -243,9 +243,7 @@ pub(crate) fn generate_key_pair(
         .map_err(runtime)?;
     let signing = SigningKey::from_bytes(&seed);
     let public = signing.verifying_key();
-    let mut secret = [0; 64];
-    secret[..32].copy_from_slice(&seed);
-    secret[32..].copy_from_slice(public.as_bytes());
+    let secret = signing.to_keypair_bytes();
 
     create_file(
         secret_path,

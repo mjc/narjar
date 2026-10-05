@@ -4,6 +4,10 @@
 pub mod auth;
 #[doc(hidden)]
 #[allow(missing_docs)]
+#[path = "filesystem.rs"]
+pub mod filesystem;
+#[doc(hidden)]
+#[allow(missing_docs)]
 #[path = "http/mod.rs"]
 pub mod http;
 #[doc(hidden)]
@@ -36,6 +40,10 @@ pub mod nar_encode;
 pub mod narinfo;
 #[path = "object.rs"]
 pub mod object;
+#[doc(hidden)]
+#[allow(missing_docs)]
+#[path = "records.rs"]
+pub mod records;
 #[doc(hidden)]
 #[allow(missing_docs)]
 #[path = "storage.rs"]

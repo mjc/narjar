@@ -47,7 +47,8 @@ impl<Purpose> CompressedNarReceipt<Purpose> {
     }
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
-        let receipt = postcard::from_bytes::<SerializedCompressedNarReceipt>(bytes).ok()?;
+        let receipt =
+            crate::records::decode_complete::<SerializedCompressedNarReceipt>(bytes).ok()?;
         (receipt.version == RECEIPT_VERSION).then_some(Self {
             identity: receipt.identity,
             purpose: PhantomData,

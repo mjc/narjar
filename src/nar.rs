@@ -262,9 +262,7 @@ impl<R: Read> Decoder<R> {
             ));
         }
 
-        let digest = self.digest.clone().finalize();
-        let mut raw_sha256 = [0_u8; 32];
-        raw_sha256.copy_from_slice(&digest);
+        let raw_sha256: [u8; 32] = self.digest.finalize().into();
         Ok(DecodeSummary {
             root,
             raw_size: self.raw_bytes,

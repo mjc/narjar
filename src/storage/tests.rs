@@ -60,6 +60,23 @@ fn egress_receipt_round_trips_through_compact_binary_serialization() {
     assert!(EgressReceipt::parse(&bytes[..bytes.len() - 1]).is_none());
 }
 
+#[test]
+fn compressed_receipts_reject_bytes_after_the_complete_record() {
+    let raw = NarIdentity::new(NarHash::from_digest([1; 32]), NarSize::new(100));
+    let output = EncodedIdentity::new(
+        CompressionCodec::Zstd,
+        FileHash::from_digest([2; 32]),
+        EncodedSize::new(50),
+    );
+    let receipt = super::receipt::CompressedNarReceipt::<()>::new(output, raw);
+    let mut bytes = receipt.bytes();
+    bytes.push(0);
+    assert!(
+        super::receipt::CompressedNarReceipt::<()>::parse(&bytes).is_none(),
+        "a valid prefix must not authorize a record with trailing bytes"
+    );
+}
+
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
     CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
         .and_then(|creation| creation.create_or_complete())
@@ -2881,7 +2898,7 @@ fn recovery_keeps_evidence_when_published_destination_is_missing() {
 }
 
 #[test]
-fn legacy_terminal_publication_transactions_remain_recoverable() {
+fn text_publication_records_are_rejected_without_removing_their_files() {
     for state in ["linked", "published"] {
         let directory = TestDir::new();
         let storage = initialize_storage(directory.path()).expect("initialize storage");
@@ -2901,11 +2918,15 @@ fn legacy_terminal_publication_transactions_remain_recoverable() {
         fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
             .expect("make legacy record private");
 
-        storage
-            .finish_recovery()
-            .expect("legacy transaction should be recoverable");
-        assert!(!temporary.exists());
-        assert!(!record.exists());
+        assert!(
+            storage.finish_recovery().is_err(),
+            "only versioned binary records are accepted"
+        );
+        assert!(
+            temporary.exists(),
+            "invalid evidence must not remove a temporary file"
+        );
+        assert!(record.exists(), "retain rejected evidence");
     }
 }
 
@@ -2933,13 +2954,20 @@ fn current_terminal_publication_transactions_still_require_destinations() {
 
 #[test]
 fn recovery_records_publish_state_before_each_fault_boundary() {
+    use super::recovery::{PublicationState, TransactionRecord, parse_transaction};
     for (boundary, expected_state) in [
-        (PublishBoundary::BeforeTempCreate, "staging"),
-        (PublishBoundary::AfterTempCreate, "streaming"),
-        (PublishBoundary::AfterStream, "streaming"),
-        (PublishBoundary::AfterTempSync, "streaming"),
-        (PublishBoundary::BeforeFinalLink, "validated"),
-        (PublishBoundary::BeforeParentSync, "linked"),
+        (PublishBoundary::BeforeTempCreate, PublicationState::Staging),
+        (
+            PublishBoundary::AfterTempCreate,
+            PublicationState::Streaming,
+        ),
+        (PublishBoundary::AfterStream, PublicationState::Streaming),
+        (PublishBoundary::AfterTempSync, PublicationState::Streaming),
+        (
+            PublishBoundary::BeforeFinalLink,
+            PublicationState::Validated,
+        ),
+        (PublishBoundary::BeforeParentSync, PublicationState::Linked),
     ] {
         let directory = TestDir::new();
         let storage = initialize_storage(directory.path()).expect("initialize storage");
@@ -2962,10 +2990,12 @@ fn recovery_records_publish_state_before_each_fault_boundary() {
             "state replacement must not leave an extra transaction record"
         );
         let contents = fs::read(record.path()).expect("read transaction record");
-        let contents = String::from_utf8(contents).expect("transaction record is UTF-8");
-        assert!(
-            contents.starts_with(&format!("state={expected_state}\npath=")),
-            "{boundary:?} recorded unexpected state: {contents:?}"
+        let TransactionRecord::V1 { state, .. } =
+            parse_transaction(&contents).expect("complete typed transaction");
+        assert_eq!(
+            state.phase(),
+            expected_state,
+            "{boundary:?} recorded unexpected state"
         );
     }
 }

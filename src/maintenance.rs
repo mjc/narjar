@@ -1,8 +1,8 @@
 use enum_map::{Enum, EnumMap};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    fs::{self, File},
+    io::{self, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -215,8 +215,8 @@ fn decode_record<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
     if bytes.len() as u64 > MAX_RECORD_BYTES {
         return None;
     }
-    let (Record::V1(value), remaining) = postcard::take_from_bytes(bytes).ok()?;
-    remaining.is_empty().then_some(value)
+    let Record::V1(value) = crate::records::decode_complete(bytes).ok()?;
+    Some(value)
 }
 
 fn parse_run(operation: Operation, bytes: &[u8]) -> Option<Run> {
@@ -233,25 +233,8 @@ fn parse_started(operation: Operation, bytes: &[u8]) -> Option<Started> {
 }
 
 fn read_bounded_file(path: &Path) -> io::Result<Vec<u8>> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(
-            (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
-        );
-    }
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
-    }
-    Ok(bytes)
+    let file = crate::filesystem::open_regular_at(rustix::fs::CWD, path)?;
+    crate::records::read_bounded_bytes(file, MAX_RECORD_BYTES).map_err(Into::into)
 }
 
 fn write_atomic(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {

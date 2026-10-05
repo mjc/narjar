@@ -245,7 +245,7 @@ impl Derivative<'_, Validated<EncodedIdentity>> {
         let target = PublishTarget::RepairEgressNar(output);
         let destination = target.destination();
         let mut transaction = self.transaction;
-        transaction.set_destination(&destination.relative_path());
+        transaction.set_destination(destination.path.clone());
         storage.commit_temporary(destination, &temporary, transaction, |_| Ok(()))?;
         Ok(output)
     }

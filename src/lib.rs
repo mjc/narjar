@@ -49,12 +49,12 @@ pub use implementation::{nar, nar_encode, object};
 #[doc(hidden)]
 pub mod __private {
     pub use crate::implementation::{
-        auth, http, http_server, inventory, maintenance, metrics, nar, nar_compression, nar_encode,
-        narinfo, object, storage, token_file,
+        auth, filesystem, http, http_server, inventory, maintenance, metrics, nar, nar_compression,
+        nar_encode, narinfo, object, records, storage, token_file,
     };
 }
 
 pub(crate) use implementation::{
-    auth, http_server, inventory, maintenance, metrics, nar_compression, narinfo, storage,
-    token_file,
+    auth, filesystem, http_server, inventory, maintenance, metrics, nar_compression, narinfo,
+    records, storage, token_file,
 };

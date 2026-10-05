@@ -3,7 +3,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::Path,
     process,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -37,18 +37,24 @@ pub enum RecoveryStatus {
 pub(super) struct PublicationTransaction {
     directory: File,
     name: Option<OsString>,
-    path: PathBuf,
-    destination: PathBuf,
+    path: TemporaryPath,
+    destination: TransactionDestination,
     state: PublicationState,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) enum PublicationState {
     Staging,
     Streaming,
     Validated,
     Linked,
     Published,
+}
+
+#[derive(Debug)]
+enum TransactionDestination {
+    Undetermined,
+    Known(StorePath),
 }
 
 impl PublicationState {
@@ -62,29 +68,17 @@ impl PublicationState {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, StorageError> {
-        match value {
-            "staging" => Ok(Self::Staging),
-            "streaming" => Ok(Self::Streaming),
-            "validated" => Ok(Self::Validated),
-            "linked" => Ok(Self::Linked),
-            "published" => Ok(Self::Published),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "publication transaction record has an unknown state",
-            )
-            .into()),
-        }
-    }
-
     fn can_transition_to(self, next: Self) -> bool {
-        matches!(
-            (self, next),
-            (Self::Staging, Self::Streaming)
-                | (Self::Streaming, Self::Validated)
-                | (Self::Validated, Self::Linked | Self::Published)
-                | (Self::Linked, Self::Published)
-        )
+        match self {
+            Self::Staging => next == Self::Streaming,
+            Self::Streaming => next == Self::Validated,
+            Self::Validated => match next {
+                Self::Linked | Self::Published => true,
+                Self::Staging | Self::Streaming | Self::Validated => false,
+            },
+            Self::Linked => next == Self::Published,
+            Self::Published => false,
+        }
     }
 }
 
@@ -203,8 +197,8 @@ impl TransactionRecordOperations for FilesystemTransactionRecordOperations {
 }
 
 impl PublicationTransaction {
-    pub(super) fn set_destination(&mut self, destination: &Path) {
-        self.destination = destination.to_owned();
+    pub(super) fn set_destination(&mut self, destination: StorePath) {
+        self.destination = TransactionDestination::Known(destination);
     }
 
     pub(super) fn transition(&mut self, state: PublicationState) -> Result<(), StorageError> {
@@ -235,23 +229,8 @@ impl PublicationTransaction {
         Ok(())
     }
 
-    fn record_contents(&self, state: PublicationState) -> io::Result<String> {
-        let path = self.path.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "publication transaction path is not UTF-8",
-            )
-        })?;
-        let destination = self.destination.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "publication destination path is not UTF-8",
-            )
-        })?;
-        Ok(format!(
-            "state={}\npath={path}\ndestination={destination}\n",
-            state.as_str()
-        ))
+    fn record_contents(&self, state: PublicationState) -> io::Result<Vec<u8>> {
+        serialize_transaction(self.path.clone(), &self.destination, state)
     }
 
     pub(super) fn complete(mut self) -> Result<(), StorageError> {
@@ -316,22 +295,23 @@ impl RecoveryState {
         temporary_path: &Path,
         destination: &Path,
     ) -> Result<PublicationTransaction, StorageError> {
-        let temporary_path = temporary_path.to_owned();
-        let destination = destination.to_owned();
-        let temporary_path_text = temporary_path.to_str().ok_or_else(|| {
+        let temporary_path = TemporaryPath::parse(temporary_path)?;
+        destination.to_str().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "publication temporary path is not UTF-8",
+                "transaction destination is not UTF-8",
             )
         })?;
-        let destination_text = destination.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "publication destination path is not UTF-8",
-            )
-        })?;
-        let contents =
-            format!("state=staging\npath={temporary_path_text}\ndestination={destination_text}\n");
+        let destination = if destination.as_os_str().is_empty() {
+            TransactionDestination::Undetermined
+        } else {
+            TransactionDestination::Known(StorePath::parse(destination)?)
+        };
+        let contents = serialize_transaction(
+            temporary_path.clone(),
+            &destination,
+            PublicationState::Staging,
+        )?;
         for _ in 0..128 {
             let sequence = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed);
             let name = OsString::from(format!("publish-{}-{sequence:016x}.txn", process::id()));
@@ -401,39 +381,33 @@ impl RecoveryState {
 
     fn recover_named_transaction(&self, name: &OsStr) -> Result<(), StorageError> {
         let record = open_regular_at(&self.transactions, name)?;
-        let mut contents = Vec::new();
-        record
-            .take(MAX_TRANSACTION_BYTES + 1)
-            .read_to_end(&mut contents)?;
+        let contents = crate::records::read_bounded_bytes(record, MAX_TRANSACTION_BYTES)
+            .map_err(io::Error::from)?;
         self.recover_transaction(parse_transaction(&contents)?)?;
         unlink_at(&self.transactions, name)?;
         Ok(())
     }
 
     fn recover_transaction(&self, transaction: TransactionRecord) -> Result<(), StorageError> {
-        let temporary = match transaction {
-            TransactionRecord::Legacy { temporary } => temporary,
-            TransactionRecord::Current { temporary, phase } => {
-                match phase {
-                    CurrentTransactionPhase::PreLink => {}
-                    CurrentTransactionPhase::Linked(destination) => {
-                        match self.verify_destination(&destination) {
-                            Ok(()) => {}
-                            // A pre-durable rollback deliberately removes the linked
-                            // destination. The transaction still records enough
-                            // information to safely remove its temporary file.
-                            Err(StorageError::Io(error))
-                                if error.kind() == io::ErrorKind::NotFound => {}
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    CurrentTransactionPhase::Published(destination) => {
-                        self.verify_destination(&destination)?;
-                    }
+        let TransactionRecord::V1 { temporary, state } = transaction;
+        match state {
+            RecordedPublicationState::Staging
+            | RecordedPublicationState::Streaming
+            | RecordedPublicationState::Validated => {}
+            RecordedPublicationState::Linked(destination) => {
+                match self.verify_destination(&destination) {
+                    Ok(()) => {}
+                    // A pre-durable rollback deliberately removes the linked
+                    // destination. The transaction still records enough
+                    // information to safely remove its temporary file.
+                    Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
                 }
-                temporary
             }
-        };
+            RecordedPublicationState::Published(destination) => {
+                self.verify_destination(&destination)?;
+            }
+        }
         self.remove_temporary_path(temporary)
     }
 
@@ -540,7 +514,7 @@ impl RecoveryState {
 fn publish_transaction_record(
     directory: &File,
     name: &OsStr,
-    contents: &str,
+    contents: &[u8],
     installation: TransactionInstall,
     fault: impl FnMut(TransactionRecordBoundary) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -557,7 +531,7 @@ fn publish_transaction_record(
 fn publish_transaction_record_with_operations(
     directory: &File,
     name: &OsStr,
-    contents: &str,
+    contents: &[u8],
     installation: TransactionInstall,
     operations: &mut impl TransactionRecordOperations,
     mut fault: impl FnMut(TransactionRecordBoundary) -> io::Result<()>,
@@ -583,7 +557,7 @@ fn publish_transaction_record_with_operations(
 fn write_transaction_draft(
     directory: &File,
     name: &OsStr,
-    contents: &str,
+    contents: &[u8],
     operations: &mut impl TransactionRecordOperations,
     fault: &mut impl FnMut(TransactionRecordBoundary) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -595,7 +569,7 @@ fn write_transaction_draft(
     )?;
     fault(TransactionRecordBoundary::DraftCreated)?;
     draft.set_permissions(fs::Permissions::from_mode(0o600))?;
-    draft.write_all(contents.as_bytes())?;
+    draft.write_all(contents)?;
     fault(TransactionRecordBoundary::DraftWritten)?;
     operations.sync_draft(&draft)?;
     fault(TransactionRecordBoundary::DraftSynchronized)
@@ -609,106 +583,69 @@ fn invalid_transaction_filename(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-enum TransactionRecord {
-    Legacy {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(super) enum TransactionRecord {
+    V1 {
         temporary: TemporaryPath,
-    },
-    Current {
-        temporary: TemporaryPath,
-        phase: CurrentTransactionPhase,
+        state: RecordedPublicationState,
     },
 }
 
-enum CurrentTransactionPhase {
-    PreLink,
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(super) enum RecordedPublicationState {
+    Staging,
+    Streaming,
+    Validated,
     Linked(StorePath),
     Published(StorePath),
 }
 
-fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError> {
-    let contents = contents.strip_suffix(b"\n").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "publication transaction record is not newline terminated",
-        )
-    })?;
-    let contents = std::str::from_utf8(contents).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "publication transaction record is not UTF-8",
-        )
-    })?;
-    let mut lines = contents.lines();
-    let first = lines.next().unwrap_or_default();
-    if let Some(state) = first.strip_prefix("state=") {
-        let state = PublicationState::parse(state)?;
-        let path = lines
-            .next()
-            .and_then(|line| line.strip_prefix("path="))
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "publication transaction record has no path",
-                )
-            })?;
-        let temporary = TemporaryPath::parse(Path::new(path))?;
-        let record = match lines.next() {
-            None => TransactionRecord::Legacy { temporary },
-            Some(line) => {
-                let path = line.strip_prefix("destination=").ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "publication transaction record has an invalid destination",
-                    )
-                })?;
-                let destination = (!path.is_empty())
-                    .then(|| StorePath::parse(Path::new(path)))
-                    .transpose()?;
-                let phase = match state {
-                    PublicationState::Staging
-                    | PublicationState::Streaming
-                    | PublicationState::Validated => CurrentTransactionPhase::PreLink,
-                    PublicationState::Linked => {
-                        CurrentTransactionPhase::Linked(destination.ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "linked transaction has no destination",
-                            )
-                        })?)
-                    }
-                    PublicationState::Published => {
-                        CurrentTransactionPhase::Published(destination.ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "published transaction has no destination",
-                            )
-                        })?)
-                    }
-                };
-                TransactionRecord::Current { temporary, phase }
-            }
-        };
-        if lines.next().is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "publication transaction record has extra fields",
-            )
-            .into());
+impl RecordedPublicationState {
+    #[cfg(test)]
+    pub(super) fn phase(&self) -> PublicationState {
+        match self {
+            Self::Staging => PublicationState::Staging,
+            Self::Streaming => PublicationState::Streaming,
+            Self::Validated => PublicationState::Validated,
+            Self::Linked(_) => PublicationState::Linked,
+            Self::Published(_) => PublicationState::Published,
         }
-        return Ok(record);
     }
+}
 
-    if first.is_empty() || lines.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "publication transaction record has an invalid legacy path",
-        )
-        .into());
+fn serialize_transaction(
+    temporary: TemporaryPath,
+    destination: &TransactionDestination,
+    state: PublicationState,
+) -> io::Result<Vec<u8>> {
+    let destination = || match destination {
+        TransactionDestination::Known(path) => Ok(path.clone()),
+        TransactionDestination::Undetermined => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "linked publication requires a resolved destination",
+        )),
+    };
+    let state = match state {
+        PublicationState::Staging => RecordedPublicationState::Staging,
+        PublicationState::Streaming => RecordedPublicationState::Streaming,
+        PublicationState::Validated => RecordedPublicationState::Validated,
+        PublicationState::Linked => RecordedPublicationState::Linked(destination()?),
+        PublicationState::Published => RecordedPublicationState::Published(destination()?),
+    };
+    let bytes = postcard::to_allocvec(&TransactionRecord::V1 { temporary, state })
+        .map_err(io::Error::other)?;
+    if bytes.len() as u64 > MAX_TRANSACTION_BYTES {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
-    Ok(TransactionRecord::Legacy {
-        temporary: TemporaryPath::parse(Path::new(first))?,
-    })
+    Ok(bytes)
+}
+
+pub(super) fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, StorageError> {
+    if contents.len() as u64 > MAX_TRANSACTION_BYTES {
+        return Err(io::Error::from(io::ErrorKind::InvalidData).into());
+    }
+    crate::records::decode_complete(contents)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
 }
 
 fn trusted_keys_digest(root: &File) -> Result<[u8; 32], StorageError> {
@@ -736,8 +673,69 @@ mod tests {
     };
 
     const TRANSACTION_NAME: &str = "publish-123-0000000000000001.txn";
-    const OLD_RECORD: &str = "state=staging\npath=.tmp/item.part\ndestination=item\n";
-    const NEW_RECORD: &str = "state=streaming\npath=.tmp/item.part\ndestination=item\n";
+    // V1 discriminant, temporary path, pre-link state discriminant.
+    const OLD_RECORD: &[u8] = b"\0\x0e.tmp/item.part\0";
+    const NEW_RECORD: &[u8] = b"\0\x0e.tmp/item.part\x01";
+
+    #[test]
+    fn versioned_records_require_valid_terminal_paths_and_complete_consumption() {
+        for state in [
+            super::PublicationState::Staging,
+            super::PublicationState::Streaming,
+            super::PublicationState::Validated,
+            super::PublicationState::Linked,
+            super::PublicationState::Published,
+        ] {
+            let bytes = super::serialize_transaction(
+                super::TemporaryPath::parse(std::path::Path::new(".tmp/item.part")).unwrap(),
+                &super::TransactionDestination::Known(
+                    super::StorePath::parse(std::path::Path::new("nar/item.nar")).unwrap(),
+                ),
+                state,
+            )
+            .unwrap();
+            let super::TransactionRecord::V1 {
+                state: recorded, ..
+            } = parse_transaction(&bytes).unwrap();
+            assert_eq!(recorded.phase(), state);
+            assert!(parse_transaction(&bytes[..bytes.len() - 1]).is_err());
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(parse_transaction(&trailing).is_err());
+            let mut unknown_version = bytes;
+            unknown_version[0] = 1;
+            assert!(parse_transaction(&unknown_version).is_err());
+        }
+        for bad_path in ["", "../outside", "unknown/object", "/outside"] {
+            let bytes = postcard::to_allocvec(&(0_u8, ".tmp/item.part", 3_u8, bad_path)).unwrap();
+            assert!(
+                parse_transaction(&bytes).is_err(),
+                "invalid linked destination: {bad_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_derivative_identity_can_be_staged_but_cannot_be_linked() {
+        let temporary =
+            || super::TemporaryPath::parse(std::path::Path::new(".tmp/item.part")).unwrap();
+        assert!(
+            super::serialize_transaction(
+                temporary(),
+                &super::TransactionDestination::Undetermined,
+                super::PublicationState::Streaming
+            )
+            .is_ok()
+        );
+        assert!(
+            super::serialize_transaction(
+                temporary(),
+                &super::TransactionDestination::Undetermined,
+                super::PublicationState::Linked
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn record_publication_failures_leave_only_complete_authoritative_records() {
@@ -779,7 +777,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(
             fs::read(directory_path.join(TRANSACTION_NAME)).expect("read original record"),
-            OLD_RECORD.as_bytes(),
+            OLD_RECORD,
             "the collision leaves the existing authoritative record intact"
         );
         assert!(
@@ -899,7 +897,7 @@ mod tests {
             Some(expected) => {
                 let contents = fs::read(directory_path.join(TRANSACTION_NAME))
                     .expect("complete authoritative record remains");
-                assert_eq!(contents, expected.as_bytes());
+                assert_eq!(contents, expected);
                 assert!(parse_transaction(&contents).is_ok());
             }
             None => assert!(

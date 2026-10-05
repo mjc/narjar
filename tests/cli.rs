@@ -53,6 +53,12 @@ fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
     signed_narinfo_for(STORE_HASH, nar_hash, nar_size)
 }
 
+fn published_transaction_bytes(temporary: &str, destination: &str) -> Vec<u8> {
+    // Postcard enum discriminants: TransactionRecord::V1 = 0, Published = 4.
+    postcard::to_allocvec(&(0_u32, temporary, 4_u32, destination))
+        .expect("published recovery fixture should encode")
+}
+
 fn read_http_response_headers(stream: &mut impl BufRead) -> Vec<u8> {
     let mut headers = Vec::new();
     loop {
@@ -6517,7 +6523,7 @@ fn gc_recovers_a_published_nar_before_eviction_and_restart() {
     let transaction = data_dir.join(".narjar-transactions/gc-pending.txn");
     fs::write(
         &transaction,
-        format!("state=published\npath=.tmp/gc-pending.part\ndestination=nar/{NARJAR_HASH}.nar\n"),
+        published_transaction_bytes(".tmp/gc-pending.part", &format!("nar/{NARJAR_HASH}.nar")),
     )
     .expect("published transaction should be written");
     fs::set_permissions(&transaction, fs::Permissions::from_mode(0o600))
@@ -6592,9 +6598,7 @@ fn delete_recovers_a_published_narinfo_before_removing_it() {
     let transaction = data_dir.join(".narjar-transactions/delete-pending.txn");
     fs::write(
         &transaction,
-        format!(
-            "state=published\npath=.tmp/delete-pending.part\ndestination={STORE_HASH}.narinfo\n"
-        ),
+        published_transaction_bytes(".tmp/delete-pending.part", &format!("{STORE_HASH}.narinfo")),
     )
     .expect("published transaction should be written");
     fs::set_permissions(&transaction, fs::Permissions::from_mode(0o600))
@@ -7119,7 +7123,16 @@ fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
     )
     .expect("new orphan should be written");
 
-    thread::sleep(Duration::from_secs(2));
+    // Explicit timestamps order the orphans without depending on scheduler delays.
+    for (name, seconds) in [(NAR_ID, 1), (retained_orphan_nar.as_str(), 2)] {
+        fs::File::open(data_dir.join(format!("nar/{name}.nar")))
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)),
+            )
+            .unwrap();
+    }
     let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
     let narinfo_bytes = narinfo.len() as u64;
     fs::write(data_dir.join(format!("{STORE_HASH}.narinfo")), narinfo)
@@ -7130,11 +7143,15 @@ fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
     let published_bytes = narinfo_bytes + NAR_BYTES.len() as u64;
     let retained_orphan_bytes = b"new-orphan".len() as u64;
     let target_bytes = published_bytes + retained_orphan_bytes;
+    let roots = data_dir.join("protected-roots");
+    fs::write(&roots, format!("/nix/store/{STORE_HASH}-narjar\n")).unwrap();
     let path = data_dir.to_str().expect("temporary path should be UTF-8");
     let dry_run = command()
         .args(["gc", "--data-dir", path, "--target-bytes"])
         .arg(target_bytes.to_string())
-        .args(["--min-age-seconds", "1", "--json"])
+        .args(["--min-age-seconds", "0", "--protected-roots"])
+        .arg(&roots)
+        .arg("--json")
         .output()
         .expect("gc should run");
 
@@ -7163,7 +7180,9 @@ fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
     let apply = command()
         .args(["gc", "--data-dir", path, "--target-bytes"])
         .arg(target_bytes.to_string())
-        .args(["--min-age-seconds", "1", "--apply", "--json"])
+        .args(["--min-age-seconds", "0", "--protected-roots"])
+        .arg(&roots)
+        .args(["--apply", "--json"])
         .output()
         .expect("gc should run");
     assert!(
@@ -7283,7 +7302,7 @@ fn library_gc_dry_run_preserves_pending_recovery_state() {
     let transaction = data_dir.join(".narjar-transactions/gc-pending.txn");
     fs::write(
         &transaction,
-        b"state=published\npath=.tmp/gc-pending.part\ndestination=nix-cache-info\n",
+        published_transaction_bytes(".tmp/gc-pending.part", "nix-cache-info"),
     )
     .expect("published transaction should be written");
     fs::set_permissions(&transaction, fs::Permissions::from_mode(0o600))

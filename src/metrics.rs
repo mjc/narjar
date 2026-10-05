@@ -2088,13 +2088,9 @@ fn sample_process_resources() -> Result<ProcessResources, ()> {
 
 #[cfg(target_os = "linux")]
 fn read_bounded_text(path: impl AsRef<Path>, limit: u64) -> Result<String, ()> {
-    let mut text = String::new();
-    File::open(path)
-        .map_err(|_| ())?
-        .take(limit.saturating_add(1))
-        .read_to_string(&mut text)
+    let bytes = crate::records::read_bounded_bytes(File::open(path).map_err(|_| ())?, limit)
         .map_err(|_| ())?;
-    (text.len() as u64 <= limit).then_some(text).ok_or(())
+    String::from_utf8(bytes).map_err(|_| ())
 }
 
 #[cfg(target_os = "linux")]

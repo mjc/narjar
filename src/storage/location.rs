@@ -12,12 +12,26 @@ use super::{
 
 /// A regular-file location inside one of the store directories that may hold
 /// published content.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "PathBuf", into = "PathBuf")]
 pub(super) enum StorePath {
     Root(OsString),
     Nar(OsString),
     IngestionReceipt(OsString),
     EgressReceipt(OsString),
+}
+
+impl TryFrom<PathBuf> for StorePath {
+    type Error = io::Error;
+    fn try_from(path: PathBuf) -> io::Result<Self> {
+        Self::parse(&path)
+    }
+}
+
+impl From<StorePath> for PathBuf {
+    fn from(path: StorePath) -> Self {
+        path.relative_path()
+    }
 }
 
 impl StorePath {
@@ -80,10 +94,24 @@ impl StorePath {
 }
 
 /// A temporary publication file under a store-managed temporary directory.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "PathBuf", into = "PathBuf")]
 pub(super) enum TemporaryPath {
     Root(OsString),
     Nar(OsString),
+}
+
+impl TryFrom<PathBuf> for TemporaryPath {
+    type Error = io::Error;
+    fn try_from(path: PathBuf) -> io::Result<Self> {
+        Self::parse(&path)
+    }
+}
+
+impl From<TemporaryPath> for PathBuf {
+    fn from(path: TemporaryPath) -> Self {
+        path.relative_path()
+    }
 }
 
 impl TemporaryPath {

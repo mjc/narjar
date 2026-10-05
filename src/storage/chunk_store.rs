@@ -26,8 +26,8 @@ use super::{
         MANIFEST_RECORD_BYTES, ManifestError, ManifestReader, write_manifest_header,
     },
     fs::{
-        DirectoryEntryAction, DirectoryScanOutcome, ensure_directory_at, files_equal_at,
-        for_each_dir_name, hard_link_at, open_at, open_directory_at, open_regular_at,
+        DirectoryEntryAction, DirectoryScanOutcome, ImmutableLinkOutcome, ensure_directory_at,
+        for_each_dir_name, link_or_compare_immutable, open_at, open_directory_at, open_regular_at,
         read_dir_names, require_directory_at, unlink_at,
     },
     publication::{StagingReservation, StorageError},
@@ -204,7 +204,7 @@ impl ChunkStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        match open_regular_at(&shard, &chunk_name(hash)) {
+        match open_regular_at(&shard, chunk_name(hash)) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
@@ -212,7 +212,7 @@ impl ChunkStore {
     }
 
     pub(crate) fn open_manifest(&self, hash: NarHash) -> io::Result<Option<File>> {
-        match open_regular_at(&self.manifests, &manifest_name(hash)) {
+        match open_regular_at(&self.manifests, manifest_name(hash)) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
@@ -1486,19 +1486,13 @@ fn publish_temporary_file_without_directory_sync(
     temporary_name: &OsStr,
     name: &OsStr,
 ) -> io::Result<super::publication::PublishOutcome> {
-    match hard_link_at(directory, temporary_name, directory, name) {
-        Ok(()) => Ok(super::publication::PublishOutcome::Created),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if files_equal_at(directory, temporary_name, directory, name)? {
-                Ok(super::publication::PublishOutcome::Identical)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "content-addressed storage collision",
-                ))
-            }
-        }
-        Err(error) => Err(error),
+    match link_or_compare_immutable(directory, temporary_name, directory, name)? {
+        ImmutableLinkOutcome::Created => Ok(super::publication::PublishOutcome::Created),
+        ImmutableLinkOutcome::Identical => Ok(super::publication::PublishOutcome::Identical),
+        ImmutableLinkOutcome::Collision => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "content-addressed storage collision",
+        )),
     }
 }
 
@@ -1507,22 +1501,14 @@ fn publish_temporary_file(
     temporary_name: &OsStr,
     name: &OsStr,
 ) -> io::Result<super::publication::PublishOutcome> {
-    let result = match hard_link_at(directory, temporary_name, directory, name) {
-        Ok(()) => directory
-            .sync_all()
-            .map(|()| super::publication::PublishOutcome::Created),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if files_equal_at(directory, temporary_name, directory, name)? {
-                Ok(super::publication::PublishOutcome::Identical)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "content-addressed storage collision",
-                ))
+    let result = publish_temporary_file_without_directory_sync(directory, temporary_name, name)
+        .and_then(|outcome| {
+            match outcome {
+                super::publication::PublishOutcome::Created => directory.sync_all()?,
+                super::publication::PublishOutcome::Identical => {}
             }
-        }
-        Err(error) => Err(error),
-    };
+            Ok(outcome)
+        });
     let cleanup = unlink_at(directory, temporary_name);
     match (result, cleanup) {
         (Ok(outcome), Ok(())) => Ok(outcome),
@@ -1956,6 +1942,80 @@ mod tests {
     }
 
     #[test]
+    fn chunk_ingest_is_independent_of_source_read_boundaries() {
+        let first_directory = tempdir().unwrap();
+        let second_directory = tempdir().unwrap();
+        let first_root = Directory::open(first_directory.path()).unwrap();
+        let second_root = Directory::open(second_directory.path()).unwrap();
+        let first_store = ChunkStore::initialize(first_root.file()).unwrap();
+        let second_store = ChunkStore::initialize(second_root.file()).unwrap();
+        let profile = ChunkProfile::MinCdcHash4V2;
+        let input = deterministic_chunk_fixture(
+            profile.max_size() as usize * (super::CHUNK_PUBLICATION_BATCH_SIZE + 1) + 17,
+        );
+        let hash = NarHash::from_digest(Sha256::digest(&input).into());
+        let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
+        let first = first_store
+            .store_nar(Cursor::new(&input), identity, profile)
+            .unwrap();
+        let second = second_store
+            .store_nar(
+                FragmentedReader {
+                    reader: Cursor::new(&input),
+                    fragment: 17,
+                },
+                identity,
+                profile,
+            )
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(first.chunk_count() > super::CHUNK_PUBLICATION_BATCH_SIZE as u64);
+
+        let mut first_reader = ManifestReader::new(
+            first_store.open_manifest(hash).unwrap().unwrap(),
+            super::MAX_CHUNK_MANIFEST_BYTES,
+        )
+        .unwrap();
+        let mut second_reader = ManifestReader::new(
+            second_store.open_manifest(hash).unwrap().unwrap(),
+            super::MAX_CHUNK_MANIFEST_BYTES,
+        )
+        .unwrap();
+        for _ in 0..first.chunk_count() {
+            assert_eq!(
+                first_reader.next_record().unwrap(),
+                second_reader.next_record().unwrap()
+            );
+        }
+        first_reader.finish_remaining().unwrap();
+        second_reader.finish_remaining().unwrap();
+        for store in [&first_store, &second_store] {
+            let mut reader = store
+                .open_verified_reader(
+                    hash,
+                    0..identity.size().get(),
+                    super::MAX_CHUNK_MANIFEST_BYTES,
+                )
+                .unwrap();
+            let mut reconstructed = Vec::new();
+            reader.read_to_end(&mut reconstructed).unwrap();
+            assert_eq!(reconstructed, input);
+        }
+    }
+
+    struct FragmentedReader<R> {
+        reader: R,
+        fragment: usize,
+    }
+
+    impl<R: Read> Read for FragmentedReader<R> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let length = self.fragment.min(output.len());
+            self.reader.read(&mut output[..length])
+        }
+    }
+
+    #[test]
     fn stores_deduplicated_chunks_and_a_round_trippable_manifest() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
@@ -1968,21 +2028,13 @@ mod tests {
             .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
             .unwrap();
         let manifest_file = store.open_manifest(hash).unwrap().unwrap();
-        let bytes = super::super::fs::read_bounded_regular_file(
-            &store.manifests,
-            &super::manifest_name(hash),
-            1_000_000,
-        )
-        .unwrap();
-        let bytes = match bytes {
-            super::super::fs::BoundedRegularFile::Valid(bytes) => bytes,
-            _ => panic!("manifest should be readable"),
-        };
         assert_eq!(
-            super::super::chunked::ChunkManifest::decode(&bytes).unwrap(),
-            manifest
+            manifest_file.metadata().unwrap().len(),
+            super::encoded_manifest_size(manifest.chunk_count()).unwrap()
         );
-        assert_eq!(manifest_file.metadata().unwrap().len(), bytes.len() as u64);
+        let reader = ManifestReader::new(manifest_file, 1_000_000).unwrap();
+        assert_eq!(reader.manifest(), manifest);
+        reader.finish_remaining().unwrap();
         assert!(manifest.chunk_count() > 0);
 
         let mut reconstructed = Vec::new();

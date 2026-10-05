@@ -1,8 +1,8 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Read,
     num::{NonZeroU64, NonZeroUsize},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -446,29 +446,14 @@ fn require_writable_roots_filesystem(writeability: FilesystemWriteability) -> Re
 }
 
 fn open_read_only_regular_file(path: &Path, description: &str) -> Result<File, String> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(
-            (rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC
-                | rustix::fs::OFlags::NONBLOCK)
-                .bits() as i32,
-        )
-        .open(path)
-        .map_err(|error| match error.raw_os_error() {
+    narjar::__private::filesystem::open_regular_at(rustix::fs::CWD, path).map_err(|error| {
+        match error.raw_os_error() {
             Some(raw) if raw == rustix::io::Errno::LOOP.raw_os_error() => {
                 format!("{description} must not be a symlink")
             }
             _ => format!("opening {description} {}: {error}", path.display()),
-        })?;
-    match file
-        .metadata()
-        .map_err(|error| format!("inspecting {description}: {error}"))?
-        .is_file()
-    {
-        true => Ok(file),
-        false => Err(format!("{description} is not a regular file")),
-    }
+        }
+    })
 }
 
 fn descriptor_identity(file: &File) -> Result<(u64, u64), String> {
@@ -519,15 +504,7 @@ fn filesystem_writeability_from_flags(flags: StatVfsMountFlags) -> FilesystemWri
 }
 
 fn open_directory_without_following_final_symlink(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(
-            (rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC)
-                .bits() as i32,
-        )
-        .open(path)
+    narjar::__private::filesystem::open_directory(path)
 }
 
 fn require_absolute_path(path: &Path, description: &str) -> Result<(), String> {

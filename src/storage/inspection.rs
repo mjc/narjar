@@ -72,7 +72,7 @@ pub(crate) struct ReferencedPayload {
 impl ReferencedPayload {
     pub(crate) fn open(directory: &File, payload: NarRepresentation) -> io::Result<Option<Self>> {
         let name = payload.file_name();
-        match open_regular_at(directory, &name.os_string()) {
+        match open_regular_at(directory, name.os_string()) {
             Ok(file) => Ok(Some(Self { file, payload })),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
