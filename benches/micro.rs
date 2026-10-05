@@ -16,6 +16,7 @@ use narjar::__private::{
     narinfo::TrustedPublicKeys,
     storage::{CacheCreation, Directory, NarFileName, NarHash, Storage, SupportedStorageBackend},
 };
+use sha2::{Digest, Sha256};
 
 const OBJECT_ID: &str = "19rci548pgfshmx7rd3wzw2mhkq2dg8x3mq4q1kfkikgb2raqzxd";
 const MISSING_OBJECT_ID: &str = "0000000000000000000000000000000000000000000000000000";
@@ -322,11 +323,38 @@ fn bench_nar_decoder() {
     });
 }
 
+fn bench_streaming_hash_writes() {
+    const CHUNKS: usize = 128;
+    let chunk = [0_u8; 64 * 1024];
+    let inline = || {
+        let mut hasher = Sha256::new();
+        for _ in 0..CHUNKS {
+            hasher.update(black_box(&chunk));
+        }
+        <[u8; 32]>::from(hasher.finalize())
+    };
+    let adapted = || {
+        let mut output = digest_io::HashWriter::<Sha256, _>::new(std::io::sink());
+        for _ in 0..CHUNKS {
+            output.write_all(black_box(&chunk)).expect("hash chunk");
+        }
+        <[u8; 32]>::from(output.finalize())
+    };
+    assert_eq!(inline(), adapted(), "hash the same accepted byte stream");
+    run("SHA256 inline (8 MiB)", 10, || {
+        black_box(inline());
+    });
+    run("SHA256 writer (8 MiB)", 10, || {
+        black_box(adapted());
+    });
+}
+
 fn main() {
     println!("narjar microbenchmarks (custom std::time harness)");
     assert_header_scan_equivalence();
     bench_header_scanning();
     bench_nar_decoder();
+    bench_streaming_hash_writes();
     bench_request_parse();
     bench_storage();
     bench_startup();

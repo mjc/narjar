@@ -69,6 +69,21 @@ The cache server uses filesystem storage and serves plain HTTP behind a
 TLS proxy. The earlier exclusions do not describe this implemented graph, and
 the manifest does not by itself establish approval of a dependency change.
 
+The implementation uses `thiserror` for ordinary error plumbing, `enum-map`
+for fixed enum-keyed storage, and `digest-io` for hashing accepted I/O bytes.
+Checked size limits, typed identities, publication transitions, and error
+classification remain in Narjar. The hashing adapters share the existing
+digest 0.11 dependency and add no native library. Enum-map uses internal
+unsafe array construction; its derive macro runs at build time. Rustix owns
+the syscall boundary, including sendfile, advisory locks, and clock ticks;
+libc remains in the resolved graph and as an Apple-only test dependency for
+FIFO fixtures, because rustix does not expose mkfifo on Apple targets. It is
+not a direct production dependency.
+
+Maintenance records are bounded, versioned Postcard records. Readers reject
+unsupported versions, trailing bytes, invalid operation/mode combinations,
+and backwards timestamps. The private text record format is not supported.
+
 ## Dependency gates
 
 Every dependency change must pass:
