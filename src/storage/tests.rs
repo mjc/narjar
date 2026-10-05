@@ -78,14 +78,65 @@ fn compressed_receipts_reject_bytes_after_the_complete_record() {
 }
 
 fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
-    CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
+    initialize_storage_with_backend(path, SupportedStorageBackend::FLAT)
+}
+
+fn initialize_storage_with_backend(
+    path: &Path,
+    backend: SupportedStorageBackend,
+) -> Result<Storage, StorageError> {
+    CacheCreation::prepare(&Directory::open(path)?, backend)
         .and_then(|creation| creation.create_or_complete())
+}
+
+fn flat_storage_fixture() -> (TestDir, Storage) {
+    storage_fixture(SupportedStorageBackend::FLAT)
+}
+
+fn storage_fixture(backend: SupportedStorageBackend) -> (TestDir, Storage) {
+    let directory = TestDir::new();
+    let storage = initialize_storage_with_backend(directory.path(), backend)
+        .expect("initialize storage fixture");
+    (directory, storage)
+}
+
+fn store_raw_nar(storage: &Storage, raw: &[u8]) -> NarIdentity {
+    let identity = NarIdentity::new(
+        NarHash::from_digest(Sha256::digest(raw).into()),
+        NarSize::new(raw.len() as u64),
+    );
+    storage
+        .publish(
+            PublishTarget::Nar(NarFileName::raw(identity.hash())),
+            Cursor::new(raw),
+        )
+        .expect("raw NAR should be stored");
+    identity
+}
+
+fn upload_raw_nar(storage: &Storage, raw: &[u8], policy: super::NarUploadPolicy) -> NarIdentity {
+    let identity = NarIdentity::new(
+        NarHash::from_digest(Sha256::digest(raw).into()),
+        NarSize::new(raw.len() as u64),
+    );
+    storage
+        .publish_nar(
+            NarFileName::raw(identity.hash()),
+            Cursor::new(raw),
+            raw.len() as u64,
+            policy,
+        )
+        .expect("raw NAR should be uploaded");
+    identity
+}
+
+fn directory_entry_count(path: impl AsRef<Path>) -> usize {
+    fs::read_dir(path).expect("read fixture directory").count()
 }
 
 #[test]
 fn population_scan_counts_recognized_files_without_retaining_names() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (directory, storage) = flat_storage_fixture();
     let narinfo = format!(
         "StorePath: /nix/store/{STORE_HASH}-sample\nURL: nar/{NAR_ID}.nar\nCompression: none\nFileHash: sha256:{NAR_ID}\nFileSize: 11\nNarHash: sha256:{NAR_ID}\nNarSize: 11\nReferences: \n"
     );
@@ -186,8 +237,7 @@ fn population_scan_counts_recognized_files_without_retaining_names() {
 
 #[test]
 fn population_scan_can_be_cancelled_without_returning_partial_totals() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let stopping = std::sync::atomic::AtomicBool::new(true);
 
     let error = storage.population_counts(&stopping).unwrap_err();
@@ -200,24 +250,10 @@ fn population_scan_can_be_cancelled_without_returning_partial_totals() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn chunked_ingestion_publishes_a_verified_manifest() {
-    let directory = TestDir::new();
-    let storage = CacheCreation::prepare(
-        &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked.try_into().unwrap(),
-    )
-    .and_then(|creation| creation.create_or_complete())
-    .unwrap();
+    let (_directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = vec![b'x'; 100_000];
-    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
-    let name = NarFileName::raw(hash);
-    storage
-        .publish_nar(
-            name,
-            Cursor::new(&raw),
-            raw.len() as u64,
-            super::NarUploadPolicy::new(200_000, 0),
-        )
-        .unwrap();
+    let identity = upload_raw_nar(&storage, &raw, super::NarUploadPolicy::new(200_000, 0));
+    let hash = identity.hash();
     let manifest = storage
         .chunk_store()
         .unwrap()
@@ -225,10 +261,7 @@ fn chunked_ingestion_publishes_a_verified_manifest() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(
-        manifest.identity(),
-        NarIdentity::new(hash, (raw.len() as u64).into())
-    );
+    assert_eq!(manifest.identity(), identity);
     assert!(
         storage
             .chunk_store()
@@ -251,13 +284,7 @@ fn chunked_ingestion_publishes_a_verified_manifest() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn chunked_backend_routes_the_complete_nar_publication() {
-    let directory = TestDir::new();
-    let storage = CacheCreation::prepare(
-        &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked.try_into().unwrap(),
-    )
-    .and_then(|creation| creation.create_or_complete())
-    .unwrap();
+    let (_directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = vec![b'c'; 100_000];
     let hash = NarHash::from_digest(Sha256::digest(&raw).into());
     let name = NarFileName::raw(hash);
@@ -312,13 +339,7 @@ fn chunked_backend_routes_the_complete_nar_publication() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn chunked_upload_enforces_encoded_size_before_creating_staging() {
-    let directory = TestDir::new();
-    let storage = CacheCreation::prepare(
-        &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked.try_into().unwrap(),
-    )
-    .and_then(|creation| creation.create_or_complete())
-    .unwrap();
+    let (directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = b"compressed body larger than encoded upload limit";
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let encoding = WireEncoding::Compressed(CompressionCodec::Zstd);
@@ -365,13 +386,7 @@ fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
         #[cfg(not(target_os = "macos"))]
         StorageBackend::Chunked,
     ] {
-        let directory = TestDir::new();
-        let storage = CacheCreation::prepare(
-            &Directory::open(directory.path()).unwrap(),
-            backend.try_into().unwrap(),
-        )
-        .and_then(|creation| creation.create_or_complete())
-        .unwrap();
+        let (_directory, storage) = storage_fixture(backend.try_into().unwrap());
         let raw = vec![b'u'; 100_000];
         let hash = NarHash::from_digest(Sha256::digest(&raw).into());
         let name = NarFileName::raw(hash);
@@ -411,24 +426,14 @@ fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
-    let directory = TestDir::new();
-    let storage = CacheCreation::prepare(
-        &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked.try_into().unwrap(),
-    )
-    .and_then(|creation| creation.create_or_complete())
-    .unwrap();
+    let (directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = vec![b'm'; 100_000];
-    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
-    let identity = NarIdentity::new(hash, NarSize::new(raw.len() as u64));
-    storage
-        .publish_nar(
-            NarFileName::raw(hash),
-            Cursor::new(&raw),
-            raw.len() as u64,
-            super::NarUploadPolicy::new(raw.len() as u64, 0),
-        )
-        .unwrap();
+    let identity = upload_raw_nar(
+        &storage,
+        &raw,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
+    let hash = identity.hash();
 
     let manifest_path = directory
         .path()
@@ -449,24 +454,14 @@ fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
-    let directory = TestDir::new();
-    let storage = CacheCreation::prepare(
-        &Directory::open(directory.path()).unwrap(),
-        StorageBackend::Chunked.try_into().unwrap(),
-    )
-    .and_then(|creation| creation.create_or_complete())
-    .unwrap();
+    let (directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = vec![b's'; 100_000];
-    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
-    let name = NarFileName::raw(hash);
-    storage
-        .publish_nar(
-            name,
-            Cursor::new(&raw),
-            raw.len() as u64,
-            super::NarUploadPolicy::new(raw.len() as u64, 0),
-        )
-        .unwrap();
+    let identity = upload_raw_nar(
+        &storage,
+        &raw,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
+    let name = NarFileName::raw(identity.hash());
 
     let chunks = directory.path().join(super::CHUNK_DIRECTORY);
     let shard = fs::read_dir(&chunks)
@@ -494,25 +489,15 @@ fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
 
 #[test]
 fn flat_canonical_nar_rejects_same_size_corruption() {
-    let directory = TestDir::new();
-    let storage = CacheCreation::prepare(
-        &Directory::open(directory.path()).unwrap(),
-        SupportedStorageBackend::FLAT,
-    )
-    .and_then(|creation| creation.create_or_complete())
-    .unwrap();
+    let (directory, storage) = flat_storage_fixture();
     let raw = vec![b'f'; 4096];
-    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
-    let identity = NarIdentity::new(hash, NarSize::new(raw.len() as u64));
+    let identity = upload_raw_nar(
+        &storage,
+        &raw,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
+    let hash = identity.hash();
     let name = NarFileName::raw(hash);
-    storage
-        .publish_nar(
-            name,
-            Cursor::new(&raw),
-            raw.len() as u64,
-            super::NarUploadPolicy::new(raw.len() as u64, 0),
-        )
-        .unwrap();
 
     let payload = directory.path().join("nar").join(format!("{hash}.nar"));
     let mut corrupted = fs::read(&payload).unwrap();
@@ -531,20 +516,14 @@ fn flat_canonical_nar_rejects_same_size_corruption() {
 
 #[test]
 fn evicted_delivery_validation_proof_is_recomputed() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = vec![b'f'; 4096];
-    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
-    let identity = NarIdentity::new(hash, NarSize::new(raw.len() as u64));
-    let name = NarFileName::raw(hash);
-    storage
-        .publish_nar(
-            name,
-            Cursor::new(&raw),
-            raw.len() as u64,
-            super::NarUploadPolicy::new(raw.len() as u64, 0),
-        )
-        .expect("raw NAR should be stored");
+    let identity = upload_raw_nar(
+        &storage,
+        &raw,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
+    let name = NarFileName::raw(identity.hash());
     let file = storage
         .open_nar(name)
         .expect("stored NAR should open")
@@ -582,20 +561,15 @@ fn evicted_delivery_validation_proof_is_recomputed() {
 
 #[test]
 fn flat_canonical_nar_rejects_a_claimed_size_mismatch() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = vec![b's'; 4096];
-    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
-    storage
-        .publish_nar(
-            NarFileName::raw(hash),
-            Cursor::new(&raw),
-            raw.len() as u64,
-            super::NarUploadPolicy::new(raw.len() as u64, 0),
-        )
-        .expect("raw NAR should be stored");
+    let identity = upload_raw_nar(
+        &storage,
+        &raw,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
 
-    let claimed = NarIdentity::new(hash, NarSize::new(raw.len() as u64 + 1));
+    let claimed = NarIdentity::new(identity.hash(), NarSize::new(raw.len() as u64 + 1));
     assert!(matches!(
         storage.open_verified_canonical_nar(NarRepresentation::Raw(claimed)),
         Err(StorageError::NarMismatch)
@@ -604,19 +578,13 @@ fn flat_canonical_nar_rejects_a_claimed_size_mismatch() {
 
 #[test]
 fn compressed_delivery_rejects_same_size_corruption() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = vec![b'c'; 4096];
-    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
-    let identity = NarIdentity::new(hash, NarSize::new(raw.len() as u64));
-    storage
-        .publish_nar(
-            NarFileName::raw(hash),
-            Cursor::new(&raw),
-            raw.len() as u64,
-            super::NarUploadPolicy::new(raw.len() as u64, 0),
-        )
-        .expect("raw NAR should be stored");
+    let identity = upload_raw_nar(
+        &storage,
+        &raw,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
     let (name, encoded_size) = storage
         .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
         .expect("compressed NAR should be generated");
@@ -681,24 +649,19 @@ fn assert_upload_resources_released(storage: &Storage) {
         "the upload must release its disk reservation"
     );
     assert_eq!(
-        fs::read_dir(storage.layout().nar_temp_dir())
-            .unwrap()
-            .count(),
+        directory_entry_count(storage.layout().nar_temp_dir()),
         0,
         "dropping an upload must unlink its temporary file"
     );
 }
 
 fn transaction_record_count(storage: &Storage) -> usize {
-    fs::read_dir(storage.layout().transaction_dir())
-        .expect("read transaction directory")
-        .count()
+    directory_entry_count(storage.layout().transaction_dir())
 }
 
 #[test]
 fn abandoning_a_receiving_upload_releases_its_file_and_reservation() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let receiving = begin_raw_upload(&storage, b"raw NAR");
     assert_eq!(storage.temporary_objects(), 1);
     assert_eq!(
@@ -711,8 +674,7 @@ fn abandoning_a_receiving_upload_releases_its_file_and_reservation() {
 
 #[test]
 fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let bytes = b"raw NAR";
     let complete = begin_raw_upload(&storage, bytes)
         .receive(bytes.as_slice())
@@ -739,8 +701,7 @@ fn completing_an_upload_does_not_publish_it_and_abandonment_still_cleans_up() {
 
 #[test]
 fn generic_publication_commits_only_after_finishing_its_stream() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let target = super::publication::PublishTarget::Nar(NarFileName::raw(nar));
 
@@ -768,8 +729,7 @@ fn generic_publication_commits_only_after_finishing_its_stream() {
 
 #[test]
 fn abandoned_generic_publication_cleans_up_staging() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let target = super::publication::PublishTarget::Nar(NarFileName::raw(nar));
 
@@ -792,18 +752,12 @@ fn abandoned_generic_publication_cleans_up_staging() {
     assert_eq!(storage.temporary_objects(), 0);
     assert!(!storage.recovery_required().unwrap());
     assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
-    assert!(
-        fs::read_dir(storage.layout().nar_temp_dir())
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(directory_entry_count(storage.layout().nar_temp_dir()) == 0);
 }
 
 #[test]
 fn abandoned_generic_publication_retains_recovery_when_temp_cleanup_fails() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let target = PublishTarget::Nar(NarFileName::raw(nar));
     let streaming = storage.begin_publication(target, |_| Ok(())).unwrap();
@@ -816,18 +770,17 @@ fn abandoned_generic_publication_retains_recovery_when_temp_cleanup_fails() {
     fs::set_permissions(&temporary_directory, fs::Permissions::from_mode(0o700))
         .expect("restore temporary directory permissions");
     assert!(storage.recovery_required().unwrap());
-    assert_eq!(fs::read_dir(&temporary_directory).unwrap().count(), 1);
+    assert_eq!(directory_entry_count(&temporary_directory), 1);
 
     storage.finish_recovery().unwrap();
 
     assert!(!storage.recovery_required().unwrap());
-    assert_eq!(fs::read_dir(&temporary_directory).unwrap().count(), 0);
+    assert_eq!(directory_entry_count(&temporary_directory), 0);
 }
 
 #[test]
 fn failed_generic_publication_stream_cleans_up_staging() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let target = PublishTarget::Nar(NarFileName::raw(nar));
 
@@ -841,18 +794,12 @@ fn failed_generic_publication_stream_cleans_up_staging() {
     );
     assert_eq!(storage.temporary_objects(), 0);
     assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
-    assert!(
-        fs::read_dir(storage.layout().nar_temp_dir())
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(directory_entry_count(storage.layout().nar_temp_dir()) == 0);
 }
 
 #[test]
 fn a_completed_upload_commits_its_own_bytes_and_releases_resources() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let bytes = b"raw NAR";
     let complete = begin_raw_upload(&storage, bytes)
         .receive(FailsIfReadAfterEof::new(bytes))
@@ -865,8 +812,7 @@ fn a_completed_upload_commits_its_own_bytes_and_releases_resources() {
 
 #[test]
 fn source_errors_and_unwinding_release_upload_resources() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let failed = begin_raw_upload(&storage, b"raw NAR")
         .receive(BrokenReader::new(rustix::io::Errno::IO.raw_os_error()));
     assert!(
@@ -891,8 +837,7 @@ fn source_errors_and_unwinding_release_upload_resources() {
 
 #[test]
 fn rejected_and_disconnected_uploads_do_not_accumulate_transactions() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let bytes = b"rejected NAR";
     let wrong_hash = FileHash::from_digest(Sha256::digest(b"different NAR").into());
 
@@ -929,8 +874,7 @@ fn rejected_and_disconnected_uploads_do_not_accumulate_transactions() {
 
 #[test]
 fn uncertain_upload_publication_retains_its_recovery_record() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let raw = b"raw NAR";
     let complete = begin_raw_upload(&storage, raw)
         .receive(raw.as_slice())
@@ -943,10 +887,7 @@ fn uncertain_upload_publication_retains_its_recovery_record() {
     );
     assert_eq!(transaction_record_count(&storage), 1);
     assert!(
-        fs::read_dir(storage.layout().nar_temp_dir())
-            .unwrap()
-            .next()
-            .is_none(),
+        directory_entry_count(storage.layout().nar_temp_dir()) == 0,
         "a conclusively removable staging file is cleaned even when publication is uncertain"
     );
     assert_upload_resources_released(&storage);
@@ -957,8 +898,7 @@ fn uncertain_upload_publication_retains_its_recovery_record() {
 
 #[test]
 fn upload_setup_failure_cancels_transaction_after_temporary_cleanup() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let bytes = b"raw NAR";
     let name = NarFileName::new(
         FileHash::from_digest(Sha256::digest(bytes).into()),
@@ -981,8 +921,7 @@ fn upload_setup_failure_cancels_transaction_after_temporary_cleanup() {
 
 #[test]
 fn upload_setup_failure_retains_transaction_when_temporary_cleanup_fails() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (_directory, storage) = flat_storage_fixture();
     let bytes = b"raw NAR";
     let name = NarFileName::new(
         FileHash::from_digest(Sha256::digest(bytes).into()),
@@ -1007,7 +946,7 @@ fn upload_setup_failure_retains_transaction_when_temporary_cleanup_fails() {
     assert!(result.is_err());
     assert_eq!(transaction_record_count(&storage), 1);
     assert_eq!(
-        fs::read_dir(&temporary_directory).unwrap().count(),
+        directory_entry_count(&temporary_directory),
         1,
         "failed cleanup leaves the replacement path for recovery"
     );
@@ -1026,8 +965,7 @@ fn upload_setup_failure_retains_transaction_when_temporary_cleanup_fails() {
 
 #[test]
 fn a_commit_destination_open_failure_still_cleans_the_owned_staging_file() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).unwrap();
+    let (directory, storage) = flat_storage_fixture();
     let complete = begin_raw_upload(&storage, b"raw NAR")
         .receive(&b"raw NAR"[..])
         .unwrap();
@@ -1040,7 +978,7 @@ fn a_commit_destination_open_failure_still_cleans_the_owned_staging_file() {
     );
     assert_upload_resources_released(&storage);
     assert_eq!(
-        fs::read_dir(&moved).unwrap().count(),
+        directory_entry_count(&moved),
         1,
         "only the empty .tmp directory remains"
     );
@@ -1353,8 +1291,7 @@ fn zstd_upload_memory_limit_includes_decoder_workspace_beyond_its_window() {
 
 #[test]
 fn upload_memory_rejection_publishes_no_nar_and_releases_staging() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let raw = b"compressed upload rejected before decoder allocation";
     let decoded_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let decoder_limit = 1024;
@@ -1389,9 +1326,7 @@ fn upload_memory_rejection_publishes_no_nar_and_releases_staging() {
                 .exists()
         );
         assert_eq!(
-            fs::read_dir(directory.path().join(".tmp"))
-                .expect("temporary directory exists")
-                .count(),
+            directory_entry_count(directory.path().join(".tmp")),
             0,
             "rejection removes its staging file"
         );
@@ -1436,14 +1371,9 @@ fn assert_compressed_upload_memory_limit(
 
 #[test]
 fn xz_uploads_are_normalized_to_the_raw_nar() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let raw = b"nar bytes";
-    let mut compressed = Vec::new();
-    let mut writer =
-        XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
-    writer.write_all(raw).expect("compress NAR");
-    writer.finish().expect("finish XZ stream");
+    let compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
     let encoded = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed)))
         .expect("compressed hash is a valid file hash");
     let raw =
@@ -1470,11 +1400,7 @@ fn encoded_verification_precedes_xz_nar_identity_verification() {
     let directory = TestDir::new();
     let path = directory.path().join("nar.xz");
     let raw = b"nar bytes";
-    let mut compressed = Vec::new();
-    let mut writer =
-        XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
-    writer.write_all(raw).expect("compress NAR");
-    writer.finish().expect("finish XZ stream");
+    let compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
     fs::write(&path, &compressed).expect("write XZ NAR");
     let file = fs::File::open(path).expect("open XZ NAR");
     let nar_hash = NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).expect("NAR hash is valid");
@@ -1506,11 +1432,7 @@ fn reserved_xz_stream_flags_are_invalid_content() {
     let directory = TestDir::new();
     let path = directory.path().join("nar.xz");
     let raw = b"nar bytes";
-    let mut compressed = Vec::new();
-    let mut writer =
-        XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
-    writer.write_all(raw).expect("compress NAR");
-    writer.finish().expect("finish XZ stream");
+    let mut compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
 
     // Keep the stream-header CRC valid while setting a reserved flag bit.
     compressed[6] = 0x04;
@@ -1543,12 +1465,8 @@ fn reserved_xz_stream_flags_are_invalid_content() {
 #[test]
 fn compressed_matching_still_checks_both_hashes_and_sizes() {
     let raw = b"nar bytes";
-    let mut xz = Vec::new();
-    let mut writer = XzWriter::new(&mut xz, XzOptions::with_preset(1)).unwrap();
-    writer.write_all(raw).unwrap();
-    writer.finish().unwrap();
-    let mut zstd = Vec::new();
-    compress(Cursor::new(raw), &mut zstd, CompressionLevel::Fastest);
+    let xz = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
+    let zstd = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Zstd), raw);
     let nar_hash = NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).unwrap();
     let wrong_file_hash = FileHash::parse(&"0".repeat(52)).unwrap();
     let wrong_nar_hash = NarHash::parse(&"0".repeat(52)).unwrap();
@@ -1606,11 +1524,9 @@ fn compressed_matching_still_checks_both_hashes_and_sizes() {
 
 #[test]
 fn zstd_uploads_are_normalized_to_the_raw_nar() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let raw = b"nar bytes";
-    let mut compressed = Vec::new();
-    compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
+    let compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Zstd), raw);
     let encoded = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed)))
         .expect("compressed hash is a valid file hash");
     let raw_hash =
@@ -1670,9 +1586,7 @@ fn a_restart_after_raw_commit_retries_receipt_publication() {
             "the canonical raw object is durable before receipt publication"
         );
         assert_eq!(
-            fs::read_dir(storage.layout().ingestion_receipt_dir())
-                .unwrap()
-                .count(),
+            directory_entry_count(storage.layout().ingestion_receipt_dir()),
             0,
             "the failed receipt publication must not leave partial evidence"
         );
@@ -1689,9 +1603,7 @@ fn a_restart_after_raw_commit_retries_receipt_publication() {
             .expect("retry compressed upload");
         assert_eq!(outcome, PublishOutcome::Identical);
         assert_eq!(
-            fs::read_dir(restarted.layout().ingestion_receipt_dir())
-                .unwrap()
-                .count(),
+            directory_entry_count(restarted.layout().ingestion_receipt_dir()),
             1,
             "the retry must publish exactly one durable receipt"
         );
@@ -1726,9 +1638,7 @@ fn recovery_removes_receipts_without_a_usable_raw_object() {
 
         let restarted = initialize_storage(directory.path()).expect("restart storage");
         assert_eq!(
-            fs::read_dir(restarted.layout().ingestion_receipt_dir())
-                .unwrap()
-                .count(),
+            directory_entry_count(restarted.layout().ingestion_receipt_dir()),
             1,
             "restart must see the stale receipt before recovery"
         );
@@ -1736,9 +1646,7 @@ fn recovery_removes_receipts_without_a_usable_raw_object() {
             .finish_recovery()
             .expect("clean the receipt for the missing raw object");
         assert_eq!(
-            fs::read_dir(restarted.layout().ingestion_receipt_dir())
-                .unwrap()
-                .count(),
+            directory_entry_count(restarted.layout().ingestion_receipt_dir()),
             0,
             "recovery must remove unusable receipt evidence"
         );
@@ -1753,20 +1661,16 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
     let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     let output = {
-        let storage = CacheCreation::prepare(
-            &Directory::open(directory.path()).unwrap(),
+        let storage = initialize_storage_with_backend(
+            directory.path(),
             StorageBackend::Chunked.try_into().unwrap(),
         )
-        .and_then(|creation| creation.create_or_complete())
         .unwrap();
-        storage
-            .publish_nar(
-                NarFileName::raw(raw_hash),
-                Cursor::new(raw),
-                raw.len() as u64,
-                super::NarUploadPolicy::new(raw.len() as u64, 0),
-            )
-            .unwrap();
+        upload_raw_nar(
+            &storage,
+            raw,
+            super::NarUploadPolicy::new(raw.len() as u64, 0),
+        );
         let output = storage
             .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
             .unwrap();
@@ -1774,17 +1678,14 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
         output
     };
 
-    let restarted = CacheCreation::prepare(
-        &Directory::open(directory.path()).unwrap(),
+    let restarted = initialize_storage_with_backend(
+        directory.path(),
         StorageBackend::Chunked.try_into().unwrap(),
     )
-    .and_then(|creation| creation.create_or_complete())
     .unwrap();
     restarted.finish_recovery().unwrap();
     assert_eq!(
-        fs::read_dir(restarted.layout().egress_receipt_dir())
-            .unwrap()
-            .count(),
+        directory_entry_count(restarted.layout().egress_receipt_dir()),
         1,
         "manifest-backed canonical raw storage must retain its egress receipt"
     );
@@ -1799,15 +1700,10 @@ fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
 
 #[test]
 fn compressed_uploads_converge_on_one_raw_object() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = b"nar bytes";
-    let mut compressed = Vec::new();
-    compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
-    let mut xz = Vec::new();
-    let mut writer = XzWriter::new(&mut xz, XzOptions::with_preset(1)).unwrap();
-    writer.write_all(raw).unwrap();
-    writer.finish().unwrap();
+    let compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Zstd), raw);
+    let xz = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
     let xz_id = FileHash::parse(&nix32_sha256(&Sha256::digest(&xz))).unwrap();
     let zstd_id = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed))).unwrap();
     let raw_hash = NarHash::parse(&nix32_sha256(&Sha256::digest(raw))).unwrap();
@@ -1861,26 +1757,19 @@ fn compressed_uploads_converge_on_one_raw_object() {
 
 #[test]
 fn compressed_egress_respects_the_staging_capacity_reserve() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = (0_u32..2_000_000)
         .map(|index| index.wrapping_mul(37) as u8)
         .collect::<Vec<_>>();
-    let raw_hash = NarHash::from_digest(Sha256::digest(&raw).into());
-    storage
-        .publish(
-            PublishTarget::Nar(NarFileName::raw(raw_hash)),
-            Cursor::new(&raw),
-        )
-        .expect("raw NAR should be stored");
+    let identity = store_raw_nar(&storage, &raw);
     let raw_file = storage
-        .open_nar(NarFileName::raw(raw_hash))
+        .open_nar(NarFileName::raw(identity.hash()))
         .expect("raw NAR should open")
         .expect("raw NAR should exist");
     let min_free_bytes = u64::MAX;
     let result = storage.materialize_compressed_nar_for_test(
         &raw_file,
-        NarIdentity::new(raw_hash, (raw.len() as u64).into()),
+        identity,
         CompressionCodec::Zstd,
         min_free_bytes,
     );
@@ -1895,9 +1784,7 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
     assert_eq!(activity.egress_generations_failed, 1);
     assert_eq!(activity.egress_generations_succeeded, 0);
     assert_eq!(
-        fs::read_dir(storage.layout().nar_temp_dir())
-            .unwrap()
-            .count(),
+        directory_entry_count(storage.layout().nar_temp_dir()),
         0,
         "failed egress must remove its temporary payload"
     );
@@ -1905,17 +1792,9 @@ fn compressed_egress_respects_the_staging_capacity_reserve() {
 
 #[test]
 fn repeated_compressed_egress_reuses_its_durable_derivative() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = b"raw NAR for durable egress reuse";
-    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
-    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
-    storage
-        .publish(
-            PublishTarget::Nar(NarFileName::raw(raw_hash)),
-            Cursor::new(raw),
-        )
-        .expect("raw NAR should be stored");
+    let identity = store_raw_nar(&storage, raw);
 
     let first = storage
         .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
@@ -1932,9 +1811,7 @@ fn repeated_compressed_egress_reuses_its_durable_derivative() {
     assert_eq!(activity.egress_generations_succeeded, 1);
     assert_eq!(activity.egress_reuses, 1);
     assert_eq!(
-        fs::read_dir(storage.layout().egress_receipt_dir())
-            .expect("egress receipt directory should be readable")
-            .count(),
+        directory_entry_count(storage.layout().egress_receipt_dir()),
         1
     );
     assert!(storage.layout().nar_path_encoded(first.0).is_file());
@@ -1948,12 +1825,7 @@ fn restarting_storage_reuses_a_durable_compressed_derivative() {
     let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
     let (first, initial_generations) = {
         let storage = initialize_storage(directory.path()).expect("storage should initialize");
-        storage
-            .publish(
-                PublishTarget::Nar(NarFileName::raw(raw_hash)),
-                Cursor::new(raw),
-            )
-            .expect("raw NAR should be stored");
+        store_raw_nar(&storage, raw);
         let output = storage
             .compressed_representation_for_test(identity, CompressionCodec::Xz, 0)
             .expect("first derivative should be created");
@@ -1972,17 +1844,9 @@ fn restarting_storage_reuses_a_durable_compressed_derivative() {
 
 #[test]
 fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = b"raw NAR with a removable derivative";
-    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
-    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
-    storage
-        .publish(
-            PublishTarget::Nar(NarFileName::raw(raw_hash)),
-            Cursor::new(raw),
-        )
-        .expect("raw NAR should be stored");
+    let identity = store_raw_nar(&storage, raw);
 
     let first = storage
         .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
@@ -2000,17 +1864,9 @@ fn missing_compressed_derivative_is_rebuilt_from_its_receipt() {
 
 #[test]
 fn missing_compressed_derivative_must_reproduce_its_receipt_identity() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = b"raw NAR with a binding receipt";
-    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
-    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
-    storage
-        .publish(
-            PublishTarget::Nar(NarFileName::raw(raw_hash)),
-            Cursor::new(raw),
-        )
-        .expect("raw NAR should be stored");
+    let identity = store_raw_nar(&storage, raw);
 
     let output = storage
         .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
@@ -2057,17 +1913,9 @@ fn assert_egress_derivative_is_repaired(
     corrupt_derivative: impl FnOnce(&mut Vec<u8>),
     remove_receipt: bool,
 ) {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = b"raw NAR with a corrupt derivative";
-    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
-    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
-    storage
-        .publish(
-            PublishTarget::Nar(NarFileName::raw(raw_hash)),
-            Cursor::new(raw),
-        )
-        .expect("raw NAR should be stored");
+    let identity = store_raw_nar(&storage, raw);
 
     let output = storage
         .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
@@ -2081,9 +1929,7 @@ fn assert_egress_derivative_is_repaired(
         .finish_recovery()
         .expect("recovery should retain repair evidence for an existing raw NAR");
     assert_eq!(
-        fs::read_dir(storage.layout().egress_receipt_dir())
-            .expect("egress receipt directory should be readable")
-            .count(),
+        directory_entry_count(storage.layout().egress_receipt_dir()),
         1,
         "recovery must retain the receipt while its raw source exists"
     );
@@ -2117,14 +1963,7 @@ fn concurrent_requests_coalesce_compressed_derivative_generation() {
     let storage =
         Arc::new(initialize_storage(directory.path()).expect("storage should initialize"));
     let raw = b"raw NAR for concurrent egress generation";
-    let raw_hash = NarHash::from_digest(Sha256::digest(raw).into());
-    let identity = NarIdentity::new(raw_hash, (raw.len() as u64).into());
-    storage
-        .publish(
-            PublishTarget::Nar(NarFileName::raw(raw_hash)),
-            Cursor::new(raw),
-        )
-        .expect("raw NAR should be stored");
+    let identity = store_raw_nar(&storage, raw);
 
     let barrier = Arc::new(std::sync::Barrier::new(4));
     let workers = (0..4)
@@ -2150,20 +1989,16 @@ fn concurrent_requests_coalesce_compressed_derivative_generation() {
     assert_eq!(activity.egress_generations_succeeded, 1);
     assert_eq!(activity.egress_reuses, 3);
     assert_eq!(
-        fs::read_dir(storage.layout().egress_receipt_dir())
-            .expect("egress receipt directory should be readable")
-            .count(),
+        directory_entry_count(storage.layout().egress_receipt_dir()),
         1
     );
 }
 
 #[test]
 fn zstd_validation_rejects_bytes_after_the_frame() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = b"nar bytes";
-    let mut compressed = Vec::new();
-    compress(Cursor::new(raw), &mut compressed, CompressionLevel::Fastest);
+    let mut compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Zstd), raw);
     let frame_length = compressed.len();
     compressed.extend_from_slice(b"trailing bytes");
     let nar = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed[..frame_length])))
@@ -2181,14 +2016,9 @@ fn zstd_validation_rejects_bytes_after_the_frame() {
 
 #[test]
 fn xz_validation_rejects_bytes_after_the_stream() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let raw = b"nar bytes";
-    let mut compressed = Vec::new();
-    let mut writer =
-        XzWriter::new(&mut compressed, XzOptions::with_preset(1)).expect("create XZ writer");
-    writer.write_all(raw).expect("compress XZ NAR");
-    writer.finish().expect("finish XZ stream");
+    let mut compressed = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
     let frame_length = compressed.len();
     compressed.extend_from_slice(b"trailing bytes");
     let nar = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed[..frame_length])))
@@ -2207,14 +2037,9 @@ fn xz_validation_rejects_bytes_after_the_stream() {
 #[test]
 fn compressed_nars_reject_truncated_frames() {
     let raw = b"nar bytes";
-    let mut xz = Vec::new();
-    let mut xz_writer =
-        XzWriter::new(&mut xz, XzOptions::with_preset(1)).expect("create XZ writer");
-    xz_writer.write_all(raw).expect("compress XZ NAR");
-    xz_writer.finish().expect("finish XZ stream");
+    let xz = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Xz), raw);
 
-    let mut zstd = Vec::new();
-    compress(Cursor::new(raw), &mut zstd, CompressionLevel::Fastest);
+    let zstd = compressed_bytes(WireEncoding::Compressed(CompressionCodec::Zstd), raw);
 
     for (encoding, mut compressed) in [
         (WireEncoding::Compressed(CompressionCodec::Xz), xz),
@@ -2223,8 +2048,7 @@ fn compressed_nars_reject_truncated_frames() {
         compressed.pop().expect("compressed frame is not empty");
         let nar = FileHash::parse(&nix32_sha256(&Sha256::digest(&compressed)))
             .expect("compressed hash is a valid file hash");
-        let directory = TestDir::new();
-        let storage = initialize_storage(directory.path()).expect("initialize storage");
+        let (_directory, storage) = flat_storage_fixture();
 
         let result = storage.publish_nar(
             NarFileName::new(nar, encoding),
@@ -2306,8 +2130,7 @@ fn ids_reject_wrong_length_and_non_nix32_bytes() {
 
 #[test]
 fn initialization_creates_only_the_fixed_layout() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
 
     assert_eq!(
         fs::read(directory.path().join(super::LAYOUT_DESCRIPTOR)).unwrap(),
@@ -2412,7 +2235,7 @@ fn unsupported_backend_cannot_be_prepared_for_storage_initialization() {
         .expect_err("chunked storage is unsupported on macOS");
 
     assert!(error.to_string().contains("not supported on macOS"));
-    assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
+    assert!(directory_entry_count(directory.path()) == 0);
 }
 
 #[test]
@@ -2432,8 +2255,7 @@ fn initialization_rejects_a_symlinked_data_directory() {
 
 #[test]
 fn initialization_rejects_a_symlinked_lock() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     drop(storage);
 
     let target = directory.path().join("lock-target");
@@ -2477,8 +2299,7 @@ fn initialization_rejects_writable_storage_directories() {
 
 #[test]
 fn temporary_publication_files_are_private() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let temporary = storage
         .create_temp(&PublishTarget::CacheInfo)
         .expect("create temporary publication file");
@@ -2499,25 +2320,14 @@ fn temporary_publication_files_are_private() {
 
 #[test]
 fn nar_publication_uses_a_destination_local_temporary_directory() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
     let temporary = storage
         .create_temp(&PublishTarget::Nar(NarFileName::raw(nar)))
         .expect("create NAR temporary publication file");
-    assert_eq!(
-        fs::read_dir(storage.layout().temp_dir())
-            .expect("read metadata temporary directory")
-            .count(),
-        0
-    );
-    assert_eq!(
-        fs::read_dir(storage.layout().nar_temp_dir())
-            .expect("read NAR temporary directory")
-            .count(),
-        1
-    );
+    assert_eq!(directory_entry_count(storage.layout().temp_dir()), 0);
+    assert_eq!(directory_entry_count(storage.layout().nar_temp_dir()), 1);
     remove_temp(&temporary).expect("remove NAR temporary publication file");
 }
 
@@ -2534,8 +2344,7 @@ fn directory_sync_rejects_a_symlinked_directory() {
 
 #[test]
 fn publication_rejects_a_symlinked_temporary_directory() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let temporary = storage.layout.nar_temp_dir();
     let real_temporary = directory.path().join("nar-tmp-real");
     let target = directory.path().join("external");
@@ -2553,18 +2362,12 @@ fn publication_rejects_a_symlinked_temporary_directory() {
             .is_err()
     );
     assert!(!storage.layout.nar_path(nar).exists());
-    assert!(
-        fs::read_dir(&target)
-            .expect("read external directory")
-            .next()
-            .is_none()
-    );
+    assert!(directory_entry_count(&target) == 0);
 }
 
 #[test]
 fn publication_rejects_a_symlinked_destination_directory() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let nar_dir = storage.layout.nar_dir();
     let real_nar_dir = directory.path().join("nar-real");
@@ -2591,8 +2394,7 @@ fn publication_rejects_a_symlinked_destination_directory() {
 
 #[test]
 fn reconciliation_rejects_a_symlinked_nar_directory() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let (directory, storage) = flat_storage_fixture();
     let nar_dir = storage.layout.nar_dir();
     let real_nar_dir = directory.path().join("nar-real");
     let external = directory.path().join("external");
@@ -2617,8 +2419,7 @@ fn reconciliation_rejects_a_symlinked_nar_directory() {
 
 #[test]
 fn delete_rejects_a_symlinked_narinfo() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("storage should initialize");
+    let (directory, storage) = flat_storage_fixture();
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
     let target = directory.path().join("external-narinfo");
     let link = directory.path().join(format!("{STORE_HASH}.narinfo"));
@@ -2635,8 +2436,7 @@ fn delete_rejects_a_symlinked_narinfo() {
 
 #[test]
 fn recovery_marker_distinguishes_clean_and_interrupted_publication() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
     assert!(
@@ -2662,8 +2462,7 @@ fn recovery_marker_distinguishes_clean_and_interrupted_publication() {
 
 #[test]
 fn recovery_cleans_incomplete_publication_transactions() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let trusted_keys = directory.path().join("trusted-public-keys");
     let temporary = directory.path().join(".tmp/cache-info-recovery.part");
     let nar_temporary = directory.path().join("nar/.tmp/nar-recovery.part");
@@ -2693,19 +2492,13 @@ fn recovery_cleans_incomplete_publication_transactions() {
 
     assert!(!temporary.exists());
     assert!(!nar_temporary.exists());
-    assert!(
-        fs::read_dir(directory.path().join(".narjar-transactions"))
-            .expect("read transaction directory")
-            .next()
-            .is_none()
-    );
+    assert!(directory_entry_count(directory.path().join(".narjar-transactions")) == 0);
     assert!(!storage.recovery_required().expect("inspect clean state"));
 }
 
 #[test]
 fn recovery_discards_abandoned_transaction_drafts_before_parsing_records() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let temporary = directory.path().join(".tmp/abandoned-draft.part");
     fs::write(&temporary, b"incomplete publication").expect("create publication temp");
     drop(
@@ -2747,18 +2540,14 @@ fn recovery_discards_abandoned_transaction_drafts_before_parsing_records() {
         "recovery removes the abandoned draft"
     );
     assert!(
-        fs::read_dir(&transaction_directory)
-            .expect("read recovered transaction directory")
-            .next()
-            .is_none(),
+        directory_entry_count(&transaction_directory) == 0,
         "recovery leaves no transaction entries"
     );
 }
 
 #[test]
 fn recovery_handles_the_initial_record_hard_link_before_draft_unlink() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let temporary = directory.path().join(".tmp/initial-link-window.part");
     fs::write(&temporary, b"interrupted publication").expect("create publication temp");
     drop(
@@ -2800,18 +2589,14 @@ fn recovery_handles_the_initial_record_hard_link_before_draft_unlink() {
         "recovery removes the leftover draft link"
     );
     assert!(
-        fs::read_dir(&transaction_directory)
-            .expect("read recovered transaction directory")
-            .next()
-            .is_none(),
+        directory_entry_count(&transaction_directory) == 0,
         "recovery leaves no transaction entries"
     );
 }
 
 #[test]
 fn recovery_rejects_invalid_destination_before_creating_a_record() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let invalid_destination = Path::new(std::ffi::OsStr::from_bytes(b"invalid-\xff-name"));
 
     assert!(
@@ -2822,18 +2607,14 @@ fn recovery_rejects_invalid_destination_before_creating_a_record() {
         "transaction paths must be validated before record publication"
     );
     assert!(
-        fs::read_dir(directory.path().join(".narjar-transactions"))
-            .expect("read transaction directory")
-            .next()
-            .is_none(),
+        directory_entry_count(directory.path().join(".narjar-transactions")) == 0,
         "a rejected transaction must not leave a partial authoritative record"
     );
 }
 
 #[test]
 fn recovery_requires_published_transaction_destinations() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     fs::write(
         directory.path().join("nix-cache-info"),
         b"Cache-Control: max-age=1\n",
@@ -2866,8 +2647,7 @@ fn recovery_requires_published_transaction_destinations() {
 
 #[test]
 fn recovery_keeps_evidence_when_published_destination_is_missing() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let mut transaction = storage
         .recovery
         .begin(
@@ -2900,8 +2680,7 @@ fn recovery_keeps_evidence_when_published_destination_is_missing() {
 #[test]
 fn text_publication_records_are_rejected_without_removing_their_files() {
     for state in ["linked", "published"] {
-        let directory = TestDir::new();
-        let storage = initialize_storage(directory.path()).expect("initialize storage");
+        let (directory, storage) = flat_storage_fixture();
         let trusted_keys = directory.path().join("trusted-public-keys");
         let temporary = directory.path().join(format!(".tmp/legacy-{state}.part"));
         let record = directory
@@ -2932,8 +2711,7 @@ fn text_publication_records_are_rejected_without_removing_their_files() {
 
 #[test]
 fn current_terminal_publication_transactions_still_require_destinations() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let temporary = directory.path().join(".tmp/missing-field.part");
     let record = directory
         .path()
@@ -2969,8 +2747,7 @@ fn recovery_records_publish_state_before_each_fault_boundary() {
         ),
         (PublishBoundary::BeforeParentSync, PublicationState::Linked),
     ] {
-        let directory = TestDir::new();
-        let storage = initialize_storage(directory.path()).expect("initialize storage");
+        let (directory, storage) = flat_storage_fixture();
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
         assert!(
@@ -3002,8 +2779,7 @@ fn recovery_records_publish_state_before_each_fault_boundary() {
 
 #[test]
 fn malformed_publication_transaction_blocks_recovery() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let trusted_keys = directory.path().join("trusted-public-keys");
     let record = directory
         .path()
@@ -3020,8 +2796,7 @@ fn malformed_publication_transaction_blocks_recovery() {
 
 #[test]
 fn malformed_publication_transaction_destination_blocks_recovery() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let trusted_keys = directory.path().join("trusted-public-keys");
     let temporary = directory.path().join(".tmp/malformed-destination.part");
     let record = directory
@@ -3047,8 +2822,7 @@ fn malformed_publication_transaction_destination_blocks_recovery() {
 
 #[test]
 fn unknown_publication_transaction_state_blocks_recovery() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let trusted_keys = directory.path().join("trusted-public-keys");
     let temporary = directory.path().join(".tmp/unknown-state.part");
     let record = directory
@@ -3071,8 +2845,7 @@ fn unknown_publication_transaction_state_blocks_recovery() {
 
 #[test]
 fn publication_is_immutable_idempotent_and_pair_gated() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
 
@@ -3137,18 +2910,14 @@ fn publication_is_immutable_idempotent_and_pair_gated() {
     assert_eq!(nar_bytes, b"nar bytes");
     assert_eq!(narinfo_bytes, b"narinfo bytes");
     assert!(
-        fs::read_dir(storage.layout().temp_dir())
-            .expect("read temp directory")
-            .next()
-            .is_none(),
+        directory_entry_count(storage.layout().temp_dir()) == 0,
         "completed attempts must not leave temporary files"
     );
 }
 
 #[test]
 fn narinfo_publication_is_idempotent_for_matching_logical_claims() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let identity = NarIdentity::new(nar, NarSize::new(11));
@@ -3255,8 +3024,7 @@ fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
         PublishBoundary::BeforeFinalLink,
         PublishBoundary::BeforeParentSync,
     ] {
-        let directory = TestDir::new();
-        let storage = initialize_storage(directory.path()).expect("initialize storage");
+        let (directory, storage) = flat_storage_fixture();
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
         assert!(
@@ -3270,16 +3038,11 @@ fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
             "{boundary:?} left a final NAR"
         );
         assert!(
-            fs::read_dir(storage.layout().temp_dir())
-                .expect("read temp directory")
-                .next()
-                .is_none(),
+            directory_entry_count(storage.layout().temp_dir()) == 0,
             "{boundary:?} left a temporary file"
         );
         assert_eq!(
-            fs::read_dir(directory.path().join(".narjar-transactions"))
-                .expect("read publication transaction directory")
-                .count(),
+            directory_entry_count(directory.path().join(".narjar-transactions")),
             1,
             "{boundary:?} lost its durable recovery record"
         );
@@ -3287,9 +3050,7 @@ fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
             .finish_recovery()
             .expect("recover failed publication");
         assert_eq!(
-            fs::read_dir(directory.path().join(".narjar-transactions"))
-                .expect("read recovered transaction directory")
-                .count(),
+            directory_entry_count(directory.path().join(".narjar-transactions")),
             0,
             "{boundary:?} left its recovery record"
         );
@@ -3298,8 +3059,7 @@ fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
 
 #[test]
 fn response_loss_after_parent_sync_is_visible_and_idempotent() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
 
@@ -3313,9 +3073,7 @@ fn response_loss_after_parent_sync_is_visible_and_idempotent() {
             .is_err()
     );
     assert_eq!(
-        fs::read_dir(directory.path().join(".narjar-transactions"))
-            .expect("read publication transaction directory")
-            .count(),
+        directory_entry_count(directory.path().join(".narjar-transactions")),
         0,
         "durable response loss must complete its transaction record"
     );
@@ -3355,8 +3113,7 @@ fn stream_resource_failures_leave_no_false_publication_state() {
         rustix::io::Errno::IO.raw_os_error(),
         rustix::io::Errno::NOSPC.raw_os_error(),
     ] {
-        let directory = TestDir::new();
-        let storage = initialize_storage(directory.path()).expect("initialize storage");
+        let (_directory, storage) = flat_storage_fixture();
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
         let error = storage
@@ -3370,12 +3127,7 @@ fn stream_resource_failures_leave_no_false_publication_state() {
         };
         assert_eq!(error.raw_os_error(), Some(raw_error));
         assert!(!storage.layout().nar_path(nar).exists());
-        assert!(
-            fs::read_dir(storage.layout().temp_dir())
-                .expect("read temp directory")
-                .next()
-                .is_none()
-        );
+        assert!(directory_entry_count(storage.layout().temp_dir()) == 0);
     }
 }
 
@@ -3724,8 +3476,7 @@ fn process_lock_replacement_probe() {
 
 #[test]
 fn reconciliation_is_deterministic_bounded_and_reports_manual_changes() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     fs::write(directory.path().join("manual"), b"manual").expect("write manual file");
     fs::write(directory.path().join("nar/not-valid.nar"), b"bad").expect("write malformed NAR");
     fs::write(directory.path().join(".tmp/nar-manual.part"), b"temp")
@@ -3763,8 +3514,7 @@ fn reconciliation_is_deterministic_bounded_and_reports_manual_changes() {
 
 #[test]
 fn cleanup_removes_only_reported_stale_temps() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let stale_path = directory.path().join(".tmp/nar-stale.part");
     fs::write(&stale_path, b"temp").expect("write stale temp");
 
@@ -3853,8 +3603,7 @@ fn cleanup_removes_only_reported_stale_temps() {
 
 #[test]
 fn cleanup_does_not_remove_a_replaced_stale_temp() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (directory, storage) = flat_storage_fixture();
     let path = directory.path().join(".tmp/nar-replaced.part");
     fs::write(&path, b"original").expect("write stale temp");
 
@@ -3883,8 +3632,7 @@ fn cleanup_does_not_remove_a_replaced_stale_temp() {
 
 #[test]
 fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
-    let directory = TestDir::new();
-    let storage = initialize_storage(directory.path()).expect("initialize storage");
+    let (_directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
     let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
     storage
