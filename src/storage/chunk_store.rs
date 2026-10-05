@@ -131,7 +131,7 @@ impl ChunkStore {
     }
 
     pub(crate) fn remove_abandoned_temporary_files(&self) -> io::Result<()> {
-        remove_abandoned_manifest_temps(&self.manifests)?;
+        remove_abandoned_temps(&self.manifests, ".manifest-")?;
         remove_abandoned_chunk_temps(&self.chunks)
     }
 
@@ -1606,24 +1606,6 @@ fn is_chunk_name(name: &OsStr) -> bool {
         .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-fn remove_abandoned_manifest_temps(directory: &File) -> io::Result<()> {
-    let removed = read_dir_names(directory)?
-        .into_iter()
-        .try_fold(false, |removed, name| {
-            let is_temporary = name
-                .to_str()
-                .is_some_and(|name| name.starts_with(".manifest-"));
-            if is_temporary {
-                unlink_at(directory, &name)?;
-            }
-            Ok::<_, io::Error>(removed || is_temporary)
-        })?;
-    if removed {
-        directory.sync_all()?;
-    }
-    Ok(())
-}
-
 fn remove_abandoned_chunk_temps(directory: &File) -> io::Result<()> {
     let removed =
         read_dir_names(directory)?
@@ -1715,7 +1697,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use super::{ChunkStore, ChunkStoreError, OFlags};
+    use super::{ChunkStore, ChunkStoreError, OFlags, remove_abandoned_temps};
     use crate::{
         object::{NarHash, NarIdentity, NarSize},
         storage::{
@@ -2500,6 +2482,36 @@ mod tests {
         assert!(report.deleted_chunks > 0);
         assert!(store.open_manifest(first_hash).unwrap().is_some());
         assert!(store.open_manifest(second_hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn abandoned_temp_cleanup_preserves_nonmatching_entries_and_symlink_targets() {
+        for prefix in [".manifest-", ".chunk-"] {
+            let root = tempdir().unwrap();
+            let directory = super::super::fs::open_directory(root.path()).unwrap();
+            std::fs::write(root.path().join("keep"), b"published content").unwrap();
+            std::fs::write(root.path().join(".unrelated"), b"unrelated content").unwrap();
+            let temporary = format!("{prefix}abandoned");
+            let link = format!("{prefix}link");
+            std::fs::write(root.path().join(&temporary), b"staging").unwrap();
+            std::os::unix::fs::symlink("keep", root.path().join(&link)).unwrap();
+
+            assert!(remove_abandoned_temps(&directory, prefix).unwrap());
+            assert_eq!(
+                std::fs::read(root.path().join("keep")).unwrap(),
+                b"published content"
+            );
+            assert_eq!(
+                std::fs::read(root.path().join(".unrelated")).unwrap(),
+                b"unrelated content"
+            );
+            assert!(!root.path().join(temporary).exists());
+            assert!(std::fs::symlink_metadata(root.path().join(link)).is_err());
+            assert!(
+                !remove_abandoned_temps(&directory, prefix).unwrap(),
+                "retry finds no staged entries"
+            );
+        }
     }
 
     #[test]
