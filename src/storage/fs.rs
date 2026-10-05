@@ -17,7 +17,8 @@ use std::{
 };
 
 use rustix::fs::{
-    self, AtFlags, Dir, FlockOperation, Mode, OFlags, RawMode, Stat, StatVfs, StatVfsMountFlags,
+    self, AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RawMode, Stat, StatVfs,
+    StatVfsMountFlags,
 };
 
 use super::publication::{StagingBudget, TemporaryFile};
@@ -55,7 +56,7 @@ pub(super) fn read_bounded_regular_file(
         }
         Err(error)
             if error.kind() == io::ErrorKind::InvalidData
-                || error.raw_os_error() == Some(libc::ELOOP) =>
+                || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
         {
             return Ok(BoundedRegularFile::Invalid);
         }
@@ -72,14 +73,14 @@ pub(super) fn read_bounded_regular_file(
 
 pub(crate) fn capacity_error_kind(raw_error: i32) -> CapacityErrorKind {
     match raw_error {
-        libc::ENOSPC => CapacityErrorKind::NoSpace,
-        libc::EDQUOT => CapacityErrorKind::Quota,
-        libc::EROFS => CapacityErrorKind::ReadOnly,
+        raw if raw == rustix::io::Errno::NOSPC.raw_os_error() => CapacityErrorKind::NoSpace,
+        raw if raw == rustix::io::Errno::DQUOT.raw_os_error() => CapacityErrorKind::Quota,
+        raw if raw == rustix::io::Errno::ROFS.raw_os_error() => CapacityErrorKind::ReadOnly,
         _ => CapacityErrorKind::Other,
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct StorageCapacity {
     pub total_bytes: u64,
     pub available_bytes: u64,
@@ -91,7 +92,9 @@ pub struct StorageCapacity {
 impl StorageCapacity {
     pub(super) fn required_capacity(self, required_bytes: u64) -> Result<(), StorageError> {
         if self.read_only {
-            return Err(StorageError::Io(io::Error::from_raw_os_error(libc::EROFS)));
+            return Err(StorageError::Io(io::Error::from_raw_os_error(
+                rustix::io::Errno::ROFS.raw_os_error(),
+            )));
         }
         if self.available_bytes < required_bytes {
             return Err(StorageError::InsufficientSpace);
@@ -267,11 +270,11 @@ pub(crate) fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File
 }
 
 pub(crate) fn entry_is_regular_at(directory: &File, name: &OsStr) -> io::Result<bool> {
-    Ok(entry_mode_at(directory, name)? & libc::S_IFMT == libc::S_IFREG)
+    Ok(FileType::from_raw_mode(entry_mode_at(directory, name)?) == FileType::RegularFile)
 }
 
 pub(crate) fn entry_is_directory_at(directory: &File, name: &OsStr) -> io::Result<bool> {
-    Ok(entry_mode_at(directory, name)? & libc::S_IFMT == libc::S_IFDIR)
+    Ok(FileType::from_raw_mode(entry_mode_at(directory, name)?) == FileType::Directory)
 }
 
 pub(crate) fn entry_identity_at(
@@ -298,8 +301,8 @@ pub(super) fn metadata_change_time(metadata: &Stat) -> (i64, i64) {
     (metadata.st_ctime, metadata.st_ctime_nsec)
 }
 
-pub(super) fn entry_mode_at(directory: &File, name: &OsStr) -> io::Result<libc::mode_t> {
-    Ok(entry_stat_at(directory, name)?.st_mode as libc::mode_t)
+pub(super) fn entry_mode_at(directory: &File, name: &OsStr) -> io::Result<RawMode> {
+    Ok(entry_stat_at(directory, name)?.st_mode as RawMode)
 }
 
 pub(super) fn entry_stat_at(directory: &File, name: &OsStr) -> io::Result<Stat> {
@@ -511,7 +514,7 @@ mod tests {
                 OsStr::from_bytes(b"link-\xff"),
                 OsStr::from_bytes(b"renamed-\xff"),
             ),
-            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) => {
                 hard_link_at(&directory, source, &directory, OsStr::new("link"))
                     .expect("hard link symlink itself");
                 (OsStr::new("link"), OsStr::new("renamed"))
@@ -534,7 +537,7 @@ mod tests {
             open_regular_at(&directory, link)
                 .expect_err("must not follow symlink")
                 .raw_os_error(),
-            Some(libc::ELOOP),
+            Some(rustix::io::Errno::LOOP.raw_os_error()),
         );
 
         rename_at(&directory, link, &directory, renamed).expect("rename raw-byte link");
@@ -547,7 +550,7 @@ mod tests {
             entry_stat_at(&directory, renamed)
                 .expect_err("link removed")
                 .raw_os_error(),
-            Some(libc::ENOENT)
+            Some(rustix::io::Errno::NOENT.raw_os_error())
         );
         assert!(
             entry_stat_at(&directory, source).is_ok(),
@@ -610,7 +613,9 @@ mod tests {
     #[test]
     fn injected_readdir_error_propagates() {
         let result = visit_directory_names(
-            std::iter::once(Err(io::Error::from_raw_os_error(libc::EIO))),
+            std::iter::once(Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error(),
+            ))),
             |_| Ok(DirectoryEntryAction::Continue),
         );
 
@@ -618,7 +623,7 @@ mod tests {
             result
                 .expect_err("incomplete enumeration must fail")
                 .raw_os_error(),
-            Some(libc::EIO)
+            Some(rustix::io::Errno::IO.raw_os_error())
         );
     }
 
@@ -633,7 +638,9 @@ mod tests {
 
         let error = read_dir_names_with(std::iter::from_fn(|| {
             if returned_live_name {
-                return Some(Err(io::Error::from_raw_os_error(libc::EIO)));
+                return Some(Err(io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                )));
             }
             let entry = entries.next()?;
             if let Ok(name) = &entry {
@@ -647,7 +654,10 @@ mod tests {
             returned_live_name,
             "the real entry must precede the injected error"
         );
-        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::IO.raw_os_error())
+        );
     }
 
     #[test]
@@ -687,11 +697,16 @@ mod tests {
         let directory = open_directory(directory.path()).expect("directory should open");
 
         let error = for_each_dir_name(&directory, |_| {
-            Err(io::Error::from_raw_os_error(libc::EACCES))
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::ACCESS.raw_os_error(),
+            ))
         })
         .expect_err("visitor error should propagate");
 
-        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::ACCESS.raw_os_error())
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -675,7 +675,9 @@ impl Storage {
             Ok(()) => StorageReadiness::Ready,
             Err(StorageError::InsufficientSpace) => StorageReadiness::LowSpace,
             Err(StorageError::InsufficientInodes) => StorageReadiness::NoInodes,
-            Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EROFS) => {
+            Err(StorageError::Io(error))
+                if error.raw_os_error() == Some(rustix::io::Errno::ROFS.raw_os_error()) =>
+            {
                 StorageReadiness::ReadOnly
             }
             Err(_) => StorageReadiness::ProbeFailed,

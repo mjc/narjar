@@ -25,6 +25,7 @@ use narjar::__private::{
     },
 };
 use narjar::object::WireEncoding;
+use serde::Serialize;
 use ureq::Agent;
 
 use crate::{
@@ -200,7 +201,7 @@ fn report(
         let inventory = scan_inventory(storage, trusted, mode.verification_mode(verify_hashes))?;
         let inventory_class_counts = inventory_class_counts(&inventory);
         let invalid_pairs = invalid_published_pair_count(&inventory);
-        print_inventory_findings(&inventory, mode, json);
+        print_inventory_findings(&inventory, mode, json)?;
 
         let failed_verification = mode.verification_failed(invalid_pairs);
         Ok((
@@ -250,22 +251,35 @@ fn invalid_published_pair_count(inventory: &Inventory) -> u64 {
         .count() as u64
 }
 
-fn print_inventory_findings(inventory: &Inventory, mode: ReportMode, json: bool) {
+fn print_inventory_findings(
+    inventory: &Inventory,
+    mode: ReportMode,
+    json: bool,
+) -> Result<(), Error> {
     inventory
         .entries()
         .iter()
         .filter(|finding| mode.includes_finding(finding.class()))
-        .for_each(|finding| print_inventory_finding(finding, json));
+        .try_for_each(|finding| print_inventory_finding(finding, json))
 }
 
-fn print_inventory_finding(finding: &InventoryEntry, json: bool) {
+#[derive(Serialize)]
+struct FindingRecord<'a> {
+    class: &'a str,
+    identifier: &'a str,
+    action: &'a str,
+}
+
+fn print_inventory_finding(finding: &InventoryEntry, json: bool) -> Result<(), Error> {
     if json {
-        println!(
-            "{{\"class\":\"{}\",\"identifier\":\"{}\",\"action\":\"{}\"}}",
-            finding.class(),
-            json_escape(finding.identifier()),
-            finding.class().action()
-        );
+        write_json_line(
+            std::io::stdout().lock(),
+            &FindingRecord {
+                class: finding.class().as_str(),
+                identifier: finding.identifier(),
+                action: finding.class().action(),
+            },
+        )?;
     } else {
         println!(
             "{}\t{}\t{}",
@@ -274,6 +288,7 @@ fn print_inventory_finding(finding: &InventoryEntry, json: bool) {
             finding.class().action()
         );
     }
+    Ok(())
 }
 
 fn structural_report(
@@ -408,7 +423,7 @@ fn process_structural_entry(
     json: bool,
 ) -> Result<StructuralEntryResult, Error> {
     let (output_action, result) = structural_entry_action(storage, entry, action)?;
-    print_structural_entry(entry.class(), entry.relative_path(), output_action, json);
+    print_structural_entry(entry.class(), entry.relative_path(), output_action, json)?;
     Ok(result)
 }
 
@@ -436,17 +451,31 @@ fn cleanup_structural_entry(
     }
 }
 
-fn print_structural_entry(class: ReconcileClass, path: &Path, action: &str, json: bool) {
+fn print_structural_entry(
+    class: ReconcileClass,
+    path: &Path,
+    action: &str,
+    json: bool,
+) -> Result<(), Error> {
     if json {
-        println!(
-            "{{\"class\":\"{}\",\"path\":\"{}\",\"action\":\"{}\"}}",
-            class.as_str(),
-            json_escape(&path.to_string_lossy()),
-            action
-        );
+        #[derive(Serialize)]
+        struct StructuralRecord<'a> {
+            class: &'a str,
+            path: std::borrow::Cow<'a, str>,
+            action: &'a str,
+        }
+        write_json_line(
+            std::io::stdout().lock(),
+            &StructuralRecord {
+                class: class.as_str(),
+                path: path.to_string_lossy(),
+                action,
+            },
+        )?;
     } else {
         println!("{}\t{}\t{}", class.as_str(), path.display(), action);
     }
+    Ok(())
 }
 
 #[derive(Args)]
@@ -516,34 +545,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
     };
 
     if json {
-        println!(
-            "{{\"accounting_basis\":\"{}\",\"dry_run\":{},\"before_bytes\":{},\"after_bytes\":{},\"target_met\":{},\"candidates\":{},\"protected\":{},\"eligible\":{},\"evicted\":{},\"shared\":{},\"orphaned\":{},\"temporary\":{},\"malformed\":{},\"missing_roots\":{},\"missing_references\":{},\"protected_bytes\":{},\"eligible_bytes\":{},\"evicted_bytes\":{},\"shared_bytes\":{},\"orphaned_bytes\":{},\"temporary_bytes\":{},\"malformed_bytes\":{},\"deleted_narinfos\":{},\"deleted_nars\":{},\"deleted_orphans\":{}}}",
-            report.accounting_basis,
-            report.dry_run,
-            report.before_bytes,
-            report.after_bytes,
-            report.target_met,
-            report.candidates,
-            report.protected,
-            report.eligible,
-            report.evicted,
-            report.shared,
-            report.orphaned,
-            report.temporary,
-            report.malformed,
-            report.missing_roots,
-            report.missing_references,
-            report.protected_bytes,
-            report.eligible_bytes,
-            report.evicted_bytes,
-            report.shared_bytes,
-            report.orphaned_bytes,
-            report.temporary_bytes,
-            report.malformed_bytes,
-            report.deleted_narinfos,
-            report.deleted_nars,
-            report.deleted_orphans,
-        );
+        write_json_line(std::io::stdout().lock(), &report)?;
     } else {
         println!(
             "accounting_basis={} dry_run={} before_bytes={} after_bytes={} target_met={} candidates={} protected={} eligible={} evicted={} shared={} orphaned={} temporary={} malformed={} missing_roots={} missing_references={} protected_bytes={} eligible_bytes={} evicted_bytes={} shared_bytes={} orphaned_bytes={} temporary_bytes={} malformed_bytes={} deleted_narinfos={} deleted_nars={} deleted_orphans={}",
@@ -633,10 +635,14 @@ pub(crate) fn delete(options: Delete) -> Result<(), Error> {
     })?;
 
     if json {
-        println!(
-            "{{\"class\":\"deleted\",\"identifier\":\"{}\",\"action\":\"narinfo removed; NAR retained\"}}",
-            json_escape(&route)
-        );
+        write_json_line(
+            std::io::stdout().lock(),
+            &FindingRecord {
+                class: "deleted",
+                identifier: &route,
+                action: "narinfo removed; NAR retained",
+            },
+        )?;
     } else {
         println!("deleted\t{route}");
     }
@@ -686,7 +692,8 @@ impl Doctor {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum DoctorSeverity {
     Ok,
     Warning,
@@ -712,6 +719,7 @@ impl DoctorSeverity {
     }
 }
 
+#[derive(Serialize)]
 struct DoctorPath {
     path: &'static str,
     required: bool,
@@ -723,8 +731,10 @@ struct DoctorPath {
     detail: String,
 }
 
+#[derive(Serialize)]
 struct DoctorCapacity {
     path: &'static str,
+    #[serde(flatten)]
     capacity: StorageCapacity,
     device: u64,
 }
@@ -740,6 +750,7 @@ struct DoctorReport {
     source: DoctorSource,
 }
 
+#[derive(Serialize)]
 struct DoctorSource {
     name: &'static str,
     severity: DoctorSeverity,
@@ -774,7 +785,7 @@ pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
     report.source = inspect_doctor_source(&options, source);
     let failed = report.has_failures();
     if options.json {
-        println!("{}", doctor_json(&report));
+        write_json_line(std::io::stdout().lock(), &doctor_json(&report))?;
     } else {
         print_doctor(&report);
     }
@@ -829,8 +840,8 @@ fn inspect_doctor(root: &Path, backend: SupportedStorageBackend) -> Result<Docto
         Ok(file) => match doctor_try_lease(&file) {
             Ok(()) => (DoctorSeverity::Ok, "lease is available".to_owned()),
             Err(error)
-                if error.raw_os_error() == Some(libc::EWOULDBLOCK)
-                    || error.raw_os_error() == Some(libc::EAGAIN) =>
+                if error.raw_os_error() == Some(rustix::io::Errno::WOULDBLOCK.raw_os_error())
+                    || error.raw_os_error() == Some(rustix::io::Errno::AGAIN.raw_os_error()) =>
             {
                 (
                     DoctorSeverity::Warning,
@@ -1010,22 +1021,37 @@ fn doctor_try_lease(file: &File) -> Result<(), std::io::Error> {
         .map_err(Into::into)
 }
 
-fn doctor_json(report: &DoctorReport) -> String {
-    let paths = report.paths.iter().map(|path| format!("{{\"path\":\"{}\",\"required\":{},\"kind\":\"{}\",\"mode\":{},\"uid\":{},\"gid\":{},\"severity\":\"{}\",\"detail\":\"{}\"}}", json_escape(path.path), path.required, json_escape(path.kind), path.mode.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.uid.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.gid.map_or_else(|| "null".to_owned(), |value| value.to_string()), path.severity.as_str(), json_escape(&path.detail))).collect::<Vec<_>>().join(",");
-    let capacities = report.capacities.iter().map(|capacity| format!("{{\"path\":\"{}\",\"total_bytes\":{},\"available_bytes\":{},\"total_inodes\":{},\"available_inodes\":{},\"read_only\":{},\"device\":{}}}", capacity.path, capacity.capacity.total_bytes, capacity.capacity.available_bytes, capacity.capacity.total_inodes, capacity.capacity.available_inodes, capacity.capacity.read_only, capacity.device)).collect::<Vec<_>>().join(",");
-    format!(
-        "{{\"schema\":1,\"data_dir\":\"{}\",\"source\":{{\"name\":\"{}\",\"severity\":\"{}\",\"detail\":\"{}\"}},\"mount\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"lease\":{{\"severity\":\"{}\",\"detail\":\"{}\"}},\"paths\":[{}],\"capacity\":[{}]}}",
-        json_escape(&report.root.to_string_lossy()),
-        report.source.name,
-        report.source.severity.as_str(),
-        json_escape(report.source.detail),
-        report.mount.as_str(),
-        json_escape(&report.mount_detail),
-        report.lease.as_str(),
-        json_escape(&report.lease_detail),
-        paths,
-        capacities
-    )
+fn doctor_json(report: &DoctorReport) -> impl Serialize + '_ {
+    #[derive(Serialize)]
+    struct Check<'a> {
+        severity: DoctorSeverity,
+        detail: &'a str,
+    }
+    #[derive(Serialize)]
+    struct Report<'a> {
+        schema: u8,
+        data_dir: std::borrow::Cow<'a, str>,
+        source: &'a DoctorSource,
+        mount: Check<'a>,
+        lease: Check<'a>,
+        paths: &'a [DoctorPath],
+        capacity: &'a [DoctorCapacity],
+    }
+    Report {
+        schema: 1,
+        data_dir: report.root.to_string_lossy(),
+        source: &report.source,
+        mount: Check {
+            severity: report.mount,
+            detail: &report.mount_detail,
+        },
+        lease: Check {
+            severity: report.lease,
+            detail: &report.lease_detail,
+        },
+        paths: &report.paths,
+        capacity: &report.capacities,
+    }
 }
 
 fn print_doctor(report: &DoctorReport) {
@@ -1220,23 +1246,9 @@ fn runtime(error: impl std::fmt::Display) -> Error {
     Error::runtime(error.to_string())
 }
 
-fn json_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            character if character.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(escaped, "\\u{:04x}", character as u32);
-            }
-            character => escaped.push(character),
-        }
-    }
-    escaped
+fn write_json_line(mut writer: impl Write, value: &impl Serialize) -> Result<(), Error> {
+    serde_json::to_writer(&mut writer, value).map_err(runtime)?;
+    writer.write_all(b"\n").map_err(runtime)
 }
 
 #[cfg(test)]
@@ -1244,6 +1256,66 @@ mod tests {
     use super::*;
     use narjar::__private::maintenance::{Operation, Outcome};
     use narjar::__private::storage::{CacheCreation, Directory, SupportedStorageBackend};
+
+    #[test]
+    fn json_lines_preserve_strings_and_end_with_one_newline() {
+        let record = FindingRecord {
+            class: "invalid",
+            identifier: "quotes\" backslash\\ newline\n tab\t nul\0 café",
+            action: "inspect",
+        };
+        let mut output = Vec::new();
+        write_json_line(&mut output, &record).unwrap();
+        assert_eq!(output.last(), Some(&b'\n'));
+        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["identifier"], record.identifier);
+        assert_eq!(value["class"], record.class);
+        assert_eq!(value["action"], record.action);
+    }
+
+    #[test]
+    fn json_lines_propagate_body_and_newline_write_failures() {
+        struct FailsAfter(usize);
+        impl Write for FailsAfter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "report sink closed",
+                    ));
+                }
+                let length = bytes.len().min(self.0);
+                self.0 -= length;
+                Ok(length)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for remaining in [0, 4] {
+            let error = write_json_line(FailsAfter(remaining), &true).unwrap_err();
+            assert!(error.to_string().contains("report sink closed"));
+        }
+    }
+
+    #[test]
+    fn doctor_json_preserves_lossy_paths_nulls_and_flat_capacity_fields() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = initialized_doctor_cache();
+        let mut report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT).unwrap();
+        report.root = PathBuf::from(std::ffi::OsString::from_vec(b"cache-\xff".to_vec()));
+        report.mount_detail = "quote\" slash\\\n\0".into();
+        report.paths[0].mode = None;
+        let value = serde_json::to_value(doctor_json(&report)).unwrap();
+        assert_eq!(value["schema"], 1);
+        assert_eq!(value["data_dir"], "cache-�");
+        assert_eq!(value["mount"]["detail"], report.mount_detail);
+        assert!(value["paths"][0]["mode"].is_null());
+        assert!(value["capacity"][0]["available_bytes"].is_u64());
+        assert!(value["capacity"][0]["read_only"].is_boolean());
+        assert!(value["capacity"][0].get("capacity").is_none());
+    }
 
     #[test]
     fn managed_file_conflict_never_replaces_existing_contents_or_leaves_temps() {
@@ -1306,11 +1378,11 @@ machine other.example password other-secret
 
         let history = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should be readable");
-        let run = history.last_runs[Operation::Gc.index()].expect("GC result should be recorded");
+        let run = history.last_runs[Operation::Gc].expect("GC result should be recorded");
         assert_eq!(run.outcome, Outcome::Success);
         assert_eq!(run.objects_selected, Some(0));
         assert_eq!(run.objects_reclaimed, None);
-        assert_eq!(history.started[Operation::Gc.index()], None);
+        assert_eq!(history.started[Operation::Gc], None);
 
         init(Init {
             data_dir: directory.path().to_owned(),
@@ -1373,13 +1445,10 @@ machine other.example password other-secret
 
         let after = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should remain readable");
+        assert_eq!(after.started[Operation::Gc], before.started[Operation::Gc]);
         assert_eq!(
-            after.started[Operation::Gc.index()],
-            before.started[Operation::Gc.index()]
-        );
-        assert_eq!(
-            after.last_runs[Operation::Gc.index()],
-            before.last_runs[Operation::Gc.index()]
+            after.last_runs[Operation::Gc],
+            before.last_runs[Operation::Gc]
         );
     }
 
@@ -1546,12 +1615,12 @@ machine other.example password other-secret
 
         let history = narjar::__private::maintenance::read_snapshot(directory.path())
             .expect("maintenance history should be readable");
-        let run = history.last_runs[Operation::Verify.index()]
-            .expect("verification result should be recorded");
+        let run =
+            history.last_runs[Operation::Verify].expect("verification result should be recorded");
         assert_eq!(run.outcome, Outcome::Failure);
         assert_eq!(run.objects_examined, Some(2));
         assert_eq!(run.inventory_class_counts, Some([0, 0, 0, 1, 0, 0, 1]));
-        assert_eq!(history.started[Operation::Verify.index()], None);
+        assert_eq!(history.started[Operation::Verify], None);
     }
 
     #[test]
@@ -1852,7 +1921,7 @@ machine other.example password other-secret
 
         let report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
             .expect("doctor should inspect cache");
-        let json = doctor_json(&report);
+        let json = serde_json::to_string(&doctor_json(&report)).unwrap();
         assert!(json.contains("\"schema\":1"));
         assert!(json.contains("\"mount\":{\"severity\":\"ok\""));
         assert!(json.contains("\"path\":\"nar\""));
@@ -2008,7 +2077,7 @@ machine other.example password other-secret
         let mut report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
             .expect("doctor should inspect cache");
         report.source = inspect_doctor_source(&options, options.prepare_source());
-        let json = doctor_json(&report);
+        let json = serde_json::to_string(&doctor_json(&report)).unwrap();
 
         assert!(json.contains("\"name\":\"native-store\""));
         assert!(json.contains("\"detail\":\"Nix store path is unavailable or unsafe\""));

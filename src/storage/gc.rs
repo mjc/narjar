@@ -38,6 +38,7 @@ pub struct GcOptions {
     pub backend: StorageBackend,
 }
 
+#[derive(serde::Serialize)]
 pub struct GcReport {
     pub accounting_basis: &'static str,
     pub dry_run: bool,
@@ -100,19 +101,13 @@ struct ChunkedEntry {
     protected: bool,
 }
 
-struct ChunkedProtectionReport {
-    protected: usize,
-    missing_roots: usize,
-    missing_references: usize,
-}
-
 struct ChunkedGcReportInput<'a> {
     before_entries: &'a [ChunkedEntry],
     before_bytes: u64,
     after_bytes: u64,
     target_bytes: Option<u64>,
     dry_run: bool,
-    protection: ChunkedProtectionReport,
+    protection: ProtectionReport,
     protected_bytes: u64,
     eligible: usize,
     eligible_bytes: u64,
@@ -301,7 +296,14 @@ fn run_flat_gc(
     mut scan_entries: impl FnMut(&Storage, &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError>,
 ) -> Result<GcReport, StorageError> {
     let mut entries = scan_entries(storage, trusted)?;
-    let protection = protect(&mut entries, options.protected_roots.as_deref())?;
+    let protection = protect(&mut entries, options.protected_roots.as_deref(), |entry| {
+        ProtectionNode {
+            store: &entry.store,
+            store_path: &entry.store_path,
+            references: &entry.references,
+            protected: &mut entry.protected,
+        }
+    })?;
     let orphans = scan_orphans(storage, &entries)?;
     let protected_bytes = category_bytes(&entries, |entry| entry.protected);
 
@@ -400,7 +402,7 @@ fn scan_with_directory_names(
             }
             Err(error)
                 if error.kind() == io::ErrorKind::InvalidData
-                    || error.raw_os_error() == Some(libc::ELOOP) =>
+                    || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
             {
                 return Err(invalid(format!(
                     "narinfo is not a regular file: {name_str}"
@@ -475,7 +477,14 @@ fn run_chunked(
     target_bytes: Option<u64>,
 ) -> Result<GcReport, StorageError> {
     let mut entries = scan_chunked(storage, chunk_store, trusted)?;
-    let protection = protect_chunked(&mut entries, options.protected_roots.as_deref())?;
+    let protection = protect(&mut entries, options.protected_roots.as_deref(), |entry| {
+        ProtectionNode {
+            store: &entry.store,
+            store_path: &entry.store_path,
+            references: &entry.references,
+            protected: &mut entry.protected,
+        }
+    })?;
     let now = SystemTime::now();
     let orphans = scan_chunked_orphans(storage, chunk_store, &entries)?;
     let before_bytes = chunked_before_bytes(storage, chunk_store, &entries)?;
@@ -818,55 +827,6 @@ fn age_reached(modified: SystemTime, now: SystemTime, age: Duration) -> bool {
 
 fn chunk_store_error(error: impl std::error::Error + Send + Sync + 'static) -> StorageError {
     StorageError::Io(io::Error::other(error))
-}
-
-fn protect_chunked(
-    entries: &mut [ChunkedEntry],
-    path: Option<&Path>,
-) -> Result<ChunkedProtectionReport, StorageError> {
-    let Some(path) = path else {
-        return Ok(ChunkedProtectionReport {
-            protected: 0,
-            missing_roots: 0,
-            missing_references: 0,
-        });
-    };
-    let contents = fs::read_to_string(path)?;
-    let mut roots = BTreeSet::new();
-    for root in contents
-        .lines()
-        .map(str::trim)
-        .filter(|root| !root.is_empty())
-    {
-        validate_root(root)?;
-        roots.insert(root.to_owned());
-    }
-    let mut pending = roots.iter().cloned().collect::<Vec<_>>();
-    let mut missing_roots = BTreeSet::new();
-    let mut missing_references = BTreeSet::new();
-    while let Some(root) = pending.pop() {
-        let Some(index) = entries
-            .iter()
-            .position(|entry| entry.store_path == root || entry.store.as_str() == root)
-        else {
-            if roots.contains(&root) {
-                missing_roots.insert(root);
-            } else {
-                missing_references.insert(root);
-            }
-            continue;
-        };
-        if entries[index].protected {
-            continue;
-        }
-        entries[index].protected = true;
-        pending.extend(entries[index].references.iter().cloned());
-    }
-    Ok(ChunkedProtectionReport {
-        protected: entries.iter().filter(|entry| entry.protected).count(),
-        missing_roots: missing_roots.len(),
-        missing_references: missing_references.len(),
-    })
 }
 
 fn is_chunked_eligible(entry: &ChunkedEntry, now: SystemTime, min_age: Duration) -> bool {
@@ -1350,7 +1310,18 @@ fn eligible_bytes(
         .sum::<u64>()
 }
 
-fn protect(entries: &mut [Entry], path: Option<&Path>) -> Result<ProtectionReport, StorageError> {
+struct ProtectionNode<'a> {
+    store: &'a StoreHash,
+    store_path: &'a str,
+    references: &'a [String],
+    protected: &'a mut bool,
+}
+
+fn protect<E>(
+    entries: &mut [E],
+    path: Option<&Path>,
+    project: impl for<'a> Fn(&'a mut E) -> ProtectionNode<'a>,
+) -> Result<ProtectionReport, StorageError> {
     let Some(path) = path else {
         return Ok(ProtectionReport {
             protected: 0,
@@ -1359,40 +1330,52 @@ fn protect(entries: &mut [Entry], path: Option<&Path>) -> Result<ProtectionRepor
         });
     };
     let contents = fs::read_to_string(path)?;
-    let mut roots = BTreeSet::new();
-    for root in contents
+    let roots = contents
         .lines()
         .map(str::trim)
         .filter(|root| !root.is_empty())
-    {
-        validate_root(root)?;
-        roots.insert(root.to_owned());
-    }
+        .try_fold(BTreeSet::new(), |mut roots, root| {
+            validate_root(root)?;
+            roots.insert(root.to_owned());
+            Ok::<_, StorageError>(roots)
+        })?;
 
     let mut pending = roots.iter().cloned().collect::<Vec<_>>();
     let mut missing_roots = BTreeSet::new();
     let mut missing_references = BTreeSet::new();
-    while let Some(root) = pending.pop() {
-        let Some(index) = entries
-            .iter()
-            .position(|entry| entry.store_path == root || entry.store.as_str() == root)
-        else {
-            if roots.contains(&root) {
-                missing_roots.insert(root);
-            } else {
-                missing_references.insert(root);
+    std::iter::from_fn(|| {
+        let root = pending.pop()?;
+        match entries
+            .iter_mut()
+            .map(&project)
+            .find(|entry| entry.store_path == root || entry.store.as_str() == root)
+        {
+            Some(entry) => match *entry.protected {
+                true => {}
+                false => {
+                    *entry.protected = true;
+                    pending.extend(entry.references.iter().cloned());
+                }
+            },
+            None => {
+                let missing = if roots.contains(&root) {
+                    &mut missing_roots
+                } else {
+                    &mut missing_references
+                };
+                missing.insert(root);
             }
-            continue;
-        };
-        if entries[index].protected {
-            continue;
         }
-        entries[index].protected = true;
-        pending.extend(entries[index].references.iter().cloned());
-    }
+        Some(())
+    })
+    .for_each(drop);
 
     Ok(ProtectionReport {
-        protected: entries.iter().filter(|entry| entry.protected).count(),
+        protected: entries
+            .iter_mut()
+            .map(project)
+            .filter(|entry| *entry.protected)
+            .count(),
         missing_roots: missing_roots.len(),
         missing_references: missing_references.len(),
     })
@@ -1688,6 +1671,57 @@ mod tests {
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
         CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
             .and_then(|creation| creation.create_or_complete())
+    }
+
+    #[test]
+    fn shared_protection_traversal_handles_cycles_aliases_and_missing_paths_once() {
+        struct Node {
+            store: StoreHash,
+            path: String,
+            references: Vec<String>,
+            protected: bool,
+        }
+        let a = "00000000000000000000000000000000";
+        let b = "11111111111111111111111111111111";
+        let missing_root = "22222222222222222222222222222222";
+        let missing_reference = "33333333333333333333333333333333";
+        let mut entries = [
+            Node {
+                store: StoreHash::parse(a).unwrap(),
+                path: format!("/nix/store/{a}-a"),
+                references: vec![b.into(), b.into(), missing_reference.into()],
+                protected: false,
+            },
+            Node {
+                store: StoreHash::parse(b).unwrap(),
+                path: format!("/nix/store/{b}-b"),
+                references: vec![a.into(), missing_reference.into()],
+                protected: false,
+            },
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("roots");
+        fs::write(
+            &path,
+            format!("{a}\n/nix/store/{a}-a\n{missing_root}\n{missing_root}\n\n"),
+        )
+        .unwrap();
+        let report = protect(&mut entries, Some(&path), |entry| ProtectionNode {
+            store: &entry.store,
+            store_path: &entry.path,
+            references: &entry.references,
+            protected: &mut entry.protected,
+        })
+        .unwrap();
+        assert_eq!(
+            (
+                report.protected,
+                report.missing_roots,
+                report.missing_references
+            ),
+            (2, 1, 1)
+        );
+        assert!(entries.iter().all(|entry| entry.protected));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2008,7 +2042,9 @@ mod tests {
             Some(0),
             |storage, trusted| {
                 scan_with_directory_names(storage, trusted, |_| {
-                    Err(io::Error::from_raw_os_error(libc::EIO))
+                    Err(io::Error::from_raw_os_error(
+                        rustix::io::Errno::IO.raw_os_error(),
+                    ))
                 })
             },
         );
@@ -2571,7 +2607,11 @@ mod tests {
                 .env("NARJAR_GC_SIGTERM_PROBE_DATA", directory.path())
                 .output()
                 .expect("GC interruption child should start");
-        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+        assert_eq!(
+            output.status.signal(),
+            Some(signal_hook::consts::SIGTERM),
+            "{output:?}"
+        );
         assert!(
             !orphan.exists(),
             "GC must delete the orphan before interruption"
@@ -2631,10 +2671,9 @@ mod tests {
                             storage.recovery_required().unwrap(),
                             "GC cannot clear recovery before its post-deletion scan"
                         );
-                        // SAFETY: this probe runs only in its own child process. `raise`
-                        // takes no pointers and delivers SIGTERM to that process;
-                        // the parent and parallel tests are not signaled.
-                        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                        // This probe runs in its own child; parallel tests are not signaled.
+                        signal_hook::low_level::raise(signal_hook::consts::SIGTERM)
+                            .expect("SIGTERM should be raised in the GC probe");
                         panic!("SIGTERM must terminate the GC probe before completion");
                     }
                 }

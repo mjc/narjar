@@ -1,4 +1,4 @@
-use std::{collections::HashSet, ffi::OsStr, fs::File, io, io::Write};
+use std::{collections::HashSet, ffi::OsStr, fs::File, io};
 
 use sha2::{Digest, Sha256};
 
@@ -259,7 +259,7 @@ fn verify_storage_canonical_nar_content(
         Err(error) => return classify_storage_error(error),
     };
 
-    let mut hasher = NarContentHasher::new();
+    let mut hasher = digest_io::IoWrapper(Sha256::new());
     let bytes = match io::copy(&mut opened.body, &mut hasher) {
         Ok(bytes) => bytes,
         Err(error) => return classify_io_error(error),
@@ -267,33 +267,10 @@ fn verify_storage_canonical_nar_content(
     if bytes != identity.size().get() {
         return Ok(InventoryClass::HashOrSizeMismatch);
     }
-    if hasher.finish() != identity.hash() {
+    if NarHash::from_digest(hasher.0.finalize().into()) != identity.hash() {
         return Ok(InventoryClass::HashOrSizeMismatch);
     }
     Ok(InventoryClass::ValidPair)
-}
-
-struct NarContentHasher(Sha256);
-
-impl NarContentHasher {
-    fn new() -> Self {
-        Self(Sha256::new())
-    }
-
-    fn finish(self) -> NarHash {
-        NarHash::from_digest(self.0.finalize().into())
-    }
-}
-
-impl Write for NarContentHasher {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 fn classify_storage_error(error: crate::storage::StorageError) -> io::Result<InventoryClass> {

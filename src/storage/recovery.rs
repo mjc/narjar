@@ -8,7 +8,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use rustix::fs::OFlags;
+use rustix::fs::{FileType, OFlags};
 
 use sha2::{Digest, Sha256};
 
@@ -374,7 +374,7 @@ impl RecoveryState {
             .collect::<io::Result<Vec<_>>>()?;
         for entry in &entries {
             let mode = entry_mode_at(&self.transactions, entry.name())?;
-            if mode & libc::S_IFMT != libc::S_IFREG || mode & 0o133 != 0 {
+            if FileType::from_raw_mode(mode) != FileType::RegularFile || mode & 0o133 != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "publication transaction entry has unsafe type or permissions",

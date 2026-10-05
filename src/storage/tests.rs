@@ -817,10 +817,10 @@ fn failed_generic_publication_stream_cleans_up_staging() {
     let result = storage
         .begin_publication(target, |_| Ok(()))
         .unwrap()
-        .finish_and_sync(BrokenReader::new(libc::EIO));
+        .finish_and_sync(BrokenReader::new(rustix::io::Errno::IO.raw_os_error()));
 
     assert!(
-        matches!(result, Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EIO))
+        matches!(result, Err(StorageError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()))
     );
     assert_eq!(storage.temporary_objects(), 0);
     assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
@@ -850,9 +850,10 @@ fn a_completed_upload_commits_its_own_bytes_and_releases_resources() {
 fn source_errors_and_unwinding_release_upload_resources() {
     let directory = TestDir::new();
     let storage = initialize_storage(directory.path()).unwrap();
-    let failed = begin_raw_upload(&storage, b"raw NAR").receive(BrokenReader::new(libc::EIO));
+    let failed = begin_raw_upload(&storage, b"raw NAR")
+        .receive(BrokenReader::new(rustix::io::Errno::IO.raw_os_error()));
     assert!(
-        matches!(failed, Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EIO))
+        matches!(failed, Err(StorageError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()))
     );
     assert_upload_resources_released(&storage);
     assert_eq!(transaction_record_count(&storage), 0);
@@ -898,7 +899,9 @@ fn rejected_and_disconnected_uploads_do_not_accumulate_transactions() {
         let receiving = begin_raw_upload(&storage, bytes);
         assert!(
             receiving
-                .receive(BrokenReader::new(libc::ECONNRESET))
+                .receive(BrokenReader::new(
+                    rustix::io::Errno::CONNRESET.raw_os_error()
+                ))
                 .is_err()
         );
         assert_eq!(transaction_record_count(&storage), 0);
@@ -1110,7 +1113,10 @@ fn normalized_compressed_source_errors_remain_io_errors() {
         WireEncoding::Compressed(CompressionCodec::Xz),
         WireEncoding::Compressed(CompressionCodec::Zstd),
     ] {
-        for source_error in [libc::EIO, libc::EOPNOTSUPP] {
+        for source_error in [
+            rustix::io::Errno::IO.raw_os_error(),
+            rustix::io::Errno::OPNOTSUPP.raw_os_error(),
+        ] {
             let directory = TestDir::new();
             let destination_path = directory.path().join("raw.nar");
             let mut destination =
@@ -1136,7 +1142,9 @@ struct UnsupportedOutputWriter;
 
 impl Write for UnsupportedOutputWriter {
     fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+        Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::OPNOTSUPP.raw_os_error(),
+        ))
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -1165,7 +1173,11 @@ fn compressed_output_writer_errors_remain_io_errors() {
         )
         .expect_err("output storage failure must not become invalid compressed input");
 
-        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{encoding:?}");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::OPNOTSUPP.raw_os_error()),
+            "{encoding:?}"
+        );
     }
 }
 
@@ -3309,7 +3321,10 @@ fn response_loss_after_parent_sync_is_visible_and_idempotent() {
 
 #[test]
 fn stream_resource_failures_leave_no_false_publication_state() {
-    for raw_error in [libc::EIO, libc::ENOSPC] {
+    for raw_error in [
+        rustix::io::Errno::IO.raw_os_error(),
+        rustix::io::Errno::NOSPC.raw_os_error(),
+    ] {
         let directory = TestDir::new();
         let storage = initialize_storage(directory.path()).expect("initialize storage");
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
@@ -3362,21 +3377,27 @@ fn read_only_filesystems_are_not_ready() {
 
     assert!(matches!(
         space.required_capacity(1),
-        Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EROFS)
+        Err(StorageError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::ROFS.raw_os_error())
     ));
 }
 
 #[test]
 fn capacity_errors_have_stable_categories() {
     assert_eq!(
-        capacity_error_kind(libc::ENOSPC),
+        capacity_error_kind(rustix::io::Errno::NOSPC.raw_os_error()),
         CapacityErrorKind::NoSpace
     );
-    assert_eq!(capacity_error_kind(libc::EDQUOT), CapacityErrorKind::Quota);
     assert_eq!(
-        capacity_error_kind(libc::EROFS),
+        capacity_error_kind(rustix::io::Errno::DQUOT.raw_os_error()),
+        CapacityErrorKind::Quota
+    );
+    assert_eq!(
+        capacity_error_kind(rustix::io::Errno::ROFS.raw_os_error()),
         CapacityErrorKind::ReadOnly
     );
+    for raw_error in [0, -1, 4096, i32::MIN, i32::MAX] {
+        assert_eq!(capacity_error_kind(raw_error), CapacityErrorKind::Other);
+    }
 }
 
 #[test]

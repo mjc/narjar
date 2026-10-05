@@ -241,48 +241,39 @@ fn copy_file_to_stream_linux(
     offset: u64,
     length: u64,
 ) -> Result<u64, TransferFailure> {
-    use std::os::fd::AsRawFd;
+    use rustix::io::Errno;
 
-    let mut offset = i64::try_from(offset).map_err(|_| TransferFailure {
+    // The kernel offset is signed even though rustix accepts a u64.
+    i64::try_from(offset).map_err(|_| TransferFailure {
         error: io::Error::new(io::ErrorKind::InvalidInput, "file offset is too large"),
         body_bytes: 0,
     })?;
+    let mut offset = offset;
     let mut remaining = length;
     while remaining != 0 {
         let count = remaining.min(usize::MAX as u64) as usize;
-        // SAFETY: both descriptors stay open for the call, `offset` is valid,
-        // and `count` does not exceed `usize::MAX`.
-        let sent =
-            unsafe { libc::sendfile(stream.as_raw_fd(), file.as_raw_fd(), &raw mut offset, count) };
-        if sent > 0 {
-            remaining -= sent as u64;
-            continue;
+        match rustix::fs::sendfile(&*stream, &*file, Some(&mut offset), count) {
+            Ok(0) => {
+                return Err(TransferFailure {
+                    error: io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "file ended before the declared response length",
+                    ),
+                    body_bytes: length - remaining,
+                });
+            }
+            Ok(sent) => remaining -= sent as u64,
+            Err(Errno::INTR) => continue,
+            Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) if length == remaining => {
+                return copy_file_to_stream_portable(file, stream, offset, remaining);
+            }
+            Err(error) => {
+                return Err(TransferFailure {
+                    error: error.into(),
+                    body_bytes: length - remaining,
+                });
+            }
         }
-        if sent == 0 {
-            return Err(TransferFailure {
-                error: io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "file ended before the declared response length",
-                ),
-                body_bytes: length - remaining,
-            });
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        if length == remaining
-            && matches!(
-                error.raw_os_error(),
-                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
-            )
-        {
-            return copy_file_to_stream_portable(file, stream, offset as u64, remaining);
-        }
-        return Err(TransferFailure {
-            error,
-            body_bytes: length - remaining,
-        });
     }
     Ok(length)
 }
@@ -407,5 +398,53 @@ mod tests {
             response = response.with_header(static_header("X-Test", "ok").expect("valid header"));
         }
         assert_eq!(response.headers.len(), 9);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_file_copy_rejects_offsets_above_i64_even_for_an_empty_body() {
+        let mut file = tempfile::tempfile().expect("create file");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let _receiver =
+            std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect receiver");
+        let (mut stream, _) = listener.accept().expect("accept connection");
+
+        let failure =
+            super::copy_file_to_stream_linux(&mut file, &mut stream, i64::MAX as u64 + 1, 0)
+                .expect_err("offset must fit the signed kernel offset");
+        assert_eq!(failure.error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(failure.error.to_string(), "file offset is too large");
+        assert_eq!(failure.body_bytes, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_file_copy_falls_back_before_bytes_for_an_unsupported_destination() {
+        use std::io::{Read, Write};
+
+        let mut file = tempfile::tempfile().expect("create file");
+        file.write_all(b"0123456789").expect("write fixture");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let mut receiver =
+            std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect receiver");
+        let (mut stream, _) = listener.accept().expect("accept connection");
+        rustix::fs::fcntl_setfl(&stream, rustix::fs::OFlags::APPEND)
+            .expect("set append flag on socket");
+        let mut offset = 2;
+        assert_eq!(
+            rustix::fs::sendfile(&stream, &file, Some(&mut offset), 5),
+            Err(rustix::io::Errno::INVAL),
+            "append-flagged destination must require the portable path"
+        );
+
+        assert_eq!(
+            super::copy_file_to_stream_linux(&mut file, &mut stream, 2, 5)
+                .expect("portable fallback should send the range"),
+            5
+        );
+        drop(stream);
+        let mut received = Vec::new();
+        receiver.read_to_end(&mut received).expect("read range");
+        assert_eq!(received, b"23456");
     }
 }

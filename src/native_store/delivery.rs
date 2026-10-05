@@ -701,7 +701,8 @@ mod tests {
             fs::create_dir(path).expect("create store object");
             match fs::write(path.join(&raw_name), b"raw") {
                 Ok(()) => {}
-                Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => (),
+                Err(error)
+                    if error.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) => {}
                 Err(error) => panic!("write raw-byte filename: {error}"),
             }
         });
@@ -1011,15 +1012,27 @@ mod tests {
     }
 
     fn make_fifo(path: &Path) {
-        let name = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .expect("fixture path should not contain NUL");
-        // SAFETY: name is NUL-terminated and mkfifo does not retain it.
-        let result = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
-        assert_eq!(
-            result,
-            0,
-            "mkfifo fixture failed: {}",
-            io::Error::last_os_error()
-        );
+        #[cfg(not(target_vendor = "apple"))]
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .expect("mkfifo fixture should succeed");
+
+        // rustix 1.1.5 has no mkfifo and excludes mkfifoat on Apple targets.
+        #[cfg(target_vendor = "apple")]
+        {
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .expect("fixture path should not contain NUL");
+            // SAFETY: name is NUL-terminated and mkfifo does not retain it.
+            let result = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+            assert_eq!(
+                result,
+                0,
+                "mkfifo fixture failed: {}",
+                io::Error::last_os_error()
+            );
+        }
     }
 }

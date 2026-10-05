@@ -5,7 +5,7 @@
 //! the semantic events. Input is read incrementally; file bodies are delivered
 //! as borrowed chunks and are never retained by the decoder.
 
-use std::{fmt, io, io::Read};
+use std::{io, io::Read};
 
 use sha2::{Digest, Sha256};
 
@@ -98,20 +98,25 @@ impl Default for Limits {
 ///
 /// `E` is the error type chosen by the event sink. Input and structural errors
 /// remain represented by the decoder's own variants.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 /// A decoding, validation, resource-limit, or event-sink error.
 ///
 /// The generic parameter is the error returned by [`EventSink`].
 pub enum DecodeError<E = io::Error> {
     /// Reading the encoded NAR failed.
-    Io(io::Error),
+    #[error("NAR input: {0}")]
+    Io(#[source] io::Error),
     /// The consumer rejected an emitted event.
-    Sink(E),
+    #[error("NAR event sink: {0}")]
+    Sink(#[source] E),
     /// The NAR has invalid structure or unexpected trailing bytes.
+    #[error("invalid NAR: {0}")]
     Invalid(String),
     /// The NAR is structurally readable but violates canonical encoding rules.
+    #[error("non-canonical NAR: {0}")]
     NonCanonical(&'static str),
     /// A configured decoder resource limit was exceeded.
+    #[error("NAR {what} limit exceeded: {actual} > {limit}")]
     LimitExceeded {
         /// The resource whose limit was exceeded.
         what: &'static str,
@@ -120,32 +125,6 @@ pub enum DecodeError<E = io::Error> {
         /// The observed value.
         actual: u64,
     },
-}
-
-impl<E: fmt::Display> fmt::Display for DecodeError<E> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(error) => write!(formatter, "NAR input: {error}"),
-            Self::Sink(error) => write!(formatter, "NAR event sink: {error}"),
-            Self::Invalid(message) => write!(formatter, "invalid NAR: {message}"),
-            Self::NonCanonical(message) => write!(formatter, "non-canonical NAR: {message}"),
-            Self::LimitExceeded {
-                what,
-                limit,
-                actual,
-            } => write!(formatter, "NAR {what} limit exceeded: {actual} > {limit}"),
-        }
-    }
-}
-
-impl<E: std::error::Error + 'static> std::error::Error for DecodeError<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Sink(error) => Some(error),
-            Self::Invalid(_) | Self::NonCanonical(_) | Self::LimitExceeded { .. } => None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -709,5 +688,63 @@ mod tests {
             decoder.digest.finalize().as_slice(),
             Sha256::digest(&bytes).as_slice()
         );
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &DecodeError::<std::convert::Infallible>::Invalid("detail".into()),
+                "invalid NAR: detail",
+            ),
+            (
+                &DecodeError::<std::convert::Infallible>::NonCanonical("detail"),
+                "non-canonical NAR: detail",
+            ),
+            (
+                &DecodeError::<std::convert::Infallible>::LimitExceeded {
+                    what: "bytes",
+                    limit: 8,
+                    actual: 9,
+                },
+                "NAR bytes limit exceeded: 9 > 8",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_decode_display_accepts_borrowed_display_only_sink_errors() {
+        struct DisplayOnly<'a>(&'a str);
+        impl std::fmt::Display for DisplayOnly<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        let detail = String::from("borrowed detail");
+        let error = DecodeError::Sink(DisplayOnly(&detail));
+        assert_eq!(error.to_string(), "NAR event sink: borrowed detail");
+        assert_eq!(format!("{error:>40}"), "NAR event sink: borrowed detail");
+    }
+
+    #[test]
+    fn a1_decode_infallible_and_sink_sources_keep_io_layer() {
+        use std::error::Error as _;
+        let error: DecodeError<std::convert::Infallible> =
+            DecodeError::Io(io::Error::other("read failure"));
+        assert_eq!(error.to_string(), "NAR input: read failure");
+        assert!(error.source().unwrap().is::<io::Error>());
+        assert!(error.source().unwrap().source().is_none());
+        let sink = DecodeError::Sink(io::Error::other("sink failure"));
+        assert_eq!(sink.to_string(), "NAR event sink: sink failure");
+        assert!(sink.source().unwrap().is::<io::Error>());
     }
 }

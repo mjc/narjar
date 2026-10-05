@@ -1203,7 +1203,9 @@ impl NativeStoreLeaseManager {
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(
+                (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+            )
             .open(path)
             .map_err(NativeStoreLeaseError::Io)?;
         set_flock_lock(&file)?;
@@ -1214,7 +1216,9 @@ impl NativeStoreLeaseManager {
         let path = self.state_dir.join("gc.lock");
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(
+                (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+            )
             .open(path)
             .map_err(NativeStoreLeaseError::Io)?;
         set_flock_lock_with_mode(&file, FlockOperation::LockShared)?;
@@ -1558,7 +1562,9 @@ fn create_temporary_record(directory: &Path) -> Result<(PathBuf, File), NativeSt
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .custom_flags(
+                    (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+                )
                 .open(&path)
             {
                 Ok(file) => Some(Ok((path, file))),
@@ -1628,66 +1634,38 @@ fn now_unix_seconds() -> Result<u64, NativeStoreLeaseError> {
         .map_err(|_| NativeStoreLeaseError::ClockBeforeEpoch)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum NativeStoreLeaseError {
+    #[error("native-store lease capacity is full")]
     CapacityExceeded,
+    #[error("system clock is before the Unix epoch")]
     ClockBeforeEpoch,
+    #[error("native-store lease expiry overflows")]
     ClockOverflow,
+    #[error("querying the Nix store database: {0}")]
     Database(String),
+    #[error("native-store lease record is invalid")]
     InvalidRecord,
+    #[error("native-store lease capacity record is invalid")]
     InvalidCapacityRecord,
+    #[error("native-store path is invalid")]
     InvalidStorePath,
-    Io(io::Error),
+    #[error("native-store lease I/O: {0}")]
+    Io(#[source] io::Error),
+    #[error("native-store lease has not expired")]
     LeaseStillLive,
+    #[error("native-store lease state is poisoned")]
     Poisoned,
+    #[error("native-store GC root conflicts with its lease")]
     RootConflict,
+    #[error("native-store lease record exceeds its limit")]
     RecordTooLarge,
+    #[error("native-store lease recovery must finish before admission")]
     RecoveryRequired,
+    #[error("native-store lease temporary names are exhausted")]
     TemporaryNameExhausted,
+    #[error("native-store path is not registered in the Nix store")]
     UnregisteredStorePath,
-}
-
-impl std::fmt::Display for NativeStoreLeaseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CapacityExceeded => formatter.write_str("native-store lease capacity is full"),
-            Self::ClockBeforeEpoch => formatter.write_str("system clock is before the Unix epoch"),
-            Self::ClockOverflow => formatter.write_str("native-store lease expiry overflows"),
-            Self::Database(error) => write!(formatter, "querying the Nix store database: {error}"),
-            Self::InvalidRecord => formatter.write_str("native-store lease record is invalid"),
-            Self::InvalidCapacityRecord => {
-                formatter.write_str("native-store lease capacity record is invalid")
-            }
-            Self::InvalidStorePath => formatter.write_str("native-store path is invalid"),
-            Self::Io(error) => write!(formatter, "native-store lease I/O: {error}"),
-            Self::LeaseStillLive => formatter.write_str("native-store lease has not expired"),
-            Self::Poisoned => formatter.write_str("native-store lease state is poisoned"),
-            Self::RootConflict => {
-                formatter.write_str("native-store GC root conflicts with its lease")
-            }
-            Self::RecordTooLarge => {
-                formatter.write_str("native-store lease record exceeds its limit")
-            }
-            Self::RecoveryRequired => {
-                formatter.write_str("native-store lease recovery must finish before admission")
-            }
-            Self::TemporaryNameExhausted => {
-                formatter.write_str("native-store lease temporary names are exhausted")
-            }
-            Self::UnregisteredStorePath => {
-                formatter.write_str("native-store path is not registered in the Nix store")
-            }
-        }
-    }
-}
-
-impl std::error::Error for NativeStoreLeaseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1696,7 +1674,6 @@ mod tests {
     use sqlite::Connection;
     use std::{
         num::NonZeroUsize,
-        os::fd::AsRawFd,
         process::{Command, Output},
         sync::{Arc, Barrier},
         thread,
@@ -3102,19 +3079,11 @@ mod tests {
             .open(&gc_lock_path)
             .expect("Narjar GC lock should open");
         set_flock_lock(&nix_gc_lock).expect("exclusive Nix-style flock should succeed");
-        // SAFETY: the descriptor is live; LOCK_NB avoids blocking this assertion.
-        let blocked =
-            unsafe { libc::flock(narjar_gc_lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
-        assert_eq!(blocked, -1);
-        assert!(matches!(
-            io::Error::last_os_error().kind(),
-            io::ErrorKind::WouldBlock
-        ));
-        // SAFETY: the descriptor is live and unlocking requires no pointer arguments.
-        assert_eq!(
-            unsafe { libc::flock(nix_gc_lock.as_raw_fd(), libc::LOCK_UN) },
-            0
-        );
+        let blocked = rustix::fs::flock(&narjar_gc_lock, FlockOperation::NonBlockingLockShared)
+            .expect_err("exclusive Nix lock must block shared Narjar lock");
+        assert_eq!(io::Error::from(blocked).kind(), io::ErrorKind::WouldBlock);
+        rustix::fs::flock(&nix_gc_lock, FlockOperation::Unlock)
+            .expect("exclusive Nix-style flock should unlock");
         set_flock_lock_with_mode(&narjar_gc_lock, FlockOperation::LockShared)
             .expect("shared Narjar-style flock should succeed after GC unlocks");
     }
@@ -3283,5 +3252,85 @@ mod tests {
         assert!(!root.exists());
         assert!(foreign_path.exists());
         assert!(fixture.owned_records().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &NativeStoreLeaseError::CapacityExceeded,
+                "native-store lease capacity is full",
+            ),
+            (
+                &NativeStoreLeaseError::ClockBeforeEpoch,
+                "system clock is before the Unix epoch",
+            ),
+            (
+                &NativeStoreLeaseError::ClockOverflow,
+                "native-store lease expiry overflows",
+            ),
+            (
+                &NativeStoreLeaseError::Database("detail".into()),
+                "querying the Nix store database: detail",
+            ),
+            (
+                &NativeStoreLeaseError::InvalidRecord,
+                "native-store lease record is invalid",
+            ),
+            (
+                &NativeStoreLeaseError::InvalidCapacityRecord,
+                "native-store lease capacity record is invalid",
+            ),
+            (
+                &NativeStoreLeaseError::InvalidStorePath,
+                "native-store path is invalid",
+            ),
+            (
+                &NativeStoreLeaseError::LeaseStillLive,
+                "native-store lease has not expired",
+            ),
+            (
+                &NativeStoreLeaseError::Poisoned,
+                "native-store lease state is poisoned",
+            ),
+            (
+                &NativeStoreLeaseError::RootConflict,
+                "native-store GC root conflicts with its lease",
+            ),
+            (
+                &NativeStoreLeaseError::RecordTooLarge,
+                "native-store lease record exceeds its limit",
+            ),
+            (
+                &NativeStoreLeaseError::RecoveryRequired,
+                "native-store lease recovery must finish before admission",
+            ),
+            (
+                &NativeStoreLeaseError::TemporaryNameExhausted,
+                "native-store lease temporary names are exhausted",
+            ),
+            (
+                &NativeStoreLeaseError::UnregisteredStorePath,
+                "native-store path is not registered in the Nix store",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_io_error_preserves_message_and_source() {
+        use std::error::Error as _;
+        let error = NativeStoreLeaseError::Io(io::Error::other("read failure"));
+        assert_eq!(error.to_string(), "native-store lease I/O: read failure");
+        assert!(error.source().unwrap().is::<io::Error>());
+        assert!(error.source().unwrap().source().is_none());
     }
 }

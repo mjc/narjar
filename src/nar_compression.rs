@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 
 use lzma_rust2::{XzOptions, XzWriter};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
 use crate::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
@@ -51,17 +51,15 @@ fn encode_xz_nar(
     encoder.finish().map(|_| ())
 }
 
-struct EncodedOutputHasher<W> {
-    inner: W,
-    hasher: Sha256,
+struct EncodedOutputHasher<W: Write> {
+    inner: digest_io::HashWriter<Sha256, W>,
     bytes_written: u64,
 }
 
-impl<W> EncodedOutputHasher<W> {
+impl<W: Write> EncodedOutputHasher<W> {
     fn new(inner: W) -> Self {
         Self {
-            inner,
-            hasher: Sha256::new(),
+            inner: digest_io::HashWriter::new(inner),
             bytes_written: 0,
         }
     }
@@ -69,7 +67,7 @@ impl<W> EncodedOutputHasher<W> {
     fn finish(self, codec: CompressionCodec) -> EncodedIdentity {
         EncodedIdentity::new(
             codec,
-            FileHash::from_digest(self.hasher.finalize().into()),
+            FileHash::from_digest(self.inner.finalize().into()),
             EncodedSize::new(self.bytes_written),
         )
     }
@@ -84,7 +82,6 @@ impl<W: Write> Write for EncodedOutputHasher<W> {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "encoded NAR is too large")
             })?;
-        self.hasher.update(&buffer[..written]);
         Ok(written)
     }
 
@@ -97,12 +94,48 @@ impl<W: Write> Write for EncodedOutputHasher<W> {
 mod tests {
     use super::*;
     use lzma_rust2::XzReader;
+    use sha2::Digest;
     use std::{
         cell::Cell,
         io::{Cursor, Read},
         rc::Rc,
     };
     use structured_zstd::decoding::StreamingDecoder;
+
+    #[test]
+    fn encoded_measurement_ignores_zero_writes_and_propagates_flush_errors() {
+        struct ZeroWriter;
+        impl Write for ZeroWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
+            }
+        }
+        let mut measured = EncodedOutputHasher::new(ZeroWriter);
+        assert_eq!(measured.write(b"not accepted").unwrap(), 0);
+        assert_eq!(
+            measured.flush().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let measured = measured.finish(CompressionCodec::Zstd);
+        assert_eq!(measured.size().get(), 0);
+        assert_eq!(
+            measured.hash(),
+            FileHash::from_digest(Sha256::digest([]).into())
+        );
+    }
+
+    #[test]
+    fn encoded_measurement_reports_counter_overflow_instead_of_wrapping() {
+        let mut measured = EncodedOutputHasher::new(io::sink());
+        measured.bytes_written = u64::MAX;
+        assert_eq!(
+            measured.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     fn multiblock_bytes() -> Vec<u8> {
         (0_usize..(384 * 1024 + 17))
@@ -211,10 +244,15 @@ mod tests {
         for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
             let error = encode_and_measure_nar(codec, &mut io::sink(), |output| {
                 output.write_all(b"incomplete raw NAR")?;
-                Err(io::Error::from_raw_os_error(libc::EIO))
+                Err(io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                ))
             })
             .unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            assert_eq!(
+                error.raw_os_error(),
+                Some(rustix::io::Errno::IO.raw_os_error())
+            );
         }
     }
 
@@ -223,7 +261,9 @@ mod tests {
     impl Write for FailDuringFinish {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if self.0.get() {
-                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                Err(io::Error::from_raw_os_error(
+                    rustix::io::Errno::NOSPC.raw_os_error(),
+                ))
             } else {
                 Ok(bytes.len())
             }
@@ -245,7 +285,10 @@ mod tests {
                 Ok(())
             })
             .unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+            assert_eq!(
+                error.raw_os_error(),
+                Some(rustix::io::Errno::NOSPC.raw_os_error())
+            );
         }
     }
 }

@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::http_server::{StatusCode, TransferFailure};
+use enum_map::{Enum, EnumMap};
 use serde::Deserialize;
 
 use crate::{
@@ -22,62 +23,52 @@ use crate::{
     },
 };
 
-const METHODS: [RequestMethod; 4] = [
-    RequestMethod::Get,
-    RequestMethod::Head,
-    RequestMethod::Put,
-    RequestMethod::Other,
-];
-const ROUTES: [RequestRoute; 9] = [
-    RequestRoute::Health,
-    RequestRoute::Ready,
-    RequestRoute::Metrics,
-    RequestRoute::CacheInfo,
-    RequestRoute::Nar,
-    RequestRoute::NarInfo,
-    RequestRoute::Invalid,
-    RequestRoute::Missing,
-    RequestRoute::Other,
-];
-const STATUS_CODES: [(&str, Option<u16>); 17] = [
-    ("200", Some(200)),
-    ("201", Some(201)),
-    ("206", Some(206)),
-    ("400", Some(400)),
-    ("401", Some(401)),
-    ("404", Some(404)),
-    ("405", Some(405)),
-    ("411", Some(411)),
-    ("413", Some(413)),
-    ("415", Some(415)),
-    ("416", Some(416)),
-    ("422", Some(422)),
-    ("429", Some(429)),
-    ("500", Some(500)),
-    ("503", Some(503)),
-    ("507", Some(507)),
-    ("other", None),
-];
-const CONNECTION_OUTCOMES: [ConnectionOutcome; 6] = [
-    ConnectionOutcome::Admitted,
-    ConnectionOutcome::AdmissionRejected,
-    ConnectionOutcome::RequestQueueFull,
-    ConnectionOutcome::MalformedRequest,
-    ConnectionOutcome::TimedOut,
-    ConnectionOutcome::Disconnected,
-];
-const RESPONSE_TRANSFER_FAILURES: [ResponseTransferFailureKind; 3] = [
-    ResponseTransferFailureKind::TimedOut,
-    ResponseTransferFailureKind::Disconnected,
-    ResponseTransferFailureKind::Other,
-];
-const REQUEST_SERIES: usize = METHODS.len() * ROUTES.len() * STATUS_CODES.len();
-const NAR_RANGE_OUTCOMES: [NarRangeOutcome; 4] = [
-    NarRangeOutcome::Full,
-    NarRangeOutcome::Partial,
-    NarRangeOutcome::Unsatisfiable,
-    NarRangeOutcome::Invalid,
-];
+#[derive(Clone, Copy, Debug, Enum)]
+#[repr(u16)]
+enum RecordedStatus {
+    Ok = 200,
+    Created = 201,
+    Partial = 206,
+    BadRequest = 400,
+    Unauthorized = 401,
+    NotFound = 404,
+    MethodNotAllowed = 405,
+    LengthRequired = 411,
+    TooLarge = 413,
+    UnsupportedMediaType = 415,
+    Unsatisfiable = 416,
+    Unprocessable = 422,
+    TooManyRequests = 429,
+    InternalError = 500,
+    Unavailable = 503,
+    InsufficientStorage = 507,
+    Other = 0,
+}
+
+impl RecordedStatus {
+    fn from_status(status: u16) -> Self {
+        EnumMap::<Self, ()>::default()
+            .into_iter()
+            .map(|(key, ())| key)
+            .find(|key| *key as u16 == status)
+            .unwrap_or(Self::Other)
+    }
+
+    fn label(self) -> String {
+        match self as u16 {
+            0 => "other".to_owned(),
+            status => status.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Enum)]
+enum RecordedPublication {
+    Created,
+    Identical,
+    Conflict,
+    Failure,
+}
 // A 5-second sampler needs both endpoints to cover an exact five-minute window.
 const TRAFFIC_SAMPLE_CAPACITY: usize = 61;
 #[cfg(target_os = "linux")]
@@ -145,7 +136,7 @@ fn saturating_atomic_add(counter: &AtomicU64, amount: u64) -> bool {
     overflowed
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Enum)]
 pub(crate) enum RequestMethod {
     Get,
     Head,
@@ -154,15 +145,6 @@ pub(crate) enum RequestMethod {
 }
 
 impl RequestMethod {
-    const fn index(self) -> usize {
-        match self {
-            Self::Get => 0,
-            Self::Head => 1,
-            Self::Put => 2,
-            Self::Other => 3,
-        }
-    }
-
     const fn label(self) -> &'static str {
         match self {
             Self::Get => "GET",
@@ -182,7 +164,7 @@ impl RequestMethod {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Enum)]
 pub(crate) enum RequestRoute {
     Health,
     Ready,
@@ -196,20 +178,6 @@ pub(crate) enum RequestRoute {
 }
 
 impl RequestRoute {
-    const fn index(self) -> usize {
-        match self {
-            Self::Health => 0,
-            Self::Ready => 1,
-            Self::Metrics => 2,
-            Self::CacheInfo => 3,
-            Self::Nar => 4,
-            Self::NarInfo => 5,
-            Self::Invalid => 6,
-            Self::Missing => 7,
-            Self::Other => 8,
-        }
-    }
-
     const fn label(self) -> &'static str {
         match self {
             Self::Health => "healthz",
@@ -238,7 +206,7 @@ impl RequestRoute {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Enum)]
 pub(crate) enum NarRangeOutcome {
     Full,
     Partial,
@@ -247,15 +215,6 @@ pub(crate) enum NarRangeOutcome {
 }
 
 impl NarRangeOutcome {
-    const fn index(self) -> usize {
-        match self {
-            Self::Full => 0,
-            Self::Partial => 1,
-            Self::Unsatisfiable => 2,
-            Self::Invalid => 3,
-        }
-    }
-
     const fn label(self) -> &'static str {
         match self {
             Self::Full => "full",
@@ -268,17 +227,18 @@ impl NarRangeOutcome {
 
 #[derive(Debug)]
 pub struct Metrics {
-    requests: [AtomicU64; REQUEST_SERIES],
-    connection_outcomes: [AtomicU64; CONNECTION_OUTCOMES.len()],
-    response_transfer_failures: [AtomicU64; RESPONSE_TRANSFER_FAILURES.len()],
-    publication_outcomes: [AtomicU64; 4],
+    requests: EnumMap<RequestMethod, EnumMap<RequestRoute, EnumMap<RecordedStatus, AtomicU64>>>,
+    connection_outcomes: EnumMap<ConnectionOutcome, AtomicU64>,
+    response_transfer_failures: EnumMap<ResponseTransferFailureKind, AtomicU64>,
+    publication_outcomes: EnumMap<RecordedPublication, AtomicU64>,
     completed_responses: AtomicU64,
     aborted_responses: AtomicU64,
-    nar_get_lookups: [AtomicU64; 3],
-    nar_head_lookups: [AtomicU64; 3],
-    narinfo_get_lookups: [AtomicU64; 3],
-    narinfo_head_lookups: [AtomicU64; 3],
-    nar_range_requests: [AtomicU64; NAR_RANGE_OUTCOMES.len() * 2],
+    nar_get_lookups: EnumMap<CacheLookupOutcome, AtomicU64>,
+    nar_head_lookups: EnumMap<CacheLookupOutcome, AtomicU64>,
+    narinfo_get_lookups: EnumMap<CacheLookupOutcome, AtomicU64>,
+    narinfo_head_lookups: EnumMap<CacheLookupOutcome, AtomicU64>,
+    nar_get_ranges: EnumMap<NarRangeOutcome, AtomicU64>,
+    nar_head_ranges: EnumMap<NarRangeOutcome, AtomicU64>,
     started_at_unix_seconds: u64,
     started_at: Instant,
     traffic_samples: Mutex<TrafficSamples>,
@@ -329,17 +289,18 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
-            requests: std::array::from_fn(|_| AtomicU64::new(0)),
-            connection_outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
-            response_transfer_failures: std::array::from_fn(|_| AtomicU64::new(0)),
-            publication_outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
+            requests: EnumMap::default(),
+            connection_outcomes: EnumMap::default(),
+            response_transfer_failures: EnumMap::default(),
+            publication_outcomes: EnumMap::default(),
             completed_responses: AtomicU64::new(0),
             aborted_responses: AtomicU64::new(0),
-            nar_get_lookups: std::array::from_fn(|_| AtomicU64::new(0)),
-            nar_head_lookups: std::array::from_fn(|_| AtomicU64::new(0)),
-            narinfo_get_lookups: std::array::from_fn(|_| AtomicU64::new(0)),
-            narinfo_head_lookups: std::array::from_fn(|_| AtomicU64::new(0)),
-            nar_range_requests: std::array::from_fn(|_| AtomicU64::new(0)),
+            nar_get_lookups: EnumMap::default(),
+            nar_head_lookups: EnumMap::default(),
+            narinfo_get_lookups: EnumMap::default(),
+            narinfo_head_lookups: EnumMap::default(),
+            nar_get_ranges: EnumMap::default(),
+            nar_head_ranges: EnumMap::default(),
             started_at_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -418,7 +379,7 @@ impl Metrics {
             (CacheObject::NarInfo, RequestMethod::Head) => &self.narinfo_head_lookups,
             (_, RequestMethod::Put | RequestMethod::Other) => return,
         };
-        counters[outcome.index()].fetch_add(1, Ordering::Relaxed);
+        counters[outcome].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn snapshot(
@@ -469,8 +430,8 @@ impl Metrics {
                 narinfo_head: lookup_snapshot(&self.narinfo_head_lookups),
             },
             nar_range_requests: NarRangeStats {
-                get: nar_range_method_snapshot(&self.nar_range_requests, 0),
-                head: nar_range_method_snapshot(&self.nar_range_requests, 1),
+                get: nar_range_method_snapshot(&self.nar_get_ranges),
+                head: nar_range_method_snapshot(&self.nar_head_ranges),
             },
             latency: self.latency_snapshot(),
             traffic: self.traffic_stats(traffic_bytes_overflowed, traffic_rates),
@@ -561,9 +522,9 @@ impl Metrics {
     }
 
     fn http_request_counts(&self) -> Vec<HttpRequestCount> {
-        METHODS
-            .into_iter()
-            .flat_map(|method| self.request_counts_for_method(method))
+        self.requests
+            .iter()
+            .flat_map(|(method, _)| self.request_counts_for_method(method))
             .collect()
     }
 
@@ -571,9 +532,9 @@ impl Metrics {
         &self,
         method: RequestMethod,
     ) -> impl Iterator<Item = HttpRequestCount> + '_ {
-        ROUTES
-            .into_iter()
-            .flat_map(move |route| self.request_counts_for_route(method, route))
+        self.requests[method]
+            .iter()
+            .flat_map(move |(route, _)| self.request_counts_for_route(method, route))
     }
 
     fn request_counts_for_route(
@@ -581,27 +542,22 @@ impl Metrics {
         method: RequestMethod,
         route: RequestRoute,
     ) -> impl Iterator<Item = HttpRequestCount> + '_ {
-        STATUS_CODES
-            .into_iter()
-            .enumerate()
-            .filter_map(move |(status_index, (status_code, _))| {
-                self.request_count(method, route, status_index, status_code)
-            })
+        self.requests[method][route]
+            .iter()
+            .filter_map(move |(status, _)| self.request_count(method, route, status))
     }
 
     fn request_count(
         &self,
         method: RequestMethod,
         route: RequestRoute,
-        status_index: usize,
-        status_code: &'static str,
+        status: RecordedStatus,
     ) -> Option<HttpRequestCount> {
-        let count = self.requests[request_index(method.index(), route.index(), status_index)]
-            .load(Ordering::Relaxed);
+        let count = self.requests[method][route][status].load(Ordering::Relaxed);
         (count != 0).then(|| HttpRequestCount {
             method: method.label().to_owned(),
             route: route.label().to_owned(),
-            status_code: status_code.to_owned(),
+            status_code: status.label(),
             count,
         })
     }
@@ -622,7 +578,7 @@ impl Metrics {
     }
 
     pub fn record_connection_outcome(&self, outcome: ConnectionOutcome) {
-        self.connection_outcomes[outcome.index()].fetch_add(1, Ordering::Relaxed);
+        self.connection_outcomes[outcome].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn socket_read_failure(kind: std::io::ErrorKind) -> Option<ConnectionOutcome> {
@@ -640,9 +596,8 @@ impl Metrics {
     }
 
     fn connection_stats(&self) -> ConnectionStats {
-        let count = |outcome: ConnectionOutcome| {
-            self.connection_outcomes[outcome.index()].load(Ordering::Relaxed)
-        };
+        let count =
+            |outcome: ConnectionOutcome| self.connection_outcomes[outcome].load(Ordering::Relaxed);
         ConnectionStats {
             admitted: count(ConnectionOutcome::Admitted),
             admission_rejected: count(ConnectionOutcome::AdmissionRejected),
@@ -655,23 +610,31 @@ impl Metrics {
 
     fn response_transfer_failure_stats(&self) -> ResponseTransferFailureStats {
         ResponseTransferFailureStats {
-            timed_out: self.response_transfer_failures[0].load(Ordering::Relaxed),
-            disconnected: self.response_transfer_failures[1].load(Ordering::Relaxed),
-            other: self.response_transfer_failures[2].load(Ordering::Relaxed),
+            timed_out: self.response_transfer_failures[ResponseTransferFailureKind::TimedOut]
+                .load(Ordering::Relaxed),
+            disconnected: self.response_transfer_failures
+                [ResponseTransferFailureKind::Disconnected]
+                .load(Ordering::Relaxed),
+            other: self.response_transfer_failures[ResponseTransferFailureKind::Other]
+                .load(Ordering::Relaxed),
         }
     }
 
     fn record_response_transfer_failure(&self, failure: &TransferFailure) {
         let kind = ResponseTransferFailureKind::from_error(&failure.error);
-        self.response_transfer_failures[kind.index()].fetch_add(1, Ordering::Relaxed);
+        self.response_transfer_failures[kind].fetch_add(1, Ordering::Relaxed);
     }
 
     fn publication_outcome_stats(&self) -> PublicationOutcomeStats {
         PublicationOutcomeStats {
-            created: self.publication_outcomes[0].load(Ordering::Relaxed),
-            identical: self.publication_outcomes[1].load(Ordering::Relaxed),
-            conflicts: self.publication_outcomes[2].load(Ordering::Relaxed),
-            failures: self.publication_outcomes[3].load(Ordering::Relaxed),
+            created: self.publication_outcomes[RecordedPublication::Created]
+                .load(Ordering::Relaxed),
+            identical: self.publication_outcomes[RecordedPublication::Identical]
+                .load(Ordering::Relaxed),
+            conflicts: self.publication_outcomes[RecordedPublication::Conflict]
+                .load(Ordering::Relaxed),
+            failures: self.publication_outcomes[RecordedPublication::Failure]
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -834,13 +797,13 @@ impl Metrics {
     }
 
     pub fn record_publication_result(&self, result: &Result<PublishOutcome, StorageError>) {
-        let index = match result {
-            Ok(PublishOutcome::Created) => 0,
-            Ok(PublishOutcome::Identical) => 1,
-            Err(StorageError::Conflict) => 2,
-            Err(_) => 3,
+        let outcome = match result {
+            Ok(PublishOutcome::Created) => RecordedPublication::Created,
+            Ok(PublishOutcome::Identical) => RecordedPublication::Identical,
+            Err(StorageError::Conflict) => RecordedPublication::Conflict,
+            Err(_) => RecordedPublication::Failure,
         };
-        self.publication_outcomes[index].fetch_add(1, Ordering::Relaxed);
+        self.publication_outcomes[outcome].fetch_add(1, Ordering::Relaxed);
     }
 
     fn latency_snapshot(&self) -> LatencyStats {
@@ -1203,9 +1166,8 @@ fn append_maintenance_metrics(output: &mut String, sample: &SampleState<maintena
         "narjar_maintenance_sample_available{{state=\"{state}\"}} 1\nnarjar_maintenance_sample_timestamp_seconds {sampled_at}\nnarjar_maintenance_sample_age_seconds {}\n",
         unix_seconds_now().saturating_sub(sampled_at),
     ));
-    for operation in maintenance::Operation::ALL {
-        let index = operation.index();
-        if let Some(run) = snapshot.last_runs[index] {
+    for (operation, run) in &snapshot.last_runs {
+        if let Some(run) = run {
             output.push_str(&format!(
                 "narjar_maintenance_last_completed_timestamp_seconds{{operation=\"{}\",mode=\"{}\",outcome=\"{}\"}} {}\n\
                  narjar_maintenance_last_duration_seconds{{operation=\"{}\"}} {}\n",
@@ -1231,7 +1193,7 @@ fn append_maintenance_metrics(output: &mut String, sample: &SampleState<maintena
                 }
             }
         }
-        if let Some(started) = snapshot.started[index] {
+        if let Some(started) = snapshot.started[operation] {
             output.push_str(&format!(
                 "narjar_maintenance_started_timestamp_seconds{{operation=\"{}\",mode=\"{}\"}} {}\n",
                 operation.name(),
@@ -1394,7 +1356,7 @@ fn append_nar_range_metrics(output: &mut String, ranges: &NarRangeStats) {
         "# HELP narjar_nar_range_requests_total Existing NAR requests by method and parsed Range header outcome.\n# TYPE narjar_nar_range_requests_total counter\n",
     );
     for (method, counts) in [("GET", &ranges.get), ("HEAD", &ranges.head)] {
-        for outcome in NAR_RANGE_OUTCOMES {
+        for (outcome, ()) in EnumMap::<NarRangeOutcome, ()>::default() {
             let count = counts.count(outcome);
             output.push_str(&format!(
                 "narjar_nar_range_requests_total{{method=\"{method}\",outcome=\"{}\"}} {count}\n",
@@ -1405,12 +1367,9 @@ fn append_nar_range_metrics(output: &mut String, ranges: &NarRangeStats) {
 }
 
 fn nar_range_method_snapshot(
-    counters: &[AtomicU64; NAR_RANGE_OUTCOMES.len() * 2],
-    method_index: usize,
+    counters: &EnumMap<NarRangeOutcome, AtomicU64>,
 ) -> NarRangeMethodStats {
-    let count = |outcome: NarRangeOutcome| {
-        counters[method_index * NAR_RANGE_OUTCOMES.len() + outcome.index()].load(Ordering::Relaxed)
-    };
+    let count = |outcome: NarRangeOutcome| counters[outcome].load(Ordering::Relaxed);
     NarRangeMethodStats {
         full: count(NarRangeOutcome::Full),
         partial: count(NarRangeOutcome::Partial),
@@ -1602,7 +1561,9 @@ fn read_zfs_sample(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        options.custom_flags(
+            (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+        );
     }
     let sample_file = options.open(path).map_err(|_| "sample_unreadable")?;
     let metadata = sample_file.metadata().map_err(|_| "sample_unreadable")?;
@@ -2163,9 +2124,8 @@ fn process_cpu_seconds() -> Result<(f64, f64), ()> {
         .collect::<Vec<_>>();
     let user_ticks: u64 = fields.get(11).ok_or(())?.parse().map_err(|_| ())?;
     let system_ticks: u64 = fields.get(12).ok_or(())?.parse().map_err(|_| ())?;
-    // SAFETY: sysconf reads a process-wide constant and takes no pointer arguments.
-    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks_per_second <= 0 {
+    let ticks_per_second = rustix::param::clock_ticks_per_second();
+    if ticks_per_second == 0 {
         return Err(());
     }
     Ok((
@@ -2186,10 +2146,10 @@ fn process_open_file_descriptors() -> Option<u64> {
     (observed <= MAX_PROCESS_FD_ENTRIES as u64).then_some(observed.saturating_sub(1))
 }
 
-fn lookup_snapshot(counters: &[AtomicU64; 3]) -> LookupStats {
-    let hits = counters[CacheLookupOutcome::Hit.index()].load(Ordering::Relaxed);
-    let misses = counters[CacheLookupOutcome::Miss.index()].load(Ordering::Relaxed);
-    let failures = counters[CacheLookupOutcome::Failure.index()].load(Ordering::Relaxed);
+fn lookup_snapshot(counters: &EnumMap<CacheLookupOutcome, AtomicU64>) -> LookupStats {
+    let hits = counters[CacheLookupOutcome::Hit].load(Ordering::Relaxed);
+    let misses = counters[CacheLookupOutcome::Miss].load(Ordering::Relaxed);
+    let failures = counters[CacheLookupOutcome::Failure].load(Ordering::Relaxed);
     let eligible = hits.saturating_add(misses);
     let decisions = eligible.saturating_add(failures);
     LookupStats {
@@ -2284,14 +2244,14 @@ impl TrafficSamples {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Enum)]
 pub(crate) enum CacheLookupOutcome {
     Hit,
     Miss,
     Failure,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Enum)]
 pub enum ConnectionOutcome {
     Admitted,
     AdmissionRejected,
@@ -2307,7 +2267,7 @@ enum RequestRecordingState {
     Finished,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Enum)]
 enum ResponseTransferFailureKind {
     TimedOut,
     Disconnected,
@@ -2315,14 +2275,6 @@ enum ResponseTransferFailureKind {
 }
 
 impl ResponseTransferFailureKind {
-    const fn index(self) -> usize {
-        match self {
-            Self::TimedOut => 0,
-            Self::Disconnected => 1,
-            Self::Other => 2,
-        }
-    }
-
     fn from_error(error: &std::io::Error) -> Self {
         match error.kind() {
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => Self::TimedOut,
@@ -2331,29 +2283,6 @@ impl ResponseTransferFailureKind {
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::WriteZero => Self::Disconnected,
             _ => Self::Other,
-        }
-    }
-}
-
-impl ConnectionOutcome {
-    const fn index(self) -> usize {
-        match self {
-            Self::Admitted => 0,
-            Self::AdmissionRejected => 1,
-            Self::RequestQueueFull => 2,
-            Self::MalformedRequest => 3,
-            Self::TimedOut => 4,
-            Self::Disconnected => 5,
-        }
-    }
-}
-
-impl CacheLookupOutcome {
-    const fn index(self) -> usize {
-        match self {
-            Self::Hit => 0,
-            Self::Miss => 1,
-            Self::Failure => 2,
         }
     }
 }
@@ -2788,17 +2717,6 @@ impl PopulationQuality {
     }
 }
 
-fn request_index(method: usize, route: usize, status: usize) -> usize {
-    (method * ROUTES.len() + route) * STATUS_CODES.len() + status
-}
-
-fn status_index(status: u16) -> usize {
-    STATUS_CODES
-        .iter()
-        .position(|(_, code)| *code == Some(status))
-        .unwrap_or(STATUS_CODES.len() - 1)
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ValidationClass {
     Body,
@@ -2815,13 +2733,12 @@ pub(crate) struct RequestGuard<'a> {
 
 impl RequestGuard<'_> {
     pub(crate) fn record_nar_range_request(&self, outcome: NarRangeOutcome) {
-        let method_index = match self.method {
-            RequestMethod::Get => 0,
-            RequestMethod::Head => 1,
+        let counters = match self.method {
+            RequestMethod::Get => &self.metrics.nar_get_ranges,
+            RequestMethod::Head => &self.metrics.nar_head_ranges,
             RequestMethod::Put | RequestMethod::Other => return,
         };
-        let counter_index = method_index * NAR_RANGE_OUTCOMES.len() + outcome.index();
-        saturating_atomic_add(&self.metrics.nar_range_requests[counter_index], 1);
+        saturating_atomic_add(&counters[outcome], 1);
     }
 
     pub(crate) fn record_cache_lookup(
@@ -2889,12 +2806,8 @@ impl RequestGuard<'_> {
     }
 
     fn record_status(&self, status: StatusCode) {
-        self.metrics.requests[request_index(
-            self.method.index(),
-            self.route.index(),
-            status_index(status.get()),
-        )]
-        .fetch_add(1, Ordering::Relaxed);
+        self.metrics.requests[self.method][self.route][RecordedStatus::from_status(status.get())]
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_aborted_response(&self) {
@@ -2902,9 +2815,8 @@ impl RequestGuard<'_> {
             RequestRecordingState::Pending => {}
             RequestRecordingState::Finished => return,
         }
-        self.metrics.requests
-            [request_index(self.method.index(), self.route.index(), status_index(0))]
-        .fetch_add(1, Ordering::Relaxed);
+        self.metrics.requests[self.method][self.route][RecordedStatus::Other]
+            .fetch_add(1, Ordering::Relaxed);
         self.metrics
             .aborted_responses
             .fetch_add(1, Ordering::Relaxed);
@@ -2915,9 +2827,8 @@ impl Drop for RequestGuard<'_> {
     fn drop(&mut self) {
         match self.recording.replace(RequestRecordingState::Finished) {
             RequestRecordingState::Pending => {
-                self.metrics.requests
-                    [request_index(self.method.index(), self.route.index(), status_index(0))]
-                .fetch_add(1, Ordering::Relaxed);
+                self.metrics.requests[self.method][self.route][RecordedStatus::Other]
+                    .fetch_add(1, Ordering::Relaxed);
                 self.metrics
                     .aborted_responses
                     .fetch_add(1, Ordering::Relaxed);
@@ -2979,6 +2890,59 @@ mod tests {
             "compression": "off",
             "record_size_bytes": 1_048_576,
         })
+    }
+
+    #[test]
+    fn typed_request_series_do_not_alias_and_keep_unknown_statuses_bounded() {
+        use std::collections::BTreeMap;
+        let metrics = Metrics::default();
+        let mut expected = BTreeMap::new();
+        let mut serial = 0;
+        for (method, routes) in &metrics.requests {
+            for (route, statuses) in routes {
+                for (status, counter) in statuses {
+                    serial += 1;
+                    counter.store(serial, std::sync::atomic::Ordering::Relaxed);
+                    expected.insert(
+                        (
+                            method.label().to_owned(),
+                            route.label().to_owned(),
+                            status.label(),
+                        ),
+                        serial,
+                    );
+                }
+            }
+        }
+        assert_eq!(serial, 4 * 9 * 17);
+        let actual = metrics
+            .http_request_counts()
+            .into_iter()
+            .map(|count| ((count.method, count.route, count.status_code), count.count))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual, expected);
+        for status in [0, 100, 202, 418, 599, 999] {
+            assert_eq!(super::RecordedStatus::from_status(status).label(), "other");
+        }
+        for status in [
+            200, 201, 206, 400, 401, 404, 405, 411, 413, 415, 416, 422, 429, 500, 503, 507,
+        ] {
+            assert_eq!(
+                super::RecordedStatus::from_status(status).label(),
+                status.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn histogram_exposition_saturates_cumulative_buckets_without_wrapping() {
+        let mut histogram = super::DurationHistogram::default().snapshot();
+        histogram.count = u64::MAX;
+        histogram.bucket_counts[0] = u64::MAX;
+        histogram.bucket_counts[1] = 1;
+        let mut existing = String::new();
+        super::append_duration_histogram(&mut existing, "nar_lookup", &histogram);
+        assert!(existing.contains(&format!("le=\"0.005\"}} {}", u64::MAX)));
     }
 
     #[test]

@@ -2011,7 +2011,7 @@ fn initialization_creates_a_private_root_even_with_a_group_writable_umask() {
     // parallel tests retain their own masks.
     unsafe {
         child.pre_exec(|| {
-            libc::umask(0o002);
+            rustix::process::umask(rustix::fs::Mode::WOTH);
             Ok(())
         });
     }
@@ -6012,7 +6012,10 @@ fn inventory_scan_propagates_payload_open_errors() {
     symlink(&payload, &payload).unwrap();
     for mode in [VerificationMode::Availability, VerificationMode::Content] {
         let error = Inventory::scan(&root_directory, &trusted, mode).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::LOOP.raw_os_error())
+        );
     }
 }
 

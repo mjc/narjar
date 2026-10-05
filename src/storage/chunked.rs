@@ -1,4 +1,4 @@
-use std::{fmt, io, io::Read, io::Seek, io::SeekFrom, io::Write};
+use std::{io, io::Read, io::Seek, io::SeekFrom, io::Write};
 
 use mincdc::{MinCdcHash4, ReadChunker};
 use sha2::{Digest, Sha256};
@@ -390,53 +390,32 @@ pub(crate) fn write_manifest_header<W: Write>(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum ManifestError {
+    #[error("chunk manifest checksum mismatch")]
     ChecksumMismatch,
+    #[error("chunk manifest ends at {actual} bytes, expected {expected}")]
     FinalSizeMismatch { expected: u64, actual: u64 },
+    #[error("invalid chunk length")]
     InvalidChunkLength,
+    #[error("invalid chunk manifest header")]
     InvalidHeader,
+    #[error("invalid chunk manifest magic")]
     InvalidMagic,
-    Io(io::Error),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("chunk manifest length overflow")]
     LengthOverflow,
+    #[error("chunk manifest ends are not increasing")]
     NonMonotonicEnds,
+    #[error("trailing bytes after chunk manifest")]
     TrailingBytes,
+    #[error("truncated chunk manifest")]
     Truncated,
+    #[error("unsupported chunk profile {0}")]
     UnsupportedProfile(u8),
+    #[error("unsupported chunk manifest version {0}")]
     UnsupportedVersion(u8),
-}
-
-impl fmt::Display for ManifestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ChecksumMismatch => f.write_str("chunk manifest checksum mismatch"),
-            Self::FinalSizeMismatch { expected, actual } => write!(
-                f,
-                "chunk manifest ends at {actual} bytes, expected {expected}"
-            ),
-            Self::InvalidChunkLength => f.write_str("invalid chunk length"),
-            Self::InvalidHeader => f.write_str("invalid chunk manifest header"),
-            Self::InvalidMagic => f.write_str("invalid chunk manifest magic"),
-            Self::Io(error) => error.fmt(f),
-            Self::LengthOverflow => f.write_str("chunk manifest length overflow"),
-            Self::NonMonotonicEnds => f.write_str("chunk manifest ends are not increasing"),
-            Self::TrailingBytes => f.write_str("trailing bytes after chunk manifest"),
-            Self::Truncated => f.write_str("truncated chunk manifest"),
-            Self::UnsupportedProfile(id) => write!(f, "unsupported chunk profile {id}"),
-            Self::UnsupportedVersion(version) => {
-                write!(f, "unsupported chunk manifest version {version}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ManifestError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            _ => None,
-        }
-    }
 }
 
 impl PartialEq for ManifestError {
@@ -469,11 +448,6 @@ impl PartialEq for ManifestError {
 }
 
 impl Eq for ManifestError {}
-impl From<io::Error> for ManifestError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -610,5 +584,80 @@ mod tests {
             self.position += length;
             Ok(length)
         }
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &ManifestError::ChecksumMismatch,
+                "chunk manifest checksum mismatch",
+            ),
+            (
+                &ManifestError::FinalSizeMismatch {
+                    expected: 8,
+                    actual: 9,
+                },
+                "chunk manifest ends at 9 bytes, expected 8",
+            ),
+            (&ManifestError::InvalidChunkLength, "invalid chunk length"),
+            (
+                &ManifestError::InvalidHeader,
+                "invalid chunk manifest header",
+            ),
+            (&ManifestError::InvalidMagic, "invalid chunk manifest magic"),
+            (
+                &ManifestError::LengthOverflow,
+                "chunk manifest length overflow",
+            ),
+            (
+                &ManifestError::NonMonotonicEnds,
+                "chunk manifest ends are not increasing",
+            ),
+            (
+                &ManifestError::TrailingBytes,
+                "trailing bytes after chunk manifest",
+            ),
+            (&ManifestError::Truncated, "truncated chunk manifest"),
+            (
+                &ManifestError::UnsupportedProfile(17),
+                "unsupported chunk profile 17",
+            ),
+            (
+                &ManifestError::UnsupportedVersion(23),
+                "unsupported chunk manifest version 23",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_manifest_equality_compares_io_kinds_and_variant_data() {
+        let first = ManifestError::from(io::Error::new(io::ErrorKind::NotFound, "first"));
+        let second = ManifestError::from(io::Error::new(io::ErrorKind::NotFound, "second"));
+        assert_eq!(first, second);
+        assert_ne!(first, ManifestError::from(io::Error::other("first")));
+        assert_ne!(
+            ManifestError::UnsupportedVersion(1),
+            ManifestError::UnsupportedVersion(2)
+        );
+        assert_ne!(
+            ManifestError::FinalSizeMismatch {
+                expected: 8,
+                actual: 9
+            },
+            ManifestError::FinalSizeMismatch {
+                expected: 9,
+                actual: 8
+            }
+        );
     }
 }

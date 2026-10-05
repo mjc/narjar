@@ -1154,10 +1154,10 @@ fn write_complete_manifest(
     records: &mut File,
 ) -> Result<(), ChunkStoreError> {
     let checksum = {
-        let mut digesting = DigestingWriter::new(&mut *destination);
+        let mut digesting = digest_io::HashWriter::<Sha256, _>::new(&mut *destination);
         write_manifest_header(&mut digesting, manifest)?;
         io::copy(records, &mut digesting)?;
-        digesting.finish()
+        <[u8; 32]>::from(digesting.finalize())
     };
     destination.write_all(&checksum)?;
     Ok(())
@@ -1462,35 +1462,6 @@ impl Drop for ChunkingWriter<'_> {
     }
 }
 
-struct DigestingWriter<'a, W> {
-    inner: &'a mut W,
-    hasher: Sha256,
-}
-
-impl<'a, W: Write> DigestingWriter<'a, W> {
-    fn new(inner: &'a mut W) -> Self {
-        Self {
-            inner,
-            hasher: Sha256::new(),
-        }
-    }
-    fn finish(self) -> [u8; 32] {
-        self.hasher.finalize().into()
-    }
-}
-
-impl<W: Write> Write for DigestingWriter<'_, W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.inner.write_all(bytes)?;
-        self.hasher.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 fn publish_immutable_bytes_without_directory_sync(
     directory: &File,
     name: &OsStr,
@@ -1711,7 +1682,7 @@ fn is_chunk_shard_name(name: &OsStr) -> bool {
 fn io_for_storage_error(error: StorageError) -> io::Error {
     match error {
         StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
-            io::Error::from_raw_os_error(libc::ENOSPC)
+            io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
         }
         StorageError::Io(error) => error,
         error => io::Error::other(error),
@@ -1731,60 +1702,21 @@ fn manifest_name(hash: NarHash) -> OsString {
 }
 
 fn hex_name(bytes: [u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = [0_u8; 64];
-    bytes.iter().enumerate().for_each(|(index, byte)| {
-        output[index * 2] = HEX[usize::from(byte >> 4)];
-        output[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
-    });
-    String::from_utf8(output.to_vec()).expect("hexadecimal bytes are valid UTF-8")
+    data_encoding::HEXLOWER.encode(&bytes)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum ChunkStoreError {
+    #[error("range {start}..{end} is outside NAR size {size}")]
     InvalidRange { start: u64, end: u64, size: u64 },
-    Io(io::Error),
-    Manifest(ManifestError),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Manifest(#[from] ManifestError),
+    #[error("chunked NAR hash mismatch")]
     NarHashMismatch { expected: NarHash, actual: NarHash },
+    #[error("chunked NAR size mismatch")]
     NarSizeMismatch { expected: u64, actual: u64 },
-}
-
-impl From<io::Error> for ChunkStoreError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl From<ManifestError> for ChunkStoreError {
-    fn from(error: ManifestError) -> Self {
-        Self::Manifest(error)
-    }
-}
-
-impl std::fmt::Display for ChunkStoreError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidRange { start, end, size } => {
-                write!(formatter, "range {start}..{end} is outside NAR size {size}")
-            }
-            Self::Io(error) => error.fmt(formatter),
-            Self::Manifest(error) => error.fmt(formatter),
-            Self::NarHashMismatch { .. } => formatter.write_str("chunked NAR hash mismatch"),
-            Self::NarSizeMismatch { .. } => formatter.write_str("chunked NAR size mismatch"),
-        }
-    }
-}
-
-impl std::error::Error for ChunkStoreError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Manifest(error) => Some(error),
-            Self::InvalidRange { .. }
-            | Self::NarHashMismatch { .. }
-            | Self::NarSizeMismatch { .. } => None,
-        }
-    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -2089,12 +2021,14 @@ mod tests {
         writer.write_all(&input).unwrap();
 
         let result = writer.finish_with(identity, |_| {
-            Err(std::io::Error::from_raw_os_error(libc::EIO))
+            Err(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error(),
+            ))
         });
 
         assert!(matches!(
             result,
-            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(libc::EIO)
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
         ));
         assert!(store.open_manifest(identity.hash()).unwrap().is_none());
         assert!(
@@ -2151,7 +2085,7 @@ mod tests {
         assert!(
             failed
                 .finish_with(identity, |_| Err(std::io::Error::from_raw_os_error(
-                    libc::EIO
+                    rustix::io::Errno::IO.raw_os_error()
                 )))
                 .is_err()
         );
@@ -2335,7 +2269,9 @@ mod tests {
     impl Read for FailingReader {
         fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
             if self.sent {
-                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                return Err(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                ));
             }
             let length = output.len().min(self.bytes.len());
             output[..length].copy_from_slice(&self.bytes[..length]);
@@ -2365,7 +2301,7 @@ mod tests {
                 expected,
                 ChunkProfile::MinCdcHash4V2
             ),
-            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(libc::EIO)
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
         ));
         assert!(store.open_manifest(expected.hash()).unwrap().is_none());
         assert_eq!(
@@ -2553,5 +2489,59 @@ mod tests {
         restarted.remove_abandoned_temporary_files().unwrap();
         assert!(super::super::fs::open_regular_at(&shard, chunk_temp).is_err());
         assert!(super::super::fs::open_regular_at(&restarted.manifests, manifest_temp).is_err());
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &ChunkStoreError::InvalidRange {
+                    start: 3,
+                    end: 9,
+                    size: 8,
+                },
+                "range 3..9 is outside NAR size 8",
+            ),
+            (
+                &ChunkStoreError::NarHashMismatch {
+                    expected: NarHash::from_digest([1; 32]),
+                    actual: NarHash::from_digest([2; 32]),
+                },
+                "chunked NAR hash mismatch",
+            ),
+            (
+                &ChunkStoreError::NarSizeMismatch {
+                    expected: 8,
+                    actual: 9,
+                },
+                "chunked NAR size mismatch",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_manifest_source_chain_keeps_each_layer() {
+        use std::error::Error as _;
+        let error = ChunkStoreError::from(ManifestError::from(io::Error::other("read failure")));
+        assert_eq!(error.to_string(), "read failure");
+        let manifest = error.source().unwrap();
+        assert!(manifest.is::<ManifestError>());
+        assert_eq!(manifest.to_string(), "read failure");
+        let io = manifest.source().unwrap();
+        assert!(io.is::<io::Error>());
+        assert_eq!(io.to_string(), "read failure");
+        assert!(io.source().is_none());
+        let direct = ChunkStoreError::from(io::Error::other("direct failure"));
+        assert_eq!(direct.to_string(), "direct failure");
+        assert!(direct.source().unwrap().is::<io::Error>());
     }
 }
