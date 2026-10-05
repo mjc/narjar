@@ -69,21 +69,6 @@ The cache server uses filesystem storage and serves plain HTTP behind a
 TLS proxy. The earlier exclusions do not describe this implemented graph, and
 the manifest does not by itself establish approval of a dependency change.
 
-The implementation uses `thiserror` for ordinary error plumbing, `enum-map`
-for fixed enum-keyed storage, and `digest-io` for hashing accepted I/O bytes.
-Checked size limits, typed identities, publication transitions, and error
-classification remain in Narjar. The hashing adapters share the existing
-digest 0.11 dependency and add no native library. Enum-map uses internal
-unsafe array construction; its derive macro runs at build time. Rustix owns
-the syscall boundary, including sendfile, advisory locks, and clock ticks;
-libc remains in the resolved graph and as an Apple-only test dependency for
-FIFO fixtures, because rustix does not expose mkfifo on Apple targets. It is
-not a direct production dependency.
-
-Maintenance records are bounded, versioned Postcard records. Readers reject
-unsupported versions, trailing bytes, invalid operation/mode combinations,
-and backwards timestamps. The private text record format is not supported.
-
 ## Dependency gates
 
 Every dependency change must pass:
@@ -174,15 +159,6 @@ A temporary same-filesystem fixture exercises each failure boundary:
 | crash after narinfo link, before response | durable pair; retry is identical success |
 | disk full | no new narinfo; bounded error and cleanup attempt |
 
-Private Postcard records must reject truncation, trailing bytes, and unknown
-versions. Recovery records must reject escaped paths and final states without
-a destination; pre-link derivative states may precede measurement of the final
-identity. A source `InvalidData` error must remain a source I/O failure, not be
-reported as byte-limit exhaustion. Lease persistence tests cover failed
-replacement cleanup and stale tempfile recognition. Shared immutable-link
-tests distinguish creation, identical retry, conflict, and source I/O failure
-without overwriting a destination or deleting the caller's temporary file.
-
 No general storage abstraction is added solely for fault injection. Introduce
 the smallest test hook at the exact publication boundary if OS-level fixtures
 cannot trigger an error deterministically.
@@ -192,8 +168,6 @@ cannot trigger an error deterministically.
 The chunked backend uses the exact decoded NAR byte stream as its input. These
 tests are required in addition to the flat publication cases:
 
-- Chunking and manifest tests exercise the production ingestion and streaming
-  manifest reader, not alternate test-only decoders or builders.
 - `ChunkHash` values cannot be passed where `NarHash` or `FileHash` is
   required; the manifest profile and binary schema are tested with golden
   bytes.

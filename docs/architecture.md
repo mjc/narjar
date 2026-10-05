@@ -310,12 +310,8 @@ available staging capacity before entering the queue. Each publication then
 records its private temporary path and initial `staging` state under
 `.narjar-transactions` before streaming. The record advances durably through
 `streaming`, `validated`, `linked`, and `published` as those boundaries
-complete. Records use bounded, versioned Postcard encoding. Temporary paths
-are validated storage-relative locations; `linked` and `published` records
-also require a validated final destination. Earlier states can omit a
-destination while an egress derivative's identity is still being measured.
-Truncated records, trailing bytes, unknown versions, unsafe paths, and the
-former text format are rejected. Body transfer, validation, and
+complete. Records use bounded, versioned Postcard encoding; linked/published
+states require a final destination. Body transfer, validation, and
 temporary-file sync are independent; only final-link comparison and the
 destination-directory sync use a per-destination commit lock. Queue depth and
 queue-wait summaries remain exposed in metrics. Startup recovery checks trusted
