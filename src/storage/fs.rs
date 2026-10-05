@@ -11,75 +11,36 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read},
-    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
-    path::Path,
+    os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex},
 };
 
 use rustix::fs::{
-    self, AtFlags, Dir, FlockOperation, Mode, OFlags, RawMode, Stat, StatVfs, StatVfsMountFlags,
+    self, AtFlags, FileType, FlockOperation, Mode, OFlags, RawMode, Stat, StatVfs,
+    StatVfsMountFlags,
 };
 
 use super::publication::{StagingBudget, TemporaryFile};
 use super::{StagingReservation, StorageError};
+use crate::filesystem::{directory_names, exclude_dot_directory_entries};
+pub(crate) use crate::filesystem::{
+    open_directory, open_directory_at, open_regular_at, read_dir_names,
+};
+#[cfg(test)]
+use std::path::Path;
 
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 
-pub(super) enum BoundedRegularFile<T> {
-    Missing,
-    Invalid,
-    Valid(T),
-}
-
-impl BoundedRegularFile<Vec<u8>> {
-    pub(super) fn parse<T>(self, parse: impl FnOnce(&[u8]) -> Option<T>) -> BoundedRegularFile<T> {
-        match self {
-            Self::Missing => BoundedRegularFile::Missing,
-            Self::Invalid => BoundedRegularFile::Invalid,
-            Self::Valid(bytes) => parse(&bytes)
-                .map(BoundedRegularFile::Valid)
-                .unwrap_or(BoundedRegularFile::Invalid),
-        }
-    }
-}
-
-pub(super) fn read_bounded_regular_file(
-    directory: &File,
-    name: &OsStr,
-    max_bytes: u64,
-) -> Result<BoundedRegularFile<Vec<u8>>, StorageError> {
-    let file = match open_regular_at(directory, name) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(BoundedRegularFile::Missing);
-        }
-        Err(error)
-            if error.kind() == io::ErrorKind::InvalidData
-                || error.raw_os_error() == Some(libc::ELOOP) =>
-        {
-            return Ok(BoundedRegularFile::Invalid);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        return Ok(BoundedRegularFile::Invalid);
-    }
-    Ok(BoundedRegularFile::Valid(bytes))
-}
-
 pub(crate) fn capacity_error_kind(raw_error: i32) -> CapacityErrorKind {
     match raw_error {
-        libc::ENOSPC => CapacityErrorKind::NoSpace,
-        libc::EDQUOT => CapacityErrorKind::Quota,
-        libc::EROFS => CapacityErrorKind::ReadOnly,
+        raw if raw == rustix::io::Errno::NOSPC.raw_os_error() => CapacityErrorKind::NoSpace,
+        raw if raw == rustix::io::Errno::DQUOT.raw_os_error() => CapacityErrorKind::Quota,
+        raw if raw == rustix::io::Errno::ROFS.raw_os_error() => CapacityErrorKind::ReadOnly,
         _ => CapacityErrorKind::Other,
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct StorageCapacity {
     pub total_bytes: u64,
     pub available_bytes: u64,
@@ -91,7 +52,9 @@ pub struct StorageCapacity {
 impl StorageCapacity {
     pub(super) fn required_capacity(self, required_bytes: u64) -> Result<(), StorageError> {
         if self.read_only {
-            return Err(StorageError::Io(io::Error::from_raw_os_error(libc::EROFS)));
+            return Err(StorageError::Io(io::Error::from_raw_os_error(
+                rustix::io::Errno::ROFS.raw_os_error(),
+            )));
         }
         if self.available_bytes < required_bytes {
             return Err(StorageError::InsufficientSpace);
@@ -218,60 +181,12 @@ pub(super) fn require_private_file_at(
     }
 }
 
-pub(super) fn open_directory(path: &Path) -> io::Result<File> {
-    let directory: File = fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?
-    .into();
-    if !directory.metadata()?.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a directory", path.display()),
-        ));
-    }
-    Ok(directory)
-}
-
-pub(crate) fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
-    let directory = open_at(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        0,
-    )?;
-    if !directory.metadata()?.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a directory", name.to_string_lossy()),
-        ));
-    }
-    Ok(directory)
-}
-
-pub(crate) fn open_regular_at(directory: &File, name: &OsStr) -> io::Result<File> {
-    let file = open_at(
-        directory,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        0,
-    )?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a regular file", name.to_string_lossy()),
-        ));
-    }
-    Ok(file)
-}
-
 pub(crate) fn entry_is_regular_at(directory: &File, name: &OsStr) -> io::Result<bool> {
-    Ok(entry_mode_at(directory, name)? & libc::S_IFMT == libc::S_IFREG)
+    Ok(FileType::from_raw_mode(entry_mode_at(directory, name)?) == FileType::RegularFile)
 }
 
 pub(crate) fn entry_is_directory_at(directory: &File, name: &OsStr) -> io::Result<bool> {
-    Ok(entry_mode_at(directory, name)? & libc::S_IFMT == libc::S_IFDIR)
+    Ok(FileType::from_raw_mode(entry_mode_at(directory, name)?) == FileType::Directory)
 }
 
 pub(crate) fn entry_identity_at(
@@ -298,8 +213,8 @@ pub(super) fn metadata_change_time(metadata: &Stat) -> (i64, i64) {
     (metadata.st_ctime, metadata.st_ctime_nsec)
 }
 
-pub(super) fn entry_mode_at(directory: &File, name: &OsStr) -> io::Result<libc::mode_t> {
-    Ok(entry_stat_at(directory, name)?.st_mode as libc::mode_t)
+pub(super) fn entry_mode_at(directory: &File, name: &OsStr) -> io::Result<RawMode> {
+    Ok(entry_stat_at(directory, name)?.st_mode as RawMode)
 }
 
 pub(super) fn entry_stat_at(directory: &File, name: &OsStr) -> io::Result<Stat> {
@@ -326,34 +241,11 @@ pub(super) fn open_at(
     Ok(fs::openat(parent, name, flags, Mode::from_raw_mode(mode))?.into())
 }
 
-pub(crate) fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
-    read_dir_names_with(directory_names(directory)?)
-}
-
-fn directory_names(directory: &File) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
-    // read_from opens an independent cursor, so repeated scans do not consume
-    // the borrowed descriptor's position. Dir closes this read-only stream on
-    // drop without reporting close errors; read and visitor errors propagate.
-    Ok(Dir::read_from(directory)?.map(|entry| {
-        entry
-            .map(|entry| OsString::from_vec(entry.file_name().to_bytes().to_vec()))
-            .map_err(Into::into)
-    }))
-}
-
+#[cfg(test)]
 fn read_dir_names_with(
     entries: impl Iterator<Item = io::Result<OsString>>,
 ) -> io::Result<Vec<OsString>> {
     exclude_dot_directory_entries(entries).collect()
-}
-
-fn exclude_dot_directory_entries(
-    entries: impl Iterator<Item = io::Result<OsString>>,
-) -> impl Iterator<Item = io::Result<OsString>> {
-    entries.filter(|entry| match entry {
-        Ok(name) => name != "." && name != "..",
-        Err(_) => true,
-    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -445,6 +337,42 @@ pub(super) fn files_equal_at(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ImmutableLinkOutcome {
+    Created,
+    Identical,
+    Collision,
+}
+
+/// Place immutable bytes without overwriting; synchronization and cleanup belong to the caller.
+pub(super) fn link_or_compare_immutable(
+    source_directory: &File,
+    source_name: &OsStr,
+    destination_directory: &File,
+    destination_name: &OsStr,
+) -> io::Result<ImmutableLinkOutcome> {
+    match hard_link_at(
+        source_directory,
+        source_name,
+        destination_directory,
+        destination_name,
+    ) {
+        Ok(()) => Ok(ImmutableLinkOutcome::Created),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            match files_equal_at(
+                source_directory,
+                source_name,
+                destination_directory,
+                destination_name,
+            )? {
+                true => Ok(ImmutableLinkOutcome::Identical),
+                false => Ok(ImmutableLinkOutcome::Collision),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn hard_link_at(
     source_directory: &File,
     source_name: &OsStr,
@@ -490,6 +418,43 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     #[test]
+    fn immutable_link_classifies_retries_without_overwriting_destinations() {
+        let root = tempfile::tempdir().expect("create directory");
+        let directory = open_directory(root.path()).expect("open directory");
+        let source = OsStr::new("source");
+        let destination = OsStr::new("destination");
+        std::fs::write(root.path().join(source), b"original").unwrap();
+        assert_eq!(
+            link_or_compare_immutable(&directory, source, &directory, destination).unwrap(),
+            ImmutableLinkOutcome::Created
+        );
+        std::fs::write(root.path().join("retry"), b"original").unwrap();
+        assert_eq!(
+            link_or_compare_immutable(&directory, OsStr::new("retry"), &directory, destination)
+                .unwrap(),
+            ImmutableLinkOutcome::Identical
+        );
+        std::fs::write(root.path().join("different"), b"modified").unwrap();
+        assert_eq!(
+            link_or_compare_immutable(&directory, OsStr::new("different"), &directory, destination)
+                .unwrap(),
+            ImmutableLinkOutcome::Collision
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(destination)).unwrap(),
+            b"original"
+        );
+        assert!(root.path().join("retry").exists());
+        assert!(root.path().join("different").exists());
+        assert_eq!(
+            link_or_compare_immutable(&directory, OsStr::new("missing"), &directory, destination)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
     fn relative_filesystem_operations_preserve_bytes_and_symlinks_after_directory_rename() {
         use std::os::unix::fs::{MetadataExt, symlink};
 
@@ -511,7 +476,7 @@ mod tests {
                 OsStr::from_bytes(b"link-\xff"),
                 OsStr::from_bytes(b"renamed-\xff"),
             ),
-            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) => {
                 hard_link_at(&directory, source, &directory, OsStr::new("link"))
                     .expect("hard link symlink itself");
                 (OsStr::new("link"), OsStr::new("renamed"))
@@ -534,7 +499,7 @@ mod tests {
             open_regular_at(&directory, link)
                 .expect_err("must not follow symlink")
                 .raw_os_error(),
-            Some(libc::ELOOP),
+            Some(rustix::io::Errno::LOOP.raw_os_error()),
         );
 
         rename_at(&directory, link, &directory, renamed).expect("rename raw-byte link");
@@ -547,7 +512,7 @@ mod tests {
             entry_stat_at(&directory, renamed)
                 .expect_err("link removed")
                 .raw_os_error(),
-            Some(libc::ENOENT)
+            Some(rustix::io::Errno::NOENT.raw_os_error())
         );
         assert!(
             entry_stat_at(&directory, source).is_ok(),
@@ -610,7 +575,9 @@ mod tests {
     #[test]
     fn injected_readdir_error_propagates() {
         let result = visit_directory_names(
-            std::iter::once(Err(io::Error::from_raw_os_error(libc::EIO))),
+            std::iter::once(Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error(),
+            ))),
             |_| Ok(DirectoryEntryAction::Continue),
         );
 
@@ -618,7 +585,7 @@ mod tests {
             result
                 .expect_err("incomplete enumeration must fail")
                 .raw_os_error(),
-            Some(libc::EIO)
+            Some(rustix::io::Errno::IO.raw_os_error())
         );
     }
 
@@ -633,7 +600,9 @@ mod tests {
 
         let error = read_dir_names_with(std::iter::from_fn(|| {
             if returned_live_name {
-                return Some(Err(io::Error::from_raw_os_error(libc::EIO)));
+                return Some(Err(io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                )));
             }
             let entry = entries.next()?;
             if let Ok(name) = &entry {
@@ -647,7 +616,10 @@ mod tests {
             returned_live_name,
             "the real entry must precede the injected error"
         );
-        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::IO.raw_os_error())
+        );
     }
 
     #[test]
@@ -687,11 +659,16 @@ mod tests {
         let directory = open_directory(directory.path()).expect("directory should open");
 
         let error = for_each_dir_name(&directory, |_| {
-            Err(io::Error::from_raw_os_error(libc::EACCES))
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::ACCESS.raw_os_error(),
+            ))
         })
         .expect_err("visitor error should propagate");
 
-        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::ACCESS.raw_os_error())
+        );
     }
 
     #[cfg(target_os = "linux")]

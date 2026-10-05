@@ -188,7 +188,7 @@ impl ResearchChunkStore {
     /// Hashes the exact bytes selected by a logical range in a manifest.
     pub fn hash_range(&self, manifest: &ChunkManifest, range: Range<u64>) -> io::Result<[u8; 32]> {
         validate_range(manifest, &range)?;
-        let mut writer = DigestWriter(Sha256::new());
+        let mut writer = digest_io::IoWrapper(Sha256::new());
         self.write_range(manifest, range, &mut writer)?;
         Ok(writer.0.finalize().into())
     }
@@ -310,19 +310,6 @@ fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
     metadata.len()
-}
-
-struct DigestWriter(Sha256);
-
-impl Write for DigestWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 pub fn chunk_reader<R, StoreChunk>(

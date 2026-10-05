@@ -1,7 +1,6 @@
 use std::{
     cell::RefCell,
     ffi::OsString,
-    fmt,
     fs::File,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     rc::Rc,
@@ -157,28 +156,22 @@ impl<'a> CapacityCheckedStagingWriter<'a> {
         if additional_required <= self.reservation.reserved_bytes() {
             return Ok(());
         }
-        reserve_preferred_or_exact_staging_growth(
-            self.reservation,
-            self.file,
-            self.min_free_bytes,
-            additional_required,
-        )
+        reserve_preferred_or_exact_staging_growth(additional_required, |required| {
+            self.reservation
+                .grow_to(self.file, self.min_free_bytes, required)
+        })
         .map_err(storage_capacity_error)
     }
 }
 
 fn reserve_preferred_or_exact_staging_growth(
-    reservation: &mut StagingReservation,
-    directory: &File,
-    min_free_bytes: u64,
     additional_required: u64,
+    mut reserve: impl FnMut(u64) -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
     let preferred_bytes = additional_required
         .div_ceil(RAW_STAGING_GROWTH_BYTES)
         .saturating_mul(RAW_STAGING_GROWTH_BYTES);
-    reservation
-        .grow_to(directory, min_free_bytes, preferred_bytes)
-        .or_else(|_| reservation.grow_to(directory, min_free_bytes, additional_required))
+    reserve(preferred_bytes).or_else(|_| reserve(additional_required))
 }
 
 impl Write for CapacityCheckedStagingWriter<'_> {
@@ -202,7 +195,7 @@ impl Write for CapacityCheckedStagingWriter<'_> {
 fn storage_capacity_error(error: StorageError) -> io::Error {
     match error {
         StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
-            io::Error::from_raw_os_error(libc::ENOSPC)
+            io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
         }
         StorageError::Io(error) => error,
         error => io::Error::other(error),
@@ -210,8 +203,7 @@ fn storage_capacity_error(error: StorageError) -> io::Error {
 }
 
 struct HashingWriter<'a, W: Write + ?Sized> {
-    inner: &'a mut W,
-    hasher: Sha256,
+    inner: digest_io::HashWriter<Sha256, &'a mut W>,
     bytes_written: u64,
     max_bytes: u64,
 }
@@ -219,8 +211,7 @@ struct HashingWriter<'a, W: Write + ?Sized> {
 impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
     fn new(inner: &'a mut W, max_bytes: u64) -> Self {
         Self {
-            inner,
-            hasher: Sha256::new(),
+            inner: digest_io::HashWriter::new(inner),
             bytes_written: 0,
             max_bytes,
         }
@@ -228,7 +219,7 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
 
     fn finish(self) -> NarIdentity {
         NarIdentity::new(
-            NarHash::from_digest(self.hasher.finalize().into()),
+            NarHash::from_digest(self.inner.finalize().into()),
             NarSize::new(self.bytes_written),
         )
     }
@@ -248,7 +239,6 @@ impl<W: Write + ?Sized> Write for HashingWriter<'_, W> {
         }
         let written = self.inner.write(buffer)?;
         self.bytes_written += written as u64;
-        self.hasher.update(&buffer[..written]);
         Ok(written)
     }
 
@@ -658,20 +648,9 @@ impl CompressedNarReceipt<IngestionReceiptPurpose> {
     }
 }
 
-#[derive(Debug)]
-struct CompressedSourceError(io::Error);
-
-impl fmt::Display for CompressedSourceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl std::error::Error for CompressedSourceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct CompressedSourceError(#[source] io::Error);
 
 impl<R: Read> Read for StoredCompressedSourceReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
@@ -893,24 +872,22 @@ pub(crate) fn nar_file_size_matches(file: &File, expected_size: u64) -> io::Resu
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::File,
-        io::{self, Write},
-        sync::{Arc, Mutex},
-    };
+    use std::io::{self, Write};
 
     use super::{
         EncodedIdentity, EncodedSize, FileHash, IngestionReceipt, NarHash, NarIdentity, NarSize,
-        StagingReservation, reserve_preferred_or_exact_staging_growth,
+        reserve_preferred_or_exact_staging_growth,
     };
     use crate::object::CompressionCodec;
-    use crate::storage::fs::filesystem_space;
+    use crate::storage::{StorageCapacity, publication::StagingBudget};
 
     struct EnospcWriter;
 
     impl Write for EnospcWriter {
         fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::NOSPC.raw_os_error(),
+            ))
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -928,7 +905,10 @@ mod tests {
                 |output| io::copy(&mut source, output).map(|_| ()),
             )
             .expect_err("physical output exhaustion should fail encoding");
-            assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+            assert_eq!(
+                error.raw_os_error(),
+                Some(rustix::io::Errno::NOSPC.raw_os_error())
+            );
         }
     }
 
@@ -953,26 +933,82 @@ mod tests {
 
     #[test]
     fn staging_growth_falls_back_to_the_exact_immediate_requirement() {
-        let directory = tempfile::tempdir().expect("staging growth directory");
-        let file = File::open(directory.path()).expect("open staging growth directory");
-        let available = filesystem_space(&file)
-            .expect("measure staging growth directory")
-            .available_bytes;
-        let exact_capacity = 2 * 1024 * 1024;
-        if available < exact_capacity {
-            return;
-        }
-        let min_free_bytes = available - exact_capacity;
-        let mut reservation = StagingReservation::empty(Arc::new(Mutex::new(Default::default())));
-
-        reserve_preferred_or_exact_staging_growth(
-            &mut reservation,
-            &file,
-            min_free_bytes,
-            512 * 1024,
-        )
+        let space = StorageCapacity {
+            total_bytes: 2 * 1024 * 1024,
+            available_bytes: 2 * 1024 * 1024,
+            total_inodes: 1,
+            available_inodes: 1,
+            read_only: false,
+        };
+        let mut budget = StagingBudget::default();
+        let mut attempts = Vec::new();
+        reserve_preferred_or_exact_staging_growth(512 * 1024, |required| {
+            attempts.push(required);
+            budget.reserve(space, 0, required)
+        })
         .expect("the exact output requirement should fit when the preferred chunk does not");
+        assert_eq!(attempts, [64 * 1024 * 1024, 512 * 1024]);
+        assert_eq!(budget.outstanding_bytes(), 512 * 1024);
+    }
+}
 
-        assert_eq!(reservation.reserved_bytes(), 512 * 1024);
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_compressed_source_preserves_io_layer() {
+        use std::error::Error as _;
+        let error = CompressedSourceError(io::Error::other("read failure"));
+        assert_eq!(error.to_string(), "read failure");
+        let source = error.source().unwrap();
+        assert!(source.is::<io::Error>());
+        assert_eq!(source.to_string(), "read failure");
+        assert!(source.source().is_none());
+    }
+}
+#[cfg(test)]
+mod hashing_tests {
+    use super::*;
+
+    #[test]
+    fn decoded_size_limit_checks_the_entire_attempt_before_a_partial_write() {
+        struct PartialWriter(Vec<u8>);
+        impl Write for PartialWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let accepted = bytes.len().min(1);
+                self.0.extend_from_slice(&bytes[..accepted]);
+                Ok(accepted)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut destination = PartialWriter(Vec::new());
+        let mut measured = HashingWriter::new(&mut destination, 4);
+        let error = measured.write(b"abcde").unwrap_err();
+        assert!(error.get_ref().unwrap().is::<DecodedSizeLimitExceeded>());
+        assert_eq!(measured.write(b"abcd").unwrap(), 1);
+        assert_eq!(measured.write(b"bcd").unwrap(), 1);
+        let identity = measured.finish();
+        assert_eq!(destination.0, b"ab");
+        assert_eq!(identity.size().get(), 2);
+        assert_eq!(
+            identity.hash(),
+            NarHash::from_digest(Sha256::digest(b"ab").into())
+        );
+    }
+
+    #[test]
+    fn decoded_counter_overflow_rejects_the_write_without_output() {
+        let mut destination = Vec::new();
+        let mut measured = HashingWriter::new(&mut destination, u64::MAX);
+        measured.bytes_written = u64::MAX;
+        assert_eq!(
+            measured.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(measured);
+        assert!(destination.is_empty());
     }
 }

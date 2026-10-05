@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
-    fmt,
     io::{self, Read},
     os::unix::fs::MetadataExt,
 };
@@ -121,32 +120,36 @@ impl TrustedPublicKeys {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TrustError {
+    #[error("invalid trusted public key file")]
     InvalidTrustFile,
-    Io(io::Error),
+    #[error("{0}")]
+    Io(#[from] io::Error),
 }
 
-impl From<io::Error> for TrustError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
 
-impl fmt::Display for TrustError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidTrustFile => formatter.write_str("invalid trusted public key file"),
-            Self::Io(error) => error.fmt(formatter),
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[(
+            &TrustError::InvalidTrustFile,
+            "invalid trusted public key file",
+        )];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
         }
     }
-}
 
-impl std::error::Error for TrustError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidTrustFile => None,
-            Self::Io(error) => Some(error),
-        }
+    #[test]
+    fn a1_io_error_preserves_message_and_source() {
+        use std::error::Error as _;
+        let error = TrustError::from(io::Error::other("read failure"));
+        assert_eq!(error.to_string(), "read failure");
+        assert!(error.source().unwrap().is::<io::Error>());
+        assert!(error.source().unwrap().source().is_none());
     }
 }

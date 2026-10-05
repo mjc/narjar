@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -24,7 +23,7 @@ impl TokenFile {
     pub fn load(path: &Path) -> Result<Option<Self>, Error> {
         let file = match OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags((rustix::fs::OFlags::NOFOLLOW).bits() as i32)
             .open(path)
         {
             Ok(file) => file,
@@ -96,7 +95,9 @@ impl TokenFile {
             .expect("token paths always have an auth directory");
         let directory_file = match OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .custom_flags(
+                (rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+            )
             .open(directory)
         {
             Ok(file) => file,
@@ -104,7 +105,10 @@ impl TokenFile {
                 fs::create_dir(directory)?;
                 OpenOptions::new()
                     .read(true)
-                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    .custom_flags(
+                        (rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW).bits()
+                            as i32,
+                    )
                     .open(directory)?
             }
             Err(error) => return Err(error.into()),
@@ -137,40 +141,16 @@ pub fn valid_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("token hash file permissions must be 0600")]
     InsecurePermissions,
+    #[error("invalid token hash file")]
     Invalid,
+    #[error("invalid token label")]
     InvalidLabel,
-    Io(io::Error),
-}
-
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InsecurePermissions => {
-                formatter.write_str("token hash file permissions must be 0600")
-            }
-            Self::Invalid => formatter.write_str("invalid token hash file"),
-            Self::InvalidLabel => formatter.write_str("invalid token label"),
-            Self::Io(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::InsecurePermissions | Self::Invalid | Self::InvalidLabel => None,
-        }
-    }
+    #[error("{0}")]
+    Io(#[from] io::Error),
 }
 
 #[cfg(test)]
@@ -245,5 +225,35 @@ mod tests {
 
         assert!(TokenFile::default().store(&auth.join("tokens")).is_err());
         assert!(!target.join("tokens").exists());
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &Error::InsecurePermissions,
+                "token hash file permissions must be 0600",
+            ),
+            (&Error::Invalid, "invalid token hash file"),
+            (&Error::InvalidLabel, "invalid token label"),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_io_error_preserves_message_and_source() {
+        use std::error::Error as _;
+        let error = Error::from(io::Error::other("read failure"));
+        assert_eq!(error.to_string(), "read failure");
+        assert!(error.source().unwrap().is::<io::Error>());
+        assert!(error.source().unwrap().source().is_none());
     }
 }

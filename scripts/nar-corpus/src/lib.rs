@@ -73,33 +73,30 @@ impl BytePosition {
     }
 }
 
-pub struct HashingReader<R> {
-    inner: R,
+pub struct HashingReader<R: Read> {
+    inner: digest_io::HashReader<Sha256, R>,
     position: BytePosition,
-    digest: Sha256,
-    bytes: u64,
 }
 
-impl<R> HashingReader<R> {
+impl<R: Read> HashingReader<R> {
     pub fn new(inner: R) -> (Self, BytePosition) {
         let position = BytePosition(Rc::new(Cell::new(0)));
         (
             Self {
-                inner,
+                inner: digest_io::HashReader::new(inner),
                 position: position.clone(),
-                digest: Sha256::new(),
-                bytes: 0,
             },
             position,
         )
     }
 
     pub fn finish(self) -> (R, DigestSummary) {
+        let (digest, inner) = self.inner.into_parts();
         (
-            self.inner,
+            inner,
             DigestSummary {
-                bytes: self.bytes,
-                sha256: finalize_digest(self.digest),
+                bytes: self.position.get(),
+                sha256: finalize_digest(digest),
             },
         )
     }
@@ -109,33 +106,30 @@ impl<R: Read> Read for HashingReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read(buffer)?;
         self.position.0.set(self.position.get() + read as u64);
-        self.digest.update(&buffer[..read]);
-        self.bytes += read as u64;
         Ok(read)
     }
 }
 
-pub struct HashingWriter<W> {
-    inner: W,
-    digest: Sha256,
+pub struct HashingWriter<W: Write> {
+    inner: digest_io::HashWriter<Sha256, W>,
     bytes: u64,
 }
 
-impl<W> HashingWriter<W> {
+impl<W: Write> HashingWriter<W> {
     pub fn new(inner: W) -> Self {
         Self {
-            inner,
-            digest: Sha256::new(),
+            inner: digest_io::HashWriter::new(inner),
             bytes: 0,
         }
     }
 
     pub fn finish(self) -> (W, DigestSummary) {
+        let (digest, inner) = self.inner.into_parts();
         (
-            self.inner,
+            inner,
             DigestSummary {
                 bytes: self.bytes,
-                sha256: finalize_digest(self.digest),
+                sha256: finalize_digest(digest),
             },
         )
     }
@@ -144,7 +138,6 @@ impl<W> HashingWriter<W> {
 impl<W: Write> Write for HashingWriter<W> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let written = self.inner.write(buffer)?;
-        self.digest.update(&buffer[..written]);
         self.bytes += written as u64;
         Ok(written)
     }
@@ -243,6 +236,73 @@ mod tests {
             hex(&summary.sha256),
             "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603"
         );
+    }
+
+    #[test]
+    fn reader_errors_do_not_advance_the_live_position_or_digest() {
+        struct FailingReader(u8);
+        impl Read for FailingReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.0 += 1;
+                match self.0 {
+                    1 => Err(io::ErrorKind::Interrupted.into()),
+                    2 => {
+                        output[..2].copy_from_slice(b"ab");
+                        Ok(2)
+                    }
+                    _ => {
+                        output.fill(99);
+                        Err(io::ErrorKind::PermissionDenied.into())
+                    }
+                }
+            }
+        }
+        let (mut input, position) = HashingReader::new(FailingReader(0));
+        let mut buffer = [0; 8];
+        assert_eq!(
+            input.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(position.get(), 0);
+        assert_eq!(input.read(&mut buffer).unwrap(), 2);
+        assert_eq!(
+            input.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let (_, summary) = input.finish();
+        assert_eq!(position.get(), 2);
+        assert_eq!(summary.bytes, 2);
+        assert_eq!(summary.sha256, <[u8; 32]>::from(Sha256::digest(b"ab")));
+    }
+
+    #[test]
+    fn zero_and_failed_writes_and_flushes_preserve_empty_measurements() {
+        struct FailingWriter(bool);
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                if self.0 {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                self.0 = true;
+                Ok(0)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let mut output = HashingWriter::new(FailingWriter(false));
+        assert_eq!(output.write(b"not accepted").unwrap(), 0);
+        assert_eq!(
+            output.write(b"not accepted").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            output.flush().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let (_, summary) = output.finish();
+        assert_eq!(summary.bytes, 0);
+        assert_eq!(summary.sha256, <[u8; 32]>::from(Sha256::digest([])));
     }
 
     #[test]

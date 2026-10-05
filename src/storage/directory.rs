@@ -21,10 +21,12 @@ impl Directory {
                     format!("data directory is not a directory: {}", path.display()),
                 )
             }
-            _ if error.raw_os_error() == Some(libc::ELOOP) => io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("data directory is not a directory: {}", path.display()),
-            ),
+            _ if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("data directory is not a directory: {}", path.display()),
+                )
+            }
             _ => error,
         })?;
         if file.metadata()?.permissions().mode() & 0o022 != 0 {

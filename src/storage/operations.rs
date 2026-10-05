@@ -25,6 +25,7 @@ use crate::{
     narinfo::{
         BoundNarInfo, NarInfoClaims, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file,
     },
+    records::{BoundedRegularFile, read_bounded_regular_file},
 };
 
 use super::{
@@ -38,13 +39,12 @@ use super::{
     },
     egress::NarReadBody,
     fs::{
-        BoundedRegularFile, StorageCapacity, entry_is_regular_at, files_equal_at, filesystem_space,
-        hard_link_at, open_at, open_directory_at, open_optional_at, open_regular_at,
-        read_bounded_regular_file, read_dir_names, remove_temp, rename_at, reserve_staging_bytes,
-        rollback_link_at, unlink_at,
+        ImmutableLinkOutcome, StorageCapacity, entry_is_regular_at, filesystem_space,
+        link_or_compare_immutable, open_at, open_directory_at, open_optional_at, open_regular_at,
+        read_dir_names, remove_temp, rename_at, reserve_staging_bytes, rollback_link_at, unlink_at,
     },
     ids::StoreHash,
-    location::TemporaryPath,
+    location::{StorePath, TemporaryPath},
     publication::{
         DestinationPublication, NEXT_TEMP, NarUploadPolicy, PublicationDestination,
         PublishBoundary, PublishOutcome, PublishTarget, StagedPublication, StagingReservation,
@@ -126,15 +126,19 @@ enum DestinationPublicationAttempt {
 struct CreatedDestination<'a> {
     temporary_location: TemporaryLocation,
     directory: &'a File,
-    name: &'a OsStr,
+    path: &'a StorePath,
 }
 
 impl<'a> CreatedDestination<'a> {
-    fn new(temporary_location: TemporaryLocation, directory: &'a File, name: &'a OsStr) -> Self {
+    fn new(
+        temporary_location: TemporaryLocation,
+        directory: &'a File,
+        path: &'a StorePath,
+    ) -> Self {
         Self {
             temporary_location,
             directory,
-            name,
+            path,
         }
     }
 }
@@ -551,7 +555,7 @@ impl Storage {
             PayloadStorage::Flat => {
                 let nar_directory = self.nar_directory()?;
                 let nar_name = NarFileName::raw(*nar);
-                match open_regular_at(&nar_directory, &nar_name.os_string()) {
+                match open_regular_at(&nar_directory, nar_name.os_string()) {
                     Ok(_) => Ok(()),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         Err(StorageError::MissingNar)
@@ -675,7 +679,9 @@ impl Storage {
             Ok(()) => StorageReadiness::Ready,
             Err(StorageError::InsufficientSpace) => StorageReadiness::LowSpace,
             Err(StorageError::InsufficientInodes) => StorageReadiness::NoInodes,
-            Err(StorageError::Io(error)) if error.raw_os_error() == Some(libc::EROFS) => {
+            Err(StorageError::Io(error))
+                if error.raw_os_error() == Some(rustix::io::Errno::ROFS.raw_os_error()) =>
+            {
                 StorageReadiness::ReadOnly
             }
             Err(_) => StorageReadiness::ProbeFailed,
@@ -751,12 +757,10 @@ impl Storage {
         Checkpoint: FnMut(PublishBoundary) -> Result<(), StorageError>,
     {
         let destination = target.destination();
+        destination.validate_path()?;
         let temp_name = self.next_temp_name(&target);
         let temporary_path = self.temporary_path(&target, temp_name.clone());
-        let mut transaction = self.recovery.begin(
-            &temporary_path.relative_path(),
-            &destination.relative_path(),
-        )?;
+        let mut transaction = self.recovery.begin(&temporary_path.relative_path())?;
         checkpoint(PublishBoundary::BeforeTempCreate)?;
         let temporary = OwnedTemporary::new(self, self.create_temp_named(&target, temp_name)?);
         transaction.transition(PublicationState::Streaming)?;
@@ -864,17 +868,13 @@ impl Storage {
             temp,
         )? {
             DestinationPublicationAttempt::Existing => {
-                transaction.transition(PublicationState::Published)?;
+                transaction.transition(PublicationState::Published(destination.path.clone()))?;
                 Ok(PublishOutcome::Identical)
             }
             DestinationPublicationAttempt::Created(location) => {
                 *progress = PublicationProgress::created(location);
                 self.durably_finalize_created_destination(
-                    CreatedDestination::new(
-                        location,
-                        destination_directory,
-                        destination.path.name(),
-                    ),
+                    CreatedDestination::new(location, destination_directory, &destination.path),
                     temp,
                     transaction,
                     checkpoint,
@@ -885,11 +885,7 @@ impl Storage {
             DestinationPublicationAttempt::Repaired(location) => {
                 *progress = PublicationProgress::created(location);
                 self.durably_finalize_created_destination(
-                    CreatedDestination::new(
-                        location,
-                        destination_directory,
-                        destination.path.name(),
-                    ),
+                    CreatedDestination::new(location, destination_directory, &destination.path),
                     temp,
                     transaction,
                     checkpoint,
@@ -940,40 +936,17 @@ impl Storage {
         destination_directory: &File,
         temp: &TemporaryFile,
     ) -> Result<DestinationPublicationAttempt, StorageError> {
-        match hard_link_at(
-            &temp.directory,
-            &temp.name,
-            destination_directory,
-            destination.path.name(),
-        ) {
-            Ok(()) => Ok(DestinationPublicationAttempt::Created(
-                TemporaryLocation::Staging,
-            )),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => self
-                .compare_temporary_with_existing_destination(
-                    destination,
-                    destination_directory,
-                    temp,
-                ),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn compare_temporary_with_existing_destination(
-        &self,
-        destination: &PublicationDestination,
-        destination_directory: &File,
-        temp: &TemporaryFile,
-    ) -> Result<DestinationPublicationAttempt, StorageError> {
-        if files_equal_at(
+        match link_or_compare_immutable(
             &temp.directory,
             &temp.name,
             destination_directory,
             destination.path.name(),
         )? {
-            Ok(DestinationPublicationAttempt::Existing)
-        } else {
-            Err(StorageError::Conflict)
+            ImmutableLinkOutcome::Created => Ok(DestinationPublicationAttempt::Created(
+                TemporaryLocation::Staging,
+            )),
+            ImmutableLinkOutcome::Identical => Ok(DestinationPublicationAttempt::Existing),
+            ImmutableLinkOutcome::Collision => Err(StorageError::Conflict),
         }
     }
 
@@ -1014,20 +987,26 @@ impl Storage {
         destination
             .temporary_location
             .synchronize_source_directory_after_destination_creation(temp)?;
-        transaction.transition(PublicationState::Linked)?;
+        transaction.transition(PublicationState::Linked(destination.path.clone()))?;
         if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
             destination
                 .temporary_location
-                .rollback_destination_before_durability(destination.directory, destination.name)?;
+                .rollback_destination_before_durability(
+                    destination.directory,
+                    destination.path.name(),
+                )?;
             return Err(error);
         }
         if let Err(error) = destination.directory.sync_all() {
             destination
                 .temporary_location
-                .rollback_destination_before_durability(destination.directory, destination.name)?;
+                .rollback_destination_before_durability(
+                    destination.directory,
+                    destination.path.name(),
+                )?;
             return Err(error.into());
         }
-        transaction.transition(PublicationState::Published)?;
+        transaction.transition(PublicationState::Published(destination.path.clone()))?;
         progress.mark_durable();
         checkpoint(PublishBoundary::AfterParentSync)
     }

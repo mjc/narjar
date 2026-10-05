@@ -54,12 +54,10 @@ impl Storage {
     ) -> Result<Staged<'_, Streaming<UploadRequest>>, StorageError> {
         let target = PublishTarget::Nar(name);
         let destination = target.destination();
+        destination.validate_path()?;
         let temp_name = self.next_temp_name(&target);
         let temporary_path = self.temporary_path(&target, temp_name.clone());
-        let transaction = self.recovery.begin(
-            &temporary_path.relative_path(),
-            &destination.relative_path(),
-        )?;
+        let transaction = self.recovery.begin(&temporary_path.relative_path())?;
         let temporary = match self.create_temp_named_owned(&target, temp_name) {
             Ok(temporary) => temporary,
             Err(error) => {

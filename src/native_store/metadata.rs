@@ -1,4 +1,4 @@
-use std::{fmt, num::NonZeroU64, path::Path};
+use std::{num::NonZeroU64, path::Path};
 
 use narjar::{
     __private::narinfo::{NarInfoMetadata, TrustedPublicKeys},
@@ -101,16 +101,9 @@ impl SignedNativeNarInfo {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("no trusted signature is available for native store metadata")]
 pub(crate) struct MissingTrustedSignature;
-
-impl fmt::Display for MissingTrustedSignature {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("no trusted signature is available for native store metadata")
-    }
-}
-
-impl std::error::Error for MissingTrustedSignature {}
 
 struct NativePathRow {
     id: i64,
@@ -230,55 +223,35 @@ fn parse_nix_base16_nar_hash(value: &str) -> Result<NarHash, NativeMetadataError
     let hex = value.strip_prefix("sha256:").ok_or_else(|| {
         NativeMetadataError::InvalidMetadata(format!("unsupported Nix path hash: {value}"))
     })?;
-    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
-    if !remainder.is_empty() || pairs.len() != 32 {
+    if hex.len() != 64 {
         return Err(NativeMetadataError::InvalidMetadata(
             "Nix SHA-256 digest must contain 32 bytes".into(),
         ));
     }
     let mut digest = [0; 32];
-    digest
-        .iter_mut()
-        .zip(pairs)
-        .try_for_each(|(output, pair)| {
-            *output = (parse_hex_nibble(pair[0])? << 4) | parse_hex_nibble(pair[1])?;
-            Ok::<(), NativeMetadataError>(())
+    data_encoding::HEXLOWER_PERMISSIVE
+        .decode_mut(hex.as_bytes(), &mut digest)
+        .map_err(|_| {
+            NativeMetadataError::InvalidMetadata(
+                "Nix SHA-256 digest contains non-hexadecimal bytes".into(),
+            )
         })?;
     Ok(NarHash::from_digest(digest))
-}
-
-fn parse_hex_nibble(byte: u8) -> Result<u8, NativeMetadataError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(NativeMetadataError::InvalidMetadata(
-            "Nix SHA-256 digest contains non-hexadecimal bytes".into(),
-        )),
-    }
 }
 
 fn database_error(context: &'static str) -> impl FnOnce(sqlite::Error) -> NativeMetadataError {
     move |error| NativeMetadataError::Database(format!("{context}: {error}"))
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum NativeMetadataError {
+    #[error("{0}")]
     Database(String),
+    #[error("{0}")]
     InvalidMetadata(String),
+    #[error("store path is not valid: {0}")]
     MissingStorePath(String),
 }
-
-impl fmt::Display for NativeMetadataError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Database(detail) | Self::InvalidMetadata(detail) => formatter.write_str(detail),
-            Self::MissingStorePath(path) => write!(formatter, "store path is not valid: {path}"),
-        }
-    }
-}
-
-impl std::error::Error for NativeMetadataError {}
 
 #[cfg(test)]
 mod tests {
@@ -467,5 +440,36 @@ mod tests {
             metadata.sign_for_trusted_cache(&trusted_keys, None).err(),
             Some(MissingTrustedSignature)
         );
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &MissingTrustedSignature,
+                "no trusted signature is available for native store metadata",
+            ),
+            (
+                &NativeMetadataError::Database("query detail".into()),
+                "query detail",
+            ),
+            (
+                &NativeMetadataError::InvalidMetadata("metadata detail".into()),
+                "metadata detail",
+            ),
+            (
+                &NativeMetadataError::MissingStorePath("/nix/store/path".into()),
+                "store path is not valid: /nix/store/path",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
     }
 }

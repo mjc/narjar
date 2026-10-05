@@ -5,20 +5,19 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use data_encoding::HEXLOWER;
+use narjar::__private::records::{BoundedRegularFile, decode_complete, read_bounded_regular_file};
 use rustix::{fs::FlockOperation, io::Errno};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlite::{ConnectionThreadSafe, State};
 
 const LEASE_PREFIX: &str = ".narjar-lease-";
+const LEASE_TEMP_PREFIX: &str = ".narjar-lease-temp-";
 const RECORD_FILE: &str = "record";
 const ROOT_FILE: &str = "root";
 const LOCK_FILE: &str = ".narjar-lease.lock";
@@ -29,7 +28,6 @@ const MAX_EXPIRY_CLEANUP_PER_CALL: usize = 64;
 #[cfg(test)]
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 
-static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static FAIL_DIRECTORY_SYNC: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
 
@@ -1203,7 +1201,9 @@ impl NativeStoreLeaseManager {
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(
+                (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+            )
             .open(path)
             .map_err(NativeStoreLeaseError::Io)?;
         set_flock_lock(&file)?;
@@ -1214,7 +1214,9 @@ impl NativeStoreLeaseManager {
         let path = self.state_dir.join("gc.lock");
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(
+                (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+            )
             .open(path)
             .map_err(NativeStoreLeaseError::Io)?;
         set_flock_lock_with_mode(&file, FlockOperation::LockShared)?;
@@ -1389,17 +1391,14 @@ fn read_optional_record(
     path: &Path,
     store_dir: &Path,
 ) -> Result<Option<LeaseRecord>, NativeStoreLeaseError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(NativeStoreLeaseError::Io(error)),
+    let record = match read_bounded_regular_file(rustix::fs::CWD, path, MAX_RECORD_BYTES)
+        .map_err(NativeStoreLeaseError::Io)?
+        .parse(|bytes| decode_complete::<LeaseRecord>(bytes).ok())
+    {
+        BoundedRegularFile::Missing => return Ok(None),
+        BoundedRegularFile::Invalid => return Err(NativeStoreLeaseError::InvalidRecord),
+        BoundedRegularFile::Valid(record) => record,
     };
-    if !metadata.file_type().is_file() || metadata.len() > MAX_RECORD_BYTES {
-        return Err(NativeStoreLeaseError::InvalidRecord);
-    }
-    let bytes = fs::read(path).map_err(NativeStoreLeaseError::Io)?;
-    let record: LeaseRecord =
-        postcard::from_bytes(&bytes).map_err(|_| NativeStoreLeaseError::InvalidRecord)?;
     let store_path = record.store_path(store_dir)?;
     if path.file_name() != Some(std::ffi::OsStr::new(RECORD_FILE))
         || path.parent().and_then(Path::file_name)
@@ -1431,18 +1430,14 @@ fn write_record_atomically(
 
 fn read_capacity_record(roots_dir: &Path) -> Result<CapacityRecord, NativeStoreLeaseError> {
     let path = roots_dir.join(CAPACITY_FILE);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(CapacityRecord::default());
-        }
-        Err(error) => return Err(NativeStoreLeaseError::Io(error)),
-    };
-    if !metadata.file_type().is_file() || metadata.len() > MAX_CAPACITY_RECORD_BYTES {
-        return Err(NativeStoreLeaseError::InvalidCapacityRecord);
+    match read_bounded_regular_file(rustix::fs::CWD, &path, MAX_CAPACITY_RECORD_BYTES)
+        .map_err(NativeStoreLeaseError::Io)?
+        .parse(|bytes| decode_complete(bytes).ok())
+    {
+        BoundedRegularFile::Missing => Ok(CapacityRecord::default()),
+        BoundedRegularFile::Invalid => Err(NativeStoreLeaseError::InvalidCapacityRecord),
+        BoundedRegularFile::Valid(record) => Ok(record),
     }
-    postcard::from_bytes(&fs::read(path).map_err(NativeStoreLeaseError::Io)?)
-        .map_err(|_| NativeStoreLeaseError::InvalidCapacityRecord)
 }
 
 fn write_capacity_record(
@@ -1481,19 +1476,20 @@ fn write_bytes_atomically(
     path: &Path,
     bytes: &[u8],
 ) -> Result<(), NativeStoreLeaseError> {
-    let (temporary_path, mut file) = create_temporary_record(roots_dir)?;
-    let write_result = file
+    let mut temporary = tempfile::Builder::new()
+        .prefix(LEASE_TEMP_PREFIX)
+        .tempfile_in(roots_dir)
+        .map_err(NativeStoreLeaseError::Io)?;
+    temporary
         .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(NativeStoreLeaseError::Io);
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temporary_path);
-        return Err(error);
-    }
-    if let Err(error) = fs::rename(&temporary_path, path) {
-        let _ = fs::remove_file(&temporary_path);
-        return Err(NativeStoreLeaseError::Io(error));
-    }
+        .map_err(NativeStoreLeaseError::Io)?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(NativeStoreLeaseError::Io)?;
+    temporary
+        .persist(path)
+        .map_err(|error| NativeStoreLeaseError::Io(error.error))?;
     let destination_directory = path.parent().unwrap_or(roots_dir);
     sync_directory(destination_directory)?;
     if destination_directory != roots_dir {
@@ -1542,33 +1538,6 @@ fn fail_nth_directory_sync(path: &Path, nth_sync: usize) {
         Some((path.to_owned(), nth_sync));
 }
 
-fn temporary_path(directory: &Path) -> PathBuf {
-    let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed);
-    directory.join(format!(
-        "{LEASE_PREFIX}temp-{}-{sequence}",
-        std::process::id()
-    ))
-}
-
-fn create_temporary_record(directory: &Path) -> Result<(PathBuf, File), NativeStoreLeaseError> {
-    (0..128)
-        .find_map(|_| {
-            let path = temporary_path(directory);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-                .open(&path)
-            {
-                Ok(file) => Some(Ok((path, file))),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
-                Err(error) => Some(Err(NativeStoreLeaseError::Io(error))),
-            }
-        })
-        .unwrap_or(Err(NativeStoreLeaseError::TemporaryNameExhausted))
-}
-
 fn remove_stale_temporary_records(roots_dir: &Path) -> Result<(), NativeStoreLeaseError> {
     let stale_paths = fs::read_dir(roots_dir)
         .map_err(NativeStoreLeaseError::Io)?
@@ -1597,18 +1566,11 @@ fn remove_stale_temporary_records(roots_dir: &Path) -> Result<(), NativeStoreLea
 }
 
 fn is_temporary_record_name(name: &std::ffi::OsStr) -> bool {
-    name.to_str().is_some_and(|name| {
-        name.strip_prefix(LEASE_PREFIX)
-            .and_then(|name| name.strip_prefix("temp-"))
-            .is_some_and(|suffix| {
-                suffix
-                    .split_once('-')
-                    .is_some_and(|(pid, sequence)| !pid.is_empty() && !sequence.is_empty())
-                    && suffix
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || byte == b'-')
-            })
-    })
+    name.to_str()
+        .and_then(|name| name.strip_prefix(LEASE_TEMP_PREFIX))
+        .is_some_and(|suffix| {
+            suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
 }
 
 fn lease_directory_name(path: &NativeStorePath) -> std::ffi::OsString {
@@ -1628,66 +1590,36 @@ fn now_unix_seconds() -> Result<u64, NativeStoreLeaseError> {
         .map_err(|_| NativeStoreLeaseError::ClockBeforeEpoch)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum NativeStoreLeaseError {
+    #[error("native-store lease capacity is full")]
     CapacityExceeded,
+    #[error("system clock is before the Unix epoch")]
     ClockBeforeEpoch,
+    #[error("native-store lease expiry overflows")]
     ClockOverflow,
+    #[error("querying the Nix store database: {0}")]
     Database(String),
+    #[error("native-store lease record is invalid")]
     InvalidRecord,
+    #[error("native-store lease capacity record is invalid")]
     InvalidCapacityRecord,
+    #[error("native-store path is invalid")]
     InvalidStorePath,
-    Io(io::Error),
+    #[error("native-store lease I/O: {0}")]
+    Io(#[source] io::Error),
+    #[error("native-store lease has not expired")]
     LeaseStillLive,
+    #[error("native-store lease state is poisoned")]
     Poisoned,
+    #[error("native-store GC root conflicts with its lease")]
     RootConflict,
+    #[error("native-store lease record exceeds its limit")]
     RecordTooLarge,
+    #[error("native-store lease recovery must finish before admission")]
     RecoveryRequired,
-    TemporaryNameExhausted,
+    #[error("native-store path is not registered in the Nix store")]
     UnregisteredStorePath,
-}
-
-impl std::fmt::Display for NativeStoreLeaseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CapacityExceeded => formatter.write_str("native-store lease capacity is full"),
-            Self::ClockBeforeEpoch => formatter.write_str("system clock is before the Unix epoch"),
-            Self::ClockOverflow => formatter.write_str("native-store lease expiry overflows"),
-            Self::Database(error) => write!(formatter, "querying the Nix store database: {error}"),
-            Self::InvalidRecord => formatter.write_str("native-store lease record is invalid"),
-            Self::InvalidCapacityRecord => {
-                formatter.write_str("native-store lease capacity record is invalid")
-            }
-            Self::InvalidStorePath => formatter.write_str("native-store path is invalid"),
-            Self::Io(error) => write!(formatter, "native-store lease I/O: {error}"),
-            Self::LeaseStillLive => formatter.write_str("native-store lease has not expired"),
-            Self::Poisoned => formatter.write_str("native-store lease state is poisoned"),
-            Self::RootConflict => {
-                formatter.write_str("native-store GC root conflicts with its lease")
-            }
-            Self::RecordTooLarge => {
-                formatter.write_str("native-store lease record exceeds its limit")
-            }
-            Self::RecoveryRequired => {
-                formatter.write_str("native-store lease recovery must finish before admission")
-            }
-            Self::TemporaryNameExhausted => {
-                formatter.write_str("native-store lease temporary names are exhausted")
-            }
-            Self::UnregisteredStorePath => {
-                formatter.write_str("native-store path is not registered in the Nix store")
-            }
-        }
-    }
-}
-
-impl std::error::Error for NativeStoreLeaseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1696,11 +1628,142 @@ mod tests {
     use sqlite::Connection;
     use std::{
         num::NonZeroUsize,
-        os::fd::AsRawFd,
         process::{Command, Output},
         sync::{Arc, Barrier},
         thread,
     };
+
+    #[test]
+    fn lease_and_capacity_readers_keep_absence_invalid_records_and_io_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let capacity = directory.path().join(CAPACITY_FILE);
+        assert_eq!(
+            read_capacity_record(directory.path()).unwrap(),
+            CapacityRecord::default()
+        );
+        assert!(
+            read_optional_record(&capacity, directory.path())
+                .unwrap()
+                .is_none()
+        );
+
+        for bytes in [vec![], vec![0; MAX_RECORD_BYTES as usize + 1]] {
+            fs::write(&capacity, bytes).unwrap();
+            assert!(matches!(
+                read_capacity_record(directory.path()),
+                Err(NativeStoreLeaseError::InvalidCapacityRecord)
+            ));
+            assert!(matches!(
+                read_optional_record(&capacity, directory.path()),
+                Err(NativeStoreLeaseError::InvalidRecord)
+            ));
+        }
+
+        fs::remove_file(&capacity).unwrap();
+        fs::create_dir(&capacity).unwrap();
+        assert!(matches!(
+            read_capacity_record(directory.path()),
+            Err(NativeStoreLeaseError::InvalidCapacityRecord)
+        ));
+        assert!(matches!(
+            read_optional_record(&capacity, directory.path()),
+            Err(NativeStoreLeaseError::InvalidRecord)
+        ));
+        fs::remove_dir(&capacity).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                &capacity,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )
+            .unwrap();
+            assert!(matches!(
+                read_capacity_record(directory.path()),
+                Err(NativeStoreLeaseError::InvalidCapacityRecord)
+            ));
+            assert!(matches!(
+                read_optional_record(&capacity, directory.path()),
+                Err(NativeStoreLeaseError::InvalidRecord)
+            ));
+            fs::remove_file(&capacity).unwrap();
+        }
+        let target = directory.path().join("target");
+        fs::write(
+            &target,
+            postcard::to_allocvec(&CapacityRecord::default()).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &capacity).unwrap();
+        assert!(matches!(
+            read_capacity_record(directory.path()),
+            Err(NativeStoreLeaseError::InvalidCapacityRecord)
+        ));
+        assert!(matches!(
+            read_optional_record(&capacity, directory.path()),
+            Err(NativeStoreLeaseError::InvalidRecord)
+        ));
+
+        for result in [
+            read_capacity_record(&target).map(|_| ()),
+            read_optional_record(&target.join(RECORD_FILE), directory.path()).map(|_| ()),
+        ] {
+            match result {
+                Err(NativeStoreLeaseError::Io(error)) => {
+                    assert_eq!(error.raw_os_error(), Some(Errno::NOTDIR.raw_os_error()))
+                }
+                result => panic!("non-directory parent must retain its I/O error: {result:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lease_and_capacity_reads_reject_trailing_bytes() {
+        let fixture = LeaseFixture::new(1);
+        let _lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 2)
+            .unwrap();
+        let path = fixture
+            .roots_dir
+            .join(lease_directory_name(&fixture.store_path))
+            .join(RECORD_FILE);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+        assert!(matches!(
+            read_optional_record(&path, &fixture.store_dir),
+            Err(NativeStoreLeaseError::InvalidRecord)
+        ));
+        let capacity = fixture.roots_dir.join(CAPACITY_FILE);
+        OpenOptions::new()
+            .append(true)
+            .open(capacity)
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+        assert!(matches!(
+            read_capacity_record(&fixture.roots_dir),
+            Err(NativeStoreLeaseError::InvalidCapacityRecord)
+        ));
+    }
+
+    #[test]
+    fn failed_record_persistence_cleans_the_owned_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            write_bytes_atomically(
+                directory.path(),
+                &directory.path().join("missing/record"),
+                b"record"
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 
     struct LeaseFixture {
         _directory: tempfile::TempDir,
@@ -2849,7 +2912,11 @@ mod tests {
     #[test]
     fn recovery_removes_leftover_temporary_records() {
         let fixture = LeaseFixture::new(1);
-        let path = temporary_path(&fixture.roots_dir);
+        let temporary = tempfile::Builder::new()
+            .prefix(LEASE_TEMP_PREFIX)
+            .tempfile_in(&fixture.roots_dir)
+            .unwrap();
+        let (_, path) = temporary.keep().unwrap();
         fs::write(&path, b"incomplete sidecar").expect("interrupted temp should be written");
 
         fixture.reopen(1);
@@ -3102,19 +3169,11 @@ mod tests {
             .open(&gc_lock_path)
             .expect("Narjar GC lock should open");
         set_flock_lock(&nix_gc_lock).expect("exclusive Nix-style flock should succeed");
-        // SAFETY: the descriptor is live; LOCK_NB avoids blocking this assertion.
-        let blocked =
-            unsafe { libc::flock(narjar_gc_lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
-        assert_eq!(blocked, -1);
-        assert!(matches!(
-            io::Error::last_os_error().kind(),
-            io::ErrorKind::WouldBlock
-        ));
-        // SAFETY: the descriptor is live and unlocking requires no pointer arguments.
-        assert_eq!(
-            unsafe { libc::flock(nix_gc_lock.as_raw_fd(), libc::LOCK_UN) },
-            0
-        );
+        let blocked = rustix::fs::flock(&narjar_gc_lock, FlockOperation::NonBlockingLockShared)
+            .expect_err("exclusive Nix lock must block shared Narjar lock");
+        assert_eq!(io::Error::from(blocked).kind(), io::ErrorKind::WouldBlock);
+        rustix::fs::flock(&nix_gc_lock, FlockOperation::Unlock)
+            .expect("exclusive Nix-style flock should unlock");
         set_flock_lock_with_mode(&narjar_gc_lock, FlockOperation::LockShared)
             .expect("shared Narjar-style flock should succeed after GC unlocks");
     }
@@ -3283,5 +3342,81 @@ mod tests {
         assert!(!root.exists());
         assert!(foreign_path.exists());
         assert!(fixture.owned_records().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &NativeStoreLeaseError::CapacityExceeded,
+                "native-store lease capacity is full",
+            ),
+            (
+                &NativeStoreLeaseError::ClockBeforeEpoch,
+                "system clock is before the Unix epoch",
+            ),
+            (
+                &NativeStoreLeaseError::ClockOverflow,
+                "native-store lease expiry overflows",
+            ),
+            (
+                &NativeStoreLeaseError::Database("detail".into()),
+                "querying the Nix store database: detail",
+            ),
+            (
+                &NativeStoreLeaseError::InvalidRecord,
+                "native-store lease record is invalid",
+            ),
+            (
+                &NativeStoreLeaseError::InvalidCapacityRecord,
+                "native-store lease capacity record is invalid",
+            ),
+            (
+                &NativeStoreLeaseError::InvalidStorePath,
+                "native-store path is invalid",
+            ),
+            (
+                &NativeStoreLeaseError::LeaseStillLive,
+                "native-store lease has not expired",
+            ),
+            (
+                &NativeStoreLeaseError::Poisoned,
+                "native-store lease state is poisoned",
+            ),
+            (
+                &NativeStoreLeaseError::RootConflict,
+                "native-store GC root conflicts with its lease",
+            ),
+            (
+                &NativeStoreLeaseError::RecordTooLarge,
+                "native-store lease record exceeds its limit",
+            ),
+            (
+                &NativeStoreLeaseError::RecoveryRequired,
+                "native-store lease recovery must finish before admission",
+            ),
+            (
+                &NativeStoreLeaseError::UnregisteredStorePath,
+                "native-store path is not registered in the Nix store",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_io_error_preserves_message_and_source() {
+        use std::error::Error as _;
+        let error = NativeStoreLeaseError::Io(io::Error::other("read failure"));
+        assert_eq!(error.to_string(), "native-store lease I/O: read failure");
+        assert!(error.source().unwrap().is::<io::Error>());
+        assert!(error.source().unwrap().source().is_none());
     }
 }

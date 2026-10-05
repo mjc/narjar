@@ -419,18 +419,28 @@ pub enum PublishOutcome {
     Identical,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("immutable destination has different contents")]
     Conflict,
+    #[error("decoded NAR exceeds configured size limit")]
     DecodedSizeLimitExceeded,
+    #[error("compressed decoder memory requirement exceeds configured limit")]
     DecoderMemoryLimitExceeded,
+    #[error("configured free space reserve would be violated")]
     InsufficientSpace,
+    #[error("filesystem has no free inodes")]
     InsufficientInodes,
+    #[error("data directory is locked by another process")]
     Locked,
+    #[error("referenced NAR is not published")]
     MissingNar,
+    #[error("referenced NAR size does not match narinfo")]
     NarMismatch,
+    #[error("NAR upload exceeds configured size limit")]
     UploadTooLarge,
-    Io(io::Error),
+    #[error("{0}")]
+    Io(#[source] io::Error),
 }
 
 impl From<io::Error> for StorageError {
@@ -447,65 +457,87 @@ impl From<io::Error> for StorageError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("decoded NAR exceeds configured size limit")]
 pub(super) struct DecodedSizeLimitExceeded;
 
-impl std::fmt::Display for DecodedSizeLimitExceeded {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("decoded NAR exceeds configured size limit")
-    }
-}
-
-impl std::error::Error for DecodedSizeLimitExceeded {}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("compressed decoder memory requirement exceeds configured limit")]
 pub(super) struct DecoderMemoryLimitExceeded;
 
-impl std::fmt::Display for DecoderMemoryLimitExceeded {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("compressed decoder memory requirement exceeds configured limit")
-    }
-}
-
-impl std::error::Error for DecoderMemoryLimitExceeded {}
-
-impl std::fmt::Display for StorageError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Conflict => formatter.write_str("immutable destination has different contents"),
-            Self::DecodedSizeLimitExceeded => {
-                formatter.write_str("decoded NAR exceeds configured size limit")
-            }
-            Self::DecoderMemoryLimitExceeded => formatter
-                .write_str("compressed decoder memory requirement exceeds configured limit"),
-            Self::InsufficientSpace => {
-                formatter.write_str("configured free space reserve would be violated")
-            }
-            Self::InsufficientInodes => formatter.write_str("filesystem has no free inodes"),
-            Self::Locked => formatter.write_str("data directory is locked by another process"),
-            Self::MissingNar => formatter.write_str("referenced NAR is not published"),
-            Self::NarMismatch => formatter.write_str("referenced NAR size does not match narinfo"),
-            Self::UploadTooLarge => formatter.write_str("NAR upload exceeds configured size limit"),
-            Self::Io(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for StorageError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Conflict
-            | Self::DecodedSizeLimitExceeded
-            | Self::DecoderMemoryLimitExceeded
-            | Self::InsufficientSpace
-            | Self::InsufficientInodes
-            | Self::Locked
-            | Self::MissingNar
-            | Self::NarMismatch
-            | Self::UploadTooLarge => None,
-        }
-    }
-}
-
 pub(super) static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &StorageError::Conflict,
+                "immutable destination has different contents",
+            ),
+            (
+                &StorageError::DecodedSizeLimitExceeded,
+                "decoded NAR exceeds configured size limit",
+            ),
+            (
+                &StorageError::DecoderMemoryLimitExceeded,
+                "compressed decoder memory requirement exceeds configured limit",
+            ),
+            (
+                &StorageError::InsufficientSpace,
+                "configured free space reserve would be violated",
+            ),
+            (
+                &StorageError::InsufficientInodes,
+                "filesystem has no free inodes",
+            ),
+            (
+                &StorageError::Locked,
+                "data directory is locked by another process",
+            ),
+            (&StorageError::MissingNar, "referenced NAR is not published"),
+            (
+                &StorageError::NarMismatch,
+                "referenced NAR size does not match narinfo",
+            ),
+            (
+                &StorageError::UploadTooLarge,
+                "NAR upload exceeds configured size limit",
+            ),
+            (
+                &DecodedSizeLimitExceeded,
+                "decoded NAR exceeds configured size limit",
+            ),
+            (
+                &DecoderMemoryLimitExceeded,
+                "compressed decoder memory requirement exceeds configured limit",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_storage_io_conversion_preserves_sources_and_limit_classification() {
+        use std::error::Error as _;
+        let error = StorageError::from(io::Error::other("read failure"));
+        assert_eq!(error.to_string(), "read failure");
+        let source = error.source().unwrap();
+        assert!(source.is::<io::Error>());
+        assert_eq!(source.to_string(), "read failure");
+        assert!(source.source().is_none());
+        assert!(matches!(
+            StorageError::from(io::Error::other(DecodedSizeLimitExceeded)),
+            StorageError::DecodedSizeLimitExceeded
+        ));
+        assert!(matches!(
+            StorageError::from(io::Error::other(DecoderMemoryLimitExceeded)),
+            StorageError::DecoderMemoryLimitExceeded
+        ));
+    }
+}

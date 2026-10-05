@@ -5,7 +5,7 @@
 //! bodies are written and hashed as they arrive. The output writer is returned
 //! by [`Encoder::finish`] so callers retain ownership of their destination.
 
-use std::{fmt, io, io::Write};
+use std::{io, io::Write};
 
 use sha2::{Digest, Sha256};
 
@@ -14,7 +14,7 @@ use crate::nar::RootKind;
 /// The compatibility version of this event-to-byte contract.
 pub const ENCODER_VERSION: u32 = 1;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 /// An output, event-sequence, canonicality, or resource-limit error.
 ///
 /// An encoding attempt is terminal after any such error. The encoder may have
@@ -23,12 +23,16 @@ pub const ENCODER_VERSION: u32 = 1;
 /// [`Encoder::finish`]. An I/O error can also follow a partial write.
 pub enum EncodeError {
     /// Writing canonical NAR bytes failed.
-    Io(io::Error),
+    #[error("NAR output: {0}")]
+    Io(#[source] io::Error),
     /// The event sequence cannot describe a complete NAR.
+    #[error("invalid NAR events: {0}")]
     Invalid(&'static str),
     /// An event value violates canonical NAR rules.
+    #[error("non-canonical NAR events: {0}")]
     NonCanonical(&'static str),
     /// A configured encoding resource limit was exceeded.
+    #[error("NAR encoder {what} limit exceeded: {actual} > {limit}")]
     LimitExceeded {
         /// The resource whose limit was exceeded.
         what: &'static str,
@@ -37,33 +41,6 @@ pub enum EncodeError {
         /// The observed value.
         actual: u64,
     },
-}
-
-impl fmt::Display for EncodeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(error) => write!(formatter, "NAR output: {error}"),
-            Self::Invalid(message) => write!(formatter, "invalid NAR events: {message}"),
-            Self::NonCanonical(message) => write!(formatter, "non-canonical NAR events: {message}"),
-            Self::LimitExceeded {
-                what,
-                limit,
-                actual,
-            } => write!(
-                formatter,
-                "NAR encoder {what} limit exceeded: {actual} > {limit}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EncodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Invalid(_) | Self::NonCanonical(_) | Self::LimitExceeded { .. } => None,
-        }
-    }
 }
 
 /// Representation-neutral events accepted by [`Encoder`].
@@ -193,9 +170,7 @@ impl<W: Write> Encoder<W> {
         let RootState::Complete(root) = self.root else {
             return Err(EncodeError::Invalid("the root node is incomplete"));
         };
-        let digest = self.digest.finalize();
-        let mut raw_sha256 = [0_u8; 32];
-        raw_sha256.copy_from_slice(&digest);
+        let raw_sha256: [u8; 32] = self.digest.finalize().into();
         Ok((
             self.writer,
             EncodeSummary {
@@ -531,5 +506,45 @@ impl<W: Write> Encoder<W> {
         self.digest.update(bytes);
         self.raw_size = next;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &EncodeError::Invalid("detail"),
+                "invalid NAR events: detail",
+            ),
+            (
+                &EncodeError::NonCanonical("detail"),
+                "non-canonical NAR events: detail",
+            ),
+            (
+                &EncodeError::LimitExceeded {
+                    what: "bytes",
+                    limit: 8,
+                    actual: 9,
+                },
+                "NAR encoder bytes limit exceeded: 9 > 8",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_encode_io_source_keeps_io_layer() {
+        use std::error::Error as _;
+        let error = EncodeError::Io(io::Error::other("write failure"));
+        assert_eq!(error.to_string(), "NAR output: write failure");
+        assert!(error.source().unwrap().is::<io::Error>());
+        assert!(error.source().unwrap().source().is_none());
     }
 }

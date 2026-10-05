@@ -454,10 +454,7 @@ impl Request {
         let mut stream = self.stream;
         response
             .write_headers(&mut stream, connection)
-            .map_err(|error| TransferFailure {
-                error,
-                body_bytes: 0,
-            })?;
+            .map_err(TransferFailure::before_body)?;
         let body_bytes = if head {
             0
         } else {
@@ -500,20 +497,11 @@ impl Request {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum BodyReaderError {
+    #[error("request body was already consumed")]
     AlreadyConsumed,
 }
-
-impl std::fmt::Display for BodyReaderError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AlreadyConsumed => formatter.write_str("request body was already consumed"),
-        }
-    }
-}
-
-impl std::error::Error for BodyReaderError {}
 
 pub struct BodyReader<'a> {
     stream: &'a mut TcpStream,
@@ -969,5 +957,22 @@ mod tests {
                 .expect("sender should finish")
                 .ends_with(b"\r\n\r\n2345")
         );
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[(
+            &BodyReaderError::AlreadyConsumed,
+            "request body was already consumed",
+        )];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
     }
 }

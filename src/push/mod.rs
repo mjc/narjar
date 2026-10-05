@@ -34,7 +34,8 @@ use transfer::request_status;
 use transfer::{LookupPurpose, get_bounded, put};
 use upstream::{CacheLookup, PushDisposition, TrustedUpstreams};
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{message}")]
 pub(super) struct PushError {
     message: String,
 }
@@ -51,14 +52,6 @@ impl PushError {
         self.message.contains(needle)
     }
 }
-
-impl fmt::Display for PushError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for PushError {}
 
 impl From<String> for PushError {
     fn from(message: String) -> Self {
@@ -1718,5 +1711,29 @@ mod tests {
             error.to_string().contains("missing referenced store path"),
             "unexpected error: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (&PushError::from("detail"), "detail"),
+            (
+                &PushError::from(String::from("owned detail")),
+                "owned detail",
+            ),
+            (
+                &PushError::from(crate::http_url::HttpUrlError::MissingHost),
+                "URL must include a host",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
     }
 }

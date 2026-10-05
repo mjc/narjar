@@ -1,7 +1,4 @@
-use std::{
-    fmt,
-    io::{self, Read, Write},
-};
+use std::io::{self, Read, Write};
 
 use crate::object::{
     EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarRepresentation,
@@ -101,24 +98,15 @@ pub struct NarInfoClaims {
     identity: NarIdentity,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LogicalClaimsMismatch {
+    #[error("store path differs")]
     StorePath,
+    #[error("NAR hash or size differs")]
     NarIdentity,
+    #[error("references differ")]
     References,
 }
-
-impl fmt::Display for LogicalClaimsMismatch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::StorePath => formatter.write_str("store path differs"),
-            Self::NarIdentity => formatter.write_str("NAR hash or size differs"),
-            Self::References => formatter.write_str("references differ"),
-        }
-    }
-}
-
-impl std::error::Error for LogicalClaimsMismatch {}
 
 #[derive(Clone, Copy)]
 enum ReferencesFieldHandling {
@@ -385,13 +373,13 @@ impl NarInfoMetadata {
     }
 }
 
-pub(crate) fn read_narinfo_file(file: impl Read) -> io::Result<Vec<u8>> {
+pub fn read_narinfo_file(file: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(MAX_NARINFO_BYTES + 1).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, enum_map::Enum)]
 enum NarInfoField {
     StorePath,
     Url,
@@ -404,10 +392,6 @@ enum NarInfoField {
     Deriver,
     System,
     ContentAddress,
-}
-
-impl NarInfoField {
-    const COUNT: usize = Self::ContentAddress as usize + 1;
 }
 
 enum NarInfoLineField {
@@ -442,7 +426,7 @@ impl NarInfoLineField {
 }
 
 struct NarInfoDocument<'text> {
-    fields: [Option<&'text str>; NarInfoField::COUNT],
+    fields: enum_map::EnumMap<NarInfoField, Option<&'text str>>,
     signature_values: Vec<&'text str>,
 }
 
@@ -464,7 +448,7 @@ impl<'text> NarInfoDocument<'text> {
             .split('\n')
             .try_fold(
                 Self {
-                    fields: [None; NarInfoField::COUNT],
+                    fields: enum_map::EnumMap::default(),
                     signature_values: Vec::new(),
                 },
                 |document, line| document.record_line(line, unknown_fields),
@@ -497,12 +481,12 @@ impl<'text> NarInfoDocument<'text> {
                 self.signature_values.push(value);
                 Ok(())
             }
-            NarInfoLineField::Unique(field) => set_once(&mut self.fields[field as usize], value),
+            NarInfoLineField::Unique(field) => set_once(&mut self.fields[field], value),
         }
     }
 
     fn field(&self, field: NarInfoField) -> Option<&'text str> {
-        self.fields[field as usize]
+        self.fields[field]
     }
 
     fn required(&self, field: NarInfoField) -> Result<&'text str, NarInfoError> {
@@ -874,7 +858,8 @@ fn validate_store_basename(value: &str) -> Result<(StoreHash, &str), NarInfoErro
     crate::storage::validate_store_basename(value).map_err(|_| NarInfoError)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("invalid or untrusted narinfo")]
 pub struct NarInfoError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -882,14 +867,6 @@ pub(crate) enum PublishedNarInfoError {
     Malformed,
     UntrustedSignature,
 }
-
-impl fmt::Display for NarInfoError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("invalid or untrusted narinfo")
-    }
-}
-
-impl std::error::Error for NarInfoError {}
 
 #[cfg(test)]
 mod tests {
@@ -900,7 +877,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let file = std::fs::File::create(directory.path().join("write-only")).unwrap();
         let error = read_narinfo_file(file).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::BADF.raw_os_error())
+        );
     }
 
     const STORE_HASH: &str = "00000000000000000000000000000000";
@@ -1112,5 +1092,27 @@ mod tests {
         .into_bytes();
 
         assert!(UnverifiedPublicationNarInfo::parse(&route, bytes).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (&LogicalClaimsMismatch::StorePath, "store path differs"),
+            (
+                &LogicalClaimsMismatch::NarIdentity,
+                "NAR hash or size differs",
+            ),
+            (&LogicalClaimsMismatch::References, "references differ"),
+            (&NarInfoError, "invalid or untrusted narinfo"),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
     }
 }

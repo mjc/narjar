@@ -1,8 +1,8 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Read,
     num::{NonZeroU64, NonZeroUsize},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -69,7 +69,8 @@ pub(crate) enum NativeStoreIssue {
     SignatureTrust,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
 pub(crate) struct NativeStoreValidationError {
     issue: NativeStoreIssue,
     detail: String,
@@ -111,14 +112,6 @@ fn classify_validation<T>(
 ) -> Result<T, NativeStoreValidationError> {
     result.map_err(|detail| NativeStoreValidationError::new(issue, detail))
 }
-
-impl std::fmt::Display for NativeStoreValidationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.detail)
-    }
-}
-
-impl std::error::Error for NativeStoreValidationError {}
 
 #[derive(Debug)]
 pub(crate) struct NativeStoreSettings {
@@ -453,22 +446,14 @@ fn require_writable_roots_filesystem(writeability: FilesystemWriteability) -> Re
 }
 
 fn open_read_only_regular_file(path: &Path, description: &str) -> Result<File, String> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| match error.raw_os_error() {
-            Some(libc::ELOOP) => format!("{description} must not be a symlink"),
+    narjar::__private::filesystem::open_regular_at(rustix::fs::CWD, path).map_err(|error| {
+        match error.raw_os_error() {
+            Some(raw) if raw == rustix::io::Errno::LOOP.raw_os_error() => {
+                format!("{description} must not be a symlink")
+            }
             _ => format!("opening {description} {}: {error}", path.display()),
-        })?;
-    match file
-        .metadata()
-        .map_err(|error| format!("inspecting {description}: {error}"))?
-        .is_file()
-    {
-        true => Ok(file),
-        false => Err(format!("{description} is not a regular file")),
-    }
+        }
+    })
 }
 
 fn descriptor_identity(file: &File) -> Result<(u64, u64), String> {
@@ -519,10 +504,7 @@ fn filesystem_writeability_from_flags(flags: StatVfsMountFlags) -> FilesystemWri
 }
 
 fn open_directory_without_following_final_symlink(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    narjar::__private::filesystem::open_directory(path)
 }
 
 fn require_absolute_path(path: &Path, description: &str) -> Result<(), String> {
@@ -653,8 +635,7 @@ fn require_trusted_signature_key(trusted_keys: &TrustedPublicKeys) -> Result<(),
 }
 
 fn effective_user_id() -> u32 {
-    // SAFETY: geteuid has no preconditions and reads the process effective uid.
-    unsafe { libc::geteuid() }
+    rustix::process::geteuid().as_raw()
 }
 
 fn validate_supported_schema(database: &Connection) -> Result<(), String> {
@@ -1396,13 +1377,25 @@ mod tests {
     }
 
     fn create_fifo(path: &std::path::Path) {
-        use std::os::unix::ffi::OsStrExt;
+        #[cfg(not(target_vendor = "apple"))]
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .expect("FIFO fixture should be created");
 
-        let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .expect("fixture path should not contain NUL");
-        // SAFETY: path is NUL-terminated and mkfifo reads it before returning.
-        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
-        assert_eq!(result, 0, "FIFO fixture should be created");
+        // rustix 1.1.5 has no mkfifo and excludes mkfifoat on Apple targets.
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .expect("fixture path should not contain NUL");
+            // SAFETY: path is NUL-terminated and mkfifo reads it before returning.
+            let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+            assert_eq!(result, 0, "FIFO fixture should be created");
+        }
     }
 
     #[test]
@@ -1618,5 +1611,62 @@ mod tests {
                 .execute("CREATE TABLE must_not_be_written (id INTEGER)")
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_native_validation_preserves_detail_and_doctor_classification() {
+        use std::error::Error as _;
+        for (issue, doctor) in [
+            (
+                NativeStoreIssue::StorePath,
+                "Nix store path is unavailable or unsafe",
+            ),
+            (
+                NativeStoreIssue::StateDirectory,
+                "Nix state directory is unavailable or unsafe",
+            ),
+            (
+                NativeStoreIssue::RootsDirectory,
+                "Narjar roots directory is unavailable or unsafe",
+            ),
+            (
+                NativeStoreIssue::LeaseState,
+                "Narjar native-store lease state is invalid or unavailable",
+            ),
+            (
+                NativeStoreIssue::RootsLocation,
+                "Narjar roots directory overlaps a protected directory",
+            ),
+            (
+                NativeStoreIssue::Database,
+                "Nix metadata database is unavailable or unsafe",
+            ),
+            (
+                NativeStoreIssue::SchemaVersion,
+                "Nix metadata schema version is unsupported",
+            ),
+            (
+                NativeStoreIssue::SchemaStructure,
+                "Nix metadata schema is incomplete or unsupported",
+            ),
+            (
+                NativeStoreIssue::SchemaMigration,
+                "Nix metadata contains an unsupported migration",
+            ),
+            (
+                NativeStoreIssue::SignatureTrust,
+                "native-store signature trust policy is unavailable",
+            ),
+        ] {
+            let error = NativeStoreValidationError::new(issue, "original detail");
+            assert_eq!(error.to_string(), "original detail");
+            assert_eq!(error.doctor_detail(), doctor);
+            assert!(error.source().is_none());
+        }
     }
 }

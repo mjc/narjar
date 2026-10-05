@@ -10,6 +10,7 @@ use std::{
 use super::{
     chunk_store::{ChunkManifestFile, ChunkStore},
     fs::unlink_at,
+    inspection::NarinfoName,
     state::PayloadStorage,
 };
 use crate::{
@@ -38,6 +39,7 @@ pub struct GcOptions {
     pub backend: StorageBackend,
 }
 
+#[derive(serde::Serialize)]
 pub struct GcReport {
     pub accounting_basis: &'static str,
     pub dry_run: bool,
@@ -86,6 +88,74 @@ struct Entry {
     protected: bool,
 }
 
+struct TrustedGcPublication {
+    store: StoreHash,
+    store_path: String,
+    references: Vec<String>,
+    narinfo_name: OsString,
+    narinfo_bytes: u64,
+    modified: SystemTime,
+    representation: NarRepresentation,
+}
+
+fn scan_trusted_gc_publications<'a>(
+    root: &'a File,
+    trusted: &'a TrustedPublicKeys,
+    names: Vec<OsString>,
+) -> impl Iterator<Item = Result<TrustedGcPublication, StorageError>> + 'a {
+    names.into_iter().filter_map(move |name| {
+        let store = match NarinfoName::classify(&name)? {
+            NarinfoName::Invalid(text) => {
+                return Some(Err(invalid(format!("invalid narinfo filename: {text}"))));
+            }
+            NarinfoName::Candidate(candidate) => *candidate.store(),
+        };
+        Some(inspect_trusted_gc_publication(root, trusted, store, name))
+    })
+}
+
+fn inspect_trusted_gc_publication(
+    root: &File,
+    trusted: &TrustedPublicKeys,
+    store: StoreHash,
+    name: OsString,
+) -> Result<TrustedGcPublication, StorageError> {
+    let name_str = name.to_string_lossy();
+    let file = open_regular_at(root, &name).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => invalid(format!("narinfo disappeared during scan: {name_str}")),
+        io::ErrorKind::InvalidData => invalid(format!("narinfo is not a regular file: {name_str}")),
+        _ if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            invalid(format!("narinfo is not a regular file: {name_str}"))
+        }
+        _ => error.into(),
+    })?;
+    let metadata = file.metadata()?;
+    let validated =
+        trusted
+            .inspect(&store, read_narinfo_file(file)?)
+            .map_err(|error| match error {
+                PublishedNarInfoError::Malformed => {
+                    invalid(format!("malformed narinfo: {name_str}"))
+                }
+                PublishedNarInfoError::UntrustedSignature => {
+                    invalid(format!("untrusted narinfo: {name_str}"))
+                }
+            })?;
+    Ok(TrustedGcPublication {
+        store,
+        store_path: validated.claims().store_path().to_owned(),
+        references: validated
+            .claims()
+            .reference_paths()
+            .map(str::to_owned)
+            .collect(),
+        narinfo_name: name,
+        narinfo_bytes: metadata.len(),
+        modified: metadata.modified()?,
+        representation: validated.payload(),
+    })
+}
+
 struct ChunkedEntry {
     store: StoreHash,
     store_path: String,
@@ -100,19 +170,13 @@ struct ChunkedEntry {
     protected: bool,
 }
 
-struct ChunkedProtectionReport {
-    protected: usize,
-    missing_roots: usize,
-    missing_references: usize,
-}
-
 struct ChunkedGcReportInput<'a> {
     before_entries: &'a [ChunkedEntry],
     before_bytes: u64,
     after_bytes: u64,
     target_bytes: Option<u64>,
     dry_run: bool,
-    protection: ChunkedProtectionReport,
+    protection: ProtectionReport,
     protected_bytes: u64,
     eligible: usize,
     eligible_bytes: u64,
@@ -301,7 +365,14 @@ fn run_flat_gc(
     mut scan_entries: impl FnMut(&Storage, &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError>,
 ) -> Result<GcReport, StorageError> {
     let mut entries = scan_entries(storage, trusted)?;
-    let protection = protect(&mut entries, options.protected_roots.as_deref())?;
+    let protection = protect(&mut entries, options.protected_roots.as_deref(), |entry| {
+        ProtectionNode {
+            store: &entry.store,
+            store_path: &entry.store_path,
+            references: &entry.references,
+            protected: &mut entry.protected,
+        }
+    })?;
     let orphans = scan_orphans(storage, &entries)?;
     let protected_bytes = category_bytes(&entries, |entry| entry.protected);
 
@@ -382,46 +453,17 @@ fn scan_with_directory_names(
     let mut entries = Vec::new();
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
-    for name in read_names(&root)? {
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        let Some(route) = name_str.strip_suffix(".narinfo") else {
-            continue;
-        };
-        let store = StoreHash::parse(route)
-            .map_err(|_| invalid(format!("invalid narinfo filename: {name_str}")))?;
-        let narinfo = match open_regular_at(&root, &name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(invalid(format!(
-                    "narinfo disappeared during scan: {name_str}"
-                )));
-            }
-            Err(error)
-                if error.kind() == io::ErrorKind::InvalidData
-                    || error.raw_os_error() == Some(libc::ELOOP) =>
-            {
-                return Err(invalid(format!(
-                    "narinfo is not a regular file: {name_str}"
-                )));
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let metadata = narinfo.metadata()?;
-
-        let bytes = read_narinfo_file(narinfo)?;
-        let validated = trusted
-            .inspect(&store, bytes)
-            .map_err(|error| match error {
-                PublishedNarInfoError::Malformed => {
-                    invalid(format!("malformed narinfo: {name_str}"))
-                }
-                PublishedNarInfoError::UntrustedSignature => {
-                    invalid(format!("untrusted narinfo: {name_str}"))
-                }
-            })?;
-        let representation = validated.payload();
+    for publication in scan_trusted_gc_publications(&root, trusted, read_names(&root)?) {
+        let TrustedGcPublication {
+            store,
+            store_path,
+            references,
+            narinfo_name: name,
+            narinfo_bytes,
+            modified,
+            representation,
+        } = publication?;
+        let name_str = name.to_string_lossy();
         let nar_name = OsString::from(representation.file_name().to_string());
         let nar_metadata = open_regular_at(&nar_directory, &nar_name)
             .and_then(|file| file.metadata())
@@ -448,19 +490,15 @@ fn scan_with_directory_names(
 
         entries.push(Entry {
             store,
-            store_path: validated.claims().store_path().to_owned(),
-            references: validated
-                .claims()
-                .reference_paths()
-                .map(str::to_owned)
-                .collect(),
+            store_path,
+            references,
             narinfo_name: name,
             nar_name,
-            narinfo_bytes: metadata.len(),
+            narinfo_bytes,
             nar_bytes: nar_metadata.len(),
             raw_nar_name,
             raw_nar_bytes,
-            modified: metadata.modified()?,
+            modified,
             protected: false,
         });
     }
@@ -475,7 +513,14 @@ fn run_chunked(
     target_bytes: Option<u64>,
 ) -> Result<GcReport, StorageError> {
     let mut entries = scan_chunked(storage, chunk_store, trusted)?;
-    let protection = protect_chunked(&mut entries, options.protected_roots.as_deref())?;
+    let protection = protect(&mut entries, options.protected_roots.as_deref(), |entry| {
+        ProtectionNode {
+            store: &entry.store,
+            store_path: &entry.store_path,
+            references: &entry.references,
+            protected: &mut entry.protected,
+        }
+    })?;
     let now = SystemTime::now();
     let orphans = scan_chunked_orphans(storage, chunk_store, &entries)?;
     let before_bytes = chunked_before_bytes(storage, chunk_store, &entries)?;
@@ -510,28 +555,15 @@ fn run_chunked(
     let after_bytes = chunked_projected_bytes(chunk_store, &entries, &orphans, &selected)?;
     let evicted = selected.entries.len() + selected.manifests.len() + selected.outputs.len();
     let dry_run = options.mode == GcMode::DryRun;
-    let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
-        (0, 0, 0)
-    } else {
-        let deleted = apply_chunked(storage, chunk_store, &entries, &orphans, &selected)?;
-        let remaining = scan_chunked(storage, chunk_store, trusted)?;
-        storage.finish_recovery()?;
-        let actual_after = chunked_before_bytes(storage, chunk_store, &remaining)?;
-        return Ok(chunked_report(ChunkedGcReportInput {
-            before_entries: &entries,
-            before_bytes,
-            after_bytes: actual_after,
-            target_bytes,
-            dry_run,
-            protection,
-            protected_bytes,
-            eligible,
-            eligible_bytes,
-            evicted,
-            orphaned,
-            orphaned_bytes,
-            deleted,
-        }));
+    let (after_bytes, deleted) = match options.mode {
+        GcMode::DryRun => (after_bytes, (0, 0, 0)),
+        GcMode::Apply => {
+            let deleted = apply_chunked(storage, chunk_store, &entries, &orphans, &selected)?;
+            let remaining = scan_chunked(storage, chunk_store, trusted)?;
+            let actual_after = chunked_before_bytes(storage, chunk_store, &remaining)?;
+            storage.finish_recovery()?;
+            (actual_after, deleted)
+        }
     };
 
     Ok(chunked_report(ChunkedGcReportInput {
@@ -547,7 +579,7 @@ fn run_chunked(
         evicted,
         orphaned,
         orphaned_bytes,
-        deleted: (deleted_narinfos, deleted_nars, deleted_orphans),
+        deleted,
     }))
 }
 
@@ -685,34 +717,17 @@ fn scan_chunked(
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
     let mut entries = Vec::new();
-    for name in read_dir_names(&root)? {
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        let Some(route) = name_str.strip_suffix(".narinfo") else {
-            continue;
-        };
-        let store = StoreHash::parse(route)
-            .map_err(|_| invalid(format!("invalid narinfo filename: {name_str}")))?;
-        let narinfo = open_regular_at(&root, &name).map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => {
-                invalid(format!("narinfo disappeared during scan: {name_str}"))
-            }
-            _ => error.into(),
-        })?;
-        let metadata = narinfo.metadata()?;
-        let bytes = read_narinfo_file(narinfo)?;
-        let validated = trusted
-            .inspect(&store, bytes)
-            .map_err(|error| match error {
-                PublishedNarInfoError::Malformed => {
-                    invalid(format!("malformed narinfo: {name_str}"))
-                }
-                PublishedNarInfoError::UntrustedSignature => {
-                    invalid(format!("untrusted narinfo: {name_str}"))
-                }
-            })?;
-        let representation = validated.payload();
+    for publication in scan_trusted_gc_publications(&root, trusted, read_dir_names(&root)?) {
+        let TrustedGcPublication {
+            store,
+            store_path,
+            references,
+            narinfo_name: name,
+            narinfo_bytes,
+            modified,
+            representation,
+        } = publication?;
+        let name_str = name.to_string_lossy();
         let raw_hash = representation.identity().hash();
         let manifest = chunk_store
             .validate_manifest(raw_hash)
@@ -751,19 +766,15 @@ fn scan_chunked(
         };
         entries.push(ChunkedEntry {
             store,
-            store_path: validated.claims().store_path().to_owned(),
-            references: validated
-                .claims()
-                .reference_paths()
-                .map(str::to_owned)
-                .collect(),
+            store_path,
+            references,
             narinfo_name: name,
             output_name,
             output_bytes,
             raw_hash,
             manifest_bytes,
-            narinfo_bytes: metadata.len(),
-            modified: metadata.modified()?,
+            narinfo_bytes,
+            modified,
             protected: false,
         });
     }
@@ -818,55 +829,6 @@ fn age_reached(modified: SystemTime, now: SystemTime, age: Duration) -> bool {
 
 fn chunk_store_error(error: impl std::error::Error + Send + Sync + 'static) -> StorageError {
     StorageError::Io(io::Error::other(error))
-}
-
-fn protect_chunked(
-    entries: &mut [ChunkedEntry],
-    path: Option<&Path>,
-) -> Result<ChunkedProtectionReport, StorageError> {
-    let Some(path) = path else {
-        return Ok(ChunkedProtectionReport {
-            protected: 0,
-            missing_roots: 0,
-            missing_references: 0,
-        });
-    };
-    let contents = fs::read_to_string(path)?;
-    let mut roots = BTreeSet::new();
-    for root in contents
-        .lines()
-        .map(str::trim)
-        .filter(|root| !root.is_empty())
-    {
-        validate_root(root)?;
-        roots.insert(root.to_owned());
-    }
-    let mut pending = roots.iter().cloned().collect::<Vec<_>>();
-    let mut missing_roots = BTreeSet::new();
-    let mut missing_references = BTreeSet::new();
-    while let Some(root) = pending.pop() {
-        let Some(index) = entries
-            .iter()
-            .position(|entry| entry.store_path == root || entry.store.as_str() == root)
-        else {
-            if roots.contains(&root) {
-                missing_roots.insert(root);
-            } else {
-                missing_references.insert(root);
-            }
-            continue;
-        };
-        if entries[index].protected {
-            continue;
-        }
-        entries[index].protected = true;
-        pending.extend(entries[index].references.iter().cloned());
-    }
-    Ok(ChunkedProtectionReport {
-        protected: entries.iter().filter(|entry| entry.protected).count(),
-        missing_roots: missing_roots.len(),
-        missing_references: missing_references.len(),
-    })
 }
 
 fn is_chunked_eligible(entry: &ChunkedEntry, now: SystemTime, min_age: Duration) -> bool {
@@ -1350,7 +1312,18 @@ fn eligible_bytes(
         .sum::<u64>()
 }
 
-fn protect(entries: &mut [Entry], path: Option<&Path>) -> Result<ProtectionReport, StorageError> {
+struct ProtectionNode<'a> {
+    store: &'a StoreHash,
+    store_path: &'a str,
+    references: &'a [String],
+    protected: &'a mut bool,
+}
+
+fn protect<E>(
+    entries: &mut [E],
+    path: Option<&Path>,
+    project: impl for<'a> Fn(&'a mut E) -> ProtectionNode<'a>,
+) -> Result<ProtectionReport, StorageError> {
     let Some(path) = path else {
         return Ok(ProtectionReport {
             protected: 0,
@@ -1359,40 +1332,63 @@ fn protect(entries: &mut [Entry], path: Option<&Path>) -> Result<ProtectionRepor
         });
     };
     let contents = fs::read_to_string(path)?;
-    let mut roots = BTreeSet::new();
-    for root in contents
+    let roots = contents
         .lines()
         .map(str::trim)
         .filter(|root| !root.is_empty())
-    {
-        validate_root(root)?;
-        roots.insert(root.to_owned());
-    }
+        .try_fold(BTreeSet::new(), |mut roots, root| {
+            validate_root(root)?;
+            roots.insert(root.to_owned());
+            Ok::<_, StorageError>(roots)
+        })?;
 
     let mut pending = roots.iter().cloned().collect::<Vec<_>>();
     let mut missing_roots = BTreeSet::new();
     let mut missing_references = BTreeSet::new();
-    while let Some(root) = pending.pop() {
-        let Some(index) = entries
-            .iter()
-            .position(|entry| entry.store_path == root || entry.store.as_str() == root)
-        else {
-            if roots.contains(&root) {
-                missing_roots.insert(root);
-            } else {
-                missing_references.insert(root);
+    let mut index = BTreeMap::new();
+    entries
+        .iter_mut()
+        .enumerate()
+        .for_each(|(position, entry)| {
+            let node = project(entry);
+            // Preserve the first-match policy if multiple publications share a key.
+            index.entry(node.store_path.to_owned()).or_insert(position);
+            index
+                .entry(node.store.as_str().to_owned())
+                .or_insert(position);
+        });
+    std::iter::from_fn(|| {
+        let root = pending.pop()?;
+        match index
+            .get(&root)
+            .map(|&position| project(&mut entries[position]))
+        {
+            Some(entry) => match *entry.protected {
+                true => {}
+                false => {
+                    *entry.protected = true;
+                    pending.extend(entry.references.iter().cloned());
+                }
+            },
+            None => {
+                let missing = if roots.contains(&root) {
+                    &mut missing_roots
+                } else {
+                    &mut missing_references
+                };
+                missing.insert(root);
             }
-            continue;
-        };
-        if entries[index].protected {
-            continue;
         }
-        entries[index].protected = true;
-        pending.extend(entries[index].references.iter().cloned());
-    }
+        Some(())
+    })
+    .for_each(drop);
 
     Ok(ProtectionReport {
-        protected: entries.iter().filter(|entry| entry.protected).count(),
+        protected: entries
+            .iter_mut()
+            .map(project)
+            .filter(|entry| *entry.protected)
+            .count(),
         missing_roots: missing_roots.len(),
         missing_references: missing_references.len(),
     })
@@ -1688,6 +1684,66 @@ mod tests {
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
         CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
             .and_then(|creation| creation.create_or_complete())
+    }
+
+    #[test]
+    fn shared_protection_traversal_handles_cycles_aliases_and_missing_paths_once() {
+        struct Node {
+            store: StoreHash,
+            path: String,
+            references: Vec<String>,
+            protected: bool,
+        }
+        let a = "00000000000000000000000000000000";
+        let b = "11111111111111111111111111111111";
+        let missing_root = "22222222222222222222222222222222";
+        let missing_reference = "33333333333333333333333333333333";
+        let mut entries = [
+            Node {
+                store: StoreHash::parse(a).unwrap(),
+                path: format!("/nix/store/{a}-a"),
+                references: vec![b.into(), b.into(), missing_reference.into()],
+                protected: false,
+            },
+            Node {
+                store: StoreHash::parse(b).unwrap(),
+                path: format!("/nix/store/{b}-b"),
+                references: vec![a.into(), missing_reference.into()],
+                protected: false,
+            },
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("roots");
+        fs::write(
+            &path,
+            format!("{a}\n/nix/store/{a}-a\n{missing_root}\n{missing_root}\n\n"),
+        )
+        .unwrap();
+        let projections = std::cell::Cell::new(0);
+        let report = protect(&mut entries, Some(&path), |entry| {
+            projections.set(projections.get() + 1);
+            ProtectionNode {
+                store: &entry.store,
+                store_path: &entry.path,
+                references: &entry.references,
+                protected: &mut entry.protected,
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            (
+                report.protected,
+                report.missing_roots,
+                report.missing_references
+            ),
+            (2, 1, 1)
+        );
+        assert!(entries.iter().all(|entry| entry.protected));
+        assert_eq!(
+            projections.get(),
+            9,
+            "indexing and counting project each entry once; each known root projects only its match"
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2008,7 +2064,9 @@ mod tests {
             Some(0),
             |storage, trusted| {
                 scan_with_directory_names(storage, trusted, |_| {
-                    Err(io::Error::from_raw_os_error(libc::EIO))
+                    Err(io::Error::from_raw_os_error(
+                        rustix::io::Errno::IO.raw_os_error(),
+                    ))
                 })
             },
         );
@@ -2571,7 +2629,11 @@ mod tests {
                 .env("NARJAR_GC_SIGTERM_PROBE_DATA", directory.path())
                 .output()
                 .expect("GC interruption child should start");
-        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+        assert_eq!(
+            output.status.signal(),
+            Some(signal_hook::consts::SIGTERM),
+            "{output:?}"
+        );
         assert!(
             !orphan.exists(),
             "GC must delete the orphan before interruption"
@@ -2631,10 +2693,9 @@ mod tests {
                             storage.recovery_required().unwrap(),
                             "GC cannot clear recovery before its post-deletion scan"
                         );
-                        // SAFETY: this probe runs only in its own child process. `raise`
-                        // takes no pointers and delivers SIGTERM to that process;
-                        // the parent and parallel tests are not signaled.
-                        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                        // This probe runs in its own child; parallel tests are not signaled.
+                        signal_hook::low_level::raise(signal_hook::consts::SIGTERM)
+                            .expect("SIGTERM should be raised in the GC probe");
                         panic!("SIGTERM must terminate the GC probe before completion");
                     }
                 }

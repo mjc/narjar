@@ -294,7 +294,8 @@ staging capacity before it enters the queue. Each upload then writes a private
 temporary file and a durable record under `.narjar-transactions` before
 streaming its body. The record durably advances through `staging`, `streaming`,
 `validated`, `linked`, and `published` states at the corresponding filesystem
-boundaries. Only the final
+boundaries. Invalid binary records stop recovery without discarding evidence;
+text records are not supported. Only the final
 link/compare and destination-directory sync are serialized for the same
 destination; unrelated destinations do not wait behind a slow body or decoder.
 The queue remains bounded and exposes depth and wait metrics; excess requests

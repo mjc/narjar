@@ -352,7 +352,9 @@ fn staging_reservation_status(error: &StorageError) -> StatusCode {
         StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
             StatusCode::INSUFFICIENT_STORAGE
         }
-        StorageError::Io(error) if error.raw_os_error() == Some(libc::EROFS) => {
+        StorageError::Io(error)
+            if error.raw_os_error() == Some(rustix::io::Errno::ROFS.raw_os_error()) =>
+        {
             StatusCode::SERVICE_UNAVAILABLE
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -475,7 +477,7 @@ fn install_signal_handlers(
         unsafe {
             low_level::register(signal, move || {
                 if signal_count.fetch_add(1, Ordering::Relaxed) > 0 {
-                    libc::_exit(128 + signal);
+                    low_level::exit(128 + signal);
                 }
                 stopping.store(true, Ordering::Release);
             })

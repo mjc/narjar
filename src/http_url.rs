@@ -12,38 +12,25 @@ use fluent_uri::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HttpUrl(Uri<String>);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum HttpUrlError {
+    #[error("{0}")]
     Parse(String),
+    #[error("URL must use http:// or https://")]
     UnsupportedScheme,
+    #[error("URL must include an authority")]
     MissingAuthority,
+    #[error("URL must include a host")]
     MissingHost,
+    #[error("URL must not contain credentials; use --netrc-file")]
     Credentials,
+    #[error("URL port must fit in 16 bits")]
     InvalidPort,
+    #[error("URL must not contain a fragment")]
     Fragment,
+    #[error("redirect leaves the trusted cache authority")]
     UntrustedRedirectAuthority,
 }
-
-impl fmt::Display for HttpUrlError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Parse(error) => formatter.write_str(error),
-            Self::UnsupportedScheme => formatter.write_str("URL must use http:// or https://"),
-            Self::MissingAuthority => formatter.write_str("URL must include an authority"),
-            Self::MissingHost => formatter.write_str("URL must include a host"),
-            Self::Credentials => {
-                formatter.write_str("URL must not contain credentials; use --netrc-file")
-            }
-            Self::InvalidPort => formatter.write_str("URL port must fit in 16 bits"),
-            Self::Fragment => formatter.write_str("URL must not contain a fragment"),
-            Self::UntrustedRedirectAuthority => {
-                formatter.write_str("redirect leaves the trusted cache authority")
-            }
-        }
-    }
-}
-
-impl std::error::Error for HttpUrlError {}
 
 impl HttpUrl {
     fn authority(&self) -> Authority<'_> {
@@ -212,6 +199,41 @@ mod tests {
             "https://cache.example/#fragment",
         ] {
             assert!(HttpUrl::from_str(value).is_err(), "accepted {value}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (&HttpUrlError::Parse("parse detail".into()), "parse detail"),
+            (
+                &HttpUrlError::UnsupportedScheme,
+                "URL must use http:// or https://",
+            ),
+            (
+                &HttpUrlError::MissingAuthority,
+                "URL must include an authority",
+            ),
+            (&HttpUrlError::MissingHost, "URL must include a host"),
+            (
+                &HttpUrlError::Credentials,
+                "URL must not contain credentials; use --netrc-file",
+            ),
+            (&HttpUrlError::InvalidPort, "URL port must fit in 16 bits"),
+            (&HttpUrlError::Fragment, "URL must not contain a fragment"),
+            (
+                &HttpUrlError::UntrustedRedirectAuthority,
+                "redirect leaves the trusted cache authority",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
         }
     }
 }

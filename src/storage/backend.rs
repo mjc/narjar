@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -9,35 +9,19 @@ pub enum StorageBackend {
     Chunked,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("expected one of: flat, chunked")]
 pub struct InvalidStorageBackend;
 
-impl fmt::Display for InvalidStorageBackend {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected one of: flat, chunked")
-    }
-}
-
-impl std::error::Error for InvalidStorageBackend {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum UnsupportedStorageBackend {
     /// Chunked storage has no verified durability contract on macOS.
+    #[error("chunked storage is not supported on macOS; choose flat")]
     MacOS,
     /// Chunked storage is supported only on Linux.
+    #[error("chunked storage is supported only on Linux")]
     Platform,
 }
-
-impl fmt::Display for UnsupportedStorageBackend {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::MacOS => "chunked storage is not supported on macOS; choose flat",
-            Self::Platform => "chunked storage is supported only on Linux",
-        })
-    }
-}
-
-impl std::error::Error for UnsupportedStorageBackend {}
 
 /// A backend whose publication contract is supported on this platform.
 ///
@@ -180,5 +164,29 @@ mod tests {
                 .map(SupportedStorageBackend::backend),
             expected
         );
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (&InvalidStorageBackend, "expected one of: flat, chunked"),
+            (
+                &UnsupportedStorageBackend::MacOS,
+                "chunked storage is not supported on macOS; choose flat",
+            ),
+            (
+                &UnsupportedStorageBackend::Platform,
+                "chunked storage is supported only on Linux",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
     }
 }

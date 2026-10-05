@@ -8,6 +8,7 @@ mod push;
 mod server;
 mod setup;
 mod token;
+mod verified_stream;
 
 use std::process::ExitCode;
 

@@ -49,8 +49,31 @@ const TEST_AUTHORIZATION: &str = "Basic bmFyamFyOnRlc3Qtd3JpdGUtdG9rZW4=";
 const TEST_WRITE_TOKEN: &str =
     "test 4c6fe1d79dd5595d75e9b7c82dbdc4481996f7aea7143e7153c8eb5e9f94ea45\n";
 
+fn test_trusted_public_key() -> String {
+    format!(
+        "narjar-test:{}\n",
+        BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+    )
+}
+
+fn write_test_trusted_public_keys(path: impl AsRef<Path>) {
+    fs::write(path, test_trusted_public_key()).expect("write trusted test public key");
+}
+
+#[track_caller]
+fn assert_clean_shutdown(signal: ExitStatus, status: ExitStatus) {
+    assert!(signal.success(), "SIGTERM should be sent");
+    assert!(status.success(), "narjar should shut down cleanly");
+}
+
 fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
     signed_narinfo_for(STORE_HASH, nar_hash, nar_size)
+}
+
+fn published_transaction_bytes(temporary: &str, destination: &str) -> Vec<u8> {
+    // Postcard enum discriminants: TransactionRecord::V1 = 0, Published = 4.
+    postcard::to_allocvec(&(0_u32, temporary, 4_u32, destination))
+        .expect("published recovery fixture should encode")
 }
 
 fn read_http_response_headers(stream: &mut impl BufRead) -> Vec<u8> {
@@ -643,8 +666,7 @@ fn native_push_keeps_the_first_valid_publication_of_a_store_path() {
         published_narinfo.as_bytes()
     );
     let (signal, status) = server.stop();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -731,8 +753,7 @@ fn native_push_uploads_when_upstream_metadata_is_not_an_exact_trusted_match() {
         );
         upstream_server.join().expect("upstream server should exit");
         let (signal, status) = destination.stop();
-        assert!(signal.success());
-        assert!(status.success());
+        assert_clean_shutdown(signal, status);
     }
 }
 
@@ -942,8 +963,7 @@ fn native_push_uploads_when_upstream_transport_fields_are_unusable() {
         );
         upstream_server.join().expect("upstream should exit");
         let (signal, status) = destination.stop();
-        assert!(signal.success());
-        assert!(status.success());
+        assert_clean_shutdown(signal, status);
     }
 }
 
@@ -1014,8 +1034,7 @@ fn native_push_treats_upstream_misses_and_outages_as_upload_required() {
             server.join().expect("upstream server should exit");
         }
         let (signal, status) = destination.stop();
-        assert!(signal.success());
-        assert!(status.success());
+        assert_clean_shutdown(signal, status);
     }
 }
 
@@ -1153,8 +1172,7 @@ fn native_push_classifies_each_closure_member_independently() {
         "the upstream dependency should not be copied to the destination"
     );
     let (signal, status) = destination.stop();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 struct NativePushFixture {
@@ -2011,7 +2029,7 @@ fn initialization_creates_a_private_root_even_with_a_group_writable_umask() {
     // parallel tests retain their own masks.
     unsafe {
         child.pre_exec(|| {
-            libc::umask(0o002);
+            rustix::process::umask(rustix::fs::Mode::WOTH);
             Ok(())
         });
     }
@@ -2311,13 +2329,9 @@ impl RunningServer {
             )
             .expect("test read tokens should be private");
         }
-        let trusted_key = trusted_keys.map(str::to_owned).unwrap_or_else(|| {
-            let signing_key = SigningKey::from_bytes(&[7; 32]);
-            format!(
-                "narjar-test:{}\n",
-                BASE64.encode(signing_key.verifying_key().as_bytes())
-            )
-        });
+        let trusted_key = trusted_keys
+            .map(str::to_owned)
+            .unwrap_or_else(test_trusted_public_key);
         fs::write(data_dir.path().join("trusted-public-keys"), trusted_key)
             .expect("test trusted key should be written");
 
@@ -2604,8 +2618,7 @@ fn serve_reports_listener_and_stops_on_sigterm() {
     );
 
     let (signal, status) = server.stop();
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -2846,12 +2859,11 @@ fn nix_cache_info_get_and_head_match_contract() {
         .expect("legacy HEAD response should be UTF-8");
     let (signal, status) = server.stop();
 
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 
     let body = "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
     for response in [&get, &head, &legacy_get, &legacy_head] {
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response:?}");
+        assert_http_status_line(response, "200 OK");
         assert!(
             response.contains("Content-Type: text/x-nix-cache-info\r\n"),
             "{response:?}"
@@ -2882,8 +2894,7 @@ fn private_cache_info_is_not_shared() {
     .expect("response should be UTF-8");
     let (signal, status) = server.stop();
 
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(
         response.contains("Cache-Control: private, no-store\r\n"),
@@ -2905,8 +2916,7 @@ fn cache_info_reads_the_initialized_priority() {
         .expect("response should be UTF-8");
     let (signal, status) = server.stop();
 
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
     assert!(response.ends_with("\r\n\r\nStoreDir: /nix/store\nWantMassQuery: 0\nPriority: 17\n"));
 }
 
@@ -2946,8 +2956,7 @@ fn http11_connection_serves_two_sequential_requests() {
     drop(writer);
     drop(stream);
     let (signal, status) = server.stop();
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -2978,8 +2987,7 @@ fn published_narinfo_and_nar_get_head_are_served() {
     let metrics = String::from_utf8(metrics_body).expect("metrics response should be UTF-8");
     let (signal, status) = server.stop();
 
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
     for series in [
         "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"GET\",outcome=\"hit\"} 1",
         "narjar_cache_lookup_outcomes_total{object=\"narinfo\",method=\"GET\",outcome=\"miss\"} 1",
@@ -3015,7 +3023,7 @@ fn published_narinfo_and_nar_get_head_are_served() {
     let nar_head_headers = String::from_utf8_lossy(&nar_head[..nar_head_body]).into_owned();
 
     for headers in [&narinfo_get_headers, &narinfo_head_headers] {
-        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+        assert_http_status_line(headers, "200 OK");
         assert!(
             headers.contains("Content-Type: text/x-nix-narinfo\r\n"),
             "{headers:?}"
@@ -3030,7 +3038,7 @@ fn published_narinfo_and_nar_get_head_are_served() {
         );
     }
     for headers in [&nar_get_headers, &nar_head_headers] {
-        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+        assert_http_status_line(headers, "200 OK");
         assert!(
             headers.contains("Content-Type: application/x-nix-nar\r\n"),
             "{headers:?}"
@@ -3067,9 +3075,8 @@ fn narinfo_get_trusts_immutable_disk_contents_without_revalidation() {
     let (headers, body) = response_parts(&response);
     let (signal, status) = server.stop();
 
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
-    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+    assert_clean_shutdown(signal, status);
+    assert_http_status_line(&headers, "200 OK");
     assert_eq!(body, narinfo.as_bytes());
 }
 fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
@@ -3097,6 +3104,21 @@ fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
         body = &body[size + 2..];
     }
     decoded
+}
+
+#[track_caller]
+fn assert_http_status_line(headers: &str, status: &str) {
+    assert!(
+        headers.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+        "{headers:?}"
+    );
+}
+
+#[track_caller]
+fn assert_empty_http_response(response: &[u8], status: &str) {
+    let (headers, body) = response_parts(response);
+    assert_http_status_line(&headers, status);
+    assert!(body.is_empty(), "unexpected response body: {body:?}");
 }
 
 fn response_parts(response: &[u8]) -> (String, Vec<u8>) {
@@ -3205,8 +3227,7 @@ fn nar_get_and_head_support_one_byte_range() {
         .expect("metrics should be UTF-8");
     let (signal, status) = server.stop();
 
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 
     assert_eq!(response_parts(&full).1, nar_bytes);
 
@@ -3216,10 +3237,7 @@ fn nar_get_and_head_support_one_byte_range() {
         (&suffix, "bytes 6-9/10", &b"6789"[..]),
     ] {
         let (headers, actual_body) = response_parts(response);
-        assert!(
-            headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
-            "{headers:?}"
-        );
+        assert_http_status_line(&headers, "206 Partial Content");
         assert!(
             headers.contains(&format!("Content-Range: {content_range}\r\n")),
             "{headers:?}"
@@ -3232,10 +3250,7 @@ fn nar_get_and_head_support_one_byte_range() {
     }
 
     let (head_headers, head_body) = response_parts(&head);
-    assert!(
-        head_headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
-        "{head_headers:?}"
-    );
+    assert_http_status_line(&head_headers, "206 Partial Content");
     assert!(
         head_headers.contains("Content-Range: bytes 2-5/10\r\n"),
         "{head_headers:?}"
@@ -3248,10 +3263,7 @@ fn nar_get_and_head_support_one_byte_range() {
 
     for response in [&unsatisfiable, &reversed] {
         let (headers, body) = response_parts(response);
-        assert!(
-            headers.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
-            "{headers:?}"
-        );
+        assert_http_status_line(&headers, "416 Range Not Satisfiable");
         assert!(
             headers.contains("Content-Range: bytes */10\r\n"),
             "{headers:?}"
@@ -3261,10 +3273,7 @@ fn nar_get_and_head_support_one_byte_range() {
 
     for response in [&multiple, &malformed, &empty, &overflow, &duplicate] {
         let (headers, body) = response_parts(response);
-        assert!(
-            headers.starts_with("HTTP/1.1 400 Bad Request\r\n"),
-            "{headers:?}"
-        );
+        assert_http_status_line(&headers, "400 Bad Request");
         assert!(body.is_empty());
     }
     assert!(
@@ -3321,42 +3330,23 @@ fn read_routes_distinguish_bad_methods_names_and_unsupported_surfaces() {
     .map(|path| server.request("GET", &path));
     let (signal, status) = server.stop();
 
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 
     let (headers, body) = response_parts(&wrong_method);
-    assert!(
-        headers.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
-        "{headers:?}"
-    );
+    assert_http_status_line(&headers, "405 Method Not Allowed");
     assert!(headers.contains("Allow: GET, HEAD, PUT\r\n"), "{headers:?}");
     assert!(body.is_empty());
 
     for response in nar_read_misses {
-        let (headers, body) = response_parts(&response);
-        assert!(
-            headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
-            "{headers:?}"
-        );
-        assert!(body.is_empty());
+        assert_empty_http_response(&response, "404 Not Found");
     }
 
     for response in invalid_routes {
-        let (headers, body) = response_parts(&response);
-        assert!(
-            headers.starts_with("HTTP/1.1 400 Bad Request\r\n"),
-            "{headers:?}"
-        );
-        assert!(body.is_empty());
+        assert_empty_http_response(&response, "400 Bad Request");
     }
 
     for response in unsupported_routes {
-        let (headers, body) = response_parts(&response);
-        assert!(
-            headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
-            "{headers:?}"
-        );
-        assert!(body.is_empty());
+        assert_empty_http_response(&response, "404 Not Found");
     }
 }
 
@@ -3392,20 +3382,12 @@ fn nar_reads_survive_unlink_without_exposing_temps() {
         .read_to_end(&mut deleting_response)
         .expect("finish unlinked NAR response");
     let (headers, body) = response_parts(&deleting_response);
-    assert!(
-        headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
-        "{headers:?}"
-    );
+    assert_http_status_line(&headers, "206 Partial Content");
     assert_eq!(body.len(), nar_bytes.len());
     assert!(body.iter().all(|&byte| byte == 0x5a));
 
     let missing = server.request("GET", &path);
-    let (missing_headers, missing_body) = response_parts(&missing);
-    assert!(
-        missing_headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
-        "{missing_headers:?}"
-    );
-    assert!(missing_body.is_empty());
+    assert_empty_http_response(&missing, "404 Not Found");
 
     fs::write(
         server.data_dir.join(".tmp/read-race-unvalidated"),
@@ -3422,8 +3404,7 @@ fn nar_reads_survive_unlink_without_exposing_temps() {
     }
 
     let (signal, status) = server.stop();
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3435,16 +3416,10 @@ fn nar_reads_reject_content_that_does_not_match_its_filename() {
 
     for method in ["HEAD", "GET"] {
         let response = server.request(method, &path);
-        let (headers, body) = response_parts(&response);
-        assert!(
-            headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
-            "{headers:?}"
-        );
-        assert!(body.is_empty());
+        assert_empty_http_response(&response, "500 Internal Server Error");
     }
     let (signal, status) = server.stop();
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3459,10 +3434,7 @@ fn nar_reads_release_the_worker_after_a_client_aborts_a_valid_transfer() {
     // an unoptimized build on a shared runner.
     let head = server.request("HEAD", &path);
     let (head_headers, head_body) = response_parts(&head);
-    assert!(
-        head_headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "{head_headers:?}"
-    );
+    assert_http_status_line(&head_headers, "200 OK");
     assert!(head_headers.contains(&format!("Content-Length: {}\r\n", nar_bytes.len())));
     assert!(head_body.is_empty());
 
@@ -3473,7 +3445,7 @@ fn nar_reads_release_the_worker_after_a_client_aborts_a_valid_transfer() {
     let mut aborted = BufReader::new(aborted);
     let headers = read_http_response_headers(&mut aborted);
     let headers = std::str::from_utf8(&headers).expect("response headers should be UTF-8");
-    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+    assert_http_status_line(headers, "200 OK");
     assert!(headers.contains(&format!("Content-Length: {}\r\n", nar_bytes.len())));
     drop(aborted);
 
@@ -3488,12 +3460,8 @@ fn nar_reads_release_the_worker_after_a_client_aborts_a_valid_transfer() {
     );
     let (signal, status) = server.stop();
 
-    assert!(
-        after_abort_headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "{after_abort_headers:?}"
-    );
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_http_status_line(&after_abort_headers, "200 OK");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3504,10 +3472,7 @@ fn narinfo_reads_trust_immutable_metadata_and_reject_symlinked_nars() {
 
     let corrupt_narinfo = server.request("GET", &format!("/{STORE_HASH}.narinfo"));
     let (corrupt_headers, corrupt_body) = response_parts(&corrupt_narinfo);
-    assert!(
-        corrupt_headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "{corrupt_headers:?}"
-    );
+    assert_http_status_line(&corrupt_headers, "200 OK");
     assert_eq!(corrupt_body, [0xff]);
     fs::remove_file(narinfo_path).expect("remove corrupt narinfo");
 
@@ -3515,25 +3480,16 @@ fn narinfo_reads_trust_immutable_metadata_and_reject_symlinked_nars() {
     symlink(nar_path.file_name().expect("NAR file name"), &nar_path)
         .expect("create unreadable final");
     let unreadable_nar = server.request("GET", &format!("/nar/{NAR_ID}.nar"));
-    let (unreadable_headers, unreadable_body) = response_parts(&unreadable_nar);
-    assert!(
-        unreadable_headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
-        "{unreadable_headers:?}"
-    );
-    assert!(unreadable_body.is_empty());
+    assert_empty_http_response(&unreadable_nar, "500 Internal Server Error");
     fs::remove_file(&nar_path).expect("remove unreadable final");
 
     let missing_nar = server.request("GET", &format!("/nar/{NAR_ID}.nar"));
     let (missing_headers, missing_body) = response_parts(&missing_nar);
     let (signal, status) = server.stop();
 
-    assert!(
-        missing_headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
-        "{missing_headers:?}"
-    );
+    assert_http_status_line(&missing_headers, "404 Not Found");
     assert!(missing_body.is_empty());
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3553,17 +3509,13 @@ fn nar_reads_external_symlinks_as_internal_errors() {
     let (headers, body) = response_parts(&response);
     let (signal, status) = server.stop();
 
-    assert!(
-        headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
-        "{headers:?}"
-    );
+    assert_http_status_line(&headers, "500 Internal Server Error");
     assert!(body.is_empty());
     assert_eq!(
         fs::read(&external_path).expect("read external target"),
         external_bytes
     );
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3586,18 +3538,14 @@ fn nar_reads_replaced_nar_directories_as_internal_errors() {
     let (headers, body) = response_parts(&response);
     let (signal, status) = server.stop();
 
-    assert!(
-        headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
-        "{headers:?}"
-    );
+    assert_http_status_line(&headers, "500 Internal Server Error");
     assert!(body.is_empty());
     assert_eq!(
         fs::read(&external_nar).expect("read external NAR"),
         NAR_BYTES
     );
     fs::remove_dir_all(&external_dir).expect("remove external directory");
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3624,8 +3572,7 @@ fn nar_put_streams_hash_checks_and_retries_immutably() {
     }
     assert_eq!(published.expect("published NAR"), NAR_BYTES);
     assert!(!mismatched_path.exists());
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3648,26 +3595,14 @@ fn nar_put_normalizes_xz_to_raw_bytes() {
     let (signal, status) = server.stop();
 
     let (upload_headers, upload_body) = response_parts(&uploaded);
-    let (wrong_headers, wrong_body) = response_parts(&wrong);
-    assert!(
-        wrong_headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
-        "{wrong_headers:?}"
-    );
-    assert!(wrong_body.is_empty());
-    assert!(
-        upload_headers.starts_with("HTTP/1.1 201 Created\r\n"),
-        "{upload_headers:?}"
-    );
+    assert_empty_http_response(&wrong, "422 Unprocessable Entity");
+    assert_http_status_line(&upload_headers, "201 Created");
     assert!(upload_body.is_empty());
     let (download_headers, download_body) = response_parts(&downloaded);
-    assert!(
-        download_headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "{download_headers:?}"
-    );
+    assert_http_status_line(&download_headers, "200 OK");
     assert_eq!(download_body, NAR_BYTES);
     assert_eq!(stored, NAR_BYTES);
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3688,21 +3623,12 @@ fn nar_put_normalizes_zstd_to_raw_bytes() {
         .expect("read stored raw NAR");
     let (signal, status) = server.stop();
 
-    let (upload_headers, upload_body) = response_parts(&uploaded);
-    assert!(
-        upload_headers.starts_with("HTTP/1.1 201 Created\r\n"),
-        "{upload_headers:?}"
-    );
-    assert!(upload_body.is_empty());
+    assert_empty_http_response(&uploaded, "201 Created");
     let (download_headers, download_body) = response_parts(&downloaded);
-    assert!(
-        download_headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "{download_headers:?}"
-    );
+    assert_http_status_line(&download_headers, "200 OK");
     assert_eq!(download_body, NAR_BYTES);
     assert_eq!(stored, NAR_BYTES);
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3742,8 +3668,7 @@ fn compressed_upload_memory_limits_return_422_without_publishing() {
             "{encoding:?} was rejected before commit"
         );
         assert_eq!(temporary, 0, "{encoding:?} staging file was removed");
-        assert!(signal.success());
-        assert!(status.success());
+        assert_clean_shutdown(signal, status);
     }
 }
 
@@ -3763,19 +3688,13 @@ fn decoded_size_limit_returns_422_for_a_large_raw_upload() {
         .count();
     let (signal, status) = server.stop();
 
-    let (headers, body) = response_parts(&response);
-    assert!(
-        headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
-        "{headers:?}"
-    );
-    assert!(body.is_empty());
+    assert_empty_http_response(&response, "422 Unprocessable Entity");
     assert!(
         !published.exists(),
         "oversized decoded NAR was not published"
     );
     assert_eq!(temporary, 0, "staging file was removed");
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3828,19 +3747,13 @@ fn malicious_xz_index_cannot_allocate_from_its_declared_block_count() {
         .exists();
     let (signal, status) = server.stop();
 
-    let (headers, body) = response_parts(&response);
-    assert!(
-        headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
-        "{headers:?}"
-    );
-    assert!(body.is_empty());
+    assert_empty_http_response(&response, "422 Unprocessable Entity");
     assert!(
         peak_virtual_memory <= baseline_peak + ALLOWED_VIRTUAL_MEMORY_GROWTH,
         "malformed XZ index grew VmPeak from {baseline_peak} to {peak_virtual_memory} bytes"
     );
     assert!(!nar_published, "malformed XZ input must not publish a NAR");
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3944,12 +3857,7 @@ fn concurrent_compressed_uploads_stay_within_the_worker_memory_ceiling() {
     let (signal, status) = server.stop();
 
     for response in responses {
-        let (headers, body) = response_parts(&response);
-        assert!(
-            headers.starts_with("HTTP/1.1 201 Created\r\n"),
-            "{headers:?}"
-        );
-        assert!(body.is_empty());
+        assert_empty_http_response(&response, "201 Created");
     }
     let configured_peak_bytes = baseline_peak_bytes
         + DECODER_LIMIT_BYTES * PUBLICATION_WORKERS as u64
@@ -3962,8 +3870,7 @@ fn concurrent_compressed_uploads_stay_within_the_worker_memory_ceiling() {
          {PUBLICATION_WORKERS} × {DECODER_LIMIT_BYTES} B decoder budget + \
          {ALLOWED_FIXED_PROCESS_OVERHEAD} B fixed overhead"
     );
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -4006,8 +3913,7 @@ fn chunked_backend_serves_the_reconstructed_raw_nar() {
     );
     assert_eq!(range_body, &NAR_BYTES[1..4]);
     let (signal, status) = server.stop();
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -4049,8 +3955,7 @@ fn native_push_and_raw_read_share_one_chunked_cache_url() {
         );
 
         let (signal, status) = server.stop();
-        assert!(signal.success(), "SIGTERM should be sent");
-        assert!(status.success(), "narjar should shut down cleanly");
+        assert_clean_shutdown(signal, status);
     }
 }
 
@@ -4092,8 +3997,7 @@ fn xz_publications_are_idempotent_at_1_8_and_32_way_concurrency() {
         );
 
         let (signal, status) = server.stop();
-        assert!(signal.success(), "SIGTERM should be sent");
-        assert!(status.success(), "narjar should shut down cleanly");
+        assert_clean_shutdown(signal, status);
     }
 }
 
@@ -4156,8 +4060,7 @@ fn stalled_publication_does_not_block_an_independent_put() {
     );
 
     let (signal, status) = server.stop();
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -4204,8 +4107,7 @@ fn xz_narinfo_is_published_as_the_canonical_raw_pair() {
     );
     let (_, nar_body) = response_parts(&nar_get);
     assert_eq!(nar_body, NAR_BYTES);
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -4239,12 +4141,7 @@ fn zstd_narinfo_is_published_as_the_canonical_raw_pair() {
     let nar_get = server.request("GET", &format!("/nar/{NARJAR_HASH}.nar"));
     let (signal, status) = server.stop();
 
-    let (wrong_headers, wrong_body) = response_parts(&wrong);
-    assert!(
-        wrong_headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
-        "{wrong_headers:?}"
-    );
-    assert!(wrong_body.is_empty());
+    assert_empty_http_response(&wrong, "422 Unprocessable Entity");
     for (name, response) in [
         ("uploaded", &uploaded),
         ("published", &published),
@@ -4263,8 +4160,7 @@ fn zstd_narinfo_is_published_as_the_canonical_raw_pair() {
     );
     let (_, nar_body) = response_parts(&nar_get);
     assert_eq!(nar_body, NAR_BYTES);
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -4361,8 +4257,7 @@ fn configured_compressed_egress_is_independent_of_ingress_encoding() {
         assert!(repeated.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(output_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert_eq!(output_body, output_bytes);
-        assert!(signal.success(), "SIGTERM should be sent");
-        assert!(status.success(), "narjar should shut down cleanly");
+        assert_clean_shutdown(signal, status);
 
         let gc = run(&[
             "gc",
@@ -4483,8 +4378,7 @@ fn chunked_backend_materializes_compressed_egress_from_chunks() {
     );
     assert!(server.data_dir.join(".narjar-egress").is_dir());
     let (signal, status) = server.stop();
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 fn encode_test_nar(encoding: WireEncoding) -> Vec<u8> {
@@ -4688,8 +4582,7 @@ fn an_ingestion_receipt_cannot_bind_a_missing_or_wrong_sized_raw_payload() {
                 .exists()
         );
         let (signal, status) = server.stop();
-        assert!(signal.success());
-        assert!(status.success());
+        assert_clean_shutdown(signal, status);
     }
 }
 
@@ -4810,15 +4703,9 @@ fn narinfo_put_rejects_unsigned_metadata_without_publication() {
             .0
             .starts_with("HTTP/1.1 201 Created\r\n")
     );
-    let (headers, body) = response_parts(&rejected);
-    assert!(
-        headers.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
-        "{headers:?}"
-    );
-    assert!(body.is_empty());
+    assert_empty_http_response(&rejected, "422 Unprocessable Entity");
     assert!(!published.exists());
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -4847,10 +4734,9 @@ fn narinfo_put_accepts_a_trusted_nix_signature() {
         assert!(body.is_empty());
     }
     let (headers, body) = response_parts(&visible);
-    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers:?}");
+    assert_http_status_line(&headers, "200 OK");
     assert_eq!(body, narinfo.as_bytes());
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 #[test]
 fn narinfo_put_rejects_a_signed_malformed_deriver() {
@@ -4882,8 +4768,7 @@ fn narinfo_put_rejects_a_signed_malformed_deriver() {
             .0
             .starts_with("HTTP/1.1 404 Not Found\r\n")
     );
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 #[test]
 fn narinfo_put_rejects_a_signed_malformed_content_address() {
@@ -4915,8 +4800,7 @@ fn narinfo_put_rejects_a_signed_malformed_content_address() {
             .0
             .starts_with("HTTP/1.1 404 Not Found\r\n")
     );
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 #[test]
 fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
@@ -4945,8 +4829,7 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
             .0
             .starts_with("HTTP/1.1 201 Created\r\n")
     );
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 
     let restarted = RunningServer::start_in(data_dir, &[]);
     assert!(
@@ -4955,8 +4838,7 @@ fn trusted_key_rotation_blocks_deleting_a_still_used_key() {
             .starts_with("HTTP/1.1 200 OK\r\n")
     );
     let (data_dir, signal, status) = restarted.stop_preserving();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 
     fs::write(
         data_dir.join("trusted-public-keys"),
@@ -5060,8 +4942,7 @@ fn nar_put_rejects_encoded_malformed_oversized_and_truncated_bodies() {
     );
     assert!(temp_is_empty);
     assert!(!oversized_path.exists());
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
     assert!(limited_signal.success(), "SIGTERM should be sent");
     assert!(limited_status.success(), "narjar should shut down cleanly");
 }
@@ -5076,16 +4957,9 @@ fn nar_put_preserves_the_configured_free_space_reserve() {
         server.request_with_body("PUT", &format!("/nar/{NARJAR_HASH}.nar"), &[], NAR_BYTES);
     let final_path = server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"));
     let (signal, status) = server.stop();
-    let (headers, body) = response_parts(&response);
-
-    assert!(
-        headers.starts_with("HTTP/1.1 507 Insufficient Storage\r\n"),
-        "{headers:?}"
-    );
-    assert!(body.is_empty());
+    assert_empty_http_response(&response, "507 Insufficient Storage");
     assert!(!final_path.exists());
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -5108,8 +4982,7 @@ fn saturated_request_limit_rejects_excess_work() {
 
     drop(blocked);
     let (signal, status) = server.stop();
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -5143,16 +5016,12 @@ fn reads_continue_while_a_publication_waits_for_its_body() {
         started.elapsed()
     );
     let (headers, body) = response_parts(&range);
-    assert!(
-        headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
-        "{headers:?}"
-    );
+    assert_http_status_line(&headers, "206 Partial Content");
     assert_eq!(body, b"2345");
 
     drop(stalled);
     let (signal, status) = server.stop();
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -5168,10 +5037,7 @@ fn writes_require_valid_basic_auth_before_route_or_storage() {
 
     for response in [missing, malformed] {
         let (headers, body) = response_parts(&response);
-        assert!(
-            headers.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
-            "{headers:?}"
-        );
+        assert_http_status_line(&headers, "401 Unauthorized");
         assert!(
             headers.contains("WWW-Authenticate: Basic realm=\"narjar\"\r\n"),
             "{headers:?}"
@@ -5183,8 +5049,7 @@ fn writes_require_valid_basic_auth_before_route_or_storage() {
         "{public_read:?}"
     );
     assert!(!final_path.exists());
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -5194,17 +5059,13 @@ fn configured_empty_read_token_set_stays_private() {
     let (signal, status) = server.stop();
     let (headers, body) = response_parts(&response);
 
-    assert!(
-        headers.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
-        "{headers:?}"
-    );
+    assert_http_status_line(&headers, "401 Unauthorized");
     assert!(
         headers.contains("WWW-Authenticate: Basic realm=\"narjar\"\r\n"),
         "{headers:?}"
     );
     assert!(body.is_empty());
-    assert!(signal.success(), "SIGTERM should be sent");
-    assert!(status.success(), "narjar should shut down cleanly");
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -5284,8 +5145,7 @@ fn token_create_and_revoke_rotate_hashed_write_credentials() {
         );
     }
     let (data_dir, signal, status) = server.stop_preserving();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 
     let revoked = run(&[
         "token",
@@ -5310,8 +5170,7 @@ fn token_create_and_revoke_rotate_hashed_write_credentials() {
 
     assert!(rejected.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
     assert!(!accepted.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -5351,8 +5210,7 @@ fn nix_cache_info_put_is_durable_idempotent_and_immutable() {
         String::from_utf8_lossy(&conflict)
     );
     assert_eq!(stored, CACHE_INFO);
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -5369,8 +5227,7 @@ fn nix_2_31_5_trace_drives_redacted_socket_conformance() {
         "{transcript}"
     );
     assert!(!transcript.contains(TEST_AUTHORIZATION), "{transcript}");
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 fn init_data_dir(test: &str) -> TestDir {
@@ -5682,14 +5539,7 @@ fn inventory_scan_recognizes_formats_and_keeps_trusted_references() {
         let root = directory.path();
         fs::create_dir(root.join("nar")).unwrap();
         let key_path = root.join("trusted-public-keys");
-        fs::write(
-            &key_path,
-            format!(
-                "narjar-test:{}\n",
-                BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-            ),
-        )
-        .unwrap();
+        write_test_trusted_public_keys(&key_path);
         let root_directory = Directory::open(root).unwrap();
         let trusted = TrustedPublicKeys::load(&root_directory).unwrap();
         let hash = nix32_sha256(&bytes);
@@ -5893,14 +5743,7 @@ fn inventory_and_trust_keep_using_the_directory_opened_by_run() {
     let root = directory.path().join("cache");
     fs::create_dir(&root).unwrap();
     fs::create_dir(root.join("nar")).unwrap();
-    fs::write(
-        root.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .unwrap();
+    write_test_trusted_public_keys(root.join("trusted-public-keys"));
     fs::write(root.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES).unwrap();
     fs::write(
         root.join(format!("{STORE_HASH}.narinfo")),
@@ -5993,14 +5836,7 @@ fn inventory_scan_propagates_payload_open_errors() {
     let root = directory.path();
     fs::create_dir(root.join("nar")).unwrap();
     let key_path = root.join("trusted-public-keys");
-    fs::write(
-        &key_path,
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .unwrap();
+    write_test_trusted_public_keys(&key_path);
     let root_directory = Directory::open(root).unwrap();
     let trusted = TrustedPublicKeys::load(&root_directory).unwrap();
     fs::write(
@@ -6012,21 +5848,17 @@ fn inventory_scan_propagates_payload_open_errors() {
     symlink(&payload, &payload).unwrap();
     for mode in [VerificationMode::Availability, VerificationMode::Content] {
         let error = Inventory::scan(&root_directory, &trusted, mode).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::LOOP.raw_os_error())
+        );
     }
 }
 
 #[test]
 fn reconcile_and_verify_classify_operator_findings() {
     let data_dir = init_data_dir("operator-verify");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
 
     let missing_store = "11111111111111111111111111111111";
     let malformed_store = "22222222222222222222222222222222";
@@ -6239,8 +6071,7 @@ fn delete_is_offline_and_leaves_shared_nar_objects() {
     assert!(String::from_utf8_lossy(&locked.stderr).contains("locked"));
 
     let (data_dir, signal, status) = server.stop_preserving();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
     let deleted = run(&[
         "delete",
         "--data-dir",
@@ -6336,8 +6167,7 @@ fn health_readiness_metrics_and_stats_follow_the_operator_contract() {
     assert!(String::from_utf8_lossy(&stats.stdout).contains("narjar_cache_lookup_outcomes_total"));
 
     let (signal, status) = server.stop();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -6353,8 +6183,7 @@ fn health_is_public_but_private_read_protects_readiness_and_metrics() {
     assert!(metrics.starts_with("HTTP/1.1 401"), "{metrics}");
 
     let (signal, status) = server.stop();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -6374,21 +6203,13 @@ fn readiness_fails_without_affecting_liveness_when_space_is_reserved() {
     assert!(metrics.contains("narjar_ready 0"));
 
     let (signal, status) = server.stop();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
 fn restored_cache_verifies_before_serving() {
     let source = init_data_dir("backup-source");
-    fs::write(
-        source.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(source.join("trusted-public-keys"));
     fs::write(source.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("NAR should be written");
     fs::write(
@@ -6494,14 +6315,7 @@ fn dirty_start_rejects_a_malformed_published_narinfo() {
 #[test]
 fn gc_recovers_a_published_nar_before_eviction_and_restart() {
     let data_dir = init_data_dir("gc-recovers-before-eviction");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("published NAR should be written");
     fs::write(
@@ -6514,7 +6328,7 @@ fn gc_recovers_a_published_nar_before_eviction_and_restart() {
     let transaction = data_dir.join(".narjar-transactions/gc-pending.txn");
     fs::write(
         &transaction,
-        format!("state=published\npath=.tmp/gc-pending.part\ndestination=nar/{NARJAR_HASH}.nar\n"),
+        published_transaction_bytes(".tmp/gc-pending.part", &format!("nar/{NARJAR_HASH}.nar")),
     )
     .expect("published transaction should be written");
     fs::set_permissions(&transaction, fs::Permissions::from_mode(0o600))
@@ -6568,14 +6382,7 @@ fn gc_recovers_a_published_nar_before_eviction_and_restart() {
 #[test]
 fn delete_recovers_a_published_narinfo_before_removing_it() {
     let data_dir = init_data_dir("delete-recovers-before-removal");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("published NAR should be written");
     let narinfo = data_dir.join(format!("{STORE_HASH}.narinfo"));
@@ -6589,9 +6396,7 @@ fn delete_recovers_a_published_narinfo_before_removing_it() {
     let transaction = data_dir.join(".narjar-transactions/delete-pending.txn");
     fs::write(
         &transaction,
-        format!(
-            "state=published\npath=.tmp/delete-pending.part\ndestination={STORE_HASH}.narinfo\n"
-        ),
+        published_transaction_bytes(".tmp/delete-pending.part", &format!("{STORE_HASH}.narinfo")),
     )
     .expect("published transaction should be written");
     fs::set_permissions(&transaction, fs::Permissions::from_mode(0o600))
@@ -6650,14 +6455,7 @@ fn delete_recovers_a_published_narinfo_before_removing_it() {
 #[test]
 fn dirty_start_rejects_a_published_narinfo_without_its_nar() {
     let data_dir = init_data_dir("dirty-start-missing-nar");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::remove_file(data_dir.join(".narjar-clean")).expect("clean marker should be removed");
     let recovery = data_dir.join(".narjar-recovery");
     fs::write(&recovery, b"").expect("recovery marker should be created");
@@ -6689,14 +6487,7 @@ fn dirty_start_rejects_a_published_narinfo_without_its_nar() {
 #[test]
 fn dirty_start_checks_payload_availability_without_hashing_it() {
     let data_dir = init_data_dir("dirty-start-availability");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::write(
         data_dir.join(format!("{STORE_HASH}.narinfo")),
         signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
@@ -6713,21 +6504,13 @@ fn dirty_start_checks_payload_availability_without_hashing_it() {
         .expect("recovery marker should be private");
     let server = RunningServer::start_in(data_dir, &[]);
     let (signal, status) = server.stop();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
 fn dirty_start_rejects_a_published_narinfo_with_the_wrong_nar_size() {
     let data_dir = init_data_dir("dirty-start-wrong-nar-size");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("NAR should be written");
     fs::write(
@@ -6761,14 +6544,7 @@ fn dirty_start_rejects_a_published_narinfo_with_the_wrong_nar_size() {
 #[test]
 fn gc_dry_run_preserves_and_apply_removes_old_pair() {
     let data_dir = init_data_dir("operator-gc");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("NAR should be written");
     fs::write(
@@ -6824,14 +6600,7 @@ fn gc_dry_run_preserves_and_apply_removes_old_pair() {
 #[test]
 fn gc_deletes_a_shared_nar_only_after_the_last_narinfo() {
     let data_dir = init_data_dir("operator-gc-shared");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     let second_store = "11111111111111111111111111111111";
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("NAR should be written");
@@ -6874,14 +6643,7 @@ fn gc_deletes_a_shared_nar_only_after_the_last_narinfo() {
 #[test]
 fn gc_protected_roots_are_not_candidates() {
     let data_dir = init_data_dir("operator-gc-protected");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("NAR should be written");
     fs::write(
@@ -6926,14 +6688,7 @@ fn gc_protected_roots_are_not_candidates() {
 #[test]
 fn gc_reports_missing_protected_references() {
     let data_dir = init_data_dir("operator-gc-missing-reference");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     let missing_store = "11111111111111111111111111111111";
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("NAR should be written");
@@ -6999,14 +6754,7 @@ fn gc_refuses_to_apply_while_the_cache_is_serving() {
 #[test]
 fn interrupted_gc_deletion_is_recovered_before_serving_shared_payloads() {
     let data_dir = init_data_dir("operator-gc-interrupted-deletion");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::write(data_dir.join(format!("nar/{NARJAR_HASH}.nar")), NAR_BYTES)
         .expect("shared NAR should be written");
     for index in 0..2 {
@@ -7041,8 +6789,7 @@ fn interrupted_gc_deletion_is_recovered_before_serving_shared_payloads() {
     assert!(payload.starts_with("HTTP/1.1 200"), "{payload}");
     assert_eq!(bytes, NAR_BYTES);
     let (signal, status) = server.stop();
-    assert!(signal.success());
-    assert!(status.success());
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -7100,14 +6847,7 @@ fn gc_reclaims_old_orphan_nars() {
 fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
     let data_dir = init_data_dir("operator-gc-retained-orphan");
     let retained_orphan_nar = "1".repeat(52);
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::write(data_dir.join(format!("nar/{NAR_ID}.nar")), b"old-orphan")
         .expect("old orphan should be written");
     fs::write(
@@ -7116,7 +6856,16 @@ fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
     )
     .expect("new orphan should be written");
 
-    thread::sleep(Duration::from_secs(2));
+    // Explicit timestamps order the orphans without depending on scheduler delays.
+    for (name, seconds) in [(NAR_ID, 1), (retained_orphan_nar.as_str(), 2)] {
+        fs::File::open(data_dir.join(format!("nar/{name}.nar")))
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)),
+            )
+            .unwrap();
+    }
     let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
     let narinfo_bytes = narinfo.len() as u64;
     fs::write(data_dir.join(format!("{STORE_HASH}.narinfo")), narinfo)
@@ -7127,11 +6876,15 @@ fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
     let published_bytes = narinfo_bytes + NAR_BYTES.len() as u64;
     let retained_orphan_bytes = b"new-orphan".len() as u64;
     let target_bytes = published_bytes + retained_orphan_bytes;
+    let roots = data_dir.join("protected-roots");
+    fs::write(&roots, format!("/nix/store/{STORE_HASH}-narjar\n")).unwrap();
     let path = data_dir.to_str().expect("temporary path should be UTF-8");
     let dry_run = command()
         .args(["gc", "--data-dir", path, "--target-bytes"])
         .arg(target_bytes.to_string())
-        .args(["--min-age-seconds", "1", "--json"])
+        .args(["--min-age-seconds", "0", "--protected-roots"])
+        .arg(&roots)
+        .arg("--json")
         .output()
         .expect("gc should run");
 
@@ -7160,7 +6913,9 @@ fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
     let apply = command()
         .args(["gc", "--data-dir", path, "--target-bytes"])
         .arg(target_bytes.to_string())
-        .args(["--min-age-seconds", "1", "--apply", "--json"])
+        .args(["--min-age-seconds", "0", "--protected-roots"])
+        .arg(&roots)
+        .args(["--apply", "--json"])
         .output()
         .expect("gc should run");
     assert!(
@@ -7194,14 +6949,7 @@ fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
 #[test]
 fn gc_rejects_symlinked_narinfo_without_removing_it() {
     let data_dir = init_data_dir("operator-gc-symlink");
-    fs::write(
-        data_dir.join("trusted-public-keys"),
-        format!(
-            "narjar-test:{}\n",
-            BASE64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
-        ),
-    )
-    .expect("trusted key should be written");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     fs::write(
         data_dir.join("narinfo-target"),
         signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64),
@@ -7280,7 +7028,7 @@ fn library_gc_dry_run_preserves_pending_recovery_state() {
     let transaction = data_dir.join(".narjar-transactions/gc-pending.txn");
     fs::write(
         &transaction,
-        b"state=published\npath=.tmp/gc-pending.part\ndestination=nix-cache-info\n",
+        published_transaction_bytes(".tmp/gc-pending.part", "nix-cache-info"),
     )
     .expect("published transaction should be written");
     fs::set_permissions(&transaction, fs::Permissions::from_mode(0o600))

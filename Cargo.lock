@@ -225,6 +225,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "digest-io"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2de63d600bc7fab91180bc17385f29b342468dc8ef2af09dceba450a293de3da"
+dependencies = [
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "ed25519"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -257,6 +266,26 @@ name = "embedded-io"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
+name = "enum-map"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4532960034c15ba2f55e9eee631040ecc473c32e6c4b200828c759840f13a06"
+dependencies = [
+ "enum-map-derive",
+]
+
+[[package]]
+name = "enum-map-derive"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7127272f64b3e098f7d81f350d672081b879bff896d219c42370dc858b1af9ff"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
 
 [[package]]
 name = "errno"
@@ -401,7 +430,9 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "data-encoding",
+ "digest-io",
  "ed25519-dalek",
+ "enum-map",
  "fluent-uri",
  "httparse",
  "libc",
@@ -418,6 +449,7 @@ dependencies = [
  "structured-zstd",
  "subtle",
  "tempfile",
+ "thiserror",
  "ureq",
  "xz4rust",
 ]
@@ -426,6 +458,7 @@ dependencies = [
 name = "narjar-corpus"
 version = "0.1.0"
 dependencies = [
+ "digest-io",
  "nix-archive",
  "sha2 0.11.0",
 ]
@@ -434,6 +467,7 @@ dependencies = [
 name = "narjar-nar-chunking"
 version = "0.1.0"
 dependencies = [
+ "digest-io",
  "mincdc",
  "sha2 0.11.0",
 ]

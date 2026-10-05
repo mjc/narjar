@@ -12,17 +12,10 @@ use serde::{Deserialize, Serialize};
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const NIX32_SHA256_LEN: usize = 52;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 /// A string is not a canonical Nix base-32 SHA-256 identifier.
+#[error("invalid Nix base-32 object identifier")]
 pub struct InvalidObjectId;
-
-impl fmt::Display for InvalidObjectId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("invalid Nix base-32 object identifier")
-    }
-}
-
-impl std::error::Error for InvalidObjectId {}
 
 /// Purpose tag for values describing the decoded NAR byte stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -294,17 +287,10 @@ pub enum WireEncoding {
     Compressed(CompressionCodec),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 /// A compression name is not one of the supported wire encodings.
+#[error("expected one of: none, zstd, xz")]
 pub struct InvalidWireEncoding;
-
-impl fmt::Display for InvalidWireEncoding {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected one of: none, zstd, xz")
-    }
-}
-
-impl std::error::Error for InvalidWireEncoding {}
 
 impl FromStr for WireEncoding {
     type Err = InvalidWireEncoding;
@@ -482,5 +468,22 @@ mod tests {
         assert_eq!(file_hash.bytes(), expected);
         assert_eq!(nar_hash.to_string(), encoded);
         assert_eq!(file_hash.to_string(), encoded);
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (&InvalidObjectId, "invalid Nix base-32 object identifier"),
+            (&InvalidWireEncoding, "expected one of: none, zstd, xz"),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
     }
 }

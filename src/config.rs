@@ -121,13 +121,22 @@ impl ServeSource {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum SourcePreparationError {
+    #[error("native-store options require --serve-source native-store")]
     NativeOptionsForCache,
+    #[error(
+        "native-store source requires --native-store-dir, --native-state-dir, --native-roots-dir, and --native-min-lease-seconds"
+    )]
     MissingNativeOptions,
+    #[error("native-store source requires uncompressed output (--egress-compression none)")]
     NativeCompressedOutput,
+    #[error(
+        "native-store source requires the flat storage backend during initial raw output support"
+    )]
     NativeChunkedBackend,
-    UnsupportedBackend(UnsupportedStorageBackend),
+    #[error("{0}")]
+    UnsupportedBackend(#[source] UnsupportedStorageBackend),
 }
 
 impl SourcePreparationError {
@@ -139,37 +148,6 @@ impl SourcePreparationError {
                 "native source requires raw output and flat storage"
             }
             Self::UnsupportedBackend(_) => "storage backend is unsupported on this platform",
-        }
-    }
-}
-
-impl std::fmt::Display for SourcePreparationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::NativeOptionsForCache => "native-store options require --serve-source native-store",
-            Self::MissingNativeOptions => concat!(
-                "native-store source requires --native-store-dir, --native-state-dir, ",
-                "--native-roots-dir, and --native-min-lease-seconds"
-            ),
-            Self::NativeCompressedOutput => {
-                "native-store source requires uncompressed output (--egress-compression none)"
-            }
-            Self::NativeChunkedBackend => {
-                "native-store source requires the flat storage backend during initial raw output support"
-            }
-            Self::UnsupportedBackend(error) => return std::fmt::Display::fmt(error, formatter),
-        })
-    }
-}
-
-impl std::error::Error for SourcePreparationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::UnsupportedBackend(error) => Some(error),
-            Self::NativeOptionsForCache
-            | Self::MissingNativeOptions
-            | Self::NativeCompressedOutput
-            | Self::NativeChunkedBackend => None,
         }
     }
 }
@@ -598,6 +576,70 @@ mod tests {
                     .expect_err("unsupported native output must fail configuration"),
                 expected_error,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &SourcePreparationError::NativeOptionsForCache,
+                "native-store options require --serve-source native-store",
+            ),
+            (
+                &SourcePreparationError::MissingNativeOptions,
+                "native-store source requires --native-store-dir, --native-state-dir, --native-roots-dir, and --native-min-lease-seconds",
+            ),
+            (
+                &SourcePreparationError::NativeCompressedOutput,
+                "native-store source requires uncompressed output (--egress-compression none)",
+            ),
+            (
+                &SourcePreparationError::NativeChunkedBackend,
+                "native-store source requires the flat storage backend during initial raw output support",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_source_preparation_keeps_backend_source_and_doctor_detail() {
+        use std::error::Error as _;
+        let error = SourcePreparationError::UnsupportedBackend(UnsupportedStorageBackend::MacOS);
+        assert_eq!(
+            error.to_string(),
+            "chunked storage is not supported on macOS; choose flat"
+        );
+        assert!(error.source().unwrap().is::<UnsupportedStorageBackend>());
+        assert!(error.source().unwrap().source().is_none());
+        for (error, detail) in [
+            (
+                SourcePreparationError::NativeOptionsForCache,
+                "native source options require native-store selection",
+            ),
+            (
+                SourcePreparationError::MissingNativeOptions,
+                "required native source options are missing",
+            ),
+            (
+                SourcePreparationError::NativeCompressedOutput,
+                "native source requires raw output and flat storage",
+            ),
+            (
+                SourcePreparationError::NativeChunkedBackend,
+                "native source requires raw output and flat storage",
+            ),
+            (error, "storage backend is unsupported on this platform"),
+        ] {
+            assert_eq!(error.doctor_detail(), detail);
         }
     }
 }

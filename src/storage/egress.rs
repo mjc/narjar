@@ -15,14 +15,13 @@ use crate::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
     NarIdentity, NarRepresentation, WireEncoding,
 };
+use crate::records::{BoundedRegularFile, read_bounded_regular_file};
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
 use super::compression::{
     CapacityCheckedStagingWriter, encoded_file_matches, nar_file_size_matches,
 };
-use super::fs::{
-    BoundedRegularFile, open_optional_at, read_bounded_regular_file, read_dir_names, unlink_at,
-};
+use super::fs::{open_optional_at, read_dir_names, unlink_at};
 use super::operations::{NarMatch, OwnedTemporary};
 use super::publication::{NarUploadPolicy, PublishOutcome, PublishTarget, StorageError};
 use super::receipt::CompressedNarReceipt;
@@ -165,9 +164,7 @@ impl<'storage> Derivative<'storage, Prepared> {
     fn begin(storage: &'storage Storage) -> Result<Self, StorageError> {
         let temp_name = storage.next_temp_name_with_prefix("nar");
         let temporary_path = TemporaryPath::nar(temp_name.clone());
-        let transaction = storage
-            .recovery
-            .begin(&temporary_path.relative_path(), PathBuf::new().as_path())?;
+        let transaction = storage.recovery.begin(&temporary_path.relative_path())?;
         let file = storage.create_temp_in_directory(storage.nar_temp_directory()?, temp_name)?;
         Ok(Self {
             temporary: OwnedTemporary::new(storage, file),
@@ -244,9 +241,8 @@ impl Derivative<'_, Validated<EncodedIdentity>> {
         let temporary = self.temporary.into_file();
         let target = PublishTarget::RepairEgressNar(output);
         let destination = target.destination();
-        let mut transaction = self.transaction;
-        transaction.set_destination(&destination.relative_path());
-        storage.commit_temporary(destination, &temporary, transaction, |_| Ok(()))?;
+        destination.validate_path()?;
+        storage.commit_temporary(destination, &temporary, self.transaction, |_| Ok(()))?;
         Ok(output)
     }
 }

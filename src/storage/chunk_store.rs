@@ -26,8 +26,8 @@ use super::{
         MANIFEST_RECORD_BYTES, ManifestError, ManifestReader, write_manifest_header,
     },
     fs::{
-        DirectoryEntryAction, DirectoryScanOutcome, ensure_directory_at, files_equal_at,
-        for_each_dir_name, hard_link_at, open_at, open_directory_at, open_regular_at,
+        DirectoryEntryAction, DirectoryScanOutcome, ImmutableLinkOutcome, ensure_directory_at,
+        for_each_dir_name, link_or_compare_immutable, open_at, open_directory_at, open_regular_at,
         read_dir_names, require_directory_at, unlink_at,
     },
     publication::{StagingReservation, StorageError},
@@ -131,7 +131,7 @@ impl ChunkStore {
     }
 
     pub(crate) fn remove_abandoned_temporary_files(&self) -> io::Result<()> {
-        remove_abandoned_manifest_temps(&self.manifests)?;
+        remove_abandoned_temps(&self.manifests, ".manifest-")?;
         remove_abandoned_chunk_temps(&self.chunks)
     }
 
@@ -204,7 +204,7 @@ impl ChunkStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        match open_regular_at(&shard, &chunk_name(hash)) {
+        match open_regular_at(&shard, chunk_name(hash)) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
@@ -212,7 +212,7 @@ impl ChunkStore {
     }
 
     pub(crate) fn open_manifest(&self, hash: NarHash) -> io::Result<Option<File>> {
-        match open_regular_at(&self.manifests, &manifest_name(hash)) {
+        match open_regular_at(&self.manifests, manifest_name(hash)) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
@@ -1154,10 +1154,10 @@ fn write_complete_manifest(
     records: &mut File,
 ) -> Result<(), ChunkStoreError> {
     let checksum = {
-        let mut digesting = DigestingWriter::new(&mut *destination);
+        let mut digesting = digest_io::HashWriter::<Sha256, _>::new(&mut *destination);
         write_manifest_header(&mut digesting, manifest)?;
         io::copy(records, &mut digesting)?;
-        digesting.finish()
+        <[u8; 32]>::from(digesting.finalize())
     };
     destination.write_all(&checksum)?;
     Ok(())
@@ -1462,35 +1462,6 @@ impl Drop for ChunkingWriter<'_> {
     }
 }
 
-struct DigestingWriter<'a, W> {
-    inner: &'a mut W,
-    hasher: Sha256,
-}
-
-impl<'a, W: Write> DigestingWriter<'a, W> {
-    fn new(inner: &'a mut W) -> Self {
-        Self {
-            inner,
-            hasher: Sha256::new(),
-        }
-    }
-    fn finish(self) -> [u8; 32] {
-        self.hasher.finalize().into()
-    }
-}
-
-impl<W: Write> Write for DigestingWriter<'_, W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.inner.write_all(bytes)?;
-        self.hasher.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 fn publish_immutable_bytes_without_directory_sync(
     directory: &File,
     name: &OsStr,
@@ -1515,19 +1486,13 @@ fn publish_temporary_file_without_directory_sync(
     temporary_name: &OsStr,
     name: &OsStr,
 ) -> io::Result<super::publication::PublishOutcome> {
-    match hard_link_at(directory, temporary_name, directory, name) {
-        Ok(()) => Ok(super::publication::PublishOutcome::Created),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if files_equal_at(directory, temporary_name, directory, name)? {
-                Ok(super::publication::PublishOutcome::Identical)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "content-addressed storage collision",
-                ))
-            }
-        }
-        Err(error) => Err(error),
+    match link_or_compare_immutable(directory, temporary_name, directory, name)? {
+        ImmutableLinkOutcome::Created => Ok(super::publication::PublishOutcome::Created),
+        ImmutableLinkOutcome::Identical => Ok(super::publication::PublishOutcome::Identical),
+        ImmutableLinkOutcome::Collision => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "content-addressed storage collision",
+        )),
     }
 }
 
@@ -1536,22 +1501,21 @@ fn publish_temporary_file(
     temporary_name: &OsStr,
     name: &OsStr,
 ) -> io::Result<super::publication::PublishOutcome> {
-    let result = match hard_link_at(directory, temporary_name, directory, name) {
-        Ok(()) => directory
-            .sync_all()
-            .map(|()| super::publication::PublishOutcome::Created),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if files_equal_at(directory, temporary_name, directory, name)? {
-                Ok(super::publication::PublishOutcome::Identical)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "content-addressed storage collision",
-                ))
-            }
-        }
-        Err(error) => Err(error),
-    };
+    publish_temporary_file_with_sync(directory, temporary_name, name, || directory.sync_all())
+}
+
+fn publish_temporary_file_with_sync(
+    directory: &File,
+    temporary_name: &OsStr,
+    name: &OsStr,
+    sync_directory: impl FnOnce() -> io::Result<()>,
+) -> io::Result<super::publication::PublishOutcome> {
+    let result = publish_temporary_file_without_directory_sync(directory, temporary_name, name)
+        .and_then(|outcome| {
+            // An identical entry may have been left by a failed durability barrier.
+            sync_directory()?;
+            Ok(outcome)
+        });
     let cleanup = unlink_at(directory, temporary_name);
     match (result, cleanup) {
         (Ok(outcome), Ok(())) => Ok(outcome),
@@ -1649,24 +1613,6 @@ fn is_chunk_name(name: &OsStr) -> bool {
         .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-fn remove_abandoned_manifest_temps(directory: &File) -> io::Result<()> {
-    let removed = read_dir_names(directory)?
-        .into_iter()
-        .try_fold(false, |removed, name| {
-            let is_temporary = name
-                .to_str()
-                .is_some_and(|name| name.starts_with(".manifest-"));
-            if is_temporary {
-                unlink_at(directory, &name)?;
-            }
-            Ok::<_, io::Error>(removed || is_temporary)
-        })?;
-    if removed {
-        directory.sync_all()?;
-    }
-    Ok(())
-}
-
 fn remove_abandoned_chunk_temps(directory: &File) -> io::Result<()> {
     let removed =
         read_dir_names(directory)?
@@ -1711,7 +1657,7 @@ fn is_chunk_shard_name(name: &OsStr) -> bool {
 fn io_for_storage_error(error: StorageError) -> io::Error {
     match error {
         StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
-            io::Error::from_raw_os_error(libc::ENOSPC)
+            io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
         }
         StorageError::Io(error) => error,
         error => io::Error::other(error),
@@ -1731,65 +1677,27 @@ fn manifest_name(hash: NarHash) -> OsString {
 }
 
 fn hex_name(bytes: [u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = [0_u8; 64];
-    bytes.iter().enumerate().for_each(|(index, byte)| {
-        output[index * 2] = HEX[usize::from(byte >> 4)];
-        output[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
-    });
-    String::from_utf8(output.to_vec()).expect("hexadecimal bytes are valid UTF-8")
+    data_encoding::HEXLOWER.encode(&bytes)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum ChunkStoreError {
+    #[error("range {start}..{end} is outside NAR size {size}")]
     InvalidRange { start: u64, end: u64, size: u64 },
-    Io(io::Error),
-    Manifest(ManifestError),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Manifest(#[from] ManifestError),
+    #[error("chunked NAR hash mismatch")]
     NarHashMismatch { expected: NarHash, actual: NarHash },
+    #[error("chunked NAR size mismatch")]
     NarSizeMismatch { expected: u64, actual: u64 },
-}
-
-impl From<io::Error> for ChunkStoreError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl From<ManifestError> for ChunkStoreError {
-    fn from(error: ManifestError) -> Self {
-        Self::Manifest(error)
-    }
-}
-
-impl std::fmt::Display for ChunkStoreError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidRange { start, end, size } => {
-                write!(formatter, "range {start}..{end} is outside NAR size {size}")
-            }
-            Self::Io(error) => error.fmt(formatter),
-            Self::Manifest(error) => error.fmt(formatter),
-            Self::NarHashMismatch { .. } => formatter.write_str("chunked NAR hash mismatch"),
-            Self::NarSizeMismatch { .. } => formatter.write_str("chunked NAR size mismatch"),
-        }
-    }
-}
-
-impl std::error::Error for ChunkStoreError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Manifest(error) => Some(error),
-            Self::InvalidRange { .. }
-            | Self::NarHashMismatch { .. }
-            | Self::NarSizeMismatch { .. } => None,
-        }
-    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
+        ffi::OsStr,
         fs,
         io::{Cursor, Read, Write},
     };
@@ -1797,7 +1705,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use super::{ChunkStore, ChunkStoreError, OFlags};
+    use super::{ChunkStore, ChunkStoreError, OFlags, remove_abandoned_temps};
     use crate::{
         object::{NarHash, NarIdentity, NarSize},
         storage::{
@@ -2024,6 +1932,120 @@ mod tests {
     }
 
     #[test]
+    fn chunk_ingest_is_independent_of_source_read_boundaries() {
+        let first_directory = tempdir().unwrap();
+        let second_directory = tempdir().unwrap();
+        let first_root = Directory::open(first_directory.path()).unwrap();
+        let second_root = Directory::open(second_directory.path()).unwrap();
+        let first_store = ChunkStore::initialize(first_root.file()).unwrap();
+        let second_store = ChunkStore::initialize(second_root.file()).unwrap();
+        let profile = ChunkProfile::MinCdcHash4V2;
+        let input = deterministic_chunk_fixture(
+            profile.max_size() as usize * (super::CHUNK_PUBLICATION_BATCH_SIZE + 1) + 17,
+        );
+        let hash = NarHash::from_digest(Sha256::digest(&input).into());
+        let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
+        let first = first_store
+            .store_nar(Cursor::new(&input), identity, profile)
+            .unwrap();
+        let second = second_store
+            .store_nar(
+                FragmentedReader {
+                    reader: Cursor::new(&input),
+                    fragment: 17,
+                },
+                identity,
+                profile,
+            )
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(first.chunk_count() > super::CHUNK_PUBLICATION_BATCH_SIZE as u64);
+
+        let mut first_reader = ManifestReader::new(
+            first_store.open_manifest(hash).unwrap().unwrap(),
+            super::MAX_CHUNK_MANIFEST_BYTES,
+        )
+        .unwrap();
+        let mut second_reader = ManifestReader::new(
+            second_store.open_manifest(hash).unwrap().unwrap(),
+            super::MAX_CHUNK_MANIFEST_BYTES,
+        )
+        .unwrap();
+        for _ in 0..first.chunk_count() {
+            assert_eq!(
+                first_reader.next_record().unwrap(),
+                second_reader.next_record().unwrap()
+            );
+        }
+        first_reader.finish_remaining().unwrap();
+        second_reader.finish_remaining().unwrap();
+        for store in [&first_store, &second_store] {
+            let mut reader = store
+                .open_verified_reader(
+                    hash,
+                    0..identity.size().get(),
+                    super::MAX_CHUNK_MANIFEST_BYTES,
+                )
+                .unwrap();
+            let mut reconstructed = Vec::new();
+            reader.read_to_end(&mut reconstructed).unwrap();
+            assert_eq!(reconstructed, input);
+        }
+    }
+
+    struct FragmentedReader<R> {
+        reader: R,
+        fragment: usize,
+    }
+
+    impl<R: Read> Read for FragmentedReader<R> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let length = self.fragment.min(output.len());
+            self.reader.read(&mut output[..length])
+        }
+    }
+
+    #[test]
+    fn identical_manifests_still_require_a_successful_directory_sync() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let temporary_name = OsStr::new("manifest.part");
+        let final_name = OsStr::new("manifest");
+        std::fs::write(directory.path().join(final_name), b"manifest bytes").unwrap();
+        std::fs::write(directory.path().join(temporary_name), b"manifest bytes").unwrap();
+
+        let error = super::publish_temporary_file_with_sync(
+            root.file(),
+            temporary_name,
+            final_name,
+            || Err(std::io::Error::other("injected directory sync failure")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected directory sync failure");
+        assert!(!directory.path().join(temporary_name).exists());
+        assert_eq!(
+            std::fs::read(directory.path().join(final_name)).unwrap(),
+            b"manifest bytes"
+        );
+
+        std::fs::write(directory.path().join(temporary_name), b"manifest bytes").unwrap();
+        let syncs = std::cell::Cell::new(0);
+        let outcome = super::publish_temporary_file_with_sync(
+            root.file(),
+            temporary_name,
+            final_name,
+            || {
+                syncs.set(syncs.get() + 1);
+                root.file().sync_all()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, crate::storage::PublishOutcome::Identical);
+        assert_eq!(syncs.get(), 1);
+        assert!(!directory.path().join(temporary_name).exists());
+    }
+
+    #[test]
     fn stores_deduplicated_chunks_and_a_round_trippable_manifest() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
@@ -2036,21 +2058,13 @@ mod tests {
             .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
             .unwrap();
         let manifest_file = store.open_manifest(hash).unwrap().unwrap();
-        let bytes = super::super::fs::read_bounded_regular_file(
-            &store.manifests,
-            &super::manifest_name(hash),
-            1_000_000,
-        )
-        .unwrap();
-        let bytes = match bytes {
-            super::super::fs::BoundedRegularFile::Valid(bytes) => bytes,
-            _ => panic!("manifest should be readable"),
-        };
         assert_eq!(
-            super::super::chunked::ChunkManifest::decode(&bytes).unwrap(),
-            manifest
+            manifest_file.metadata().unwrap().len(),
+            super::encoded_manifest_size(manifest.chunk_count()).unwrap()
         );
-        assert_eq!(manifest_file.metadata().unwrap().len(), bytes.len() as u64);
+        let reader = ManifestReader::new(manifest_file, 1_000_000).unwrap();
+        assert_eq!(reader.manifest(), manifest);
+        reader.finish_remaining().unwrap();
         assert!(manifest.chunk_count() > 0);
 
         let mut reconstructed = Vec::new();
@@ -2089,12 +2103,14 @@ mod tests {
         writer.write_all(&input).unwrap();
 
         let result = writer.finish_with(identity, |_| {
-            Err(std::io::Error::from_raw_os_error(libc::EIO))
+            Err(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error(),
+            ))
         });
 
         assert!(matches!(
             result,
-            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(libc::EIO)
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
         ));
         assert!(store.open_manifest(identity.hash()).unwrap().is_none());
         assert!(
@@ -2151,7 +2167,7 @@ mod tests {
         assert!(
             failed
                 .finish_with(identity, |_| Err(std::io::Error::from_raw_os_error(
-                    libc::EIO
+                    rustix::io::Errno::IO.raw_os_error()
                 )))
                 .is_err()
         );
@@ -2335,7 +2351,9 @@ mod tests {
     impl Read for FailingReader {
         fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
             if self.sent {
-                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                return Err(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                ));
             }
             let length = output.len().min(self.bytes.len());
             output[..length].copy_from_slice(&self.bytes[..length]);
@@ -2365,7 +2383,7 @@ mod tests {
                 expected,
                 ChunkProfile::MinCdcHash4V2
             ),
-            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(libc::EIO)
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
         ));
         assert!(store.open_manifest(expected.hash()).unwrap().is_none());
         assert_eq!(
@@ -2515,6 +2533,36 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_temp_cleanup_preserves_nonmatching_entries_and_symlink_targets() {
+        for prefix in [".manifest-", ".chunk-"] {
+            let root = tempdir().unwrap();
+            let directory = super::super::fs::open_directory(root.path()).unwrap();
+            std::fs::write(root.path().join("keep"), b"published content").unwrap();
+            std::fs::write(root.path().join(".unrelated"), b"unrelated content").unwrap();
+            let temporary = format!("{prefix}abandoned");
+            let link = format!("{prefix}link");
+            std::fs::write(root.path().join(&temporary), b"staging").unwrap();
+            std::os::unix::fs::symlink("keep", root.path().join(&link)).unwrap();
+
+            assert!(remove_abandoned_temps(&directory, prefix).unwrap());
+            assert_eq!(
+                std::fs::read(root.path().join("keep")).unwrap(),
+                b"published content"
+            );
+            assert_eq!(
+                std::fs::read(root.path().join(".unrelated")).unwrap(),
+                b"unrelated content"
+            );
+            assert!(!root.path().join(temporary).exists());
+            assert!(std::fs::symlink_metadata(root.path().join(link)).is_err());
+            assert!(
+                !remove_abandoned_temps(&directory, prefix).unwrap(),
+                "retry finds no staged entries"
+            );
+        }
+    }
+
+    #[test]
     fn recovery_completion_removes_abandoned_chunk_and_manifest_temps() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
@@ -2553,5 +2601,59 @@ mod tests {
         restarted.remove_abandoned_temporary_files().unwrap();
         assert!(super::super::fs::open_regular_at(&shard, chunk_temp).is_err());
         assert!(super::super::fs::open_regular_at(&restarted.manifests, manifest_temp).is_err());
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a1_error_messages_and_leaf_sources() {
+        let cases: &[(&dyn std::error::Error, &str)] = &[
+            (
+                &ChunkStoreError::InvalidRange {
+                    start: 3,
+                    end: 9,
+                    size: 8,
+                },
+                "range 3..9 is outside NAR size 8",
+            ),
+            (
+                &ChunkStoreError::NarHashMismatch {
+                    expected: NarHash::from_digest([1; 32]),
+                    actual: NarHash::from_digest([2; 32]),
+                },
+                "chunked NAR hash mismatch",
+            ),
+            (
+                &ChunkStoreError::NarSizeMismatch {
+                    expected: 8,
+                    actual: 9,
+                },
+                "chunked NAR size mismatch",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), *message);
+            assert!(error.source().is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a1_manifest_source_chain_keeps_each_layer() {
+        use std::error::Error as _;
+        let error = ChunkStoreError::from(ManifestError::from(io::Error::other("read failure")));
+        assert_eq!(error.to_string(), "read failure");
+        let manifest = error.source().unwrap();
+        assert!(manifest.is::<ManifestError>());
+        assert_eq!(manifest.to_string(), "read failure");
+        let io = manifest.source().unwrap();
+        assert!(io.is::<io::Error>());
+        assert_eq!(io.to_string(), "read failure");
+        assert!(io.source().is_none());
+        let direct = ChunkStoreError::from(io::Error::other("direct failure"));
+        assert_eq!(direct.to_string(), "direct failure");
+        assert!(direct.source().unwrap().is::<io::Error>());
     }
 }

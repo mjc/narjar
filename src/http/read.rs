@@ -158,17 +158,9 @@ fn load_published_narinfo(
     read_bounded_narinfo(narinfo)
 }
 
-fn read_bounded_narinfo(mut narinfo: impl Read) -> Result<Vec<u8>, NarInfoReadFailure> {
-    let mut bytes = Vec::new();
-    narinfo
-        .by_ref()
-        .take(MAX_NARINFO_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)?;
-    if bytes.len() as u64 > MAX_NARINFO_BYTES {
-        return Err(NarInfoReadFailure::InvalidOrUnreadable);
-    }
-    Ok(bytes)
+fn read_bounded_narinfo(narinfo: impl Read) -> Result<Vec<u8>, NarInfoReadFailure> {
+    crate::records::read_bounded_bytes(narinfo, MAX_NARINFO_BYTES)
+        .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)
 }
 
 fn record_narinfo_lookup(
