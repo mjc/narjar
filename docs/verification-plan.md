@@ -174,6 +174,15 @@ A temporary same-filesystem fixture exercises each failure boundary:
 | crash after narinfo link, before response | durable pair; retry is identical success |
 | disk full | no new narinfo; bounded error and cleanup attempt |
 
+Private Postcard records must reject truncation, trailing bytes, and unknown
+versions. Recovery records must reject escaped paths and final states without
+a destination; pre-link derivative states may precede measurement of the final
+identity. A source `InvalidData` error must remain a source I/O failure, not be
+reported as byte-limit exhaustion. Lease persistence tests cover failed
+replacement cleanup and stale tempfile recognition. Shared immutable-link
+tests distinguish creation, identical retry, conflict, and source I/O failure
+without overwriting a destination or deleting the caller's temporary file.
+
 No general storage abstraction is added solely for fault injection. Introduce
 the smallest test hook at the exact publication boundary if OS-level fixtures
 cannot trigger an error deterministically.
@@ -183,6 +192,8 @@ cannot trigger an error deterministically.
 The chunked backend uses the exact decoded NAR byte stream as its input. These
 tests are required in addition to the flat publication cases:
 
+- Chunking and manifest tests exercise the production ingestion and streaming
+  manifest reader, not alternate test-only decoders or builders.
 - `ChunkHash` values cannot be passed where `NarHash` or `FileHash` is
   required; the manifest profile and binary schema are tested with golden
   bytes.
