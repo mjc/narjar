@@ -373,7 +373,7 @@ impl NarInfoMetadata {
     }
 }
 
-pub(crate) fn read_narinfo_file(file: impl Read) -> io::Result<Vec<u8>> {
+pub fn read_narinfo_file(file: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(MAX_NARINFO_BYTES + 1).read_to_end(&mut bytes)?;
     Ok(bytes)

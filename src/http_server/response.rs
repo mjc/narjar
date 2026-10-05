@@ -92,6 +92,26 @@ pub struct TransferFailure {
     pub body_bytes: u64,
 }
 
+impl TransferFailure {
+    pub(super) fn before_body(error: io::Error) -> Self {
+        Self::after_body(error, 0)
+    }
+
+    fn after_body(error: io::Error, body_bytes: u64) -> Self {
+        Self { error, body_bytes }
+    }
+
+    fn truncated_body(body_bytes: u64) -> Self {
+        Self::after_body(
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file ended before the declared response length",
+            ),
+            body_bytes,
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct CompletedTransfer {
     pub connection: Option<TcpStream>,
@@ -180,20 +200,9 @@ impl<R> Response<R> {
         R: Read,
     {
         self.write_headers(stream, connection)
-            .map_err(|error| TransferFailure {
-                error,
-                body_bytes: 0,
-            })?;
+            .map_err(TransferFailure::before_body)?;
         if !head {
-            let mut writer = BodyWriter {
-                stream,
-                body_bytes: 0,
-            };
-            io::copy(&mut self.body, &mut writer).map_err(|error| TransferFailure {
-                error,
-                body_bytes: writer.body_bytes,
-            })?;
-            return Ok(writer.body_bytes);
+            return BodyWriter::copy_from(stream, &mut self.body);
         }
         Ok(0)
     }
@@ -202,6 +211,17 @@ impl<R> Response<R> {
 struct BodyWriter<'a> {
     stream: &'a mut TcpStream,
     body_bytes: u64,
+}
+
+impl BodyWriter<'_> {
+    fn copy_from(stream: &mut TcpStream, mut source: impl Read) -> Result<u64, TransferFailure> {
+        let mut writer = BodyWriter {
+            stream,
+            body_bytes: 0,
+        };
+        io::copy(&mut source, &mut writer)
+            .map_err(|error| TransferFailure::after_body(error, writer.body_bytes))
+    }
 }
 
 impl io::Write for BodyWriter<'_> {
@@ -244,9 +264,11 @@ fn copy_file_to_stream_linux(
     use rustix::io::Errno;
 
     // The kernel offset is signed even though rustix accepts a u64.
-    i64::try_from(offset).map_err(|_| TransferFailure {
-        error: io::Error::new(io::ErrorKind::InvalidInput, "file offset is too large"),
-        body_bytes: 0,
+    i64::try_from(offset).map_err(|_| {
+        TransferFailure::before_body(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file offset is too large",
+        ))
     })?;
     let mut offset = offset;
     let mut remaining = length;
@@ -254,13 +276,7 @@ fn copy_file_to_stream_linux(
         let count = remaining.min(usize::MAX as u64) as usize;
         match rustix::fs::sendfile(&*stream, &*file, Some(&mut offset), count) {
             Ok(0) => {
-                return Err(TransferFailure {
-                    error: io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "file ended before the declared response length",
-                    ),
-                    body_bytes: length - remaining,
-                });
+                return Err(TransferFailure::truncated_body(length - remaining));
             }
             Ok(sent) => remaining -= sent as u64,
             Err(Errno::INTR) => continue,
@@ -268,10 +284,10 @@ fn copy_file_to_stream_linux(
                 return copy_file_to_stream_portable(file, stream, offset, remaining);
             }
             Err(error) => {
-                return Err(TransferFailure {
-                    error: error.into(),
-                    body_bytes: length - remaining,
-                });
+                return Err(TransferFailure::after_body(
+                    error.into(),
+                    length - remaining,
+                ));
             }
         }
     }
@@ -285,29 +301,12 @@ fn copy_file_to_stream_portable(
     length: u64,
 ) -> Result<u64, TransferFailure> {
     file.seek(SeekFrom::Start(offset))
-        .map_err(|error| TransferFailure {
-            error,
-            body_bytes: 0,
-        })?;
-    let mut writer = BodyWriter {
-        stream,
-        body_bytes: 0,
-    };
-    let copied =
-        io::copy(&mut file.take(length), &mut writer).map_err(|error| TransferFailure {
-            error,
-            body_bytes: writer.body_bytes,
-        })?;
+        .map_err(TransferFailure::before_body)?;
+    let copied = BodyWriter::copy_from(stream, file.take(length))?;
     if copied == length {
         Ok(copied)
     } else {
-        Err(TransferFailure {
-            error: io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "file ended before the declared response length",
-            ),
-            body_bytes: copied,
-        })
+        Err(TransferFailure::truncated_body(copied))
     }
 }
 

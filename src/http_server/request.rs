@@ -454,10 +454,7 @@ impl Request {
         let mut stream = self.stream;
         response
             .write_headers(&mut stream, connection)
-            .map_err(|error| TransferFailure {
-                error,
-                body_bytes: 0,
-            })?;
+            .map_err(TransferFailure::before_body)?;
         let body_bytes = if head {
             0
         } else {

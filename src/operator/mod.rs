@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::Write,
     num::{NonZeroU64, NonZeroUsize},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use narjar::__private::{
         Mode as MaintenanceMode, Operation as MaintenanceOperation, Outcome as MaintenanceOutcome,
         RunValues as MaintenanceValues,
     },
-    narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
+    narinfo::{TrustedPublicKeys, read_narinfo_file},
     storage::{
         CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, CACHE_RECOVERY_MARKERS, CachePolicies,
         CleanupOutcome, Directory, LAYOUT_DESCRIPTOR, ReconcileClass, Storage, StorageBackend,
@@ -619,10 +619,7 @@ pub(crate) fn delete(options: Delete) -> Result<(), Error> {
             .open_narinfo(&store)
             .map_err(runtime)?
             .ok_or_else(|| Error::runtime("narinfo is not published"))?;
-        let mut bytes = Vec::new();
-        file.take(MAX_NARINFO_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(runtime)?;
+        let bytes = read_narinfo_file(file).map_err(runtime)?;
         if trusted.validate(&store, bytes).is_err() {
             return Err(Error::runtime("narinfo is malformed or untrusted"));
         }

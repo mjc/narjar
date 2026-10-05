@@ -10,6 +10,7 @@ use std::{
 use super::{
     chunk_store::{ChunkManifestFile, ChunkStore},
     fs::unlink_at,
+    inspection::NarinfoName,
     state::PayloadStorage,
 };
 use crate::{
@@ -103,17 +104,13 @@ fn scan_trusted_gc_publications<'a>(
     names: Vec<OsString>,
 ) -> impl Iterator<Item = Result<TrustedGcPublication, StorageError>> + 'a {
     names.into_iter().filter_map(move |name| {
-        let route = name.to_str()?.strip_suffix(".narinfo")?;
-        Some(
-            StoreHash::parse(route)
-                .map_err(|_| {
-                    invalid(format!(
-                        "invalid narinfo filename: {}",
-                        name.to_string_lossy()
-                    ))
-                })
-                .and_then(|store| inspect_trusted_gc_publication(root, trusted, store, name)),
-        )
+        let store = match NarinfoName::classify(&name)? {
+            NarinfoName::Invalid(text) => {
+                return Some(Err(invalid(format!("invalid narinfo filename: {text}"))));
+            }
+            NarinfoName::Candidate(candidate) => *candidate.store(),
+        };
+        Some(inspect_trusted_gc_publication(root, trusted, store, name))
     })
 }
 
@@ -558,28 +555,15 @@ fn run_chunked(
     let after_bytes = chunked_projected_bytes(chunk_store, &entries, &orphans, &selected)?;
     let evicted = selected.entries.len() + selected.manifests.len() + selected.outputs.len();
     let dry_run = options.mode == GcMode::DryRun;
-    let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
-        (0, 0, 0)
-    } else {
-        let deleted = apply_chunked(storage, chunk_store, &entries, &orphans, &selected)?;
-        let remaining = scan_chunked(storage, chunk_store, trusted)?;
-        storage.finish_recovery()?;
-        let actual_after = chunked_before_bytes(storage, chunk_store, &remaining)?;
-        return Ok(chunked_report(ChunkedGcReportInput {
-            before_entries: &entries,
-            before_bytes,
-            after_bytes: actual_after,
-            target_bytes,
-            dry_run,
-            protection,
-            protected_bytes,
-            eligible,
-            eligible_bytes,
-            evicted,
-            orphaned,
-            orphaned_bytes,
-            deleted,
-        }));
+    let (after_bytes, deleted) = match options.mode {
+        GcMode::DryRun => (after_bytes, (0, 0, 0)),
+        GcMode::Apply => {
+            let deleted = apply_chunked(storage, chunk_store, &entries, &orphans, &selected)?;
+            let remaining = scan_chunked(storage, chunk_store, trusted)?;
+            let actual_after = chunked_before_bytes(storage, chunk_store, &remaining)?;
+            storage.finish_recovery()?;
+            (actual_after, deleted)
+        }
     };
 
     Ok(chunked_report(ChunkedGcReportInput {
@@ -595,7 +579,7 @@ fn run_chunked(
         evicted,
         orphaned,
         orphaned_bytes,
-        deleted: (deleted_narinfos, deleted_nars, deleted_orphans),
+        deleted,
     }))
 }
 
@@ -1361,12 +1345,23 @@ fn protect<E>(
     let mut pending = roots.iter().cloned().collect::<Vec<_>>();
     let mut missing_roots = BTreeSet::new();
     let mut missing_references = BTreeSet::new();
+    let mut index = BTreeMap::new();
+    entries
+        .iter_mut()
+        .enumerate()
+        .for_each(|(position, entry)| {
+            let node = project(entry);
+            // Preserve the first-match policy if multiple publications share a key.
+            index.entry(node.store_path.to_owned()).or_insert(position);
+            index
+                .entry(node.store.as_str().to_owned())
+                .or_insert(position);
+        });
     std::iter::from_fn(|| {
         let root = pending.pop()?;
-        match entries
-            .iter_mut()
-            .map(&project)
-            .find(|entry| entry.store_path == root || entry.store.as_str() == root)
+        match index
+            .get(&root)
+            .map(|&position| project(&mut entries[position]))
         {
             Some(entry) => match *entry.protected {
                 true => {}
@@ -1724,11 +1719,15 @@ mod tests {
             format!("{a}\n/nix/store/{a}-a\n{missing_root}\n{missing_root}\n\n"),
         )
         .unwrap();
-        let report = protect(&mut entries, Some(&path), |entry| ProtectionNode {
-            store: &entry.store,
-            store_path: &entry.path,
-            references: &entry.references,
-            protected: &mut entry.protected,
+        let projections = std::cell::Cell::new(0);
+        let report = protect(&mut entries, Some(&path), |entry| {
+            projections.set(projections.get() + 1);
+            ProtectionNode {
+                store: &entry.store,
+                store_path: &entry.path,
+                references: &entry.references,
+                protected: &mut entry.protected,
+            }
         })
         .unwrap();
         assert_eq!(
@@ -1740,6 +1739,11 @@ mod tests {
             (2, 1, 1)
         );
         assert!(entries.iter().all(|entry| entry.protected));
+        assert_eq!(
+            projections.get(),
+            9,
+            "indexing and counting project each entry once; each known root projects only its match"
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

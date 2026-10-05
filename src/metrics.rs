@@ -1,7 +1,6 @@
 use std::{
     cell::Cell,
-    fs::{File, OpenOptions},
-    io::Read,
+    fs::File,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -1556,31 +1555,20 @@ fn read_zfs_sample(
     expected_root: &Path,
     now_unix_seconds: u64,
 ) -> Result<(u64, FilesystemStats), &'static str> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(
-            (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
-        );
-    }
-    let sample_file = options.open(path).map_err(|_| "sample_unreadable")?;
-    let metadata = sample_file.metadata().map_err(|_| "sample_unreadable")?;
-    if !metadata.is_file() {
-        return Err("sample_not_regular_file");
-    }
-    if metadata.len() > MAX_ZFS_SAMPLE_BYTES {
-        return Err("sample_too_large");
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    sample_file
-        .take(MAX_ZFS_SAMPLE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "sample_unreadable")?;
-    if bytes.len() as u64 > MAX_ZFS_SAMPLE_BYTES {
-        return Err("sample_too_large");
-    }
+    let sample_file =
+        crate::filesystem::open_regular_at(rustix::fs::CWD, path).map_err(|error| {
+            match error.kind() {
+                std::io::ErrorKind::InvalidData => "sample_not_regular_file",
+                _ => "sample_unreadable",
+            }
+        })?;
+    let bytes =
+        crate::records::read_bounded_bytes(sample_file, MAX_ZFS_SAMPLE_BYTES).map_err(|error| {
+            match error {
+                crate::records::BoundedReadError::TooLarge => "sample_too_large",
+                crate::records::BoundedReadError::Io(_) => "sample_unreadable",
+            }
+        })?;
     let sample: ZfsSampleFile = serde_json::from_slice(&bytes).map_err(|_| "sample_invalid")?;
     if sample.schema_version != 1 {
         return Err("sample_version_unsupported");
@@ -3388,6 +3376,41 @@ mod tests {
         ));
         assert!(
             render_prometheus(&snapshot).contains("narjar_zfs_sample_available{state=\"stale\"} 0")
+        );
+    }
+
+    #[test]
+    fn zfs_samples_reject_nonregular_files_without_waiting_for_a_writer() {
+        let temporary = tempfile::tempdir().unwrap();
+        let now = super::unix_seconds_now();
+        assert_eq!(
+            super::read_zfs_sample(temporary.path(), temporary.path(), now).unwrap_err(),
+            "sample_not_regular_file"
+        );
+        let fifo = temporary.path().join("sample.fifo");
+        #[cfg(not(target_vendor = "apple"))]
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .unwrap();
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: mkfifo reads the NUL-terminated path without retaining it.
+            let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+            assert_eq!(
+                result,
+                0,
+                "FIFO fixture: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        assert_eq!(
+            super::read_zfs_sample(&fifo, temporary.path(), now).unwrap_err(),
+            "sample_not_regular_file"
         );
     }
 
