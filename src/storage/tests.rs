@@ -2472,17 +2472,11 @@ fn recovery_cleans_incomplete_publication_transactions() {
         .expect("create interrupted NAR temporary file");
     storage
         .recovery
-        .begin(
-            Path::new(".tmp/cache-info-recovery.part"),
-            Path::new("nix-cache-info"),
-        )
+        .begin(Path::new(".tmp/cache-info-recovery.part"))
         .expect("record interrupted cache-info publication");
     storage
         .recovery
-        .begin(
-            Path::new("nar/.tmp/nar-recovery.part"),
-            Path::new("nar/recovery.nar"),
-        )
+        .begin(Path::new("nar/.tmp/nar-recovery.part"))
         .expect("record interrupted NAR publication");
 
     assert!(storage.recovery_required().expect("inspect recovery state"));
@@ -2504,10 +2498,7 @@ fn recovery_discards_abandoned_transaction_drafts_before_parsing_records() {
     drop(
         storage
             .recovery
-            .begin(
-                Path::new(".tmp/abandoned-draft.part"),
-                Path::new("nix-cache-info"),
-            )
+            .begin(Path::new(".tmp/abandoned-draft.part"))
             .expect("record interrupted publication"),
     );
 
@@ -2553,10 +2544,7 @@ fn recovery_handles_the_initial_record_hard_link_before_draft_unlink() {
     drop(
         storage
             .recovery
-            .begin(
-                Path::new(".tmp/initial-link-window.part"),
-                Path::new("nix-cache-info"),
-            )
+            .begin(Path::new(".tmp/initial-link-window.part"))
             .expect("record interrupted publication"),
     );
 
@@ -2595,21 +2583,28 @@ fn recovery_handles_the_initial_record_hard_link_before_draft_unlink() {
 }
 
 #[test]
-fn recovery_rejects_invalid_destination_before_creating_a_record() {
-    let (directory, storage) = flat_storage_fixture();
-    let invalid_destination = Path::new(std::ffi::OsStr::from_bytes(b"invalid-\xff-name"));
+fn known_publication_destinations_reject_invalid_paths() {
+    use super::location::StorePath;
 
     assert!(
-        storage
-            .recovery
-            .begin(Path::new(".tmp/unrecorded.part"), invalid_destination)
-            .is_err(),
-        "transaction paths must be validated before record publication"
+        PublishTarget::CacheInfo
+            .destination()
+            .validate_path()
+            .is_ok()
     );
-    assert!(
-        directory_entry_count(directory.path().join(".narjar-transactions")) == 0,
-        "a rejected transaction must not leave a partial authoritative record"
-    );
+    for path in [
+        StorePath::Root(std::ffi::OsStr::from_bytes(b"invalid-\xff-name").to_os_string()),
+        StorePath::Root("../outside".into()),
+        StorePath::Root("unknown/object".into()),
+        StorePath::Nar("..".into()),
+    ] {
+        let mut destination = PublishTarget::CacheInfo.destination();
+        destination.path = path;
+        assert!(
+            destination.validate_path().is_err(),
+            "known destination paths must be validated before record publication"
+        );
+    }
 }
 
 #[test]
@@ -2623,10 +2618,7 @@ fn recovery_requires_published_transaction_destinations() {
 
     let mut transaction = storage
         .recovery
-        .begin(
-            Path::new(".tmp/published-recovery.part"),
-            Path::new("nix-cache-info"),
-        )
+        .begin(Path::new(".tmp/published-recovery.part"))
         .expect("record publication");
     transaction
         .transition(super::recovery::PublicationState::Streaming)
@@ -2635,7 +2627,9 @@ fn recovery_requires_published_transaction_destinations() {
         .transition(super::recovery::PublicationState::Validated)
         .expect("validation transition");
     transaction
-        .transition(super::recovery::PublicationState::Linked)
+        .transition(super::recovery::PublicationState::Linked(
+            super::location::StorePath::parse(Path::new("nix-cache-info")).unwrap(),
+        ))
         .expect("linked transition");
     drop(transaction);
 
@@ -2650,10 +2644,7 @@ fn recovery_keeps_evidence_when_published_destination_is_missing() {
     let (_directory, storage) = flat_storage_fixture();
     let mut transaction = storage
         .recovery
-        .begin(
-            Path::new(".tmp/missing-destination.part"),
-            Path::new("nix-cache-info"),
-        )
+        .begin(Path::new(".tmp/missing-destination.part"))
         .expect("record publication");
     transaction
         .transition(super::recovery::PublicationState::Streaming)
@@ -2662,7 +2653,9 @@ fn recovery_keeps_evidence_when_published_destination_is_missing() {
         .transition(super::recovery::PublicationState::Validated)
         .expect("validation transition");
     transaction
-        .transition(super::recovery::PublicationState::Published)
+        .transition(super::recovery::PublicationState::Published(
+            super::location::StorePath::parse(Path::new("nix-cache-info")).unwrap(),
+        ))
         .expect("published transition");
     drop(transaction);
 
@@ -2719,7 +2712,7 @@ fn current_terminal_publication_transactions_still_require_destinations() {
     fs::write(&temporary, b"temporary publication").expect("create temporary publication");
     fs::write(
         &record,
-        b"state=published\npath=.tmp/missing-field.part\ndestination=\n",
+        postcard::to_allocvec(&(0_u8, ".tmp/missing-field.part", 4_u8, "")).unwrap(),
     )
     .expect("create incomplete current transaction record");
     fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
@@ -2745,7 +2738,12 @@ fn recovery_records_publish_state_before_each_fault_boundary() {
             PublishBoundary::BeforeFinalLink,
             PublicationState::Validated,
         ),
-        (PublishBoundary::BeforeParentSync, PublicationState::Linked),
+        (
+            PublishBoundary::BeforeParentSync,
+            PublicationState::Linked(
+                super::location::StorePath::parse(Path::new(&format!("nar/{NAR_ID}.nar"))).unwrap(),
+            ),
+        ),
     ] {
         let (directory, storage) = flat_storage_fixture();
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
@@ -2770,8 +2768,7 @@ fn recovery_records_publish_state_before_each_fault_boundary() {
         let TransactionRecord::V1 { state, .. } =
             parse_transaction(&contents).expect("complete typed transaction");
         assert_eq!(
-            state.phase(),
-            expected_state,
+            state, expected_state,
             "{boundary:?} recorded unexpected state"
         );
     }
@@ -2806,7 +2803,8 @@ fn malformed_publication_transaction_destination_blocks_recovery() {
     fs::write(&temporary, b"temporary").expect("create temporary publication");
     fs::write(
         &record,
-        b"state=staging\npath=.tmp/malformed-destination.part\ngarbage\n",
+        postcard::to_allocvec(&(0_u8, ".tmp/malformed-destination.part", 3_u8, "../outside"))
+            .unwrap(),
     )
     .expect("create malformed destination record");
     fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
@@ -2830,8 +2828,11 @@ fn unknown_publication_transaction_state_blocks_recovery() {
         .join(".narjar-transactions/publish-unknown-state.txn");
     fs::write(&trusted_keys, b"").expect("create trusted key file");
     fs::write(&temporary, b"temporary").expect("create temporary publication");
-    fs::write(&record, b"state=unknown\npath=.tmp/unknown-state.part\n")
-        .expect("create unknown-state record");
+    fs::write(
+        &record,
+        postcard::to_allocvec(&(0_u8, ".tmp/unknown-state.part", 5_u8)).unwrap(),
+    )
+    .expect("create unknown-state record");
     fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
         .expect("make unknown-state record private");
 

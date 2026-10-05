@@ -1,6 +1,6 @@
-use std::ffi::OsString;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::{ffi::OsString, io};
 
 use super::super::{
     compression::IngestionReceipt, egress::EgressReceipt, ids::StoreHash, location::StorePath,
@@ -79,8 +79,15 @@ pub(crate) struct PublicationDestination {
 }
 
 impl PublicationDestination {
-    pub(crate) fn relative_path(&self) -> std::path::PathBuf {
-        self.path.relative_path()
+    pub(crate) fn validate_path(&self) -> io::Result<()> {
+        let path = self.path.relative_path();
+        path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction destination is not UTF-8",
+            )
+        })?;
+        StorePath::parse(&path).map(|_| ())
     }
 }
 

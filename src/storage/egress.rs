@@ -164,9 +164,7 @@ impl<'storage> Derivative<'storage, Prepared> {
     fn begin(storage: &'storage Storage) -> Result<Self, StorageError> {
         let temp_name = storage.next_temp_name_with_prefix("nar");
         let temporary_path = TemporaryPath::nar(temp_name.clone());
-        let transaction = storage
-            .recovery
-            .begin(&temporary_path.relative_path(), PathBuf::new().as_path())?;
+        let transaction = storage.recovery.begin(&temporary_path.relative_path())?;
         let file = storage.create_temp_in_directory(storage.nar_temp_directory()?, temp_name)?;
         Ok(Self {
             temporary: OwnedTemporary::new(storage, file),
@@ -243,9 +241,8 @@ impl Derivative<'_, Validated<EncodedIdentity>> {
         let temporary = self.temporary.into_file();
         let target = PublishTarget::RepairEgressNar(output);
         let destination = target.destination();
-        let mut transaction = self.transaction;
-        transaction.set_destination(destination.path.clone());
-        storage.commit_temporary(destination, &temporary, transaction, |_| Ok(()))?;
+        destination.validate_path()?;
+        storage.commit_temporary(destination, &temporary, self.transaction, |_| Ok(()))?;
         Ok(output)
     }
 }
