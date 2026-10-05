@@ -10,10 +10,7 @@ use std::{
 };
 
 use data_encoding::HEXLOWER;
-use narjar::__private::{
-    filesystem::open_regular_at,
-    records::{BoundedReadError, decode_complete, read_bounded_bytes},
-};
+use narjar::__private::records::{BoundedRegularFile, decode_complete, read_bounded_regular_file};
 use rustix::{fs::FlockOperation, io::Errno};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1394,23 +1391,14 @@ fn read_optional_record(
     path: &Path,
     store_dir: &Path,
 ) -> Result<Option<LeaseRecord>, NativeStoreLeaseError> {
-    let file = match open_regular_at(rustix::fs::CWD, path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error)
-            if error.kind() == io::ErrorKind::InvalidData
-                || error.raw_os_error() == Some(Errno::LOOP.raw_os_error()) =>
-        {
-            return Err(NativeStoreLeaseError::InvalidRecord);
-        }
-        Err(error) => return Err(NativeStoreLeaseError::Io(error)),
+    let record = match read_bounded_regular_file(rustix::fs::CWD, path, MAX_RECORD_BYTES)
+        .map_err(NativeStoreLeaseError::Io)?
+        .parse(|bytes| decode_complete::<LeaseRecord>(bytes).ok())
+    {
+        BoundedRegularFile::Missing => return Ok(None),
+        BoundedRegularFile::Invalid => return Err(NativeStoreLeaseError::InvalidRecord),
+        BoundedRegularFile::Valid(record) => record,
     };
-    let bytes = read_bounded_bytes(file, MAX_RECORD_BYTES).map_err(|error| match error {
-        BoundedReadError::TooLarge => NativeStoreLeaseError::InvalidRecord,
-        BoundedReadError::Io(error) => NativeStoreLeaseError::Io(error),
-    })?;
-    let record: LeaseRecord =
-        decode_complete(&bytes).map_err(|_| NativeStoreLeaseError::InvalidRecord)?;
     let store_path = record.store_path(store_dir)?;
     if path.file_name() != Some(std::ffi::OsStr::new(RECORD_FILE))
         || path.parent().and_then(Path::file_name)
@@ -1442,25 +1430,14 @@ fn write_record_atomically(
 
 fn read_capacity_record(roots_dir: &Path) -> Result<CapacityRecord, NativeStoreLeaseError> {
     let path = roots_dir.join(CAPACITY_FILE);
-    let file = match open_regular_at(rustix::fs::CWD, &path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(CapacityRecord::default());
-        }
-        Err(error)
-            if error.kind() == io::ErrorKind::InvalidData
-                || error.raw_os_error() == Some(Errno::LOOP.raw_os_error()) =>
-        {
-            return Err(NativeStoreLeaseError::InvalidCapacityRecord);
-        }
-        Err(error) => return Err(NativeStoreLeaseError::Io(error)),
-    };
-    let bytes =
-        read_bounded_bytes(file, MAX_CAPACITY_RECORD_BYTES).map_err(|error| match error {
-            BoundedReadError::TooLarge => NativeStoreLeaseError::InvalidCapacityRecord,
-            BoundedReadError::Io(error) => NativeStoreLeaseError::Io(error),
-        })?;
-    decode_complete(&bytes).map_err(|_| NativeStoreLeaseError::InvalidCapacityRecord)
+    match read_bounded_regular_file(rustix::fs::CWD, &path, MAX_CAPACITY_RECORD_BYTES)
+        .map_err(NativeStoreLeaseError::Io)?
+        .parse(|bytes| decode_complete(bytes).ok())
+    {
+        BoundedRegularFile::Missing => Ok(CapacityRecord::default()),
+        BoundedRegularFile::Invalid => Err(NativeStoreLeaseError::InvalidCapacityRecord),
+        BoundedRegularFile::Valid(record) => Ok(record),
+    }
 }
 
 fn write_capacity_record(
@@ -1655,6 +1632,90 @@ mod tests {
         sync::{Arc, Barrier},
         thread,
     };
+
+    #[test]
+    fn lease_and_capacity_readers_keep_absence_invalid_records_and_io_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let capacity = directory.path().join(CAPACITY_FILE);
+        assert_eq!(
+            read_capacity_record(directory.path()).unwrap(),
+            CapacityRecord::default()
+        );
+        assert!(
+            read_optional_record(&capacity, directory.path())
+                .unwrap()
+                .is_none()
+        );
+
+        for bytes in [vec![], vec![0; MAX_RECORD_BYTES as usize + 1]] {
+            fs::write(&capacity, bytes).unwrap();
+            assert!(matches!(
+                read_capacity_record(directory.path()),
+                Err(NativeStoreLeaseError::InvalidCapacityRecord)
+            ));
+            assert!(matches!(
+                read_optional_record(&capacity, directory.path()),
+                Err(NativeStoreLeaseError::InvalidRecord)
+            ));
+        }
+
+        fs::remove_file(&capacity).unwrap();
+        fs::create_dir(&capacity).unwrap();
+        assert!(matches!(
+            read_capacity_record(directory.path()),
+            Err(NativeStoreLeaseError::InvalidCapacityRecord)
+        ));
+        assert!(matches!(
+            read_optional_record(&capacity, directory.path()),
+            Err(NativeStoreLeaseError::InvalidRecord)
+        ));
+        fs::remove_dir(&capacity).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                &capacity,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )
+            .unwrap();
+            assert!(matches!(
+                read_capacity_record(directory.path()),
+                Err(NativeStoreLeaseError::InvalidCapacityRecord)
+            ));
+            assert!(matches!(
+                read_optional_record(&capacity, directory.path()),
+                Err(NativeStoreLeaseError::InvalidRecord)
+            ));
+            fs::remove_file(&capacity).unwrap();
+        }
+        let target = directory.path().join("target");
+        fs::write(
+            &target,
+            postcard::to_allocvec(&CapacityRecord::default()).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &capacity).unwrap();
+        assert!(matches!(
+            read_capacity_record(directory.path()),
+            Err(NativeStoreLeaseError::InvalidCapacityRecord)
+        ));
+        assert!(matches!(
+            read_optional_record(&capacity, directory.path()),
+            Err(NativeStoreLeaseError::InvalidRecord)
+        ));
+
+        for result in [
+            read_capacity_record(&target).map(|_| ()),
+            read_optional_record(&target.join(RECORD_FILE), directory.path()).map(|_| ()),
+        ] {
+            match result {
+                Err(NativeStoreLeaseError::Io(error)) => {
+                    assert_eq!(error.raw_os_error(), Some(Errno::NOTDIR.raw_os_error()))
+                }
+                result => panic!("non-directory parent must retain its I/O error: {result:?}"),
+            }
+        }
+    }
 
     #[test]
     fn lease_and_capacity_reads_reject_trailing_bytes() {

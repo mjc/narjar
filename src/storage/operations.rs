@@ -25,6 +25,7 @@ use crate::{
     narinfo::{
         BoundNarInfo, NarInfoClaims, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file,
     },
+    records::{BoundedRegularFile, read_bounded_regular_file},
 };
 
 use super::{
@@ -38,10 +39,9 @@ use super::{
     },
     egress::NarReadBody,
     fs::{
-        BoundedRegularFile, ImmutableLinkOutcome, StorageCapacity, entry_is_regular_at,
-        filesystem_space, link_or_compare_immutable, open_at, open_directory_at, open_optional_at,
-        open_regular_at, read_bounded_regular_file, read_dir_names, remove_temp, rename_at,
-        reserve_staging_bytes, rollback_link_at, unlink_at,
+        ImmutableLinkOutcome, StorageCapacity, entry_is_regular_at, filesystem_space,
+        link_or_compare_immutable, open_at, open_directory_at, open_optional_at, open_regular_at,
+        read_dir_names, remove_temp, rename_at, reserve_staging_bytes, rollback_link_at, unlink_at,
     },
     ids::StoreHash,
     location::TemporaryPath,

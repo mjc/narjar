@@ -15,14 +15,13 @@ use crate::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
     NarIdentity, NarRepresentation, WireEncoding,
 };
+use crate::records::{BoundedRegularFile, read_bounded_regular_file};
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
 use super::compression::{
     CapacityCheckedStagingWriter, encoded_file_matches, nar_file_size_matches,
 };
-use super::fs::{
-    BoundedRegularFile, open_optional_at, read_bounded_regular_file, read_dir_names, unlink_at,
-};
+use super::fs::{open_optional_at, read_dir_names, unlink_at};
 use super::operations::{NarMatch, OwnedTemporary};
 use super::publication::{NarUploadPolicy, PublishOutcome, PublishTarget, StorageError};
 use super::receipt::CompressedNarReceipt;

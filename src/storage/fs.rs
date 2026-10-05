@@ -31,49 +31,6 @@ use std::path::Path;
 
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
 
-pub(super) enum BoundedRegularFile<T> {
-    Missing,
-    Invalid,
-    Valid(T),
-}
-
-impl BoundedRegularFile<Vec<u8>> {
-    pub(super) fn parse<T>(self, parse: impl FnOnce(&[u8]) -> Option<T>) -> BoundedRegularFile<T> {
-        match self {
-            Self::Missing => BoundedRegularFile::Missing,
-            Self::Invalid => BoundedRegularFile::Invalid,
-            Self::Valid(bytes) => parse(&bytes)
-                .map(BoundedRegularFile::Valid)
-                .unwrap_or(BoundedRegularFile::Invalid),
-        }
-    }
-}
-
-pub(super) fn read_bounded_regular_file(
-    directory: &File,
-    name: &OsStr,
-    max_bytes: u64,
-) -> Result<BoundedRegularFile<Vec<u8>>, StorageError> {
-    let file = match open_regular_at(directory, name) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(BoundedRegularFile::Missing);
-        }
-        Err(error)
-            if error.kind() == io::ErrorKind::InvalidData
-                || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
-        {
-            return Ok(BoundedRegularFile::Invalid);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    match crate::records::read_bounded_bytes(file, max_bytes) {
-        Ok(bytes) => Ok(BoundedRegularFile::Valid(bytes)),
-        Err(crate::records::BoundedReadError::TooLarge) => Ok(BoundedRegularFile::Invalid),
-        Err(crate::records::BoundedReadError::Io(error)) => Err(error.into()),
-    }
-}
-
 pub(crate) fn capacity_error_kind(raw_error: i32) -> CapacityErrorKind {
     match raw_error {
         raw if raw == rustix::io::Errno::NOSPC.raw_os_error() => CapacityErrorKind::NoSpace,
