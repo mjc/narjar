@@ -769,9 +769,11 @@ In-flight uploads and queued publications may finish within the grace period;
 transaction records make any interruption before a durable boundary
 reconcile-safe. After the deadline, process termination leaves only recorded
 transactions, reconcile-safe temporaries, or already durable immutable files.
-A second signal exits immediately. Set systemd `TimeoutStopSec` above the
-grace period, plus a small supervisor margin, when the service should be
-allowed to drain rather than be externally killed.
+A second signal exits immediately. The NixOS module defaults systemd
+`TimeoutStopSec` to `shutdownGraceSeconds + 10`. An explicit
+`systemd.services.narjar.serviceConfig.TimeoutStopSec` overrides that default.
+For other systemd deployments, set the stop timeout above the grace period
+with a supervisor margin so the service can drain before being killed.
 
 Implementation may use signal-hook as the one justified signal dependency.
 There is no control socket.

@@ -22,6 +22,8 @@
     cachePriority ? 30,
     privateRead ? false,
     ioTimeoutSeconds ? 30,
+    shutdownGraceSeconds ? 30,
+    stopTimeout ? null,
     egressCompression ? "none",
     storageBackend ? "flat",
     readTokens ? null,
@@ -48,6 +50,7 @@
               cachePriority
               privateRead
               ioTimeoutSeconds
+              shutdownGraceSeconds
               egressCompression
               storageBackend
               ;
@@ -58,6 +61,9 @@
             inherit gc;
             minFreeBytes = 0;
             package = package;
+          };
+          systemd.services.narjar.serviceConfig = lib.optionalAttrs (stopTimeout != null) {
+            TimeoutStopSec = stopTimeout;
           };
         }
       ];
@@ -89,6 +95,14 @@
     "/var/lib//foo"
   ];
   defaultConfig = configuration {dataDir = "/var/lib/narjar";};
+  longShutdownConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    shutdownGraceSeconds = 300;
+  };
+  overriddenStopTimeoutConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    stopTimeout = 600;
+  };
   sampledConfig = configuration {
     dataDir = "/var/lib/narjar";
     statsInventory = true;
@@ -233,6 +247,10 @@ in
   assert gcThresholdAssertion.message == gcThresholdMessage;
   assert evaluatesConfig equalGcThresholdConfig;
   assert evaluatesConfig lowerGcTargetConfig;
+  assert defaultConfig.systemd.services.narjar.serviceConfig.TimeoutStopSec == 40;
+  assert longShutdownConfig.systemd.services.narjar.serviceConfig.TimeoutStopSec == 310;
+  assert lib.hasInfix "--shutdown-grace-seconds 300" longShutdownConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert overriddenStopTimeoutConfig.systemd.services.narjar.serviceConfig.TimeoutStopSec == 600;
   assert !(lib.hasInfix "--stats-inventory-interval-seconds" defaultConfig.systemd.services.narjar.serviceConfig.ExecStart);
   assert (lib.hasInfix "--stats-inventory-interval-seconds 900" sampledConfig.systemd.services.narjar.serviceConfig.ExecStart);
   assert (lib.hasInfix "--stats-inventory-interval-seconds 30" customIntervalConfig.systemd.services.narjar.serviceConfig.ExecStart);
