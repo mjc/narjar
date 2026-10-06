@@ -10,28 +10,16 @@ Nix installation or a database.
 Uploads and downloads support uncompressed NARs, Zstd, and XZ. Upload
 compression, storage layout, and download compression are configured separately.
 
-## Rust API
-
-The supported library modules are the streaming decoder (`nar`), canonical
-encoder (`nar_encode`), and typed content identities (`object`). Application
-code under `narjar::__private` is shared by the binary and repository tests;
-it is not a supported downstream API.
-
-For the codec and identity library without application dependencies:
-
-```toml
-[dependencies]
-narjar = { version = "0.1", default-features = false }
-```
-
-The minimal library excludes SQLite, HTTP/TLS, storage, and compression-codec
-dependencies. The default `application` feature builds the CLI. Pre-1.0 minor
-releases may change the API incompatibly; patch releases retain compatibility.
-
 ## Installation
 
-To build from source, install Rust 1.98 or later, a C toolchain, pkg-config, and
-the SQLite development libraries:
+Install Rust 1.98 or later, a C toolchain, pkg-config, and the SQLite development
+libraries, then install Narjar:
+
+```sh
+cargo install --locked narjar
+```
+
+To install from a source checkout:
 
 ```sh
 git clone https://github.com/mjc/narjar.git
@@ -39,8 +27,7 @@ cd narjar
 cargo install --locked --path .
 ```
 
-The CLI supports Linux and macOS. On Windows, run it under WSL; the minimal
-Rust library does not require Unix.
+The CLI supports Linux and macOS. On Windows, run it under WSL.
 
 Nix packages are available for x86_64 Linux and Apple Silicon macOS, with a
 NixOS module and a Linux OCI image. Use flat storage on macOS; chunked storage
@@ -48,12 +35,6 @@ is Linux-only. To run with Nix:
 
 ```sh
 nix run github:mjc/narjar -- --help
-```
-
-After Narjar has been published to crates.io, install a released version with:
-
-```sh
-cargo install --locked narjar
 ```
 
 ## Create a cache
@@ -306,8 +287,6 @@ already points at the checkout. The end-to-end gates check transfers into
 independent Nix stores, signature trust, compression, interrupted uploads,
 restart, and offline GC. They do not boot NixOS VMs or establish
 filesystem-specific power-loss guarantees.
-
-Generate API documentation with `cargo doc --no-deps --open`.
 
 Further documentation:
 
