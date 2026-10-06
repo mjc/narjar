@@ -244,6 +244,28 @@ impl ChunkStore {
         Ok(Some(manifest))
     }
 
+    pub(crate) fn acquire_durable_manifest(
+        &self,
+        hash: NarHash,
+    ) -> Result<Option<super::chunked::ChunkManifest>, ChunkStoreError> {
+        self.acquire_manifest_with_directory_sync(hash, || self.manifests.sync_all())
+    }
+
+    fn acquire_manifest_with_directory_sync(
+        &self,
+        hash: NarHash,
+        sync_directory: impl FnOnce() -> io::Result<()>,
+    ) -> Result<Option<super::chunked::ChunkManifest>, ChunkStoreError> {
+        self.validate_manifest(hash)?
+            .map(|manifest| {
+                // Chunks are durable before a manifest can become visible.
+                // Complete a failed publisher's manifest-directory barrier.
+                sync_directory()?;
+                Ok(manifest)
+            })
+            .transpose()
+    }
+
     pub(crate) fn check_nar_availability(
         &self,
         identity: NarIdentity,
@@ -2130,6 +2152,45 @@ mod tests {
             store.read_range(hash, invalid_start..invalid_end, 1_000_000, &mut range),
             Err(ChunkStoreError::InvalidRange { .. })
         ));
+    }
+
+    #[test]
+    fn canonical_manifest_acquisition_cannot_skip_a_failed_directory_barrier() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = b"canonical chunked NAR";
+        let hash = NarHash::from_digest(Sha256::digest(input).into());
+        let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
+        store
+            .store_nar(Cursor::new(input), identity, ChunkProfile::MinCdcHash4V2)
+            .unwrap();
+
+        let result = store.acquire_manifest_with_directory_sync(hash, || {
+            Err(std::io::Error::other(
+                "injected manifest directory sync failure",
+            ))
+        });
+        assert!(matches!(result, Err(ChunkStoreError::Io(error))
+            if error.to_string() == "injected manifest directory sync failure"));
+        assert_eq!(
+            store
+                .acquire_durable_manifest(hash)
+                .unwrap()
+                .unwrap()
+                .identity(),
+            identity
+        );
+
+        let missing = NarHash::from_digest([0; 32]);
+        assert!(
+            store
+                .acquire_manifest_with_directory_sync(missing, || {
+                    panic!("missing manifests must not run a publication barrier")
+                })
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
