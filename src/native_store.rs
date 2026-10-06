@@ -31,6 +31,7 @@ pub(crate) mod lease;
     )
 )]
 pub(crate) mod metadata;
+pub(crate) mod temp_roots;
 
 const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
     (

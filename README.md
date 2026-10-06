@@ -156,7 +156,9 @@ The command takes concrete `/nix/store/...` paths. It needs read access to the
 store and its SQLite metadata database, plus access to Nix's rooting mechanism.
 Normal unprivileged users retain temporary roots through the native Nix daemon
 socket for the duration of the push. Direct writable-store access uses a GC
-read lock while installing roots and reading metadata. The Nix command in this
+read lock while registering paths in Nix's locked `temproots/<pid>` file and
+reading metadata. Closing the file releases those roots, including after a
+forced exit; the next Nix GC removes the stale file. The Nix command in this
 example builds the input path.
 
 Netrc credentials are sent over HTTPS unless `--insecure-http` is supplied.

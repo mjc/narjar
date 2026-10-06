@@ -136,11 +136,15 @@ it does not modify the local store database or invoke Nix subprocesses.
 served representations. Uploads use fixed-length streamed requests and the
 server's atomic per-object publication. The client needs read access to the
 store and its metadata database. It protects the requested roots before reading
-closure metadata. Direct writable-state access installs roots under
-`$NIX_STATE_DIR/gcroots/auto` (default `/nix/var/nix/gcroots/auto`) and holds
-Nix's `gc.lock` shared while validating live paths, installing roots, and
-reading metadata; the roots remain until the push finishes. Normal unprivileged
-users register temporary roots with `AddTempRoot` through the native Nix daemon
+closure metadata. Direct writable-state access records NUL-separated paths in
+`$NIX_STATE_DIR/temproots/<pid>` (default `/nix/var/nix/temproots/<pid>`) and
+holds an exclusive file lock for the push. Guards in the same process share
+that file. Nix's `gc.lock` is held shared only while validating paths,
+registering roots, and reading metadata, not during uploads. When the last
+guard closes the file, Nix GC can reclaim it without retaining its paths.
+This also holds after SIGKILL; no destructor or signal handler is required.
+Normal unprivileged users register temporary roots with `AddTempRoot` through
+the native Nix daemon
 socket and keep that connection alive for the entire push. A missing lock file
 is created only when the local state directory is writable; symlinks and
 non-regular lock files are rejected. Permission-denied or read-only failures
