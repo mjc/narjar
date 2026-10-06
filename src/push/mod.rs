@@ -239,11 +239,10 @@ pub(crate) fn run(args: Push) -> Result<(), Error> {
 }
 
 fn prepare_push(args: &Push) -> Result<PreparedPush, Error> {
-    let mut metadata = LocalStore::open()
-        .map_err(Error::runtime)?
-        .closure_paths(&args.paths)
-        .map_err(Error::runtime)?;
-    let roots = StoreRoots::hold(&args.paths).map_err(Error::runtime)?;
+    let (roots, mut metadata) = StoreRoots::hold_while_reading_metadata(&args.paths, |state_dir| {
+        LocalStore::open(state_dir)?.closure_paths(&args.paths)
+    })
+    .map_err(Error::runtime)?;
     if let Some(key_file) = args.signing_key_file.as_deref() {
         sign_metadata(key_file, &mut metadata).map_err(Error::runtime)?;
     }

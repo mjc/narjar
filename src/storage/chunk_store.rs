@@ -1284,9 +1284,14 @@ impl<'store> ChunkingWriter<'store> {
 
     fn publish_next_batch(&mut self, final_batch: bool) -> io::Result<()> {
         let specifications = self.next_chunk_specifications(final_batch)?;
-        for specification in &specifications {
-            self.reserve_before_materialization(&self.store.chunks, specification.length)?;
-        }
+        let batch_bytes = specifications
+            .iter()
+            .try_fold(0_u64, |total, specification| {
+                total.checked_add(specification.length).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "chunk batch size overflow")
+                })
+            })?;
+        self.reserve_before_materialization(&self.store.chunks, batch_bytes)?;
         let batch = specifications
             .iter()
             .map(|specification| PendingChunk {
@@ -1421,11 +1426,7 @@ impl<'store> ChunkingWriter<'store> {
             return Ok(());
         };
         reservation
-            .grow_to(
-                directory,
-                self.min_free_bytes,
-                reservation.reserved_bytes().saturating_add(bytes),
-            )
+            .grow_to(directory, self.min_free_bytes, bytes)
             .map_err(io_for_storage_error)
     }
 
@@ -1777,6 +1778,50 @@ mod tests {
             chunk_lengths.len() > 1,
             "fixture includes unequal chunk lengths"
         );
+    }
+
+    #[test]
+    fn chunked_ingestion_spends_admitted_credit_before_requesting_more_space() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let profile = ChunkProfile::MinCdcHash4V2;
+        let input = deterministic_chunk_fixture(profile.max_size() as usize * 18);
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        let budget = std::sync::Arc::new(std::sync::Mutex::new(StagingBudget::default()));
+        let capacity = StorageCapacity {
+            total_bytes: input.len() as u64 + 10,
+            available_bytes: input.len() as u64 + 10,
+            total_inodes: 100,
+            available_inodes: 100,
+            read_only: false,
+        };
+        let reservation = crate::storage::fs::reserve_staging_bytes_for_test(
+            &budget,
+            10,
+            input.len() as u64,
+            || Ok(capacity),
+        )
+        .unwrap();
+        // No growth can pass this floor. The admitted credit must cover all
+        // payload batches even as those bytes become materialized on disk.
+        let mut writer = store
+            .begin_ingest_with_reservation(profile, reservation, u64::MAX)
+            .unwrap();
+        writer
+            .write_all(&input)
+            .expect("already admitted payload must fit");
+        writer.publish_pending_chunk().unwrap();
+        assert_eq!(budget.lock().unwrap().outstanding_bytes(), 0);
+        assert_eq!(writer.reservation.as_ref().unwrap().reserved_bytes(), 0);
+        // The manifest is an additional, separately budgeted allocation.
+        writer.min_free_bytes = 0;
+        let completed = writer.finish(identity).unwrap();
+        completed.release_reservation();
+        store.check_nar_availability(identity).unwrap();
     }
 
     #[test]

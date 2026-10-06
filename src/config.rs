@@ -156,6 +156,7 @@ impl SourcePreparationError {
 pub(crate) enum ServeSourceChoice {
     #[default]
     FlatCache,
+    #[value(hide = true)]
     NativeStore,
 }
 
@@ -208,13 +209,13 @@ pub(crate) struct ServeArgs {
         default_value = "flat-cache"
     )]
     source: ServeSourceChoice,
-    #[arg(long, env = "NARJAR_NATIVE_STORE_DIR", value_parser = non_empty_path)]
+    #[arg(long, hide = true, env = "NARJAR_NATIVE_STORE_DIR", value_parser = non_empty_path)]
     native_store_dir: Option<PathBuf>,
-    #[arg(long, env = "NARJAR_NATIVE_STATE_DIR", value_parser = non_empty_path)]
+    #[arg(long, hide = true, env = "NARJAR_NATIVE_STATE_DIR", value_parser = non_empty_path)]
     native_state_dir: Option<PathBuf>,
-    #[arg(long, env = "NARJAR_NATIVE_ROOTS_DIR", value_parser = non_empty_path)]
+    #[arg(long, hide = true, env = "NARJAR_NATIVE_ROOTS_DIR", value_parser = non_empty_path)]
     native_roots_dir: Option<PathBuf>,
-    #[arg(long, env = "NARJAR_NATIVE_MIN_LEASE_SECONDS")]
+    #[arg(long, hide = true, env = "NARJAR_NATIVE_MIN_LEASE_SECONDS")]
     native_min_lease_seconds: Option<NonZeroU64>,
     #[arg(
         long,

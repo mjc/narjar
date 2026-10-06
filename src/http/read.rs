@@ -191,6 +191,10 @@ impl RequestedRange {
 }
 
 fn requested_range(request: &Request, length: u64) -> RequestedRange {
+    match request.method() {
+        Method::Get => {}
+        Method::Head | Method::Put | Method::Other => return RequestedRange::Full,
+    }
     let mut headers = request
         .headers()
         .iter()

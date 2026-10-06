@@ -319,6 +319,9 @@ impl Storage {
                 if manifest.identity() != identity {
                     return Err(StorageError::NarMismatch);
                 }
+                store
+                    .check_nar_availability(identity)
+                    .map_err(super::operations::storage_error_for_chunk_store)?;
                 StoredNarSource::Chunked(store)
             }
         };

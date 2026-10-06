@@ -23,6 +23,7 @@ use rustix::fs::{
 use super::publication::{StagingBudget, TemporaryFile};
 use super::{StagingReservation, StorageError};
 use crate::filesystem::{directory_names, exclude_dot_directory_entries};
+pub(super) use crate::filesystem::{ensure_directory_at, validate_directory};
 pub(crate) use crate::filesystem::{
     open_directory, open_directory_at, open_regular_at, read_dir_names,
 };
@@ -123,32 +124,6 @@ pub fn capacity_from_statvfs(statistics: &StatVfs) -> StorageCapacity {
         available_inodes: statistics.f_favail,
         read_only: statistics.f_flag.contains(StatVfsMountFlags::RDONLY),
     }
-}
-
-pub(super) fn ensure_directory_at(parent: &File, name: &OsStr, label: &str) -> io::Result<File> {
-    match open_directory_at(parent, name) {
-        Ok(directory) => validate_directory(&directory, label),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if let Err(error) = fs::mkdirat(parent, name, Mode::from_raw_mode(0o755))
-                && error != rustix::io::Errno::EXIST
-            {
-                return Err(error.into());
-            }
-            let directory = open_directory_at(parent, name)?;
-            validate_directory(&directory, label)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-pub(super) fn validate_directory(directory: &File, name: &str) -> io::Result<File> {
-    if directory.metadata()?.permissions().mode() & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} has unsafe permissions"),
-        ));
-    }
-    directory.try_clone()
 }
 
 pub(super) fn require_directory_at(parent: &File, name: &str) -> io::Result<File> {

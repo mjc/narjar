@@ -11,11 +11,13 @@ use narjar::__private::narinfo::TrustedPublicKeys;
 use rustix::fs::{Access, AtFlags, CWD, StatVfsMountFlags};
 use sqlite::{Connection, ConnectionThreadSafe, OpenFlags, State};
 
+pub(crate) mod daemon_roots;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "NARJ-141 connects native NAR delivery to HTTP")
 )]
 pub(crate) mod delivery;
+pub(crate) mod gc;
 #[expect(
     dead_code,
     reason = "NARJ-142 connects lease capabilities to native-store serving"

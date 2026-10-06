@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     auth::{Authorizer, Permission},
-    http_server::{BodyReader, BodyReaderError, Request, Response, StatusCode},
+    http_server::{BodyReader, BodyReaderError, Request, RequestExpectation, Response, StatusCode},
     metrics::{ConnectionOutcome, Metrics, RequestGuard, RequestMethod, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
     object::{NarFileName, WireEncoding},
@@ -83,6 +83,10 @@ pub struct PublicationRequest {
 }
 
 impl PublicationRequest {
+    pub fn acknowledge_body(&mut self) -> io::Result<()> {
+        self.upload.request.acknowledge_body()
+    }
+
     pub fn reject(self, metrics: &Metrics, status: StatusCode) {
         let guard = metrics.request(RequestMethod::Put, request_route(self.upload.request.url()));
         let _ = self.upload.respond(&guard, status);
@@ -93,7 +97,8 @@ impl PublicationRequest {
         match &self.route {
             CacheRoute::Nar(_) if length <= max_encoded_nar_bytes => Some(length),
             CacheRoute::Nar(_) => None,
-            CacheRoute::NarInfo(_) => Some(length.min(MAX_NARINFO_BYTES)),
+            CacheRoute::NarInfo(_) if length <= MAX_NARINFO_BYTES => Some(length),
+            CacheRoute::NarInfo(_) => None,
             CacheRoute::CacheInfo => Some(0),
         }
     }
@@ -190,6 +195,10 @@ impl UploadRequest {
     }
 
     fn validate_headers_and_length(request: &Request) -> Result<usize, StatusCode> {
+        match request.expectation() {
+            RequestExpectation::None | RequestExpectation::Continue => {}
+            RequestExpectation::Unsupported => return Err(StatusCode::EXPECTATION_FAILED),
+        }
         if has_header(request, "Transfer-Encoding") {
             return Err(StatusCode::BAD_REQUEST);
         }

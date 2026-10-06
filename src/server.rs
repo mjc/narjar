@@ -257,15 +257,17 @@ fn queue_publication(
     admission: &mut Option<Admission>,
     context: &RequestWorkerContext,
 ) {
-    let Some(request) = prepare_publication(request, &context.authorizer, &context.metrics) else {
+    let Some(mut request) = prepare_publication(request, &context.authorizer, &context.metrics)
+    else {
         return;
     };
-    let staging = context.storage.reserve_staging(
-        request
-            .staging_bytes(context.max_encoded_nar_bytes)
-            .unwrap_or(0),
-        context.min_free_bytes,
-    );
+    let Some(bytes) = request.staging_bytes(context.max_encoded_nar_bytes) else {
+        request.reject(&context.metrics, StatusCode::PAYLOAD_TOO_LARGE);
+        return;
+    };
+    let staging = context
+        .storage
+        .reserve_staging(bytes, context.min_free_bytes);
     let staging = match staging {
         Ok(staging) => staging,
         Err(error) => {
@@ -273,6 +275,12 @@ fn queue_publication(
             return;
         }
     };
+    if let Err(error) = request.acknowledge_body() {
+        if let Some(outcome) = Metrics::socket_read_failure(error.kind()) {
+            context.metrics.record_connection_outcome(outcome);
+        }
+        return;
+    }
     let publication = QueuedPublication {
         request,
         _admission: admission
