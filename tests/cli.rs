@@ -3227,6 +3227,42 @@ fn cache_info_reads_the_initialized_priority() {
 }
 
 #[test]
+fn idle_http11_connection_does_not_occupy_the_only_request_worker() {
+    let server = RunningServer::start_with_workers(
+        "idle-connection-fairness",
+        1,
+        &["--io-timeout-seconds", "30"],
+    );
+    let mut idle = BufReader::new(TcpStream::connect(&server.address).unwrap());
+    idle.get_mut()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    idle.get_mut()
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\n\r\n")
+        .unwrap();
+    assert!(read_http_response(&mut idle).starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+    let mut other = BufReader::new(TcpStream::connect(&server.address).unwrap());
+    other
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    other
+        .get_mut()
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    assert!(read_http_response(&mut other).starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+    // The original connection remains reusable after another client was served.
+    idle.get_mut()
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    assert!(read_http_response(&mut idle).starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
 fn http11_connection_serves_two_sequential_requests() {
     let server = RunningServer::start("http11-keep-alive");
     let stream = TcpStream::connect(&server.address).expect("connect to narjar");

@@ -33,6 +33,8 @@ use crate::{
 };
 use narjar::__private::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure};
 
+mod idle;
+
 struct Admissions {
     limit: usize,
     in_flight: AtomicUsize,
@@ -167,18 +169,7 @@ struct RequestWorkerContext {
     stopping: Arc<AtomicBool>,
     min_free_bytes: u64,
     max_encoded_nar_bytes: u64,
-}
-
-#[derive(Clone, Copy)]
-enum ConnectionPhase {
-    FirstRequest,
-    KeepAlive,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum ConnectionReadiness {
-    Readable,
-    Closed,
+    idle: Arc<idle::IdleConnections>,
 }
 
 #[derive(Clone)]
@@ -265,15 +256,12 @@ fn run_request_worker(receiver: Receiver<AcceptedRequest>, context: RequestWorke
         context.metrics.connection_dequeued();
         let AcceptedRequest { stream, _admission } = accepted;
         let mut admission = Some(_admission);
-        let mut phase = ConnectionPhase::FirstRequest;
-        let mut next_stream = Some(stream);
-        std::iter::from_fn(|| {
-            let stream = next_stream.take()?;
-            next_stream = process_next_request(stream, &mut admission, &context, phase);
-            phase = ConnectionPhase::KeepAlive;
-            Some(())
-        })
-        .for_each(drop);
+        if let Some(stream) = process_next_request(stream, &mut admission, &context) {
+            context.idle.park(AcceptedRequest {
+                stream,
+                _admission: admission.expect("read response retains its connection admission"),
+            });
+        }
     });
 }
 
@@ -281,24 +269,9 @@ fn process_next_request(
     stream: TcpStream,
     admission: &mut Option<Admission>,
     context: &RequestWorkerContext,
-    phase: ConnectionPhase,
 ) -> Option<TcpStream> {
     if context.stopping.load(Ordering::Acquire) {
         return None;
-    }
-    match phase {
-        ConnectionPhase::FirstRequest => {}
-        ConnectionPhase::KeepAlive => {
-            match wait_for_keep_alive_request_or_shutdown(&stream, &context.stopping) {
-                Ok(ConnectionReadiness::Readable) => {}
-                Ok(ConnectionReadiness::Closed) => return None,
-                Err(error) => {
-                    let mut stream = stream;
-                    report_request_read_failure(&mut stream, error, &context.metrics);
-                    return None;
-                }
-            }
-        }
     }
     match Request::read(stream) {
         Ok(_) if context.stopping.load(Ordering::Acquire) => None,
@@ -319,44 +292,6 @@ fn process_next_request(
             report_request_read_failure(&mut stream, error, &context.metrics);
             None
         }
-    }
-}
-
-fn wait_for_keep_alive_request_or_shutdown(
-    stream: &TcpStream,
-    stopping: &AtomicBool,
-) -> io::Result<ConnectionReadiness> {
-    let timeout = stream.read_timeout()?;
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
-    let poll_interval = Duration::from_millis(50);
-    stream.set_read_timeout(Some(timeout.unwrap_or(poll_interval).min(poll_interval)))?;
-    let result = std::iter::repeat_with(|| poll_keep_alive_connection(stream, stopping, deadline))
-        .find_map(std::convert::identity)
-        .expect("polling ends only with a readiness result");
-    stream.set_read_timeout(timeout)?;
-    result
-}
-
-fn poll_keep_alive_connection(
-    stream: &TcpStream,
-    stopping: &AtomicBool,
-    deadline: Option<Instant>,
-) -> Option<io::Result<ConnectionReadiness>> {
-    if stopping.load(Ordering::Acquire)
-        || deadline.is_some_and(|deadline| Instant::now() >= deadline)
-    {
-        return Some(Ok(ConnectionReadiness::Closed));
-    }
-    let mut first_byte = [0; 1];
-    match stream.peek(&mut first_byte) {
-        Ok(0) => Some(Ok(ConnectionReadiness::Closed)),
-        Ok(_) => Some(Ok(ConnectionReadiness::Readable)),
-        Err(error) => match error.kind() {
-            io::ErrorKind::Interrupted | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
-                None
-            }
-            _ => Some(Err(error)),
-        },
     }
 }
 
@@ -746,6 +681,14 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         },
     )?;
     drop(publication_receiver);
+    let (idle, idle_handle) = idle::IdleConnections::start(
+        sender.clone(),
+        Arc::clone(&metrics),
+        Arc::clone(&stopping),
+        max_in_flight,
+        Duration::from_secs(config.io_timeout_seconds.get()),
+    )
+    .map_err(|error| Error::runtime(format!("cannot start idle connection monitor: {error}")))?;
     let request_context = RequestWorkerContext {
         storage: Arc::clone(&storage),
         authorizer: Arc::clone(&authorizer),
@@ -754,6 +697,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         stopping: Arc::clone(&stopping),
         min_free_bytes,
         max_encoded_nar_bytes,
+        idle,
     };
     let handles = spawn_request_workers(config.workers.get(), receiver.clone(), request_context);
     drop(receiver);
@@ -769,6 +713,10 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             io_timeout: Duration::from_secs(config.io_timeout_seconds.get()),
         },
     )?;
+    idle_handle
+        .join()
+        .map_err(|_| Error::runtime("idle connection monitor panicked"))?
+        .map_err(|error| Error::runtime(format!("idle connection monitor failed: {error}")))?;
     metrics_sampler.thread().unpark();
     if let Some(sampler) = &population_sampler {
         sampler.thread().unpark();
@@ -858,10 +806,7 @@ mod tests {
 
     use narjar::__private::{http_server::Request, metrics::Metrics};
 
-    use super::{
-        Admissions, ConnectionReadiness, configure_accepted_socket, request_read_failure_outcome,
-        wait_for_keep_alive_request_or_shutdown,
-    };
+    use super::{Admissions, configure_accepted_socket, request_read_failure_outcome};
     use narjar::__private::metrics::ConnectionOutcome;
 
     #[test]
@@ -964,6 +909,16 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let admissions = Arc::new(Admissions::new(1, Arc::clone(&metrics)));
         let (publication_sender, receiver) = crossbeam_channel::bounded(0);
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ready, _ready_receiver) = crossbeam_channel::bounded(1);
+        let (idle, idle_handle) = super::idle::IdleConnections::start(
+            ready,
+            Arc::clone(&metrics),
+            Arc::clone(&stopping),
+            1,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         let context = super::RequestWorkerContext {
             storage: Arc::new(storage),
             authorizer: Arc::new(Authorizer::load(&root).unwrap()),
@@ -972,9 +927,10 @@ mod tests {
                 publication_sender,
                 Arc::clone(&metrics),
             )),
-            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopping: Arc::clone(&stopping),
             min_free_bytes: 0,
             max_encoded_nar_bytes: 1024,
+            idle,
         };
         let mut receiver = Some(receiver);
         enum Rejection {
@@ -1022,6 +978,8 @@ mod tests {
                 "rejected request released admission"
             );
         }
+        stopping.store(true, std::sync::atomic::Ordering::Release);
+        idle_handle.join().unwrap().unwrap();
     }
 
     #[test]
@@ -1042,25 +1000,6 @@ mod tests {
             Err(crossbeam_channel::TryRecvError::Disconnected)
         ));
         request_context_reference.begin_draining();
-    }
-
-    #[test]
-    fn keep_alive_readiness_restores_the_request_header_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        let timeout = Duration::from_secs(2);
-        configure_accepted_socket(&stream, timeout).unwrap();
-        client.write_all(b"G").unwrap();
-        assert_eq!(
-            wait_for_keep_alive_request_or_shutdown(
-                &stream,
-                &std::sync::atomic::AtomicBool::new(false)
-            )
-            .unwrap(),
-            ConnectionReadiness::Readable
-        );
-        assert_eq!(stream.read_timeout().unwrap(), Some(timeout));
     }
 
     #[test]
@@ -1145,82 +1084,6 @@ mod tests {
             error.kind(),
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
         ));
-        client.join().expect("client should finish");
-    }
-
-    #[test]
-    fn idle_keep_alive_timeout_has_no_next_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
-        let address = listener.local_addr().expect("listener address");
-        let client = thread::spawn(move || {
-            let _stream = TcpStream::connect(address).expect("connect test listener");
-            thread::sleep(Duration::from_millis(150));
-        });
-
-        let (stream, _) = listener.accept().expect("accept idle connection");
-        configure_accepted_socket(&stream, Duration::from_millis(30))
-            .expect("configure socket timeout");
-        assert_eq!(
-            wait_for_keep_alive_request_or_shutdown(
-                &stream,
-                &std::sync::atomic::AtomicBool::new(false)
-            )
-            .expect("peek idle connection"),
-            ConnectionReadiness::Closed
-        );
-        client.join().expect("client should finish");
-    }
-
-    #[test]
-    fn clean_keep_alive_close_has_no_next_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
-        let address = listener.local_addr().expect("listener address");
-        let client = thread::spawn(move || {
-            drop(TcpStream::connect(address).expect("connect test listener"));
-        });
-
-        let (stream, _) = listener.accept().expect("accept closed connection");
-        configure_accepted_socket(&stream, Duration::from_millis(100))
-            .expect("configure socket timeout");
-        client.join().expect("client should close cleanly");
-        assert_eq!(
-            wait_for_keep_alive_request_or_shutdown(
-                &stream,
-                &std::sync::atomic::AtomicBool::new(false)
-            )
-            .expect("peek closed connection"),
-            ConnectionReadiness::Closed
-        );
-    }
-
-    #[test]
-    fn partial_keep_alive_request_is_not_mistaken_for_idle_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
-        let address = listener.local_addr().expect("listener address");
-        let client = thread::spawn(move || {
-            let mut stream = TcpStream::connect(address).expect("connect test listener");
-            stream.write_all(b"G").expect("write start of next request");
-            thread::sleep(Duration::from_millis(150));
-        });
-
-        let (stream, _) = listener.accept().expect("accept partial request");
-        configure_accepted_socket(&stream, Duration::from_millis(30))
-            .expect("configure socket timeout");
-        assert_eq!(
-            wait_for_keep_alive_request_or_shutdown(
-                &stream,
-                &std::sync::atomic::AtomicBool::new(false)
-            )
-            .expect("peek partial request"),
-            ConnectionReadiness::Readable
-        );
-        let error = match Request::read(stream) {
-            Ok(_) => panic!("incomplete request should time out"),
-            Err((_, error)) => error,
-        };
-        assert!(
-            error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock
-        );
         client.join().expect("client should finish");
     }
 }
