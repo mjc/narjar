@@ -229,6 +229,12 @@ runs on publication workers, so at most `workers` decoders run at once; the
 configured worst-case decoder working memory is therefore
 `workers × maxDecoderMemoryBytes`.
 
+A Linux deployment with 32 workers measured about 16 MiB process RSS after
+four days of uptime, using flat storage and uncompressed downloads. This is
+an observed footprint, not a peak-memory bound; compressed uploads and
+concurrent requests can increase memory use. Process RSS does not include
+the system's filesystem caches.
+
 ## Monitoring
 
 `GET /metrics` returns Prometheus text. It includes cache hits, misses and
