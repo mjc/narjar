@@ -2525,6 +2525,55 @@ impl RunningServer {
         self.open_raw_request(method, path, &headers)
     }
 
+    fn open_upload_after_continue(&self, path: &str, length: usize) -> TcpStream {
+        let length = length.to_string();
+        let mut stream = self.open_request(
+            "PUT",
+            path,
+            &[("Content-Length", &length), ("Expect", "100-continue")],
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut interim = [0; 25];
+        stream
+            .read_exact(&mut interim)
+            .expect("publication worker must admit the upload before the test proceeds");
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        stream
+    }
+
+    fn wait_until_listener_is_closed(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for connection in std::iter::repeat_with(|| TcpStream::connect(&self.address)) {
+            match connection {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+                Err(error) => panic!("checking shutdown listener: {error}"),
+                Ok(stream) => drop(stream),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first SIGTERM must stop accepting connections"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn wait_for_metrics_containing(&self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for response in std::iter::repeat_with(|| self.request("GET", "/metrics")) {
+            let metrics = String::from_utf8(response_parts(&response).1).unwrap();
+            if metrics.contains(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "metric never reached {expected:?}: {metrics}"
+            );
+            thread::yield_now();
+        }
+    }
+
     fn authenticated_headers<'a>(
         method: &str,
         headers: &[(&'a str, &'a str)],
@@ -2747,12 +2796,7 @@ fn stalled_upload_body_is_rejected_without_publication() {
 fn second_sigterm_exits_a_stalled_request_immediately() {
     let mut server =
         RunningServer::start_with_args("second-sigterm", &["--shutdown-grace-seconds", "30"]);
-    let _stalled = server.open_request(
-        "PUT",
-        &format!("/nar/{NAR_ID}.nar"),
-        &[("Content-Length", "1")],
-    );
-    thread::sleep(Duration::from_millis(100));
+    let _stalled = server.open_upload_after_continue(&format!("/nar/{NAR_ID}.nar"), 1);
 
     let pid = server
         .child
@@ -2763,7 +2807,7 @@ fn second_sigterm_exits_a_stalled_request_immediately() {
         .args(["-TERM", &pid.to_string()])
         .status()
         .expect("first SIGTERM should be sent");
-    thread::sleep(Duration::from_millis(50));
+    server.wait_until_listener_is_closed();
     let started = Instant::now();
     Command::new("kill")
         .args(["-TERM", &pid.to_string()])
@@ -2787,12 +2831,7 @@ fn second_sigterm_exits_a_stalled_request_immediately() {
 fn shutdown_grace_deadline_terminates_a_stalled_request() {
     let mut server =
         RunningServer::start_with_args("shutdown-deadline", &["--shutdown-grace-seconds", "1"]);
-    let _stalled = server.open_request(
-        "PUT",
-        &format!("/nar/{NAR_ID}.nar"),
-        &[("Content-Length", "1")],
-    );
-    thread::sleep(Duration::from_millis(100));
+    let _stalled = server.open_upload_after_continue(&format!("/nar/{NAR_ID}.nar"), 1);
 
     let pid = server
         .child
@@ -2829,17 +2868,9 @@ fn shutdown_grace_deadline_covers_a_queued_publication() {
         &["--max-in-flight", "3", "--shutdown-grace-seconds", "1"],
     );
     let path = format!("/nar/{NAR_ID}.nar");
-    let _active = server.open_request("PUT", &path, &[("Content-Length", "1")]);
-    thread::sleep(Duration::from_millis(50));
+    let _active = server.open_upload_after_continue(&path, 1);
     let _queued = server.open_request("PUT", &path, &[("Content-Length", "1")]);
-    thread::sleep(Duration::from_millis(50));
-
-    let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
-        .expect("metrics should be UTF-8");
-    assert!(
-        metrics.contains("narjar_publication_queue_depth 1"),
-        "{metrics}"
-    );
+    server.wait_for_metrics_containing("narjar_publication_queue_depth 1");
 
     let pid = server
         .child
@@ -3997,20 +4028,8 @@ fn chunked_narinfo_publication_rejects_missing_and_truncated_chunks() {
 #[test]
 fn accepted_upload_sends_continue_before_reading_the_body() {
     let server = RunningServer::start("expect-continue");
-    let length = NAR_BYTES.len().to_string();
-    let mut stream = server.open_request(
-        "PUT",
-        &format!("/nar/{NARJAR_HASH}.nar"),
-        &[("Content-Length", &length), ("Expect", "100-continue")],
-    );
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let mut interim = [0; 25];
-    stream
-        .read_exact(&mut interim)
-        .expect("server must grant admission without waiting for the body");
-    assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+    let mut stream =
+        server.open_upload_after_continue(&format!("/nar/{NARJAR_HASH}.nar"), NAR_BYTES.len());
     stream.write_all(NAR_BYTES).unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();
