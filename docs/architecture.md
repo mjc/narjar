@@ -1,35 +1,28 @@
-# Narjar v0.1 architecture and trust decisions
+# Narjar architecture
 
-Status: current architecture and operational contracts.
+## Scope
 
-## Decision
+Narjar is a filesystem-only HTTP binary cache. Flat storage is supported on
+Linux and Apple Silicon macOS; shared content-defined chunks are Linux-only.
+Uploads accept raw `.nar`, `.nar.zst`, and `.nar.xz` transports and store the
+decoded bytes as a canonical raw file or an ordered manifest plus shared raw
+chunks. The server materializes deterministic compressed egress derivatives
+on demand.
 
-Narjar is a filesystem-only HTTP binary cache with two canonical
-storage backends: flat files and shared content-defined chunks. The flat
-backend is supported on Linux and Apple Silicon macOS; chunked storage is
-Linux-only. The
-server does not expose a native /nix/store, invoke Nix, own a secret signing key,
-or perform online or background garbage collection. It supports optional
-background cache-population sampling for metrics. It can normalize uploaded NAR
-representations to canonical raw storage and materialize deterministic
-compressed egress derivatives on demand. It provides a bounded,
-operator-invoked offline retention pass. It accepts
-Nix's raw `.nar`, precompressed `.nar.zst`, and `.nar.xz` forms as upload
-transports. A selected backend stores either one canonical raw `.nar` or one
-ordered manifest plus shared raw chunks, together with any requested
-server-generated egress derivatives.
+Filesystem metadata, identity receipts, and publication recovery records are
+the server's persistent state. It has no database or private signing key and
+does not expose a native /nix/store or invoke Nix. Retention is an
+operator-invoked offline pass; there is no online or background GC. Optional
+background cache-population sampling supplies metrics.
 
-The server uses filesystem metadata without a database or private signing key.
-Chunked storage includes manifests and sharded chunks; compressed egress and
-publication recovery records are part of the implemented storage contract.
-The push client reads the producer's local Nix SQLite database and can check
-trusted upstream metadata before uploading. It does not populate the server
-from an upstream cache.
+The push client reads the producer's local Nix SQLite database and checks
+configured trusted upstream metadata before uploading. It does not populate
+the server from an upstream cache.
 
 ## System boundary
 
 ~~~text
-producer with Nix and signing key
+producer with local Nix store and signing key
   |
   | compression=none, zstd, or xz, Basic/netrc write token
   v
@@ -53,34 +46,26 @@ TLS reverse proxy -> Narjar -> immutable files
 Narjar knows Nix binary-cache metadata and NAR hashes. It does not know how to
 build, realise, register, mount, or garbage-collect a native Nix store.
 
-The required DATA filesystem capabilities and rejected filesystem integrations
-are recorded in the [portable filesystem capability ADR](filesystem-capability-adr.md).
+Required DATA filesystem capabilities and support boundaries are in the
+[filesystem requirements](filesystem-capability-adr.md).
 
-## Chosen trust model: client-signed ingestion
+## Client-signed ingestion
 
 A producer must sign the store path before upload. Narjar accepts configured
 trusted public keys and verifies at least one accepted signature over the
 canonical Nix store-path fingerprint before publishing narinfo.
 
-Consequences:
-
 - A write token authorizes transport and storage, not signing.
 - A compromised writer without a trusted signing key can consume bounded
   temporary/disk capacity but cannot publish a consumer-trusted path.
 - A compromised trusted producer can publish arbitrary content under the
-  authority of its key. That is inherent in Nix's trust model and must be
-  handled by key revocation plus object quarantine/deletion.
+  authority of its key. Revoke the key and quarantine or delete affected objects.
 - The cache server never stores a secret signing key and has no signing-key
   rotation command.
 - Client key rotation uses overlap: consumers and Narjar trust old plus new
   public keys; producers switch to the new private key; cached old narinfos
   remain valid until the old key is removed after the positive
   cache window and operational verification.
-
-Server-signed ingestion is rejected for v0.1 because it makes every write token
-equivalent to cache-signing authority and requires secret-key custody,
-canonical metadata regeneration, and rotation machinery. bincache already
-implements that model.
 
 ## Authorization
 
@@ -91,23 +76,20 @@ Two deployment modes are supported:
 | public-read/private-write | unauthenticated | Basic/netrc token required |
 | private-read/private-write | Basic/netrc read or write token | write token required |
 
-Bearer auth is a future-compatible optional parser, not a v0.1 requirement.
 TLS terminates at a reverse proxy. Direct Narjar HTTP must bind loopback or a
 trusted private network.
 
 Tokens are random high-entropy values generated by the CLI. Configuration
 stores only cryptographic token hashes. Comparisons cover fixed-size hashes and
-are constant-time. Logs include authorization outcome and token identifier,
-never Authorization, token bytes, netrc content, or argv secrets. CLI defaults
-read tokens from stdin or a mode-0600 file; accepting a secret directly in argv
-is an explicit unsafe override, if offered at all.
+are constant-time. Store credentials in private files; see
+[operations](operations.md#cli) for token creation and netrc requirements.
 
 A read token cannot PUT. A write token may read so native Nix existence probes
 work without a second credential.
 
 ## Filesystem is the source of truth
 
-Exact v0.1 layout:
+DATA layout:
 
 ~~~text
 DATA/
@@ -165,7 +147,7 @@ unbounded scans.
 `narjar init --storage-backend flat|chunked` selects the canonical layout for a
 new DATA root; `flat` remains the default. Chunked storage is supported only on
 Linux and is rejected on macOS before initialization. The choice is recorded in the
-small `.narjar-layout` descriptor and is immutable for that root. A chunked
+`.narjar-layout` descriptor and is immutable for that root. A chunked
 descriptor also records `profile=mincdc-hash4-v2`; this profile identifier is
 part of the storage format, not an advisory tuning value. Startup and offline
 commands reject a missing descriptor on a populated root or a descriptor that
@@ -173,34 +155,21 @@ disagrees with the requested backend or supported profile. There is no
 migration, legacy-layout fallback, mixed per-object selection, or automatic
 conversion.
 
-Backend-name parsing is platform-independent. Preparing a storage operation
-converts the selected `StorageBackend` into `SupportedStorageBackend`;
-unsupported selections fail before directory creation or modification.
-`CacheCreation::prepare` binds that capability to an exclusively locked root.
-Its consuming `create_or_complete` operation creates the selected payload
-layout and completes interrupted initialization. Flat creation does not create
-chunk or manifest directories. The layout descriptor is staged, synced, and
-installed with a no-replace hard link; an interrupted descriptor draft is
-removed when initialization resumes.
+Unsupported backends fail before directory creation or modification.
+Initialization holds the exclusive root lock and creates only the selected
+payload layout. The layout descriptor is staged, synced, and installed with a
+no-replace hard link; resumed initialization removes an interrupted draft.
 
-`Storage::open` requires the existing descriptor, directories, private lock
+Opening storage requires the existing descriptor, directories, private lock
 file, and recovery marker. It does not create missing entries or change their
-permissions. Serving and maintenance load authorization and trusted keys
-through `CachePolicies`, which requires the complete private policy layout.
-Storage recovery remains a separate operation.
+permissions. Serving and maintenance require the complete private policy layout
+for authorization and trusted keys.
 
-The chunk store owns its supported publication barrier. Chunk completion
-consumes the receiving writer, verifies the measured NAR identity and record
-coverage, makes newly published chunks durable, then publishes the manifest.
-Only the durable state exposes manifest publication. Reusing chunks skips the
-filesystem barrier only when a verified completed manifest proves their prior
-durability. Identical chunks left by an interrupted or failed upload still
-require synchronization.
-
-Serve configuration stores backend and output selection in the prepared cache
-source. The native-store source has fixed raw output and flat storage; those
-choices cannot contradict its source selection. Serve and doctor use the same
-source-preparation rules.
+Chunk publication verifies the measured NAR identity and record coverage, makes
+newly published chunks durable, then publishes the manifest. Reusing chunks
+skips the filesystem barrier only when a verified completed manifest proves
+their prior durability. Identical chunks left by an interrupted or failed
+upload still require synchronization.
 
 The flat backend stores the complete decoded NAR at `nar/<NarHash>.nar`.
 The Linux chunked backend stores the exact decoded byte stream as immutable
@@ -278,8 +247,7 @@ describe the streamed decoded NAR. Canonical storage retains the decoded byte
 stream; published narinfo transport fields describe the server-selected served
 representation. Narjar does not parse NAR semantics or framing. The trusted
 producer signature authorizes the raw hash and size, and consumer Nix verifies
-and parses the NAR while importing. A second parser would add attack surface
-without adding authenticity.
+and parses the NAR while importing.
 
 Compressed uploads are decoded while validating and are normalized to the
 selected canonical backend. When compressed output is selected, Narjar
@@ -320,15 +288,13 @@ and flat canonical-object acquisition share a per-destination commit lock.
 Binding cannot accept a visible link while its publisher can still roll it
 back. Identical retries complete the directory barrier before acknowledging
 success; chunked binding likewise completes the manifest-directory barrier.
-Queue depth and queue-wait summaries remain exposed in metrics. Startup recovery checks trusted
-published narinfo references for available payloads before removing
+Queue depth and queue-wait summaries are exposed in metrics. Startup recovery
+checks trusted published narinfo references for available payloads before removing
 transaction-recorded temporary files and rewriting the clean marker. Flat
 payloads are checked by file type and size; chunked payloads are checked by
 manifest and chunk type and size. Startup does not read payload contents or
 scan orphans. It stops at the first invalid published pair and logs progress
 and elapsed time. Full content verification remains an explicit operator task.
-The earlier serialized design and its measurement
-remain historical context in [`publication-lock-adr.md`](publication-lock-adr.md).
 
 ## Publication and crash semantics
 
@@ -368,7 +334,7 @@ X-Content-Type-Options: nosniff. Missing valid names return 404. Invalid route
 syntax returns 400. HEAD returns the status and headers of a full GET without a
 body and ignores Range.
 
-NAR GET requests support one RFC byte range in v0.1: valid satisfiable ranges return
+NAR GET requests support one RFC byte range: valid satisfiable ranges return
 206 with Content-Range and Accept-Ranges: bytes; unsatisfiable ranges return
 416 with Content-Range: bytes */<length>. Multiple ranges are rejected. Files
 are opened before delivery; maintenance cannot delete them while serving owns
@@ -380,7 +346,7 @@ mode. Authenticated/private responses are private/no-store unless deployment
 policy proves otherwise. A newly published path may remain hidden by Nix's
 negative cache until --refresh; the server cannot invalidate client caches.
 
-## Explicit non-goals
+## Unsupported features
 
 - Native /nix/store serving or a server-side Nix installation.
 - gzip, semantic-tree storage, or server recompression outside the existing
@@ -410,7 +376,6 @@ or filesystem-specific power-loss durability. Darwin package tests cover flat
 storage; they do not establish APFS crash durability. See the
 [filesystem support boundary](filesystem-capability-adr.md#support-boundary).
 
-Retained benchmark reports describe their measured workloads and hosts. They
-do not establish general performance or physical-space guarantees and are not
-release requirements. Current release checks are listed in the
-[release procedure](release.md#validate-the-candidate).
+Benchmark reports describe specific workloads and hosts, not general performance
+or physical-space guarantees. Current release checks are in the
+[release procedure](release.md).

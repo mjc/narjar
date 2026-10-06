@@ -1,21 +1,14 @@
-# Semantic object and root descriptor proposal
+# Experimental semantic object format
 
-The NARJ-80 contract proposal defines identity and recovery data
-for a future semantic store; it does not select a production file layout or
-Git packing format. Nix's `NarHash` and `NarSize` remain authoritative for the
-served archive.
+This format is used by the semantic descriptor vectors, not by Narjar's
+production storage. It describes semantic object identities and a root
+descriptor. The complete NAR retains its own `NarHash` and `NarSize`.
 
 ## Hash choice
 
-Use SHA-256 with explicit domain separation for internal semantic objects:
-
-| Candidate | Decision | Reason |
-| --- | --- | --- |
-| Raw SHA-256(payload) | Reject | A blob, symlink, and tree could share an undistinguished byte preimage. |
-| Domain-separated SHA-256 | Baseline | One small, already-supported algorithm with distinct object kinds and versions. |
-| Git SHA-1/SHA-256 | Reject for identity | Git compatibility does not provide NAR serialization or root-file/symlink semantics, and would import Git's object-format ABI. |
-| BLAKE3 | Defer | No measured advantage justifies a second durable algorithm yet. |
-| Reusing `NarHash` | Reject for internal objects | It identifies the authoritative complete NAR, not a semantic child object, and makes derived representation identity protocol-visible. |
+Internal objects use SHA-256 with domain separation for object kind and format
+version. Their hashes are distinct from Git object hashes and the complete
+NAR's `NarHash`.
 
 Every multi-byte integer below is unsigned little-endian. Every byte string is
 length-delimited by its u64 byte length. Names and symlink targets are raw
@@ -47,8 +40,7 @@ The remaining fields are:
   name order: `u64(name_length) || name || u8(child_kind) || child_oid`;
 - `child_oid` is exactly 32 bytes and is itself domain-separated.
 
-The tree name rules are inherited from the frozen NAR model: empty, `.`, `..`,
-NUL-containing, and slash-containing names are invalid. Duplicate or
+Tree names cannot be empty, `.`, `..`, or contain NUL or `/`. Duplicate or
 non-ascending names fail closed. A child kind is repeated in the tree entry so
 decoders do not need to infer mode from an OID or storage record. A tree's
 canonical order is the NAR byte-name order, not Git's virtual-slash comparator.
@@ -107,10 +99,9 @@ or descriptor checksum except for its declared version.
 | Mixed object/descriptor versions | Reject unless an explicit compatibility rule names both versions |
 | Crash during object or descriptor creation | Temporary data is invisible; startup/reconcile scans and removes/quarantines it |
 
-The durable publication gate is reconstruct, hash, and size-verify the complete
-NAR before exposing the descriptor to readers or publishing narinfo. This keeps
-the internal DAG as a rebuildable implementation detail while preserving the
-current Nix trust contract.
+Any use of this format for publication would need to reconstruct the complete
+NAR and verify its hash and size before publishing metadata. The vector tests
+do not implement that storage path.
 
 Golden preimage and checksum vectors are in
 [`docs/evidence/semantic-descriptor-vectors.txt`](evidence/semantic-descriptor-vectors.txt)

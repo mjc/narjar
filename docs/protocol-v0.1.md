@@ -1,8 +1,8 @@
-# Narjar v0.1 protocol contract
+# HTTP binary-cache protocol
 
-Status: current HTTP contract. Historical Nix 2.31.5 and 2.35.2 captures
-are retained under [protocol evidence](evidence/nix-http-protocol.md).
-The locked real-Nix app and repository tests check the implemented behavior.
+This is the implemented v0.1 HTTP interface. See
+[protocol captures](evidence/nix-http-protocol.md) for Nix 2.31.5 and 2.35.2
+and [tests/nix-e2e.sh](../tests/nix-e2e.sh) for the locked real-Nix checks.
 
 ## Compatibility target
 
@@ -19,7 +19,7 @@ The locked real-Nix app and repository tests check the implemented behavior.
 | TLS | Required in deployment; terminated before Narjar |
 | Server-emitted redirects | Non-goal |
 | Client following HTTP 307 | Captured compatibility fact |
-| Proxy request buffering | Must be disabled; deployment configuration, outside the loopback CI gate |
+| Proxy request buffering | Must be disabled; configure the deployment proxy |
 | Persistent connections | Optional optimization |
 | Connection close between requests | Required to work |
 | Negative-cache refresh | Required operator behavior; captured |
@@ -105,8 +105,8 @@ Error classes:
 | 507 | destination filesystem has insufficient space |
 
 Errors generally have empty bodies; diagnostic endpoints use bounded plain
-text. There is no request-identifier or structured-error-body contract. HTTP
-responses do not expose credentials or filesystem paths. Retry classification belongs to the Nix client;
+text. There are no request identifiers or structured error bodies. HTTP
+responses do not expose credentials or filesystem paths. The Nix client classifies retries;
 [recorded source evidence](evidence/nix-http-protocol.md#retries-and-interrupted-transfers)
 describes it. Idempotency makes retried PUT safe.
 
@@ -156,10 +156,8 @@ Accepted metadata must:
 - Verify the canonical Nix store-path fingerprint and preserve its signed
   logical claims and accepted signatures when projecting transport fields.
 
-Deriver and CA are accepted only with Nix-compatible field grammar; they never
-substitute for the required trusted signature. Other field names are rejected
-in v0.1. This matches the current Nix parser's semantic fields
-without making unsigned future extensions part of Narjar's trust boundary.
+Deriver and CA require Nix-compatible field grammar; neither replaces the
+trusted signature. Other field names are rejected in v0.1.
 
 ## Caching
 
@@ -207,7 +205,6 @@ offline GC with a protected closure. It records the Nix version and commands.
 Repository Rust tests cover route, header, authentication, size, hash,
 signature, and range edge cases. The static ELF and closure checks establish
 packaging properties separately; the end-to-end app uses the normal package.
-Historical captures are evidence for their recorded versions, not a separate
-multi-version release matrix. TLS proxy configuration and filesystem
-power-loss behavior require deployment-specific validation beyond these CI
-checks. See the [release procedure](release.md#validate-the-candidate).
+Historical captures cover only their recorded versions. TLS proxy behavior
+and filesystem power-loss durability require deployment testing. See the
+[release procedure](release.md#validate-the-candidate).

@@ -1,15 +1,14 @@
 # Nix HTTP binary-cache protocol evidence
 
-Status: NARJ-2 evidence snapshot. Captured behavior, source-derived behavior,
-and remaining acceptance gaps are recorded separately.
+Recorded Nix 2.31.5 and 2.35.2 behavior. Source-derived details are linked
+separately from the wire captures.
 
 ## Capture boundary
 
-The canonical capture ran Nix 2.31.5 with curl 8.20.0 on aarch64-darwin against
+The first capture ran Nix 2.31.5 with curl 8.20.0 on aarch64-darwin against
 a real loopback TCP connection to nginx at 127.0.0.1:18080. The comparison
 capture ran Nix 2.35.2 with curl 8.21.0. There was no DNS lookup and no TLS
-terminator. Those are deployment concerns, not evidence supplied by these
-traces.
+terminator. The traces do not test deployment DNS or TLS.
 
 The nginx fixture is [nix-http-trace-nginx.conf](./nix-http-trace-nginx.conf).
 Trace columns are, in order:
@@ -82,8 +81,7 @@ either PUT.
 
 A stock nix copy --from readback succeeded. The ordinary read path probed
 narinfo and then issued GET /nar/<file-hash>.nar; it did not send Range.
-Range/resume support is therefore not required for a normal read, but
-interrupted-transfer behavior remains a separate acceptance test.
+This ordinary read did not exercise interruption or resumption.
 
 Nix treats narinfo existence as path validity:
 [binary-cache-store.cc lines 361-366](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/binary-cache-store.cc#L361-L366).
@@ -92,8 +90,8 @@ Realisation metadata, when used, is a separate JSON object at
 registration to that namespace:
 [binary-cache-store.cc lines 470-497](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/binary-cache-store.cc#L470-L497).
 No realisation request occurred for the tested source-path/content-addressed
-fixtures. v0.1 reserves the route and returns 404/405; support remains an
-explicit non-goal until a real CA-derivation trace requires it.
+fixtures. Narjar v0.1 reserves the route and returns 404/405; realisations
+are unsupported.
 
 ## Authentication and redirects
 
@@ -103,18 +101,15 @@ credential supplied by libcurl; the server must authorize each request and
 must never assume one authenticated connection covers later requests.
 
 Nix 2.35.2 followed HTTP 307 redirects for all methods, preserving PUT bodies
-and content lengths for nix-cache-info, the NAR, and narinfo. This proves 307
-behavior for the current client tested here; it does not authorize a server to
-emit redirects unless the destination is equally trusted.
+and content lengths for nix-cache-info, the NAR, and narinfo. This result
+applies to the recorded client version.
 
 ## Negative caching and refresh
 
 For Nix 2.35.2, a missing narinfo was cached. After the same object was
 published out-of-band, a normal nix path-info still failed without making the
 object visible. nix path-info --refresh re-fetched narinfo and succeeded.
-Servers must therefore make publication atomic at narinfo and operators must
-understand that a prior 404 may remain client-visible until refresh or cache
-expiry.
+A prior 404 can remain visible to the client until refresh or cache expiry.
 
 The default negative narinfo TTL is 3600 seconds and applies to the local disk
 cache; zero forces refresh. The in-process path-info cache uses the same
@@ -147,15 +142,13 @@ later full-body retry idempotently:
 - Existing identical objects are idempotent success. Conflicting attempts must
   not overwrite published content.
 - GET and HEAD share metadata and status behavior; HEAD sends no body.
-- TLS is expected at a reverse proxy for v0.1; Narjar itself has no evidence
-  basis for owning TLS.
+- TLS terminates at a reverse proxy; Narjar serves plain HTTP.
 
 ## Explicit evidence boundaries
 
 - Nix client HTTP behavior is captured on real Darwin sockets for Nix 2.31.5
-  and 2.35.2. This is protocol evidence, not evidence that the Narjar server
-  builds or runs on macOS; the separate native package/test lane provides that
-  server-side evidence for flat storage, not chunked durability.
+  and 2.35.2. Narjar's separate Apple Silicon CI builds and tests flat storage;
+  these traces do not test its macOS server or chunked durability.
 - TLS verification and CA selection are libcurl/Nix client responsibilities;
   Narjar terminates plain HTTP behind a trusted proxy. The production proxy
   buffering and timeout configuration must be validated for each deployment;

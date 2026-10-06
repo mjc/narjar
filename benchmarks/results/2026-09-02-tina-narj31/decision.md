@@ -13,11 +13,11 @@ The matched run used Narjar commit `c4aa453bd83452946dac9d9d28d3407bdaf5c415` an
 | 1,000 | 4.135 / 5.179 / 3.617 / 5.179 ms | 50.175 / 64.721 ms | 34.077 / 52.315 ms |
 | 10,000 | 2.918 / 5.622 / 2.733 / 5.622 ms | 478.590 / 522.193 ms | 42.985 / 108.460 ms |
 
-The 10,000-path median fell by 99.4% from the pre-change run. This guards against pathological startup on Tina’s x86-64 Linux system; it does not establish cross-architecture performance.
+The 10,000-path median fell by 99.4% from the pre-change run on Tina’s x86-64 Linux system. This does not establish cross-architecture performance.
 
 ## Correctness and recovery
 
-The branch-added characterization test distinguishes a clean cache from one interrupted after temporary NAR creation. Clean startup skips the inventory scan; an interrupted publication leaves a durable recovery marker, causes the next startup to reconcile, and clears the marker only after recovery completes. The clean marker is bound to the trusted-key file digest, so trust-key rotation still forces reconciliation.
+The characterization test distinguishes a clean cache from one interrupted after temporary NAR creation. Clean startup skips the inventory scan; an interrupted publication leaves a durable recovery marker, causes the next startup to reconcile, and clears the marker only after recovery completes. The clean marker is bound to the trusted-key file digest, so trust-key rotation still forces reconciliation.
 
 The benchmark confirmed 200 responses for GET and HEAD, 206 for ranges, 404 for missing paths, successful substitution with the correct key, rejection with the wrong key, invisible interrupted uploads before and after restart, and a live service plus 404 visibility after ENOSPC failure. Settled Narjar RSS remained about 2.5 MiB at 10,000 paths versus 13.7 MiB for bincache.
 

@@ -1,7 +1,7 @@
 # Pure-Rust zstd decoder comparison
 
-This compares the three pure-Rust streaming decoders under consideration for
-NARJ-107. It uses the same decoder loop and the same compressed NAR inputs for
+This compares three pure-Rust streaming decoders for NARJ-107.
+It uses the same decoder loop and the same compressed NAR inputs for
 each candidate. Input loading is outside the timed region; the sink counts
 decoded bytes, so destination filesystem latency is not part of this codec
 comparison.
@@ -41,8 +41,8 @@ absolute capacity claim. All candidates ran sequentially, were pinned to CPU
   against the small uncompressed source before timing. The medium and large
   timing runs checked the expected decoded byte count on every iteration.
 
-This does not benchmark encoding or the eventual egress path. Narjar already
-uses `structured-zstd` 0.0.52 with the measured SIMD feature set, so this
-result does not authorize a dependency switch or an MSRV change. The remaining
-work is the full compatibility and project gates plus clean, repeated policy
+This does not benchmark encoding or egress. Narjar used `structured-zstd`
+0.0.52 with the measured SIMD feature set at the time of this comparison;
+this result does not authorize a dependency switch or an MSRV change.
+The results do not establish full compatibility or clean, repeated policy
 measurements on the real corpus.

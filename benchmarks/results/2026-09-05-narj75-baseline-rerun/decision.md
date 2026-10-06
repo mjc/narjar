@@ -6,11 +6,10 @@
 > `../2026-09-05-narj75-baseline-corrected/` instead. The measurements below
 > are retained only as historical raw evidence.
 
-This is the current flat-cache baseline required before semantic-storage
-candidate comparisons. It is not a semantic candidate result and does not
-claim the 25% physical-byte savings gate; the matched raw-NAR transparent
-filesystem-compression baseline remains the later comparison defined by the
-frozen constitution.
+This historical flat-cache run is not a semantic candidate result or evidence
+for the 25% physical-byte savings gate. The frozen constitution required a
+matched raw-NAR transparent-filesystem-compression baseline for candidate
+comparisons.
 
 The run used Narjar commit `655b9cd1ffba40de97ed22fb28319ac14e7d3baa`, pinned
 bincache commit `556a9c8f97a3c994a9de85f567a2ef16ce6513ab`, Tina's AMD Ryzen 9
@@ -26,7 +25,7 @@ and command-log phases. `samples.jsonl` contains 1,036 raw samples and
 returned 200 for GET/HEAD, 206 for Range, 404 for missing/interrupted objects;
 both services survived ENOSPC and rejected the wrong signing key.
 
-Selected current flat-baseline medians:
+Selected flat-baseline medians:
 
 | Case | Narjar | Bincache |
 | --- | ---: | ---: |

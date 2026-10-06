@@ -1,7 +1,7 @@
 # NAR chunking experiment
 
-The isolated NARJ-83 measurement tool does not change Narjar's
-storage layout or HTTP protocol.
+This standalone program measures NAR chunk reuse. Its storage format is
+separate from Narjar's production backend.
 
 The semantic measurement uses a small NAR scanner kept in this package to
 find regular-file content ranges. It rejects malformed framing and limits
@@ -13,7 +13,7 @@ Run it against the frozen corpus with:
 
 ```console
 cargo run --release -p narjar-nar-chunking -- \
-  --corpus /home/mjc/narjar-corpora/narjar-real-nix-v1
+  --corpus /path/to/nars
 ```
 
 Materialize a bounded raw-store sample and verify full plus 90%-resume
@@ -21,7 +21,7 @@ ranges with:
 
 ```console
 cargo run --release -p narjar-nar-chunking -- \
-  --corpus /home/mjc/narjar-corpora/narjar-real-nix-v1 \
+  --corpus /path/to/nars \
   --max-files 100 \
   --store-root /tmp/narj83-store-sample \
   --store-algorithm hash4
@@ -41,7 +41,7 @@ Run the fixed raw-Hash4 parameter sweep with:
 
 ```console
 cargo run --release -p narjar-nar-chunking -- \
-  --corpus /home/mjc/narjar-corpora/narjar-real-nix-v1 \
+  --corpus /path/to/nars \
   --raw-sweep
 ```
 
@@ -51,8 +51,8 @@ not an open-ended parameter search.
 The command walks `.nar` files in sorted path order and prints one stable
 `key=value` record for each control:
 
-- `raw-mincdc-hash4`: the recommended robust MinCDC implementation;
-- `raw-mincdc4`: the faster academic MinCDC implementation;
+- `raw-mincdc-hash4`: `MinCdcHash4` chunking;
+- `raw-mincdc4`: `MinCdc4` chunking;
 - `hybrid-small-65536`: whole-file CAS for NARs up to 64 KiB, raw
   MinCdcHash4 for larger NARs;
 - `fixed-BYTES`: fixed-size chunks, defaulting to 8 KiB;

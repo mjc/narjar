@@ -1,9 +1,7 @@
 //! Bounded, streaming reader for the Nix Archive (NAR) format.
 //!
-//! This is deliberately a decoder only. It exposes NAR structure to research
-//! tools while hashing and counting the original byte stream independently of
-//! the semantic events. Input is read incrementally; file bodies are delivered
-//! as borrowed chunks and are never retained by the decoder.
+//! The decoder emits structural events while hashing and counting the original
+//! byte stream. File bodies are delivered as borrowed chunks and are not retained.
 
 use std::{io, io::Read};
 

@@ -4,7 +4,7 @@ Measurement commit: `eb3adc0d22d8267324db614edf927d03f17750fe`.
 
 ## Scope
 
-Four protocol-neutral probes were compared with the current Narjar graph:
+Four protocol-neutral probes were compared with the measured Narjar graph:
 
 - `loose`: `gix-hash`, `gix-object`, `gix-odb`, and `tempfile`; loose-object write/read.
 - `packed-read`: the loose probe plus the `gix-pack` index-read API.
@@ -15,7 +15,7 @@ The high-level probe disables facade default features. The available index could
 
 ## Results
 
-All sizes are bytes unless noted. Candidate binaries are one-binary probes; the Narjar package contains five binaries, so package-level comparisons are directional rather than functionality-equivalent.
+All sizes are bytes unless noted. Candidate binaries are one-binary probes; the measured Narjar package contains five binaries, so the package-level comparisons cover different functionality.
 
 | graph | resolved packages | static binary | clean build s | warm build s | max RSS native 1/32 readers KiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -29,10 +29,10 @@ The full machine-readable tables are next to this report. Static-musl builds suc
 
 Every candidate passed `cargo check --locked` under Rust 1.85.1 on Linux and for the `x86_64-apple-darwin` target. The build-time figures were collected sequentially on the measurement host with its configured compiler cache; they are comparative observations for this run, not clean-machine forecasts.
 
-The loose candidate is the smallest gix graph tested, but still resolves 96 packages versus the current graph's 47. Adding packed reads did not enlarge the resolved graph in this feature configuration and added about 10 KiB to the static binary. Pack writing added about 420 KiB over loose. The high-level facade added about 1.15 MiB over loose, 50 more resolved packages, and the highest lexical unsafe-token inventory.
+The loose candidate is the smallest gix graph tested, but resolves 96 packages versus the measured Narjar graph's 47. Adding packed reads did not enlarge the resolved graph in this feature configuration and added about 10 KiB to the static binary. Pack writing added about 420 KiB over loose. The high-level facade added about 1.15 MiB over loose, 50 more resolved packages, and the highest lexical unsafe-token inventory.
 
 The RSS figures are probe RSS, not full Narjar service RSS. They are useful for graph comparison only; they do not establish production service memory behavior.
 
 ## Recommendation
 
-Do not replace Narjar's current storage implementation with gix based on this evidence. Retain only the loose graph for a future prototype. It increases dependency breadth and was not tested against Narjar's publication, validation, locking, or HTTP contracts, so it is not recommended for production. Reject the high-level facade and pack-writing graph for the current cost envelope.
+The evidence did not support replacing Narjar's storage with gix. Only the loose graph was recommended for prototyping; it increases dependency breadth and was not tested against Narjar's publication, validation, locking, or HTTP contracts. It was not recommended for production. The high-level facade and pack-writing graph were rejected for the measured cost envelope.

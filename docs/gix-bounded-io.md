@@ -1,6 +1,6 @@
 # Gitoxide bounded semantic-object I/O probe
 
-NARJ-93 tests the exact graph audited by NARJ-86:
+The probe used the graph in the [Gitoxide audit](gix-audit.md):
 `gix-odb 0.84.0`, `gix-pack 0.74.2`, `gix-object 0.64.1`, `gix-hash 0.26.2`,
 and `gix-features 0.49.1`. The disposable Rust probe is kept outside the
 repository at `/tmp/narjar-gix-probe`; it uses `gix_odb::loose::Store`
@@ -50,7 +50,7 @@ The 32-reader result is consistent with each `try_find` owning a complete
 8 MiB output buffer. It is not an O(1)-with-payload read path: the result is
 about 256 MiB before allocator/page-accounting differences. The write path is
 bounded for the generated 1 GiB stream, but that does not make whole-file
-reads viable. NARJ-75's frozen per-operation working-set budget is 16 MiB;
+reads bounded. The experiment's per-operation working-set budget was 16 MiB;
 an 8 MiB object is below that individual limit, but a whole-file object can
 exceed it as soon as the object size crosses the budget.
 
@@ -66,17 +66,13 @@ exceed it as soon as the object size crosses the budget.
   operations. The 32-reader 8 MiB HWM is the retained concurrency measurement.
 - SHA-1 and SHA-256 feature combinations compile in the same probe graph.
 
-## Decision
+## Result
 
-Whole-file gix objects are rejected from Narjar's hot read path. A future gix
-prototype would need bounded chunks, an explicit EOF/length wrapper, a strict
-process concurrency budget, caller-side expected-OID validation, and separate
-tests for packed/delta objects. The current evidence does not justify adding
-gix to Narjar or treating its per-object allocation limit as a process-wide
-memory limit. Bounded chunks remain a separately authorized prototype, not an
-accepted configuration.
+Gitoxide is not used by Narjar. Its loose-object reads allocate the complete
+output, and its per-object allocation limit does not bound process memory.
+The write API also leaves bytes beyond the declared length unread.
 
 Raw probe outputs and the exact commands are summarized in
-[`docs/evidence/gix-bounded-io.tsv`](evidence/gix-bounded-io.tsv). The existing
+[`docs/evidence/gix-bounded-io.tsv`](evidence/gix-bounded-io.tsv).
 [`docs/gix-audit.md`](gix-audit.md) records the broader API and durability
 decision.

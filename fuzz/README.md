@@ -1,7 +1,7 @@
-# NAR decoder fuzz target
+# Fuzz targets
 
-The separate fuzz crate exercises the research decoder
-without adding fuzzing dependencies to the Narjar production package.
+This separate crate tests the NAR codecs, HTTP parsing, authentication,
+metadata, and compressed uploads. It is excluded from the production package.
 
 Enter `devenv shell`; it provides `cargo-fuzz` and the pinned nightly compiler
 path in `NARJAR_FUZZ_RUSTC`. Then run:

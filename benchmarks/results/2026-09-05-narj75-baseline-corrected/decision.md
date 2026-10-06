@@ -1,10 +1,9 @@
 # NARJ-75 corrected flat baseline
 
-This is the current flat-cache control required before semantic-storage
-candidate comparisons. It is not a semantic candidate result and does not
-claim the 25% physical-byte savings gate. Candidate decisions still require
-the six-category corpus and the matched raw-NAR transparent-filesystem-
-compression baseline frozen by constitution version 4.
+This run is a historical flat-cache control, not a semantic candidate result
+or evidence for the 25% physical-byte savings gate. Constitution version 4
+required the six-category corpus and a matched raw-NAR
+transparent-filesystem-compression baseline for candidate comparisons.
 
 The run used Narjar commit `26577b3e8d7e996407d071acaf456cb0d0c1a401`,
 pinned bincache commit `556a9c8f97a3c994a9de85f567a2ef16ce6513ab`, Tina's
@@ -29,7 +28,7 @@ objects. Both services survived ENOSPC without publishing the failed object,
 restarted with it still absent, rejected an unrelated signing key, and
 substituted with the configured key.
 
-Selected current flat-control medians (Bincache is unmatched as noted above):
+Selected flat-control medians (Bincache is unmatched as noted above):
 
 | Case | Narjar | Bincache |
 | --- | ---: | ---: |

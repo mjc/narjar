@@ -34,12 +34,12 @@ The root NAR was 1,090,707,416 bytes. The raw result file records these values;
 
 ## Evidence boundary
 
-These are single-run pilots, not the final policy benchmark. The recorded
+These are single-run pilots. The recorded
 binary source revision, filesystem identity, producer CPU/RSS, warmups, and
 repeated distributions are missing. The large run predates the later zstd
 implementation migration, so it is historical compatibility evidence rather
-than a current decoder comparison. Retry, interruption, corruption, and the
-full multi-corpus matrix remain open on NARJ-107.
+than a current decoder comparison. The evidence does not establish retry,
+interruption, corruption, or full multi-corpus coverage.
 
 `commands.log`, `run.log`, per-lane logs, narinfo responses, range headers, and
 the machine-readable result files are retained under `pilot/` and `large/`.

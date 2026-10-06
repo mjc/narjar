@@ -1,13 +1,12 @@
 # Real-Nix corpus
 
-`nix-corpus` is the single collection and validation command for
-the real-Nix corpus. It exports uncompressed NAR streams and records both the
+`scripts/nix-corpus` collects and validates a real-Nix corpus. It exports
+uncompressed NAR streams and records both the
 Nix `narHash`/`narSize` and a SHA-256 of the exact exported bytes.
 It is a self-contained Bash script: `devenv shell` provides its only
 non-core utility, `jq`; it has no Python, Cargo, or Rust-crate dependency.
-The harness prints every Nix and `nix-store` operation to stderr. Pass `--log
-FILE` to also persist the exact shell-escaped build, closure, and byte-export
-commands without relying on manual stderr redirection.
+The script prints every Nix and `nix-store` command to stderr. `--log FILE`
+also records the shell-escaped commands in a file.
 
 Start from `benchmarks/corpus-spec.example.json`, replace the pinned commits,
 flake attributes, and (when already materialized) generation roots, and add one
@@ -57,9 +56,8 @@ scripts/nix-corpus validate \
   --schema-only
 ```
 
-The generated manifest is kept outside the repository; a
-schema-only pass without `--spec` is not evidence that it matches the current
-candidate.
+Keep generated manifests outside the repository. Without `--spec`, a
+schema-only check does not compare the manifest with the intended corpus.
 
 When present, the manifest's `targets` list must contain collected target
 records with an id, generation, pinned nixpkgs revision, flake reference,
@@ -76,8 +74,7 @@ do not need to remain in the local store.
 
 Keep the spec in version control; keep generated manifests, large NAR exports,
 and regeneration roots outside the repository. The manifest's `requirements` block
-is enforced during validation so a partial local store cannot
-silently become the full corpus. When present, `min_generations` and
+is enforced during validation. When present, `min_generations` and
 `min_nixpkgs_revisions` must be finite nonnegative integers, and
 `required_families` must be a non-empty array of non-empty strings; malformed
 or null requirement values fail schema validation.

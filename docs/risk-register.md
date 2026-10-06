@@ -1,17 +1,14 @@
-# Operational risks and verification boundaries
+# Operational limits
 
-This register describes the implemented filesystem cache. Current release
-checks are in the [release procedure](release.md#validate-the-candidate);
-historical design proposals and benchmark thresholds are not release gates.
+Release checks are listed in the [release procedure](release.md#validate-the-candidate).
 
 ## Transport compatibility and authentication
 
-Nix probe counts, ordering, retries, and negative caching can change between
-client versions. The server validates each request independently, publishes
-NAR data before narinfo, and handles identical retries without replacing
-immutable content. Linux CI runs the locked real-Nix app for both flat and
-chunked storage; [historical protocol captures](evidence/nix-http-protocol.md)
-describe their recorded clients. Neither is evidence for every Nix version.
+Nix probe ordering, retries, and negative caching vary by client version.
+Narjar validates each request, publishes NAR data before narinfo, and accepts
+identical retries without replacing immutable content. Linux CI tests the
+locked Nix version with both backends; [protocol captures](evidence/nix-http-protocol.md)
+cover their recorded versions.
 Use `--refresh` after a prior miss when immediate visibility is required.
 
 A write token grants transport access, not signing authority. Narinfo requires
@@ -31,19 +28,19 @@ not provide TLS termination for the server.
 
 ## Untrusted input and bounded resources
 
-Strict route grammars and once-only decoding prevent request paths from
-escaping DATA. Metadata validation binds the route, store path, encoded
+Routes are decoded once and checked before filesystem access. Metadata
+validation binds the route, store path, encoded
 representation, raw NAR identity, references, and producer signature before
 narinfo becomes visible. A valid signature does not prove NAR grammar;
 consumer Nix parses and verifies the imported NAR. The separate library codecs
-have their own [semantic-input threat model](nar-threat-model.md).
+have separate [limits and validation rules](nar-threat-model.md).
 
 Upload limits cover encoded bytes, decoded NAR bytes, and compressed-decoder
 memory. At most `workers` decoders run concurrently, so the configured decoder
 memory budget is `workers × maxDecoderMemoryBytes`, in addition to other
 process allocations. Bounded admission, stream timeouts, staging reservations,
-and a free-space reserve reduce resource exhaustion; they do not guarantee
-availability under hostile traffic or prevent external disk consumption.
+and a free-space reserve bound upload work. They cannot prevent hostile
+traffic or other processes from consuming resources.
 Use proxy connection/rate limits and monitor capacity and admission failures.
 
 ## Publication, corruption, and recovery
@@ -90,9 +87,7 @@ scripts are inspected at build time without import-from-derivation; module
 evaluation alone does not execute a systemd service. Native-store serving is
 disabled by the module until that HTTP path is implemented.
 
-Those checks do not prove separate-host runtime behavior without Nix or boot a
-NixOS VM. Dependency advisories are checked using the
-[advisory gate](dependency-advisories.md). Performance, RSS, physical-space
-savings, and filesystem-specific recovery claims require evidence for the
-actual workload and deployment. Archived benchmarks supply measurements for
-their recorded conditions, not general guarantees or release requirements.
+Dependency checks use the [advisory check](dependency-advisories.md).
+Performance, memory, physical storage savings, and filesystem recovery need
+measurements on the deployed workload. Archived benchmarks cover their
+recorded conditions, not general guarantees or release requirements.
