@@ -66,8 +66,11 @@ credentials through OIDC. See the
    10 MB limit. See the
    [Cargo publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html).
 6. Confirm Linux and Apple Silicon CI passed. The package requires Rust 1.98.
-   Extracted-archive installation is tested on Linux; Darwin tests use flat
-   storage. Chunked storage is Linux-only.
+   Separate runners without Nix install the extracted Cargo archive on Linux
+   and macOS, inspect its runtime linkage, and run help, version, cache
+   initialization, and stats with a minimal environment. Windows CI tests the
+   library without application dependencies; the CLI requires Unix. Darwin
+   tests use flat storage. Chunked storage is Linux-only.
 7. Run the real-Nix transfer checks:
 
    ```sh
@@ -118,6 +121,9 @@ its bytes, and tests installation of that exact version. It then publishes a
 GitHub release containing the `.crate`, static x86_64 Linux binary archive, and
 `SHA256SUMS`. The binary archive includes both license files. macOS users install
 through Cargo or Nix; no standalone macOS binary is published.
+The Linux and macOS runners without Nix then repeat installation from crates.io
+using the exact published version. Their failures fail the workflow but cannot
+undo publication; extracted-archive installation is checked before approval.
 
 ## Retry a partial release
 

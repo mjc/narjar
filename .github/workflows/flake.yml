@@ -58,3 +58,8 @@ jobs:
         run: nix build -L --no-update-lock-file .#packages.aarch64-darwin.default
       - name: Run the Darwin Narjar package tests
         run: nix build -L --no-update-lock-file .#checks.aarch64-darwin.tests
+
+  cargo-install:
+    uses: ./.github/workflows/cargo-install.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}

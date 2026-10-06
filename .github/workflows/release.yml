@@ -160,3 +160,10 @@ jobs:
           test "$(target/registry-install/bin/narjar --version)" = "narjar $RELEASE_VERSION"
       - name: Publish the GitHub release
         run: bash ci/publish-github-release.sh
+
+  install-published:
+    needs: [candidate, publish]
+    uses: ./.github/workflows/cargo-install.yml
+    with:
+      ref: ${{ needs.candidate.outputs.commit }}
+      version: ${{ needs.candidate.outputs.version }}

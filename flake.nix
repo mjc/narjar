@@ -367,9 +367,10 @@
             ''
               cp -R ${repositorySrc}/ci ${repositorySrc}/.github .
               chmod -R u+w ci .github
-              actionlint .github/workflows/flake.yml .github/workflows/release.yml
+              actionlint .github/workflows/flake.yml .github/workflows/release.yml .github/workflows/cargo-install.yml
               shellcheck ci/check-release-candidate.sh ci/check-published-crate.sh \
-                ci/publish-github-release.sh ci/test-release-candidate.sh ci/test-release-publication.sh
+                ci/publish-github-release.sh ci/test-release-candidate.sh ci/test-release-publication.sh \
+                ci/check-cargo-install-without-nix.sh
               bash ci/test-release-candidate.sh
               bash ci/test-release-publication.sh
               touch $out

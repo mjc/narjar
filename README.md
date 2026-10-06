@@ -39,6 +39,9 @@ cd narjar
 cargo install --locked --path .
 ```
 
+The CLI supports Linux and macOS. On Windows, run it under WSL; the minimal
+Rust library does not require Unix.
+
 Nix packages are available for x86_64 Linux and Apple Silicon macOS, with a
 NixOS module and a Linux OCI image. Use flat storage on macOS; chunked storage
 is Linux-only. To run with Nix:
