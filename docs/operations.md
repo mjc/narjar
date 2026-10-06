@@ -855,18 +855,28 @@ services.nginx = {
 };
 ~~~
 
-Build and load the OCI archive with any OCI-capable runtime:
+Build the OCI archive, then initialize the bind mount before serving. This
+example uses rootful Podman so UID 65532 owns the same directory inside and
+outside the container:
 
 ~~~sh
 image="$(nix build --print-out-paths .#narjar-oci)"
-podman load --input "$image"
-install -d -m 0700 -o 65532 -g 65532 /var/lib/narjar-container
-podman run --rm --read-only \
+sudo podman load --input "$image"
+sudo install -d -m 0700 -o 65532 -g 65532 /var/lib/narjar-container
+sudo podman run --rm --read-only \
+  --user 65532:65532 \
+  --volume /var/lib/narjar-container:/var/lib/narjar \
+  narjar:latest init --data-dir /var/lib/narjar
+sudo podman run --rm --read-only \
   --user 65532:65532 \
   --publish 127.0.0.1:5000:5000 \
   --volume /var/lib/narjar-container:/var/lib/narjar \
   narjar:latest
 ~~~
+
+Initialization creates the cache layout, not upload credentials. Configure
+trusted keys and write tokens before uploading, as described above. Use the
+same mount and container user for subsequent administrative commands.
 
 The archive sets only the standard image entrypoint, command, user, port,
 working directory, and volume metadata. TLS, credentials, and bind mounts remain
