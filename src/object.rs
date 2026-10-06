@@ -4,7 +4,9 @@
 //! their byte counts. This prevents accidentally comparing or substituting
 //! identities for different byte streams.
 
-use std::{ffi::OsString, fmt, marker::PhantomData, str::FromStr, sync::OnceLock};
+#[cfg(feature = "application")]
+use std::ffi::OsString;
+use std::{fmt, marker::PhantomData, str::FromStr, sync::OnceLock};
 
 use data_encoding::{BitOrder, Encoding, Specification};
 use serde::{Deserialize, Serialize};
@@ -64,6 +66,7 @@ impl<Purpose> fmt::Display for Sha256Digest<Purpose> {
 }
 
 impl Sha256Digest<EncodedFile> {
+    #[cfg(feature = "application")]
     pub(crate) fn matches_nar_hash(self, hash: NarHash) -> bool {
         self.bytes() == hash.bytes()
     }
@@ -260,6 +263,7 @@ impl NarFileName {
         self.encoding
     }
 
+    #[cfg(feature = "application")]
     pub(crate) const fn raw_hash(self) -> Option<NarHash> {
         match self.encoding {
             WireEncoding::Raw => Some(self.file_hash.as_nar_hash()),
@@ -267,6 +271,7 @@ impl NarFileName {
         }
     }
 
+    #[cfg(feature = "application")]
     pub(crate) fn os_string(self) -> OsString {
         OsString::from(self.to_string())
     }

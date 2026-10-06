@@ -26,20 +26,15 @@ pub mod maintenance;
 #[allow(missing_docs)]
 #[path = "metrics.rs"]
 pub mod metrics;
-#[path = "nar.rs"]
-pub mod nar;
 #[doc(hidden)]
 #[allow(missing_docs)]
 #[path = "nar_compression.rs"]
 pub mod nar_compression;
-#[path = "nar_encode.rs"]
-pub mod nar_encode;
 #[doc(hidden)]
 #[allow(missing_docs)]
 #[path = "narinfo.rs"]
 pub mod narinfo;
-#[path = "object.rs"]
-pub mod object;
+pub use crate::{nar, nar_encode, object};
 #[doc(hidden)]
 #[allow(missing_docs)]
 #[path = "records.rs"]
