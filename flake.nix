@@ -354,6 +354,26 @@
               ${env.pkgs.bash}/bin/bash ${repositorySrc}/ci/check-rust-contract.sh
               touch $out
             '';
+          release-workflow = env.pkgs.runCommand "narjar-release-workflow"
+            {
+              nativeBuildInputs = [
+                env.pkgs.actionlint
+                env.pkgs.bash
+                env.pkgs.coreutils
+                env.pkgs.jq
+                env.pkgs.shellcheck
+              ];
+            }
+            ''
+              cp -R ${repositorySrc}/ci ${repositorySrc}/.github .
+              chmod -R u+w ci .github
+              actionlint .github/workflows/flake.yml .github/workflows/release.yml
+              shellcheck ci/check-release-candidate.sh ci/check-published-crate.sh \
+                ci/publish-github-release.sh ci/test-release-candidate.sh ci/test-release-publication.sh
+              bash ci/test-release-candidate.sh
+              bash ci/test-release-publication.sh
+              touch $out
+            '';
           source-filter = env.pkgs.runCommand "narjar-source-filter" { } ''
             test -f ${repositorySrc}/Cargo.toml
             test -f ${repositorySrc}/Cargo.lock
@@ -509,6 +529,7 @@
             tests
             docs
             rust-check-contract
+            release-workflow
             source-filter
             lock-consistency
             cargo-source-filter

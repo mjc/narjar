@@ -18,6 +18,7 @@ in
     cargo-nextest
     cargo-audit
     shellcheck
+    actionlint
     cargo-fuzz
     # cargo-fuzz requires nightly-only compiler flags. Keep this snapshot
     # separate from the stable toolchain used for normal builds.
