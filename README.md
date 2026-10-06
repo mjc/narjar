@@ -17,10 +17,21 @@ limited to the NAR streaming decoder (`nar`), canonical event encoder
 (`nar_encode`), and typed content identities (`object`). These APIs cover
 reading and writing NAR streams; they do not expose cache storage, HTTP server,
 authorization, maintenance, or backend lifecycle contracts. Those
-implementation modules are hidden under `narjar::__private` for use by the
-binary and repository integration tests and are not supported for downstream
-consumers. The API may change incompatibly between pre-1.0 minor releases;
-patch releases retain compatibility.
+implementation modules are hidden under `narjar::__private` when the
+`application` feature is enabled, for use by the binary and repository
+integration tests; they are not supported for downstream consumers.
+
+For the codec and identity library without application dependencies:
+
+```toml
+[dependencies]
+narjar = { version = "0.1", default-features = false }
+```
+
+This exposes only `nar`, `nar_encode`, and `object`, without SQLite, HTTP/TLS,
+cache storage, or compression-codec dependencies. The default `application`
+feature retains the complete CLI and its dependencies. The API may change
+incompatibly between pre-1.0 minor releases; patch releases retain compatibility.
 
 ## Installation
 
@@ -142,8 +153,11 @@ parallel, up to `--jobs`. It serializes NARs and signs their metadata directly,
 without invoking Nix subprocesses.
 
 The command takes concrete `/nix/store/...` paths. It needs read access to the
-store and its SQLite metadata database, plus permission to create temporary
-GC roots. The Nix command in this example builds the input path.
+store and its SQLite metadata database, plus access to Nix's rooting mechanism.
+Normal unprivileged users retain temporary roots through the native Nix daemon
+socket for the duration of the push. Direct writable-store access uses a GC
+read lock while installing roots and reading metadata. The Nix command in this
+example builds the input path.
 
 Netrc credentials are sent over HTTPS unless `--insecure-http` is supplied.
 That flag is needed for the local HTTP example above. Upload requests have a
@@ -284,6 +298,19 @@ devenv tasks run check:doc
 nix flake check -L --no-update-lock-file
 ```
 
+Linux CI also runs the locked real-Nix app against both storage backends:
+
+```sh
+nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend flat
+nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend chunked
+```
+
+Run shell commands through `devenv shell -- <command>` unless `DEVENV_ROOT`
+already points at the checkout. The end-to-end gates check transfers into
+independent Nix stores, signature trust, compression, interrupted uploads,
+restart, and offline GC. They do not boot NixOS VMs or establish
+filesystem-specific power-loss guarantees.
+
 The supported library API exports NAR encoding and decoding plus typed content
 identities. Generate API documentation with `cargo doc --no-deps --open`.
 
@@ -292,6 +319,8 @@ Further documentation:
 - [Architecture](https://github.com/mjc/narjar/blob/main/docs/architecture.md)
 - [Binary cache protocol](https://github.com/mjc/narjar/blob/main/docs/protocol-v0.1.md)
 - [Filesystem requirements](https://github.com/mjc/narjar/blob/main/docs/filesystem-capability-adr.md)
+- [Release procedure](https://github.com/mjc/narjar/blob/main/docs/release.md)
+- [Operational risks](https://github.com/mjc/narjar/blob/main/docs/risk-register.md)
 - [NixOS module](https://github.com/mjc/narjar/blob/main/nix/module.nix)
 - [Benchmark tools](https://github.com/mjc/narjar/blob/main/docs/benchmark-scripts.md)
 - [CPU and heap profiling](https://github.com/mjc/narjar/blob/main/scripts/profile.sh)

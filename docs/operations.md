@@ -135,7 +135,17 @@ it does not modify the local store database or invoke Nix subprocesses.
 `xz`) and defaults to `none`; the server independently selects its stored and
 served representations. Uploads use fixed-length streamed requests and the
 server's atomic per-object publication. The client needs read access to the
-store and its metadata database, plus permission to create temporary GC roots.
+store and its metadata database. It protects the requested roots before reading
+closure metadata. Direct writable-state access installs roots under
+`$NIX_STATE_DIR/gcroots/auto` (default `/nix/var/nix/gcroots/auto`) and holds
+Nix's `gc.lock` shared while validating live paths, installing roots, and
+reading metadata; the roots remain until the push finishes. Normal unprivileged
+users register temporary roots with `AddTempRoot` through the native Nix daemon
+socket and keep that connection alive for the entire push. A missing lock file
+is created only when the local state directory is writable; symlinks and
+non-regular lock files are rejected. No separate root-directory configuration,
+Nix subprocess, or additional dependency is needed. Failure to establish roots
+aborts the push before metadata lookup.
 Each native HTTP request has a 30-second timeout by default; `--timeout-seconds` or
 `NARJAR_PUSH_TIMEOUT_SECONDS` changes it.
 
@@ -144,10 +154,6 @@ unless `--insecure-http` explicitly permits sending them over plain HTTP. Use
 HTTPS for remote access. A request started over HTTP without that override
 remains unauthenticated after an HTTP-to-HTTPS redirect; use an HTTPS target
 from the start. The netrc file must have restrictive permissions.
-`NARJAR_PUSH_GCROOTS` may point
-to an operator-owned existing `gcroots/auto` directory when the normal Nix
-state directory is not writable; it changes only where Narjar places its
-temporary reachability symlinks, not Nix's store or state database.
 
 Shared publishers can pass `--ignore-conflicts` to skip a store path whose
 immutable destination already has a different NAR identity and continue the
@@ -591,16 +597,11 @@ resident worker, and an HTTP delete/GC API.
 
 ## Observability
 
-Logs are one line per event on stderr using stable key=value fields:
-
-~~~text
-level=info event=request_done request_id=... method=PUT route=nar status=201
-bytes_in=... bytes_out=... duration_ms=... auth=write token_name=ci
-~~~
-
-No field contains Authorization, token bytes, netrc, signature bytes, request
-body, arbitrary filesystem path, or query credentials. Store/file hash logging
-is configurable and off by default.
+Startup, recovery, and command failures produce diagnostics on stderr. Narjar
+does not emit structured per-request logs, assign request identifiers, or provide
+a configurable store-hash logging mode. Use the HTTP metrics for aggregate
+request counts, byte counts, outcomes, and durations. If a reverse proxy logs
+individual requests, configure it to redact credentials.
 
 GET /healthz is unauthenticated and returns 200 once the HTTP loop is alive.
 It says nothing about disk writability or trust configuration.

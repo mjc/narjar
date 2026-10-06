@@ -1,7 +1,6 @@
 # Narjar v0.1 architecture and trust decisions
 
-Status: accepted v0.1 architecture; implementation and operational follow-up
-remain subject to the evidence gates recorded below.
+Status: current architecture and operational contracts.
 
 ## Decision
 
@@ -20,13 +19,12 @@ transports. A selected backend stores either one canonical raw `.nar` or one
 ordered manifest plus shared raw chunks, together with any requested
 server-generated egress derivatives.
 
-The differentiator from bincache is deletion of redb, server signing,
-recompression, io_uring-specific paths, sharding, and maintenance state. The
-differentiator from Kasha is deletion of manifests, remote mirroring, upstream
-population, retention workers, and S3 credentials.
-
-If matched measurements do not show a material startup/RSS/operability benefit,
-the correct outcome is to adopt bincache rather than ship Narjar.
+The server uses filesystem metadata without a database or private signing key.
+Chunked storage includes manifests and sharded chunks; compressed egress and
+publication recovery records are part of the implemented storage contract.
+The push client reads the producer's local Nix SQLite database and can check
+trusted upstream metadata before uploading. It does not populate the server
+from an upstream cache.
 
 ## System boundary
 
@@ -130,7 +128,7 @@ DATA/
   realisations/
     .tmp/
       realisation-<random>.part
-    <validated-drv-output-id>.doi       optional protocol compatibility
+    <validated-drv-output-id>.doi       reserved; HTTP serving unsupported
   .tmp/
     narinfo-<random>.part
   auth/
@@ -354,18 +352,20 @@ reconcile.
 GET or HEAD /nix-cache-info
 GET or HEAD /<store-hash>.narinfo
 GET or HEAD /nar/<file-hash>.nar[.zst|.xz]
-GET or HEAD /realisations/<id>.doi   optional
+GET or HEAD /realisations/<id>.doi   unsupported; returns 404
 ~~~
 
 Exact files return 200 with Content-Length, a fixed content type, and
 X-Content-Type-Options: nosniff. Missing valid names return 404. Invalid route
-syntax returns 400. HEAD returns the same status and headers as GET without a
-body.
+syntax returns 400. HEAD returns the status and headers of a full GET without a
+body and ignores Range.
 
-NAR reads support one RFC byte range in v0.1: valid satisfiable ranges return
+NAR GET requests support one RFC byte range in v0.1: valid satisfiable ranges return
 206 with Content-Range and Accept-Ranges: bytes; unsatisfiable ranges return
 416 with Content-Range: bytes */<length>. Multiple ranges are rejected. Files
-are immutable, so a range cannot race replacement or deletion.
+are opened before delivery; maintenance cannot delete them while serving owns
+the cache lease. Valid payloads are immutable. Repair can replace a proven-corrupt
+server-generated derivative, without changing an already opened file handle.
 
 narinfo and nix-cache-info use conservative public cache headers in public-read
 mode. Authenticated/private responses are private/no-store unless deployment
@@ -378,28 +378,31 @@ negative cache until --refresh; the server cannot invalidate client caches.
 - gzip, semantic-tree storage, or server recompression outside the existing
   raw/zstd/xz egress options.
 - Server-side signing or private signing-key custody.
-- Multi-tenancy, quotas, namespaces, UI, database, Redis, S3, mirrors, workers.
+- Multi-tenancy, quotas, namespaces, UI, server database, Redis, S3, mirrors.
 - Online delete or GC, access-time retention, a resident retention worker, or
   a resident chunk catalog.
 - NAR listings, build logs, mass query, debug-info indexes, pull-through cache.
+- Realisation metadata serving or registration.
 - Built-in TLS, ACME, OIDC, mTLS, or proxy configuration generation.
 - Multiple HTTP ranges or conditional mutation.
 - Availability guarantees across multiple processes or hosts.
 
-## Open follow-up evidence gates
+## Verification boundaries
 
-The v0.1 storage contract is accepted; these items qualify the remaining
-deployment and architecture claims rather than reopening the serving contract:
+The [flake workflow](../.github/workflows/flake.yml) runs the locked
+`nix-e2e` app for both flat and chunked storage on Linux. It uses a real server
+and independent Nix stores to check transfers, signatures, compression,
+interruption, restart, and offline GC. The module check evaluates configuration
+assertions and checks generated pre-start scripts at build time without
+import-from-derivation. Neither check boots a NixOS VM.
 
-- Complete the clean-host real-Nix and cross-host evidence for the native push
-  path (NARJ-111/NARJ-112), including any current static Linux packaging gap.
-- Complete the filesystem/ZFS profile and operator drill (NARJ-67 through
-  NARJ-73) before making filesystem-specific performance, space, or recovery
-  claims.
-- Keep the per-publication recovery measurements in NARJ-110 as evidence for
-  concurrency and memory claims; the implementation does not depend on those
-  measurements to preserve its correctness invariants.
-- Keep the semantic-storage investigation (NARJ-74) separate; it remains the
-  gate for any parsed-NAR or content-addressed replacement.
-- Complete NARJ-130's matched flat-versus-chunked ZFS evidence before changing
-  the default backend or making physical-space claims.
+The static ELF and runtime closure checks cover packaging properties. They do
+not establish behavior on a separate host without Nix, TLS proxy correctness,
+or filesystem-specific power-loss durability. Darwin package tests cover flat
+storage; they do not establish APFS crash durability. See the
+[filesystem support boundary](filesystem-capability-adr.md#support-boundary).
+
+Retained benchmark reports describe their measured workloads and hosts. They
+do not establish general performance or physical-space guarantees and are not
+release requirements. Current release checks are listed in the
+[release procedure](release.md#validate-the-candidate).

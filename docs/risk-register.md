@@ -1,377 +1,98 @@
-# Narjar v0.1 risk register and decision log
-
-Status: accepted v0.1 risk register; remaining evidence gates are tracked in
-Lific. Likelihood and impact are Low, Medium, High, or Critical. Owner is the
-Lific issue that must supply proof.
-
-## R1: Undocumented HTTP write behavior
-
-Likelihood: Medium. Impact: High.
-
-Statement and invariant: Nix may change probe order, status handling, upload
-routes, or retry behavior. Stock nix copy compatibility must not depend on
-accidental sequencing.
-
-Evidence: Nix 2.31.5 and 2.35.2 traces plus pinned upstream source are in
-docs/evidence. Probe counts differ from the minimum semantic protocol.
-
-Owner and mitigation: NARJ-2/NARJ-4. Treat probes as idempotent and unordered;
-version the route contract; keep raw traces and source pins.
-
-Detection and recovery: Run compatibility vectors on every supported Nix
-update. Hold release or revert the declared client range.
-
-Residual/disposition/proof: Medium, release-blocking until Linux, retry, and
-proxy captures pass NARJ-17/NARJ-18.
-
-## R2: Reimplementing existing products
-
-Likelihood: High. Impact: High.
-
-Statement and invariant: A greenfield cache may duplicate bincache or Kasha
-without a material benefit. Narjar must remain the smallest useful profile.
-
-Evidence: docs/prior-art.md.
-
-Owner and mitigation: NARJ-3/NARJ-19/NARJ-20. Require matched startup, RSS,
-CPU, stored-size, and operational comparisons. Adopt upstream if the
-differential is not material.
-
-Detection and recovery: Dependency/LOC growth or new DB/signing/recompression
-scope reopens the decision. Stop implementation and upstream the delta.
-
-Residual/disposition/proof: High continuation risk. NARJ-19 remains the matched
-measurement gate for whether the greenfield implementation delivers a material
-benefit over existing products.
-
-## R3: Native-store and flat-cache confusion
-
-Likelihood: Medium. Impact: High.
-
-Statement and invariant: Code may assume /nix/store registration or attempt to
-serve native paths. The daemon must require no server Nix installation.
-
-Evidence: Harmonia solves native-store serving; Nix file:// proves flat cache.
-
-Owner and mitigation: NARJ-5. Exact validated route-to-file mapping and flat
-layout; no libnix/native-store dependency.
-
-Detection and recovery: Runtime closure check rejects Nix; E2E runs on a host
-without server Nix. Revert any native-store coupling.
-
-Residual/disposition/proof: Low after NARJ-18/NARJ-29.
-
-## R4: Signature authority confusion
-
-Likelihood: Medium. Impact: Critical.
-
-Statement and invariant: Treating a write token as signing authority would let
-a compromised uploader publish trusted malware. Only configured producer keys
-may authorize narinfo.
-
-Evidence: Server-signed bincache grants this authority; client-
-signed Kasha demonstrates the alternative.
-
-Owner and mitigation: NARJ-6/NARJ-12. Client-signed only; no server secret key;
-verify a canonical Nix fingerprint against trusted public keys.
-
-Detection and recovery: Negative untrusted-key E2E, signer identifier audit,
-public-key overlap runbook. Revoke compromised public key and quarantine its
-published narinfos.
-
-Residual/disposition/proof: High until canonical fingerprint/signature vectors
-and wrong-key tests pass NARJ-16/NARJ-18.
-
-## R5: Narinfo/NAR mismatch or forged metadata
-
-Likelihood: High for malicious writers. Impact: Critical.
-
-Statement and invariant: Published narinfo must name the exact durable NAR and
-store hash; no partial or mismatched pair is reader-visible.
-
-Evidence: Wire capture shows NAR first and narinfo as final visibility marker.
-
-Owner and mitigation: NARJ-8/NARJ-9. Stream SHA-256 and byte count; require
-compression=none equality; strict route, Path, URL, hash, size, reference, and
-signature validation; publish narinfo last.
-
-Detection and recovery: Property/negative tests and offline reconcile detect
-missing/mismatched pairs. Quarantine narinfo first, then investigate orphan NAR.
-
-Residual/disposition/proof: Medium after fault injection and real-Nix refusal
-tests NARJ-16/NARJ-18.
-
-## R6: Compression and size amplification
-
-Likelihood: Medium. Impact: High.
-
-Statement and invariant: Compressed uploads can cause CPU/memory/disk
-amplification. Resource use must stay bounded by configured raw bytes and
-concurrency.
-
-Evidence: Nix supports many codecs; prior art adds decompression/recompression
-pipelines.
-
-Owner and mitigation: NARJ-29. Reject HTTP Content-Encoding and unsupported
-compressed suffixes; accept only fixed-length `.nar`, `.nar.zst`, and `.nar.xz`
-bodies; cap both received and decompressed bytes; stream matching validation with
-no NAR semantic parser or recompressor.
-
-Detection and recovery: Per-route byte counters, 413 tests, disk watermark.
-Abort temporary and return admission failure.
-
-Residual/disposition/proof: Low after oversize/slow-body tests NARJ-16/NARJ-17.
-
-## R7: Truncation, corruption, and local disk faults
-
-Likelihood: Medium. Impact: High.
-
-Statement and invariant: Truncated uploads or bit rot must not yield trusted
-published paths.
-
-Evidence: HTTP bodies can end early; filesystem corruption is outside process
-atomicity.
-
-Owner and mitigation: NARJ-8/NARJ-13. Count and hash every upload; sync before
-rename; narinfo last; offline full reconcile hashes objects.
-
-Detection and recovery: Short-read/hash tests, scheduled reconcile, consumer
-NarHash failures. Quarantine affected narinfos and restore immutable files from
-backup/reupload.
-
-Residual/disposition/proof: Medium; v0.1 detects upload corruption immediately
-and latent corruption only during read/client verification or reconcile.
-
-## R8: Rename and fsync crash windows
-
-Likelihood: Medium. Impact: Critical.
-
-Statement and invariant: A 201 must not precede durable data, and a crash must
-never expose narinfo before its NAR.
-
-Evidence: Rename atomicity does not imply power-loss durability; directory sync
-is required.
-
-Owner and mitigation: NARJ-9/NARJ-11. Same-filesystem temporaries, file sync,
-no-replace hard-link publication, parent-directory sync, NAR before narinfo.
-
-Detection and recovery: Fault injection at every write/sync/link step;
-restart state matrix; reconcile stale temporaries/orphans.
-
-Residual/disposition/proof: Medium. In-process fault coverage passes, but there
-is no dedicated Linux filesystem-conformance lane and broader filesystem and
-power-loss claims remain outside the current evidence; they are tracked by
-NARJ-68/NARJ-69.
-
-## R9: Traversal and route ambiguity
-
-Likelihood: High for exposed service. Impact: Critical.
-
-Statement and invariant: No request may escape DATA or alias another immutable
-object.
-
-Evidence: HTTP percent-decoding and platform separators create multiple path
-representations.
-
-Owner and mitigation: NARJ-4/NARJ-10. Match strict ASCII route grammar before
-path construction; decode once; reject slash encodings, dot segments, NUL,
-Unicode, duplicate separators, unsupported suffixes.
-
-Detection and recovery: Table/property/fuzz corpus across raw and encoded
-paths. A finding is a release stop and security patch.
-
-Residual/disposition/proof: Low after NARJ-16 fuzz/property gates.
-
-## R10: Slow clients and resource exhaustion
-
-Likelihood: High on untrusted networks. Impact: High.
-
-Statement and invariant: Slow readers/uploaders, floods, descriptors, or
-temporary files must not violate bounded memory or starve the server.
-
-Evidence: One task/file/descriptor exists per admitted request.
-
-Owner and mitigation: NARJ-8/NARJ-14. Global concurrency semaphore, header/body
-limits, idle/progress deadlines, bounded buffers, create-new temporaries, proxy
-connection limits, disk admission watermark.
-
-Detection and recovery: Metrics/log counters without secrets; load tests at and
-above admission cap. Return 429/413/507 and clean temporaries.
-
-Residual/disposition/proof: Medium; single-process service can still be denied
-within configured capacity. Document deployment rate limiting.
-
-## R11: TLS and reverse-proxy mismatch
-
-Likelihood: Medium. Impact: Critical for private credentials.
-
-Statement and invariant: Basic tokens must never traverse an untrusted cleartext
-network or appear in proxy logs; proxy buffering must not defeat streaming.
-
-Evidence: Loopback traces omit TLS; configuration is unproven.
-
-Owner and mitigation: NARJ-2/NARJ-14/NARJ-17. Bind privately, terminate TLS,
-disable request buffering, preserve Content-Length/Authorization, align limits
-and timeouts, redact logs.
-
-Detection and recovery: Real proxy capture and config test. Revoke exposed
-tokens, rotate credentials, fix proxy before restart.
-
-Residual/disposition/proof: High release blocker until TLS/proxy E2E passes.
-
-## R12: Token and producer-key rotation errors
-
-Likelihood: Medium. Impact: High.
-
-Statement and invariant: Rotation must not expose tokens, lock out all writers,
-or invalidate still-cached narinfos unexpectedly.
-
-Evidence: Nix positive metadata caching outlives a deployment; client public
-keys are independently configured.
-
-Owner and mitigation: NARJ-12/NARJ-14. Token add-then-revoke overlap; public-key
-old/new overlap; no server signing key; mode-0600 files; atomic config reload.
-
-Detection and recovery: Rotation integration test with old/new clients and
-wrong-key negative case. Restore previous public key/token hash file.
-
-Residual/disposition/proof: Medium after runbook tests; compromised producer
-content still requires explicit quarantine.
-
-## R13: Startup/RSS target and filesystem scale
-
-Likelihood: Medium. Impact: High to product premise.
-
-Statement and invariant: Startup under 100 ms and idle RSS under 30 MiB must not
-grow with NAR size or require an unbounded scan.
-
-Evidence: Filesystem route mapping removes the need for a startup index.
-
-Owner and mitigation: NARJ-7/NARJ-19. No boot scan; lazy exact lookup; offline
-reconcile; measure empty and modest caches against bincache.
-
-Detection and recovery: Benchmark gates on startup median/p95 and settled RSS.
-Adopt bincache or revise the premise if the differential is immaterial.
-
-Residual/disposition/proof: High continuation blocker. The architecture gate
-may authorize only the thin vertical slice required for matched measurement.
-
-## R14: Unsafe or unnecessary dependencies
-
-Likelihood: Medium. Impact: High.
-
-Statement and invariant: Dependencies must not dominate closure, memory, audit
-surface, or static-link feasibility.
-
-Evidence: The initial crate has no runtime dependencies; planned HTTP, hash,
-signature, and CLI work can expand quickly.
-
-Owner and mitigation: NARJ-15/NARJ-29. Standard library first; one HTTP stack;
-one SHA-256 implementation; one Ed25519 verifier; no DB, codec, TLS, NAR parser,
-async trait framework, or general configuration framework without proof.
-
-Detection and recovery: cargo tree, duplicate/features/license/advisory checks,
-static ELF and runtime closure gates. Remove or replace violating dependency.
-
-Residual/disposition/proof: Medium throughout implementation; every dependency
-change reopens review.
-
-## R15: GC, deletion, backup, and restore
-
-Likelihood: Medium. Impact: High.
-
-Statement and invariant: Deletion must not race reads or strand metadata; backup
-must preserve a coherent published set.
-
-Evidence: Content sharing and mutable indexes make GC difficult in prior art.
-
-Owner and mitigation: NARJ-32. No online delete or GC; immutable files; the
-offline GC command takes the DATA lease, validates the full inventory, retains
-configured root closures, removes/syncs narinfo before the last referenced NAR,
-and age-gates orphan cleanup. Back up narinfo and NAR trees, restore then
-reconcile; stale temporaries are outside the published set.
-
-Detection and recovery: Restore drill and reconcile report. Missing NAR causes
-narinfo quarantine; orphan NAR is retained.
-
-Residual/disposition/proof: Low for offline deletion safety, Medium for
-operator capacity planning because GC reports logical rather than physical
-snapshot/compression space; monitor destination capacity separately.
-
-## R16: Real-Nix and Linux proof gaps
-
-Likelihood: Medium for a new deployment. Impact: Critical.
-
-Statement and invariant: Handler tests or flake evaluation cannot prove stock
-Nix protocol behavior, trust enforcement, static Linux packaging, or proxy
-deployment.
-
-Evidence: The repository has protocol/CLI coverage and recorded real-Nix
-client-path evidence, but the current native transfer and static Linux release
-claims still require the clean-host/cross-host evidence tracked by NARJ-111 and
-NARJ-112.
-
-Owner and mitigation: NARJ-17/NARJ-18/NARJ-29. Real sockets, independent Nix
-store, trusted/untrusted keys, Linux static binary, reverse proxy, and exact
-trace assertions.
-
-Detection and recovery: These are release gates, not warnings. Keep
-implementation tickets incomplete until proof is attached.
-
-Residual/disposition/proof: High for release and cross-host claims. The flat
-storage implementation remains the accepted v0.1 contract; do not advertise a
-new native-transfer or static-Linux deployment as fully proven until those
-remaining gates pass.
-
-## Decision log
-
-### D1: Flat cache, not native store
-
-Accepted. Removes server Nix and maps validated routes directly to immutable
-files. Rejected alternative: Harmonia/native /nix/store.
-
-### D2: Client signing, not server signing
-
-Accepted provisionally. Keeps write authority separate from trust authority.
-Rejected alternative: bincache-style server signing.
-
-### D3: Filesystem only, no database
-
-Accepted provisionally. Exact route lookup requires no index; reconciliation is
-offline. Rejected alternatives: redb and SQLite.
-
-### D4: Store compression=none byte-for-byte
-
-Superseded by the current [canonical storage contract](architecture.md#canonical-storage-backends)
-and [compressed upload and egress flow](architecture.md#write-flow). The earlier
-proposal retained raw, zstd, and XZ uploads byte-for-byte and rejected
-server-generated compression. The current implementation validates the encoded
-and decoded identities, stores the decoded NAR in the selected flat or chunked
-backend, and materializes reusable compressed egress derivatives when selected.
-Published narinfo transport fields describe the served representation while
-preserving the signed NAR identity.
-
-### D5: Do not parse NAR semantics
-
-Accepted. Narjar verifies signed hash/size metadata; consumer Nix is the semantic
-parser. A duplicate parser adds attack surface without authenticity.
-
-### D6: TLS at reverse proxy
-
-Accepted provisionally. Keeps TLS stack out of the static binary. Deployment
-proof remains a release gate.
-
-### D7: No online GC or deletion
-
-Accepted for v0.1. Avoids reader/deletion races. Bounded offline retention uses
-an exclusive lease and a temporary in-memory validated inventory rather than
-resident mutable reachability state. Capacity planning and offline
-reconciliation remain required.
-
-### D8: Greenfield implementation is conditional
-
-Narjar's greenfield thin vertical slice is accepted for the current v0.1
-implementation because its approved profile removes the database,
-recompression, server signing key, background workers, and startup index.
-NARJ-19 defines the measurement discipline; the separate NARJ-74 research
-program still gates any semantic-storage replacement.
+# Operational risks and verification boundaries
+
+This register describes the implemented filesystem cache. Current release
+checks are in the [release procedure](release.md#validate-the-candidate);
+historical design proposals and benchmark thresholds are not release gates.
+
+## Transport compatibility and authentication
+
+Nix probe counts, ordering, retries, and negative caching can change between
+client versions. The server validates each request independently, publishes
+NAR data before narinfo, and handles identical retries without replacing
+immutable content. Linux CI runs the locked real-Nix app for both flat and
+chunked storage; [historical protocol captures](evidence/nix-http-protocol.md)
+describe their recorded clients. Neither is evidence for every Nix version.
+Use `--refresh` after a prior miss when immediate visibility is required.
+
+A write token grants transport access, not signing authority. Narinfo requires
+a signature from a configured producer key. The server holds public keys and
+token hashes; the push client holds private signing material. A compromised
+trusted producer can authorize malicious content even when every hash and
+signature is valid. Revoke its key and quarantine affected publications.
+Rotate keys with overlap because consumers can retain signed metadata.
+See [credential operations](operations.md#cli).
+
+Narjar serves plain HTTP. Use a TLS reverse proxy for remote access, restrict
+direct access to a trusted network, disable PUT buffering, preserve
+Content-Length and Authorization, align limits and timeouts, and redact
+credentials from logs. Loopback end-to-end CI does not validate a deployment's
+certificate, buffering, or timeout configuration. Client HTTPS support does
+not provide TLS termination for the server.
+
+## Untrusted input and bounded resources
+
+Strict route grammars and once-only decoding prevent request paths from
+escaping DATA. Metadata validation binds the route, store path, encoded
+representation, raw NAR identity, references, and producer signature before
+narinfo becomes visible. A valid signature does not prove NAR grammar;
+consumer Nix parses and verifies the imported NAR. The separate library codecs
+have their own [semantic-input threat model](nar-threat-model.md).
+
+Upload limits cover encoded bytes, decoded NAR bytes, and compressed-decoder
+memory. At most `workers` decoders run concurrently, so the configured decoder
+memory budget is `workers × maxDecoderMemoryBytes`, in addition to other
+process allocations. Bounded admission, stream timeouts, staging reservations,
+and a free-space reserve reduce resource exhaustion; they do not guarantee
+availability under hostile traffic or prevent external disk consumption.
+Use proxy connection/rate limits and monitor capacity and admission failures.
+
+## Publication, corruption, and recovery
+
+Publication uses destination-local staging, content checks, file and directory
+synchronization, and no-replace final links. Flat storage publishes a canonical
+raw NAR; chunked storage synchronizes chunks before publishing its authoritative
+manifest. Narinfo is the store-path visibility marker. Transactions and recovery
+markers distinguish interrupted work from completed publications.
+
+Fault tests and interrupted-upload CI cover process-level failures. They do
+not establish power-loss behavior on every filesystem or device. Chunked
+storage requires Linux `syncfs` and is rejected on macOS; APFS-specific flat
+crash durability also remains unverified. Follow the
+[filesystem capability contract](filesystem-capability-adr.md).
+
+Ordinary availability checks do not detect every same-size out-of-band
+mutation. Run offline `verify` or `reconcile --verify-hashes` for full content
+verification. Quarantine affected narinfos before repairing payloads. Preserve
+shared chunks and manifests together; a chunk directory alone is not a NAR.
+See [recovery](operations.md#restart-matrix).
+
+## Maintenance and capacity accounting
+
+Serving and maintenance require the same exclusive DATA lease. Delete and GC
+operate offline, remove and sync narinfo first, and retain canonical data while
+any publication still references it. GC retains protected roots and their
+transitive references; chunked GC follows live manifests to shared chunks.
+No HTTP delete endpoint or resident GC worker is provided.
+
+Backups must preserve the selected layout, canonical objects, manifests/chunks,
+published metadata, policy files, and recovery records. Stop serving for the
+documented backup procedure, then verify a restored root before using it.
+GC reports logical file lengths, which do not predict physical bytes freed
+under compression, CoW, or snapshots. Measure destination capacity separately.
+See [backup and restore](operations.md#backup-and-restore).
+
+## Packaging and performance claims
+
+The flake builds Linux and Apple Silicon packages; CI tests Darwin flat storage
+and real Nix transfers on Linux. Static ELF and runtime closure checks reject
+dynamic linkage or prohibited runtime dependencies. The generated module
+scripts are inspected at build time without import-from-derivation; module
+evaluation alone does not execute a systemd service. Native-store serving is
+disabled by the module until that HTTP path is implemented.
+
+Those checks do not prove separate-host runtime behavior without Nix or boot a
+NixOS VM. Dependency advisories are checked using the
+[advisory gate](dependency-advisories.md). Performance, RSS, physical-space
+savings, and filesystem-specific recovery claims require evidence for the
+actual workload and deployment. Archived benchmarks supply measurements for
+their recorded conditions, not general guarantees or release requirements.

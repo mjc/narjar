@@ -28,13 +28,20 @@ version without explicit maintainer consent.
 3. Run `devenv tasks run check:fmt`, `devenv tasks run check:clippy`,
    `devenv tasks run check:test`, and `devenv tasks run check:doc`. These cover
    the workspace; the doc task runs doctests and denies rustdoc warnings. Then
-   run `nix run .#advisory-check` and `nix flake check`.
+   run `nix run -L --no-update-lock-file .#advisory-check` and
+   `nix flake check -L --no-update-lock-file`. Use `devenv shell -- <command>`
+   for shell commands unless `DEVENV_ROOT` already points at this checkout.
+   Locks must remain unchanged by validation.
 4. Inspect the package file list with `cargo package --locked --list`. Run
    `bash ci/check-cargo-package.sh`; it packages the crate, checks the archive
    size, builds and tests the extracted source, then installs from that
    extracted archive and exercises the installed binary's `--help` and
-   `--version` commands. The flake's `cratePackageCheck` runs this same script
-   with a clean Cargo home and vendored dependencies.
+   `--version` commands. It also checks and tests the extracted library with
+   `--no-default-features` and rejects application dependencies in its normal
+   dependency graph. That library exposes only `nar`, `nar_encode`, and `object`;
+   the default `application` feature retains the complete CLI. The flake's
+   `cratePackageCheck` runs this same script with a clean Cargo home and vendored
+   dependencies.
 5. Inspect `target/package/narjar-<version>.crate` and its file list. The
    repository enforces an 8 MiB ceiling to leave room below crates.io's current
    10 MB archive limit. ([Cargo publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html))
@@ -43,6 +50,32 @@ version without explicit maintainer consent.
    Apple Silicon macOS. The packaged-archive consumer smoke is x86_64 Linux
    only. Chunked storage remains Linux-only; APFS-specific crash durability is
    not established by the macOS package/test lane.
+7. Run both real-Nix Linux gates from the repository environment:
+
+   ```sh
+   nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend flat
+   nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend chunked
+   ```
+
+   The [flake workflow](../.github/workflows/flake.yml) runs these same apps.
+   They start the packaged server, publish through native push and stock Nix,
+   substitute into independent stores, verify signatures and content, reject
+   untrusted keys and corrupt uploads, exercise raw/XZ/Zstd representations,
+   and check interruption, restart, and protected-closure GC. They use the
+   locked Nix toolchain without NixOS VMs. The normal package is used for this
+   protocol gate; static ELF/closure checks are separate packaging checks.
+
+The module check evaluates option and service invariants without
+import-from-derivation. Building it also checks the generated privileged
+pre-start scripts for shell syntax, no-follow ownership operations, directory
+type checks, and native-root ancestor/path checks. Native-store serving stays
+disabled by a module assertion; those script checks do not enable it.
+
+These checks do not prove TLS proxy configuration, separate-host runtime
+behavior without Nix, filesystem power-loss durability, or physical-space
+savings. Preserve the [filesystem support boundary](filesystem-capability-adr.md#support-boundary)
+in release notes. Retained research benchmarks are historical evidence, not
+release or migration requirements.
 
 ## Publish only with explicit approval
 

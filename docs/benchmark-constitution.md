@@ -10,7 +10,12 @@ The machine-readable thresholds are in
 results must not alter this file; a changed constitution gets a new version,
 reason, and review before measurement.
 
-Scope: frozen NARJ-75 experiment gates. The Rust 1.85 dependency requirement
+Scope: historical NARJ-75 experiment criteria, retained to interpret and
+reproduce the archived results. This research program is not a current release,
+continuation, or migration requirement. Current release checks are in the
+[release procedure](release.md#validate-the-candidate).
+
+The Rust 1.85 dependency requirement
 below belongs to version 4 of this research constitution. The current package
 requires Rust 1.98, as declared in [Cargo.toml](../Cargo.toml). The frozen
 thresholds are unchanged.

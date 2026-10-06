@@ -158,7 +158,8 @@ later full-body retry idempotently:
   server-side evidence for flat storage, not chunked durability.
 - TLS verification and CA selection are libcurl/Nix client responsibilities;
   Narjar terminates plain HTTP behind a trusted proxy. The production proxy
-  buffering/timeout test remains an implementation acceptance check:
+  buffering and timeout configuration must be validated for each deployment;
+  the loopback CI gates do not test TLS proxy behavior:
   [filetransfer.cc lines 363-377](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/filetransfer.cc#L363-L377).
 - No live realisation request was produced by the captured corpus. The exact
   namespace is source-backed and explicitly unsupported in v0.1.

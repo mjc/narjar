@@ -67,8 +67,11 @@ portable read/write path as the required behavior.
 ## Support boundary
 
 The repository's [`module-evaluation` check](../nix/module-eval-test.nix) covers
-valid and invalid `dataDir` declarations and the generated service configuration.
-CI does not boot NixOS VMs. There is no dedicated block-device, tmpfs, or
+valid and invalid `dataDir` declarations and the generated service configuration
+without import-from-derivation. Building that check also validates the generated
+privileged pre-start scripts. The [flake workflow](../.github/workflows/flake.yml)
+runs real-Nix end-to-end gates for flat and chunked storage on Linux using the
+locked app. CI does not boot NixOS VMs. There is no dedicated block-device, tmpfs, or
 unmount/remount conformance lane at present. ZFS is the primary
 deployment profile, but compression, copy-on-write, sparse extents, snapshots,
 and physical space accounting are filesystem observations rather than Narjar
@@ -76,7 +79,7 @@ correctness requirements. The recommended ZFS DATA profile uses
 `compression=zstd` (the OpenZFS alias for `zstd-3`); Narjar does not set or
 verify ZFS properties. XFS, btrfs, ZFS-specific behavior, overlay,
 bind-mount variants, quota/inode exhaustion, and read-only remounts remain
-unverified until the corresponding evidence work is complete. Darwin
+unverified. Darwin
 APFS-specific crash durability remains unverified; flat storage is covered by
 the native Apple Silicon package test lane, while chunked storage is rejected.
 
@@ -86,7 +89,7 @@ NARJ-46/NARJ-68 evidence artifacts, not in this capability contract.
 
 ## Rejected integrations
 
-The current flat-storage design excludes:
+The current storage design excludes:
 
 - automatic backend migration, legacy-layout fallback, or mixed-layout reads;
 - libzfs bindings, elevated filesystem privileges, or daemon hooks for
