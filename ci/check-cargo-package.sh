@@ -16,6 +16,7 @@ required_package_files=(
   LICENSE-APACHE
   LICENSE-MIT
   README.md
+  docs/operations.md
   benches/micro.rs
   src/lib.rs
   src/main.rs
@@ -24,6 +25,7 @@ required_package_files=(
   tests/gc_scale.rs
   tests/nar_decoder.rs
   tests/nar_encoder.rs
+  tests/operations_examples.rs
 )
 
 for file in "${required_package_files[@]}"; do

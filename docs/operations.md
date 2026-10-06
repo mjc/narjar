@@ -249,13 +249,21 @@ There is no TOML configuration file.
 Example fresh start:
 
 ~~~sh
+set -euo pipefail
+umask 077
 install -d -m 0700 /var/lib/narjar
+install -d -m 0700 /run/narjar-credentials
 narjar init --data-dir /var/lib/narjar
-narjar token create --data-dir /var/lib/narjar --scope write --name ci > /run/credentials/narjar-ci-token
-narjar key generate --name narjar-producer --secret-key-file /run/credentials/narjar-producer.sec --public-key-file /var/lib/narjar/narjar-producer.pub
-install -m 0600 producer-public-keys /var/lib/narjar/trusted-public-keys
+narjar token create --data-dir /var/lib/narjar --scope write --name ci > /run/narjar-credentials/narjar-ci-token
+narjar key generate --name narjar-producer --secret-key-file /run/narjar-credentials/narjar-producer.sec --public-key-file /var/lib/narjar/narjar-producer.pub
+install -m 0600 /var/lib/narjar/narjar-producer.pub /var/lib/narjar/trusted-public-keys
 narjar serve --data-dir /var/lib/narjar --listen 127.0.0.1:5000
 ~~~
+
+Run this example in Bash as the intended cache owner, with permission to create
+these directories. The token and producer secret in `/run/narjar-credentials`
+are lost on reboot; retain producer credentials in protected persistent storage
+if needed. The server uses the installed public key, not the producer secret.
 
 ## File ownership and permissions
 
@@ -276,9 +284,12 @@ The reverse proxy does not read DATA.
 
 ## Request concurrency and timeouts
 
-serve creates a fixed worker set and a bounded queue. max-in-flight limits
-requests that have begun processing; excess requests receive 429 when possible
-or remain outside Narjar in the proxy accept queue.
+serve creates fixed request and publication worker pools and bounded queues.
+max-in-flight limits admitted connections, including parked keep-alive sockets
+and queued uploads; excess connections receive 429 when possible. Idle
+keep-alive sockets retain their connection admission but do not occupy request
+workers. A readiness monitor returns them to the request queue when data arrives
+and closes them after the configured idle timeout or on shutdown.
 
 Memory includes the server baseline, bounded connections and queues, metadata,
 and each active worker's scratch buffers, codec working memory, and backend
@@ -516,24 +527,86 @@ target and run `doctor`, `reconcile --verify-hashes`, and `verify` there before
 using it. An incremental stream requires that the destination retain the base
 snapshot; use `-R` for a recursive dataset tree.
 
+Run the following in Bash. The target dataset and restore mountpoint must be
+new. Every source filesystem must be mounted at DATA or below it; the example
+preserves those relative mountpoints, including child datasets whose names do
+not match their mountpoints. It does not handle zvols or external DATA mounts.
+Receive-time [mountpoint overrides](https://openzfs.github.io/openzfs-docs/man/v2.4/8/zfs-receive.8.html)
+keep production mountpoints out of both full and incremental restores.
+Verification writes maintenance records into the receiver. Incremental receive
+uses `-F` to discard those changes and snapshots or datasets absent from the
+source stream. Use this only on the disposable, offline restore target, never
+on the live DATA dataset or a backup containing unrelated data.
+
 ~~~sh
 set -euo pipefail
 target=backup/narjar-restore
+restore_data_dir=/mnt/narjar-restore
+test ! -e "$restore_data_dir"
+if zfs list -H -o name "$target" >/dev/null 2>&1; then
+  printf 'Restore target already exists: %s\n' "$target" >&2
+  exit 1
+fi
+mounted_datasets=()
+unmount_restore() {
+  local index failed=0
+  for ((index=${#mounted_datasets[@]}-1; index>=0; index--)); do
+    zfs unmount "${mounted_datasets[index]}" || failed=1
+  done
+  mounted_datasets=()
+  return "$failed"
+}
+trap unmount_restore EXIT
+
+receive_restore() {
+  local layout source_name source_mount restored_name
+  local -a receive_options=()
+  case "$1" in
+    -i) receive_options=(-F) ;;
+  esac
+  layout="$(zfs list -H -r -t filesystem -o name,mountpoint -s name "$dataset")"
+  while IFS=$'\t' read -r source_name source_mount; do
+    case "$source_mount" in
+      /var/lib/narjar|/var/lib/narjar/*) ;;
+      *) printf 'Source is outside DATA: %s\n' "$source_name" >&2; return 1 ;;
+    esac
+  done <<< "$layout"
+  zfs send -R "$@" | zfs receive -u "${receive_options[@]}" \
+    -o mountpoint="$restore_data_dir" -o canmount=noauto "$target"
+  while IFS=$'\t' read -r source_name source_mount; do
+    restored_name="$target${source_name#"$dataset"}"
+    zfs set mountpoint="$restore_data_dir${source_mount#/var/lib/narjar}" \
+      canmount=noauto "$restored_name"
+  done <<< "$layout"
+}
+
+verify_restore() {
+  local layout restored_name mountpoint
+  layout="$(zfs list -H -r -t filesystem -o name,mountpoint -s mountpoint "$target")"
+  while IFS=$'\t' read -r restored_name mountpoint; do
+    case "$mountpoint" in
+      "$restore_data_dir"|"$restore_data_dir"/*) ;;
+      *) printf 'Restore mountpoint is outside target: %s\n' "$restored_name" >&2; return 1 ;;
+    esac
+    zfs mount "$restored_name"
+    mounted_datasets+=("$restored_name")
+  done <<< "$layout"
+  narjar doctor --data-dir "$restore_data_dir"
+  narjar reconcile --data-dir "$restore_data_dir" --verify-hashes
+  narjar verify --data-dir "$restore_data_dir"
+  unmount_restore
+}
+
 zfs send -nP -R "$dataset@$snapshot"
-zfs send -R "$dataset@$snapshot" | zfs receive -u "$target"
+receive_restore "$dataset@$snapshot"
+verify_restore
 
-zfs mount "$target"
-restore_data_dir="$(zfs get -H -o value mountpoint "$target")"
-narjar doctor --data-dir "$restore_data_dir"
-narjar reconcile --data-dir "$restore_data_dir" --verify-hashes
-narjar verify --data-dir "$restore_data_dir"
-zfs unmount "$target"
-
-base=narjar-previous
+base="$snapshot"
 next=narjar-next
 zfs snapshot -r "$dataset@$next"
 zfs send -nP -R -i "$dataset@$base" "$dataset@$next"
-zfs send -R -i "$dataset@$base" "$dataset@$next" | zfs receive -u "$target"
+receive_restore -i "$dataset@$base" "$dataset@$next"
+verify_restore
 ~~~
 
 If a send or receive fails, keep the receive target offline and treat it as an

@@ -76,7 +76,8 @@
             filter =
               path: type:
               craneLib.filterCargoSources path type
-              || toString path == toString ./tests/fixtures/nix-2.31.5-http-v0.1.tsv;
+              || toString path == toString ./tests/fixtures/nix-2.31.5-http-v0.1.tsv
+              || toString path == toString ./docs/operations.md;
           };
           cargoVendorDir = craneLib.vendorCargoDeps { inherit src; };
           commonArgs = {
@@ -366,6 +367,7 @@
             test -f ${repositorySrc}/rust-toolchain.toml
             test -f ${repositorySrc}/README.md
             test -f ${env.src}/tests/fixtures/nix-2.31.5-http-v0.1.tsv
+            test -f ${env.src}/docs/operations.md
             test ! -e ${repositorySrc}/target
             test ! -e ${repositorySrc}/.direnv
             test ! -e ${repositorySrc}/benchmarks/results

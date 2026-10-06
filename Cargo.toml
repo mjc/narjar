@@ -13,6 +13,7 @@ include = [
     "/LICENSE-APACHE",
     "/LICENSE-MIT",
     "/README.md",
+    "docs/operations.md",
     "benches/micro.rs",
     "benches/nar_codec.rs",
     "benches/nar_codec_allocations.rs",
@@ -26,6 +27,7 @@ include = [
     "tests/gc_scale.rs",
     "tests/nar_decoder.rs",
     "tests/nar_encoder.rs",
+    "tests/operations_examples.rs",
 ]
 
 [workspace]
