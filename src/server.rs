@@ -599,34 +599,70 @@ struct AcceptLoopContext {
 }
 
 fn run_accept_loop(listener: TcpListener, context: AcceptLoopContext) -> Result<(), Error> {
-    while !context.stopping.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _peer)) => {
-                if context.stopping.load(Ordering::Acquire) {
-                    drop(stream);
-                    break;
+    run_accept_loop_with(context, || listener.accept().map(|(stream, _)| stream))
+}
+
+fn run_accept_loop_with(
+    context: AcceptLoopContext,
+    mut accept: impl FnMut() -> io::Result<TcpStream>,
+) -> Result<(), Error> {
+    std::iter::from_fn(|| (!context.stopping.load(Ordering::Acquire)).then(&mut accept))
+        .try_for_each(|connection| {
+            match connection {
+                Ok(stream) => {
+                    if context.stopping.load(Ordering::Acquire) {
+                        drop(stream);
+                        return Ok(());
+                    }
+                    configure_accepted_socket(&stream, context.io_timeout).map_err(|error| {
+                        Error::runtime(format!("cannot configure socket timeouts: {error}"))
+                    })?;
+                    if let Some(mut stream) = try_dispatch(
+                        &context.sender,
+                        &context.admissions,
+                        &context.metrics,
+                        stream,
+                    ) {
+                        let _ = write_status(&mut stream, StatusCode::TOO_MANY_REQUESTS);
+                    }
                 }
-                configure_accepted_socket(&stream, context.io_timeout).map_err(|error| {
-                    Error::runtime(format!("cannot configure socket timeouts: {error}"))
-                })?;
-                if let Some(mut stream) = try_dispatch(
-                    &context.sender,
-                    &context.admissions,
-                    &context.metrics,
-                    stream,
-                ) {
-                    let _ = write_status(&mut stream, StatusCode::TOO_MANY_REQUESTS);
-                }
+                Err(error) => continue_after_accept_error(error)?,
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(Error::runtime(format!("cannot accept connection: {error}"))),
-        }
-    }
+            Ok(())
+        })?;
     context.publications.begin_draining();
     Ok(())
+}
+
+fn continue_after_accept_error(error: io::Error) -> Result<(), Error> {
+    let kind = error.kind();
+    // Linux reports pending per-connection network failures from accept().
+    // Its accept(2) contract requires treating these like an empty queue.
+    #[cfg(target_os = "linux")]
+    let kind = match error
+        .raw_os_error()
+        .map(rustix::io::Errno::from_raw_os_error)
+    {
+        Some(
+            rustix::io::Errno::NETDOWN
+            | rustix::io::Errno::PROTO
+            | rustix::io::Errno::NOPROTOOPT
+            | rustix::io::Errno::HOSTDOWN
+            | rustix::io::Errno::NONET
+            | rustix::io::Errno::HOSTUNREACH
+            | rustix::io::Errno::OPNOTSUPP
+            | rustix::io::Errno::NETUNREACH,
+        ) => io::ErrorKind::WouldBlock,
+        _ => kind,
+    };
+    match kind {
+        io::ErrorKind::WouldBlock => {
+            thread::sleep(Duration::from_millis(50));
+            Ok(())
+        }
+        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => Ok(()),
+        _ => Err(Error::runtime(format!("cannot accept connection: {error}"))),
+    }
 }
 
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
@@ -827,6 +863,80 @@ mod tests {
         wait_for_keep_alive_request_or_shutdown,
     };
     use narjar::__private::metrics::ConnectionOutcome;
+
+    #[test]
+    fn aborted_pending_connections_do_not_stop_accepting_requests() {
+        assert_accepts_after_connection_error(io::ErrorKind::ConnectionAborted.into());
+    }
+
+    #[test]
+    fn permanent_listener_errors_are_not_retried() {
+        use rustix::io::Errno;
+        for errno in [
+            Errno::BADF,
+            Errno::INVAL,
+            Errno::NOTSOCK,
+            Errno::MFILE,
+            Errno::NFILE,
+        ] {
+            let error = super::continue_after_accept_error(errno.into())
+                .expect_err("invalid listeners and exhausted descriptors must not spin");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&errno.raw_os_error().to_string())
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pending_network_errors_do_not_stop_accepting_requests() {
+        use rustix::io::Errno;
+        for errno in [
+            Errno::NETDOWN,
+            Errno::PROTO,
+            Errno::NOPROTOOPT,
+            Errno::HOSTDOWN,
+            Errno::NONET,
+            Errno::HOSTUNREACH,
+            Errno::OPNOTSUPP,
+            Errno::NETUNREACH,
+        ] {
+            assert_accepts_after_connection_error(errno.into());
+        }
+    }
+
+    fn assert_accepts_after_connection_error(error: io::Error) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let admissions = Arc::new(Admissions::new(1, Arc::clone(&metrics)));
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let (publication_sender, _publication_receiver) = crossbeam_channel::bounded(1);
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let context = super::AcceptLoopContext {
+            sender,
+            admissions,
+            metrics: Arc::clone(&metrics),
+            stopping: Arc::clone(&stopping),
+            publications: Arc::new(super::PublicationQueue::new(publication_sender, metrics)),
+            io_timeout: Duration::from_secs(1),
+        };
+        let mut pending = [Err(error), Ok(stream)].into_iter();
+        super::run_accept_loop_with(context, || {
+            pending.next().unwrap_or_else(|| {
+                stopping.store(true, std::sync::atomic::Ordering::Release);
+                Err(io::ErrorKind::Interrupted.into())
+            })
+        })
+        .expect("a failed pending connection must not stop the listener");
+        let accepted = receiver
+            .try_recv()
+            .expect("the next connection reaches a worker");
+        assert!(accepted.stream.nodelay().unwrap());
+    }
 
     #[test]
     fn unavailable_publication_queue_rejects_without_continue_and_releases_admission() {

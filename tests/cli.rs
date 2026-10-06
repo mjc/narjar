@@ -66,6 +66,64 @@ fn assert_clean_shutdown(signal: ExitStatus, status: ExitStatus) {
     assert!(status.success(), "narjar should shut down cleanly");
 }
 
+fn wait_for_connection_refusal<T>(
+    deadline: Instant,
+    mut connect: impl FnMut() -> std::io::Result<T>,
+) {
+    for connection in std::iter::repeat_with(&mut connect) {
+        match connection {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("checking shutdown listener: {error}"),
+            Ok(stream) => drop(stream),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first SIGTERM must stop accepting connections"
+        );
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn shutdown_probe_retries_resets_and_open_connections_until_refused() {
+    let mut probes = [
+        Err(std::io::ErrorKind::ConnectionReset.into()),
+        Ok(()),
+        Err(std::io::ErrorKind::ConnectionRefused.into()),
+    ]
+    .into_iter();
+    wait_for_connection_refusal(Instant::now() + Duration::from_secs(1), || {
+        probes
+            .next()
+            .expect("shutdown must be established by refusal, not a reset")
+    });
+    assert_eq!(probes.len(), 0);
+}
+
+#[test]
+fn shutdown_probe_does_not_treat_resets_as_listener_closure() {
+    let result = std::panic::catch_unwind(|| {
+        wait_for_connection_refusal::<()>(Instant::now(), || {
+            Err(std::io::ErrorKind::ConnectionReset.into())
+        });
+    });
+    assert!(
+        result.is_err(),
+        "a reset without refusal must not satisfy the probe"
+    );
+}
+
+#[test]
+fn shutdown_probe_does_not_hide_other_connection_errors() {
+    let result = std::panic::catch_unwind(|| {
+        wait_for_connection_refusal::<()>(Instant::now() + Duration::from_secs(1), || {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+    });
+    assert!(result.is_err());
+}
+
 fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
     signed_narinfo_for(STORE_HASH, nar_hash, nar_size)
 }
@@ -2544,19 +2602,9 @@ impl RunningServer {
     }
 
     fn wait_until_listener_is_closed(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        for connection in std::iter::repeat_with(|| TcpStream::connect(&self.address)) {
-            match connection {
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
-                Err(error) => panic!("checking shutdown listener: {error}"),
-                Ok(stream) => drop(stream),
-            }
-            assert!(
-                Instant::now() < deadline,
-                "first SIGTERM must stop accepting connections"
-            );
-            thread::yield_now();
-        }
+        wait_for_connection_refusal(Instant::now() + Duration::from_secs(5), || {
+            TcpStream::connect(&self.address)
+        });
     }
 
     fn wait_for_metrics_containing(&self, expected: &str) {
