@@ -143,9 +143,11 @@ reading metadata; the roots remain until the push finishes. Normal unprivileged
 users register temporary roots with `AddTempRoot` through the native Nix daemon
 socket and keep that connection alive for the entire push. A missing lock file
 is created only when the local state directory is writable; symlinks and
-non-regular lock files are rejected. No separate root-directory configuration,
-Nix subprocess, or additional dependency is needed. Failure to establish roots
-aborts the push before metadata lookup.
+non-regular lock files are rejected. Permission-denied or read-only failures
+opening the lock or installing local roots use the same daemon path. Invalid
+paths and other rooting failures remain errors. No separate root-directory
+configuration, Nix subprocess, or additional dependency is needed. Failure to
+establish roots aborts the push before metadata lookup.
 Each native HTTP request has a 30-second timeout by default; `--timeout-seconds` or
 `NARJAR_PUSH_TIMEOUT_SECONDS` changes it.
 

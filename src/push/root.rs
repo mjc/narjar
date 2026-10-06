@@ -1,6 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
+    io,
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
@@ -53,15 +54,35 @@ impl StoreRoots {
         read_metadata: impl FnOnce(&Path) -> Result<T, PushError>,
     ) -> Result<(Self, T), PushError> {
         match gc_lock {
-            Ok(gc_lock) => Self::hold_and_read_metadata(
-                state_dir,
-                store_paths
+            Ok(gc_lock) => {
+                let targets = store_paths
                     .iter()
                     .map(|path| local_store_path(path))
-                    .collect::<Result<Vec<_>, _>>()?,
-                gc_lock,
-                read_metadata,
-            ),
+                    .collect::<Result<Vec<_>, _>>()?;
+                Self::hold_and_read_metadata(
+                    state_dir,
+                    store_paths,
+                    gc_lock,
+                    Self::hold_in(state_dir, targets),
+                    read_metadata,
+                )
+            }
+            Err(error) => {
+                let roots =
+                    Self::hold_local_roots_or_use_daemon(state_dir, store_paths, Err(error))?;
+                let metadata = read_metadata(state_dir)?;
+                Ok((roots, metadata))
+            }
+        }
+    }
+
+    fn hold_local_roots_or_use_daemon(
+        state_dir: &Path,
+        store_paths: &[String],
+        local_roots: io::Result<Self>,
+    ) -> Result<Self, PushError> {
+        match local_roots {
+            Ok(roots) => Ok(roots),
             Err(error)
                 if error.kind() == std::io::ErrorKind::PermissionDenied
                     || error.kind() == std::io::ErrorKind::ReadOnlyFilesystem =>
@@ -71,11 +92,9 @@ impl StoreRoots {
                         "protecting store paths through the Nix daemon: {error}"
                     ))
                 })?;
-                let roots = Self::Daemon {
+                Ok(Self::Daemon {
                     _connection: connection,
-                };
-                let metadata = read_metadata(state_dir)?;
-                Ok((roots, metadata))
+                })
             }
             Err(error) => Err(PushError::new(format!(
                 "protecting store paths from Nix GC: {error}"
@@ -85,32 +104,30 @@ impl StoreRoots {
 
     fn hold_and_read_metadata<T>(
         state_dir: &Path,
-        targets: Vec<PathBuf>,
+        store_paths: &[String],
         _gc_lock: GcReadLock,
+        local_roots: io::Result<Self>,
         read_metadata: impl FnOnce(&Path) -> Result<T, PushError>,
     ) -> Result<(Self, T), PushError> {
-        let roots = Self::hold_in(state_dir, targets)?;
+        let roots = Self::hold_local_roots_or_use_daemon(state_dir, store_paths, local_roots)?;
         let metadata = read_metadata(state_dir)?;
         Ok((roots, metadata))
     }
 
-    fn hold_in(
-        state_dir: &Path,
-        targets: impl IntoIterator<Item = PathBuf>,
-    ) -> Result<Self, PushError> {
+    fn hold_in(state_dir: &Path, targets: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
         let mut roots = LocalRoots {
             directory: open_automatic_root_directory(state_dir)?,
             entries: Vec::new(),
         };
         targets.into_iter().try_for_each(|target| {
-            let store_dir = target
-                .parent()
-                .ok_or_else(|| PushError::new("store path has no parent"))?;
+            let store_dir = target.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "store path has no parent")
+            })?;
             let target = NativeStorePath::validate(store_dir, &target)
-                .map_err(|error| PushError::new(format!("rooting a live store path: {error}")))?;
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             let entry = allocate_root_entry(&roots.directory, target.as_path())?;
             roots.entries.push(entry);
-            Ok::<(), PushError>(())
+            Ok::<(), io::Error>(())
         })?;
         Ok(Self::Local { _roots: roots })
     }
@@ -124,16 +141,13 @@ impl Drop for LocalRoots {
     }
 }
 
-fn open_automatic_root_directory(state_dir: &Path) -> Result<File, PushError> {
-    let open = || {
-        let state = open_directory(state_dir)?;
-        let roots = ensure_directory_at(&state, OsStr::new("gcroots"), "Nix GC roots directory")?;
-        ensure_directory_at(&roots, OsStr::new("auto"), "Nix automatic roots directory")
-    };
-    open().map_err(|error: std::io::Error| PushError::new(format!("opening Nix GC roots: {error}")))
+fn open_automatic_root_directory(state_dir: &Path) -> io::Result<File> {
+    let state = open_directory(state_dir)?;
+    let roots = ensure_directory_at(&state, OsStr::new("gcroots"), "Nix GC roots directory")?;
+    ensure_directory_at(&roots, OsStr::new("auto"), "Nix automatic roots directory")
 }
 
-fn allocate_root_entry(automatic_roots: &File, target: &Path) -> Result<OsString, PushError> {
+fn allocate_root_entry(automatic_roots: &File, target: &Path) -> io::Result<OsString> {
     (0..128)
         .find_map(|_| {
             let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
@@ -141,14 +155,10 @@ fn allocate_root_entry(automatic_roots: &File, target: &Path) -> Result<OsString
             match symlinkat(target, automatic_roots, &entry) {
                 Ok(()) => Some(Ok(entry)),
                 Err(rustix::io::Errno::EXIST) => None,
-                Err(error) => Some(Err(format!(
-                    "creating Nix GC root for {}: {error}",
-                    target.display()
-                )
-                .into())),
+                Err(error) => Some(Err(error.into())),
             }
         })
-        .unwrap_or_else(|| Err("could not allocate a unique Nix GC root".into()))
+        .unwrap_or_else(|| Err(io::Error::other("could not allocate a unique Nix GC root")))
 }
 
 #[cfg(test)]
@@ -158,6 +168,80 @@ mod tests {
     use tempfile::tempdir;
 
     use super::StoreRoots;
+
+    #[test]
+    fn read_only_root_installation_uses_daemon_roots_under_the_acquired_gc_lock() {
+        use std::{
+            io::{self, Read, Write},
+            os::unix::net::UnixListener,
+            time::Duration,
+        };
+
+        let directory = tempdir().unwrap();
+        let state_dir = directory.path();
+        fs::create_dir(state_dir.join("daemon-socket")).unwrap();
+        let listener = UnixListener::bind(state_dir.join("daemon-socket/socket")).unwrap();
+        let path = "/nix/store/00000000000000000000000000000000-live";
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let read_number = |stream: &mut std::os::unix::net::UnixStream| {
+                let mut bytes = [0; 8];
+                stream.read_exact(&mut bytes).unwrap();
+                u64::from_le_bytes(bytes)
+            };
+            assert_eq!(read_number(&mut stream), 0x6e69_7863);
+            assert_eq!(read_number(&mut stream), 0x0112);
+            stream.write_all(&0x6478_696fu64.to_le_bytes()).unwrap();
+            stream.write_all(&0x0126u64.to_le_bytes()).unwrap();
+            assert_eq!(read_number(&mut stream), 0);
+            assert_eq!(read_number(&mut stream), 0);
+            stream.write_all(&0x616c_7473u64.to_le_bytes()).unwrap();
+            assert_eq!(read_number(&mut stream), 11);
+            let length = read_number(&mut stream) as usize;
+            assert_eq!(length, path.len());
+            let mut registered = vec![0; length.next_multiple_of(8)];
+            stream.read_exact(&mut registered).unwrap();
+            assert_eq!(&registered[..length], path.as_bytes());
+            stream.write_all(&0x616c_7473u64.to_le_bytes()).unwrap();
+            stream.write_all(&1u64.to_le_bytes()).unwrap();
+            assert_eq!(
+                stream.read(&mut [0]).unwrap(),
+                0,
+                "root connection closes on drop"
+            );
+        });
+        let gc_lock = crate::native_store::gc::GcReadLock::acquire(state_dir).unwrap();
+        let collector = fs::File::open(state_dir.join("gc.lock")).unwrap();
+        let (roots, ()) = StoreRoots::hold_and_read_metadata(
+            state_dir,
+            &[path.to_owned()],
+            gc_lock,
+            Err(io::Error::from(io::ErrorKind::ReadOnlyFilesystem)),
+            |_| {
+                let error = rustix::fs::flock(
+                    &collector,
+                    rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                )
+                .unwrap_err();
+                assert_eq!(io::Error::from(error).kind(), io::ErrorKind::WouldBlock);
+                Ok(())
+            },
+        )
+        .expect(
+            "daemon protects the path before metadata lookup despite EROFS installing local roots",
+        );
+        assert!(matches!(roots, StoreRoots::Daemon { .. }));
+        rustix::fs::flock(
+            &collector,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .unwrap();
+        drop(roots);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn inaccessible_local_gc_locks_use_the_daemon_but_other_failures_do_not() {
@@ -269,8 +353,12 @@ mod tests {
         fs::write(&path, b"root target").unwrap();
         let collector = fs::File::open(state_dir.join("gc.lock")).unwrap();
         let gc_lock = crate::native_store::gc::GcReadLock::acquire(state_dir).unwrap();
-        let (roots, ()) =
-            StoreRoots::hold_and_read_metadata(state_dir, vec![path.clone()], gc_lock, |_| {
+        let (roots, ()) = StoreRoots::hold_and_read_metadata(
+            state_dir,
+            &[],
+            gc_lock,
+            StoreRoots::hold_in(state_dir, [path.clone()]),
+            |_| {
                 assert_eq!(fs::read_dir(&roots_directory).unwrap().count(), 1);
                 let error = rustix::fs::flock(
                     &collector,
@@ -282,8 +370,9 @@ mod tests {
                     std::io::ErrorKind::WouldBlock
                 );
                 Ok(())
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         // Uploads retain roots, but do not keep the global GC lock held.
         rustix::fs::flock(
             &collector,
@@ -334,10 +423,13 @@ mod tests {
             .join("00000000000000000000000000000000-live");
         fs::write(&live, b"root target").unwrap();
         let gc_lock = crate::native_store::gc::GcReadLock::acquire(directory.path()).unwrap();
-        let result =
-            StoreRoots::hold_and_read_metadata(directory.path(), vec![live], gc_lock, |_| {
-                Err::<(), _>(super::PushError::new("metadata lookup failed"))
-            });
+        let result = StoreRoots::hold_and_read_metadata(
+            directory.path(),
+            &[],
+            gc_lock,
+            StoreRoots::hold_in(directory.path(), [live]),
+            |_| Err::<(), _>(super::PushError::new("metadata lookup failed")),
+        );
         assert!(result.is_err());
         assert_eq!(fs::read_dir(&roots_directory).unwrap().count(), 0);
         let collector = fs::File::open(directory.path().join("gc.lock")).unwrap();
