@@ -3476,6 +3476,23 @@ fn process_lock_replacement_probe() {
 }
 
 #[test]
+fn reconciliation_recognizes_all_initialized_storage_layout_artifacts() {
+    let backends = std::iter::once(SupportedStorageBackend::FLAT)
+        .chain(SupportedStorageBackend::try_from(StorageBackend::Chunked).ok());
+    for backend in backends {
+        let (_directory, storage) = storage_fixture(backend);
+        let report = storage
+            .reconcile(NonZeroUsize::new(64).unwrap(), SystemTime::now())
+            .unwrap();
+        assert!(
+            report.entries().is_empty(),
+            "normal layout artifacts are not anomalies: {:?}",
+            report.entries()
+        );
+    }
+}
+
+#[test]
 fn reconciliation_is_deterministic_bounded_and_reports_manual_changes() {
     let (directory, storage) = flat_storage_fixture();
     fs::write(directory.path().join("manual"), b"manual").expect("write manual file");
