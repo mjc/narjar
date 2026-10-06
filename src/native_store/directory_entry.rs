@@ -3,13 +3,13 @@ use std::{
     os::unix::ffi::OsStrExt,
 };
 
-pub(super) struct NativeDirectoryEntry {
-    pub(super) filesystem_name: OsString,
+pub(crate) struct NativeDirectoryEntry {
+    filesystem_name: OsString,
     nar_name_length: usize,
 }
 
 impl NativeDirectoryEntry {
-    pub(super) fn new(filesystem_name: OsString) -> Self {
+    pub(crate) fn new(filesystem_name: OsString) -> Self {
         let nar_name_length = nar_entry_name_for_filesystem_name(&filesystem_name).len();
         Self {
             filesystem_name,
@@ -17,10 +17,14 @@ impl NativeDirectoryEntry {
         }
     }
 
-    pub(super) fn nar_name(&self) -> &OsStr {
+    pub(crate) fn nar_name(&self) -> &OsStr {
         // Construction measures a prefix of this same owned name. Sorting
         // doesn't need to rescan case-hack suffixes or own another allocation.
         OsStr::from_bytes(&self.filesystem_name.as_bytes()[..self.nar_name_length])
+    }
+
+    pub(crate) fn filesystem_name(&self) -> &OsStr {
+        &self.filesystem_name
     }
 }
 

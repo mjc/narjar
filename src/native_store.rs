@@ -17,6 +17,7 @@ pub(crate) mod daemon_roots;
     expect(dead_code, reason = "NARJ-141 connects native NAR delivery to HTTP")
 )]
 pub(crate) mod delivery;
+pub(crate) mod directory_entry;
 pub(crate) mod gc;
 #[expect(
     dead_code,

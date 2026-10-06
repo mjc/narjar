@@ -16,11 +16,7 @@ use narjar::{
 };
 use rustix::fs::{self, AtFlags, FileType};
 
-use super::lease::NativeStoreLease;
-
-#[path = "directory_entry.rs"]
-mod directory_entry;
-use directory_entry::NativeDirectoryEntry;
+use super::{directory_entry::NativeDirectoryEntry, lease::NativeStoreLease};
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 const DISCARD_BUFFER_SIZE: usize = 64 * 1024;
@@ -212,7 +208,7 @@ fn emit_directory_at<W: Write>(
         encoder
             .push(Event::Entry(entry.nar_name().as_bytes()))
             .map_err(encode_io_error)?;
-        emit_node_at(encoder, &directory, &entry.filesystem_name)?;
+        emit_node_at(encoder, &directory, entry.filesystem_name())?;
     }
     encoder.push(Event::EndDirectory).map_err(encode_io_error)
 }
@@ -327,9 +323,11 @@ mod tests {
             .collect();
         let run = || {
             for name in &names {
-                black_box(super::directory_entry::nar_entry_name_for_filesystem_name(
-                    black_box(name),
-                ));
+                black_box(
+                    crate::native_store::directory_entry::nar_entry_name_for_filesystem_name(
+                        black_box(name),
+                    ),
+                );
             }
         };
         let (_, counts) = super::test_allocations::measure(run);
@@ -689,7 +687,7 @@ mod tests {
             super::sorted_directory_entries(&directory)
                 .expect("enumerate store directory")
                 .into_iter()
-                .map(|entry| entry.filesystem_name)
+                .map(|entry| entry.filesystem_name().to_owned())
                 .collect::<Vec<_>>()
         };
 

@@ -1,11 +1,12 @@
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
 use super::{NarInfoMetadata, PushError, payload::write_encoded_nar};
-use crate::verified_stream::VerifiedStream;
+use crate::{native_store::directory_entry::NativeDirectoryEntry, verified_stream::VerifiedStream};
 use narjar::nar_encode::{EncodeSummary, Encoder, Event};
 use narjar::object::{ContentIdentity, NarRepresentation};
 
@@ -93,21 +94,17 @@ fn emit_directory<W: Write>(encoder: &mut Encoder<W>, path: &Path) -> io::Result
         .map_err(encode_io_error)?;
 
     let mut entries = fs::read_dir(path)?
-        .map(|entry| {
-            let entry = entry?;
-            let name = entry.file_name();
-            #[cfg(unix)]
-            let bytes = std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str()).to_vec();
-            #[cfg(not(unix))]
-            let bytes = name.to_string_lossy().into_owned().into_bytes();
-            Ok((bytes, entry.path()))
-        })
+        .map(|entry| entry.map(|entry| NativeDirectoryEntry::new(entry.file_name())))
         .collect::<io::Result<Vec<_>>>()?;
-    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    entries.sort_unstable_by(|left, right| {
+        left.nar_name().as_bytes().cmp(right.nar_name().as_bytes())
+    });
 
-    for (name, child) in entries {
-        encoder.push(Event::Entry(&name)).map_err(encode_io_error)?;
-        emit_path(encoder, &child)?;
+    for entry in entries {
+        encoder
+            .push(Event::Entry(entry.nar_name().as_bytes()))
+            .map_err(encode_io_error)?;
+        emit_path(encoder, &path.join(entry.filesystem_name()))?;
     }
     encoder.push(Event::EndDirectory).map_err(encode_io_error)
 }
@@ -210,6 +207,131 @@ mod tests {
             .decode(&mut sink)
             .expect("decode serialized fixture");
         assert_eq!(names, [b"a".to_vec(), b"link".to_vec(), b"z".to_vec()]);
+    }
+
+    fn encode_directory_fixture(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        use narjar::nar_encode::{Encoder, Event};
+        let mut encoder = Encoder::new(Vec::new()).expect("fixture header");
+        encoder
+            .push(Event::BeginDirectory)
+            .expect("fixture directory");
+        for (name, contents) in entries {
+            encoder
+                .push(Event::Entry(name))
+                .expect("canonical fixture name");
+            encoder
+                .push(Event::BeginFile {
+                    executable: false,
+                    size: contents.len() as u64,
+                })
+                .expect("fixture file");
+            encoder
+                .push(Event::FileChunk(contents))
+                .expect("fixture contents");
+            encoder.push(Event::EndFile).expect("fixture file end");
+        }
+        encoder
+            .push(Event::EndDirectory)
+            .expect("fixture directory end");
+        encoder.finish().expect("complete fixture").0
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_darwin_push_preserves_literal_case_hack_markers_in_filenames() {
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let entries = [
+            (b"readme".as_slice(), b"ordinary".as_slice()),
+            (b"readme~nix~case~hack~1".as_slice(), b"literal".as_slice()),
+        ];
+        for (name, contents) in entries {
+            use std::os::unix::ffi::OsStrExt;
+            fs::write(
+                directory.path().join(std::ffi::OsStr::from_bytes(name)),
+                contents,
+            )
+            .unwrap();
+        }
+        let mut actual = Vec::new();
+        write_nar(directory.path(), &mut actual).expect("serialize literal filenames");
+        assert_eq!(actual, encode_directory_fixture(&entries));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_push_projects_and_sorts_nar_names_but_opens_original_paths_for_every_encoding() {
+        use narjar::__private::nar_compression::encode_and_measure_nar;
+        use narjar::object::{CompressedNarIdentity, CompressionCodec};
+        let directory = tempfile::tempdir().expect("create case-hacked Nix store fixture");
+        for (name, contents) in [
+            ("README", b"upper".as_slice()),
+            ("readme~nix~case~hack~1", b"lower".as_slice()),
+            ("a~nix~case~hack~1", b"projected first".as_slice()),
+            ("az", b"physically first".as_slice()),
+        ] {
+            fs::write(directory.path().join(name), contents)
+                .expect("write physical store filename");
+        }
+        let expected_raw = encode_directory_fixture(&[
+            (b"README", b"upper"),
+            (b"a", b"projected first"),
+            (b"az", b"physically first"),
+            (b"readme", b"lower"),
+        ]);
+        let decoded = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&expected_raw).into()),
+            NarSize::new(expected_raw.len() as u64),
+        );
+        let mut actual_raw = Vec::new();
+        let summary =
+            write_nar(directory.path(), &mut actual_raw).expect("serialize case-hacked tree");
+        assert_eq!(actual_raw, expected_raw);
+        assert_eq!(NarHash::from_digest(summary.raw_sha256), decoded.hash());
+        assert_eq!(summary.raw_size, decoded.size().get());
+
+        for codec in [
+            None,
+            Some(CompressionCodec::Xz),
+            Some(CompressionCodec::Zstd),
+        ] {
+            let (representation, expected) = match codec {
+                None => (NarRepresentation::Raw(decoded), expected_raw.clone()),
+                Some(codec) => {
+                    let mut encoded = Vec::new();
+                    let identity = encode_and_measure_nar(codec, &mut encoded, |output| {
+                        output.write_all(&expected_raw)
+                    })
+                    .expect("encode independently constructed canonical NAR");
+                    (
+                        NarRepresentation::Compressed(CompressedNarIdentity::new(
+                            identity, decoded,
+                        )),
+                        encoded,
+                    )
+                }
+            };
+            let mut actual = Vec::new();
+            open_upload_reader_at(representation, directory.path().to_owned())
+                .expect("start verified producer")
+                .read_to_end(&mut actual)
+                .expect("every upload encoding must match the canonical NAR identity");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_push_rejects_two_physical_entries_with_the_same_projected_nar_name() {
+        let directory = tempfile::tempdir().expect("create collision fixture");
+        fs::write(directory.path().join("name"), b"first").unwrap();
+        fs::write(
+            directory.path().join("name~nix~case~hack~nonnumeric"),
+            b"second",
+        )
+        .unwrap();
+        let error = write_nar(directory.path(), Vec::new())
+            .expect_err("distinct physical entries must not become duplicate NAR entries");
+        assert!(error.to_string().contains("order"), "{error}");
     }
 
     #[test]
