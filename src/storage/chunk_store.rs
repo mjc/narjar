@@ -244,6 +244,28 @@ impl ChunkStore {
         Ok(Some(manifest))
     }
 
+    pub(crate) fn acquire_durable_manifest(
+        &self,
+        hash: NarHash,
+    ) -> Result<Option<super::chunked::ChunkManifest>, ChunkStoreError> {
+        self.acquire_manifest_with_directory_sync(hash, || self.manifests.sync_all())
+    }
+
+    fn acquire_manifest_with_directory_sync(
+        &self,
+        hash: NarHash,
+        sync_directory: impl FnOnce() -> io::Result<()>,
+    ) -> Result<Option<super::chunked::ChunkManifest>, ChunkStoreError> {
+        self.validate_manifest(hash)?
+            .map(|manifest| {
+                // Chunks are durable before a manifest can become visible.
+                // Complete a failed publisher's manifest-directory barrier.
+                sync_directory()?;
+                Ok(manifest)
+            })
+            .transpose()
+    }
+
     pub(crate) fn check_nar_availability(
         &self,
         identity: NarIdentity,
@@ -1284,9 +1306,14 @@ impl<'store> ChunkingWriter<'store> {
 
     fn publish_next_batch(&mut self, final_batch: bool) -> io::Result<()> {
         let specifications = self.next_chunk_specifications(final_batch)?;
-        for specification in &specifications {
-            self.reserve_before_materialization(&self.store.chunks, specification.length)?;
-        }
+        let batch_bytes = specifications
+            .iter()
+            .try_fold(0_u64, |total, specification| {
+                total.checked_add(specification.length).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "chunk batch size overflow")
+                })
+            })?;
+        self.reserve_before_materialization(&self.store.chunks, batch_bytes)?;
         let batch = specifications
             .iter()
             .map(|specification| PendingChunk {
@@ -1421,11 +1448,7 @@ impl<'store> ChunkingWriter<'store> {
             return Ok(());
         };
         reservation
-            .grow_to(
-                directory,
-                self.min_free_bytes,
-                reservation.reserved_bytes().saturating_add(bytes),
-            )
+            .grow_to(directory, self.min_free_bytes, bytes)
             .map_err(io_for_storage_error)
     }
 
@@ -1780,6 +1803,50 @@ mod tests {
     }
 
     #[test]
+    fn chunked_ingestion_spends_admitted_credit_before_requesting_more_space() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let profile = ChunkProfile::MinCdcHash4V2;
+        let input = deterministic_chunk_fixture(profile.max_size() as usize * 18);
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        let budget = std::sync::Arc::new(std::sync::Mutex::new(StagingBudget::default()));
+        let capacity = StorageCapacity {
+            total_bytes: input.len() as u64 + 10,
+            available_bytes: input.len() as u64 + 10,
+            total_inodes: 100,
+            available_inodes: 100,
+            read_only: false,
+        };
+        let reservation = crate::storage::fs::reserve_staging_bytes_for_test(
+            &budget,
+            10,
+            input.len() as u64,
+            || Ok(capacity),
+        )
+        .unwrap();
+        // No growth can pass this floor. The admitted credit must cover all
+        // payload batches even as those bytes become materialized on disk.
+        let mut writer = store
+            .begin_ingest_with_reservation(profile, reservation, u64::MAX)
+            .unwrap();
+        writer
+            .write_all(&input)
+            .expect("already admitted payload must fit");
+        writer.publish_pending_chunk().unwrap();
+        assert_eq!(budget.lock().unwrap().outstanding_bytes(), 0);
+        assert_eq!(writer.reservation.as_ref().unwrap().reserved_bytes(), 0);
+        // The manifest is an additional, separately budgeted allocation.
+        writer.min_free_bytes = 0;
+        let completed = writer.finish(identity).unwrap();
+        completed.release_reservation();
+        store.check_nar_availability(identity).unwrap();
+    }
+
+    #[test]
     fn multi_batch_ingest_accounts_each_chunk_and_reconstructs_exact_bytes() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
@@ -2085,6 +2152,45 @@ mod tests {
             store.read_range(hash, invalid_start..invalid_end, 1_000_000, &mut range),
             Err(ChunkStoreError::InvalidRange { .. })
         ));
+    }
+
+    #[test]
+    fn canonical_manifest_acquisition_cannot_skip_a_failed_directory_barrier() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = b"canonical chunked NAR";
+        let hash = NarHash::from_digest(Sha256::digest(input).into());
+        let identity = NarIdentity::new(hash, NarSize::new(input.len() as u64));
+        store
+            .store_nar(Cursor::new(input), identity, ChunkProfile::MinCdcHash4V2)
+            .unwrap();
+
+        let result = store.acquire_manifest_with_directory_sync(hash, || {
+            Err(std::io::Error::other(
+                "injected manifest directory sync failure",
+            ))
+        });
+        assert!(matches!(result, Err(ChunkStoreError::Io(error))
+            if error.to_string() == "injected manifest directory sync failure"));
+        assert_eq!(
+            store
+                .acquire_durable_manifest(hash)
+                .unwrap()
+                .unwrap()
+                .identity(),
+            identity
+        );
+
+        let missing = NarHash::from_digest([0; 32]);
+        assert!(
+            store
+                .acquire_manifest_with_directory_sync(missing, || {
+                    panic!("missing manifests must not run a publication barrier")
+                })
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

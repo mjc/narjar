@@ -1,44 +1,51 @@
-# Semantic NAR threat model
+# NAR codec limits and validation
 
-Phase A covers the decoder and encoder codecs and prototypes. The cache server
-does not parse NAR semantics; publication and serving rows below describe
-caller obligations for a future semantic store.
+This document covers the public `nar` decoder and `nar_encode` encoder. The
+cache server verifies uploaded byte identities but does not parse NAR grammar.
+Producer signatures do not make archive contents safe to parse.
 
-A valid producer signature authenticates metadata; it does not make the
-producer or its key holder non-malicious. The codec therefore rejects malformed and
-non-canonical input before it can become a reader-visible semantic root.
+## Format
 
-| Input or actor | Resource/correctness impact | Enforcing boundary | Evidence | Recovery | Residual risk |
-| --- | --- | --- | --- | --- | --- |
-| Authenticated malicious writer | Deep nesting and stack/heap growth | `Limits::max_depth`; encoder node stack and depth-limited decoder recursion | decoder limit tests; bounded encoder fuzz target | Reject the object before publication | Limits must remain aligned with deployment budgets |
-| Authenticated malicious writer | Huge names or symlink targets | `max_name_bytes`, `max_symlink_target_bytes`; raw-byte validation | decoder and encoder boundary tests | Reject the object and retain no root | A high limit can still be operationally expensive |
-| Authenticated malicious writer | Entry/inode fan-out | `max_entries` and `max_work` | decoder limit tests; encoder event-work limit | Abort the event stream before object creation | Semantic object/inode quotas are later admission work |
-| Authenticated malicious writer | File/NAR memory or disk exhaustion | `max_file_bytes`, `max_total_bytes`; file bodies stream in chunks | 20 GiB RSS harness; decoder/encoder size checks | Fail closed and discard incomplete output | Publication/storage quotas remain separate |
-| Corrupted or truncated NAR | Wrong hash, size, or reconstructed bytes | Exact framing, padding, EOF, hash, and size validation | decoder negative tests; corpus byte round trips | Do not expose a root; retry transport if applicable | Transport-level corruption still needs retry policy |
-| Non-canonical producer | Hash identity drift from directory order or names | Strict ordering, forbidden-name, executable-marker, and NUL checks | NARJ-78 corpus equality and negative tests | Reject rather than normalize | New grammar versions require a new contract version |
-| Faulting output/storage sink | Partial semantic publication | `Write::write_all` plus typed `EncodeError::Io`; caller must discard failed output | faulting/short-write tests | Remove or quarantine the failed temporary | Publication recovery belongs to storage boundaries |
-| Unauthenticated reader | Range or reconstruction CPU amplification | No reconstruction or serving integration in this prototype; raw codec work is bounded | explicit non-goal; future range limits required | Serving layer must reject over-budget work | Serving design must enforce separate read budgets |
-| Compromised producer key | Malicious but correctly signed archives | Same parser/codec limits and canonical checks; signature is not a trust bypass | fuzz and limit targets | Reject malformed objects and rotate/revoke keys operationally | Key rotation and operator response are outside this codec |
+NAR starts with `nix-archive-1`. Each string has a little-endian u64 length,
+its bytes, and zero padding to an eight-byte boundary. Nodes are regular
+files, symlinks, or directories. Regular files have contents and an optional
+executable marker; symlinks have a target; directories contain named children
+in strictly increasing byte order.
+
+The decoder rejects invalid tags, lengths, padding, names, ordering, symlink
+targets, truncation, and bytes after the root. It hashes and counts the original
+stream. Callers compare the returned hash and size with any expected identity.
+The encoder checks event ordering and writes canonical framing.
+
+See the [NAR format](https://nix.dev/manual/nix/2.35/protocols/nix-archive/)
+and [byte fixtures](evidence/nar-vectors.json).
 
 ## Current codec defaults
 
-`nar::Limits::default()` sets the codec limits: depth 1,024;
-names/targets 1 MiB; 10 million entries; 64 GiB per file; 128 GiB total raw
-NAR bytes; and 2^34 work units. Callers can supply their own `Limits`. These
-defaults differ from the earlier [NARJ-76 proposal](nar-semantic-model.md) and
-are separate from the cache server's encoded/decoded upload and decoder-memory
-limits. Fuzz targets use substantially smaller limits to make boundary
-transitions frequent and deterministic.
+Both codecs use `nar::Limits`:
 
-The encoder uses the same limit structure as the decoder. It checks limits
-before writing the bytes that would exceed them, so a rejected event cannot
-silently extend the output past the configured raw-size budget.
+| Limit | Default |
+| --- | ---: |
+| Nesting depth | 1,024 |
+| Name or symlink target | 1 MiB |
+| Entries | 10 million |
+| File contents | 64 GiB |
+| Total NAR bytes | 128 GiB |
+| Work units | 2^34 |
 
-## Fuzzing boundary
+Callers can lower these limits. File contents stream through bounded chunks;
+open directories retain traversal and ordering metadata. These defaults are
+not a promise that Nix accepts every archive within them. Server upload and
+compressed-decoder limits are separate.
 
-`nar_decode` mutates arbitrary raw bytes under bounded decoder limits.
-`nar_encode` mutates event transitions, names, targets, file sizes, chunks,
-and close events under bounded encoder limits. Neither target treats a crash
-or timeout as proof of safety; retained failures become minimized regression
-fixtures. Descriptor, seek-index, pack/object, delta, and range-amplification
-targets remain future work as those surfaces are introduced.
+The encoder checks byte limits before writes. A failure can leave partial
+output; callers must discard it. Input I/O, sink, structural, and limit errors
+remain distinct. Neither codec publishes objects or manages disk quotas.
+
+## Tests and fuzzing
+
+`tests/nar_decoder.rs`, `tests/nar_encoder.rs`, and `tests/nar_allocations.rs`
+cover malformed input, canonical round trips, limits, typed errors, partial
+writes, traversal depth, and buffer reuse. The `nar_decode` and `nar_encode`
+fuzz targets use smaller limits to exercise the same boundaries. See the
+[fuzzing instructions](../fuzz/README.md).

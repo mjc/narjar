@@ -82,7 +82,6 @@ crash_server() {
 temp_root=$(mktemp -d "${TMPDIR:-/tmp}/narjar-nix-e2e.XXXXXX")
 temp_root=$(cd "$temp_root" && pwd -P)
 export XDG_CACHE_HOME="$temp_root/nix-cache"
-export NARJAR_PUSH_GCROOTS="$temp_root/nix-gcroots/auto"
 cleanup() {
   stop_server
   rm -rf -- "$temp_root"
@@ -286,7 +285,6 @@ trusted_key=$(<"$public_key")
 wrong_key=$(<"$wrong_public_key")
 
 run mkdir -p "$data_dir"
-run mkdir -p "$NARJAR_PUSH_GCROOTS"
 run narjar init --data-dir "$data_dir" --storage-backend "$storage_backend"
 token=$(run narjar token create --data-dir "$data_dir" --scope write --name nix-e2e)
 run cp "$public_key" "$data_dir/trusted-public-keys"
@@ -410,16 +408,21 @@ restart_source="$temp_root/restart.nar"
 run nix_cli store dump-path -- "$restart_path" > "$restart_source"
 restart_hash=$(nix_cli hash file --type sha256 --base32 "$restart_source")
 restart_url="nar/$restart_hash.nar"
-cache_curl --limit-rate 65536 \
-  --upload-file "$restart_source" \
-  "$server_url/$restart_url" \
-  >"$temp_root/restart-upload.log" 2>&1 &
-restart_upload_pid=$!
-wait_for_temp "$restart_upload_pid"
+# Keep the final body byte unsent: even a tiny NAR cannot finish publication
+# before the visibility assertion and crash. The staging file acknowledges
+# that the server has started processing this request, rather than a delay.
+restart_length=$(wc -c < "$restart_source")
+[[ "$restart_length" -gt 1 ]] || fail "restart fixture is too short"
+restart_auth=$(printf 'narjar:%s' "$token" | base64 | tr -d '\n')
+exec {restart_upload_fd}<>"/dev/tcp/127.0.0.1/${server_url##*:}"
+printf 'PUT /%s HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' \
+  "$restart_url" "$restart_auth" "$restart_length" >&"$restart_upload_fd"
+head -c "$((restart_length - 1))" "$restart_source" >&"$restart_upload_fd"
+wait_for_temp "$server_pid"
 [[ $(http_status "$server_url/$restart_url") == 404 ]] ||
   fail "in-progress publication became visible"
 crash_server
-wait "$restart_upload_pid" || true
+exec {restart_upload_fd}>&-
 start_server
 [[ $(http_status "$server_url/$restart_url") == 404 ]] ||
   fail "restart exposed a partial publication"
@@ -614,12 +617,9 @@ cat "$server_log"
 metrics_body="$temp_root/metrics"
 metrics_status=$(run curl --silent --show-error --netrc-file "$netrc" \
   --output "$metrics_body" --write-out '%{http_code}' "$server_url/metrics")
-if [[ "$metrics_status" == 200 ]]; then
-  cat "$metrics_body"
-elif [[ "$metrics_status" == 404 ]]; then
-  printf 'SKIP metrics: the endpoint is scheduled after this baseline in the verification plan\n'
-else
+if [[ "$metrics_status" != 200 ]]; then
   fail "unexpected metrics status: $metrics_status"
 fi
+cat "$metrics_body"
 
 printf '\nPASS real-Nix end-to-end verification\n'

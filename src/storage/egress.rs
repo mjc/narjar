@@ -32,7 +32,7 @@ use super::{CleanupAction, EGRESS_RECEIPT_DIRECTORY, location::TemporaryPath};
 
 pub(super) const MAX_EGRESS_RECEIPT_BYTES: u64 = 256;
 
-/// A canonical NAR whose backing storage and identity have been verified.
+/// A canonical NAR whose backing storage is durable and whose identity has been verified.
 pub(crate) struct VerifiedCanonicalNar<'storage> {
     storage: &'storage Storage,
     source: StoredNarSource<'storage>,
@@ -299,9 +299,7 @@ impl Storage {
         };
         let source = match &self.payloads {
             PayloadStorage::Flat => {
-                let file = self
-                    .open_nar(NarFileName::raw(identity.hash()))?
-                    .ok_or(StorageError::MissingNar)?;
+                let file = self.open_durable_nar(NarFileName::raw(identity.hash()))?;
                 let actual =
                     self.validated_delivery_identity(NarFileName::raw(identity.hash()), &file)?;
                 if actual != identity {
@@ -311,7 +309,7 @@ impl Storage {
             }
             PayloadStorage::Chunked(store) => {
                 let Some(manifest) = store
-                    .validate_manifest(identity.hash())
+                    .acquire_durable_manifest(identity.hash())
                     .map_err(super::operations::storage_error_for_chunk_store)?
                 else {
                     return Err(StorageError::MissingNar);
@@ -319,6 +317,9 @@ impl Storage {
                 if manifest.identity() != identity {
                     return Err(StorageError::NarMismatch);
                 }
+                store
+                    .check_nar_availability(identity)
+                    .map_err(super::operations::storage_error_for_chunk_store)?;
                 StoredNarSource::Chunked(store)
             }
         };
@@ -424,16 +425,27 @@ impl Storage {
         &self,
         output: EncodedIdentity,
     ) -> Result<ExistingDerivative, StorageError> {
+        self.inspect_derivative_with_directory_sync(output, File::sync_all)
+    }
+
+    fn inspect_derivative_with_directory_sync(
+        &self,
+        output: EncodedIdentity,
+        sync_directory: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<ExistingDerivative, StorageError> {
         let nar = self.nar_directory()?;
         open_optional_at(&nar, &output.file_name().os_string())?.map_or(
             Ok(ExistingDerivative::Missing),
             |file| {
-                Ok(
-                    encoded_file_matches(&file, output).map(|matches| match matches {
-                        true => ExistingDerivative::Usable(Validated::new(output)),
-                        false => ExistingDerivative::Corrupt,
-                    })?,
-                )
+                Ok(match encoded_file_matches(&file, output)? {
+                    true => {
+                        // A failed repair can leave valid replacement bytes
+                        // visible without completing its directory barrier.
+                        sync_directory(&nar)?;
+                        ExistingDerivative::Usable(Validated::new(output))
+                    }
+                    false => ExistingDerivative::Corrupt,
+                })
             },
         )
     }
@@ -587,5 +599,91 @@ impl Storage {
     #[cfg(test)]
     pub(super) fn egress_generations(&self) -> u64 {
         self.egress_generations.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::{
+        object::{NarHash, NarSize},
+        storage::{
+            CacheCreation, Directory, SupportedStorageBackend, publication::PublishBoundary,
+        },
+    };
+    use sha2::{Digest, Sha256};
+    use std::{fs, io::Cursor};
+
+    #[test]
+    fn derivative_reuse_completes_a_failed_repair_barrier_even_with_an_earlier_raw_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .unwrap()
+            .create_or_complete()
+            .unwrap();
+        let bytes = b"canonical raw NAR for a repaired derivative";
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(bytes).into()),
+            NarSize::new(bytes.len() as u64),
+        );
+        storage
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(identity.hash())),
+                Cursor::new(bytes),
+            )
+            .unwrap();
+        let raw = storage
+            .open_verified_canonical_nar(NarRepresentation::Raw(identity))
+            .unwrap();
+        for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
+            let slot = EgressSlot::new(identity, codec);
+            let NarRepresentation::Compressed(compressed) = storage
+                .select_compressed(&raw, slot, NarUploadPolicy::new(u64::MAX, 0))
+                .unwrap()
+            else {
+                panic!("compressed egress expected")
+            };
+            let output = compressed.encoded();
+            let path = directory
+                .path()
+                .join("nar")
+                .join(output.file_name().os_string());
+            let encoded = fs::read(&path).unwrap();
+            let mut corrupt = encoded.clone();
+            corrupt[0] ^= 1;
+            fs::write(&path, corrupt).unwrap();
+            let result = storage.publish_with(
+                PublishTarget::RepairEgressNar(output),
+                Cursor::new(&encoded),
+                |boundary| match boundary {
+                    PublishBoundary::BeforeParentSync => {
+                        Err(io::Error::other("injected repair sync failure").into())
+                    }
+                    _ => Ok(()),
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                encoded,
+                "repair rename left valid but unacknowledged bytes"
+            );
+
+            let result = storage.inspect_derivative_with_directory_sync(output, |_| {
+                Err(io::Error::other("injected reuse sync failure"))
+            });
+            assert!(matches!(result, Err(StorageError::Io(error))
+                if error.to_string() == "injected reuse sync failure"));
+            let reused = storage
+                .select_compressed(&raw, slot, NarUploadPolicy::new(u64::MAX, u64::MAX))
+                .unwrap();
+            assert_eq!(reused, NarRepresentation::Compressed(compressed));
+        }
+        assert_eq!(
+            storage.egress_generations(),
+            2,
+            "reuse must not regenerate either codec"
+        );
     }
 }

@@ -1,8 +1,8 @@
 # NAR research tools
 
-These tools are research-only. They are kept in the separate
-`scripts/nar-corpus` package, read NAR files and cache HTTP traffic, and do not
-write to a Narjar data directory or ship in the Narjar package.
+These tools read NAR files and cache HTTP traffic. The Rust programs live in
+`scripts/nar-corpus`; they are not part of the Narjar package and do not write
+to its data directory.
 
 ## Streaming decoder and corpus scan
 
@@ -23,7 +23,8 @@ target/release/nar-scan \
 
 ## Canonical streaming encoder
 
-`nix_archive::nar::Encoder` is a version-1 research-only event sink. It emits
+`nar-encode-bench` exercises `nix_archive::nar::Encoder`, not Narjar's public
+encoder. It emits
 the canonical NAR framing, checks strictly increasing directory names, streams
 file chunks directly to its writer, and computes the raw SHA-256 and size in
 the same pass. It keeps only the open-node stack and one previous name per open
@@ -38,8 +39,9 @@ scripts/nar-encode-memory --output /tmp/narjar-narj77.json
 ```
 
 The benchmark writes to `io::sink()` and therefore measures encoding work and
-memory without disk throughput or compression. The 2026-09-07 run is recorded
-at `/tmp/narjar-narj77-20260907-final.json`; its 1 GiB and 20 GiB cases used
+memory without disk throughput or compression. The historical 2026-09-07 run
+used `/tmp/narjar-narj77-20260907-final.json` (not a retained release artifact);
+its 1 GiB and 20 GiB cases used
 1,836 KiB and 1,640 KiB peak RSS respectively.
 
 `nar-reencode` validates byte-for-byte compatibility with an existing Nix NAR
@@ -52,8 +54,9 @@ nix-store --dump /nix/store/<path> | target/release/nar-reencode > reencoded.nar
 The final check used a Nix-produced 120-byte NAR and `cmp` reported identical
 input and re-encoded output.
 
-The corpus-wide streaming comparison is recorded at
-`/tmp/narjar-narj78-20260907.json`: 7,107 raw NARs totaling 78,503,939,680
+The historical corpus-wide streaming comparison used
+`/tmp/narjar-narj78-20260907.json` (not a retained release artifact):
+7,107 raw NARs totaling 78,503,939,680
 bytes produced 7,107 equal outputs and zero mismatches. The comparator uses a
 bounded stdin/stdout pipe and emits one result, first-difference offset, input
 SHA-256, and command record per NAR.
@@ -64,7 +67,7 @@ complete raw NAR length and SHA-256 plus structural counts. The decoder hashes
 and counts the original stream while emitting bounded file chunks; it does not
 materialize file contents.
 
-## Candidate-neutral tree sharing report
+## Tree sharing report
 
 Build `nar-tree-report` to derive domain-separated semantic tree identities
 from the same streaming events:
@@ -78,9 +81,8 @@ target/release/nar-tree-report \
 ```
 
 The report emits one `N` row per NAR, a global `G` reconciliation row, and `T`
-rows for unique tree identities. It counts only tree preimage bytes; file and
-symlink payload bytes are excluded. The NARJ-82 full-corpus
-result is retained at
+rows for unique tree identities. It counts tree preimage bytes, excluding file
+and symlink payloads. The full-corpus result is in
 [`benchmarks/results/2026-09-11-narj82-tree-sharing/report.md`](../benchmarks/results/2026-09-11-narj82-tree-sharing/report.md).
 
 ## Reproducible corpus evidence
@@ -97,8 +99,7 @@ scripts/nix-corpus collect \
   --log /tmp/corpus-collect.commands
 ```
 
-The log is plain shell-escaped command text suitable for attaching to the
-manifest and raw-artifact evidence.
+The log contains shell-escaped commands.
 
 ## Exact reuse report
 
@@ -114,7 +115,7 @@ scripts/nar-report \
 
 The output contains `objects.tsv`, `report.json`, and `commands.txt`. Candidate
 duplicates are reread from their original raw NAR ranges before being counted,
-so digest collisions are not treated as reuse. Reports include all corpus
+so matching hashes alone do not count as reuse. Reports include all corpus
 objects, target/machine/family/generation/subset slices, size buckets, and
 whole-NAR deduplication. No compression or delta encoding is modeled.
 
@@ -153,4 +154,4 @@ scripts/nar-memory \
 ```
 
 The default sizes are 1 MiB, 1 GiB, and 20 GiB. `peak_rss_kib` should remain
-bounded by decoder buffers and metadata rather than the declared file size.
+bounded by decoder buffers and metadata, independent of file size.

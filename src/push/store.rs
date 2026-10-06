@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::Path};
 
 use super::{NarInfoMetadata, PushError};
 use crate::native_store::metadata::NativeMetadataSnapshot;
@@ -8,11 +8,8 @@ pub(super) struct LocalStore {
 }
 
 impl LocalStore {
-    pub(super) fn open() -> Result<Self, PushError> {
-        let state_dir = std::env::var_os("NIX_STATE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/nix/var/nix"));
-        let metadata = NativeMetadataSnapshot::open(&state_dir)
+    pub(super) fn open(state_dir: &Path) -> Result<Self, PushError> {
+        let metadata = NativeMetadataSnapshot::open(state_dir)
             .map_err(|error| PushError::new(error.to_string()))?;
         Ok(Self { metadata })
     }
@@ -51,8 +48,7 @@ fn concrete_store_path(value: &str) -> Result<String, PushError> {
         .strip_prefix("/nix/store/")
         .filter(|relative| !relative.is_empty() && !relative.contains('/'))
         .ok_or_else(|| format!("native push requires a concrete store path: {value}"))?;
-    if relative.split_once('-').is_none() {
-        return Err(format!("invalid concrete store path: {value}").into());
-    }
+    narjar::__private::storage::validate_store_basename(relative)
+        .map_err(|_| PushError::new(format!("invalid concrete store path: {value}")))?;
     Ok(format!("/nix/store/{relative}"))
 }

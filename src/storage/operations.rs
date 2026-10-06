@@ -117,28 +117,40 @@ impl TemporaryLocation {
     }
 }
 
+#[derive(Clone, Copy)]
 enum DestinationPublicationAttempt {
     Existing,
     Created(TemporaryLocation),
     Repaired(TemporaryLocation),
 }
 
-struct CreatedDestination<'a> {
-    temporary_location: TemporaryLocation,
-    directory: &'a File,
-    path: &'a StorePath,
-}
+impl DestinationPublicationAttempt {
+    fn temporary_location(self) -> TemporaryLocation {
+        match self {
+            Self::Existing => TemporaryLocation::Staging,
+            Self::Created(location) | Self::Repaired(location) => location,
+        }
+    }
 
-impl<'a> CreatedDestination<'a> {
-    fn new(
-        temporary_location: TemporaryLocation,
-        directory: &'a File,
-        path: &'a StorePath,
-    ) -> Self {
-        Self {
-            temporary_location,
-            directory,
-            path,
+    fn record_linked_destination(
+        self,
+        path: &StorePath,
+        transaction: &mut PublicationTransaction,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Existing => Ok(()),
+            Self::Created(_) | Self::Repaired(_) => {
+                transaction.transition(PublicationState::Linked(path.clone()))
+            }
+        }
+    }
+
+    fn rollback_new_link(self, directory: &File, name: &OsStr) -> Result<(), StorageError> {
+        match self {
+            Self::Existing => Ok(()),
+            Self::Created(location) | Self::Repaired(location) => {
+                location.rollback_destination_before_durability(directory, name)
+            }
         }
     }
 }
@@ -261,7 +273,7 @@ enum PublicationProgress {
 }
 
 impl PublicationProgress {
-    fn created(location: TemporaryLocation) -> Self {
+    fn pending(location: TemporaryLocation) -> Self {
         Self::Pending(location)
     }
 
@@ -323,7 +335,8 @@ impl Storage {
     }
 
     fn existing_narinfo_matches(&self, expected: &NarInfoClaims) -> Result<bool, StorageError> {
-        let Some(file) = self.open_narinfo(expected.store())? else {
+        let destination = PublishTarget::NarInfo(expected.store()).destination();
+        let Some(file) = self.open_durable_destination(&destination)? else {
             return Ok(false);
         };
         let bytes = read_narinfo_file(file)?;
@@ -569,6 +582,37 @@ impl Storage {
     pub fn open_nar(&self, name: NarFileName) -> Result<Option<File>, StorageError> {
         let directory = self.nar_directory()?;
         open_optional_at(&directory, &name.os_string())
+    }
+
+    pub(super) fn open_durable_nar(&self, name: NarFileName) -> Result<File, StorageError> {
+        let destination = PublishTarget::Nar(name).destination();
+        self.open_durable_destination(&destination)?
+            .ok_or(StorageError::MissingNar)
+    }
+
+    fn open_durable_destination(
+        &self,
+        destination: &PublicationDestination,
+    ) -> Result<Option<File>, StorageError> {
+        self.open_destination_with_directory_sync(destination, File::sync_all)
+    }
+
+    fn open_destination_with_directory_sync(
+        &self,
+        destination: &PublicationDestination,
+        sync_directory: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<Option<File>, StorageError> {
+        self.with_destination_lock(destination, || {
+            let root = self.root_directory()?;
+            let directory = destination.path.open_parent(&root)?;
+            let file = open_optional_at(&directory, destination.path.name())?;
+            // A visible entry may be left by an interrupted publication. Wait
+            // for its publisher and complete the barrier before binding it.
+            if file.is_some() {
+                sync_directory(&directory)?;
+            }
+            Ok(file)
+        })
     }
 
     pub(crate) fn nar_size(&self, name: NarFileName) -> Result<Option<u64>, StorageError> {
@@ -862,35 +906,34 @@ impl Storage {
         checkpoint: &mut impl FnMut(PublishBoundary) -> Result<(), StorageError>,
         progress: &mut PublicationProgress,
     ) -> Result<PublishOutcome, StorageError> {
-        match self.place_temporary_at_destination_or_resolve_existing(
+        let attempt = self.place_temporary_at_destination_or_resolve_existing(
             destination,
             destination_directory,
             temp,
-        )? {
-            DestinationPublicationAttempt::Existing => {
-                transaction.transition(PublicationState::Published(destination.path.clone()))?;
-                Ok(PublishOutcome::Identical)
-            }
-            DestinationPublicationAttempt::Created(location) => {
-                *progress = PublicationProgress::created(location);
-                self.durably_finalize_created_destination(
-                    CreatedDestination::new(location, destination_directory, &destination.path),
-                    temp,
-                    transaction,
-                    checkpoint,
-                    progress,
-                )?;
-                Ok(PublishOutcome::Created)
-            }
-            DestinationPublicationAttempt::Repaired(location) => {
-                *progress = PublicationProgress::created(location);
-                self.durably_finalize_created_destination(
-                    CreatedDestination::new(location, destination_directory, &destination.path),
-                    temp,
-                    transaction,
-                    checkpoint,
-                    progress,
-                )?;
+        )?;
+        *progress = PublicationProgress::pending(attempt.temporary_location());
+        let barrier = (|| {
+            attempt
+                .temporary_location()
+                .synchronize_source_directory_after_destination_creation(temp)?;
+            attempt.record_linked_destination(&destination.path, transaction)?;
+            checkpoint(PublishBoundary::BeforeParentSync)?;
+            destination_directory.sync_all()?;
+            Ok::<_, StorageError>(())
+        })();
+        if let Err(error) = barrier {
+            attempt.rollback_new_link(destination_directory, destination.path.name())?;
+            return Err(error);
+        }
+        // The destination is durable even if recording that fact fails. Never
+        // roll it back because of a later journal or response failure.
+        progress.mark_durable();
+        transaction.transition(PublicationState::Published(destination.path.clone()))?;
+        checkpoint(PublishBoundary::AfterParentSync)?;
+        match attempt {
+            DestinationPublicationAttempt::Existing => Ok(PublishOutcome::Identical),
+            DestinationPublicationAttempt::Created(_) => Ok(PublishOutcome::Created),
+            DestinationPublicationAttempt::Repaired(_) => {
                 self.activity.record_egress_repair();
                 Ok(PublishOutcome::Created)
             }
@@ -974,41 +1017,6 @@ impl Storage {
             }
             Err(error) => Err(error.into()),
         }
-    }
-
-    fn durably_finalize_created_destination(
-        &self,
-        destination: CreatedDestination<'_>,
-        temp: &TemporaryFile,
-        transaction: &mut PublicationTransaction,
-        checkpoint: &mut impl FnMut(PublishBoundary) -> Result<(), StorageError>,
-        progress: &mut PublicationProgress,
-    ) -> Result<(), StorageError> {
-        destination
-            .temporary_location
-            .synchronize_source_directory_after_destination_creation(temp)?;
-        transaction.transition(PublicationState::Linked(destination.path.clone()))?;
-        if let Err(error) = checkpoint(PublishBoundary::BeforeParentSync) {
-            destination
-                .temporary_location
-                .rollback_destination_before_durability(
-                    destination.directory,
-                    destination.path.name(),
-                )?;
-            return Err(error);
-        }
-        if let Err(error) = destination.directory.sync_all() {
-            destination
-                .temporary_location
-                .rollback_destination_before_durability(
-                    destination.directory,
-                    destination.path.name(),
-                )?;
-            return Err(error.into());
-        }
-        transaction.transition(PublicationState::Published(destination.path.clone()))?;
-        progress.mark_durable();
-        checkpoint(PublishBoundary::AfterParentSync)
     }
 
     fn replace_corrupt_egress_derivative(
@@ -1352,5 +1360,50 @@ impl RecoveredStorage<'_> {
 
     pub const fn recovery_status(&self) -> RecoveryStatus {
         self.status
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::storage::{CacheCreation, Directory, SupportedStorageBackend};
+
+    #[test]
+    fn existing_object_acquisition_requires_directory_sync_under_its_publication_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .unwrap()
+            .create_or_complete()
+            .unwrap();
+        let store = StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let nar = NarHash::from_digest([0; 32]);
+        for target in [
+            PublishTarget::Nar(NarFileName::raw(nar)),
+            PublishTarget::NarInfo(&store),
+        ] {
+            let destination = target.destination();
+            storage
+                .publish(target, Cursor::new(b"stored bytes"))
+                .unwrap();
+            let lock = storage.destination_lock(storage.destination_key(&destination));
+            let result = storage.open_destination_with_directory_sync(&destination, |_| {
+                assert!(matches!(
+                    lock.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                Err(io::Error::other(
+                    "injected acquisition directory sync failure",
+                ))
+            });
+            assert!(matches!(result, Err(StorageError::Io(error))
+                if error.to_string() == "injected acquisition directory sync failure"));
+            assert!(
+                storage
+                    .open_durable_destination(&destination)
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 }

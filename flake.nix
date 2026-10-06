@@ -483,12 +483,17 @@
             wait "$pid"
             trap - EXIT
           '';
-          runtime-closure = env.pkgs.runCommand "narjar-runtime-closure" { } ''
-            if ${env.pkgs.nix}/bin/nix-store -qR ${env.narjar} | grep -Eq '(rustc|cargo-|rust-analyzer|clippy|nix-[0-9])'; then
-              exit 1
-            fi
-            touch $out
-          '';
+          runtime-closure =
+            let
+              closure = env.pkgs.closureInfo { rootPaths = [ env.narjar ]; };
+            in
+            env.pkgs.runCommand "narjar-runtime-closure" { } ''
+              test -s ${closure}/store-paths
+              forbidden_reference_status=0
+              grep -Eq '(rustc|cargo-|rust-analyzer|clippy|nix-[0-9])' ${closure}/store-paths || forbidden_reference_status=$?
+              test "$forbidden_reference_status" -eq 1
+              touch $out
+            '';
           module-evaluation = env.pkgs.writeText "narjar-module-evaluation" (
             import ./nix/module-eval-test.nix {
               pkgs = import nixpkgs {system = "x86_64-linux";};
@@ -518,6 +523,12 @@
           cargo-artifacts = env.cargoArtifacts;
           compile = env.narjar;
           package = env.narjar;
+        }
+        // lib.optionalAttrs env.pkgs.stdenv.isLinux {
+          module-startup = import ./nix/module-startup-test.nix {
+            pkgs = env.pkgs;
+            package = env.narjar;
+          };
         }
         // lib.optionalAttrs (system == staticSystem) {
           continuation-benchmark-launcher = continuationBenchmarkLauncher;

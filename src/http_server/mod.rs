@@ -2,7 +2,8 @@ mod request;
 mod response;
 
 pub use request::{
-    BodyReader, BodyReaderError, HeaderField, HeaderValue, Headers, Method, Request, RequestHeader,
+    BodyReader, BodyReaderError, HeaderField, HeaderValue, Headers, Method, Request,
+    RequestExpectation, RequestHeader,
 };
 pub use response::{
     CompletedTransfer, Response, ResponseHeader, StatusCode, TransferFailure, static_header,

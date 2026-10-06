@@ -2,7 +2,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io,
-    os::unix::ffi::OsStringExt,
+    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
     path::Path,
 };
 
@@ -52,6 +52,32 @@ pub fn open_regular_at(parent: impl AsFd, path: impl AsRef<Path>) -> io::Result<
 
 pub fn open_directory(path: &Path) -> io::Result<File> {
     open_directory_at(rustix::fs::CWD, path)
+}
+
+pub fn ensure_directory_at(parent: &File, name: &OsStr, label: &str) -> io::Result<File> {
+    match open_directory_at(parent, name) {
+        Ok(directory) => validate_directory(&directory, label),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Err(error) = fs::mkdirat(parent, name, Mode::from_raw_mode(0o755))
+                && error != rustix::io::Errno::EXIST
+            {
+                return Err(error.into());
+            }
+            let directory = open_directory_at(parent, name)?;
+            validate_directory(&directory, label)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn validate_directory(directory: &File, name: &str) -> io::Result<File> {
+    if directory.metadata()?.permissions().mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} has unsafe permissions"),
+        ));
+    }
+    directory.try_clone()
 }
 
 pub fn directory_names(directory: &File) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {

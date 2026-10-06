@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{Arc, Mutex, mpsc},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use super::compression::{
@@ -2955,6 +2955,165 @@ fn narinfo_publication_is_idempotent_for_matching_logical_claims() {
 }
 
 #[test]
+fn canonical_binding_waits_for_a_publisher_that_rolls_back_its_visible_nar() {
+    let (_directory, storage) = flat_storage_fixture();
+    let storage = Arc::new(storage);
+    let raw = b"a fully written NAR is not yet a durable publication";
+    let identity = NarIdentity::new(
+        NarHash::from_digest(Sha256::digest(raw).into()),
+        NarSize::new(raw.len() as u64),
+    );
+    let name = NarFileName::raw(identity.hash());
+    let (linked_tx, linked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let publisher = {
+        let storage = Arc::clone(&storage);
+        std::thread::spawn(move || {
+            storage.publish_with(PublishTarget::Nar(name), Cursor::new(raw), |boundary| {
+                if boundary == PublishBoundary::BeforeParentSync {
+                    linked_tx
+                        .send(())
+                        .expect("the NAR is visible but not durable");
+                    release_rx.recv().expect("release the failing publisher");
+                    return Err(io::Error::other("injected parent sync failure").into());
+                }
+                Ok(())
+            })
+        })
+    };
+    linked_rx.recv().expect("wait for the visible NAR");
+    let destination = PublishTarget::Nar(name).destination();
+    let publication_lock = storage.destination_lock(storage.destination_key(&destination));
+    let (result_tx, result_rx) = mpsc::channel();
+    let binding = {
+        let storage = Arc::clone(&storage);
+        std::thread::spawn(move || {
+            let result = storage
+                .open_verified_canonical_nar(NarRepresentation::Raw(identity))
+                .map(|_| ());
+            result_tx.send(result).expect("send the binding result");
+        })
+    };
+    let premature_binding =
+        wait_for_destination_lock_contender_or_result(&publication_lock, &result_rx);
+    release_tx.send(()).expect("allow the NAR rollback");
+    assert!(publisher.join().expect("join the publisher").is_err());
+    let result = premature_binding.unwrap_or_else(|| result_rx.recv().expect("binding result"));
+    binding.join().expect("join canonical binding");
+
+    assert!(
+        matches!(result, Err(StorageError::MissingNar)),
+        "narinfo binding must not retain a NAR removed by its failing publisher: {result:?}"
+    );
+    assert!(!storage.layout().nar_path(identity.hash()).exists());
+}
+
+// The publisher and this observer each own one lock reference. A third means
+// the contender reached the same lock; an early result exposes a bypass.
+// Waiting on that event, rather than a fixed delay, keeps the race controlled.
+fn wait_for_destination_lock_contender_or_result<T>(
+    lock: &Arc<Mutex<()>>,
+    result: &mpsc::Receiver<T>,
+) -> Option<T> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match result.try_recv() {
+            Ok(result) => return Some(result),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => panic!("contender disconnected"),
+        }
+        if Arc::strong_count(lock) >= 3 {
+            return None;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "contender never reached publication"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn identical_nar_retry_cannot_succeed_when_its_directory_sync_fails() {
+    let (_directory, storage) = flat_storage_fixture();
+    let identity = store_raw_nar(&storage, b"retry the same immutable NAR");
+    let result = storage.publish_nar_fault(
+        &identity.hash(),
+        Cursor::new(b"retry the same immutable NAR"),
+        PublishBoundary::BeforeParentSync,
+    );
+
+    assert!(
+        result.is_err(),
+        "identical success must complete the durability barrier"
+    );
+    assert!(
+        storage.layout().nar_path(identity.hash()).exists(),
+        "a failed retry must not remove the existing immutable object"
+    );
+    assert_eq!(
+        storage
+            .publish(
+                PublishTarget::Nar(NarFileName::raw(identity.hash())),
+                Cursor::new(b"retry the same immutable NAR")
+            )
+            .expect("a retry with a working barrier succeeds"),
+        PublishOutcome::Identical
+    );
+}
+
+#[test]
+fn failed_linked_journal_update_rolls_back_its_new_payload() {
+    let (_directory, storage) = flat_storage_fixture();
+    let nar = NarHash::parse(NAR_ID).unwrap();
+    let result = storage.publish_with(
+        PublishTarget::Nar(NarFileName::raw(nar)),
+        Cursor::new(b"NAR bytes"),
+        |boundary| {
+            if boundary == PublishBoundary::BeforeFinalLink {
+                obstruct_active_transaction_record_replacement(&storage);
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert!(!storage.layout().nar_path(nar).exists());
+    assert_eq!(storage.temporary_objects(), 0);
+}
+
+#[test]
+fn failed_published_journal_update_keeps_its_durable_payload() {
+    let (_directory, storage) = flat_storage_fixture();
+    let nar = NarHash::parse(NAR_ID).unwrap();
+    let result = storage.publish_with(
+        PublishTarget::Nar(NarFileName::raw(nar)),
+        Cursor::new(b"NAR bytes"),
+        |boundary| {
+            if boundary == PublishBoundary::BeforeParentSync {
+                obstruct_active_transaction_record_replacement(&storage);
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read(storage.layout().nar_path(nar)).unwrap(),
+        b"NAR bytes"
+    );
+    assert_eq!(storage.temporary_objects(), 0);
+}
+
+fn obstruct_active_transaction_record_replacement(storage: &Storage) {
+    let entries = fs::read_dir(storage.layout().transaction_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1, "one publication record is active");
+    fs::remove_file(&entries[0]).unwrap();
+    fs::create_dir(&entries[0]).unwrap();
+}
+
+#[test]
 fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
     let directory = TestDir::new();
     let storage = Arc::new(initialize_storage(directory.path()).expect("initialize storage"));
@@ -2981,6 +3140,9 @@ fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
     };
 
     linked_rx.recv().expect("wait for linked destination");
+    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
+    let destination = PublishTarget::Nar(NarFileName::raw(nar)).destination();
+    let publication_lock = storage.destination_lock(storage.destination_key(&destination));
     let (started_tx, started_rx) = mpsc::channel();
     let (outcome_tx, outcome_rx) = mpsc::channel();
     let contender = {
@@ -2997,7 +3159,8 @@ fn failed_publisher_cannot_invalidate_concurrent_identical_success() {
     };
 
     started_rx.recv().expect("wait for contender");
-    let early_outcome = outcome_rx.recv_timeout(Duration::from_secs(5)).ok();
+    let early_outcome =
+        wait_for_destination_lock_contender_or_result(&publication_lock, &outcome_rx);
     release_tx.send(()).expect("release failing publisher");
 
     assert!(winner.join().expect("join failing publisher").is_err());
@@ -3472,6 +3635,23 @@ fn process_lock_replacement_probe() {
             Err(StorageError::Locked)
         )),
         other => panic!("unexpected lock probe expectation: {other:?}"),
+    }
+}
+
+#[test]
+fn reconciliation_recognizes_all_initialized_storage_layout_artifacts() {
+    let backends = std::iter::once(SupportedStorageBackend::FLAT)
+        .chain(SupportedStorageBackend::try_from(StorageBackend::Chunked).ok());
+    for backend in backends {
+        let (_directory, storage) = storage_fixture(backend);
+        let report = storage
+            .reconcile(NonZeroUsize::new(64).unwrap(), SystemTime::now())
+            .unwrap();
+        assert!(
+            report.entries().is_empty(),
+            "normal layout artifacts are not anomalies: {:?}",
+            report.entries()
+        );
     }
 }
 

@@ -1,16 +1,17 @@
-# Narjar v0.1 protocol contract
+# HTTP binary-cache protocol
 
-Status: NARJ-4 draft. Authority is the pinned Nix source plus the raw captures
-under docs/evidence. Third-party implementations are comparison material only.
+This is the implemented v0.1 HTTP interface. See
+[protocol captures](evidence/nix-http-protocol.md) for Nix 2.31.5 and 2.35.2
+and [tests/nix-e2e.sh](../tests/nix-e2e.sh) for the locked real-Nix checks.
 
 ## Compatibility target
 
-| Axis | v0.1 classification |
+| Axis | Contract and evidence |
 | --- | --- |
-| Nix 2.31.5 | Required and captured |
-| Nix 2.35.2 | Required for tested routes; redirect/negative-cache comparison captured |
-| aarch64-darwin client | Required and captured |
-| x86_64-linux client | Required before release; unresolved |
+| Nix 2.31.5 | Historical protocol capture |
+| Nix 2.35.2 | Historical redirect/negative-cache comparison capture |
+| aarch64-darwin client | Historical protocol captures; native flat-storage package/test CI |
+| x86_64-linux client | Locked real-Nix end-to-end CI for flat and chunked storage |
 | Input-addressed store paths | Required |
 | Content-addressed store paths | Required and captured |
 | Basic/netrc | Required and captured |
@@ -18,14 +19,14 @@ under docs/evidence. Third-party implementations are comparison material only.
 | TLS | Required in deployment; terminated before Narjar |
 | Server-emitted redirects | Non-goal |
 | Client following HTTP 307 | Captured compatibility fact |
-| Proxy request buffering | Must be disabled; deployment proof unresolved |
+| Proxy request buffering | Must be disabled; configure the deployment proxy |
 | Persistent connections | Optional optimization |
 | Connection close between requests | Required to work |
 | Negative-cache refresh | Required operator behavior; captured |
 | compression=none, zstd, and xz writes | Required |
 | Other precompressed writes | Explicit non-goal |
 | Chunked request bodies | Explicit non-goal; Content-Length required |
-| Realisations | Explicit v0.1 non-goal unless Linux E2E proves required |
+| Realisations | Unsupported; no requests in the recorded corpus |
 | NAR listings, logs, mass query | Explicit non-goal |
 
 ## Read routes
@@ -45,12 +46,12 @@ with Allow. Private-read auth failures return 401 with a fixed
 WWW-Authenticate challenge. Authorization and path existence are not disclosed
 before auth.
 
-HEAD returns the GET status and headers, including Content-Length, without a
-body.
+HEAD returns the status and headers of a full GET, including Content-Length,
+without a body. It ignores Range.
 
 One satisfiable byte range returns 206 and Content-Range. An unsatisfiable
 range returns 416 and Content-Range: bytes */<full-length>. Multiple or malformed
-ranges return 400. Only NAR objects support ranges.
+ranges return 400. Only GET requests for NAR objects support ranges.
 
 nix-cache-info body is fixed at initialization:
 
@@ -60,8 +61,9 @@ WantMassQuery: 0
 Priority: 30
 ~~~
 
-Priority is configurable only at initialization; changing it requires an
-explicit migration because clients cache this file for days.
+Priority is configurable only at initialization. There is no in-place priority
+change or backend migration command; create a new cache root for a different
+priority. Clients can retain the previous cache metadata for days.
 
 ## Write routes
 
@@ -74,10 +76,17 @@ explicit migration because clients cache this file for days.
 
 All writes require a write token. Content-Length is required. The server rejects
 Transfer-Encoding request bodies, HTTP Content-Encoding, unexpected route
-suffixes, and bodies larger than configured route-specific limits. XZ and Zstd
-uploads are validated against the decompressed NAR hash and size before
-publication. The server stores the canonical raw NAR and may materialize one
-selected compressed egress representation from it.
+suffixes, and bodies larger than configured route-specific limits. For HTTP/1.1
+`Expect: 100-continue`, the publication worker sends 100 before reading an
+incompletely buffered body. Authentication, header, declared-size, storage
+capacity, and queue-admission failures receive a final response without granting
+continuation. A fully buffered or empty body needs no interim response.
+Unsupported expectations receive 417. HTTP/1.0 expectations are ignored.
+
+XZ and Zstd uploads verify their encoded identity and measure the decoded NAR
+hash and size. Later narinfo publication binds those measurements to the signed
+logical claims. The server stores the canonical raw NAR in the selected flat or
+chunked backend and may materialize a compressed egress representation from it.
 
 Error classes:
 
@@ -89,23 +98,24 @@ Error classes:
 | 411 | Content-Length missing |
 | 413 | declared or streamed body exceeds limit |
 | 415 | HTTP Content-Encoding or unsupported NAR encoding |
+| 417 | unsupported HTTP/1.1 request expectation |
 | 422 | hash, size, path, URL, or signature validation failed |
 | 429 | configured concurrency admission limit reached |
 | 500 | internal invariant or unexpected I/O failure |
 | 507 | destination filesystem has insufficient space |
 
-Error bodies are bounded plain text with a stable class and request identifier.
-They never include secrets, raw Authorization, complete narinfo signatures, or
-filesystem paths. Whether Nix retries each status is a client concern still
-covered by NARJ-2 fault capture; idempotency makes retried PUT safe.
+Errors generally have empty bodies; diagnostic endpoints use bounded plain
+text. There are no request identifiers or structured error bodies. HTTP
+responses do not expose credentials or filesystem paths. The Nix client classifies retries;
+[recorded source evidence](evidence/nix-http-protocol.md#retries-and-interrupted-transfers)
+describes it. Idempotency makes retried PUT safe.
 
 ## Publication order
 
 A fresh cache copy is expected to perform:
 
 ~~~text
-GET  /nix-cache-info                  -> 404
-PUT  /nix-cache-info                  -> 201
+GET  /nix-cache-info                  -> 200 for an initialized Narjar root
 GET  /<store-hash>.narinfo            -> 404
 HEAD /<store-hash>.narinfo            -> 404, possibly repeated
 HEAD /nar/<file-hash>.nar             -> 404
@@ -116,6 +126,10 @@ PUT  /<store-hash>.narinfo            -> 201
 Narjar does not depend on the exact number or order of existence probes. It
 does depend on NAR-before-narinfo for native v0.1 ingestion. A narinfo PUT whose
 NAR is absent fails with 422 and never creates a visible path.
+
+The historical nginx fixture returned 404 and accepted an initial
+`PUT /nix-cache-info`; Narjar initializes that file before serving. A matching
+PUT is idempotent and a conflicting PUT is rejected.
 
 The NAR object may be durable but unreachable. The store path becomes visible
 only when its validated narinfo no-replace hard link and directory sync
@@ -142,20 +156,18 @@ Accepted metadata must:
 - Verify the canonical Nix store-path fingerprint and preserve its signed
   logical claims and accepted signatures when projecting transport fields.
 
-Deriver and CA are accepted only with Nix-compatible field grammar; they never
-substitute for the required trusted signature. Other field names are rejected
-in v0.1. This matches the current Nix parser's semantic fields
-without making unsigned future extensions part of Narjar's trust boundary.
+Deriver and CA require Nix-compatible field grammar; neither replaces the
+trusted signature. Other field names are rejected in v0.1.
 
 ## Caching
 
 Public immutable NAR and narinfo responses may use a long max-age plus
-immutable. nix-cache-info uses a shorter explicit policy because deployment
-priority may change only by migration. Private/authenticated responses default
-to private, no-store.
+immutable. nix-cache-info uses a shorter explicit policy. Its initialized
+priority remains fixed for that cache root. Private/authenticated responses
+default to private, no-store.
 
 The `serve --egress-compression` policy selects the representation named by
-newly published narinfo files: `none` serves the canonical raw file, while
+newly published narinfo files: `none` serves the canonical raw byte stream, while
 `zstd` and `xz` materialize an immutable compressed derivative from that raw
 file. The URL, Compression, FileHash, and FileSize fields always describe the
 same published derivative. A single cache URL is used for both uploads and
@@ -180,23 +192,19 @@ The reverse proxy:
 
 Narjar itself speaks HTTP/1.1. HTTP/2 and HTTP/3 belong to the proxy.
 
-## Compatibility vectors
+## Compatibility checks
 
-Release tests must include:
+The [real-Nix app](../tests/nix-e2e.sh) runs in Linux CI for both canonical
+backends using the Nix version pinned by the flake. It checks native push and
+stock `nix copy`, duplicate refresh, content-addressed paths, range reads,
+independent-store substitution and Nix verification, wrong-key refusal,
+negative-cache refresh, concurrent and interrupted uploads, restart recovery,
+corrupt input rejection, all raw/XZ/Zstd input and output combinations, and
+offline GC with a protected closure. It records the Nix version and commands.
 
-1. Fresh Nix 2.31.5 compression=none push to an empty cache.
-2. Duplicate push with no second object mutation.
-3. Nix 2.35.2 push through regular-file netrc.
-4. Content-addressed nix store add-file path.
-5. Pull into an independent real Nix store with the trusted public key.
-6. Pull refusal when the producer signature key is not trusted.
-7. HEAD parity and full/suffix/open-ended range reads.
-8. Interrupted PUT leaves no final file; exact retry succeeds.
-9. Interrupted GET resumes or a fresh full GET succeeds without corruption.
-10. Out-of-band publication after 404 remains hidden until --refresh.
-11. Connection closure between every request.
-12. Reverse-proxy TLS path with buffering disabled.
-13. Malformed/traversal/oversize/hash/size/signature negative corpus.
-14. Linux static binary serving the real client sequence.
-
-Any behavior change requires a versioned decision record and an updated vector.
+Repository Rust tests cover route, header, authentication, size, hash,
+signature, and range edge cases. The static ELF and closure checks establish
+packaging properties separately; the end-to-end app uses the normal package.
+Historical captures cover only their recorded versions. TLS proxy behavior
+and filesystem power-loss durability require deployment testing. See the
+[release procedure](release.md#validate-the-candidate).

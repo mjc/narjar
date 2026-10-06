@@ -1,18 +1,14 @@
-# NARJ-83 MinCDC baseline
+# Historical MinCDC measurements
 
-The first frozen-corpus measurement covers the storage chunking
-prototype. It does not authorize or implement a production chunk store, alter
-NAR transport bytes, or change the Nix binary-cache protocol.
+These measurements use the standalone chunking prototype, not Narjar's
+production chunked backend. Its chunk sizes and layout differ from production.
 
 The primary storage metric is authoritative ZFS dataset `used` after the
 candidate store has been fully materialized with the target ZFS compression
 property. This captures the candidate representation and ZFS's actual block,
 metadata, and inode costs. This prototype writes uncompressed chunk payload
-files; there is no separate user-space chunk compressor in this measurement.
-If a future candidate adds one, its output must be measured again on ZFS—the
-logical sum is not a substitute. Logical sums, apparent file bytes, and the
-prototype's per-file allocation walk are diagnostic metrics only; they do not
-choose the policy.
+files; there is no user-space chunk compressor. Logical sums, apparent file
+bytes, and per-file allocation totals exclude some filesystem costs.
 
 ## Reproduction
 
@@ -79,12 +75,11 @@ The fixed raw-Hash4 parameter sweep is:
 | 4–12 KiB | 10,079,213 | 5,692,069 | 45,764,482,040 | 138.3 s | 541 MiB/s |
 | 8–24 KiB | 5,051,561 | 2,949,353 | 46,925,503,905 | 252.6 s | 296 MiB/s |
 
-## Decision
+## Physical measurements
 
-Select raw `MinCdcHash4` with the 8–24 KiB window for the next experiment
-slice. The logical sweep alone would choose 2–8 KiB, but the bounded
-ZFS-backed stores reversed that result: 2–8 KiB used 113 MiB, 4–12 KiB used
-99.0 MiB, and 8–24 KiB used 85.6 MiB for the same 100-file sample. The
+The experiment selected raw `MinCdcHash4` with an 8–24 KiB window. The logical
+sweep favored 2–8 KiB, but ZFS usage was 113 MiB for 2–8 KiB, 99.0 MiB for
+4–12 KiB, and 85.6 MiB for 8–24 KiB on the same 100-file sample. The
 larger window reduces chunk-file and filesystem-metadata costs enough to use
 less allocated storage.
 
@@ -95,9 +90,8 @@ dataset. After `zpool sync`, its authoritative dataset usage was
 metadata. All 14,214 full/90%-resume range checks passed. The deployed
 `/var/lib/narjar` dataset used 12,836,595,816 bytes (11.955 GiB) at the same
 time, so this full-corpus experiment store was 10.479 GiB larger (1.877×).
-That comparison is directional rather than an apples-to-apples replacement
-cost: the corpus is 78.5 GB logical while the deployed dataset is 28.3 GB
-logical.
+The inputs differ: the corpus is 78.5 GB logical and the deployed dataset is
+28.3 GB logical. This does not measure replacement cost for the same content.
 
 The two MinCDC implementations were also materialized in separate temporary
 `zstd-19` ZFS datasets using the same 100-file, 232,264,816-byte sample:
@@ -111,8 +105,8 @@ These are independent dataset `used` readings taken after `zpool sync`, and
 include ZFS metadata. Hash4 used about 9% less space in this physical
 comparison and was faster for cold range verification. Together with the
 full-corpus logical measurements and the full Hash4 materialization above,
-this selects `MinCdcHash4`; the `mincdc4` store option remains available to
-reproduce the comparison. A pre-sync `zfs list` reading is not valid evidence
+the experiment selected `MinCdcHash4`. The `mincdc4` store option reproduces
+the comparison. A pre-sync `zfs list` reading is not valid evidence
 for this metric because ZFS usage accounting is asynchronous.
 
 The semantic baseline only improves the estimated physical result by about
@@ -123,10 +117,8 @@ measured reason to add either semantic or hybrid policy here.
 
 The semantic rows provide limited evidence: they chunk regular-file
 contents independently and retain all other NAR bytes as passthrough. They do
-not claim that a semantic manifest can yet reconstruct a NAR byte-for-byte.
-That requires the separate semantic codec/reconstruction work tracked by the
-blocked dependency. The raw rows do reconstruct exact bytes in the prototype
-tests.
+not reconstruct a NAR from a semantic manifest. The raw prototype does
+reconstruct exact bytes in its tests.
 
 No production storage code was changed by this experiment.
 
@@ -151,9 +143,8 @@ cold research-store reconstruction measurement; it includes source and chunk
 hash verification and is not an HTTP TTFB or network-serving measurement.
 
 The allocated-byte result is specific to the ZFS dataset and its compression;
-it is evidence that file-backed overhead can be measured, not a portable
-promise for the eventual storage layout. For this decision, the authoritative
-number is the ZFS dataset `used` value after materialization, including ZFS
+it is not an estimate for other filesystems or Narjar's production layout.
+The storage measurement is ZFS dataset `used` after materialization, including
 compression and filesystem metadata. The prototype rejects non-contiguous or
 reordered manifests and verifies every chunk hash while serving a range.
 

@@ -1,6 +1,6 @@
-# NARJ-30 current flat baseline
+# NARJ-30 flat baseline
 
-This is the corrected current-state continuation run against the pinned
+This is the corrected continuation run against the pinned
 Bincache reference. It used three warmups, 15 measured repetitions, the
 10,000-path corpus, identity HTTP encoding, and `compression=none` for both
 candidates. `commands.txt` contains the commands and requests executed;
@@ -19,11 +19,6 @@ Narjar completed the full benchmark. `samples.jsonl` contains
 | concurrent upload wall | 1,491.296 ms | 198.082 ms |
 | runtime closure | 46,807,008 bytes | 51,364,744 bytes |
 
-The result confirms that the remaining performance work is in Narjar's
-publication and request path, not idle arena retention: RSS remains small,
-while metadata/Range and upload latency remain materially behind Bincache.
-The next performance implementation is NARJ-109's dedicated publication
-worker, with the existing streaming and bounded-queue constraints and no
-jemalloc or `MALLOC_ARENA_MAX` workaround. The tracker’s
-immediate verification priority is NARJ-112, which unblocks the urgent
-real-Nix corpus issue NARJ-81.
+In this run, RSS stayed small while metadata/Range and upload latency lagged
+Bincache. The result pointed to publication and request handling rather than
+idle arena retention.

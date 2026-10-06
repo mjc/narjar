@@ -57,18 +57,21 @@ pub fn storage_directories(backend: SupportedStorageBackend) -> impl Iterator<It
 }
 
 pub fn storage_root_entries() -> impl Iterator<Item = &'static str> {
+    storage_root_directories().chain(storage_root_files())
+}
+
+pub(super) fn storage_root_files() -> impl Iterator<Item = &'static str> {
+    [LAYOUT_DESCRIPTOR, DESCRIPTOR_DRAFT, "lock"]
+        .into_iter()
+        .chain(CACHE_RECOVERY_MARKERS)
+}
+
+pub(super) fn storage_root_directories() -> impl Iterator<Item = &'static str> {
     COMMON_DIRECTORIES
         .iter()
         .copied()
-        .filter(|name| !name.contains('/'))
         .chain(CHUNK_DIRECTORIES.iter().copied())
-        .chain([
-            LAYOUT_DESCRIPTOR,
-            DESCRIPTOR_DRAFT,
-            ".narjar-clean",
-            ".narjar-recovery",
-            "lock",
-        ])
+        .filter(|name| !name.contains('/'))
 }
 
 /// Startup policies loaded only from a complete, private policy layout.

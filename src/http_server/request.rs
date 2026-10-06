@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, Read},
+    io::{self, Read, Write},
     net::TcpStream,
     ops::Range,
 };
@@ -28,6 +28,13 @@ pub enum Method {
     Head,
     Put,
     Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestExpectation {
+    None,
+    Continue,
+    Unsupported,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +193,7 @@ struct ParsedHead {
     headers: HeaderRanges,
     body_length: Option<usize>,
     connection: ConnectionDisposition,
+    expectation: RequestExpectation,
 }
 
 pub struct Request {
@@ -198,6 +206,7 @@ pub struct Request {
     body_length: Option<usize>,
     body_state: BodyState,
     connection: ConnectionDisposition,
+    expectation: RequestExpectation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,6 +286,7 @@ impl BufferedHead {
                 None => BodyState::Complete,
             },
             connection: parsed.connection,
+            expectation: parsed.expectation,
         })
     }
 }
@@ -303,6 +313,7 @@ impl ParsedHead {
         let headers = HeaderRanges::from_httparse(buffered.bytes(), parsed.headers)?;
         let body_length = request_content_length(buffered.bytes(), &headers)?;
         let connection = request_connection_disposition(version, buffered.bytes(), &headers);
+        let expectation = request_expectation(version, buffered.bytes(), &headers);
 
         Ok(Self {
             method: Method::from_http(method),
@@ -310,8 +321,32 @@ impl ParsedHead {
             headers,
             body_length,
             connection,
+            expectation,
         })
     }
+}
+
+fn request_expectation(version: u8, buffer: &[u8], headers: &HeaderRanges) -> RequestExpectation {
+    if version == 0 {
+        return RequestExpectation::None;
+    }
+    headers
+        .iter()
+        .filter(|header| header.name(buffer).eq_ignore_ascii_case("Expect"))
+        .flat_map(|header| header.value(buffer).split(','))
+        .fold(RequestExpectation::None, |expectation, value| {
+            match (
+                expectation,
+                value.trim().eq_ignore_ascii_case("100-continue"),
+            ) {
+                (RequestExpectation::Unsupported, _) | (_, false) => {
+                    RequestExpectation::Unsupported
+                }
+                (RequestExpectation::None | RequestExpectation::Continue, true) => {
+                    RequestExpectation::Continue
+                }
+            }
+        })
 }
 
 impl Method {
@@ -394,6 +429,30 @@ impl Request {
 
     pub fn body_length(&self) -> Option<usize> {
         self.body_length
+    }
+
+    pub fn expectation(&self) -> RequestExpectation {
+        self.expectation
+    }
+
+    /// Acknowledge an admitted upload before its client transmits the body.
+    pub fn acknowledge_body(&mut self) -> io::Result<()> {
+        match std::mem::replace(&mut self.expectation, RequestExpectation::None) {
+            RequestExpectation::None => Ok(()),
+            RequestExpectation::Continue => {
+                if self
+                    .body_length
+                    .is_some_and(|length| length > self.body_prefix.len())
+                {
+                    self.stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+                }
+                Ok(())
+            }
+            RequestExpectation::Unsupported => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported request expectation",
+            )),
+        }
     }
 
     pub fn as_reader(&mut self) -> Result<BodyReader<'_>, BodyReaderError> {
@@ -568,6 +627,80 @@ mod tests {
         BufferedHead, FORCE_PORTABLE_FILE_COPY, HeaderBoundary, MAX_HEADER_BYTES, Method,
         ParsedHead, Request, Response, StatusCode, find_header_delimiter,
     };
+
+    #[test]
+    fn continue_is_sent_once_for_a_partially_prefetched_body() {
+        let (request, client) = request_with_prefetched_bytes(
+            b"PUT /nar/example.nar HTTP/1.1\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\nb",
+        );
+        let mut request = request.expect("parse partially buffered upload");
+        assert_eq!(request.body_prefix.len(), 1);
+        request.acknowledge_body().unwrap();
+        request.acknowledge_body().unwrap();
+        drop(request);
+        assert_eq!(client.join().unwrap(), b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+
+    #[test]
+    fn complete_or_empty_prefetched_bodies_do_not_need_continue() {
+        for bytes in [
+            &b"PUT /nar/example.nar HTTP/1.1\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\nbody"[..],
+            &b"PUT /nar/example.nar HTTP/1.1\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n"[..],
+        ] {
+            let (request, client) = request_with_prefetched_bytes(bytes);
+            let mut request = request.unwrap();
+            request.acknowledge_body().unwrap();
+            drop(request);
+            assert!(client.join().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn expectation_tokens_are_complete_case_insensitive_and_http_version_specific() {
+        for (version, expectation, expected) in [
+            ("1.1", "", super::RequestExpectation::None),
+            (
+                "1.1",
+                "Expect: 100-Continue\r\n",
+                super::RequestExpectation::Continue,
+            ),
+            (
+                "1.1",
+                "Expect: 100-continue, 100-continue\r\n",
+                super::RequestExpectation::Continue,
+            ),
+            (
+                "1.1",
+                "Expect: 100-continue\r\nExpect: unknown\r\n",
+                super::RequestExpectation::Unsupported,
+            ),
+            (
+                "1.1",
+                "Expect: unknown, 100-continue\r\n",
+                super::RequestExpectation::Unsupported,
+            ),
+            (
+                "1.1",
+                "Expect: \r\n",
+                super::RequestExpectation::Unsupported,
+            ),
+            (
+                "1.0",
+                "Expect: unknown\r\n",
+                super::RequestExpectation::None,
+            ),
+        ] {
+            let head = format!(
+                "PUT /nar/example.nar HTTP/{version}\r\nContent-Length: 1\r\n{expectation}\r\n"
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client.write_all(head.as_bytes()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let request = Request::read(stream).unwrap();
+            assert_eq!(request.expectation(), expected, "{head}");
+        }
+    }
 
     #[test]
     fn parses_headers_without_allocating_header_storage() {

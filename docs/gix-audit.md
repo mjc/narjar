@@ -1,8 +1,7 @@
 # Gitoxide storage audit
 
-NARJ-86 audits the feasibility of the pinned gitoxide graph. It is a
-capability audit, not a production dependency proposal. The disposable probe
-used for the API checks lived outside this repository at
+This experiment checked the pinned gitoxide graph below. Gitoxide is not a
+Narjar dependency. The API probe ran outside the repository at
 `/tmp/narjar-gix-probe`.
 
 ## Versions and evidence
@@ -28,9 +27,8 @@ Primary references:
 - [Gitoxide `write_blob_stream` implementation](https://github.com/GitoxideLabs/gitoxide/blob/main/gix/src/repository/object.rs)
 - [Gitoxide malformed-pack advisory](https://github.com/GitoxideLabs/gitoxide/security/advisories/GHSA-x494-mj8g-cj27)
 
-The crate-status page is the source of truth for whether a component is
-production-ready; docs.rs is used for the exact public API and the local crate
-source was inspected for buffering, limits, and publication behavior.
+The audit used docs.rs for API signatures and local crate sources for
+buffering, limits, and publication behavior.
 
 ## Capability matrix
 
@@ -49,23 +47,11 @@ source was inspected for buffering, limits, and publication behavior.
 | Interrupted maintenance/recovery | Custom work required | Pack/index generation has interruption and temporary-file handling, but recovery policy and durable inventory are application responsibilities. No Narjar recovery proof was obtained from these crates. |
 | Static-musl and unsafe/transitive surface | Static-musl unproven; inventory separate | The native probe compiled, and both SHA features compiled. The repository toolchain lacks the musl target, so static packaging failed before codegen with `can't find crate for core`/`std`. Transitive unsafe inventory and reachable advisories still need a separate security gate. |
 
-## Recommendation
+## Result
 
-Reject gitoxide as Narjar's production storage backend for now. It can be a
-useful isolated prototype for reading existing Git objects or validating pack
-input, but the missing bounded streaming read, lack of a NAR-specific delta
-selection policy, and application-owned durability/recovery surface leave the
-core cache path custom either way. Adding the crates would also introduce a
-large maintenance and advisory-tracking surface for a storage format Narjar
-does not serve.
+Gitoxide was not adopted. Its loose-store API lacks bounded streaming reads,
+its pack writer does not select NAR-specific deltas, and publication durability
+and recovery remain application responsibilities.
 
-The runtime probe has limited coverage: it does not claim deep-delta,
-missing-base, truncated-index, or interrupted-pack restart coverage. Those
-remain required before a hostile-input adoption decision.
-
-If a future prototype is authorized, it should use only narrow `gix-odb` and
-`gix-pack` APIs, disable both caches initially, set explicit allocation limits,
-keep Git repository/network features out of the graph, and wrap every generated
-file in Narjar-owned sync/rename/recovery logic. It must first pass the
-adversarial pack, concurrent lookup, RSS, and static-musl probes listed in
-NARJ-86. No production dependency change is made by this audit.
+The probe did not test deep deltas, missing bases, truncated indexes, or
+restart after interrupted pack writes.

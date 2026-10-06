@@ -87,6 +87,12 @@ fn cache_policy<R>(
     }
 }
 
+pub(super) fn prevent_operator_and_auth_response_caching<R>(response: Response<R>) -> Response<R> {
+    response
+        .with_header(header("Cache-Control", "no-store"))
+        .with_header(header("Vary", "Authorization"))
+}
+
 fn send_file_response(
     guard: &RequestGuard<'_>,
     request: Request,
@@ -191,6 +197,10 @@ impl RequestedRange {
 }
 
 fn requested_range(request: &Request, length: u64) -> RequestedRange {
+    match request.method() {
+        Method::Get => {}
+        Method::Head | Method::Put | Method::Other => return RequestedRange::Full,
+    }
     let mut headers = request
         .headers()
         .iter()
@@ -661,9 +671,11 @@ fn respond_health_request(request: Request, guard: &RequestGuard<'_>) -> Option<
         Method::Get | Method::Head => send_response(
             guard,
             request,
-            Response::from_string("ok\n")
-                .with_status_code(StatusCode::OK)
-                .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+            prevent_operator_and_auth_response_caching(
+                Response::from_string("ok\n")
+                    .with_status_code(StatusCode::OK)
+                    .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+            ),
         ),
         _ => method_not_allowed(guard, request, "GET, HEAD"),
     }
@@ -706,9 +718,11 @@ fn respond_readiness(
     send_response(
         guard,
         request,
-        Response::from_string(body)
-            .with_status_code(status)
-            .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+        prevent_operator_and_auth_response_caching(
+            Response::from_string(body)
+                .with_status_code(status)
+                .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+        ),
     )
 }
 
@@ -744,14 +758,14 @@ fn respond_metrics(
         staging_bytes,
     );
     snapshot.storage_activity = storage.activity_snapshot();
-    let response = Response::from_string(render_prometheus(&snapshot))
-        .with_status_code(StatusCode::OK)
-        .with_header(header(
-            "Content-Type",
-            "text/plain; version=0.0.4; charset=utf-8",
-        ))
-        .with_header(header("Cache-Control", "no-store"))
-        .with_header(header("Vary", "Authorization"));
+    let response = prevent_operator_and_auth_response_caching(
+        Response::from_string(render_prometheus(&snapshot))
+            .with_status_code(StatusCode::OK)
+            .with_header(header(
+                "Content-Type",
+                "text/plain; version=0.0.4; charset=utf-8",
+            )),
+    );
     send_response(guard, request, response)
 }
 

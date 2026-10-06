@@ -69,6 +69,191 @@ fn archive(root: Vec<u8>) -> Vec<u8> {
 }
 
 #[test]
+fn metadata_lengths_exceeding_the_remaining_budget_are_rejected_before_allocation() {
+    for tokens in [
+        vec![b"(".as_slice(), b"type", b"symlink", b"target"],
+        vec![
+            b"(".as_slice(),
+            b"type",
+            b"directory",
+            b"entry",
+            b"(",
+            b"name",
+        ],
+    ] {
+        let mut bytes = string(b"nix-archive-1");
+        bytes.extend(tokens.into_iter().flat_map(string));
+        bytes.extend(u64::MAX.to_le_bytes());
+        let limits = Limits {
+            max_name_bytes: u64::MAX,
+            max_symlink_target_bytes: u64::MAX,
+            max_total_bytes: 1024,
+            ..Limits::default()
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            Decoder::with_limits(bytes.as_slice(), limits)
+                .decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()))
+        }))
+        .expect("declared metadata lengths must return errors, not panic during allocation");
+        assert!(matches!(
+            result,
+            Err(DecodeError::LimitExceeded {
+                what: "raw size",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn metadata_budget_includes_padding_before_reading_the_value() {
+    let mut bytes = string(b"nix-archive-1");
+    bytes.extend(
+        [b"(".as_slice(), b"type", b"symlink", b"target"]
+            .into_iter()
+            .flat_map(string),
+    );
+    bytes.extend(1_u64.to_le_bytes());
+    let limits = Limits {
+        max_total_bytes: bytes.len() as u64 + 1,
+        ..Limits::default()
+    };
+    let result = Decoder::with_limits(bytes.as_slice(), limits)
+        .decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()));
+    assert!(
+        matches!(
+            result,
+            Err(DecodeError::LimitExceeded {
+                what: "raw size",
+                ..
+            })
+        ),
+        "the missing value must not be read when its padded length already exceeds the budget: {result:?}"
+    );
+}
+
+#[test]
+fn impossible_metadata_allocations_return_a_memory_error() {
+    let mut bytes = string(b"nix-archive-1");
+    bytes.extend(
+        [b"(".as_slice(), b"type", b"symlink", b"target"]
+            .into_iter()
+            .flat_map(string),
+    );
+    bytes.extend((isize::MAX as u64 + 1).to_le_bytes());
+    let limits = Limits {
+        max_symlink_target_bytes: u64::MAX,
+        max_total_bytes: u64::MAX,
+        ..Limits::default()
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        Decoder::with_limits(bytes.as_slice(), limits)
+            .decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()))
+    }))
+    .expect("an unrepresentable allocation must not panic");
+    assert!(
+        matches!(result, Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::OutOfMemory)
+    );
+}
+
+#[test]
+fn empty_symlink_targets_are_rejected_without_delivering_a_symlink() {
+    let bytes = archive(symlink(b""));
+    let mut events = Events::default();
+    let result = Decoder::new(bytes.as_slice()).decode(&mut events);
+    assert!(matches!(result, Err(DecodeError::NonCanonical(_))));
+    assert!(events.symlinks.is_empty());
+}
+
+#[test]
+fn configured_depth_decoding_does_not_depend_on_the_thread_stack() {
+    const PROBE: &str = "NARJAR_DECODER_DEPTH_PROBE";
+    if std::env::var_os(PROBE).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "configured_depth_decoding_does_not_depend_on_the_thread_stack",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "decoder depth probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for depth in [Limits::default().max_depth, 4096] {
+        let limits = Limits {
+            max_depth: depth,
+            ..Limits::default()
+        };
+        let mut encoder =
+            narjar::nar_encode::Encoder::with_limits(Vec::new(), limits.clone()).unwrap();
+        encoder
+            .push(narjar::nar_encode::Event::BeginDirectory)
+            .unwrap();
+        for _ in 0..depth {
+            encoder
+                .push(narjar::nar_encode::Event::Entry(b"child"))
+                .unwrap();
+            encoder
+                .push(narjar::nar_encode::Event::BeginDirectory)
+                .unwrap();
+        }
+        for _ in 0..=depth {
+            encoder
+                .push(narjar::nar_encode::Event::EndDirectory)
+                .unwrap();
+        }
+        let (bytes, encoded) = encoder.finish().unwrap();
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let mut directories = 0;
+                let mut ends = 0;
+                let mut sink = |event: Event<'_>| {
+                    match event {
+                        Event::BeginDirectory { depth: observed } => {
+                            assert_eq!(observed, directories);
+                            directories += 1;
+                        }
+                        Event::EndDirectory => ends += 1,
+                        _ => {}
+                    }
+                    Ok::<(), Infallible>(())
+                };
+                let decoded = Decoder::with_limits(bytes.as_slice(), limits.clone())
+                    .decode(&mut sink)
+                    .unwrap();
+                assert_eq!(directories, depth + 1);
+                assert_eq!(ends, directories);
+                assert_eq!(decoded.entries, depth as u64);
+                assert_eq!(decoded.raw_sha256, encoded.raw_sha256);
+                assert_eq!(decoded.raw_size, encoded.raw_size);
+                let lower = Limits {
+                    max_depth: depth - 1,
+                    ..limits
+                };
+                let result = Decoder::with_limits(bytes.as_slice(), lower)
+                    .decode(&mut |_: Event<'_>| Ok::<(), Infallible>(()));
+                assert!(matches!(
+                    result,
+                    Err(DecodeError::LimitExceeded {
+                        what: "directory depth",
+                        ..
+                    })
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[test]
 fn stack_tokens_preserve_the_grammar_limit_and_input_error_boundaries() {
     // Invalid tokens below the existing limit must still be consumed completely;
     // a shorter implementation-specific stack buffer must not change the policy.
@@ -461,7 +646,7 @@ fn retained_symlink_targets_survive_reuse_shrinking_and_growth() {
         (b"b".as_slice(), symlink(&long)),
         (
             b"c".as_slice(),
-            directory([(b"nested".as_slice(), symlink(b""))]),
+            directory([(b"nested".as_slice(), symlink(b"x"))]),
         ),
         (b"d".as_slice(), symlink(&longer)),
     ]));
@@ -473,7 +658,10 @@ fn retained_symlink_targets_survive_reuse_shrinking_and_growth() {
     })
     .decode(&mut events)
     .expect("short-read symlink stream");
-    assert_eq!(events.symlinks, [b"short".to_vec(), long, vec![], longer]);
+    assert_eq!(
+        events.symlinks,
+        [b"short".to_vec(), long, b"x".to_vec(), longer]
+    );
     assert_eq!(summary.symlinks, 4);
     assert_eq!(summary.raw_sha256, <[u8; 32]>::from(Sha256::digest(&data)));
 }

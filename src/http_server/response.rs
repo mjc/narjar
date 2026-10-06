@@ -32,6 +32,7 @@ impl StatusCode {
     pub const PAYLOAD_TOO_LARGE: Self = Self(413);
     pub const UNSUPPORTED_MEDIA_TYPE: Self = Self(415);
     pub const RANGE_NOT_SATISFIABLE: Self = Self(416);
+    pub const EXPECTATION_FAILED: Self = Self(417);
     pub const UNPROCESSABLE_ENTITY: Self = Self(422);
     pub const TOO_MANY_REQUESTS: Self = Self(429);
     pub const INTERNAL_SERVER_ERROR: Self = Self(500);
@@ -342,6 +343,7 @@ fn reason(code: u16) -> &'static str {
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
         416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
         422 => "Unprocessable Entity",
         429 => "Too Many Requests",
         500 => "Internal Server Error",

@@ -1,11 +1,11 @@
-//! Narjar's supported Rust API is limited to NAR streaming and content identities.
+//! Streaming NAR codecs and typed content identities.
 //!
-//! Narjar is primarily a command-line cache server and uploader. The supported
-//! library surface is [`nar`], [`nar_encode`], and [`object`]. The HTTP server,
-//! storage backends, authorization, maintenance, metrics, and narinfo plumbing
-//! are implementation details used by the binary and may change without notice. They are
-//! available under the hidden [`__private`] module only so the binary and repository integration
-//! tests can share the implementation; consumers should not depend on those paths.
+//! The supported library modules are [`nar`], [`nar_encode`], and [`object`]. Set
+//! `default-features = false` to use these without the application's HTTP,
+//! compression, or SQLite dependencies. The default `application` feature builds
+//! the command-line program. The binary and repository integration tests share
+//! application code through the hidden `__private` module. Its paths are not
+//! supported for downstream use and may change without notice.
 //!
 //! ```
 //! use narjar::object::{NarHash, NarIdentity, NarSize};
@@ -34,7 +34,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! Implementation modules are intentionally not exported at the crate root:
+//! Application modules are not exported at the crate root:
 //!
 //! ```compile_fail
 //! let _ = narjar::storage::StorageBackend::Flat;
@@ -42,11 +42,15 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "application")]
 mod implementation;
 
-pub use implementation::{nar, nar_encode, object};
+pub mod nar;
+pub mod nar_encode;
+pub mod object;
 
 #[doc(hidden)]
+#[cfg(feature = "application")]
 pub mod __private {
     pub use crate::implementation::{
         auth, filesystem, http, http_server, inventory, maintenance, metrics, nar, nar_compression,
@@ -54,6 +58,7 @@ pub mod __private {
     };
 }
 
+#[cfg(feature = "application")]
 pub(crate) use implementation::{
     auth, filesystem, http_server, inventory, maintenance, metrics, nar_compression, narinfo,
     records, storage, token_file,

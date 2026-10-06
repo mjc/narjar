@@ -8,6 +8,9 @@ use std::{
 };
 
 use super::fs::unlink_at;
+use super::initialization::{
+    CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, storage_root_directories, storage_root_files,
+};
 use super::{
     Storage, StorageError, StoreHash, entry_identity_at, entry_is_directory_at,
     entry_is_regular_at, open_regular_at, read_dir_names,
@@ -304,24 +307,19 @@ fn classify_root_entry(
     let is_directory = entry_is_directory_at(directory, name)?;
     let is_regular = entry_is_regular_at(directory, name)?;
     Ok(match name.to_str() {
-        Some(
-            "nar"
-            | ".tmp"
-            | ".narjar-transactions"
-            | ".narjar-ingress"
-            | ".narjar-egress"
-            | ".narjar-validation"
-            | "realisations"
-            | "auth",
-        ) => (!is_directory).then_some(ReconcileClass::UnexpectedType),
-        Some(
-            "lock"
-            | "nix-cache-info"
-            | "trusted-public-keys"
-            | ".narjar-clean"
-            | ".narjar-recovery",
-        ) => (!is_regular).then_some(ReconcileClass::UnexpectedType),
-        Some(name) if MAINTENANCE_FILES.contains(&name) => {
+        Some(name)
+            if storage_root_directories()
+                .chain(CACHE_POLICY_DIRECTORIES.iter().copied())
+                .any(|directory| name == directory) =>
+        {
+            (!is_directory).then_some(ReconcileClass::UnexpectedType)
+        }
+        Some(name)
+            if storage_root_files()
+                .chain(CACHE_POLICY_FILES.iter().copied())
+                .chain(MAINTENANCE_FILES.iter().copied())
+                .any(|file| name == file) =>
+        {
             (!is_regular).then_some(ReconcileClass::UnexpectedType)
         }
         Some(name) if valid_store_hash_filename(name) => Some(if is_regular {
@@ -375,4 +373,66 @@ fn valid_realisation_filename(name: &OsStr) -> bool {
                     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.' | b'_')
                 })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn known_layout_entries_still_reject_wrong_types_and_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::File::open(directory.path()).unwrap();
+        let directories =
+            storage_root_directories().chain(CACHE_POLICY_DIRECTORIES.iter().copied());
+        let files = storage_root_files()
+            .chain(
+                CACHE_POLICY_FILES
+                    .iter()
+                    .copied()
+                    .filter(|name| !name.contains('/')),
+            )
+            .chain(MAINTENANCE_FILES.iter().copied());
+        for (name, expects_directory) in directories
+            .map(|name| (name, true))
+            .chain(files.map(|name| (name, false)))
+        {
+            let path = directory.path().join(name);
+            if expects_directory {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, b"layout fixture").unwrap();
+            }
+            assert_eq!(
+                classify_root_entry(&root, OsStr::new(name)).unwrap(),
+                None,
+                "{name}"
+            );
+            if expects_directory {
+                fs::remove_dir(&path).unwrap();
+                fs::write(&path, b"wrong type").unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+            }
+            assert_eq!(
+                classify_root_entry(&root, OsStr::new(name)).unwrap(),
+                Some(ReconcileClass::UnexpectedType),
+                "{name}"
+            );
+            if expects_directory {
+                fs::remove_file(&path).unwrap();
+            } else {
+                fs::remove_dir(&path).unwrap();
+            }
+            symlink(directory.path(), &path).unwrap();
+            assert_eq!(
+                classify_root_entry(&root, OsStr::new(name)).unwrap(),
+                Some(ReconcileClass::UnexpectedType),
+                "symlinked {name}"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
 }

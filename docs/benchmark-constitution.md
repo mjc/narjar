@@ -1,21 +1,15 @@
-# NARJ-75 benchmark constitution
+# Historical storage benchmark criteria
 
-Status: frozen version 4, 2026-09-05. Version 4 adds observed wire compression
-to required provenance after the flat control exposed an unmatched external
-comparator. Thresholds are unchanged, and no semantic candidate has been
-measured. Version 3 restored ticket fields omitted from version 2 and
-separated exact-CAS admission from aggressive-delta admission.
-The machine-readable thresholds are in
-[`benchmarks/constitution.json`](../benchmarks/constitution.json). Candidate
-results must not alter this file; a changed constitution gets a new version,
-reason, and review before measurement.
+Version 4, 2026-09-05. These criteria describe the archived storage experiments,
+not current release requirements. Machine-readable thresholds are in
+[`benchmarks/constitution.json`](../benchmarks/constitution.json); measurements
+must not change them. Current release checks are in the
+[release procedure](release.md#validate-the-candidate).
 
-Scope: frozen NARJ-75 experiment gates. The Rust 1.85 dependency requirement
-below belongs to version 4 of this research constitution. The current package
-requires Rust 1.98, as declared in [Cargo.toml](../Cargo.toml). The frozen
-thresholds are unchanged.
+The Rust 1.85 requirement below applies only to these experiments. The current
+package requires Rust 1.98, as declared in [Cargo.toml](../Cargo.toml).
 
-The comparison is the current Narjar binary against a matched raw-NAR cache
+The comparison is the measured Narjar binary against a matched raw-NAR cache
 using transparent filesystem compression. Both run on the same Linux builder,
 filesystem, CPU governor, kernel, corpus, proxy, and sample order. HTTP wire
 compression is disabled (`compression=none`, `Accept-Encoding: identity`).
@@ -63,6 +57,5 @@ Dependencies retain Rust 1.85, have zero advisories, and report binary,
 closure, build-time, and transitive growth. Backup must restore into empty
 DATA and pass reconcile plus independent Nix verification; security must pass
 the auth-capability matrix and secret-free log checks. Their exact values are
-frozen in the JSON artifact. The final decision quotes this constitution
-verbatim and records rejected alternatives; thresholds are never tuned to fit
-observed results.
+frozen in the JSON artifact. Reports record rejected alternatives and do not
+change thresholds to fit results.

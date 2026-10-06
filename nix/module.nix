@@ -43,20 +43,23 @@
     else if cfg.statsZfsDataset != null
     then zfsSampleFile
     else null;
-  fixedDirectories = [
-    "${runtimeDataDir}/nar"
-    "${runtimeDataDir}/nar/.tmp"
-    "${runtimeDataDir}/.tmp"
-    "${runtimeDataDir}/.narjar-transactions"
-    "${runtimeDataDir}/realisations"
-    "${runtimeDataDir}/realisations/.tmp"
-    "${runtimeDataDir}/auth"
-    "${runtimeDataDir}/.narjar-validation"
-    "${runtimeDataDir}/.narjar-ingress"
-    "${runtimeDataDir}/.narjar-egress"
-    "${runtimeDataDir}/.narjar-chunks"
-    "${runtimeDataDir}/.narjar-manifests"
-  ];
+  fixedDirectories =
+    [
+      "${runtimeDataDir}/nar"
+      "${runtimeDataDir}/nar/.tmp"
+      "${runtimeDataDir}/.tmp"
+      "${runtimeDataDir}/.narjar-transactions"
+      "${runtimeDataDir}/realisations"
+      "${runtimeDataDir}/realisations/.tmp"
+      "${runtimeDataDir}/auth"
+      "${runtimeDataDir}/.narjar-validation"
+      "${runtimeDataDir}/.narjar-ingress"
+      "${runtimeDataDir}/.narjar-egress"
+    ]
+    ++ lib.optionals (cfg.storageBackend == "chunked") [
+      "${runtimeDataDir}/.narjar-chunks"
+      "${runtimeDataDir}/.narjar-manifests"
+    ];
   fixedFiles = [
     "${runtimeDataDir}/lock"
     "${runtimeDataDir}/.narjar-layout"
@@ -746,6 +749,7 @@ in {
           LoadCredential = map (credential: "${credential.name}:${credential.source}") credentials;
           ExecStart = "${executable} ${serveArgs}";
           Restart = "on-failure";
+          TimeoutStopSec = lib.mkDefault (cfg.shutdownGraceSeconds + 10);
 
           AmbientCapabilities = "";
           CapabilityBoundingSet = "";

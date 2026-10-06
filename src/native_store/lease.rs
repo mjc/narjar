@@ -9,9 +9,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use super::gc::{GcReadLock, lock_file};
 use data_encoding::HEXLOWER;
 use narjar::__private::records::{BoundedRegularFile, decode_complete, read_bounded_regular_file};
-use rustix::{fs::FlockOperation, io::Errno};
+use rustix::fs::FlockOperation;
+#[cfg(test)]
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlite::{ConnectionThreadSafe, State};
@@ -38,7 +41,10 @@ pub(crate) struct NativeStorePath {
 }
 
 impl NativeStorePath {
-    fn validate(store_dir: &Path, absolute_path: &Path) -> Result<Self, NativeStoreLeaseError> {
+    pub(crate) fn validate(
+        store_dir: &Path,
+        absolute_path: &Path,
+    ) -> Result<Self, NativeStoreLeaseError> {
         let path = Self::parse(store_dir, absolute_path)?;
         let metadata = fs::symlink_metadata(absolute_path).map_err(NativeStoreLeaseError::Io)?;
         if !(metadata.file_type().is_symlink() || metadata.is_dir() || metadata.is_file()) {
@@ -1211,16 +1217,7 @@ impl NativeStoreLeaseManager {
     }
 
     fn acquire_gc_read_lock(&self) -> Result<GcReadLock, NativeStoreLeaseError> {
-        let path = self.state_dir.join("gc.lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(
-                (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
-            )
-            .open(path)
-            .map_err(NativeStoreLeaseError::Io)?;
-        set_flock_lock_with_mode(&file, FlockOperation::LockShared)?;
-        Ok(GcReadLock { _file: file })
+        GcReadLock::acquire(&self.state_dir).map_err(NativeStoreLeaseError::Io)
     }
 
     fn is_registered_store_path(
@@ -1270,10 +1267,6 @@ struct SidecarLock {
     _file: File,
 }
 
-struct GcReadLock {
-    _file: File,
-}
-
 fn set_flock_lock(file: &File) -> Result<(), NativeStoreLeaseError> {
     set_flock_lock_with_mode(file, FlockOperation::LockExclusive)
 }
@@ -1282,10 +1275,7 @@ fn set_flock_lock_with_mode(
     file: &File,
     lock_mode: FlockOperation,
 ) -> Result<(), NativeStoreLeaseError> {
-    std::iter::repeat_with(|| rustix::fs::flock(file, lock_mode))
-        .find(|result| *result != Err(Errno::INTR))
-        .unwrap_or(Err(Errno::INTR))
-        .map_err(|error| NativeStoreLeaseError::Io(error.into()))
+    lock_file(file, lock_mode).map_err(NativeStoreLeaseError::Io)
 }
 
 fn read_record_paths(roots_dir: &Path) -> Result<Vec<PathBuf>, NativeStoreLeaseError> {
@@ -3179,10 +3169,20 @@ mod tests {
     }
 
     #[test]
-    fn startup_rejects_a_nix_state_directory_without_an_openable_gc_lock() {
+    fn startup_creates_a_missing_gc_lock_in_a_writable_nix_state_directory() {
         let fixture = LeaseFixture::new(1);
-        fs::remove_file(fixture.state_dir.join("gc.lock"))
-            .expect("GC lock should be removed to simulate bad deployment permissions");
+        fs::remove_file(fixture.state_dir.join("gc.lock")).unwrap();
+        let manager = fixture.reopen(1);
+        assert!(fixture.state_dir.join("gc.lock").is_file());
+        assert_eq!(manager.snapshot().unwrap().active, 0);
+    }
+
+    #[test]
+    fn startup_rejects_a_non_regular_nix_gc_lock() {
+        let fixture = LeaseFixture::new(1);
+        fs::remove_file(fixture.state_dir.join("gc.lock")).expect("remove fixture GC lock");
+        fs::create_dir(fixture.state_dir.join("gc.lock"))
+            .expect("a directory cannot coordinate Nix file locks");
 
         let error = match NativeStoreLeaseManager::open(
             fixture.store_dir.clone(),
@@ -3197,7 +3197,7 @@ mod tests {
         };
 
         assert!(
-            matches!(error, NativeStoreLeaseError::Io(ref error) if error.kind() == io::ErrorKind::NotFound)
+            matches!(error, NativeStoreLeaseError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData)
         );
     }
 

@@ -1,7 +1,4 @@
-# Narjar v0.1 operations and resilience contract
-
-Status: accepted v0.1 operations contract; remaining deployment evidence is
-tracked in the risk register and open Lific work.
+# Narjar operations
 
 ## CLI
 
@@ -114,10 +111,8 @@ is selected; it defaults to `flat`. A chunked descriptor records the supported
 `mincdc-hash4-v2` profile (256 KiB minimum, 1 MiB maximum). It refuses a
 non-empty incompatible directory; it does not infer or convert an older
 layout. Chunked storage is supported only on Linux. Flat storage is supported
-on Apple Silicon macOS and covered by a native CI package/test lane.
-`init`, `serve`, and maintenance commands reject a chunked
-selection before opening storage because macOS has no verified durability
-sequence for syncing chunk data and shard entries before manifest publication.
+on Apple Silicon macOS. On macOS, `init`, `serve`, and maintenance commands
+reject chunked storage before opening it.
 
 token create generates a random 256-bit token, writes only its SHA-256 hash and
 label atomically to the scope file, and prints the secret once to stdout.
@@ -135,7 +130,22 @@ it does not modify the local store database or invoke Nix subprocesses.
 `xz`) and defaults to `none`; the server independently selects its stored and
 served representations. Uploads use fixed-length streamed requests and the
 server's atomic per-object publication. The client needs read access to the
-store and its metadata database, plus permission to create temporary GC roots.
+store and its metadata database. It protects the requested roots before reading
+closure metadata. Direct writable-state access records NUL-separated paths in
+`$NIX_STATE_DIR/temproots/<pid>` (default `/nix/var/nix/temproots/<pid>`) and
+holds an exclusive file lock for the push. Guards in the same process share
+that file. Nix's `gc.lock` is held shared only while validating paths,
+registering roots, and reading metadata, not during uploads. When the last
+guard closes the file, Nix GC can reclaim it without retaining its paths.
+This also holds after SIGKILL; no destructor or signal handler is required.
+Normal unprivileged users register temporary roots with `AddTempRoot` through
+the native Nix daemon
+socket and keep that connection alive for the entire push. A missing lock file
+is created only when the local state directory is writable; symlinks and
+non-regular lock files are rejected. Permission-denied or read-only failures
+opening the lock or installing local roots use the same daemon path. Invalid
+paths and other rooting failures remain errors. Failure to establish roots
+aborts the push before metadata lookup.
 Each native HTTP request has a 30-second timeout by default; `--timeout-seconds` or
 `NARJAR_PUSH_TIMEOUT_SECONDS` changes it.
 
@@ -144,24 +154,24 @@ unless `--insecure-http` explicitly permits sending them over plain HTTP. Use
 HTTPS for remote access. A request started over HTTP without that override
 remains unauthenticated after an HTTP-to-HTTPS redirect; use an HTTPS target
 from the start. The netrc file must have restrictive permissions.
-`NARJAR_PUSH_GCROOTS` may point
-to an operator-owned existing `gcroots/auto` directory when the normal Nix
-state directory is not writable; it changes only where Narjar places its
-temporary reachability symlinks, not Nix's store or state database.
 
-Shared publishers can pass `--ignore-conflicts` to skip a store path whose
-immutable destination already has a different NAR identity and continue the
-closure. The existing destination remains untouched; without this explicit
-option, the push fails so the conflict is visible.
+Valid publications for the same full store path are skipped, even when the
+local NAR hash, size, or references differ. The first valid publication wins.
+`--refresh` forces uploads but does not replace existing metadata; a narinfo
+409 race that leaves a valid publication for the same full store path is also
+destination-present. Other destination narinfo conflicts fail the push;
+`--ignore-conflicts` skips those conflicts and continues the closure.
 
 The native client transfers store-path NARs and narinfos only. Realisations,
 build logs, `.ls` listings, and other store-daemon metadata are outside this
 client’s upload contract; use the corresponding stock Nix operation when those
 surfaces are required.
 
-delete is offline-only: it refuses while the serve lock is held, removes the
+`delete` is offline-only: it refuses while the serve lock is held, removes the
 published narinfo after validation and directory sync, and leaves
-the canonical object. list-orphans reports unreferenced flat NARs or chunked
+the canonical object. Clients with cached narinfo can still fetch its NAR;
+deletion does not erase the payload or invalidate client caches.
+`list-orphans` reports unreferenced flat NARs or chunked
 manifests. For chunked storage, `verify` and `reconcile --verify-hashes`
 reconstruct the canonical stream and inspect the referenced chunks.
 gc is also offline-only and takes the same data-directory lock. It defaults to
@@ -234,10 +244,7 @@ excess is HTTP 422. Decoding runs in the bounded publication
 worker pool, so at most `workers` decoders can be active and their configured
 aggregate memory ceiling is `workers × maxDecoderMemoryBytes`.
 
-A TOML configuration file is an explicit v0.1 non-goal. It would add a parser
-and duplicate the systemd/container environment boundary. If future option
-count makes that trade worthwhile, flags continue to override file values and
-environment continues to override only non-secret values.
+There is no TOML configuration file.
 
 Example fresh start:
 
@@ -273,9 +280,13 @@ serve creates a fixed worker set and a bounded queue. max-in-flight limits
 requests that have begun processing; excess requests receive 429 when possible
 or remain outside Narjar in the proxy accept queue.
 
-Each admitted upload owns at most one temporary file, one descriptor, bounded
-hash state, and one fixed buffer. Reads own one file and one fixed buffer. Memory
-is therefore O(workers * buffer-size), independent of NAR size.
+Memory includes the server baseline, bounded connections and queues, metadata,
+and each active worker's scratch buffers, codec working memory, and backend
+state. The decoder budget defaults to 128 MiB per compressed upload; eight
+active workers can therefore admit up to 1 GiB of decoder budgets alone. This
+is not an RSS ceiling. Chunked ingestion also holds bounded chunk batches and
+stages manifest descriptors on disk. Payloads are streamed rather than held in
+object-sized buffers.
 
 Header parsing limits come from Narjar's fixed parser plus route checks. Content-
 Length is required before upload admission. Each accepted socket uses the
@@ -284,9 +295,8 @@ default) as an idle-progress deadline for request headers, request bodies, and
 response writes. The deadline applies to each blocking read or write, so a
 large transfer may exceed 30 seconds when every interval makes progress. A
 stalled client releases its worker and upload admission when the socket
-operation times out. A reverse proxy may use stricter limits, but direct use
-does not depend on proxy enforcement. NAR size and minimum free-space checks
-happen before and during the stream.
+operation times out. A reverse proxy may use stricter limits.
+NAR size and minimum free-space checks happen before and during the stream.
 
 Publication workers are bounded by `--workers` and process independent PUTs
 concurrently. Each write reserves its declared body size against available
@@ -295,23 +305,13 @@ temporary file and a durable record under `.narjar-transactions` before
 streaming its body. The record durably advances through `staging`, `streaming`,
 `validated`, `linked`, and `published` states at the corresponding filesystem
 boundaries. Invalid binary records stop recovery without discarding evidence;
-text records are not supported. Only the final
-link/compare and destination-directory sync are serialized for the same
-destination; unrelated destinations do not wait behind a slow body or decoder.
+text records are not supported. Final link/compare, destination-directory sync,
+and flat canonical-object acquisition share the destination lock. Binding waits
+until a publisher can no longer roll back its link. Identical retries must
+complete that same directory barrier; chunked binding synchronizes the manifest
+directory. Unrelated destinations do not wait behind a slow body or decoder.
 The queue remains bounded and exposes depth and wait metrics; excess requests
 receive 429 when admission is full.
-
-If a process stops during publication, the transaction record keeps the
-temporary path and durable state recoverable without making an incomplete final
-object visible. Startup checks published references, validates each recovery
-record, removes recorded temporary state, and only then writes the clean marker.
-During that recovery check, every trusted narinfo must have its
-referenced payloads available at the declared sizes. Flat storage checks file
-metadata; chunked storage verifies the manifest and each chunk's presence and
-size. Startup stops at the first invalid pair and reports progress and elapsed
-time without reading payload bytes. Run `narjar verify` for a full content scan.
-Concurrent writers still use private temporary files and atomic
-link-no-replace, so a retry is identical success or a deterministic conflict.
 
 ## Durable upload state machine
 
@@ -354,12 +354,14 @@ publication point.
 | narinfo without canonical object | narinfo is quarantinable corruption; normal server returns 404/500 rather than bytes | missing canonical object |
 | malformed final filename | unreachable by valid route | unknown/invalid file |
 
-Startup validates the fixed layout and lock, verifies the published inventory
-when recovery records are present, then removes only those recorded temporary
-objects before serving. For a flat root that inventory points at a regular NAR
-file; for a chunked root it points at a checksum-validated manifest and its
-referenced regular chunk files. Reconciliation remains deterministic and
-operator-triggered for other stale temporary files.
+Startup validates the fixed layout and lock. During recovery, it checks every
+trusted narinfo's referenced payloads at their declared sizes: regular NAR files
+for flat storage, checksum-validated manifests and regular chunk files for
+chunked storage. It stops at the first invalid pair and reports progress and
+elapsed time without reading payload bytes. It validates recovery records,
+removes only their recorded temporary state, and then writes the clean marker
+before serving. Use `reconcile` for other stale temporary files and `verify`
+for a full content scan.
 
 Server-generated compressed egress has a durable receipt under
 `.narjar-egress/` binding one canonical raw identity and codec to the exact
@@ -370,14 +372,19 @@ reproduce the recorded identity. Materialization verifies the replacement
 identity before an atomic repair rename; ordinary uploaded NAR and narinfo
 destinations remain immutable no-replace publications.
 
-Upload validation is the first content-integrity boundary. Raw narinfo
-publication and normal availability checks inspect only that the regular file
-exists with the declared encoded size. Compressed upload validation durably
-records the decoded identity in `.narjar-validation/`; compressed narinfo
-publication reuses matching evidence and fully revalidates when it is missing,
-malformed, stale, or incompatible. Use `narjar verify` or `narjar
-reconcile --verify-hashes` for an explicit full content scan, including
-detection of same-size out-of-band mutation.
+Compressed uploads durably record their encoded-to-raw identity in
+`.narjar-ingress/`. Compressed narinfo publication requires a matching receipt;
+missing, malformed, or mismatched receipts reject publication. Upload the
+payload again to restore that evidence: the original compressed bytes are not
+retained for a verification fallback. `.narjar-validation/` is reserved and is
+not the ingress receipt store.
+
+Narinfo binding checks canonical-object identity and durability. Flat binding
+hashes a file on a verification-cache miss. Initial GET/HEAD availability lookup
+uses type and size; flat delivery then verifies the opened file's identity on a
+cache miss. Chunked binding and delivery check manifests and chunk availability.
+Use `narjar verify` or `narjar reconcile --verify-hashes` for a full content scan,
+including detection of same-size out-of-band mutation.
 
 ## Disk-full and I/O failure
 
@@ -388,14 +395,17 @@ can consume space or inodes.
 
 ENOSPC and EDQUOT return 507 after closing and attempting to remove the temp;
 inode exhaustion is also reported as 507 and read-only transitions as 503. EIO,
-sync, or directory-sync failure returns 500 and never claims success. Cleanup
-failure is logged with request ID and temporary identifier, not a raw arbitrary
-path. Metrics expose fixed-cardinality counters for no-space, quota, inode, and
-read-only pressure.
+sync, or directory-sync failure returns 500 and never claims success. Recovery
+records identify staged resources requiring cleanup; Narjar does not generate
+request IDs. Metrics expose fixed-cardinality counters for no-space, quota,
+inode, and read-only pressure.
 
-Once a narinfo is published, a later NAR read/open failure returns 500 and an
-integrity counter. It does not silently return 404 because metadata says the
-path should exist.
+A missing payload at route lookup or opening returns 404. Operational errors and
+verification failures detected before response headers return 500. A failure
+during body transfer aborts the connection; it cannot replace headers already
+sent. Narjar does not maintain a reverse index of every published reference on
+that lookup path; recovery and explicit verification detect metadata whose
+payload has gone missing.
 
 ## Reconcile classifications
 
@@ -426,9 +436,8 @@ No command turns an orphan into a published path.
 ## Backup and restore
 
 The portable backup boundary is the complete data directory, copied while the
-serving process is stopped and the DATA lease is released. A live `rsync` is
-convergent synchronization, not a point-in-time backup: it may capture a NAR
-and its narinfo at different moments.
+serving process is stopped and the DATA lease is released. A live `rsync` may
+capture a NAR and its narinfo at different moments.
 
 For a live convergent copy when downtime is not available, exclude the contents
 of every `.tmp` directory, preserving the directories themselves, and run
@@ -462,17 +471,10 @@ the recovery marker, trust material, and credentials according to that same
 policy. A corrupt or incomplete copy must remain offline: `doctor`,
 `reconcile`, or `verify` must pass before readiness is considered meaningful.
 
-Executable backup/restore coverage is the
-[`restored_cache_verifies_before_serving`](../tests/cli.rs) integration test;
-it initializes a fresh destination layout, restores the cache files, runs
-reconciliation, verification, and doctor, then starts the restored service before
-accepting readiness.
-
 ### Optional ZFS snapshot and replication workflow
 
-ZFS operations stay outside Narjar. Substitute an explicitly verified dataset
-name for `pool/narjar-data`; never infer a production target from a mountpoint
-or copy these commands onto an unrelated pool.
+ZFS operations stay outside Narjar. Replace `pool/narjar-data` with the verified
+DATA dataset name before running these commands.
 
 First confirm the DATA dataset, mountpoint, and policy before taking a snapshot:
 
@@ -535,10 +537,8 @@ zfs send -R -i "$dataset@$base" "$dataset@$next" | zfs receive -u "$target"
 ~~~
 
 If a send or receive fails, keep the receive target offline and treat it as an
-incomplete restore; do not route Narjar to it. A successful ZFS receive proves
-that the stream was accepted by ZFS, not that Narjar's published pairs are
-complete. Restore validation remains an application-level `doctor`,
-`reconcile --verify-hashes`, `verify`, and fresh-client substitution sequence.
+incomplete restore. Validate it with `doctor`, `reconcile --verify-hashes`,
+`verify`, and fresh-client substitution before serving it.
 
 Run a pool scrub separately from Narjar verification and retain the final pool
 status output. Scrub checks and, where configured, repairs ZFS block checksums;
@@ -566,41 +566,13 @@ disposable.
 zfs release -r narjar:backup "$dataset@$snapshot"
 ~~~
 
-## Deletion and retention GC
-
-`delete` supports offline logical deletion of one store hash:
-
-1. Stop serve and acquire the exclusive lock.
-2. Parse and validate the named narinfo.
-3. Remove narinfo and sync DATA.
-4. Leave its NAR untouched.
-5. Run list-orphans or verify.
-
-This instantly makes the store path absent while avoiding shared-NAR races.
-Clients may retain positive narinfo cache entries until refresh/TTL and then
-receive a NAR 200 if they already know its URL; therefore deletion is not a
-confidential-erasure feature.
-
-`gc` is the bounded offline retention operation. It validates the entire
-published inventory before planning or deleting, protects the transitive
-`References` closure of configured roots, and orders eligible narinfos by
-publication time. Its size accounting is logical file length, so snapshots,
-compression, reflinks, CoW, and sparse allocation remain filesystem/operator
-concerns. NARJ-32 rejects access-time retention, online GC, a
-resident worker, and an HTTP delete/GC API.
-
 ## Observability
 
-Logs are one line per event on stderr using stable key=value fields:
-
-~~~text
-level=info event=request_done request_id=... method=PUT route=nar status=201
-bytes_in=... bytes_out=... duration_ms=... auth=write token_name=ci
-~~~
-
-No field contains Authorization, token bytes, netrc, signature bytes, request
-body, arbitrary filesystem path, or query credentials. Store/file hash logging
-is configurable and off by default.
+Startup, recovery, and command failures produce diagnostics on stderr. Narjar
+does not emit structured per-request logs, assign request identifiers, or provide
+a configurable store-hash logging mode. Use the HTTP metrics for aggregate
+request counts, byte counts, outcomes, and durations. If a reverse proxy logs
+individual requests, configure it to redact credentials.
 
 GET /healthz is unauthenticated and returns 200 once the HTTP loop is alive.
 It says nothing about disk writability or trust configuration.
@@ -611,11 +583,11 @@ space exceeds reserve. It returns 503 with a bounded reason class otherwise.
 In private-read mode it requires read authorization; public-read mode leaves it
 public.
 
-GET /metrics exposes Prometheus text generated directly from atomic counters,
-without a metrics crate. Private-read mode requires read authorization.
+GET /metrics exposes Prometheus text. Private-read mode requires read
+authorization.
 `narjar stats` fetches and prints that same exposition; it has no JSON output
 mode, and `/metrics` is the only statistics route.
-Required series:
+Series:
 
 - `narjar_http_requests_total{method,route,status}` uses fixed method and route
   values, plus exact supported HTTP status codes and `other`.
@@ -687,12 +659,8 @@ Required series:
   logical, referenced, snapshot, child, reservation, and available byte totals.
   `narjar_zfs_compression_info{algorithm,state}` has fixed algorithm values;
   `narjar_zfs_compression_level{algorithm,state}` reports numeric levels
-  separately, and unknown future settings use `algorithm="other"`.
+  separately, and unrecognized settings use `algorithm="other"`.
 - narjar_ready 0/1
-
-The [`health_readiness_metrics_and_stats_follow_the_operator_contract`](../tests/cli.rs)
-integration test exercises the metric output and readiness transitions; the
-metric implementation is in [`src/metrics.rs`](../src/metrics.rs).
 
 Labels are fixed enums; no request IDs, paths, token names, or hashes become
 metric labels.
@@ -706,14 +674,10 @@ classes are exported as fixed labels. GC-reclaimed bytes are Narjar's logical
 accounting delta, not a claim about physical blocks freed; unmeasured byte
 counts are omitted.
 
-The following measurements are omitted. Client-side push
-preflight and trusted-cache skips cannot be inferred from server requests.
-Upstream edge-fill outcomes, native-source lease counts, and online-retention
-effects belong with those features when implemented. Per-object popularity and
-distinct-client counts are omitted to avoid a resident catalog, privacy
-exposure, and unbounded metric cardinality. Build-time savings and host-level
-ARC, disk, and network pressure belong in client or platform monitoring. These
-omissions mean "not measured," not zero.
+Server metrics do not measure client push preflight or trusted-cache skips,
+upstream fills, native-source leases, online retention, per-object popularity,
+distinct clients, or build-time savings. Monitor host ARC, disk, and network
+pressure separately. Omitted measurements are not zero.
 
 ## Filesystem support boundary
 
@@ -731,45 +695,46 @@ for backend-specific durability requirements and remaining conformance gaps.
 | Environment | Current classification | Meaning |
 | --- | --- | --- |
 | NixOS module evaluation | configuration only | Covers module options and generated units, not filesystem or service runtime behavior. |
-| XFS, btrfs, ZFS, and Darwin APFS | unverified host-specific behavior | Do not turn successful unit tests or a deployment anecdote into a support guarantee. |
+| XFS, btrfs, ZFS, and Darwin APFS | unverified host-specific behavior | Portable tests do not establish filesystem-specific crash durability. |
 | tmpfs | non-persistent fixture only | Useful for tests; it is not a durable cache or a backup target. |
 | bind-mounted DATA | depends on the mounted underlying filesystem | Validate the mounted DATA path and its ownership; the container/image filesystem is not the storage contract. |
-| overlay, NFS, SMB, and FUSE | unsupported or unverified | Do not use them for a claimed production deployment without a conformance result for link, lock, sync, and transaction-recovery semantics. |
+| overlay, NFS, SMB, and FUSE | unsupported or unverified | Link, lock, sync, and transaction-recovery conformance is not established. |
 
-For a Narjar-only ZFS dataset, the conservative provisional posture is
+For a Narjar-only ZFS dataset, use
 `sync=standard`, checksums enabled, `dedup=off`, `atime=off`, the default record
 size and cache topology, and no special vdev or SLOG requirement. The
-[filesystem capability ADR](filesystem-capability-adr.md#support-boundary) and
+[filesystem requirements](filesystem-capability-adr.md#support-boundary) and
 [architecture](architecture.md#canonical-storage-backends) recommend
 `compression=zstd` (the OpenZFS alias for `zstd-3`). Narjar does not set or verify
-ZFS properties. This recommendation does not establish a speed, space-saving,
-or filesystem-conformance guarantee. Other compression levels, non-default
-recordsize, ARC policy, deduplication, and other tuning remain optional and
-unapproved until the corresponding measured evidence exists. `sync=disabled`
-violates the durability contract.
+ZFS properties. These settings do not establish performance or filesystem
+conformance. Other compression levels, record sizes, ARC policies, and
+deduplication need workload-specific measurements. `sync=disabled` violates
+the durability contract.
 
 ## Graceful shutdown
 
 SIGINT/SIGTERM set a shutdown flag, stop admitting new requests, and wait up to
 the configured grace period for workers. The drain order is deterministic:
 
-1. The listener stops accepting connections.
-2. Accepted request workers finish reading or reject their current requests;
-   no new publication is admitted.
-3. Request workers close the publication queue, allowing already queued
-   publications to drain.
-4. Publication workers finish the current stream/validation and any narrow
-   destination commit they have begun.
+1. Publication admission changes from open to draining before the listener
+   closes. This drops the queue's only sender; no later publication can enter it.
+2. Accepted request workers finish or reject their current requests. Idle
+   keep-alive connections close without waiting for the full I/O timeout, and
+   persistent connections cannot start another request during shutdown.
+3. Publication workers drain already queued uploads and finish any narrow
+   destination commit they have begun. Request and publication workers share
+   the same grace deadline.
 
 In-flight uploads and queued publications may finish within the grace period;
 transaction records make any interruption before a durable boundary
 reconcile-safe. After the deadline, process termination leaves only recorded
 transactions, reconcile-safe temporaries, or already durable immutable files.
-A second signal exits immediately. Set systemd `TimeoutStopSec` above the
-grace period, plus a small supervisor margin, when the service should be
-allowed to drain rather than be externally killed.
+A second signal exits immediately. The NixOS module defaults systemd
+`TimeoutStopSec` to `shutdownGraceSeconds + 10`. An explicit
+`systemd.services.narjar.serviceConfig.TimeoutStopSec` overrides that default.
+For other systemd deployments, set the stop timeout above the grace period
+with a supervisor margin so the service can drain before being killed.
 
-Implementation may use signal-hook as the one justified signal dependency.
 There is no control socket.
 
 ## Deployment
@@ -856,22 +821,18 @@ operator-managed files. systemd supplies a dynamic unprivileged user, a mode-070
 `StateDirectory`, and the only writable path. The unit drops capabilities and
 enables `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, kernel and
 namespace protections, and an AF_INET/AF_INET6-only address-family allowlist.
-The module also sets `RequiresMountsFor` for the configured data path. On the
-tested native-ZFS deployment this resolves to the generated
-`var-lib-narjar.mount` unit; filesystems whose mount integration does not
-provide a path mount unit must supply an administrator-owned readiness
-dependency. Narjar never mounts or creates the dataset.
+The module sets `RequiresMountsFor` for the configured data path. If mount
+integration does not provide a path mount unit, supply a readiness dependency.
+Narjar never mounts or creates the dataset.
 The `module-evaluation` check covers generated service configuration and valid
 and invalid `dataDir` declarations. CI does not boot NixOS VMs, so it does not
-verify service activation under systemd hardening. There is currently no dedicated
-block-device, tmpfs, unmount/remount, or cross-filesystem conformance lane. XFS, btrfs, ZFS,
-overlay, bind-mount variants, quota/inode exhaustion, read-only remounts, and
-Darwin APFS remain unverified until host-specific lanes provide those fixtures;
-they must not be advertised as covered by the portable checks.
+verify service activation under systemd hardening. Portable checks do not cover
+block-device, tmpfs, unmount/remount, cross-filesystem, quota/inode exhaustion,
+or read-only-remount conformance. See the [filesystem support boundary](#filesystem-support-boundary).
 
 `GET /healthz` is the liveness endpoint. `GET /readyz` is the readiness
-endpoint and requires a read token when private-read mode is enabled. Socket
-activation is an explicit v0.1 non-goal because Narjar owns the listener.
+endpoint and requires a read token when private-read mode is enabled.
+Socket activation is unsupported; Narjar owns the listener.
 
 For public service, terminate TLS and enforce stream timeouts at a reverse
 proxy. For example:

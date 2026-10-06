@@ -57,6 +57,14 @@ printf 'Cargo archive: %s bytes compressed\n' "$crate_size_bytes"
 cd "target/package/narjar-${crate_version}"
 
 cargo check --locked --all-targets
+cargo check --locked --no-default-features --lib
+cargo nextest run --locked --no-default-features --lib --test nar_decoder --test nar_encoder --test nar_allocations
+library_dependencies=target/library-dependencies.txt
+cargo tree --locked --no-default-features --edges normal --prefix none --package narjar > "$library_dependencies"
+if grep -Eq '^(clap|httparse|sqlite|sqlite3-sys|ureq|rustix|lzma-rust2|xz4rust|structured-zstd) ' "$library_dependencies"; then
+  printf 'library-only consumers must not inherit application dependencies\n' >&2
+  exit 1
+fi
 cargo nextest run --locked --package narjar --all-features
 
 consumer_install_root="$PWD/consumer-install"

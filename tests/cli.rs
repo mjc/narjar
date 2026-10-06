@@ -66,6 +66,64 @@ fn assert_clean_shutdown(signal: ExitStatus, status: ExitStatus) {
     assert!(status.success(), "narjar should shut down cleanly");
 }
 
+fn wait_for_connection_refusal<T>(
+    deadline: Instant,
+    mut connect: impl FnMut() -> std::io::Result<T>,
+) {
+    for connection in std::iter::repeat_with(&mut connect) {
+        match connection {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("checking shutdown listener: {error}"),
+            Ok(stream) => drop(stream),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first SIGTERM must stop accepting connections"
+        );
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn shutdown_probe_retries_resets_and_open_connections_until_refused() {
+    let mut probes = [
+        Err(std::io::ErrorKind::ConnectionReset.into()),
+        Ok(()),
+        Err(std::io::ErrorKind::ConnectionRefused.into()),
+    ]
+    .into_iter();
+    wait_for_connection_refusal(Instant::now() + Duration::from_secs(1), || {
+        probes
+            .next()
+            .expect("shutdown must be established by refusal, not a reset")
+    });
+    assert_eq!(probes.len(), 0);
+}
+
+#[test]
+fn shutdown_probe_does_not_treat_resets_as_listener_closure() {
+    let result = std::panic::catch_unwind(|| {
+        wait_for_connection_refusal::<()>(Instant::now(), || {
+            Err(std::io::ErrorKind::ConnectionReset.into())
+        });
+    });
+    assert!(
+        result.is_err(),
+        "a reset without refusal must not satisfy the probe"
+    );
+}
+
+#[test]
+fn shutdown_probe_does_not_hide_other_connection_errors() {
+    let result = std::panic::catch_unwind(|| {
+        wait_for_connection_refusal::<()>(Instant::now() + Duration::from_secs(1), || {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+    });
+    assert!(result.is_err());
+}
+
 fn signed_narinfo(nar_hash: &str, nar_size: u64) -> String {
     signed_narinfo_for(STORE_HASH, nar_hash, nar_size)
 }
@@ -320,6 +378,15 @@ fn cli_help_and_version_work_for_the_packaged_binary() {
 }
 
 #[test]
+fn serve_help_does_not_advertise_unimplemented_native_store_options() {
+    let output = run(&["serve", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(!help.contains("native-store"), "{help}");
+    assert!(!help.contains("--native-"), "{help}");
+}
+
+#[test]
 fn push_uses_native_transfer_without_nix_copy() {
     for (compression, suffix) in [("none", ".nar"), ("zstd", ".nar.zst"), ("xz", ".nar.xz")] {
         assert_native_push_process_boundary(compression, suffix);
@@ -423,8 +490,11 @@ fn native_push_skips_payload_generation_for_a_matching_trusted_upstream() {
     });
 
     let fixture = native_push_fixture();
-    fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
-        .expect("remove local payload so generation would fail");
+    fs::write(
+        fixture.store_dir.join(format!("{STORE_HASH}-narjar")),
+        b"payload contradicts registered NAR identity",
+    )
+    .expect("make serialization fail identity validation if preflight does not skip it");
     let upstream_url = format!("http://{upstream_address}");
     let upstream_key = trusted_upstream_key_for(&upstream_url, 7);
     let output = run_native_push_fixture_with_options(
@@ -535,8 +605,11 @@ fn native_push_skips_payload_generation_when_the_destination_is_present() {
     );
     let (destination, server) = one_response_cache(200, "OK", narinfo);
     let fixture = native_push_fixture();
-    fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
-        .expect("remove local payload so generation would fail");
+    fs::write(
+        fixture.store_dir.join(format!("{STORE_HASH}-narjar")),
+        b"payload contradicts registered NAR identity",
+    )
+    .expect("make serialization fail identity validation if preflight does not skip it");
 
     let output = run_native_push_fixture(&fixture, &destination, "none", false);
 
@@ -581,7 +654,8 @@ fn native_push_keeps_the_first_valid_publication_of_a_store_path() {
     for compression in ["none", "xz", "zstd"] {
         let fixture = native_push_fixture();
         let local_file = fixture.store_dir.join(format!("{STORE_HASH}-narjar"));
-        fs::remove_file(&local_file).expect("make payload generation fail if preflight tries it");
+        fs::write(&local_file, b"payload contradicts registered NAR identity")
+            .expect("make payload generation fail if preflight tries it");
         let payloads_before = fs::read_dir(server.data_dir.join("nar")).unwrap().count();
 
         let skipped = run_native_push_fixture(
@@ -768,8 +842,11 @@ fn native_push_uses_the_first_matching_trusted_upstream_in_configured_order() {
     let (second, second_server) = one_response_cache(200, "OK", matching);
     let (destination, destination_server) = one_response_cache(404, "Not Found", String::new());
     let fixture = native_push_fixture();
-    fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
-        .expect("remove local payload so generation would fail");
+    fs::write(
+        fixture.store_dir.join(format!("{STORE_HASH}-narjar")),
+        b"payload contradicts registered NAR identity",
+    )
+    .expect("make serialization fail identity validation if preflight does not skip it");
     let first_key = trusted_upstream_key_for(&first, 7);
     let second_key = trusted_upstream_key_for(&second, 7);
 
@@ -849,8 +926,11 @@ fn native_push_accepts_external_trusted_narinfo_transport_fields() {
         let (upstream, upstream_server) = one_response_cache(200, "OK", narinfo);
         let key = trusted_upstream_key_for(&upstream, 7);
         let fixture = native_push_fixture();
-        fs::remove_file(fixture.store_dir.join(format!("{STORE_HASH}-narjar")))
-            .expect("remove local payload so generation would fail");
+        fs::write(
+            fixture.store_dir.join(format!("{STORE_HASH}-narjar")),
+            b"payload contradicts registered NAR identity",
+        )
+        .expect("make serialization fail identity validation if preflight does not skip it");
         let output = run_native_push_fixture_with_options(
             &fixture,
             &destination,
@@ -1219,6 +1299,7 @@ fn native_push_fixture() -> NativePushFixture {
         .expect("native store object should be written");
     let state_dir = tools.path().join("state");
     fs::create_dir(&state_dir).expect("native state directory should be created");
+    fs::File::create(state_dir.join("gc.lock")).expect("native GC lock should be created");
     fs::create_dir_all(state_dir.join("gcroots/auto"))
         .expect("native automatic roots directory should be created");
     fs::create_dir(state_dir.join("db")).expect("native database directory should be created");
@@ -2502,6 +2583,45 @@ impl RunningServer {
         self.open_raw_request(method, path, &headers)
     }
 
+    fn open_upload_after_continue(&self, path: &str, length: usize) -> TcpStream {
+        let length = length.to_string();
+        let mut stream = self.open_request(
+            "PUT",
+            path,
+            &[("Content-Length", &length), ("Expect", "100-continue")],
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut interim = [0; 25];
+        stream
+            .read_exact(&mut interim)
+            .expect("publication worker must admit the upload before the test proceeds");
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        stream
+    }
+
+    fn wait_until_listener_is_closed(&self) {
+        wait_for_connection_refusal(Instant::now() + Duration::from_secs(5), || {
+            TcpStream::connect(&self.address)
+        });
+    }
+
+    fn wait_for_metrics_containing(&self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for response in std::iter::repeat_with(|| self.request("GET", "/metrics")) {
+            let metrics = String::from_utf8(response_parts(&response).1).unwrap();
+            if metrics.contains(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "metric never reached {expected:?}: {metrics}"
+            );
+            thread::yield_now();
+        }
+    }
+
     fn authenticated_headers<'a>(
         method: &str,
         headers: &[(&'a str, &'a str)],
@@ -2724,12 +2844,7 @@ fn stalled_upload_body_is_rejected_without_publication() {
 fn second_sigterm_exits_a_stalled_request_immediately() {
     let mut server =
         RunningServer::start_with_args("second-sigterm", &["--shutdown-grace-seconds", "30"]);
-    let _stalled = server.open_request(
-        "PUT",
-        &format!("/nar/{NAR_ID}.nar"),
-        &[("Content-Length", "1")],
-    );
-    thread::sleep(Duration::from_millis(100));
+    let _stalled = server.open_upload_after_continue(&format!("/nar/{NAR_ID}.nar"), 1);
 
     let pid = server
         .child
@@ -2740,7 +2855,7 @@ fn second_sigterm_exits_a_stalled_request_immediately() {
         .args(["-TERM", &pid.to_string()])
         .status()
         .expect("first SIGTERM should be sent");
-    thread::sleep(Duration::from_millis(50));
+    server.wait_until_listener_is_closed();
     let started = Instant::now();
     Command::new("kill")
         .args(["-TERM", &pid.to_string()])
@@ -2761,15 +2876,112 @@ fn second_sigterm_exits_a_stalled_request_immediately() {
 }
 
 #[test]
+fn shutdown_closes_idle_keep_alive_connections_without_waiting_for_the_io_timeout() {
+    let server = RunningServer::start_with_args(
+        "shutdown-idle-keep-alive",
+        &[
+            "--shutdown-grace-seconds",
+            "1",
+            "--io-timeout-seconds",
+            "30",
+        ],
+    );
+    let mut connection = BufReader::new(TcpStream::connect(&server.address).unwrap());
+    connection
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    connection
+        .get_mut()
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n")
+        .unwrap();
+    let response = read_http_response(&mut connection);
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+    let mut after_shutdown = Vec::new();
+    connection.read_to_end(&mut after_shutdown).unwrap();
+    assert!(after_shutdown.is_empty());
+}
+
+#[test]
+fn shutdown_rejects_keep_alive_uploads_and_finishes_already_admitted_uploads() {
+    let mut server = RunningServer::start_with_workers(
+        "shutdown-keep-alive-upload",
+        2,
+        &["--shutdown-grace-seconds", "5"],
+    );
+    let mut active =
+        server.open_upload_after_continue(&format!("/nar/{NARJAR_HASH}.nar"), NAR_BYTES.len());
+    let mut connection = BufReader::new(TcpStream::connect(&server.address).unwrap());
+    connection
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    connection
+        .get_mut()
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n")
+        .unwrap();
+    assert!(read_http_response(&mut connection).starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let pid = server.child.as_ref().unwrap().id();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    server.wait_until_listener_is_closed();
+
+    let request = format!(
+        "PUT /nix-cache-info HTTP/1.1\r\nHost: test\r\nAuthorization: {TEST_AUTHORIZATION}\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+        CACHE_INFO.len()
+    );
+    match connection.get_mut().write_all(request.as_bytes()) {
+        Ok(()) => {
+            let mut response = [0; 256];
+            match connection.read(&mut response) {
+                Ok(0) => {}
+                Ok(count) => assert!(
+                    response[..count].starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"),
+                    "shutdown must not acknowledge another upload: {}",
+                    String::from_utf8_lossy(&response[..count])
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Err(error) => panic!("reading draining connection: {error}"),
+            }
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) => {}
+        Err(error) => panic!("writing draining connection: {error}"),
+    }
+    drop(connection);
+    active.write_all(NAR_BYTES).unwrap();
+    let response = read_http_response(&mut BufReader::new(active));
+    assert!(
+        response.starts_with(b"HTTP/1.1 201 Created\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(
+        fs::read(server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"))).unwrap(),
+        NAR_BYTES
+    );
+    let status = server.child.take().unwrap().wait().unwrap();
+    assert!(
+        status.success(),
+        "already-admitted uploads must drain cleanly"
+    );
+}
+
+#[test]
 fn shutdown_grace_deadline_terminates_a_stalled_request() {
     let mut server =
         RunningServer::start_with_args("shutdown-deadline", &["--shutdown-grace-seconds", "1"]);
-    let _stalled = server.open_request(
-        "PUT",
-        &format!("/nar/{NAR_ID}.nar"),
-        &[("Content-Length", "1")],
-    );
-    thread::sleep(Duration::from_millis(100));
+    let _stalled = server.open_upload_after_continue(&format!("/nar/{NAR_ID}.nar"), 1);
 
     let pid = server
         .child
@@ -2800,23 +3012,54 @@ fn shutdown_grace_deadline_terminates_a_stalled_request() {
 }
 
 #[test]
+fn shutdown_drains_active_and_already_queued_publications() {
+    let mut server = RunningServer::start_with_args(
+        "shutdown-drains-publication-queue",
+        &["--max-in-flight", "3", "--shutdown-grace-seconds", "5"],
+    );
+    let mut active =
+        server.open_upload_after_continue(&format!("/nar/{NARJAR_HASH}.nar"), NAR_BYTES.len());
+    let length = CACHE_INFO.len().to_string();
+    let mut queued = server.open_request(
+        "PUT",
+        "/nix-cache-info",
+        &[("Content-Length", &length), ("Expect", "100-continue")],
+    );
+    queued
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    server.wait_for_metrics_containing("narjar_publication_queue_depth 1");
+    let pid = server.child.as_ref().unwrap().id();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    server.wait_until_listener_is_closed();
+    active.write_all(NAR_BYTES).unwrap();
+    assert!(
+        read_http_response(&mut BufReader::new(active)).starts_with(b"HTTP/1.1 201 Created\r\n")
+    );
+    let mut interim = [0; 25];
+    queued.read_exact(&mut interim).unwrap();
+    assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+    queued.write_all(CACHE_INFO).unwrap();
+    assert!(read_http_response(&mut BufReader::new(queued)).starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(server.child.take().unwrap().wait().unwrap().success());
+}
+
+#[test]
 fn shutdown_grace_deadline_covers_a_queued_publication() {
     let mut server = RunningServer::start_with_args(
         "shutdown-queued-publication",
         &["--max-in-flight", "3", "--shutdown-grace-seconds", "1"],
     );
     let path = format!("/nar/{NAR_ID}.nar");
-    let _active = server.open_request("PUT", &path, &[("Content-Length", "1")]);
-    thread::sleep(Duration::from_millis(50));
+    let _active = server.open_upload_after_continue(&path, 1);
     let _queued = server.open_request("PUT", &path, &[("Content-Length", "1")]);
-    thread::sleep(Duration::from_millis(50));
-
-    let metrics = String::from_utf8(response_parts(&server.request("GET", "/metrics")).1)
-        .expect("metrics should be UTF-8");
-    assert!(
-        metrics.contains("narjar_publication_queue_depth 1"),
-        "{metrics}"
-    );
+    server.wait_for_metrics_containing("narjar_publication_queue_depth 1");
 
     let pid = server
         .child
@@ -2881,6 +3124,69 @@ fn nix_cache_info_get_and_head_match_contract() {
         "{legacy_get:?}"
     );
     assert!(legacy_head.ends_with("\r\n\r\n"), "{legacy_head:?}");
+}
+
+#[test]
+fn wrong_sized_cache_info_uploads_are_rejected_without_continuation() {
+    let server = RunningServer::start("cache-info-length-before-continue");
+    for path in ["/nix-cache-info", "/main/nix-cache-info"] {
+        let mut stream = server.open_request(
+            "PUT",
+            path,
+            &[("Content-Length", "1"), ("Expect", "100-continue")],
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 409 Conflict\r\n"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(
+            fs::read(server.data_dir.join("nix-cache-info")).unwrap(),
+            CACHE_INFO
+        );
+    }
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn operator_responses_are_not_cacheable_and_private_readiness_varies_on_authorization() {
+    let public = RunningServer::start("operator-no-store");
+    for method in ["GET", "HEAD"] {
+        for path in ["/healthz", "/readyz", "/metrics"] {
+            let response = public.request(method, path);
+            let headers = response_parts(&response).0;
+            assert!(
+                headers.contains("Cache-Control: no-store\r\n"),
+                "{method} {path}: {headers}"
+            );
+        }
+    }
+    let (signal, status) = public.stop();
+    assert_clean_shutdown(signal, status);
+    let private =
+        RunningServer::start_with_read_tokens("private-readiness-no-store", TEST_WRITE_TOKEN);
+    for method in ["GET", "HEAD"] {
+        for headers in [vec![], vec![("Authorization", TEST_AUTHORIZATION)]] {
+            let response = private.request_with_headers(method, "/readyz", &headers);
+            let response_headers = response_parts(&response).0;
+            assert!(
+                response_headers.contains("Cache-Control: no-store\r\n"),
+                "{response_headers}"
+            );
+            assert!(
+                response_headers.contains("Vary: Authorization\r\n"),
+                "{response_headers}"
+            );
+        }
+    }
+    let (signal, status) = private.stop();
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]
@@ -3195,7 +3501,7 @@ fn run_conformance_trace(server: &RunningServer, fixture: &str) -> String {
 }
 
 #[test]
-fn nar_get_and_head_support_one_byte_range() {
+fn nar_get_supports_ranges_and_head_ignores_them() {
     let server = RunningServer::start("nar-ranges");
     let nar_bytes = b"0123456789";
     let nar_hash = nix32_sha256(nar_bytes);
@@ -3211,7 +3517,8 @@ fn nar_get_and_head_support_one_byte_range() {
     let closed = request("GET", "bytes=2-5");
     let open = request("GET", "bytes=5-");
     let suffix = request("GET", "bytes=-4");
-    let head = request("HEAD", "bytes=2-5");
+    let heads = ["bytes=2-5", "bytes=20-", "bytes=wat", "bytes=0-1,4-5"]
+        .map(|range| request("HEAD", range));
     let unsatisfiable = request("GET", "bytes=20-");
     let multiple = request("GET", "bytes=0-1,4-5");
     let malformed = request("GET", "bytes=wat");
@@ -3249,17 +3556,13 @@ fn nar_get_and_head_support_one_byte_range() {
         assert_eq!(actual_body, body);
     }
 
-    let (head_headers, head_body) = response_parts(&head);
-    assert_http_status_line(&head_headers, "206 Partial Content");
-    assert!(
-        head_headers.contains("Content-Range: bytes 2-5/10\r\n"),
-        "{head_headers:?}"
-    );
-    assert!(
-        head_headers.contains("Content-Length: 4\r\n"),
-        "{head_headers:?}"
-    );
-    assert!(head_body.is_empty());
+    for head in heads {
+        let (headers, body) = response_parts(&head);
+        assert_http_status_line(&headers, "200 OK");
+        assert!(headers.contains("Content-Length: 10\r\n"), "{headers:?}");
+        assert!(!headers.contains("Content-Range:"), "{headers:?}");
+        assert!(body.is_empty());
+    }
 
     for response in [&unsatisfiable, &reversed] {
         let (headers, body) = response_parts(response);
@@ -3287,7 +3590,7 @@ fn nar_get_and_head_support_one_byte_range() {
     );
     assert!(
         metrics
-            .contains("narjar_http_requests_total{method=\"HEAD\",route=\"nar\",status=\"206\"} 1"),
+            .contains("narjar_http_requests_total{method=\"HEAD\",route=\"nar\",status=\"200\"} 4"),
         "{metrics}"
     );
     assert!(
@@ -3298,7 +3601,7 @@ fn nar_get_and_head_support_one_byte_range() {
     for expected in [
         "narjar_nar_range_requests_total{method=\"GET\",outcome=\"full\"} 1",
         "narjar_nar_range_requests_total{method=\"GET\",outcome=\"partial\"} 3",
-        "narjar_nar_range_requests_total{method=\"HEAD\",outcome=\"partial\"} 1",
+        "narjar_nar_range_requests_total{method=\"HEAD\",outcome=\"full\"} 4",
         "narjar_nar_range_requests_total{method=\"GET\",outcome=\"unsatisfiable\"} 2",
         "narjar_nar_range_requests_total{method=\"GET\",outcome=\"invalid\"} 5",
     ] {
@@ -3912,6 +4215,140 @@ fn chunked_backend_serves_the_reconstructed_raw_nar() {
         "{range_headers}"
     );
     assert_eq!(range_body, &NAR_BYTES[1..4]);
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn chunked_narinfo_publication_rejects_missing_and_truncated_chunks() {
+    for remove in [true, false] {
+        let server = RunningServer::start_with_args(
+            "chunked-bind-availability",
+            &["--storage-backend", "chunked"],
+        );
+        let uploaded = server
+            .exchange(
+                "PUT",
+                &format!("/nar/{NARJAR_HASH}.nar"),
+                &[],
+                Some(NAR_BYTES),
+            )
+            .response;
+        assert_http_status_line(&response_parts(&uploaded).0, "201 Created");
+        let chunk = fs::read_dir(server.data_dir.join(".narjar-chunks"))
+            .unwrap()
+            .flat_map(|shard| fs::read_dir(shard.unwrap().path()).unwrap())
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_file())
+            .expect("fixture has a chunk");
+        if remove {
+            fs::remove_file(chunk).unwrap();
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(chunk)
+                .unwrap()
+                .set_len(1)
+                .unwrap();
+        }
+        let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
+        let response = server
+            .exchange(
+                "PUT",
+                &format!("/{STORE_HASH}.narinfo"),
+                &[],
+                Some(narinfo.as_bytes()),
+            )
+            .response;
+        let headers = response_parts(&response).0;
+        assert!(
+            !headers.starts_with("HTTP/1.1 2"),
+            "unavailable chunk must prevent publication: {headers}"
+        );
+        assert!(
+            !server
+                .data_dir
+                .join(format!("{STORE_HASH}.narinfo"))
+                .exists()
+        );
+        let (signal, status) = server.stop();
+        assert_clean_shutdown(signal, status);
+    }
+}
+
+#[test]
+fn accepted_upload_sends_continue_before_reading_the_body() {
+    let server = RunningServer::start("expect-continue");
+    let mut stream =
+        server.open_upload_after_continue(&format!("/nar/{NARJAR_HASH}.nar"), NAR_BYTES.len());
+    stream.write_all(NAR_BYTES).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert_http_status_line(&response_parts(&response).0, "201 Created");
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn unsupported_upload_expectation_is_rejected_before_body_delivery() {
+    let server = RunningServer::start("expect-rejected");
+    let mut stream = server.open_request(
+        "PUT",
+        &format!("/nar/{NARJAR_HASH}.nar"),
+        &[("Content-Length", "6"), ("Expect", "unrecognized")],
+    );
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("unsupported expectation must receive an immediate final response");
+    assert_http_status_line(&response_parts(&response).0, "417 Expectation Failed");
+    assert!(
+        !server
+            .data_dir
+            .join(format!("nar/{NARJAR_HASH}.nar"))
+            .exists()
+    );
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn rejected_uploads_do_not_grant_continue_or_wait_for_the_body() {
+    let server =
+        RunningServer::start_with_args("expect-admission", &["--max-encoded-nar-bytes", "5"]);
+    for (authorization, length, expected_status) in [
+        ("wrong-token", "4", "401 Unauthorized"),
+        (TEST_AUTHORIZATION, "6", "413 Payload Too Large"),
+    ] {
+        let mut stream = server.open_raw_request(
+            "PUT",
+            &format!("/nar/{NARJAR_HASH}.nar"),
+            &[
+                ("Content-Length", length),
+                ("Expect", "100-continue"),
+                ("Authorization", authorization),
+            ],
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("reject before the client sends a body");
+        assert_http_status_line(&response_parts(&response).0, expected_status);
+        assert!(!String::from_utf8_lossy(&response).contains("100 Continue"));
+    }
+    assert!(
+        !server
+            .data_dir
+            .join(format!("nar/{NARJAR_HASH}.nar"))
+            .exists()
+    );
     let (signal, status) = server.stop();
     assert_clean_shutdown(signal, status);
 }

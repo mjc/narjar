@@ -1,9 +1,8 @@
 # Virtual NAR segment stream
 
-In the NARJ-94 serving-foundation design, a semantic root is exposed to
-consumers as an ordered pull stream of logical NAR bytes. The stream is
-representation-neutral: its sources may be semantic objects, raw files,
-chunks, or a future packed store, while HTTP remains unaware of that choice.
+This experimental model describes an ordered stream of NAR framing and
+content extents. The offset-map fixture tests the model; Narjar does not use
+a semantic-root storage backend or this segment interface in production.
 
 ## Segment model
 
@@ -47,11 +46,11 @@ symlink frames hold their fixed framing state and one content reference.
 
 Directory entries are sorted by raw NAR name bytes before emission. The
 generator does not use Git's virtual-slash comparator. Names, targets, and
-lengths are validated using the NARJ-76 rules before a frame is admitted.
+lengths must satisfy the NAR grammar before a frame is admitted.
 
 ## Worked offset map
 
-`root_symlink_x` from NARJ-78 is 120 bytes. Its complete map is retained in
+The `root_symlink_x` fixture is 120 bytes. Its map is in
 [`docs/evidence/virtual-nar-segments.tsv`](evidence/virtual-nar-segments.tsv):
 
 | Logical range | Segment | Source |
