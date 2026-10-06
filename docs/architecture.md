@@ -134,9 +134,7 @@ DATA/
   auth/
     read.tokens                         mode 0600, hashed records
     write.tokens                        mode 0600, hashed records
-  .narjar-validation/
-    <encoded-hash>.nar.zst.validation   durable decoded identity evidence
-    <encoded-hash>.nar.xz.validation
+  .narjar-validation/                  reserved layout directory
   .narjar-egress/
     <raw-hash>.nar.zst.receipt           raw-to-egress identity binding
     <raw-hash>.nar.xz.receipt
@@ -246,7 +244,8 @@ PUT /nar/<file-hash>.nar[.zst|.xz]
   -> validate route and Content-Length <= configured maximum
   -> stream body once through the selected canonical backend
   -> for every encoding, hash/count the received bytes while streaming the upload
-  -> for `.nar.zst`/`.nar.xz`, stream-decode the stored bytes to validate the raw NAR hash/size
+  -> for `.nar.zst`/`.nar.xz`, decode the incoming body directly into canonical staging
+     while hashing/counting the raw NAR bytes
   -> reject length/hash/empty mismatch or an oversized decompressed NAR
   -> sync and no-replace publish the flat file, or publish bounded batches of
      shared chunks, sync the Linux filesystem before manifest finalization, then
@@ -293,14 +292,20 @@ new identity is measured. User-uploaded immutable objects retain no-replace
 publication semantics. NAR staging is under `DATA/nar/.tmp`, while metadata
 remains staged under `DATA/.tmp`.
 
-Upload validation is the first content-integrity boundary. Raw narinfo
-publication and ordinary NAR availability checks inspect only that the regular
-file exists with the declared encoded size. Compressed narinfo publication
-reuses durable evidence keyed by encoding, encoded hash, and encoded size; a
-missing, malformed, stale, or incompatible record triggers full encoded and
-decoded verification before publication. Full-content verification is explicit
-operator work through `verify` or `reconcile --verify-hashes`, which detects
-same-size out-of-band mutation.
+Upload validation is the first content-integrity boundary. Compressed uploads
+retain an exact encoded-to-raw identity receipt in `.narjar-ingress/`, not the
+original compressed payload. Compressed narinfo publication requires that
+receipt to match the declared encoding, hash, size, and raw identity. Missing,
+malformed, or mismatched receipts reject publication with `NarMismatch`; the
+uploader must upload the payload again.
+
+Narinfo binding acquires durable canonical storage. Flat files are hash/size
+checked, with an in-process cache of verified file fingerprints avoiding repeat
+hashing. Chunked storage checks its manifest and chunk availability. Initial
+GET/HEAD availability lookup uses file type and size. Flat delivery then verifies
+the opened file's identity on a verification-cache miss; chunked delivery checks
+its manifest and required chunks. Use `verify` or `reconcile --verify-hashes`
+for a full content scan across the cache.
 
 Publication workers are bounded by the configured worker count and process
 valid PUTs concurrently. Each write reserves its declared body size against
@@ -310,9 +315,12 @@ records its private temporary path and initial `staging` state under
 `streaming`, `validated`, `linked`, and `published` as those boundaries
 complete. Records use bounded, versioned Postcard encoding; linked/published
 states require a final destination. Body transfer, validation, and
-temporary-file sync are independent; only final-link comparison and the
-destination-directory sync use a per-destination commit lock. Queue depth and
-queue-wait summaries remain exposed in metrics. Startup recovery checks trusted
+temporary-file sync are independent. Final-link comparison, directory sync,
+and flat canonical-object acquisition share a per-destination commit lock.
+Binding cannot accept a visible link while its publisher can still roll it
+back. Identical retries complete the directory barrier before acknowledging
+success; chunked binding likewise completes the manifest-directory barrier.
+Queue depth and queue-wait summaries remain exposed in metrics. Startup recovery checks trusted
 published narinfo references for available payloads before removing
 transaction-recorded temporary files and rewriting the clean marker. Flat
 payloads are checked by file type and size; chunked payloads are checked by

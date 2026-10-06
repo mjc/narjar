@@ -285,9 +285,13 @@ serve creates a fixed worker set and a bounded queue. max-in-flight limits
 requests that have begun processing; excess requests receive 429 when possible
 or remain outside Narjar in the proxy accept queue.
 
-Each admitted upload owns at most one temporary file, one descriptor, bounded
-hash state, and one fixed buffer. Reads own one file and one fixed buffer. Memory
-is therefore O(workers * buffer-size), independent of NAR size.
+Memory includes the server baseline, bounded connections and queues, metadata,
+and each active worker's scratch buffers, codec working memory, and backend
+state. The decoder budget defaults to 128 MiB per compressed upload; eight
+active workers can therefore admit up to 1 GiB of decoder budgets alone. This
+is not an RSS ceiling. Chunked ingestion also holds bounded chunk batches and
+stages manifest descriptors on disk. Payloads are streamed rather than held in
+object-sized buffers.
 
 Header parsing limits come from Narjar's fixed parser plus route checks. Content-
 Length is required before upload admission. Each accepted socket uses the
@@ -307,9 +311,11 @@ temporary file and a durable record under `.narjar-transactions` before
 streaming its body. The record durably advances through `staging`, `streaming`,
 `validated`, `linked`, and `published` states at the corresponding filesystem
 boundaries. Invalid binary records stop recovery without discarding evidence;
-text records are not supported. Only the final
-link/compare and destination-directory sync are serialized for the same
-destination; unrelated destinations do not wait behind a slow body or decoder.
+text records are not supported. Final link/compare, destination-directory sync,
+and flat canonical-object acquisition share the destination lock. Binding waits
+until a publisher can no longer roll back its link. Identical retries must
+complete that same directory barrier; chunked binding synchronizes the manifest
+directory. Unrelated destinations do not wait behind a slow body or decoder.
 The queue remains bounded and exposes depth and wait metrics; excess requests
 receive 429 when admission is full.
 
@@ -382,14 +388,19 @@ reproduce the recorded identity. Materialization verifies the replacement
 identity before an atomic repair rename; ordinary uploaded NAR and narinfo
 destinations remain immutable no-replace publications.
 
-Upload validation is the first content-integrity boundary. Raw narinfo
-publication and normal availability checks inspect only that the regular file
-exists with the declared encoded size. Compressed upload validation durably
-records the decoded identity in `.narjar-validation/`; compressed narinfo
-publication reuses matching evidence and fully revalidates when it is missing,
-malformed, stale, or incompatible. Use `narjar verify` or `narjar
-reconcile --verify-hashes` for an explicit full content scan, including
-detection of same-size out-of-band mutation.
+Compressed uploads durably record their encoded-to-raw identity in
+`.narjar-ingress/`. Compressed narinfo publication requires a matching receipt;
+missing, malformed, or mismatched receipts reject publication. Upload the
+payload again to restore that evidence: the original compressed bytes are not
+retained for a verification fallback. `.narjar-validation/` is reserved and is
+not the ingress receipt store.
+
+Narinfo binding checks canonical-object identity and durability. Flat binding
+hashes a file on a verification-cache miss. Initial GET/HEAD availability lookup
+uses type and size; flat delivery then verifies the opened file's identity on a
+cache miss. Chunked binding and delivery check manifests and chunk availability.
+Use `narjar verify` or `narjar reconcile --verify-hashes` for a full content scan,
+including detection of same-size out-of-band mutation.
 
 ## Disk-full and I/O failure
 
@@ -400,14 +411,17 @@ can consume space or inodes.
 
 ENOSPC and EDQUOT return 507 after closing and attempting to remove the temp;
 inode exhaustion is also reported as 507 and read-only transitions as 503. EIO,
-sync, or directory-sync failure returns 500 and never claims success. Cleanup
-failure is logged with request ID and temporary identifier, not a raw arbitrary
-path. Metrics expose fixed-cardinality counters for no-space, quota, inode, and
-read-only pressure.
+sync, or directory-sync failure returns 500 and never claims success. Recovery
+records identify staged resources requiring cleanup; Narjar does not generate
+request IDs. Metrics expose fixed-cardinality counters for no-space, quota,
+inode, and read-only pressure.
 
-Once a narinfo is published, a later NAR read/open failure returns 500 and an
-integrity counter. It does not silently return 404 because metadata says the
-path should exist.
+A missing payload at route lookup or opening returns 404. Operational errors and
+verification failures detected before response headers return 500. A failure
+during body transfer aborts the connection; it cannot replace headers already
+sent. Narjar does not maintain a reverse index of every published reference on
+that lookup path; recovery and explicit verification detect metadata whose
+payload has gone missing.
 
 ## Reconcile classifications
 
