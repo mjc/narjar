@@ -2828,6 +2828,108 @@ fn second_sigterm_exits_a_stalled_request_immediately() {
 }
 
 #[test]
+fn shutdown_closes_idle_keep_alive_connections_without_waiting_for_the_io_timeout() {
+    let server = RunningServer::start_with_args(
+        "shutdown-idle-keep-alive",
+        &[
+            "--shutdown-grace-seconds",
+            "1",
+            "--io-timeout-seconds",
+            "30",
+        ],
+    );
+    let mut connection = BufReader::new(TcpStream::connect(&server.address).unwrap());
+    connection
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    connection
+        .get_mut()
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n")
+        .unwrap();
+    let response = read_http_response(&mut connection);
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+    let mut after_shutdown = Vec::new();
+    connection.read_to_end(&mut after_shutdown).unwrap();
+    assert!(after_shutdown.is_empty());
+}
+
+#[test]
+fn shutdown_rejects_keep_alive_uploads_and_finishes_already_admitted_uploads() {
+    let mut server = RunningServer::start_with_workers(
+        "shutdown-keep-alive-upload",
+        2,
+        &["--shutdown-grace-seconds", "5"],
+    );
+    let mut active =
+        server.open_upload_after_continue(&format!("/nar/{NARJAR_HASH}.nar"), NAR_BYTES.len());
+    let mut connection = BufReader::new(TcpStream::connect(&server.address).unwrap());
+    connection
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    connection
+        .get_mut()
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n")
+        .unwrap();
+    assert!(read_http_response(&mut connection).starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let pid = server.child.as_ref().unwrap().id();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    server.wait_until_listener_is_closed();
+
+    let request = format!(
+        "PUT /nix-cache-info HTTP/1.1\r\nHost: test\r\nAuthorization: {TEST_AUTHORIZATION}\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+        CACHE_INFO.len()
+    );
+    match connection.get_mut().write_all(request.as_bytes()) {
+        Ok(()) => {
+            let mut response = [0; 256];
+            match connection.read(&mut response) {
+                Ok(0) => {}
+                Ok(count) => assert!(
+                    response[..count].starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"),
+                    "shutdown must not acknowledge another upload: {}",
+                    String::from_utf8_lossy(&response[..count])
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Err(error) => panic!("reading draining connection: {error}"),
+            }
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) => {}
+        Err(error) => panic!("writing draining connection: {error}"),
+    }
+    drop(connection);
+    active.write_all(NAR_BYTES).unwrap();
+    let response = read_http_response(&mut BufReader::new(active));
+    assert!(
+        response.starts_with(b"HTTP/1.1 201 Created\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(
+        fs::read(server.data_dir.join(format!("nar/{NARJAR_HASH}.nar"))).unwrap(),
+        NAR_BYTES
+    );
+    let status = server.child.take().unwrap().wait().unwrap();
+    assert!(
+        status.success(),
+        "already-admitted uploads must drain cleanly"
+    );
+}
+
+#[test]
 fn shutdown_grace_deadline_terminates_a_stalled_request() {
     let mut server =
         RunningServer::start_with_args("shutdown-deadline", &["--shutdown-grace-seconds", "1"]);
@@ -2859,6 +2961,45 @@ fn shutdown_grace_deadline_terminates_a_stalled_request() {
         started.elapsed() < Duration::from_secs(3),
         "shutdown should remain bounded: {started:?}"
     );
+}
+
+#[test]
+fn shutdown_drains_active_and_already_queued_publications() {
+    let mut server = RunningServer::start_with_args(
+        "shutdown-drains-publication-queue",
+        &["--max-in-flight", "3", "--shutdown-grace-seconds", "5"],
+    );
+    let mut active =
+        server.open_upload_after_continue(&format!("/nar/{NARJAR_HASH}.nar"), NAR_BYTES.len());
+    let length = CACHE_INFO.len().to_string();
+    let mut queued = server.open_request(
+        "PUT",
+        "/nix-cache-info",
+        &[("Content-Length", &length), ("Expect", "100-continue")],
+    );
+    queued
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    server.wait_for_metrics_containing("narjar_publication_queue_depth 1");
+    let pid = server.child.as_ref().unwrap().id();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    server.wait_until_listener_is_closed();
+    active.write_all(NAR_BYTES).unwrap();
+    assert!(
+        read_http_response(&mut BufReader::new(active)).starts_with(b"HTTP/1.1 201 Created\r\n")
+    );
+    let mut interim = [0; 25];
+    queued.read_exact(&mut interim).unwrap();
+    assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+    queued.write_all(CACHE_INFO).unwrap();
+    assert!(read_http_response(&mut BufReader::new(queued)).starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(server.child.take().unwrap().wait().unwrap().success());
 }
 
 #[test]
@@ -2935,6 +3076,69 @@ fn nix_cache_info_get_and_head_match_contract() {
         "{legacy_get:?}"
     );
     assert!(legacy_head.ends_with("\r\n\r\n"), "{legacy_head:?}");
+}
+
+#[test]
+fn wrong_sized_cache_info_uploads_are_rejected_without_continuation() {
+    let server = RunningServer::start("cache-info-length-before-continue");
+    for path in ["/nix-cache-info", "/main/nix-cache-info"] {
+        let mut stream = server.open_request(
+            "PUT",
+            path,
+            &[("Content-Length", "1"), ("Expect", "100-continue")],
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 409 Conflict\r\n"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(
+            fs::read(server.data_dir.join("nix-cache-info")).unwrap(),
+            CACHE_INFO
+        );
+    }
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn operator_responses_are_not_cacheable_and_private_readiness_varies_on_authorization() {
+    let public = RunningServer::start("operator-no-store");
+    for method in ["GET", "HEAD"] {
+        for path in ["/healthz", "/readyz", "/metrics"] {
+            let response = public.request(method, path);
+            let headers = response_parts(&response).0;
+            assert!(
+                headers.contains("Cache-Control: no-store\r\n"),
+                "{method} {path}: {headers}"
+            );
+        }
+    }
+    let (signal, status) = public.stop();
+    assert_clean_shutdown(signal, status);
+    let private =
+        RunningServer::start_with_read_tokens("private-readiness-no-store", TEST_WRITE_TOKEN);
+    for method in ["GET", "HEAD"] {
+        for headers in [vec![], vec![("Authorization", TEST_AUTHORIZATION)]] {
+            let response = private.request_with_headers(method, "/readyz", &headers);
+            let response_headers = response_parts(&response).0;
+            assert!(
+                response_headers.contains("Cache-Control: no-store\r\n"),
+                "{response_headers}"
+            );
+            assert!(
+                response_headers.contains("Vary: Authorization\r\n"),
+                "{response_headers}"
+            );
+        }
+    }
+    let (signal, status) = private.stop();
+    assert_clean_shutdown(signal, status);
 }
 
 #[test]

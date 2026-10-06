@@ -756,13 +756,14 @@ violates the durability contract.
 SIGINT/SIGTERM set a shutdown flag, stop admitting new requests, and wait up to
 the configured grace period for workers. The drain order is deterministic:
 
-1. The listener stops accepting connections.
-2. Accepted request workers finish reading or reject their current requests;
-   no new publication is admitted.
-3. Request workers close the publication queue, allowing already queued
-   publications to drain.
-4. Publication workers finish the current stream/validation and any narrow
-   destination commit they have begun.
+1. Publication admission changes from open to draining before the listener
+   closes. This drops the queue's only sender; no later publication can enter it.
+2. Accepted request workers finish or reject their current requests. Idle
+   keep-alive connections close without waiting for the full I/O timeout, and
+   persistent connections cannot start another request during shutdown.
+3. Publication workers drain already queued uploads and finish any narrow
+   destination commit they have begun. Request and publication workers share
+   the same grace deadline.
 
 In-flight uploads and queued publications may finish within the grace period;
 transaction records make any interruption before a durable boundary

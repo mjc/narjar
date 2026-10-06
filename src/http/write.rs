@@ -17,7 +17,8 @@ use crate::{
 };
 
 use super::read::{
-    CacheRoute, RouteMatch, has_header, header, not_found, request_route, send_response,
+    CacheRoute, RouteMatch, has_header, header, not_found,
+    prevent_operator_and_auth_response_caching, request_route, send_response,
 };
 
 struct UploadRequest {
@@ -80,6 +81,7 @@ impl Read for CountedUploadReader<'_> {
 pub struct PublicationRequest {
     upload: UploadRequest,
     route: CacheRoute,
+    staging_bytes: u64,
 }
 
 impl PublicationRequest {
@@ -92,15 +94,8 @@ impl PublicationRequest {
         let _ = self.upload.respond(&guard, status);
     }
 
-    pub fn staging_bytes(&self, max_encoded_nar_bytes: u64) -> Option<u64> {
-        let length = u64::try_from(self.upload.length()).ok()?;
-        match &self.route {
-            CacheRoute::Nar(_) if length <= max_encoded_nar_bytes => Some(length),
-            CacheRoute::Nar(_) => None,
-            CacheRoute::NarInfo(_) if length <= MAX_NARINFO_BYTES => Some(length),
-            CacheRoute::NarInfo(_) => None,
-            CacheRoute::CacheInfo => Some(0),
-        }
+    pub const fn staging_bytes(&self) -> u64 {
+        self.staging_bytes
     }
 
     pub fn respond(
@@ -113,7 +108,11 @@ impl PublicationRequest {
         staging: StagingReservation,
     ) {
         let guard = metrics.request(RequestMethod::Put, request_route(self.upload.request.url()));
-        let Self { upload, route } = self;
+        let Self {
+            upload,
+            route,
+            staging_bytes: _,
+        } = self;
         let _ = match route {
             CacheRoute::Nar(name) => respond_nar_put(
                 upload,
@@ -152,8 +151,10 @@ impl PublicationRequest {
 
 pub fn prepare_publication(
     mut request: Request,
+    storage: &Storage,
     authorizer: &Authorizer,
     metrics: &Metrics,
+    max_encoded_nar_bytes: u64,
 ) -> Option<PublicationRequest> {
     request.close_after_response();
     if !authorizer.allows(&request, Permission::Write) {
@@ -178,7 +179,56 @@ pub fn prepare_publication(
     };
 
     let upload = UploadRequest::accept(request, metrics)?;
-    Some(PublicationRequest { upload, route })
+    let staging_bytes = match declared_upload_staging_bytes(
+        upload.length(),
+        &route,
+        storage,
+        max_encoded_nar_bytes,
+    ) {
+        Ok(bytes) => bytes,
+        Err(status) => {
+            metrics.validation_failure(ValidationClass::Body);
+            let guard = metrics.request(RequestMethod::Put, request_route(upload.request.url()));
+            let _ = upload.respond(&guard, status);
+            return None;
+        }
+    };
+    Some(PublicationRequest {
+        upload,
+        route,
+        staging_bytes,
+    })
+}
+
+fn declared_upload_staging_bytes(
+    length: usize,
+    route: &CacheRoute,
+    storage: &Storage,
+    max_encoded_nar_bytes: u64,
+) -> Result<u64, StatusCode> {
+    let length = u64::try_from(length).map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+    match route {
+        CacheRoute::Nar(_) => require_upload_size_within_limit(length, max_encoded_nar_bytes),
+        CacheRoute::NarInfo(_) => require_upload_size_within_limit(length, MAX_NARINFO_BYTES),
+        CacheRoute::CacheInfo => {
+            let expected = storage
+                .cache_info()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if length == expected.len() as u64 {
+                Ok(0)
+            } else {
+                Err(StatusCode::CONFLICT)
+            }
+        }
+    }
+}
+
+fn require_upload_size_within_limit(length: u64, limit: u64) -> Result<u64, StatusCode> {
+    if length <= limit {
+        Ok(length)
+    } else {
+        Err(StatusCode::PAYLOAD_TOO_LARGE)
+    }
 }
 
 impl UploadRequest {
@@ -488,6 +538,8 @@ pub(super) fn unauthorized(guard: &RequestGuard<'_>, request: Request) -> Option
     send_response(
         guard,
         request,
-        Response::empty(StatusCode::UNAUTHORIZED).with_header(challenge),
+        prevent_operator_and_auth_response_caching(
+            Response::empty(StatusCode::UNAUTHORIZED).with_header(challenge),
+        ),
     )
 }

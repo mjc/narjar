@@ -2,7 +2,7 @@ use std::{
     io::{self, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -102,14 +102,83 @@ struct QueuedPublication {
     queued_at: Instant,
 }
 
+enum PublicationQueueState {
+    Open(Sender<QueuedPublication>),
+    Draining,
+}
+
+struct PublicationQueue {
+    state: Mutex<PublicationQueueState>,
+    metrics: Arc<Metrics>,
+}
+
+impl PublicationQueue {
+    fn new(sender: Sender<QueuedPublication>, metrics: Arc<Metrics>) -> Self {
+        Self {
+            state: Mutex::new(PublicationQueueState::Open(sender)),
+            metrics,
+        }
+    }
+
+    fn begin_draining(&self) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = PublicationQueueState::Draining;
+    }
+
+    fn enqueue(&self, publication: QueuedPublication) {
+        let rejected = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                PublicationQueueState::Draining => {
+                    Some((publication, StatusCode::SERVICE_UNAVAILABLE))
+                }
+                PublicationQueueState::Open(sender) => {
+                    self.metrics.publication_enqueued();
+                    match sender.try_send(publication) {
+                        Ok(()) => None,
+                        Err(
+                            TrySendError::Full(publication)
+                            | TrySendError::Disconnected(publication),
+                        ) => {
+                            self.metrics.publication_enqueue_failed();
+                            Some((publication, StatusCode::TOO_MANY_REQUESTS))
+                        }
+                    }
+                }
+            }
+        };
+        if let Some((publication, status)) = rejected {
+            publication.request.reject(&self.metrics, status);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RequestWorkerContext {
     storage: Arc<Storage>,
     authorizer: Arc<Authorizer>,
     metrics: Arc<Metrics>,
-    publication_sender: Sender<QueuedPublication>,
+    publications: Arc<PublicationQueue>,
+    stopping: Arc<AtomicBool>,
     min_free_bytes: u64,
     max_encoded_nar_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionPhase {
+    FirstRequest,
+    KeepAlive,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ConnectionReadiness {
+    Readable,
+    Closed,
 }
 
 #[derive(Clone)]
@@ -192,41 +261,47 @@ fn spawn_request_workers(
 }
 
 fn run_request_worker(receiver: Receiver<AcceptedRequest>, context: RequestWorkerContext) {
-    while let Ok(accepted) = receiver.recv() {
+    receiver.iter().for_each(|accepted| {
         context.metrics.connection_dequeued();
-        let AcceptedRequest {
-            mut stream,
-            _admission,
-        } = accepted;
+        let AcceptedRequest { stream, _admission } = accepted;
         let mut admission = Some(_admission);
-        let mut has_served_request = false;
-        while let Some(next_stream) =
-            process_next_request(stream, &mut admission, &context, has_served_request)
-        {
-            stream = next_stream;
-            has_served_request = true;
-        }
-    }
+        let mut phase = ConnectionPhase::FirstRequest;
+        let mut next_stream = Some(stream);
+        std::iter::from_fn(|| {
+            let stream = next_stream.take()?;
+            next_stream = process_next_request(stream, &mut admission, &context, phase);
+            phase = ConnectionPhase::KeepAlive;
+            Some(())
+        })
+        .for_each(drop);
+    });
 }
 
 fn process_next_request(
     stream: TcpStream,
     admission: &mut Option<Admission>,
     context: &RequestWorkerContext,
-    has_served_request: bool,
+    phase: ConnectionPhase,
 ) -> Option<TcpStream> {
-    if has_served_request {
-        match keep_alive_request_is_waiting(&stream) {
-            Ok(true) => {}
-            Ok(false) => return None,
-            Err(error) => {
-                let mut stream = stream;
-                report_request_read_failure(&mut stream, error, &context.metrics);
-                return None;
+    if context.stopping.load(Ordering::Acquire) {
+        return None;
+    }
+    match phase {
+        ConnectionPhase::FirstRequest => {}
+        ConnectionPhase::KeepAlive => {
+            match wait_for_keep_alive_request_or_shutdown(&stream, &context.stopping) {
+                Ok(ConnectionReadiness::Readable) => {}
+                Ok(ConnectionReadiness::Closed) => return None,
+                Err(error) => {
+                    let mut stream = stream;
+                    report_request_read_failure(&mut stream, error, &context.metrics);
+                    return None;
+                }
             }
         }
     }
     match Request::read(stream) {
+        Ok(_) if context.stopping.load(Ordering::Acquire) => None,
         Ok(request) => match request.method() {
             Method::Put => {
                 queue_publication(request, admission, context);
@@ -247,21 +322,41 @@ fn process_next_request(
     }
 }
 
-fn keep_alive_request_is_waiting(stream: &TcpStream) -> io::Result<bool> {
+fn wait_for_keep_alive_request_or_shutdown(
+    stream: &TcpStream,
+    stopping: &AtomicBool,
+) -> io::Result<ConnectionReadiness> {
+    let timeout = stream.read_timeout()?;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let poll_interval = Duration::from_millis(50);
+    stream.set_read_timeout(Some(timeout.unwrap_or(poll_interval).min(poll_interval)))?;
+    let result = std::iter::repeat_with(|| poll_keep_alive_connection(stream, stopping, deadline))
+        .find_map(std::convert::identity)
+        .expect("polling ends only with a readiness result");
+    stream.set_read_timeout(timeout)?;
+    result
+}
+
+fn poll_keep_alive_connection(
+    stream: &TcpStream,
+    stopping: &AtomicBool,
+    deadline: Option<Instant>,
+) -> Option<io::Result<ConnectionReadiness>> {
+    if stopping.load(Ordering::Acquire)
+        || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return Some(Ok(ConnectionReadiness::Closed));
+    }
     let mut first_byte = [0; 1];
-    loop {
-        match stream.peek(&mut first_byte) {
-            Ok(0) => return Ok(false),
-            Ok(_) => return Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error)
-                if error.kind() == io::ErrorKind::TimedOut
-                    || error.kind() == io::ErrorKind::WouldBlock =>
-            {
-                return Ok(false);
+    match stream.peek(&mut first_byte) {
+        Ok(0) => Some(Ok(ConnectionReadiness::Closed)),
+        Ok(_) => Some(Ok(ConnectionReadiness::Readable)),
+        Err(error) => match error.kind() {
+            io::ErrorKind::Interrupted | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                None
             }
-            Err(error) => return Err(error),
-        }
+            _ => Some(Err(error)),
+        },
     }
 }
 
@@ -270,16 +365,18 @@ fn queue_publication(
     admission: &mut Option<Admission>,
     context: &RequestWorkerContext,
 ) {
-    let Some(request) = prepare_publication(request, &context.authorizer, &context.metrics) else {
-        return;
-    };
-    let Some(bytes) = request.staging_bytes(context.max_encoded_nar_bytes) else {
-        request.reject(&context.metrics, StatusCode::PAYLOAD_TOO_LARGE);
+    let Some(request) = prepare_publication(
+        request,
+        &context.storage,
+        &context.authorizer,
+        &context.metrics,
+        context.max_encoded_nar_bytes,
+    ) else {
         return;
     };
     let staging = context
         .storage
-        .reserve_staging(bytes, context.min_free_bytes);
+        .reserve_staging(request.staging_bytes(), context.min_free_bytes);
     let staging = match staging {
         Ok(staging) => staging,
         Err(error) => {
@@ -295,16 +392,7 @@ fn queue_publication(
         _staging: staging,
         queued_at: Instant::now(),
     };
-    context.metrics.publication_enqueued();
-    match context.publication_sender.try_send(publication) {
-        Ok(()) => {}
-        Err(TrySendError::Full(publication) | TrySendError::Disconnected(publication)) => {
-            context.metrics.publication_enqueue_failed();
-            publication
-                .request
-                .reject(&context.metrics, StatusCode::TOO_MANY_REQUESTS);
-        }
-    }
+    context.publications.enqueue(publication);
 }
 
 fn report_request_read_failure(stream: &mut TcpStream, error: io::Error, metrics: &Metrics) {
@@ -506,6 +594,7 @@ struct AcceptLoopContext {
     admissions: Arc<Admissions>,
     metrics: Arc<Metrics>,
     stopping: Arc<AtomicBool>,
+    publications: Arc<PublicationQueue>,
     io_timeout: Duration,
 }
 
@@ -536,6 +625,7 @@ fn run_accept_loop(listener: TcpListener, context: AcceptLoopContext) -> Result<
             Err(error) => return Err(Error::runtime(format!("cannot accept connection: {error}"))),
         }
     }
+    context.publications.begin_draining();
     Ok(())
 }
 
@@ -604,6 +694,10 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let admissions = Arc::new(Admissions::new(max_in_flight, Arc::clone(&metrics)));
     let (sender, receiver) = bounded::<AcceptedRequest>(max_in_flight);
     let (publication_sender, publication_receiver) = bounded::<QueuedPublication>(max_in_flight);
+    let publications = Arc::new(PublicationQueue::new(
+        publication_sender,
+        Arc::clone(&metrics),
+    ));
     let publication_handles = spawn_publication_workers(
         config.workers.get(),
         publication_receiver.clone(),
@@ -620,7 +714,8 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         storage: Arc::clone(&storage),
         authorizer: Arc::clone(&authorizer),
         metrics: Arc::clone(&metrics),
-        publication_sender: publication_sender.clone(),
+        publications: Arc::clone(&publications),
+        stopping: Arc::clone(&stopping),
         min_free_bytes,
         max_encoded_nar_bytes,
     };
@@ -634,6 +729,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             admissions,
             metrics: Arc::clone(&metrics),
             stopping: Arc::clone(&stopping),
+            publications,
             io_timeout: Duration::from_secs(config.io_timeout_seconds.get()),
         },
     )?;
@@ -654,7 +750,6 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .join()
             .map_err(|_| Error::runtime("request worker panicked"))?;
     }
-    drop(publication_sender);
     while publication_handles
         .iter()
         .any(|handle| !handle.is_finished())
@@ -728,8 +823,8 @@ mod tests {
     use narjar::__private::{http_server::Request, metrics::Metrics};
 
     use super::{
-        Admissions, configure_accepted_socket, keep_alive_request_is_waiting,
-        request_read_failure_outcome,
+        Admissions, ConnectionReadiness, configure_accepted_socket, request_read_failure_outcome,
+        wait_for_keep_alive_request_or_shutdown,
     };
     use narjar::__private::metrics::ConnectionOutcome;
 
@@ -762,16 +857,37 @@ mod tests {
         let context = super::RequestWorkerContext {
             storage: Arc::new(storage),
             authorizer: Arc::new(Authorizer::load(&root).unwrap()),
-            metrics,
-            publication_sender,
+            metrics: Arc::clone(&metrics),
+            publications: Arc::new(super::PublicationQueue::new(
+                publication_sender,
+                Arc::clone(&metrics),
+            )),
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             min_free_bytes: 0,
             max_encoded_nar_bytes: 1024,
         };
         let mut receiver = Some(receiver);
-        for disconnected in [false, true] {
-            if disconnected {
-                drop(receiver.take());
-            }
+        enum Rejection {
+            Full,
+            Disconnected,
+            Draining,
+        }
+        for rejection in [
+            Rejection::Full,
+            Rejection::Disconnected,
+            Rejection::Draining,
+        ] {
+            let status = match rejection {
+                Rejection::Full => "429 Too Many Requests",
+                Rejection::Disconnected => {
+                    drop(receiver.take());
+                    "429 Too Many Requests"
+                }
+                Rejection::Draining => {
+                    context.publications.begin_draining();
+                    "503 Service Unavailable"
+                }
+            };
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             client
@@ -787,7 +903,7 @@ mod tests {
             let mut response = String::new();
             client.read_to_string(&mut response).unwrap();
             assert!(
-                response.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+                response.starts_with(&format!("HTTP/1.1 {status}\r\n")),
                 "{response}"
             );
             assert!(!response.contains("100 Continue"), "{response}");
@@ -796,6 +912,45 @@ mod tests {
                 "rejected request released admission"
             );
         }
+    }
+
+    #[test]
+    fn draining_publication_gate_releases_its_sender_without_dropping_request_contexts() {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let queue = Arc::new(super::PublicationQueue::new(
+            sender,
+            Arc::new(Metrics::default()),
+        ));
+        let request_context_reference = Arc::clone(&queue);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+        queue.begin_draining();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        request_context_reference.begin_draining();
+    }
+
+    #[test]
+    fn keep_alive_readiness_restores_the_request_header_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let timeout = Duration::from_secs(2);
+        configure_accepted_socket(&stream, timeout).unwrap();
+        client.write_all(b"G").unwrap();
+        assert_eq!(
+            wait_for_keep_alive_request_or_shutdown(
+                &stream,
+                &std::sync::atomic::AtomicBool::new(false)
+            )
+            .unwrap(),
+            ConnectionReadiness::Readable
+        );
+        assert_eq!(stream.read_timeout().unwrap(), Some(timeout));
     }
 
     #[test]
@@ -895,7 +1050,14 @@ mod tests {
         let (stream, _) = listener.accept().expect("accept idle connection");
         configure_accepted_socket(&stream, Duration::from_millis(30))
             .expect("configure socket timeout");
-        assert!(!keep_alive_request_is_waiting(&stream).expect("peek idle connection"));
+        assert_eq!(
+            wait_for_keep_alive_request_or_shutdown(
+                &stream,
+                &std::sync::atomic::AtomicBool::new(false)
+            )
+            .expect("peek idle connection"),
+            ConnectionReadiness::Closed
+        );
         client.join().expect("client should finish");
     }
 
@@ -911,7 +1073,14 @@ mod tests {
         configure_accepted_socket(&stream, Duration::from_millis(100))
             .expect("configure socket timeout");
         client.join().expect("client should close cleanly");
-        assert!(!keep_alive_request_is_waiting(&stream).expect("peek closed connection"));
+        assert_eq!(
+            wait_for_keep_alive_request_or_shutdown(
+                &stream,
+                &std::sync::atomic::AtomicBool::new(false)
+            )
+            .expect("peek closed connection"),
+            ConnectionReadiness::Closed
+        );
     }
 
     #[test]
@@ -927,7 +1096,14 @@ mod tests {
         let (stream, _) = listener.accept().expect("accept partial request");
         configure_accepted_socket(&stream, Duration::from_millis(30))
             .expect("configure socket timeout");
-        assert!(keep_alive_request_is_waiting(&stream).expect("peek partial request"));
+        assert_eq!(
+            wait_for_keep_alive_request_or_shutdown(
+                &stream,
+                &std::sync::atomic::AtomicBool::new(false)
+            )
+            .expect("peek partial request"),
+            ConnectionReadiness::Readable
+        );
         let error = match Request::read(stream) {
             Ok(_) => panic!("incomplete request should time out"),
             Err((_, error)) => error,
