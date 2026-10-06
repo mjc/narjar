@@ -19,9 +19,8 @@ if [[ -n "${CARGO_INSTALL_VERSION:-}" ]]; then
   cargo install "${install_options[@]}" --registry crates-io --version "=$version" narjar
 else
   cargo package --locked --no-verify --package narjar
-  mkdir -p target/cargo-install-source
-  tar -xzf "target/package/narjar-$version.crate" -C target/cargo-install-source
-  cargo install "${install_options[@]}" --path "target/cargo-install-source/narjar-$version"
+  tar -xzf "target/package/narjar-$version.crate" -C target/package
+  cargo install "${install_options[@]}" --path "target/package/narjar-$version"
 fi
 
 binary="$repository_root/target/cargo-install/bin/narjar"
