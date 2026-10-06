@@ -9,7 +9,8 @@ use std::{
 use lzma_rust2::XzReader as LzmaRustXzReader;
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::{
-    FrameDecoder, StreamingDecoder as StructuredZstdDecoder, read_frame_header_info,
+    ContentChecksum, FrameDecoder, StreamingDecoder as StructuredZstdDecoder,
+    read_frame_header_info,
 };
 use xz4rust::{XzDecoder, XzNextBlockResult};
 
@@ -351,6 +352,9 @@ fn decode_zstd_upload_to_raw_staging<W: Write>(
     let mut decoder = StructuredZstdDecoder::new(prefixed_source).map_err(|error| {
         take_upload_source_error(&source_error, compressed_decoder_error(error))
     })?;
+    decoder
+        .decoder_mut()
+        .set_content_checksum(ContentChecksum::Verify);
     let decoded = copy_decoded_upload_to_raw_staging(
         &mut decoder,
         destination,
@@ -790,6 +794,9 @@ fn decode_verified_zstd_payload(verified: &VerifiedCompressedNar<'_>) -> io::Res
     let input = rewound_compressed_file(verified.file)?;
     let mut decoder = StructuredZstdDecoder::new(StoredCompressedSourceReader::new(input))
         .map_err(compressed_decoder_error)?;
+    decoder
+        .decoder_mut()
+        .set_content_checksum(ContentChecksum::Verify);
     let decoded = measure_decoded_nar(&mut decoder, verified.expectation.decoded().size().get())?;
     ensure_decoder_consumed_complete_compressed_file(
         &mut decoder.into_inner().into_inner(),

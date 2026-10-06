@@ -1548,6 +1548,151 @@ fn zstd_uploads_are_normalized_to_the_raw_nar() {
     assert!(!directory.path().join(format!("{encoded}.nar.zst")).exists());
 }
 
+fn zstd_frame_with_optional_checksum(raw: &[u8], checksum: bool) -> Vec<u8> {
+    let mut encoder =
+        structured_zstd::encoding::StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+    encoder
+        .set_content_checksum(checksum)
+        .expect("select fixture checksum policy before writing");
+    encoder.write_all(raw).expect("encode fixture contents");
+    let frame = encoder.finish().expect("finish fixture frame");
+    assert_eq!(frame[4] & 4 != 0, checksum, "frame declares its checksum");
+    frame
+}
+
+fn corrupt_zstd_checksum(frame: &mut [u8]) {
+    assert_ne!(frame[4] & 4, 0, "fixture must include a checksum");
+    *frame.last_mut().expect("checksum is present") ^= 1;
+}
+
+#[test]
+fn zstd_checksum_mismatch_rejects_flat_upload_without_publishing_or_leaking_staging() {
+    assert_zstd_checksum_mismatch_rejects_upload(SupportedStorageBackend::FLAT);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn zstd_checksum_mismatch_rejects_chunked_upload_without_publishing_or_leaking_staging() {
+    assert_zstd_checksum_mismatch_rejects_upload(
+        StorageBackend::Chunked
+            .try_into()
+            .expect("Linux supports chunked storage"),
+    );
+}
+
+fn assert_zstd_checksum_mismatch_rejects_upload(backend: SupportedStorageBackend) {
+    let directory = TestDir::new();
+    let storage = initialize_storage_with_backend(directory.path(), backend)
+        .expect("initialize checksum fixture storage");
+    let raw = vec![b'x'; 256 * 1024 + 17];
+    let mut frame = zstd_frame_with_optional_checksum(&raw, true);
+    corrupt_zstd_checksum(&mut frame);
+    // Recompute the encoded identity so only codec validation can reject it.
+    let encoded_hash = FileHash::from_digest(Sha256::digest(&frame).into());
+    let result = storage.publish_nar(
+        NarFileName::new(
+            encoded_hash,
+            WireEncoding::Compressed(CompressionCodec::Zstd),
+        ),
+        Cursor::new(&frame),
+        frame.len() as u64,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
+    let StorageError::Io(error) = result.expect_err("a wrong frame checksum must fail upload")
+    else {
+        panic!("checksum mismatch must be an invalid-input I/O error");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        directory_entry_count(storage.layout().nar_dir()),
+        1,
+        "only the staging directory remains"
+    );
+    assert_eq!(
+        directory_entry_count(directory.path().join(".narjar-ingress")),
+        0
+    );
+    assert_eq!(storage.temporary_objects(), 0);
+    #[cfg(target_os = "linux")]
+    if backend.backend() == StorageBackend::Chunked {
+        assert_eq!(
+            directory_entry_count(directory.path().join(".narjar-manifests")),
+            0
+        );
+    }
+}
+
+#[test]
+fn zstd_checksum_mismatch_rejects_stored_payload_with_a_matching_encoded_hash() {
+    let directory = TestDir::new();
+    let raw = vec![b'x'; 256 * 1024 + 17];
+    let mut frame = zstd_frame_with_optional_checksum(&raw, true);
+    corrupt_zstd_checksum(&mut frame);
+    let path = directory.path().join("checksum-mismatch.nar.zst");
+    fs::write(&path, &frame).expect("write fixture frame");
+    let file = fs::File::open(path).expect("open fixture frame");
+    let expectation = CompressedNarIdentity::new(
+        EncodedIdentity::new(
+            CompressionCodec::Zstd,
+            FileHash::from_digest(Sha256::digest(&frame).into()),
+            EncodedSize::new(frame.len() as u64),
+        ),
+        NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&raw).into()),
+            NarSize::new(raw.len() as u64),
+        ),
+    );
+    let verified = verify_encoded_compressed_file(&file, expectation)
+        .expect("encoded verification should succeed")
+        .expect("fixture hash and size match");
+    assert!(
+        verify_decoded_compressed_file(verified)
+            .expect("content mismatch is not a storage I/O failure")
+            .is_none()
+    );
+}
+
+#[test]
+fn zstd_checksums_are_optional_but_valid_when_present_for_uploads_and_stored_verification() {
+    let raw = vec![b'x'; 256 * 1024 + 17];
+    let decoded = NarIdentity::new(
+        NarHash::from_digest(Sha256::digest(&raw).into()),
+        NarSize::new(raw.len() as u64),
+    );
+    for checksum in [false, true] {
+        let (_directory, storage) = flat_storage_fixture();
+        let frame = zstd_frame_with_optional_checksum(&raw, checksum);
+        let encoded = EncodedIdentity::new(
+            CompressionCodec::Zstd,
+            FileHash::from_digest(Sha256::digest(&frame).into()),
+            EncodedSize::new(frame.len() as u64),
+        );
+        storage
+            .publish_nar(
+                encoded.file_name(),
+                Cursor::new(&frame),
+                frame.len() as u64,
+                super::NarUploadPolicy::new(raw.len() as u64, 0),
+            )
+            .expect("valid checksummed and checksumless frames are accepted");
+        assert_eq!(
+            fs::read(storage.layout().nar_path(decoded.hash())).unwrap(),
+            raw
+        );
+
+        let file = tempfile::tempfile().expect("create encoded verification fixture");
+        (&file).write_all(&frame).expect("write frame");
+        let verified =
+            verify_encoded_compressed_file(&file, CompressedNarIdentity::new(encoded, decoded))
+                .unwrap()
+                .expect("valid encoded identity");
+        assert_eq!(
+            verify_decoded_compressed_file(verified).unwrap(),
+            Some(decoded)
+        );
+    }
+}
+
 #[test]
 fn a_restart_after_raw_commit_retries_receipt_publication() {
     for encoding in [
