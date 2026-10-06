@@ -23,7 +23,8 @@ target/release/nar-scan \
 
 ## Canonical streaming encoder
 
-`nix_archive::nar::Encoder` is a version-1 research-only event sink. It emits
+`nar-encode-bench` exercises `nix_archive::nar::Encoder`, not Narjar's public
+encoder. It emits
 the canonical NAR framing, checks strictly increasing directory names, streams
 file chunks directly to its writer, and computes the raw SHA-256 and size in
 the same pass. It keeps only the open-node stack and one previous name per open
@@ -38,8 +39,9 @@ scripts/nar-encode-memory --output /tmp/narjar-narj77.json
 ```
 
 The benchmark writes to `io::sink()` and therefore measures encoding work and
-memory without disk throughput or compression. The 2026-09-07 run is recorded
-at `/tmp/narjar-narj77-20260907-final.json`; its 1 GiB and 20 GiB cases used
+memory without disk throughput or compression. The historical 2026-09-07 run
+used `/tmp/narjar-narj77-20260907-final.json` (not a retained release artifact);
+its 1 GiB and 20 GiB cases used
 1,836 KiB and 1,640 KiB peak RSS respectively.
 
 `nar-reencode` validates byte-for-byte compatibility with an existing Nix NAR
@@ -52,8 +54,9 @@ nix-store --dump /nix/store/<path> | target/release/nar-reencode > reencoded.nar
 The final check used a Nix-produced 120-byte NAR and `cmp` reported identical
 input and re-encoded output.
 
-The corpus-wide streaming comparison is recorded at
-`/tmp/narjar-narj78-20260907.json`: 7,107 raw NARs totaling 78,503,939,680
+The historical corpus-wide streaming comparison used
+`/tmp/narjar-narj78-20260907.json` (not a retained release artifact):
+7,107 raw NARs totaling 78,503,939,680
 bytes produced 7,107 equal outputs and zero mismatches. The comparator uses a
 bounded stdin/stdout pipe and emits one result, first-difference offset, input
 SHA-256, and command record per NAR.

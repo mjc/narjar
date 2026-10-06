@@ -122,7 +122,7 @@ impl Default for Limits {
 ///
 /// The generic parameter is the error returned by [`EventSink`].
 pub enum DecodeError<E = io::Error> {
-    /// Reading the encoded NAR failed.
+    /// Reading the NAR or allocating decoder metadata failed.
     #[error("NAR input: {0}")]
     Io(#[source] io::Error),
     /// The consumer rejected an emitted event.

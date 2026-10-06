@@ -10,7 +10,7 @@ non-canonical input before it can become a reader-visible semantic root.
 
 | Input or actor | Resource/correctness impact | Enforcing boundary | Evidence | Recovery | Residual risk |
 | --- | --- | --- | --- | --- | --- |
-| Authenticated malicious writer | Deep nesting and stack/heap growth | `Limits::max_depth`; encoder node stack and depth-limited decoder recursion | decoder limit tests; bounded encoder fuzz target | Reject the object before publication | Limits must remain aligned with deployment budgets |
+| Authenticated malicious writer | Deep nesting and stack/heap growth | `Limits::max_depth`; iterative decoder traversal and bounded encoder/decoder node stacks | decoder limit tests; bounded encoder fuzz target | Reject the object before publication | Limits must remain aligned with deployment budgets |
 | Authenticated malicious writer | Huge names or symlink targets | `max_name_bytes`, `max_symlink_target_bytes`; raw-byte validation | decoder and encoder boundary tests | Reject the object and retain no root | A high limit can still be operationally expensive |
 | Authenticated malicious writer | Entry/inode fan-out | `max_entries` and `max_work` | decoder limit tests; encoder event-work limit | Abort the event stream before object creation | Semantic object/inode quotas are later admission work |
 | Authenticated malicious writer | File/NAR memory or disk exhaustion | `max_file_bytes`, `max_total_bytes`; file bodies stream in chunks | 20 GiB RSS harness; decoder/encoder size checks | Fail closed and discard incomplete output | Publication/storage quotas remain separate |
