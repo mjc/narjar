@@ -44,6 +44,25 @@ impl DirectoryNames {
     }
 }
 
+enum DirectoryEnd {
+    Root,
+    Entry,
+}
+
+struct DirectoryFrame {
+    names: DirectoryNames,
+    end: DirectoryEnd,
+}
+
+impl DirectoryFrame {
+    fn new(end: DirectoryEnd) -> Self {
+        Self {
+            names: DirectoryNames::default(),
+            end,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// The type of a NAR node.
 pub enum RootKind {
@@ -253,7 +272,7 @@ impl<R: Read> Decoder<R> {
     ) -> Result<DecodeSummary, DecodeError<S::Error>> {
         self.expect(b"nix-archive-1")?;
         let mut counters = Counters::default();
-        let root = self.decode_node(0, sink, &mut counters)?;
+        let root = self.decode_tree(sink, &mut counters)?;
 
         let mut trailing = [0_u8; 1];
         if self.reader.read(&mut trailing).map_err(DecodeError::Io)? != 0 {
@@ -288,7 +307,11 @@ impl<R: Read> Decoder<R> {
             });
         }
         match self.read_node_kind()? {
-            RootKind::Directory => self.decode_directory_node(depth, sink, counters),
+            RootKind::Directory => {
+                sink.event(Event::BeginDirectory { depth })
+                    .map_err(DecodeError::Sink)?;
+                Ok(RootKind::Directory)
+            }
             RootKind::Regular => self.decode_regular_file_node(sink, counters),
             RootKind::Symlink => self.decode_symlink_node(sink, counters),
         }
@@ -305,40 +328,79 @@ impl<R: Read> Decoder<R> {
         }
     }
 
-    fn decode_directory_node<S: EventSink>(
+    fn decode_tree<S: EventSink>(
         &mut self,
-        depth: usize,
         sink: &mut S,
         counters: &mut Counters,
     ) -> Result<RootKind, DecodeError<S::Error>> {
-        sink.event(Event::BeginDirectory { depth })
-            .map_err(DecodeError::Sink)?;
-        let mut names = DirectoryNames::default();
+        let root = self.decode_node(0, sink, counters)?;
+        let mut current = match root {
+            RootKind::Directory => Some(DirectoryFrame::new(DirectoryEnd::Root)),
+            RootKind::Regular | RootKind::Symlink => None,
+        };
+        let mut parents = Vec::new();
         std::iter::from_fn(|| {
-            self.decode_directory_entry_if_present(depth, &mut names, sink, counters)
-                .transpose()
+            let frame = current.take()?;
+            Some(
+                self.decode_directory_child_or_end(frame, &mut parents, sink, counters)
+                    .map(|next| current = next),
+            )
         })
         .try_for_each(|result| result)?;
-        sink.event(Event::EndDirectory).map_err(DecodeError::Sink)?;
-        Ok(RootKind::Directory)
+        Ok(root)
     }
 
-    fn decode_directory_entry_if_present<S: EventSink>(
+    fn decode_directory_child_or_end<S: EventSink>(
         &mut self,
-        depth: usize,
-        names: &mut DirectoryNames,
+        mut frame: DirectoryFrame,
+        parents: &mut Vec<DirectoryFrame>,
         sink: &mut S,
         counters: &mut Counters,
-    ) -> Result<Option<()>, DecodeError<S::Error>> {
-        let Some(name) = self.read_next_directory_entry_name(names, counters)? else {
-            return Ok(None);
-        };
-        sink.event(Event::Entry { name })
-            .map_err(DecodeError::Sink)?;
-        self.expect(b"node")?;
-        self.decode_node(depth + 1, sink, counters)?;
-        self.expect(b")")?;
-        Ok(Some(()))
+    ) -> Result<Option<DirectoryFrame>, DecodeError<S::Error>> {
+        match self.read_next_directory_entry_name(&mut frame.names, counters)? {
+            Some(name) => {
+                sink.event(Event::Entry { name })
+                    .map_err(DecodeError::Sink)?;
+                self.expect(b"node")?;
+                self.decode_child_node(frame, parents, sink, counters)
+            }
+            None => {
+                self.finish_directory(frame.end, sink)?;
+                Ok(parents.pop())
+            }
+        }
+    }
+
+    fn decode_child_node<S: EventSink>(
+        &mut self,
+        parent: DirectoryFrame,
+        parents: &mut Vec<DirectoryFrame>,
+        sink: &mut S,
+        counters: &mut Counters,
+    ) -> Result<Option<DirectoryFrame>, DecodeError<S::Error>> {
+        match self.decode_node(parents.len() + 1, sink, counters)? {
+            RootKind::Directory => {
+                parents.try_reserve(1).map_err(allocation_error)?;
+                parents.push(parent);
+                Ok(Some(DirectoryFrame::new(DirectoryEnd::Entry)))
+            }
+            RootKind::Regular | RootKind::Symlink => {
+                self.expect(b")")?;
+                Ok(Some(parent))
+            }
+        }
+    }
+
+    fn finish_directory<S: EventSink>(
+        &mut self,
+        end: DirectoryEnd,
+        sink: &mut S,
+    ) -> Result<(), DecodeError<S::Error>> {
+        sink.event(Event::EndDirectory).map_err(DecodeError::Sink)?;
+        match end {
+            DirectoryEnd::Root => Ok(()),
+            DirectoryEnd::Entry => self.expect(b")"),
+        }
     }
 
     fn read_next_directory_entry_name<'a, E>(
@@ -439,8 +501,7 @@ impl<R: Read> Decoder<R> {
     fn read_symlink_target<E>(&mut self) -> Result<(), DecodeError<E>> {
         self.expect(b"target")?;
         let length = self.read_bounded_string_length(self.limits.max_symlink_target_bytes)?;
-        self.symlink_target.resize(length, 0);
-        release_oversized_metadata_capacity(&mut self.symlink_target);
+        resize_metadata_buffer(&mut self.symlink_target, length)?;
         read_hashed_limited_bytes(
             &mut self.reader,
             &mut self.digest,
@@ -449,9 +510,7 @@ impl<R: Read> Decoder<R> {
             &mut self.symlink_target,
         )?;
         self.read_padding(length as u64)?;
-        if self.symlink_target.contains(&0) {
-            return Err(DecodeError::NonCanonical("symlink target contains NUL"));
-        }
+        validate_symlink_target(&self.symlink_target).map_err(DecodeError::NonCanonical)?;
         Ok(())
     }
 
@@ -499,8 +558,7 @@ impl<R: Read> Decoder<R> {
 
     fn read_string_into<E>(&mut self, max: u64, value: &mut Vec<u8>) -> Result<(), DecodeError<E>> {
         let length = self.read_bounded_string_length(max)?;
-        value.resize(length, 0);
-        release_oversized_metadata_capacity(value);
+        resize_metadata_buffer(value, length)?;
         self.read_raw(value)?;
         self.read_padding(length as u64)
     }
@@ -528,6 +586,8 @@ impl<R: Read> Decoder<R> {
                 actual: length,
             });
         }
+        let padded = length.saturating_add((8 - length % 8) % 8);
+        checked_raw_byte_count(self.raw_bytes, padded, &self.limits)?;
         usize::try_from(length)
             .map_err(|_| DecodeError::Invalid("string does not fit in memory".into()))
     }
@@ -593,6 +653,29 @@ impl<R: Read> Decoder<R> {
     }
 }
 
+fn allocation_error<E>(error: std::collections::TryReserveError) -> DecodeError<E> {
+    DecodeError::Io(io::Error::new(io::ErrorKind::OutOfMemory, error))
+}
+
+fn resize_metadata_buffer<E>(bytes: &mut Vec<u8>, length: usize) -> Result<(), DecodeError<E>> {
+    bytes
+        .try_reserve(length.saturating_sub(bytes.len()))
+        .map_err(allocation_error)?;
+    bytes.resize(length, 0);
+    release_oversized_metadata_capacity(bytes);
+    Ok(())
+}
+
+pub(crate) fn validate_symlink_target(target: &[u8]) -> Result<(), &'static str> {
+    if target.is_empty() {
+        return Err("symlink target is empty");
+    }
+    if target.contains(&0) {
+        return Err("symlink target contains NUL");
+    }
+    Ok(())
+}
+
 /// Ordinary filesystem metadata fits within 4 KiB. Retain that scratch, but
 /// don't carry historical huge names down a short-named subtree. A large value
 /// still in use keeps its capacity; only substantial shrink triggers release.
@@ -609,7 +692,18 @@ fn read_hashed_limited_bytes<R: Read, E>(
     limits: &Limits,
     buffer: &mut [u8],
 ) -> Result<(), DecodeError<E>> {
-    let requested = buffer.len() as u64;
+    let next = checked_raw_byte_count(*raw_bytes, buffer.len() as u64, limits)?;
+    reader.read_exact(buffer).map_err(DecodeError::Io)?;
+    digest.update(buffer);
+    *raw_bytes = next;
+    Ok(())
+}
+
+fn checked_raw_byte_count<E>(
+    raw_bytes: u64,
+    requested: u64,
+    limits: &Limits,
+) -> Result<u64, DecodeError<E>> {
     let Some(next) = raw_bytes.checked_add(requested) else {
         return Err(DecodeError::LimitExceeded {
             what: "raw size",
@@ -624,10 +718,7 @@ fn read_hashed_limited_bytes<R: Read, E>(
             actual: next,
         });
     }
-    reader.read_exact(buffer).map_err(DecodeError::Io)?;
-    digest.update(buffer);
-    *raw_bytes = next;
-    Ok(())
+    Ok(next)
 }
 
 /// Retries `Interrupted` at the only reader boundary used by the decoder.

@@ -74,6 +74,18 @@ fn encode(
 }
 
 #[test]
+fn empty_symlink_targets_are_rejected_before_writing_a_node() {
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder::new(&mut bytes).unwrap();
+    assert!(matches!(
+        encoder.push(Event::Symlink(b"")),
+        Err(EncodeError::NonCanonical(_))
+    ));
+    drop(encoder);
+    assert_eq!(bytes.len(), 24, "only the NAR magic was written");
+}
+
+#[test]
 fn encodes_all_root_forms_and_round_trips() {
     let cases = [
         (

@@ -330,9 +330,7 @@ impl<W: Write> Encoder<W> {
                 actual: target_length,
             });
         }
-        if target.contains(&0) {
-            return Err(EncodeError::NonCanonical("symlink target contains NUL"));
-        }
+        crate::nar::validate_symlink_target(target).map_err(EncodeError::NonCanonical)?;
         self.begin_node(RootKind::Symlink)?;
         self.string(b"(")?;
         self.string(b"type")?;
