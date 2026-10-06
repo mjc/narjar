@@ -144,24 +144,37 @@ fn run_publication_worker(
     receiver: Receiver<QueuedPublication>,
     context: PublicationWorkerContext,
 ) {
-    while let Ok(publication) = receiver.recv() {
-        let QueuedPublication {
-            request,
-            _admission,
-            _staging,
-            queued_at,
-        } = publication;
-        context.metrics.publication_dequeued(queued_at);
-        let _activity = PublicationActivity::start(Arc::clone(&context.metrics));
-        request.respond(
-            &context.storage,
-            &context.trusted_keys,
-            context.upload_policy,
-            context.egress_compression,
-            &context.metrics,
-            _staging,
-        );
+    receiver
+        .iter()
+        .for_each(|publication| respond_to_queued_publication(publication, &context));
+}
+
+fn respond_to_queued_publication(
+    publication: QueuedPublication,
+    context: &PublicationWorkerContext,
+) {
+    let QueuedPublication {
+        mut request,
+        _admission,
+        _staging,
+        queued_at,
+    } = publication;
+    context.metrics.publication_dequeued(queued_at);
+    let _activity = PublicationActivity::start(Arc::clone(&context.metrics));
+    if let Err(error) = request.acknowledge_body() {
+        if let Some(outcome) = Metrics::socket_read_failure(error.kind()) {
+            context.metrics.record_connection_outcome(outcome);
+        }
+        return;
     }
+    request.respond(
+        &context.storage,
+        &context.trusted_keys,
+        context.upload_policy,
+        context.egress_compression,
+        &context.metrics,
+        _staging,
+    );
 }
 
 fn spawn_request_workers(
@@ -257,8 +270,7 @@ fn queue_publication(
     admission: &mut Option<Admission>,
     context: &RequestWorkerContext,
 ) {
-    let Some(mut request) = prepare_publication(request, &context.authorizer, &context.metrics)
-    else {
+    let Some(request) = prepare_publication(request, &context.authorizer, &context.metrics) else {
         return;
     };
     let Some(bytes) = request.staging_bytes(context.max_encoded_nar_bytes) else {
@@ -275,12 +287,6 @@ fn queue_publication(
             return;
         }
     };
-    if let Err(error) = request.acknowledge_body() {
-        if let Some(outcome) = Metrics::socket_read_failure(error.kind()) {
-            context.metrics.record_connection_outcome(outcome);
-        }
-        return;
-    }
     let publication = QueuedPublication {
         request,
         _admission: admission
@@ -726,6 +732,71 @@ mod tests {
         request_read_failure_outcome,
     };
     use narjar::__private::metrics::ConnectionOutcome;
+
+    #[test]
+    fn unavailable_publication_queue_rejects_without_continue_and_releases_admission() {
+        use narjar::__private::{
+            auth::Authorizer,
+            storage::{CacheCreation, Directory, SupportedStorageBackend},
+            token_file::TokenFile,
+        };
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let storage = CacheCreation::prepare(&root, SupportedStorageBackend::FLAT)
+            .unwrap()
+            .create_or_complete()
+            .unwrap();
+        let mut tokens = TokenFile::default();
+        tokens
+            .insert("test", Sha256::digest(b"test").into())
+            .unwrap();
+        tokens
+            .store(&directory.path().join("auth/write.tokens"))
+            .unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let admissions = Arc::new(Admissions::new(1, Arc::clone(&metrics)));
+        let (publication_sender, receiver) = crossbeam_channel::bounded(0);
+        let context = super::RequestWorkerContext {
+            storage: Arc::new(storage),
+            authorizer: Arc::new(Authorizer::load(&root).unwrap()),
+            metrics,
+            publication_sender,
+            min_free_bytes: 0,
+            max_encoded_nar_bytes: 1024,
+        };
+        let mut receiver = Some(receiver);
+        for disconnected in [false, true] {
+            if disconnected {
+                drop(receiver.take());
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            client.write_all(
+                b"PUT /nar/0000000000000000000000000000000000000000000000000000.nar HTTP/1.1\r\nContent-Length: 4\r\nAuthorization: Basic OnRlc3Q=\r\nExpect: 100-continue\r\n\r\n",
+            ).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let request = Request::read(stream).unwrap();
+            let mut admission = admissions.try_acquire();
+            super::queue_publication(request, &mut admission, &context);
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+                "{response}"
+            );
+            assert!(!response.contains("100 Continue"), "{response}");
+            assert!(
+                admissions.try_acquire().is_some(),
+                "rejected request released admission"
+            );
+        }
+    }
 
     #[test]
     fn request_read_failures_keep_disconnect_timeout_and_malformed_distinct() {

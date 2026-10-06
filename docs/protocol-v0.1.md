@@ -77,10 +77,11 @@ priority. Clients can retain the previous cache metadata for days.
 All writes require a write token. Content-Length is required. The server rejects
 Transfer-Encoding request bodies, HTTP Content-Encoding, unexpected route
 suffixes, and bodies larger than configured route-specific limits. For HTTP/1.1
-`Expect: 100-continue`, an admitted upload receives 100 before the server waits
-for its body. Authentication, header, declared-size, and capacity failures
-receive a final response without granting continuation. Unsupported expectations
-receive 417. HTTP/1.0 expectations are ignored.
+`Expect: 100-continue`, the publication worker sends 100 before reading an
+incompletely buffered body. Authentication, header, declared-size, storage
+capacity, and queue-admission failures receive a final response without granting
+continuation. A fully buffered or empty body needs no interim response.
+Unsupported expectations receive 417. HTTP/1.0 expectations are ignored.
 
 XZ and Zstd uploads verify their encoded identity and measure the decoded NAR
 hash and size. Later narinfo publication binds those measurements to the signed

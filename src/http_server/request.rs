@@ -440,7 +440,9 @@ impl Request {
         match std::mem::replace(&mut self.expectation, RequestExpectation::None) {
             RequestExpectation::None => Ok(()),
             RequestExpectation::Continue => {
-                if self.body_length.is_some_and(|length| length > 0) && self.body_prefix.is_empty()
+                if self
+                    .body_length
+                    .is_some_and(|length| length > self.body_prefix.len())
                 {
                     self.stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
                 }
@@ -625,6 +627,33 @@ mod tests {
         BufferedHead, FORCE_PORTABLE_FILE_COPY, HeaderBoundary, MAX_HEADER_BYTES, Method,
         ParsedHead, Request, Response, StatusCode, find_header_delimiter,
     };
+
+    #[test]
+    fn continue_is_sent_once_for_a_partially_prefetched_body() {
+        let (request, client) = request_with_prefetched_bytes(
+            b"PUT /nar/example.nar HTTP/1.1\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\nb",
+        );
+        let mut request = request.expect("parse partially buffered upload");
+        assert_eq!(request.body_prefix.len(), 1);
+        request.acknowledge_body().unwrap();
+        request.acknowledge_body().unwrap();
+        drop(request);
+        assert_eq!(client.join().unwrap(), b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+
+    #[test]
+    fn complete_or_empty_prefetched_bodies_do_not_need_continue() {
+        for bytes in [
+            &b"PUT /nar/example.nar HTTP/1.1\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\nbody"[..],
+            &b"PUT /nar/example.nar HTTP/1.1\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n"[..],
+        ] {
+            let (request, client) = request_with_prefetched_bytes(bytes);
+            let mut request = request.unwrap();
+            request.acknowledge_body().unwrap();
+            drop(request);
+            assert!(client.join().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn expectation_tokens_are_complete_case_insensitive_and_http_version_specific() {

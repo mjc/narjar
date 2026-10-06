@@ -38,9 +38,23 @@ impl StoreRoots {
         let state_dir = std::env::var_os("NIX_STATE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nix/var/nix"));
-        match GcReadLock::acquire(&state_dir) {
+        Self::hold_after_acquiring_gc_lock(
+            &state_dir,
+            store_paths,
+            GcReadLock::acquire(&state_dir),
+            read_metadata,
+        )
+    }
+
+    fn hold_after_acquiring_gc_lock<T>(
+        state_dir: &Path,
+        store_paths: &[String],
+        gc_lock: std::io::Result<GcReadLock>,
+        read_metadata: impl FnOnce(&Path) -> Result<T, PushError>,
+    ) -> Result<(Self, T), PushError> {
+        match gc_lock {
             Ok(gc_lock) => Self::hold_and_read_metadata(
-                &state_dir,
+                state_dir,
                 store_paths
                     .iter()
                     .map(|path| local_store_path(path))
@@ -48,8 +62,11 @@ impl StoreRoots {
                 gc_lock,
                 read_metadata,
             ),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                let connection = DaemonRoots::hold(&state_dir, store_paths).map_err(|error| {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.kind() == std::io::ErrorKind::ReadOnlyFilesystem =>
+            {
+                let connection = DaemonRoots::hold(state_dir, store_paths).map_err(|error| {
                     PushError::new(format!(
                         "protecting store paths through the Nix daemon: {error}"
                     ))
@@ -57,7 +74,7 @@ impl StoreRoots {
                 let roots = Self::Daemon {
                     _connection: connection,
                 };
-                let metadata = read_metadata(&state_dir)?;
+                let metadata = read_metadata(state_dir)?;
                 Ok((roots, metadata))
             }
             Err(error) => Err(PushError::new(format!(
@@ -141,6 +158,40 @@ mod tests {
     use tempfile::tempdir;
 
     use super::StoreRoots;
+
+    #[test]
+    fn inaccessible_local_gc_locks_use_the_daemon_but_other_failures_do_not() {
+        use std::io::{self, ErrorKind};
+
+        let directory = tempdir().unwrap();
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::ReadOnlyFilesystem] {
+            let result = StoreRoots::hold_after_acquiring_gc_lock::<()>(
+                directory.path(),
+                &[],
+                Err(io::Error::from(kind)),
+                |_| panic!("metadata must wait for successful root protection"),
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("fixture has no daemon socket"),
+            };
+            assert!(
+                error.to_string().contains("through the Nix daemon"),
+                "{error}"
+            );
+        }
+        let result = StoreRoots::hold_after_acquiring_gc_lock::<()>(
+            directory.path(),
+            &[],
+            Err(io::Error::from(ErrorKind::InvalidData)),
+            |_| panic!("invalid lock must fail before metadata lookup"),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("invalid lock must fail closed"),
+        };
+        assert!(error.to_string().contains("from Nix GC"), "{error}");
+    }
 
     #[test]
     fn a_fresh_writable_store_gets_automatic_root_directories() {
