@@ -8,13 +8,19 @@ find_release_id_including_drafts() {
   '
 }
 
+assets=(
+  "narjar-$RELEASE_VERSION.crate"
+  "narjar-v$RELEASE_VERSION-x86_64-linux.tar.gz"
+  SHA256SUMS
+)
+paths=("${assets[@]/#/target/release/}")
+
 release_id=$(find_release_id_including_drafts)
 if [[ -z "$release_id" ]]; then
-  gh release create "$RELEASE_TAG" --verify-tag --draft --title "narjar $RELEASE_VERSION" \
+  gh release create "$RELEASE_TAG" "${paths[@]}" --verify-tag --title "narjar $RELEASE_VERSION" \
     --notes-file target/release/release-notes.md
-  release_id=$(find_release_id_including_drafts)
+  exit 0
 fi
-test -n "$release_id"
 state=target/github-release.json
 gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$state"
 release_state=$(jq -r '
@@ -24,11 +30,6 @@ release_state=$(jq -r '
   end
 ' "$state")
 
-assets=(
-  "narjar-$RELEASE_VERSION.crate"
-  "narjar-v$RELEASE_VERSION-x86_64-linux.tar.gz"
-  SHA256SUMS
-)
 if [[ "$release_state" == published ]]; then
   mkdir -p target/github-release
   for asset in "${assets[@]}"; do
@@ -37,7 +38,6 @@ if [[ "$release_state" == published ]]; then
   done
   printf 'GitHub release already published with identical assets.\n'
 else
-  paths=("${assets[@]/#/target/release/}")
   gh release upload "$RELEASE_TAG" "${paths[@]}" --clobber
   gh release edit "$RELEASE_TAG" --draft=false --notes-file target/release/release-notes.md
 fi

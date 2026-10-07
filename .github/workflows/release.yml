@@ -159,7 +159,9 @@ jobs:
             --root "$PWD/target/registry-install" narjar
           test "$(target/registry-install/bin/narjar --version)" = "narjar $RELEASE_VERSION"
       - name: Publish the GitHub release
-        run: bash ci/publish-github-release.sh
+        run: |
+          set -euo pipefail
+          git show "$GITHUB_SHA:ci/publish-github-release.sh" | bash
 
   install-published:
     needs: [candidate, publish]

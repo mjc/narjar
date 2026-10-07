@@ -63,11 +63,10 @@ gh() {
     if [[ "$endpoint" == */releases?per_page=100 ]]; then
       case "$scenario" in
         github-unavailable) printf '{"status":"503"}\n'; return 1 ;;
-        github-missing)
-          if [[ ! -f target/created ]]; then
-            printf '[[]]\n'
-            return
-          fi
+        github-missing|github-create-failure)
+          # Creating a draft does not guarantee immediate visibility in the list API.
+          printf '[[]]\n'
+          return
           ;;
       esac
       printf '[[{"id":42,"tag_name":"v0.1.0"},{"id":43,"tag_name":"v0.0.0"}]]\n'
@@ -78,7 +77,7 @@ gh() {
       return 1
     fi
     case "$scenario" in
-      github-missing|github-draft) printf '{"draft":true}\n' ;;
+      github-missing|github-draft|github-upload-failure) printf '{"draft":true}\n' ;;
       github-public|github-mismatch) printf '{"draft":false}\n' ;;
       github-invalid-state) printf '{}\n' ;;
       *) printf 'Unexpected GitHub scenario: %s\n' "$scenario" >&2; return 1 ;;
@@ -86,8 +85,12 @@ gh() {
     return
   fi
   case "$2" in
-    create) touch target/created ;;
-    upload|edit) ;;
+    create)
+      [[ "$scenario" != github-create-failure ]] || return 1
+      touch target/created
+      ;;
+    upload) [[ "$scenario" != github-upload-failure ]] ;;
+    edit) ;;
     download)
       local asset=$5
       cp "target/release/$asset" "target/github-release/$asset"
@@ -113,8 +116,9 @@ for scenario in github-missing github-draft github-public; do
   bash "$repository_root/ci/publish-github-release.sh"
   case "$scenario" in
     github-missing)
-      grep -Fq 'release create v0.1.0 --verify-tag --draft' target/calls
-      grep -Fq 'release edit v0.1.0 --draft=false' target/calls
+      grep -Fq 'release create v0.1.0 target/release/narjar-0.1.0.crate target/release/narjar-v0.1.0-x86_64-linux.tar.gz target/release/SHA256SUMS --verify-tag' target/calls
+      test "$(grep -c 'releases?per_page=100' target/calls)" -eq 1
+      if grep -Eq 'release (upload|edit)|--draft' target/calls; then exit 1; fi
       ;;
     github-draft)
       grep -Fq 'release upload v0.1.0' target/calls
@@ -135,6 +139,19 @@ for scenario in github-unavailable github-mismatch github-invalid-state; do
     exit 1
   fi
   require_no_release_mutation
+done
+
+for scenario in github-create-failure github-upload-failure; do
+  export scenario
+  : > target/calls
+  if bash "$repository_root/ci/publish-github-release.sh"; then
+    printf 'Asset publication failure unexpectedly accepted: %s\n' "$scenario" >&2
+    exit 1
+  fi
+  if grep -Fq 'release edit' target/calls; then
+    printf 'Published a release after asset publication failed: %s\n' "$scenario" >&2
+    exit 1
+  fi
 done
 
 printf 'Publication retries compare registry bytes and never overwrite published GitHub assets.\n'
