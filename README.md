@@ -236,6 +236,10 @@ lengths; filesystem compression and snapshots affect actual reclaimed space.
 Use `--delete-older-than 7d` instead of a byte target for seven-day retention;
 protected roots and the online grace period still apply. Scheduled NixOS
 collection accepts `services.narjar.gc.maxAgeDays = 7`.
+Scheduled collection also supports bounded passes, contention retries, last-use
+eviction order, and measured free-space thresholds. Enable it with
+`services.narjar.gc.enable`; it is off by default. See the
+[retention options](https://github.com/mjc/narjar/blob/main/docs/operations.md#scheduled-retention).
 `delete --store-hash HASH` removes a path's metadata; GC reclaims unreferenced
 payloads.
 

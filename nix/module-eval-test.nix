@@ -95,6 +95,28 @@
     "/var/lib//foo"
   ];
   defaultConfig = configuration {dataDir = "/var/lib/narjar";};
+  unattendedConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      evictionOrder = "last-use";
+      maxDeletions = 20;
+      minFreeBytes = 1000;
+      targetFreeBytes = 2000;
+      retryAttempts = 4;
+      retryDelayMillis = 250;
+      randomizedDelaySeconds = 42;
+    };
+  };
+  invalidUnattendedConfigs = map (gc: configuration {dataDir = "/var/lib/narjar"; inherit gc;}) [
+    {enable = true; minFreeBytes = 1000;}
+    {enable = true; targetFreeBytes = 2000;}
+    {enable = true; minFreeBytes = 2000; targetFreeBytes = 1000;}
+    {enable = true; minFreeBytes = 1000; targetFreeBytes = 2000; maxDeletions = null;}
+    {enable = true; maxBytes = 1000; maxDeletions = 0;}
+    {enable = true; maxBytes = 1000; retryAttempts = 17;}
+    {enable = true; maxBytes = 1000; retryDelayMillis = 30001;}
+  ];
   longShutdownConfig = configuration {
     dataDir = "/var/lib/narjar";
     shutdownGraceSeconds = 300;
@@ -270,6 +292,14 @@ in
   assert evaluatesConfig equalGcThresholdConfig;
   assert evaluatesConfig lowerGcTargetConfig;
   assert evaluatesConfig ageDaysGcConfig;
+  assert evaluatesConfig unattendedConfig;
+  assert lib.all (config: !(evaluatesConfig config)) invalidUnattendedConfigs;
+  assert lib.hasInfix "--track-access" unattendedConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert !(lib.hasInfix "--track-access" defaultConfig.systemd.services.narjar.serviceConfig.ExecStart);
+  assert lib.all (flag: lib.hasInfix flag unattendedConfig.systemd.services.narjar-gc.serviceConfig.ExecStart) [
+    "--eviction-order last-use" "--max-deletions 20" "--min-free-bytes 1000" "--target-free-bytes 2000" "--retry-attempts 4" "--retry-delay-millis 250"
+  ];
+  assert unattendedConfig.systemd.timers.narjar-gc.timerConfig.RandomizedDelaySec == 42;
   assert lib.hasInfix "--delete-older-than 7d" ageDaysGcConfig.systemd.services.narjar-gc.serviceConfig.ExecStart;
   assert !(lib.hasInfix "--max-age-seconds" ageDaysGcConfig.systemd.services.narjar-gc.serviceConfig.ExecStart);
   assert !(evaluatesConfig conflictingGcAgeConfig);

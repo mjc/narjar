@@ -196,6 +196,59 @@ Protected roots, minimum age, and online grace still apply. The seconds-based
 `--max-age-seconds` option is mutually exclusive with `--delete-older-than`.
 The NixOS module exposes this as `services.narjar.gc.maxAgeDays = 7`.
 
+### Scheduled retention
+
+Scheduling is opt-in. The timer runs GC through the daemon without stopping it.
+Size thresholds count logical cache bytes. Physical thresholds measure available
+bytes on the data-directory filesystem, including the effects of compression and
+snapshots. They are independent of the upload admission reserve.
+
+~~~nix
+services.narjar.gc = {
+  enable = true;
+  schedule = "hourly";
+  randomizedDelaySeconds = 300;
+  evictionOrder = "last-use";
+  maxBytes = 8 * 1024 * 1024 * 1024;
+  targetBytes = 6 * 1024 * 1024 * 1024;
+  maxDeletions = 100;
+  retryAttempts = 3;
+  retryDelayMillis = 1000;
+};
+~~~
+
+`last-use` orders pressure evictions by successful read resolution. It does not
+change publication-age expiration. The module enables `serve --track-access`
+when last-use scheduling is configured. Standalone servers must enable it
+explicitly. Zero-byte records in `.narjar-access/` hold coarse timestamps;
+repeated reads of cached keys update at most once an hour. The coalescing cache
+holds at most 4,096 keys. Evicted keys can be recorded more often. Hints are not
+synced per read and may be lost on a crash; reader pins, protected roots, and
+advertisement grace do not depend on them. Missing or malformed hints fall back
+to publication time; hint write or cleanup failures do not fail reads or GC.
+
+For physical pressure, set `gc.minFreeBytes` and `gc.targetFreeBytes` together,
+with a positive `gc.maxDeletions`. A bounded pass starts below the minimum and
+subsequent scheduled passes continue toward the target. Reports contain measured
+free space, not estimated reclaimed blocks. Snapshot-held space can leave the
+target unmet after deletion. Measurements use the opened data-root filesystem,
+not logical sizes or ZFS commands. `.narjar-gc-pressure` records an unfinished
+cycle for the next pass and normal restarts. Changing the thresholds starts a
+new cycle; reaching the target clears it. This advisory hint is best effort:
+if it cannot be saved, the next pass can still start below the minimum. Dry runs
+do not change the hint.
+
+`maxDeletions` caps selected publications and orphans, not the initial inventory
+scan, transfer size, or individual-object work. A chunked object may own many
+chunks. Unfinished expiration is reported as `pending_expired`; a capped pass
+can report `limit_reached`. An unmet target is not retried as a contention error.
+Only Busy and Changed replies receive bounded retries. Transport and storage
+errors are not retried after potentially ambiguous mutation.
+
+`narjar_access_records_total{outcome="written|coalesced|failed"}` reports
+access-hint recording. Existing online-GC metrics distinguish completed passes,
+unmet targets, contention, changed inventories, and failures.
+
 `--online` asks the running daemon to collect. Run it
 as the cache owner and pass the configured storage backend. The command fails
 if no daemon is running, the collector is busy, or the backend differs. Online

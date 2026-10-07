@@ -312,6 +312,7 @@
       "--storage-backend"
       cfg.storageBackend
     ]
+      ++ lib.optionals (cfg.gc.enable && cfg.gc.evictionOrder == "last-use") ["--track-access"]
       ++ lib.optionals cfg.nativeStore.enable [
         "--serve-source"
         "native-store"
@@ -433,7 +434,16 @@
       "--apply"
       "--storage-backend"
       cfg.storageBackend
+      "--eviction-order"
+      cfg.gc.evictionOrder
+      "--retry-attempts"
+      (toString cfg.gc.retryAttempts)
+      "--retry-delay-millis"
+      (toString cfg.gc.retryDelayMillis)
     ]
+    ++ lib.optionals (cfg.gc.maxDeletions != null) ["--max-deletions" (toString cfg.gc.maxDeletions)]
+    ++ lib.optionals (cfg.gc.minFreeBytes != null) ["--min-free-bytes" (toString cfg.gc.minFreeBytes)]
+    ++ lib.optionals (cfg.gc.targetFreeBytes != null) ["--target-free-bytes" (toString cfg.gc.targetFreeBytes)]
     ++ lib.optionals (cfg.gc.maxBytes != null) [
       "--max-bytes"
       (toString cfg.gc.maxBytes)
@@ -611,6 +621,48 @@ in {
     gc = {
       enable = lib.mkEnableOption "scheduled Narjar garbage collection";
 
+      evictionOrder = lib.mkOption {
+        type = lib.types.enum ["publication" "last-use"];
+        default = "publication";
+        description = "Ordering for pressure eviction. Last-use enables coalesced read tracking; maximum age still means publication age.";
+      };
+
+      maxDeletions = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.positive;
+        default = 1000;
+        description = "Maximum selected publications and orphans per pass. A selected chunked object may contain many chunks; inventory and individual-object work are not time-bounded.";
+      };
+
+      minFreeBytes = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.unsigned;
+        default = null;
+        description = "Trigger a bounded pass below this measured filesystem available capacity. Requires targetFreeBytes and maxDeletions.";
+      };
+
+      targetFreeBytes = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.unsigned;
+        default = null;
+        description = "Desired measured free capacity, at least minFreeBytes. Compression and snapshots may leave the target unmet.";
+      };
+
+      retryAttempts = lib.mkOption {
+        type = lib.types.ints.between 1 16;
+        default = 3;
+        description = "Total attempts for busy or changed-inventory replies; other errors are not retried.";
+      };
+
+      retryDelayMillis = lib.mkOption {
+        type = lib.types.ints.between 0 30000;
+        default = 1000;
+        description = "Delay between online contention retries.";
+      };
+
+      randomizedDelaySeconds = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 300;
+        description = "Maximum randomized delay for the collection timer.";
+      };
+
       schedule = lib.mkOption {
         type = lib.types.str;
         default = "weekly";
@@ -688,8 +740,17 @@ in {
           || cfg.gc.maxBytes != null
           || cfg.gc.targetBytes != null
           || cfg.gc.maxAgeSeconds != null
-          || cfg.gc.maxAgeDays != null;
-        message = "services.narjar.gc requires maxBytes, targetBytes, maxAgeSeconds, or maxAgeDays";
+          || cfg.gc.maxAgeDays != null
+          || cfg.gc.minFreeBytes != null;
+        message = "services.narjar.gc requires a size, age, or physical free-space policy";
+      }
+      {
+        assertion = (cfg.gc.minFreeBytes == null) == (cfg.gc.targetFreeBytes == null);
+        message = "services.narjar.gc physical pressure requires both minFreeBytes and targetFreeBytes";
+      }
+      {
+        assertion = cfg.gc.minFreeBytes == null || cfg.gc.targetFreeBytes == null || (cfg.gc.maxDeletions != null && cfg.gc.targetFreeBytes >= cfg.gc.minFreeBytes);
+        message = "services.narjar.gc physical pressure requires maxDeletions and targetFreeBytes >= minFreeBytes";
       }
       {
         assertion = cfg.gc.maxAgeSeconds == null || cfg.gc.maxAgeDays == null;
@@ -854,6 +915,7 @@ in {
       wantedBy = ["timers.target"];
       timerConfig = {
         OnCalendar = cfg.gc.schedule;
+        RandomizedDelaySec = cfg.gc.randomizedDelaySeconds;
         Persistent = true;
         Unit = "narjar-gc.service";
       };
