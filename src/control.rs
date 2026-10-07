@@ -90,6 +90,23 @@ struct CollectionJob {
     options: GcOptions,
 }
 
+impl CollectionJob {
+    fn receive_bounded_request(mut connection: UnixStream) -> io::Result<Self> {
+        // BSD accept() can inherit the listener's nonblocking flag.
+        connection.set_nonblocking(false)?;
+        connection.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+        let options = protocol::read_frame(DeadlineReader::new(&mut connection, REQUEST_TIMEOUT))?;
+        Ok(Self {
+            connection,
+            options,
+        })
+    }
+
+    fn reply_with_rejection(mut self, failure: ControlFailure, metrics: &Metrics) {
+        send_recorded_reply(&mut self.connection, Reply::Failed(failure), metrics);
+    }
+}
+
 /// Two fixed threads: bounded request parsing and one maintenance operation.
 pub(crate) struct ControlService {
     shutdown: ControlShutdown,
@@ -237,36 +254,31 @@ fn dispatch_requests(
 }
 
 fn queue_collection_request(
-    mut connection: UnixStream,
+    connection: UnixStream,
     jobs: &Sender<CollectionJob>,
     busy: &AtomicBool,
     metrics: &Metrics,
 ) -> io::Result<()> {
-    connection.set_write_timeout(Some(REQUEST_TIMEOUT))?;
-    if let Ok(options) = protocol::read_frame(DeadlineReader::new(&mut connection, REQUEST_TIMEOUT))
-    {
-        match busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire) {
-            Err(_) => send_recorded_reply(
-                &mut connection,
-                Reply::Failed(ControlFailure::Busy),
-                metrics,
-            ),
-            Ok(_) => {
-                if let Err(error) = jobs.try_send(CollectionJob {
-                    connection,
-                    options,
-                }) {
-                    busy.store(false, Ordering::Release);
-                    send_recorded_reply(
-                        &mut error.into_inner().connection,
-                        Reply::Failed(ControlFailure::Stopping),
-                        metrics,
-                    );
-                }
-            }
-        }
+    let job = CollectionJob::receive_bounded_request(connection)?;
+    match busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => enqueue_admitted_collection_job(job, jobs, busy, metrics),
+        Err(_) => job.reply_with_rejection(ControlFailure::Busy, metrics),
     }
     Ok(())
+}
+
+fn enqueue_admitted_collection_job(
+    job: CollectionJob,
+    jobs: &Sender<CollectionJob>,
+    busy: &AtomicBool,
+    metrics: &Metrics,
+) {
+    if let Err(error) = jobs.try_send(job) {
+        busy.store(false, Ordering::Release);
+        error
+            .into_inner()
+            .reply_with_rejection(ControlFailure::Stopping, metrics);
+    }
 }
 
 fn send_recorded_reply(connection: &mut UnixStream, reply: Reply, metrics: &Metrics) {
@@ -523,6 +535,51 @@ mod tests {
         service
             .finish(Instant::now() + Duration::from_secs(5))
             .unwrap();
+    }
+
+    #[test]
+    fn accepted_nonblocking_streams_become_blocking_before_queueing_and_replying() {
+        let root = tempfile::tempdir().unwrap();
+        let (connection, mut client) = UnixStream::pair().unwrap();
+        connection.set_nonblocking(true).unwrap();
+        protocol::write_frame(&mut client, &options(root.path())).unwrap();
+        let (sender, receiver) = bounded(1);
+        let busy = AtomicBool::new(false);
+        queue_collection_request(connection, &sender, &busy, &Metrics::default()).unwrap();
+        let mut job = receiver
+            .try_recv()
+            .expect("the decoded request must be queued");
+        assert!(
+            !rustix::fs::fcntl_getfl(&job.connection)
+                .unwrap()
+                .contains(rustix::fs::OFlags::NONBLOCK),
+            "BSD-inherited nonblocking mode must not bypass protocol deadlines"
+        );
+        assert!(busy.load(Ordering::Acquire));
+        protocol::write_frame(&mut job.connection, &Reply::Failed(ControlFailure::Busy)).unwrap();
+        assert!(matches!(
+            protocol::read_frame::<Reply>(&mut client).unwrap(),
+            Reply::Failed(ControlFailure::Busy)
+        ));
+    }
+
+    #[test]
+    fn a_closed_collection_queue_releases_admission_and_reports_stopping() {
+        let root = tempfile::tempdir().unwrap();
+        let (connection, mut client) = UnixStream::pair().unwrap();
+        protocol::write_frame(&mut client, &options(root.path())).unwrap();
+        let (sender, receiver) = bounded(1);
+        drop(receiver);
+        let busy = AtomicBool::new(false);
+        queue_collection_request(connection, &sender, &busy, &Metrics::default()).unwrap();
+        assert!(
+            !busy.load(Ordering::Acquire),
+            "failed queue admission must not keep GC busy"
+        );
+        assert!(matches!(
+            protocol::read_frame::<Reply>(&mut client).unwrap(),
+            Reply::Failed(ControlFailure::Stopping)
+        ));
     }
 
     #[test]
