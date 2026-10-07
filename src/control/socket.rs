@@ -63,6 +63,7 @@ pub(super) fn connect(root: &Path) -> io::Result<UnixStream> {
     let directory = open_directory_at(open_directory(root)?, CONTROL_DIRECTORY)?;
     require_private_owner(&directory.metadata()?)?;
     let path = socket_path(root);
+    let endpoint = directory_socket_address(&directory, &path)?;
     let metadata = fs::symlink_metadata(&path)?;
     require_private_owner(&metadata)?;
     if !metadata.file_type().is_socket() {
@@ -71,10 +72,7 @@ pub(super) fn connect(root: &Path) -> io::Result<UnixStream> {
             "control path is not a socket",
         ));
     }
-    connect_before_deadline(
-        &directory_socket_address(&directory, &path)?,
-        Instant::now() + super::REQUEST_TIMEOUT,
-    )
+    connect_before_deadline(&endpoint, Instant::now() + super::REQUEST_TIMEOUT)
 }
 
 fn directory_socket_address(directory: &File, path: &Path) -> io::Result<PathBuf> {
@@ -288,6 +286,19 @@ mod tests {
         drop(connection);
         drop(bound);
         assert!(!socket_path(&data).exists());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn an_unsupported_control_address_is_reported_before_a_missing_socket_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("long-cache-root-".repeat(12));
+        fs::create_dir(&data).unwrap();
+        prepare_private_directory(&data).unwrap();
+        assert!(!socket_path(&data).exists());
+        let error = connect(&data).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("socket pathname"));
     }
 
     #[test]
