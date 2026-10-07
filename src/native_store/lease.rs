@@ -3264,11 +3264,13 @@ mod tests {
         assert!(version.status.success(), "nix-store must be runnable");
 
         let directory = tempfile::tempdir().expect("isolated Nix store should be created");
-        let source = directory.path().join("store-input");
+        let root = fs::canonicalize(directory.path())
+            .expect("isolated Nix store parents must not contain symlinks");
+        let source = root.join("store-input");
         fs::write(&source, b"narjar isolated Nix GC integration")
             .expect("store input should be written");
-        let store_dir = directory.path().join("nix/store");
-        let state_dir = directory.path().join("nix/var/nix");
+        let store_dir = root.join("nix/store");
+        let state_dir = root.join("nix/var/nix");
         let store_url = format!(
             "local?store={}&real={}&state={}",
             store_dir.display(),
