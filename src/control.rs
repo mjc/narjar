@@ -337,13 +337,17 @@ impl<'a> DeadlineReader<'a> {
 
 impl Read for DeadlineReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let remaining = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-        self.connection.set_read_timeout(Some(remaining))?;
-        self.connection.read(bytes)
+        match bytes {
+            [] => Ok(0),
+            bytes => {
+                socket::wait_for_socket_event_before_deadline(
+                    self.connection,
+                    rustix::event::PollFlags::IN,
+                    self.deadline,
+                )?;
+                self.connection.read(bytes)
+            }
+        }
     }
 }
 
@@ -355,6 +359,53 @@ mod tests {
         storage::{CachePolicies, Directory, StorageBackend, SupportedStorageBackend, gc::GcMode},
     };
     use std::{io::Write, sync::mpsc};
+
+    struct ReleaseCollectorOnDrop<'a>(&'a mpsc::Sender<()>);
+
+    impl Drop for ReleaseCollectorOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[test]
+    fn a_paused_test_collector_is_released_when_an_assertion_panics() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let panic = std::panic::catch_unwind(|| {
+            let _release = ReleaseCollectorOnDrop(&release_tx);
+            panic!("simulate a failed assertion while collection is paused");
+        });
+        assert!(panic.is_err());
+        assert_eq!(release_rx.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn a_buffered_control_reply_is_read_after_the_daemon_closes_its_socket() {
+        let (mut client, mut daemon) = UnixStream::pair().unwrap();
+        protocol::write_frame(&mut daemon, &Reply::Failed(ControlFailure::Busy)).unwrap();
+        drop(daemon);
+
+        let reply: Reply =
+            protocol::read_frame(DeadlineReader::new(&mut client, REPORT_TIMEOUT)).unwrap();
+        assert!(matches!(reply, Reply::Failed(ControlFailure::Busy)));
+    }
+
+    #[test]
+    fn an_empty_control_read_does_not_wait_for_a_reply() {
+        let (mut client, _daemon) = UnixStream::pair().unwrap();
+        let mut reader = DeadlineReader::new(&mut client, REPORT_TIMEOUT);
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_control_read_without_available_bytes_expires_at_its_deadline() {
+        let (mut client, _daemon) = UnixStream::pair().unwrap();
+        let mut reader = DeadlineReader::new(&mut client, Duration::from_millis(20));
+        assert_eq!(
+            reader.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 
     fn options(root: &Path) -> GcOptions {
         GcOptions {
@@ -478,6 +529,7 @@ mod tests {
         )
         .unwrap();
         std::thread::scope(|scope| {
+            let release = ReleaseCollectorOnDrop(&release_tx);
             let first = scope.spawn(|| collect(options(root.path())));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let second = match collect(options(root.path())) {
@@ -488,7 +540,7 @@ mod tests {
                 second.get_ref().unwrap().downcast_ref::<ControlFailure>(),
                 Some(ControlFailure::Busy)
             ));
-            release_tx.send(()).unwrap();
+            drop(release);
             assert!(matches!(
                 first
                     .join()
@@ -613,6 +665,7 @@ mod tests {
         )
         .unwrap();
         thread::scope(|scope| {
+            let release = ReleaseCollectorOnDrop(&release_tx);
             let client = scope.spawn(|| collect(options(root.path())));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             service.shutdown.stop();
@@ -620,7 +673,7 @@ mod tests {
                 !service.collector.is_finished(),
                 "shutdown must not detach active maintenance"
             );
-            release_tx.send(()).unwrap();
+            drop(release);
             service
                 .finish(Instant::now() + Duration::from_secs(5))
                 .unwrap();
@@ -646,11 +699,12 @@ mod tests {
         )
         .unwrap();
         thread::scope(|scope| {
+            let release = ReleaseCollectorOnDrop(&release_tx);
             let client = scope.spawn(|| collect(options(root.path())));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let error = service.finish(Instant::now()).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-            release_tx.send(()).unwrap();
+            drop(release);
             assert!(client.join().unwrap().is_err());
         });
     }
