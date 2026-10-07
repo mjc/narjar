@@ -2309,6 +2309,137 @@ fn online_gc_uses_the_running_flat_daemon_without_interrupting_cache_reads() {
 }
 
 #[test]
+fn gc_delete_older_than_deletes_old_payloads_and_preserves_recent_ones() {
+    let data = data_dir("gc-age-days");
+    let initialized = run(&["init", "--data-dir", data.to_str().unwrap()]);
+    assert!(initialized.status.success());
+    let old_payload = data.join(format!("nar/{NARJAR_HASH}.nar"));
+    fs::write(&old_payload, NAR_BYTES).unwrap();
+    let old_time = std::time::SystemTime::now() - Duration::from_secs(14 * 24 * 60 * 60);
+    fs::File::open(&old_payload)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old_time))
+        .unwrap();
+    let recent_bytes = b"recent NAR payload";
+    let recent_payload = data.join(format!("nar/{}.nar", nix32_sha256(recent_bytes)));
+    fs::write(&recent_payload, recent_bytes).unwrap();
+
+    let args = [
+        "gc",
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--delete-older-than",
+        "7d",
+        "--json",
+    ];
+    let preview = run(&args);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["candidates"], 1);
+    assert!(
+        old_payload.exists(),
+        "GC defaults to a non-deleting preview"
+    );
+    assert!(recent_payload.exists());
+
+    let applied = run(&[args.as_slice(), &["--apply"]].concat());
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(report["deleted_orphans"], 1);
+    assert!(
+        !old_payload.exists(),
+        "the fourteen-day-old payload is collected"
+    );
+    assert_eq!(fs::read(&recent_payload).unwrap(), recent_bytes);
+}
+
+#[test]
+fn gc_delete_older_than_rejects_invalid_periods_and_conflicting_age_units() {
+    for age_args in [
+        vec!["--delete-older-than", "18446744073709551615d"],
+        vec!["--delete-older-than", "-1d"],
+        vec!["--delete-older-than", "1.5d"],
+        vec!["--delete-older-than", "7"],
+        vec!["--delete-older-than", "7h"],
+        vec!["--delete-older-than", "7d", "--max-age-seconds", "1"],
+    ] {
+        let result = run(&[vec!["gc", "--data-dir", "/unused-cache"], age_args].concat());
+        assert_eq!(result.status.code(), Some(2));
+        assert!(
+            !String::from_utf8_lossy(&result.stderr).contains("unexpected argument"),
+            "the days flag must be recognized; invalid values fail during argument parsing"
+        );
+    }
+}
+
+#[test]
+fn gc_delete_older_than_preserves_protected_and_recent_publications_and_shared_payloads() {
+    let data = init_data_dir("gc-age-publications");
+    write_test_trusted_public_keys(data.join("trusted-public-keys"));
+    let payload = data.join(format!("nar/{NARJAR_HASH}.nar"));
+    fs::write(&payload, NAR_BYTES).unwrap();
+    let recent_store = "22222222222222222222222222222222";
+    let old_time = std::time::SystemTime::now() - Duration::from_secs(14 * 24 * 60 * 60);
+    for store in [STORE_HASH, ABSENT_STORE_HASH, recent_store] {
+        let metadata = data.join(format!("{store}.narinfo"));
+        fs::write(
+            &metadata,
+            signed_narinfo_for(store, NARJAR_HASH, NAR_BYTES.len() as u64),
+        )
+        .unwrap();
+        if store != recent_store {
+            fs::File::open(metadata)
+                .unwrap()
+                .set_modified(old_time)
+                .unwrap();
+        }
+    }
+    let roots = data.join("protected-roots");
+    fs::write(&roots, format!("{ABSENT_STORE_HASH}\n")).unwrap();
+    let result = run(&[
+        "gc",
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--delete-older-than",
+        "7d",
+        "--protected-roots",
+        roots.to_str().unwrap(),
+        "--apply",
+        "--json",
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["deleted_narinfos"], 1);
+    assert_eq!(report["deleted_nars"], 0);
+    assert!(!data.join(format!("{STORE_HASH}.narinfo")).exists());
+    assert!(
+        data.join(format!("{ABSENT_STORE_HASH}.narinfo")).exists(),
+        "age cannot override an explicitly protected root"
+    );
+    assert!(
+        data.join(format!("{recent_store}.narinfo")).exists(),
+        "a recent publication cannot be evicted by the age-only policy"
+    );
+    assert_eq!(
+        fs::read(payload).unwrap(),
+        NAR_BYTES,
+        "retained publications still reference the shared canonical payload"
+    );
+}
+
+#[test]
 fn a_long_data_directory_does_not_prevent_the_cache_server_from_starting() {
     let owner = data_dir("long-control-path");
     let data = owner.join("long-cache-root-".repeat(12));

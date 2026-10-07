@@ -233,6 +233,9 @@ narjar gc --data-dir ./cache --target-bytes 100000000000 --apply --json
 
 Garbage collection defaults to a dry run. Its byte totals use logical file
 lengths; filesystem compression and snapshots affect actual reclaimed space.
+Use `--delete-older-than 7d` instead of a byte target for seven-day retention;
+protected roots and the online grace period still apply. Scheduled NixOS
+collection accepts `services.narjar.gc.maxAgeDays = 7`.
 `delete --store-hash HASH` removes a path's metadata; GC reclaims unreferenced
 payloads.
 

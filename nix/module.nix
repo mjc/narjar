@@ -446,6 +446,10 @@
       "--max-age-seconds"
       (toString cfg.gc.maxAgeSeconds)
     ]
+    ++ lib.optionals (cfg.gc.maxAgeDays != null) [
+      "--delete-older-than"
+      "${toString cfg.gc.maxAgeDays}d"
+    ]
     ++ lib.optionals (cfg.gc.minAgeSeconds != 0) [
       "--min-age-seconds"
       (toString cfg.gc.minAgeSeconds)
@@ -631,6 +635,12 @@ in {
         description = "Maximum publication age in seconds.";
       };
 
+      maxAgeDays = lib.mkOption {
+        type = lib.types.nullOr (lib.types.ints.between 0 213503982334601);
+        default = null;
+        description = "Collect eligible publications and orphan payloads at least this many 24-hour days old. Mutually exclusive with maxAgeSeconds; protected roots and online grace still apply.";
+      };
+
       minAgeSeconds = lib.mkOption {
         type = lib.types.ints.unsigned;
         default = 0;
@@ -677,8 +687,13 @@ in {
           !cfg.gc.enable
           || cfg.gc.maxBytes != null
           || cfg.gc.targetBytes != null
-          || cfg.gc.maxAgeSeconds != null;
-        message = "services.narjar.gc requires maxBytes, targetBytes, or maxAgeSeconds";
+          || cfg.gc.maxAgeSeconds != null
+          || cfg.gc.maxAgeDays != null;
+        message = "services.narjar.gc requires maxBytes, targetBytes, maxAgeSeconds, or maxAgeDays";
+      }
+      {
+        assertion = cfg.gc.maxAgeSeconds == null || cfg.gc.maxAgeDays == null;
+        message = "services.narjar.gc.maxAgeSeconds and maxAgeDays are mutually exclusive";
       }
       {
         assertion =
