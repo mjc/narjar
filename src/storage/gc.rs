@@ -1659,8 +1659,10 @@ fn invalid(message: impl Into<String>) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::NarFileName;
-    use crate::storage::{CacheCreation, Directory, NarUploadPolicy};
+    #[cfg(not(target_os = "macos"))]
+    use crate::storage::NarUploadPolicy;
+    use crate::storage::{CacheCreation, Directory};
+    #[cfg(not(target_os = "macos"))]
     use sha2::Digest;
     use std::{
         fs,

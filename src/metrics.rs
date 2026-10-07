@@ -1,6 +1,7 @@
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::{
     cell::Cell,
-    fs::File,
     path::{Path, PathBuf},
     sync::{
         Mutex,

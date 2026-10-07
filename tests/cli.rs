@@ -17,14 +17,17 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::{
-        Arc, Barrier,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder, compress};
 use tempfile::TempDir;
+
+#[cfg(target_os = "linux")]
+use std::sync::{Barrier, atomic::AtomicU64};
 
 const CONFIG_ENV: &[&str] = &[
     "NARJAR_DATA_DIR",
@@ -2428,6 +2431,7 @@ impl RunningServer {
         Self::start_path_with_owner(data_dir, temp_dir, workers, extra_args)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn start_with_existing_path(data_dir: PathBuf, owner: TestDir, extra_args: &[&str]) -> Self {
         Self::start_path_with_owner(data_dir, owner, 1, extra_args)
     }
@@ -5129,6 +5133,7 @@ fn test_encoding_name(encoding: WireEncoding) -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn encode_xz_variable_integer(mut value: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     while value >= 0x80 {

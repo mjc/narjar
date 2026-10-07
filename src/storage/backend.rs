@@ -38,6 +38,10 @@ pub struct SupportedStorageBackend(pub(super) BackendSupport);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BackendSupport {
     Flat,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "chunked storage is supported only on Linux")
+    )]
     Chunked(ChunkDurability),
 }
 
