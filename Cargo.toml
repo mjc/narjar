@@ -2,7 +2,6 @@
 name = "narjar"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
 description = "A filesystem-backed Nix binary cache"
 repository = "https://github.com/mjc/narjar"
 license = "MIT OR Apache-2.0"

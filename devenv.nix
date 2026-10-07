@@ -17,6 +17,7 @@ in
     curl
     cargo-nextest
     cargo-audit
+    cargo-msrv
     shellcheck
     actionlint
     cargo-fuzz

@@ -7,7 +7,8 @@ must not change them. Current release checks are in the
 [release procedure](release.md#validate-the-candidate).
 
 The Rust 1.85 requirement below applies only to these experiments. The current
-package requires Rust 1.98, as declared in [Cargo.toml](../Cargo.toml).
+CLI requires Rust 1.98; the development toolchain is pinned in
+[rust-toolchain.toml](../rust-toolchain.toml).
 
 The comparison is the measured Narjar binary against a matched raw-NAR cache
 using transparent filesystem compression. Both run on the same Linux builder,
