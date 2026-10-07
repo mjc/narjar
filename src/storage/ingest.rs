@@ -9,6 +9,7 @@ use crate::object::NarFileName;
 
 use super::{
     PublishOutcome, StagingReservation, Storage, StorageError,
+    collection::{ActivityLease, ProtectedObject},
     compression::{CapacityCheckedStagingWriter, ReceivedNar, receive_uploaded_nar},
     publication::{NarUploadPolicy, OwnedPublication, PublishTarget, TemporaryFile},
     recovery::PublicationState,
@@ -27,6 +28,7 @@ pub(super) struct Staged<'storage, State> {
     publication: OwnedPublication<'storage>,
     reservation: StagingReservation,
     state: State,
+    activity: ActivityLease<'storage>,
 }
 
 impl Storage {
@@ -52,6 +54,7 @@ impl Storage {
         reservation: StagingReservation,
         setup: impl FnOnce(&TemporaryFile) -> io::Result<()>,
     ) -> Result<Staged<'_, Streaming<UploadRequest>>, StorageError> {
+        let activity = self.collection.mutation()?;
         let target = PublishTarget::Nar(name);
         let destination = target.destination();
         destination.validate_path()?;
@@ -70,6 +73,7 @@ impl Storage {
         Ok(Staged {
             publication,
             reservation,
+            activity,
             state: Streaming::new(UploadRequest {
                 name,
                 length,
@@ -100,6 +104,7 @@ impl<'storage> Staged<'storage, Streaming<UploadRequest>> {
         Ok(Staged {
             publication: self.publication,
             reservation: self.reservation,
+            activity: self.activity,
             state: Validated::new(received),
         })
     }
@@ -147,6 +152,7 @@ impl Staged<'_, Validated<ReceivedNar>> {
             publication,
             reservation,
             state,
+            activity,
         } = self;
         let received = state.into_inner();
         let storage = publication.temporary().storage();
@@ -171,6 +177,7 @@ impl Staged<'_, Validated<ReceivedNar>> {
             }
         }
         // Keep the disk reservation until both payload and receipt are durable.
+        activity.protect(ProtectedObject::CanonicalNar(identity.hash()))?;
         drop(reservation);
         Ok(outcome)
     }

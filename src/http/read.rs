@@ -11,7 +11,6 @@ use crate::{
         CacheLookupOutcome, CacheObject, Metrics, NarRangeOutcome, RequestGuard, RequestMethod,
         RequestRoute, render_prometheus,
     },
-    narinfo::MAX_NARINFO_BYTES,
     object::NarFileName,
     storage::{NarReadBody, Storage, StorageReadiness, StoreHash},
 };
@@ -127,17 +126,18 @@ fn respond_narinfo(
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
     let lookup_started = Instant::now();
-    let bytes = match load_published_narinfo(storage, store) {
-        Ok(bytes) => bytes,
-        Err(NarInfoReadFailure::Missing) => {
-            record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
-            return not_found(guard, request);
-        }
-        Err(NarInfoReadFailure::InvalidOrUnreadable) => {
-            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
-            return internal_error(guard, request);
-        }
-    };
+    let crate::storage::AdvertisedNarInfo { bytes, _activity } =
+        match load_published_narinfo(storage, store) {
+            Ok(advertisement) => advertisement,
+            Err(NarInfoReadFailure::Missing) => {
+                record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
+                return not_found(guard, request);
+            }
+            Err(NarInfoReadFailure::InvalidOrUnreadable) => {
+                record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+                return internal_error(guard, request);
+            }
+        };
     record_narinfo_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
     let response = cache_policy(
         Response::from_data(bytes).with_header(header("Content-Type", "text/x-nix-narinfo")),
@@ -153,20 +153,15 @@ enum NarInfoReadFailure {
     InvalidOrUnreadable,
 }
 
-fn load_published_narinfo(
-    storage: &Storage,
+fn load_published_narinfo<'storage>(
+    storage: &'storage Storage,
     store: &StoreHash,
-) -> Result<Vec<u8>, NarInfoReadFailure> {
+) -> Result<crate::storage::AdvertisedNarInfo<'storage>, NarInfoReadFailure> {
     let narinfo = storage
-        .open_narinfo(store)
+        .read_advertised_narinfo(store)
         .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)?
         .ok_or(NarInfoReadFailure::Missing)?;
-    read_bounded_narinfo(narinfo)
-}
-
-fn read_bounded_narinfo(narinfo: impl Read) -> Result<Vec<u8>, NarInfoReadFailure> {
-    crate::records::read_bounded_bytes(narinfo, MAX_NARINFO_BYTES)
-        .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)
+    Ok(narinfo)
 }
 
 fn record_narinfo_lookup(
@@ -393,7 +388,7 @@ fn respond_nar_bytes(
                 nar_range_response(response_range, content_length, visibility, io::empty());
             send_file_response(guard, request, response, file, range.start, range_length)
         }
-        NarReadBody::Chunked(reader) => {
+        NarReadBody::Chunked { reader, _activity } => {
             let response = nar_range_response(response_range, content_length, visibility, reader);
             send_response(guard, request, response)
         }

@@ -18,6 +18,7 @@ use crate::object::{
 use crate::records::{BoundedRegularFile, read_bounded_regular_file};
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
+use super::collection::ActivityLease;
 use super::compression::{
     CapacityCheckedStagingWriter, encoded_file_matches, nar_file_size_matches,
 };
@@ -37,6 +38,7 @@ pub(crate) struct VerifiedCanonicalNar<'storage> {
     storage: &'storage Storage,
     source: StoredNarSource<'storage>,
     identity: NarIdentity,
+    _activity: ActivityLease<'storage>,
 }
 
 enum StoredNarSource<'storage> {
@@ -46,14 +48,17 @@ enum StoredNarSource<'storage> {
 
 pub(crate) enum NarReadBody<'storage> {
     File(File),
-    Chunked(Box<ChunkedNarReader<'storage>>),
+    Chunked {
+        reader: Box<ChunkedNarReader<'storage>>,
+        _activity: ActivityLease<'storage>,
+    },
 }
 
 impl Read for NarReadBody<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::File(file) => file.read(buffer),
-            Self::Chunked(reader) => reader.read(buffer),
+            Self::Chunked { reader, .. } => reader.read(buffer),
         }
     }
 }
@@ -84,7 +89,16 @@ impl<'storage> VerifiedCanonicalNar<'storage> {
                         MAX_CHUNK_MANIFEST_BYTES,
                     )
                     .map_err(|error| StorageError::Io(io::Error::other(error)))?;
-                Ok(NarReadBody::Chunked(Box::new(reader)))
+                Ok(NarReadBody::Chunked {
+                    reader: Box::new(reader),
+                    _activity: self
+                        .storage
+                        .collection
+                        .reader(super::collection::ProtectedObject::CanonicalNar(
+                            self.identity.hash(),
+                        ))?
+                        .ok_or(StorageError::CollectionBusy)?,
+                })
             }
         }
     }
@@ -290,6 +304,7 @@ impl Storage {
         &self,
         payload: NarRepresentation,
     ) -> Result<VerifiedCanonicalNar<'_>, StorageError> {
+        let activity = self.collection.mutation()?;
         let identity = match payload {
             NarRepresentation::Raw(identity) => identity,
             NarRepresentation::Compressed(expectation) => self
@@ -327,6 +342,7 @@ impl Storage {
             storage: self,
             source,
             identity,
+            _activity: activity,
         })
     }
 
@@ -586,6 +602,7 @@ impl Storage {
             storage: self,
             source: StoredNarSource::Flat(raw.try_clone()?),
             identity,
+            _activity: self.collection.mutation()?,
         };
         self.materialize_compressed_nar(
             &stored,

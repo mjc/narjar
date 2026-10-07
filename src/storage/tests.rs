@@ -93,6 +93,254 @@ fn flat_storage_fixture() -> (TestDir, Storage) {
     storage_fixture(SupportedStorageBackend::FLAT)
 }
 
+#[test]
+fn a_staged_publication_retains_its_collection_lease_until_cleanup() {
+    let (_directory, storage) = flat_storage_fixture();
+    let staged = storage
+        .begin_publication(PublishTarget::CacheInfo, |_| Ok(()))
+        .unwrap();
+    assert!(matches!(
+        storage.collection.snapshot(),
+        Err(StorageError::CollectionBusy)
+    ));
+    assert!(
+        matches!(storage.finish_recovery(), Err(StorageError::CollectionBusy)),
+        "offline cleanup cannot clear a live publication journal"
+    );
+    drop(staged);
+    assert!(
+        storage.collection.snapshot().is_ok(),
+        "abandonment releases the lease after cleanup"
+    );
+}
+
+#[test]
+fn a_failed_publication_invalidates_a_scan_before_any_final_commit() {
+    let (_directory, storage) = flat_storage_fixture();
+    let snapshot = storage.collection.snapshot().unwrap();
+    let result = storage.begin_publication(PublishTarget::CacheInfo, |_| {
+        Err(io::Error::other("publication rejected before streaming").into())
+    });
+    assert!(result.is_err());
+    assert!(matches!(
+        snapshot.authorize_deletion(),
+        Err(StorageError::CollectionChanged)
+    ));
+}
+
+#[test]
+fn a_verified_canonical_source_is_pinned_through_metadata_binding() {
+    let (_directory, storage) = flat_storage_fixture();
+    let raw = b"canonical source";
+    let identity = upload_raw_nar(&storage, raw, super::NarUploadPolicy::new(1024, 0));
+    let verified = storage
+        .open_verified_canonical_nar(NarRepresentation::Raw(identity))
+        .unwrap();
+    assert!(matches!(
+        storage.collection.snapshot(),
+        Err(StorageError::CollectionBusy)
+    ));
+    drop(verified);
+    assert!(storage.collection.snapshot().is_ok());
+}
+
+#[test]
+fn a_completed_narinfo_miss_does_not_invalidate_the_collection_snapshot() {
+    let (_directory, storage) = flat_storage_fixture();
+    let snapshot = storage.collection.snapshot().unwrap();
+    let store = StoreHash::parse(STORE_HASH).unwrap();
+    assert!(storage.read_advertised_narinfo(&store).unwrap().is_none());
+    assert!(
+        snapshot.authorize_deletion().is_ok(),
+        "404 responses change neither content nor advertisement protection"
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn a_lazy_chunk_reader_defers_collection_until_its_final_unopened_chunk_is_read() {
+    let (_directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
+    let raw = (0..1_000_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let identity = upload_raw_nar(
+        &storage,
+        &raw,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
+    let manifest = storage
+        .chunk_store()
+        .unwrap()
+        .validate_manifest(identity.hash())
+        .unwrap()
+        .unwrap();
+    assert!(manifest.chunk_count() > 1);
+    let mut reader = storage
+        .open_nar_range(NarFileName::raw(identity.hash()), 0..raw.len() as u64)
+        .unwrap()
+        .unwrap()
+        .body;
+    let mut first = [0; 1];
+    reader.read_exact(&mut first).unwrap();
+    assert!(matches!(
+        storage.collection.snapshot(),
+        Err(StorageError::CollectionBusy)
+    ));
+    let mut remainder = Vec::new();
+    reader.read_to_end(&mut remainder).unwrap();
+    assert_eq!(first[0], raw[0]);
+    assert_eq!(remainder, raw[1..]);
+    drop(reader);
+    assert!(storage.collection.snapshot().is_ok());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_retained_lazy_chunk_reader_opens_its_remaining_chunks_during_an_unrelated_sweep() {
+    let (_directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
+    let raw = (0..1_000_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let retained = upload_raw_nar(
+        &storage,
+        &raw,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
+    let retired = upload_raw_nar(
+        &storage,
+        b"unrelated old NAR",
+        super::NarUploadPolicy::new(1024, 0),
+    );
+    let chunks = storage.chunk_store().unwrap();
+    assert!(
+        chunks
+            .validate_manifest(retained.hash())
+            .unwrap()
+            .unwrap()
+            .chunk_count()
+            > 1
+    );
+    let sweep = chunks.mark_retained_manifests([retained.hash()]).unwrap();
+    let permit = storage
+        .collection
+        .snapshot()
+        .unwrap()
+        .authorize_retirement(super::collection::ObjectSelection::Objects(
+            std::collections::BTreeSet::from([super::collection::ProtectedObject::CanonicalNar(
+                retired.hash(),
+            )]),
+        ))
+        .unwrap();
+    let mut reader = storage
+        .open_nar_range(NarFileName::raw(retained.hash()), 0..raw.len() as u64)
+        .unwrap()
+        .unwrap()
+        .body;
+    let mut first = [0; 1];
+    reader.read_exact(&mut first).unwrap();
+    let swept = sweep.sweep().unwrap();
+    assert_eq!(swept.deleted_manifests, 1);
+    assert!(chunks.open_manifest(retired.hash()).unwrap().is_none());
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).unwrap();
+    assert_eq!(first[0], raw[0]);
+    assert_eq!(
+        rest,
+        raw[1..],
+        "later chunks must remain readable even though they were unopened when sweeping started"
+    );
+    drop(reader);
+    drop(permit);
+    assert!(storage.collection.snapshot().is_ok());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn online_gc_cannot_sweep_incrementally_published_chunks_before_ingestion_commits_its_manifest() {
+    struct PauseAtEnd<'a> {
+        raw: Cursor<&'a [u8]>,
+        entered: Option<mpsc::Sender<()>>,
+        resume: mpsc::Receiver<()>,
+    }
+    impl Read for PauseAtEnd<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.raw.read(buffer)?;
+            if count == 0
+                && let Some(entered) = self.entered.take()
+            {
+                entered.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            Ok(count)
+        }
+    }
+    let (directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
+    let raw = vec![29_u8; 20 * 1024 * 1024];
+    let hash = NarHash::from_digest(Sha256::digest(&raw).into());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let trusted =
+        crate::narinfo::TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap())
+            .unwrap();
+    let online_options = || super::gc::GcOptions {
+        data_dir: directory.path().to_owned(),
+        max_bytes: None,
+        target_bytes: Some(0),
+        max_age: None,
+        min_age: Duration::ZERO,
+        protected_roots: None,
+        mode: super::gc::GcMode::Apply,
+        backend: StorageBackend::Chunked,
+    };
+    std::thread::scope(|scope| {
+        let storage = &storage;
+        let raw = &raw;
+        let upload = scope.spawn(move || {
+            storage.publish_nar(
+                NarFileName::raw(hash),
+                PauseAtEnd {
+                    raw: Cursor::new(raw.as_slice()),
+                    entered: Some(entered_tx),
+                    resume: resume_rx,
+                },
+                raw.len() as u64,
+                super::NarUploadPolicy::new(raw.len() as u64, 0),
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let chunks = storage.chunk_store().unwrap();
+        assert!(
+            chunks.physical_bytes().unwrap().chunks > 0,
+            "the fixture must publish chunks before reaching its barrier"
+        );
+        assert!(
+            chunks.open_manifest(hash).unwrap().is_none(),
+            "the final manifest must not yet exist"
+        );
+        assert!(matches!(
+            super::gc::run_online(online_options(), storage, &trusted),
+            Err(StorageError::CollectionBusy)
+        ));
+        resume_tx.send(()).unwrap();
+        assert_eq!(upload.join().unwrap().unwrap(), PublishOutcome::Created);
+    });
+    assert_eq!(
+        super::gc::run_online(online_options(), &storage, &trusted)
+            .unwrap()
+            .deleted_orphans,
+        0
+    );
+    let mut received = Vec::new();
+    storage
+        .open_nar_range(NarFileName::raw(hash), 0..raw.len() as u64)
+        .unwrap()
+        .unwrap()
+        .body
+        .read_to_end(&mut received)
+        .unwrap();
+    assert_eq!(received, raw);
+}
+
 fn storage_fixture(backend: SupportedStorageBackend) -> (TestDir, Storage) {
     let directory = TestDir::new();
     let storage = initialize_storage_with_backend(directory.path(), backend)

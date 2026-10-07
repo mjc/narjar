@@ -8,7 +8,10 @@ use std::{
 };
 
 use super::{
-    chunk_store::{ChunkManifestFile, ChunkStore},
+    chunk_store::{ChunkManifestFile, ChunkStore, MarkedChunkSweep},
+    collection::{
+        CollectionLease, CollectionSnapshot, ONLINE_GC_GRACE, ObjectSelection, ProtectedObject,
+    },
     fs::unlink_at,
     inspection::NarinfoName,
     state::PayloadStorage,
@@ -22,12 +25,13 @@ use crate::{
     },
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum GcMode {
     DryRun,
     Apply,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GcOptions {
     pub data_dir: PathBuf,
     pub max_bytes: Option<u64>,
@@ -39,9 +43,16 @@ pub struct GcOptions {
     pub backend: StorageBackend,
 }
 
-#[derive(serde::Serialize)]
+impl GcOptions {
+    /// Validate retention policy before admitting a daemon maintenance request.
+    pub fn validate_policy(&self) -> Result<(), StorageError> {
+        gc_target_bytes(self).map(drop)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GcReport {
-    pub accounting_basis: &'static str,
+    pub accounting_basis: AccountingBasis,
     pub dry_run: bool,
     pub before_bytes: u64,
     pub after_bytes: u64,
@@ -66,6 +77,88 @@ pub struct GcReport {
     pub deleted_narinfos: usize,
     pub deleted_nars: usize,
     pub deleted_orphans: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountingBasis {
+    Logical,
+}
+
+impl std::fmt::Display for AccountingBasis {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Logical => formatter.write_str("logical"),
+        }
+    }
+}
+
+enum CollectionAccess<'storage> {
+    Offline(CollectionSnapshot<'storage>),
+    Online(CollectionSnapshot<'storage>),
+}
+
+enum CollectionPermit<'storage> {
+    Offline { _lease: CollectionLease<'storage> },
+    Online { _lease: CollectionLease<'storage> },
+}
+
+enum ChunkedCollectionAction<'storage> {
+    Inspect,
+    Apply(MarkedChunkSweep<'storage>),
+}
+
+impl<'storage> CollectionAccess<'storage> {
+    fn protects(&self, object: ProtectedObject) -> bool {
+        match self {
+            Self::Offline(_) => false,
+            Self::Online(snapshot) => snapshot.protection.contains(object),
+        }
+    }
+
+    fn protects_nar_name(&self, name: &OsStr) -> bool {
+        match self {
+            Self::Offline(_) => false,
+            Self::Online(snapshot) => snapshot.protection.contains_nar_name(name),
+        }
+    }
+
+    fn authorize(
+        self,
+        mode: GcMode,
+        retiring: BTreeSet<ProtectedObject>,
+    ) -> Result<CollectionPermit<'storage>, StorageError> {
+        let retiring = match mode {
+            GcMode::Apply => retiring,
+            GcMode::DryRun => BTreeSet::new(),
+        };
+        match self {
+            Self::Offline(snapshot) => Ok(CollectionPermit::Offline {
+                _lease: snapshot.authorize_deletion()?,
+            }),
+            Self::Online(snapshot) => Ok(CollectionPermit::Online {
+                _lease: snapshot.authorize_retirement(ObjectSelection::Objects(retiring))?,
+            }),
+        }
+    }
+}
+
+struct CollectedPass<'storage> {
+    report: GcReport,
+    permit: CollectionPermit<'storage>,
+}
+
+impl CollectedPass<'_> {
+    fn finish(self, storage: &Storage, mode: GcMode) -> Result<GcReport, StorageError> {
+        match self.permit {
+            CollectionPermit::Offline { _lease } => match mode {
+                GcMode::Apply => storage.finish_recovery_under_exclusion()?,
+                GcMode::DryRun => {}
+            },
+            CollectionPermit::Online { _lease } => {}
+        }
+        Ok(self.report)
+    }
 }
 
 struct ProtectionReport {
@@ -190,6 +283,8 @@ struct ChunkedGcReportInput<'a> {
 struct ChunkedOrphans {
     manifests: Vec<ChunkManifestFile>,
     outputs: Vec<Orphan>,
+    preserved_bytes: u64,
+    preserved_chunk_bytes: u64,
 }
 
 #[derive(Default)]
@@ -317,10 +412,7 @@ pub fn run_apply(
     recovered: &RecoveredStorage<'_>,
     trusted: &TrustedPublicKeys,
 ) -> Result<GcReport, StorageError> {
-    let report = run_with_mode(options, recovered.storage(), trusted, GcMode::Apply)?;
-    // Journal cleanup requires the offline recovery capability, not merely a completed pass.
-    recovered.storage().finish_recovery()?;
-    Ok(report)
+    run_with_mode(options, recovered.storage(), trusted, GcMode::Apply)
 }
 
 fn run_with_mode(
@@ -330,11 +422,52 @@ fn run_with_mode(
     mode: GcMode,
 ) -> Result<GcReport, StorageError> {
     options.mode = mode;
-    let target_bytes = gc_target_bytes(&options)?;
-    if let PayloadStorage::Chunked(chunk_store) = &storage.payloads {
-        return run_chunked(options, storage, chunk_store, trusted, target_bytes);
+    let snapshot = storage.collection.snapshot()?;
+    run_with_access(
+        options,
+        storage,
+        trusted,
+        CollectionAccess::Offline(snapshot),
+    )
+}
+
+/// Collect within the storage owner without performing offline recovery cleanup.
+pub fn run_online(
+    mut options: GcOptions,
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
+) -> Result<GcReport, StorageError> {
+    if options.backend != storage.backend() {
+        return Err(invalid(
+            "online collection backend does not match the running cache",
+        ));
     }
-    run_flat_gc(options, storage, trusted, target_bytes, scan)
+    options.min_age = options.min_age.max(ONLINE_GC_GRACE);
+    let snapshot = storage.collection.snapshot()?;
+    storage.recovery.ensure_no_pending_publications()?;
+    run_with_access(
+        options,
+        storage,
+        trusted,
+        CollectionAccess::Online(snapshot),
+    )
+}
+
+fn run_with_access(
+    options: GcOptions,
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
+    access: CollectionAccess<'_>,
+) -> Result<GcReport, StorageError> {
+    let target_bytes = gc_target_bytes(&options)?;
+    let mode = options.mode;
+    let pass = match &storage.payloads {
+        PayloadStorage::Chunked(chunk_store) => {
+            run_chunked(options, storage, chunk_store, trusted, target_bytes, access)?
+        }
+        PayloadStorage::Flat => run_flat_gc(options, storage, trusted, target_bytes, access, scan)?,
+    };
+    pass.finish(storage, mode)
 }
 
 fn gc_target_bytes(options: &GcOptions) -> Result<Option<u64>, StorageError> {
@@ -360,14 +493,19 @@ fn pressure_target(
     (current_bytes > max_bytes.unwrap_or(target)).then_some(target)
 }
 
-fn run_flat_gc(
+fn run_flat_gc<'storage>(
     options: GcOptions,
     storage: &Storage,
     trusted: &TrustedPublicKeys,
     target_bytes: Option<u64>,
+    access: CollectionAccess<'storage>,
     mut scan_entries: impl FnMut(&Storage, &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError>,
-) -> Result<GcReport, StorageError> {
+) -> Result<CollectedPass<'storage>, StorageError> {
     let mut entries = scan_entries(storage, trusted)?;
+    entries.iter_mut().for_each(|entry| {
+        entry.protected |= access.protects(ProtectedObject::Publication(entry.store))
+            || access.protects_nar_name(&entry.raw_nar_name);
+    });
     let protection = protect(&mut entries, options.protected_roots.as_deref(), |entry| {
         ProtectionNode {
             store: &entry.store,
@@ -382,8 +520,8 @@ fn run_flat_gc(
     let before_bytes = total_bytes(&entries) + orphan_bytes(&orphans);
     let now = SystemTime::now();
     let policy = RetentionPolicy::new(&options, before_bytes, target_bytes, now);
-    let eligible = eligible_count(&entries, &orphans, now, options.min_age);
-    let eligible_bytes_total = eligible_bytes(&entries, &orphans, now, options.min_age);
+    let eligible = eligible_count(&entries, &orphans, now, options.min_age, &access);
+    let eligible_bytes_total = eligible_bytes(&entries, &orphans, now, options.min_age, &access);
     let shared = shared_count(&entries);
     let shared_bytes_total = shared_bytes(&entries);
     let (temporary, temporary_bytes) = temporary_inventory(storage)?;
@@ -393,11 +531,14 @@ fn run_flat_gc(
         &orphans,
         after_publications + orphan_bytes(&orphans),
         policy,
+        &access,
     );
     let projected_after_bytes =
         logical_after_bytes(&entries, &selected, &orphans, &selected_orphans);
     let mut after_bytes = projected_after_bytes;
     let dry_run = options.mode == GcMode::DryRun;
+    let retiring = retiring_flat_objects(&entries, &selected, &orphans, &selected_orphans);
+    let permit = access.authorize(options.mode, retiring)?;
     let (deleted_narinfos, deleted_nars, deleted_orphans) = if dry_run {
         (0, 0, 0)
     } else {
@@ -407,40 +548,88 @@ fn run_flat_gc(
             Ok((deleted_narinfos, deleted_nars, deleted_orphans))
         })();
         let deleted = result?;
-        let remaining_entries = scan_entries(storage, trusted)?;
-        let remaining_orphans = scan_orphans(storage, &remaining_entries)?;
-        after_bytes = total_bytes(&remaining_entries) + orphan_bytes(&remaining_orphans);
+        match &permit {
+            CollectionPermit::Offline { .. } => {
+                let remaining_entries = scan_entries(storage, trusted)?;
+                let remaining_orphans = scan_orphans(storage, &remaining_entries)?;
+                after_bytes = total_bytes(&remaining_entries) + orphan_bytes(&remaining_orphans);
+            }
+            CollectionPermit::Online { .. } => {}
+        }
         deleted
     };
     let evicted_bytes = before_bytes.saturating_sub(after_bytes);
 
-    Ok(GcReport {
-        accounting_basis: "logical",
-        dry_run,
-        before_bytes,
-        after_bytes,
-        target_met: target_bytes.is_none_or(|target| after_bytes <= target),
-        candidates: selected.len() + selected_orphans.len(),
-        protected: protection.protected,
-        eligible,
-        evicted: selected.len() + selected_orphans.len(),
-        shared,
-        orphaned: orphans.len(),
-        temporary,
-        malformed: 0,
-        missing_roots: protection.missing_roots,
-        missing_references: protection.missing_references,
-        protected_bytes,
-        eligible_bytes: eligible_bytes_total,
-        evicted_bytes,
-        shared_bytes: shared_bytes_total,
-        orphaned_bytes: orphan_bytes(&orphans),
-        temporary_bytes,
-        malformed_bytes: 0,
-        deleted_narinfos,
-        deleted_nars,
-        deleted_orphans,
+    Ok(CollectedPass {
+        permit,
+        report: GcReport {
+            accounting_basis: AccountingBasis::Logical,
+            dry_run,
+            before_bytes,
+            after_bytes,
+            target_met: target_bytes.is_none_or(|target| after_bytes <= target),
+            candidates: selected.len() + selected_orphans.len(),
+            protected: protection.protected,
+            eligible,
+            evicted: selected.len() + selected_orphans.len(),
+            shared,
+            orphaned: orphans.len(),
+            temporary,
+            malformed: 0,
+            missing_roots: protection.missing_roots,
+            missing_references: protection.missing_references,
+            protected_bytes,
+            eligible_bytes: eligible_bytes_total,
+            evicted_bytes,
+            shared_bytes: shared_bytes_total,
+            orphaned_bytes: orphan_bytes(&orphans),
+            temporary_bytes,
+            malformed_bytes: 0,
+            deleted_narinfos,
+            deleted_nars,
+            deleted_orphans,
+        },
     })
+}
+
+fn retiring_flat_objects(
+    entries: &[Entry],
+    selected: &[usize],
+    orphans: &[Orphan],
+    selected_orphans: &[usize],
+) -> BTreeSet<ProtectedObject> {
+    let mut retiring = retiring_publications(
+        entries.iter().map(|entry| {
+            (
+                &entry.store,
+                entry.store_path.as_str(),
+                entry.references.as_slice(),
+            )
+        }),
+        selected.iter().map(|&index| entries[index].store),
+    );
+    let retained_payloads = entries
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected.contains(index))
+        .flat_map(|(_, entry)| entry_payload_names(entry))
+        .collect::<BTreeSet<_>>();
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| selected.contains(index))
+        .flat_map(|(_, entry)| entry_payload_names(entry))
+        .chain(selected_orphans.iter().map(|&index| &orphans[index].name))
+        .filter(|name| !retained_payloads.contains(name))
+        .filter_map(|name| {
+            name.to_str()
+                .and_then(|name| NarFileName::parse(name).ok())
+                .and_then(NarFileName::raw_hash)
+        })
+        .for_each(|hash| {
+            retiring.insert(ProtectedObject::CanonicalNar(hash));
+        });
+    retiring
 }
 
 fn scan(storage: &Storage, trusted: &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError> {
@@ -507,14 +696,19 @@ fn scan_with_directory_names(
     Ok(entries)
 }
 
-fn run_chunked(
+fn run_chunked<'storage>(
     options: GcOptions,
     storage: &Storage,
     chunk_store: &ChunkStore,
     trusted: &TrustedPublicKeys,
     target_bytes: Option<u64>,
-) -> Result<GcReport, StorageError> {
+    access: CollectionAccess<'storage>,
+) -> Result<CollectedPass<'storage>, StorageError> {
     let mut entries = scan_chunked(storage, chunk_store, trusted)?;
+    entries.iter_mut().for_each(|entry| {
+        entry.protected |= access.protects(ProtectedObject::Publication(entry.store))
+            || access.protects(ProtectedObject::CanonicalNar(entry.raw_hash));
+    });
     let protection = protect(&mut entries, options.protected_roots.as_deref(), |entry| {
         ProtectionNode {
             store: &entry.store,
@@ -533,16 +727,28 @@ fn run_chunked(
     let eligible_orphans = orphans
         .manifests
         .iter()
-        .filter(|manifest| age_reached(manifest.modified, now, options.min_age))
+        .filter(|manifest| {
+            age_reached(manifest.modified, now, options.min_age)
+                && !access.protects(ProtectedObject::CanonicalNar(manifest.hash))
+        })
         .count()
         + orphans
             .outputs
             .iter()
-            .filter(|orphan| age_reached(orphan.modified, now, options.min_age))
+            .filter(|orphan| {
+                age_reached(orphan.modified, now, options.min_age)
+                    && !access.protects_nar_name(&orphan.name)
+            })
             .count();
     let eligible = eligible_entries + eligible_orphans;
-    let eligible_bytes =
-        chunked_eligible_bytes(chunk_store, &entries, &orphans, now, options.min_age)?;
+    let eligible_bytes = chunked_eligible_bytes(
+        chunk_store,
+        &entries,
+        &orphans,
+        now,
+        options.min_age,
+        &access,
+    )?;
     let orphaned = orphans.manifests.len() + orphans.outputs.len();
     let orphaned_bytes = chunked_orphan_bytes(chunk_store, &entries, &orphans)?;
     let protected_bytes =
@@ -553,35 +759,83 @@ fn run_chunked(
         &orphans,
         before_bytes,
         RetentionPolicy::new(&options, before_bytes, target_bytes, now),
+        &access,
     )?;
     let after_bytes = chunked_projected_bytes(chunk_store, &entries, &orphans, &selected)?;
     let evicted = selected.entries.len() + selected.manifests.len() + selected.outputs.len();
     let dry_run = options.mode == GcMode::DryRun;
-    let (after_bytes, deleted) = match options.mode {
-        GcMode::DryRun => (after_bytes, (0, 0, 0)),
-        GcMode::Apply => {
-            let deleted = apply_chunked(storage, chunk_store, &entries, &orphans, &selected)?;
-            let remaining = scan_chunked(storage, chunk_store, trusted)?;
-            let actual_after = chunked_before_bytes(storage, chunk_store, &remaining)?;
+    let live_manifests =
+        retained_chunked_manifests(&entries, &orphans, &selected).collect::<BTreeSet<_>>();
+    let action = match options.mode {
+        GcMode::Apply => ChunkedCollectionAction::Apply(
+            chunk_store
+                .mark_retained_manifests(live_manifests.iter().copied())
+                .map_err(chunk_store_error)?,
+        ),
+        GcMode::DryRun => ChunkedCollectionAction::Inspect,
+    };
+    let retiring = retiring_chunked_objects(&entries, &orphans, &selected, &live_manifests);
+    let permit = access.authorize(options.mode, retiring)?;
+    let (after_bytes, deleted) = match action {
+        ChunkedCollectionAction::Inspect => (after_bytes, (0, 0, 0)),
+        ChunkedCollectionAction::Apply(sweep) => {
+            let deleted = apply_marked_chunked(storage, &entries, &orphans, &selected, sweep)?;
+            let actual_after = match &permit {
+                CollectionPermit::Offline { .. } => {
+                    let remaining = scan_chunked(storage, chunk_store, trusted)?;
+                    chunked_before_bytes(storage, chunk_store, &remaining)?
+                }
+                CollectionPermit::Online { .. } => after_bytes,
+            };
             (actual_after, deleted)
         }
     };
 
-    Ok(chunked_report(ChunkedGcReportInput {
-        before_entries: &entries,
-        before_bytes,
-        after_bytes,
-        target_bytes,
-        dry_run,
-        protection,
-        protected_bytes,
-        eligible,
-        eligible_bytes,
-        evicted,
-        orphaned,
-        orphaned_bytes,
-        deleted,
-    }))
+    Ok(CollectedPass {
+        permit,
+        report: chunked_report(ChunkedGcReportInput {
+            before_entries: &entries,
+            before_bytes,
+            after_bytes,
+            target_bytes,
+            dry_run,
+            protection,
+            protected_bytes,
+            eligible,
+            eligible_bytes,
+            evicted,
+            orphaned,
+            orphaned_bytes,
+            deleted,
+        }),
+    })
+}
+
+fn retiring_chunked_objects(
+    entries: &[ChunkedEntry],
+    orphans: &ChunkedOrphans,
+    selected: &ChunkedSelection,
+    retained_manifests: &BTreeSet<NarHash>,
+) -> BTreeSet<ProtectedObject> {
+    let mut retiring = retiring_publications(
+        entries.iter().map(|entry| {
+            (
+                &entry.store,
+                entry.store_path.as_str(),
+                entry.references.as_slice(),
+            )
+        }),
+        selected.entries.iter().map(|&index| entries[index].store),
+    );
+    retiring.extend(
+        entries
+            .iter()
+            .map(|entry| entry.raw_hash)
+            .chain(orphans.manifests.iter().map(|manifest| manifest.hash))
+            .filter(|hash| !retained_manifests.contains(hash))
+            .map(ProtectedObject::CanonicalNar),
+    );
+    retiring
 }
 
 fn chunked_orphan_bytes(
@@ -603,7 +857,8 @@ fn chunked_orphan_bytes(
         .chain(orphans.outputs.iter().map(|output| output.bytes))
         .try_fold(0_u64, checked_byte_sum("orphan byte count overflow"))?;
     physical_chunks
-        .checked_sub(retained_chunks)
+        .checked_sub(orphans.preserved_chunk_bytes)
+        .and_then(|bytes| bytes.checked_sub(retained_chunks))
         .and_then(|bytes| bytes.checked_add(orphan_files))
         .ok_or_else(|| invalid("orphan byte count underflow or overflow"))
 }
@@ -614,6 +869,7 @@ fn chunked_eligible_bytes(
     orphans: &ChunkedOrphans,
     now: SystemTime,
     min_age: Duration,
+    access: &CollectionAccess<'_>,
 ) -> Result<u64, StorageError> {
     let eligible_entries = entries
         .iter()
@@ -627,7 +883,10 @@ fn chunked_eligible_bytes(
             orphans
                 .manifests
                 .iter()
-                .filter(|manifest| !age_reached(manifest.modified, now, min_age))
+                .filter(|manifest| {
+                    !age_reached(manifest.modified, now, min_age)
+                        || access.protects(ProtectedObject::CanonicalNar(manifest.hash))
+                })
                 .map(|manifest| manifest.hash),
         )
         .collect::<BTreeSet<_>>();
@@ -679,7 +938,10 @@ fn chunked_eligible_bytes(
             orphans
                 .outputs
                 .iter()
-                .filter(|output| !age_reached(output.modified, now, min_age))
+                .filter(|output| {
+                    !age_reached(output.modified, now, min_age)
+                        || access.protects_nar_name(&output.name)
+                })
                 .map(|output| output.name.clone()),
         )
         .collect::<BTreeSet<_>>();
@@ -699,7 +961,8 @@ fn chunked_eligible_bytes(
             checked_byte_sum("eligible narinfo byte count overflow"),
         )?;
     physical_chunks
-        .checked_sub(retained_chunks)
+        .checked_sub(orphans.preserved_chunk_bytes)
+        .and_then(|bytes| bytes.checked_sub(retained_chunks))
         .and_then(|bytes| bytes.checked_add(manifest_bytes))
         .and_then(|bytes| bytes.checked_add(output_bytes))
         .and_then(|bytes| bytes.checked_add(metadata_bytes))
@@ -801,7 +1064,37 @@ fn scan_chunked_orphans(
         .filter_map(|entry| entry.output_name.as_ref())
         .collect::<BTreeSet<_>>();
     let nar_directory = storage.nar_directory()?;
-    let outputs = read_dir_names(&nar_directory)?
+    let output_names = read_dir_names(&nar_directory)?;
+    let unknown_output_bytes = output_names
+        .iter()
+        .filter(|name| {
+            !name
+                .to_str()
+                .is_some_and(|name| NarFileName::parse(name).is_ok())
+        })
+        .filter_map(
+            |name| match super::entry_is_regular_at(&nar_directory, name) {
+                Ok(true) => Some(
+                    open_regular_at(&nar_directory, name)
+                        .and_then(|file| file.metadata())
+                        .map(|metadata| metadata.len()),
+                ),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .try_fold(0_u64, |total, bytes| {
+            total
+                .checked_add(bytes?)
+                .ok_or_else(|| io::Error::other("output byte count overflow"))
+        })?;
+    let preserved = chunk_store.preserved_bytes().map_err(chunk_store_error)?;
+    let preserved_bytes = preserved
+        .chunks
+        .checked_add(preserved.manifests)
+        .and_then(|bytes| bytes.checked_add(unknown_output_bytes))
+        .ok_or_else(|| invalid("preserved byte count overflow"))?;
+    let outputs = output_names
         .into_iter()
         .filter(|name| {
             name.to_str()
@@ -821,7 +1114,12 @@ fn scan_chunked_orphans(
         })
         .filter_map(Result::transpose)
         .collect::<Result<Vec<_>, io::Error>>()?;
-    Ok(ChunkedOrphans { manifests, outputs })
+    Ok(ChunkedOrphans {
+        manifests,
+        outputs,
+        preserved_bytes,
+        preserved_chunk_bytes: preserved.chunks,
+    })
 }
 
 fn age_reached(modified: SystemTime, now: SystemTime, age: Duration) -> bool {
@@ -883,7 +1181,8 @@ fn chunked_projected_bytes(
         .reachable_chunk_bytes(manifests.keys().copied())
         .map_err(chunk_store_error)?;
     chunk_bytes
-        .checked_add(manifests.values().copied().sum())
+        .checked_add(orphans.preserved_bytes)
+        .and_then(|bytes| bytes.checked_add(manifests.values().copied().sum()))
         .and_then(|bytes| bytes.checked_add(outputs.values().copied().sum::<u64>()))
         .and_then(|bytes| bytes.checked_add(narinfo_bytes))
         .ok_or_else(|| invalid("chunked byte count overflow"))
@@ -956,6 +1255,7 @@ fn select_chunked(
     orphans: &ChunkedOrphans,
     current_bytes: u64,
     policy: RetentionPolicy,
+    access: &CollectionAccess<'_>,
 ) -> Result<ChunkedSelection, StorageError> {
     let mut order = entries
         .iter()
@@ -979,7 +1279,7 @@ fn select_chunked(
             policy
                 .reason(
                     candidate.modified(entries, orphans),
-                    candidate.protected(entries),
+                    candidate.protected(entries, orphans, access),
                     current_bytes,
                 )
                 .is_some()
@@ -997,7 +1297,7 @@ fn select_chunked(
         order.into_iter().partition(|candidate| {
             policy.reason(
                 candidate.modified(entries, orphans),
-                candidate.protected(entries),
+                candidate.protected(entries, orphans, access),
                 current_bytes,
             ) == Some(CollectionReason::MaximumAge)
         });
@@ -1010,7 +1310,7 @@ fn select_chunked(
         if policy
             .reason(
                 candidate.modified(entries, orphans),
-                candidate.protected(entries),
+                candidate.protected(entries, orphans, access),
                 remaining,
             )
             .is_some()
@@ -1030,10 +1330,18 @@ impl ChunkedCandidate {
         }
     }
 
-    fn protected(self, entries: &[ChunkedEntry]) -> bool {
+    fn protected(
+        self,
+        entries: &[ChunkedEntry],
+        orphans: &ChunkedOrphans,
+        access: &CollectionAccess<'_>,
+    ) -> bool {
         match self {
             Self::Entry(index) => entries[index].protected,
-            Self::Manifest(_) | Self::Output(_) => false,
+            Self::Manifest(index) => {
+                access.protects(ProtectedObject::CanonicalNar(orphans.manifests[index].hash))
+            }
+            Self::Output(index) => access.protects_nar_name(&orphans.outputs[index].name),
         }
     }
 
@@ -1046,12 +1354,77 @@ impl ChunkedCandidate {
     }
 }
 
+fn retiring_publications<'a>(
+    nodes: impl Iterator<Item = (&'a StoreHash, &'a str, &'a [String])>,
+    selected: impl Iterator<Item = StoreHash>,
+) -> BTreeSet<ProtectedObject> {
+    let nodes = nodes.collect::<Vec<_>>();
+    let aliases = nodes
+        .iter()
+        .flat_map(|(store, path, _)| [(*path, **store), (store.as_str(), **store)])
+        .collect::<BTreeMap<_, _>>();
+    let mut dependents = BTreeMap::<StoreHash, Vec<StoreHash>>::new();
+    nodes.iter().for_each(|(store, _, references)| {
+        references
+            .iter()
+            .filter_map(|reference| aliases.get(reference.as_str()))
+            .for_each(|reference| {
+                dependents.entry(*reference).or_default().push(**store);
+            });
+    });
+    let mut pending = selected.collect::<Vec<_>>();
+    let mut retiring = BTreeSet::new();
+    std::iter::from_fn(|| {
+        let store = pending.pop()?;
+        if retiring.insert(ProtectedObject::Publication(store)) {
+            pending.extend(dependents.get(&store).into_iter().flatten().copied());
+        }
+        Some(())
+    })
+    .for_each(drop);
+    retiring
+}
+
+fn retained_chunked_manifests<'a>(
+    entries: &'a [ChunkedEntry],
+    orphans: &'a ChunkedOrphans,
+    selected: &'a ChunkedSelection,
+) -> impl Iterator<Item = NarHash> + 'a {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected.entries.contains(index))
+        .map(|(_, entry)| entry.raw_hash)
+        .chain(
+            orphans
+                .manifests
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !selected.manifests.contains(index))
+                .map(|(_, manifest)| manifest.hash),
+        )
+}
+
+#[cfg(test)]
 fn apply_chunked(
     storage: &Storage,
     chunk_store: &ChunkStore,
     entries: &[ChunkedEntry],
     orphans: &ChunkedOrphans,
     selected: &ChunkedSelection,
+) -> Result<(usize, usize, usize), StorageError> {
+    let sweep = chunk_store
+        .mark_retained_manifests(retained_chunked_manifests(entries, orphans, selected))
+        .map_err(chunk_store_error)?;
+    apply_marked_chunked(storage, entries, orphans, selected, sweep)
+}
+
+fn apply_marked_chunked(
+    storage: &Storage,
+    entries: &[ChunkedEntry],
+    orphans: &ChunkedOrphans,
+    selected: &ChunkedSelection,
+    sweep: MarkedChunkSweep<'_>,
 ) -> Result<(usize, usize, usize), StorageError> {
     storage.recovery.require()?;
     let root = storage.root_directory()?;
@@ -1102,22 +1475,7 @@ fn apply_chunked(
     if deleted_outputs > 0 {
         nar_directory.sync_all()?;
     }
-    let live_manifests = entries
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !selected.entries.contains(index))
-        .map(|(_, entry)| entry.raw_hash)
-        .chain(
-            orphans
-                .manifests
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !selected.manifests.contains(index))
-                .map(|(_, manifest)| manifest.hash),
-        );
-    let sweep = chunk_store
-        .sweep_unreachable(live_manifests)
-        .map_err(chunk_store_error)?;
+    let sweep = sweep.sweep().map_err(chunk_store_error)?;
     Ok((
         selected.entries.len(),
         sweep.deleted_manifests,
@@ -1157,7 +1515,7 @@ fn chunked_report(input: ChunkedGcReportInput<'_>) -> GcReport {
     let deleted_nars = input.deleted.1;
     let deleted_orphans = input.deleted.2;
     GcReport {
-        accounting_basis: "logical",
+        accounting_basis: AccountingBasis::Logical,
         dry_run: input.dry_run,
         before_bytes: input.before_bytes,
         after_bytes: input.after_bytes,
@@ -1230,6 +1588,7 @@ fn eligible_count(
     orphans: &[Orphan],
     now: SystemTime,
     min_age: Duration,
+    access: &CollectionAccess<'_>,
 ) -> usize {
     entries
         .iter()
@@ -1239,7 +1598,10 @@ fn eligible_count(
         .count()
         + orphans
             .iter()
-            .filter(|orphan| now.duration_since(orphan.modified).unwrap_or_default() >= min_age)
+            .filter(|orphan| {
+                now.duration_since(orphan.modified).unwrap_or_default() >= min_age
+                    && !access.protects_nar_name(&orphan.name)
+            })
             .count()
 }
 
@@ -1303,12 +1665,16 @@ fn eligible_bytes(
     orphans: &[Orphan],
     now: SystemTime,
     min_age: Duration,
+    access: &CollectionAccess<'_>,
 ) -> u64 {
     category_bytes(entries, |entry| {
         !entry.protected && now.duration_since(entry.modified).unwrap_or_default() >= min_age
     }) + orphans
         .iter()
-        .filter(|orphan| now.duration_since(orphan.modified).unwrap_or_default() >= min_age)
+        .filter(|orphan| {
+            now.duration_since(orphan.modified).unwrap_or_default() >= min_age
+                && !access.protects_nar_name(&orphan.name)
+        })
         .map(|orphan| orphan.bytes)
         .sum::<u64>()
 }
@@ -1325,14 +1691,10 @@ fn protect<E>(
     path: Option<&Path>,
     project: impl for<'a> Fn(&'a mut E) -> ProtectionNode<'a>,
 ) -> Result<ProtectionReport, StorageError> {
-    let Some(path) = path else {
-        return Ok(ProtectionReport {
-            protected: 0,
-            missing_roots: 0,
-            missing_references: 0,
-        });
-    };
-    let contents = fs::read_to_string(path)?;
+    let contents = path
+        .map(fs::read_to_string)
+        .transpose()?
+        .unwrap_or_default();
     let roots = contents
         .lines()
         .map(str::trim)
@@ -1347,11 +1709,15 @@ fn protect<E>(
     let mut missing_roots = BTreeSet::new();
     let mut missing_references = BTreeSet::new();
     let mut index = BTreeMap::new();
+    let mut visited = BTreeSet::new();
     entries
         .iter_mut()
         .enumerate()
         .for_each(|(position, entry)| {
             let node = project(entry);
+            if *node.protected {
+                pending.push(node.store_path.to_owned());
+            }
             // Preserve the first-match policy if multiple publications share a key.
             index.entry(node.store_path.to_owned()).or_insert(position);
             index
@@ -1360,17 +1726,14 @@ fn protect<E>(
         });
     std::iter::from_fn(|| {
         let root = pending.pop()?;
-        match index
-            .get(&root)
-            .map(|&position| project(&mut entries[position]))
-        {
-            Some(entry) => match *entry.protected {
-                true => {}
-                false => {
+        match index.get(&root) {
+            Some(&position) => {
+                if visited.insert(position) {
+                    let entry = project(&mut entries[position]);
                     *entry.protected = true;
                     pending.extend(entry.references.iter().cloned());
                 }
-            },
+            }
             None => {
                 let missing = if roots.contains(&root) {
                     &mut missing_roots
@@ -1494,13 +1857,22 @@ fn select(entries: &[Entry], current_bytes: u64, policy: RetentionPolicy) -> Vec
     selected
 }
 
-fn select_orphans(orphans: &[Orphan], current_bytes: u64, policy: RetentionPolicy) -> Vec<usize> {
+fn select_orphans(
+    orphans: &[Orphan],
+    current_bytes: u64,
+    policy: RetentionPolicy,
+    access: &CollectionAccess<'_>,
+) -> Vec<usize> {
     let mut order = orphans
         .iter()
         .enumerate()
         .filter(|(_, orphan)| {
             policy
-                .reason(orphan.modified, false, current_bytes)
+                .reason(
+                    orphan.modified,
+                    access.protects_nar_name(&orphan.name),
+                    current_bytes,
+                )
                 .is_some()
         })
         .map(|(index, _)| index)
@@ -1516,7 +1888,14 @@ fn select_orphans(orphans: &[Orphan], current_bytes: u64, policy: RetentionPolic
     let mut selected = Vec::new();
     for index in order {
         let orphan = &orphans[index];
-        if policy.reason(orphan.modified, false, remaining).is_none() {
+        if policy
+            .reason(
+                orphan.modified,
+                access.protects_nar_name(&orphan.name),
+                remaining,
+            )
+            .is_none()
+        {
             continue;
         }
         selected.push(index);
@@ -1591,6 +1970,17 @@ fn apply_with_failure(
     selected: &[usize],
     failure: Option<FailurePoint>,
 ) -> Result<(usize, usize), StorageError> {
+    apply_with_checkpoint(storage, entries, selected, |boundary| {
+        fail_if(failure, boundary)
+    })
+}
+
+fn apply_with_checkpoint(
+    storage: &Storage,
+    entries: &[Entry],
+    selected: &[usize],
+    mut checkpoint: impl FnMut(FailurePoint) -> Result<(), StorageError>,
+) -> Result<(usize, usize), StorageError> {
     storage.recovery.require()?;
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
@@ -1598,11 +1988,11 @@ fn apply_with_failure(
     let mut deleted_nars = 0;
     for &index in selected {
         let entry = &entries[index];
-        fail_if(failure, FailurePoint::BeforeNarinfoDelete)?;
+        checkpoint(FailurePoint::BeforeNarinfoDelete)?;
         unlink_at(&root, &entry.narinfo_name)?;
-        fail_if(failure, FailurePoint::AfterNarinfoDeleteBeforeSync)?;
+        checkpoint(FailurePoint::AfterNarinfoDeleteBeforeSync)?;
         root.sync_all()?;
-        fail_if(failure, FailurePoint::AfterNarinfoSyncBeforeNarDelete)?;
+        checkpoint(FailurePoint::AfterNarinfoSyncBeforeNarDelete)?;
         let mut deleted_payload = false;
         let mut deleted_raw_nar = false;
         for name in entry_payload_names(entry) {
@@ -1616,7 +2006,7 @@ fn apply_with_failure(
             unlink_at(&nar_directory, name)?;
             deleted_payload = true;
             deleted_raw_nar |= *name == entry.raw_nar_name;
-            fail_if(failure, FailurePoint::AfterNarDeleteBeforeSync)?;
+            checkpoint(FailurePoint::AfterNarDeleteBeforeSync)?;
         }
         if deleted_payload {
             nar_directory.sync_all()?;
@@ -1688,6 +2078,38 @@ mod tests {
     }
 
     #[test]
+    fn an_online_dry_run_does_not_hide_the_publications_it_would_evict() {
+        let (directory, mut storage, entry) = pair_fixture();
+        storage.collection = super::super::collection::CollectionCoordinator::new(
+            std::time::Instant::now() - ONLINE_GC_GRACE - Duration::from_secs(1),
+        );
+        let store = entry.store;
+        let mut options = online_options(directory.path());
+        options.mode = GcMode::DryRun;
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let mut entries = Some(vec![entry]);
+        let pass = run_flat_gc(
+            options,
+            &storage,
+            &trusted,
+            Some(0),
+            CollectionAccess::Online(storage.collection.snapshot().unwrap()),
+            move |_, _| Ok(entries.take().expect("dry run scans once")),
+        )
+        .unwrap();
+        assert_eq!(pass.report.evicted, 1);
+        assert!(
+            storage
+                .collection
+                .reader(ProtectedObject::Publication(store))
+                .unwrap()
+                .is_some(),
+            "dry-run authorization must not temporarily withdraw selected metadata"
+        );
+        drop(pass);
+    }
+
+    #[test]
     fn shared_protection_traversal_handles_cycles_aliases_and_missing_paths_once() {
         struct Node {
             store: StoreHash,
@@ -1742,8 +2164,8 @@ mod tests {
         assert!(entries.iter().all(|entry| entry.protected));
         assert_eq!(
             projections.get(),
-            9,
-            "indexing and counting project each entry once; each known root projects only its match"
+            6,
+            "indexing, traversal, and counting each project a known node once, including aliases and cycles"
         );
     }
 
@@ -1943,6 +2365,7 @@ mod tests {
                 Duration::ZERO,
                 now,
             ),
+            &CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
         )
         .unwrap();
         assert!(selected.entries.is_empty());
@@ -1962,6 +2385,7 @@ mod tests {
                 Duration::ZERO,
                 now,
             ),
+            &CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
         )
         .unwrap();
         assert_eq!(
@@ -1983,6 +2407,7 @@ mod tests {
                 Duration::ZERO,
                 now,
             ),
+            &CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
         )
         .unwrap();
         assert!(
@@ -2063,6 +2488,7 @@ mod tests {
             &storage,
             &trusted,
             Some(0),
+            CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
             |storage, trusted| {
                 scan_with_directory_names(storage, trusted, |_| {
                     Err(io::Error::from_raw_os_error(
@@ -2256,6 +2682,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(before.len(), 1, "a staged publication owns a live journal");
 
+        // Exercise the collector core independently of admission; public entry points
+        // refuse this live publication rather than granting a collection snapshot.
+        let coordinator = super::super::collection::CollectionCoordinator::default();
+
         let report = run_flat_gc(
             GcOptions {
                 data_dir: directory.path().to_owned(),
@@ -2270,11 +2700,12 @@ mod tests {
             &storage,
             &trusted,
             Some(0),
+            CollectionAccess::Offline(coordinator.snapshot().unwrap()),
             |_, _| Ok(Vec::new()),
         )
         .unwrap();
 
-        assert_eq!(report.deleted_narinfos, 0);
+        assert_eq!(report.report.deleted_narinfos, 0);
         assert!(
             journals.join(&before[0]).exists(),
             "collection must not clear another operation's recovery evidence"
@@ -2288,6 +2719,598 @@ mod tests {
             !journals.join(&before[0]).exists(),
             "the publication still owns cancellation of its journal"
         );
+    }
+
+    fn age_publication(directory: &Path, entry: &Entry) {
+        let old = SystemTime::now() - ONLINE_GC_GRACE - Duration::from_secs(1);
+        File::open(directory.join(&entry.narinfo_name))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        File::open(directory.join("nar").join(&entry.nar_name))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    fn scannable_pair_fixture() -> (tempfile::TempDir, Storage, Entry) {
+        use data_encoding::BASE64;
+        use ed25519_dalek::{Signer, SigningKey};
+        let (directory, storage, mut entry) = pair_fixture();
+        let hash = NarHash::from_digest(sha2::Sha256::digest(b"nar").into());
+        let name = OsString::from(NarFileName::raw(hash).to_string());
+        fs::rename(
+            directory.path().join("nar").join(&entry.nar_name),
+            directory.path().join("nar").join(&name),
+        )
+        .unwrap();
+        entry.nar_name = name.clone();
+        entry.raw_nar_name = name;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let fingerprint = format!("1;{};sha256:{hash};3;", entry.store_path);
+        let signature = BASE64.encode(&key.sign(fingerprint.as_bytes()).to_bytes());
+        let bytes = format!(
+            "StorePath: {}\nURL: nar/{}\nCompression: none\nFileHash: sha256:{hash}\nFileSize: 3\nNarHash: sha256:{hash}\nNarSize: 3\nReferences: \nSig: online-gc:{signature}\n",
+            entry.store_path,
+            entry.nar_name.to_str().unwrap()
+        );
+        fs::write(directory.path().join(&entry.narinfo_name), &bytes).unwrap();
+        fs::write(
+            directory.path().join("trusted-public-keys"),
+            format!(
+                "online-gc:{}\n",
+                BASE64.encode(key.verifying_key().as_bytes())
+            ),
+        )
+        .unwrap();
+        entry.narinfo_bytes = bytes.len() as u64;
+        (directory, storage, entry)
+    }
+
+    fn online_options(directory: &Path) -> GcOptions {
+        GcOptions {
+            data_dir: directory.to_owned(),
+            max_bytes: None,
+            target_bytes: Some(0),
+            max_age: None,
+            min_age: Duration::ZERO,
+            protected_roots: None,
+            mode: GcMode::Apply,
+            backend: StorageBackend::Flat,
+        }
+    }
+
+    fn write_signed_raw_metadata(root: &Path, store: &str, identity: crate::object::NarIdentity) {
+        use data_encoding::BASE64;
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut metadata = crate::narinfo::NarInfoMetadata::from_store_metadata(
+            format!("/nix/store/{store}-narjar"),
+            None,
+            None,
+            identity,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        metadata.add_signature(format!(
+            "online-gc:{}",
+            BASE64.encode(
+                &key.sign(metadata.claims().fingerprint().as_bytes())
+                    .to_bytes()
+            )
+        ));
+        fs::write(
+            root.join(format!("{store}.narinfo")),
+            metadata
+                .serialize(NarRepresentation::Raw(identity))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cache_http_requests_complete_while_gc_is_paused_after_a_real_metadata_unlink() {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            sync::mpsc,
+        };
+        let (directory, storage, original) = scannable_pair_fixture();
+        let hash = NarHash::from_digest(sha2::Sha256::digest(b"nar").into());
+        write_signed_raw_metadata(
+            directory.path(),
+            TEST_SECOND_STORE_HASH,
+            crate::object::NarIdentity::new(hash, crate::object::NarSize::new(3)),
+        );
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let entries = scan(&storage, &trusted).unwrap();
+        let selected = [entries
+            .iter()
+            .position(|entry| entry.store == original.store)
+            .unwrap()];
+        let retiring = retiring_flat_objects(&entries, &selected, &[], &[]);
+        let permit = storage
+            .collection
+            .snapshot()
+            .unwrap()
+            .authorize_retirement(ObjectSelection::Objects(retiring))
+            .unwrap();
+        fs::create_dir_all(directory.path().join("auth")).unwrap();
+        let authorizer =
+            crate::auth::Authorizer::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let metrics = crate::metrics::Metrics::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let nar = format!("/nar/{}", original.nar_name.to_str().unwrap());
+        let requests = [
+            ("GET", format!("/{TEST_STORE_HASH}.narinfo"), "", 404),
+            ("GET", format!("/{TEST_SECOND_STORE_HASH}.narinfo"), "", 200),
+            ("GET", nar.clone(), "", 200),
+            ("HEAD", nar.clone(), "", 200),
+            ("GET", nar, "Range: bytes=1-2\r\n", 206),
+            ("GET", "/healthz".into(), "", 200),
+            ("GET", "/metrics".into(), "", 200),
+        ];
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let storage = &storage;
+        let entries = &entries;
+        let selected = &selected;
+        std::thread::scope(|scope| {
+            let collection = scope.spawn(move || {
+                let _permit = permit;
+                apply_with_checkpoint(storage, entries, selected, |boundary| {
+                    if boundary == FailurePoint::AfterNarinfoSyncBeforeNarDelete {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap()
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                !directory.path().join(&original.narinfo_name).exists(),
+                "the pass must have really deleted metadata"
+            );
+            let http = scope.spawn(|| {
+                for _ in &requests {
+                    let (stream, _) = listener.accept().unwrap();
+                    let request = crate::http_server::Request::read(stream).unwrap();
+                    drop(crate::__private::http::respond(
+                        request,
+                        storage,
+                        &authorizer,
+                        &metrics,
+                        0,
+                    ));
+                }
+            });
+            for (method, path, headers, status) in &requests {
+                let mut client = TcpStream::connect(address).unwrap();
+                client
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                write!(client, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\r\n").unwrap();
+                let mut response = String::new();
+                client.read_to_string(&mut response).unwrap();
+                assert!(
+                    response.starts_with(&format!("HTTP/1.1 {status}")),
+                    "{method} {path}: {response}"
+                );
+                if *status == 206 {
+                    assert!(response.ends_with("ar"));
+                }
+                assert!(
+                    !collection.is_finished(),
+                    "every HTTP response must complete before deletion resumes"
+                );
+            }
+            http.join().unwrap();
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                collection.join().unwrap(),
+                (1, 0),
+                "the retained entry shares the raw payload"
+            );
+        });
+    }
+
+    #[test]
+    fn online_collection_preserves_pre_restart_advertisements_during_startup_grace() {
+        let (directory, storage, entry) = scannable_pair_fixture();
+        age_publication(directory.path(), &entry);
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let report = run_online(online_options(directory.path()), &storage, &trusted).unwrap();
+        assert_eq!(report.deleted_narinfos, 0);
+        assert_eq!(report.protected, 1);
+        assert!(directory.path().join(&entry.narinfo_name).exists());
+        assert!(directory.path().join("nar").join(&entry.nar_name).exists());
+    }
+
+    #[test]
+    fn a_completed_advertisement_protects_aged_metadata_and_its_payload() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        age_publication(directory.path(), &entry);
+        storage.collection = super::super::collection::CollectionCoordinator::new(
+            std::time::Instant::now() - ONLINE_GC_GRACE,
+        );
+        let advertisement = storage
+            .read_advertised_narinfo(&entry.store)
+            .unwrap()
+            .unwrap();
+        assert!(!advertisement.bytes.is_empty());
+        assert!(matches!(
+            storage.collection.snapshot(),
+            Err(StorageError::CollectionBusy)
+        ));
+        drop(advertisement);
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let report = run_online(online_options(directory.path()), &storage, &trusted).unwrap();
+        assert_eq!(report.protected, 1);
+        assert_eq!(report.deleted_narinfos, 0);
+        assert!(directory.path().join("nar").join(&entry.nar_name).exists());
+    }
+
+    #[test]
+    fn initial_advertisement_protection_traverses_every_dependency_without_an_explicit_root_file() {
+        struct Node {
+            store: StoreHash,
+            path: String,
+            references: Vec<String>,
+            protected: bool,
+        }
+        let hashes = [
+            "00000000000000000000000000000000",
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222",
+        ];
+        let mut nodes = hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| Node {
+                store: StoreHash::parse(hash).unwrap(),
+                path: format!("/nix/store/{hash}-node"),
+                references: hashes
+                    .get(index + 1)
+                    .into_iter()
+                    .map(|hash| (*hash).to_owned())
+                    .collect(),
+                protected: index == 0,
+            })
+            .collect::<Vec<_>>();
+        let report = protect(&mut nodes, None, |node| ProtectionNode {
+            store: &node.store,
+            store_path: &node.path,
+            references: &node.references,
+            protected: &mut node.protected,
+        })
+        .unwrap();
+        assert_eq!(
+            report.protected, 3,
+            "advertising A must retain A -> B -> C for substitution"
+        );
+        assert!(nodes.iter().all(|node| node.protected));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn advertising_a_signed_root_retains_its_whole_closure_for_both_storage_backends() {
+        use crate::{
+            narinfo::NarInfoMetadata,
+            object::{NarIdentity, NarSize},
+        };
+        use data_encoding::BASE64;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        for backend in [
+            SupportedStorageBackend::FLAT,
+            SupportedStorageBackend::try_from(StorageBackend::Chunked).unwrap(),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut storage =
+                CacheCreation::prepare(&Directory::open(directory.path()).unwrap(), backend)
+                    .unwrap()
+                    .create_or_complete()
+                    .unwrap();
+            let key = SigningKey::from_bytes(&[7; 32]);
+            fs::write(
+                directory.path().join("trusted-public-keys"),
+                format!(
+                    "online-gc:{}\n",
+                    BASE64.encode(key.verifying_key().as_bytes())
+                ),
+            )
+            .unwrap();
+            let paths = [
+                "00000000000000000000000000000000",
+                "11111111111111111111111111111111",
+                "22222222222222222222222222222222",
+            ]
+            .map(|hash| format!("/nix/store/{hash}-node"));
+            let payloads: [&[u8]; 3] = [b"first", b"second", b"third"];
+            let old = SystemTime::now() - ONLINE_GC_GRACE - Duration::from_secs(1);
+            for (index, raw) in payloads.into_iter().enumerate() {
+                let identity = NarIdentity::new(
+                    NarHash::from_digest(sha2::Sha256::digest(raw).into()),
+                    NarSize::new(raw.len() as u64),
+                );
+                storage
+                    .publish_nar(
+                        NarFileName::raw(identity.hash()),
+                        io::Cursor::new(raw),
+                        raw.len() as u64,
+                        NarUploadPolicy::new(1024, 0),
+                    )
+                    .unwrap();
+                let references = paths.get(index + 1).into_iter().cloned().collect();
+                let mut metadata = NarInfoMetadata::from_store_metadata(
+                    paths[index].clone(),
+                    None,
+                    None,
+                    identity,
+                    references,
+                    Vec::new(),
+                )
+                .unwrap();
+                metadata.add_signature(format!(
+                    "online-gc:{}",
+                    BASE64.encode(
+                        &key.sign(metadata.claims().fingerprint().as_bytes())
+                            .to_bytes()
+                    )
+                ));
+                storage
+                    .publish_narinfo_with_claims(
+                        metadata.claims(),
+                        metadata
+                            .serialize(NarRepresentation::Raw(identity))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let metadata_path = directory
+                    .path()
+                    .join(format!("{}.narinfo", metadata.claims().store().as_str()));
+                File::open(metadata_path)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+            // Model an aged daemon: reset only the test coordinator, not content or signatures.
+            storage.collection = super::super::collection::CollectionCoordinator::new(
+                std::time::Instant::now() - ONLINE_GC_GRACE,
+            );
+            let root = StoreHash::parse(TEST_STORE_HASH).unwrap();
+            drop(storage.read_advertised_narinfo(&root).unwrap().unwrap());
+            let trusted =
+                TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+            let mut options = online_options(directory.path());
+            options.backend = backend.backend();
+            let report = run_online(options, &storage, &trusted).unwrap();
+            assert_eq!(report.protected, 3, "{:?}: A -> B -> C", backend.backend());
+            assert_eq!(report.deleted_narinfos, 0);
+            assert!(!report.target_met);
+            for raw in payloads {
+                let hash = NarHash::from_digest(sha2::Sha256::digest(raw).into());
+                let mut reader = storage
+                    .open_nar_range(NarFileName::raw(hash), 0..raw.len() as u64)
+                    .unwrap()
+                    .unwrap();
+                let mut received = Vec::new();
+                std::io::Read::read_to_end(&mut reader.body, &mut received).unwrap();
+                assert_eq!(received, raw);
+            }
+        }
+    }
+
+    #[test]
+    fn retirement_withdraws_transitive_dependents_but_not_unrelated_metadata() {
+        let stores = [
+            "00000000000000000000000000000000",
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222",
+            "33333333333333333333333333333333",
+        ]
+        .map(|hash| StoreHash::parse(hash).unwrap());
+        let paths = stores.map(|store| format!("/nix/store/{}-node", store.as_str()));
+        let refs = [
+            vec![stores[1].as_str().to_owned()],
+            vec![paths[2].clone()],
+            vec![paths[0].clone()],
+            Vec::new(),
+        ];
+        let nodes = (0..stores.len()).map(|index| {
+            (
+                &stores[index],
+                paths[index].as_str(),
+                refs[index].as_slice(),
+            )
+        });
+        let retiring = retiring_publications(nodes, std::iter::once(stores[2]));
+        assert_eq!(
+            retiring,
+            stores[..3]
+                .iter()
+                .copied()
+                .map(ProtectedObject::Publication)
+                .collect(),
+            "mixed full paths/hash aliases and cycles must withdraw A and B while C retires; unrelated D stays available"
+        );
+    }
+
+    #[test]
+    fn online_collection_aborts_before_unlink_when_publication_changes_the_scan() {
+        let (directory, storage, entry) = scannable_pair_fixture();
+        age_publication(directory.path(), &entry);
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let access = CollectionAccess::Online(storage.collection.snapshot().unwrap());
+        let result = run_flat_gc(
+            online_options(directory.path()),
+            &storage,
+            &trusted,
+            Some(0),
+            access,
+            |storage, trusted| {
+                let entries = scan(storage, trusted)?;
+                storage.publish_cache_info(io::Cursor::new(
+                    b"StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n",
+                ))?;
+                Ok(entries)
+            },
+        );
+        assert!(matches!(result, Err(StorageError::CollectionChanged)));
+        assert!(directory.path().join(&entry.narinfo_name).exists());
+        assert!(directory.path().join("nar").join(&entry.nar_name).exists());
+        assert!(
+            storage.collection.snapshot().is_ok(),
+            "an invalidated pass releases its capability"
+        );
+    }
+
+    #[test]
+    fn online_collection_never_cleans_an_active_publication_journal() {
+        let (directory, storage, _entry) = scannable_pair_fixture();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let publication = storage
+            .begin_publication(super::super::publication::PublishTarget::CacheInfo, |_| {
+                Ok(())
+            })
+            .unwrap();
+        let journals = directory.path().join(".narjar-transactions");
+        assert_eq!(fs::read_dir(&journals).unwrap().count(), 1);
+        assert!(matches!(
+            run_online(online_options(directory.path()), &storage, &trusted),
+            Err(StorageError::CollectionBusy)
+        ));
+        assert_eq!(fs::read_dir(&journals).unwrap().count(), 1);
+        drop(publication);
+        assert_eq!(fs::read_dir(&journals).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn offline_collection_cannot_bypass_daemon_owned_publication_or_another_scan() {
+        let (directory, storage, _) = scannable_pair_fixture();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let recovered = storage.recover_for_mutation(&trusted).unwrap();
+        let publication = storage
+            .begin_publication(super::super::publication::PublishTarget::CacheInfo, |_| {
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            run_dry_run(online_options(directory.path()), &storage, &trusted),
+            Err(StorageError::CollectionBusy)
+        ));
+        assert!(matches!(
+            run_apply(online_options(directory.path()), &recovered, &trusted),
+            Err(StorageError::CollectionBusy)
+        ));
+        drop(publication);
+        let scanning = storage.collection.snapshot().unwrap();
+        assert!(matches!(
+            run_dry_run(online_options(directory.path()), &storage, &trusted),
+            Err(StorageError::CollectionBusy)
+        ));
+        assert!(matches!(
+            run_online(online_options(directory.path()), &storage, &trusted),
+            Err(StorageError::CollectionBusy)
+        ));
+        drop(scanning);
+        assert!(run_dry_run(online_options(directory.path()), &storage, &trusted).is_ok());
+    }
+
+    #[test]
+    fn online_collection_projection_matches_deletion_without_certifying_offline_recovery() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        age_publication(directory.path(), &entry);
+        storage.collection = super::super::collection::CollectionCoordinator::new(
+            std::time::Instant::now() - ONLINE_GC_GRACE,
+        );
+        let journals = directory.path().join(".narjar-transactions");
+        let before_journals = fs::read_dir(&journals).unwrap().count();
+        assert_eq!(before_journals, 0);
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let report = run_online(online_options(directory.path()), &storage, &trusted).unwrap();
+        assert_eq!(report.deleted_narinfos, 1);
+        assert_eq!(report.deleted_nars, 1);
+        let remaining = scan(&storage, &trusted).unwrap();
+        let orphans = scan_orphans(&storage, &remaining).unwrap();
+        assert_eq!(
+            report.after_bytes,
+            total_bytes(&remaining) + orphan_bytes(&orphans)
+        );
+        assert_eq!(report.after_bytes, 0);
+        assert!(report.target_met);
+        assert_eq!(fs::read_dir(&journals).unwrap().count(), before_journals);
+        assert!(storage.recovery_required().unwrap());
+    }
+
+    #[test]
+    fn online_collection_preserves_the_destination_needed_by_an_unresolved_published_journal() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        age_publication(directory.path(), &entry);
+        storage.collection = super::super::collection::CollectionCoordinator::new(
+            std::time::Instant::now() - ONLINE_GC_GRACE,
+        );
+        let mut transaction = storage
+            .recovery
+            .begin(Path::new("nar/.tmp/nar-123-0000000000000001.part"))
+            .unwrap();
+        transaction
+            .transition(super::super::recovery::PublicationState::Streaming)
+            .unwrap();
+        transaction
+            .transition(super::super::recovery::PublicationState::Validated)
+            .unwrap();
+        transaction
+            .transition(super::super::recovery::PublicationState::Published(
+                super::super::location::StorePath::parse(&Path::new("nar").join(&entry.nar_name))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        assert!(matches!(
+            run_online(online_options(directory.path()), &storage, &trusted),
+            Err(StorageError::CollectionBusy)
+        ));
+        assert!(directory.path().join("nar").join(&entry.nar_name).exists());
+        drop(transaction);
+        assert!(
+            storage.recover_for_mutation(&trusted).is_ok(),
+            "deferring collection preserves the recorded destination for restart recovery"
+        );
+    }
+
+    #[test]
+    fn an_accepted_raw_upload_survives_orphan_collection_until_metadata_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = initialize_storage(directory.path()).unwrap();
+        storage.collection = super::super::collection::CollectionCoordinator::new(
+            std::time::Instant::now() - ONLINE_GC_GRACE,
+        );
+        let raw = b"upload awaiting a separate narinfo PUT";
+        let hash = NarHash::from_digest(sha2::Sha256::digest(raw).into());
+        let name = NarFileName::raw(hash);
+        storage
+            .publish_nar(
+                name,
+                io::Cursor::new(raw),
+                raw.len() as u64,
+                NarUploadPolicy::new(1024, 0),
+            )
+            .unwrap();
+        let path = directory.path().join("nar").join(name.to_string());
+        File::open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - ONLINE_GC_GRACE - Duration::from_secs(1))
+            .unwrap();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let report = run_online(online_options(directory.path()), &storage, &trusted).unwrap();
+        assert_eq!(report.orphaned, 1);
+        assert_eq!(report.eligible, 0);
+        assert_eq!(report.deleted_orphans, 0);
+        assert_eq!(fs::read(path).unwrap(), raw);
     }
 
     #[test]
@@ -2316,6 +3339,48 @@ mod tests {
             remaining, b"ar",
             "unlink must not interrupt an opened reader"
         );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn online_chunked_gc_does_not_claim_preserved_unknown_files_as_reclaimed() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = initialize_chunked_storage(directory.path()).unwrap();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let shard = directory
+            .path()
+            .join(super::super::CHUNK_DIRECTORY)
+            .join("aa");
+        fs::create_dir(&shard).unwrap();
+        let files = [
+            directory.path().join("nar/unknown"),
+            directory
+                .path()
+                .join(super::super::MANIFEST_DIRECTORY)
+                .join("unknown"),
+            shard.join("unknown"),
+        ];
+        files
+            .iter()
+            .for_each(|path| fs::write(path, b"preserve me").unwrap());
+        for mode in [GcMode::DryRun, GcMode::Apply] {
+            let mut options = online_options(directory.path());
+            options.backend = StorageBackend::Chunked;
+            options.mode = mode;
+            let report = run_online(options, &storage, &trusted).unwrap();
+            assert_eq!(report.before_bytes, 33);
+            assert_eq!(
+                report.after_bytes, 33,
+                "the sweep leaves all three unknown files intact"
+            );
+            assert_eq!(report.evicted_bytes, 0);
+            assert_eq!(report.eligible_bytes, 0);
+            assert_eq!(report.orphaned_bytes, 0);
+            assert!(!report.target_met);
+            files
+                .iter()
+                .for_each(|path| assert_eq!(fs::read(path).unwrap(), b"preserve me"));
+        }
     }
 
     #[test]
@@ -2621,6 +3686,7 @@ mod tests {
                 Duration::from_secs(24 * 60 * 60),
                 now,
             ),
+            &CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
         )
         .expect("select aged orphan manifest");
         assert_eq!(selected.manifests, vec![0]);
@@ -2637,6 +3703,7 @@ mod tests {
                 &orphans,
                 now,
                 Duration::from_secs(24 * 60 * 60),
+                &CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
             )
             .expect("measure uniquely reclaimable eligible bytes"),
             before_bytes - projected_after,
@@ -2762,6 +3829,7 @@ mod tests {
             recovered.storage(),
             &trusted,
             Some(0),
+            CollectionAccess::Offline(recovered.storage().collection.snapshot().unwrap()),
             |storage, trusted| {
                 match scanned_before_deletion {
                     false => {

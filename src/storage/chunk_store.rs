@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     ops::Range,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -52,6 +52,54 @@ pub(crate) struct ChunkStore {
     manifests: File,
     activity: Arc<StorageActivity>,
     durability: ChunkDurability,
+    gc_marks: Mutex<()>,
+}
+
+struct GcMarks<'store> {
+    directory: Option<File>,
+    _exclusive: MutexGuard<'store, ()>,
+}
+
+impl GcMarks<'_> {
+    fn file(&self) -> &File {
+        self.directory.as_ref().expect("unfinished mark directory")
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        clear_gc_mark_files(&self.directory.take().expect("unfinished mark directory"))
+    }
+}
+
+impl Drop for GcMarks<'_> {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.directory {
+            let _ = clear_gc_mark_files(directory);
+        }
+    }
+}
+
+/// All retained manifests are marked before retirement starts.
+pub(super) struct MarkedChunkSweep<'store> {
+    store: &'store ChunkStore,
+    marks: GcMarks<'store>,
+}
+
+impl MarkedChunkSweep<'_> {
+    pub(super) fn sweep(self) -> Result<ChunkSweepReport, ChunkStoreError> {
+        let result = (|| {
+            let manifests = self.store.delete_unmarked_manifests(self.marks.file())?;
+            let chunks = self.store.delete_unmarked_chunks(self.marks.file())?;
+            Ok(ChunkSweepReport {
+                deleted_manifests: manifests.deleted_manifests,
+                deleted_chunks: chunks.deleted_chunks,
+            })
+        })();
+        match (result, self.marks.finish()) {
+            (Ok(report), Ok(())) => Ok(report),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -114,6 +162,7 @@ impl ChunkStore {
             manifests,
             activity,
             durability,
+            gc_marks: Mutex::new(()),
         })
     }
 
@@ -127,6 +176,7 @@ impl ChunkStore {
             manifests: require_directory_at(root, MANIFEST_DIRECTORY)?,
             activity,
             durability,
+            gc_marks: Mutex::new(()),
         })
     }
 
@@ -377,24 +427,18 @@ impl ChunkStore {
     where
         I: IntoIterator<Item = NarHash>,
     {
+        self.mark_retained_manifests(live_manifests)?.sweep()
+    }
+
+    pub(super) fn mark_retained_manifests(
+        &self,
+        live_manifests: impl IntoIterator<Item = NarHash>,
+    ) -> Result<MarkedChunkSweep<'_>, ChunkStoreError> {
         let marks = self.prepare_gc_marks()?;
-        let result = (|| {
-            live_manifests
-                .into_iter()
-                .try_for_each(|hash| self.mark_live_manifest(&marks, hash))?;
-            let manifests = self.delete_unmarked_manifests(&marks)?;
-            let chunks = self.delete_unmarked_chunks(&marks)?;
-            Ok(ChunkSweepReport {
-                deleted_manifests: manifests.deleted_manifests,
-                deleted_chunks: chunks.deleted_chunks,
-            })
-        })();
-        let cleanup = clear_gc_mark_files(&marks);
-        match (result, cleanup) {
-            (Ok(report), Ok(())) => Ok(report),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error.into()),
-        }
+        live_manifests
+            .into_iter()
+            .try_for_each(|hash| self.mark_live_manifest(marks.file(), hash))?;
+        Ok(MarkedChunkSweep { store: self, marks })
     }
 
     pub(crate) fn reachable_chunk_bytes<I>(&self, live_manifests: I) -> Result<u64, ChunkStoreError>
@@ -405,10 +449,10 @@ impl ChunkStore {
         let result = (|| {
             live_manifests
                 .into_iter()
-                .try_for_each(|hash| self.mark_live_manifest(&marks, hash))?;
-            self.marked_chunk_bytes(&marks)
+                .try_for_each(|hash| self.mark_live_manifest(marks.file(), hash))?;
+            self.marked_chunk_bytes(marks.file())
         })();
-        let cleanup = clear_gc_mark_files(&marks);
+        let cleanup = marks.finish();
         match (result, cleanup) {
             (Ok(bytes), Ok(())) => Ok(bytes),
             (Err(error), _) => Err(error),
@@ -417,7 +461,20 @@ impl ChunkStore {
     }
 
     pub(crate) fn physical_bytes(&self) -> Result<ChunkPhysicalBytes, ChunkStoreError> {
-        let manifests = sum_regular_file_bytes(&self.manifests)?;
+        self.physical_bytes_matching(|_| true, |_| true)
+    }
+
+    /// Bytes deliberately excluded from the collector's filename contract.
+    pub(crate) fn preserved_bytes(&self) -> Result<ChunkPhysicalBytes, ChunkStoreError> {
+        self.physical_bytes_matching(|name| !is_manifest_name(name), |name| !is_chunk_name(name))
+    }
+
+    fn physical_bytes_matching(
+        &self,
+        manifest_filter: impl Fn(&OsStr) -> bool,
+        chunk_filter: impl Fn(&OsStr) -> bool,
+    ) -> Result<ChunkPhysicalBytes, ChunkStoreError> {
+        let manifests = sum_regular_file_bytes_matching(&self.manifests, manifest_filter)?;
         let chunks =
             read_dir_names(&self.chunks)?
                 .into_iter()
@@ -427,7 +484,7 @@ impl ChunkStore {
                     }
                     let shard = open_directory_at(&self.chunks, &shard_name)?;
                     total
-                        .checked_add(sum_regular_file_bytes(&shard)?)
+                        .checked_add(sum_regular_file_bytes_matching(&shard, &chunk_filter)?)
                         .ok_or_else(|| {
                             io::Error::new(io::ErrorKind::InvalidData, "chunk byte count overflow")
                         })
@@ -461,7 +518,11 @@ impl ChunkStore {
             .collect()
     }
 
-    fn prepare_gc_marks(&self) -> Result<File, ChunkStoreError> {
+    fn prepare_gc_marks(&self) -> Result<GcMarks<'_>, ChunkStoreError> {
+        let exclusive = self
+            .gc_marks
+            .lock()
+            .map_err(|_| io::Error::other("chunk collection marks lock poisoned"))?;
         let marks = ensure_directory_at(
             &self.chunks,
             OsStr::new(GC_MARK_DIRECTORY),
@@ -473,7 +534,10 @@ impl ChunkStore {
             OsStr::new(GC_MANIFEST_MARK_DIRECTORY),
             "manifest GC mark directory",
         )?;
-        Ok(marks)
+        Ok(GcMarks {
+            directory: Some(marks),
+            _exclusive: exclusive,
+        })
     }
 
     fn mark_live_manifest(&self, marks: &File, hash: NarHash) -> Result<(), ChunkStoreError> {
@@ -1595,9 +1659,13 @@ fn gc_marker_exists(directory: &File, name: &OsStr) -> io::Result<bool> {
     }
 }
 
-fn sum_regular_file_bytes(directory: &File) -> io::Result<u64> {
+fn sum_regular_file_bytes_matching(
+    directory: &File,
+    include: impl Fn(&OsStr) -> bool,
+) -> io::Result<u64> {
     read_dir_names(directory)?
         .into_iter()
+        .filter(|name| include(name))
         .try_fold(0_u64, |total, name| {
             if !super::fs::entry_is_regular_at(directory, &name)? {
                 return Ok(total);
