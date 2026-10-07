@@ -136,7 +136,7 @@ jobs:
         if: steps.registry.outputs.published == 'false'
         run: |
           set -euo pipefail
-          devenv shell -- cargo publish --dry-run --locked --package narjar --registry crates-io
+          devenv shell -- cargo package --locked --package narjar
           cmp "target/package/narjar-$RELEASE_VERSION.crate" "target/release/narjar-$RELEASE_VERSION.crate"
       - name: Authenticate with Trusted Publishing
         if: steps.registry.outputs.published == 'false' && env.BOOTSTRAP_TOKEN == ''
