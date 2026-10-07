@@ -317,7 +317,10 @@ pub fn run_apply(
     recovered: &RecoveredStorage<'_>,
     trusted: &TrustedPublicKeys,
 ) -> Result<GcReport, StorageError> {
-    run_with_mode(options, recovered.storage(), trusted, GcMode::Apply)
+    let report = run_with_mode(options, recovered.storage(), trusted, GcMode::Apply)?;
+    // Journal cleanup requires the offline recovery capability, not merely a completed pass.
+    recovered.storage().finish_recovery()?;
+    Ok(report)
 }
 
 fn run_with_mode(
@@ -407,7 +410,6 @@ fn run_flat_gc(
         let remaining_entries = scan_entries(storage, trusted)?;
         let remaining_orphans = scan_orphans(storage, &remaining_entries)?;
         after_bytes = total_bytes(&remaining_entries) + orphan_bytes(&remaining_orphans);
-        storage.finish_recovery()?;
         deleted
     };
     let evicted_bytes = before_bytes.saturating_sub(after_bytes);
@@ -561,7 +563,6 @@ fn run_chunked(
             let deleted = apply_chunked(storage, chunk_store, &entries, &orphans, &selected)?;
             let remaining = scan_chunked(storage, chunk_store, trusted)?;
             let actual_after = chunked_before_bytes(storage, chunk_store, &remaining)?;
-            storage.finish_recovery()?;
             (actual_after, deleted)
         }
     };
@@ -2236,6 +2237,85 @@ mod tests {
         assert_eq!(projected_published_bytes(&entries, &[0]), 0);
         drop(storage);
         drop(directory);
+    }
+
+    #[test]
+    fn collection_preserves_an_unrelated_live_publication_journal() {
+        use crate::storage::publication::PublishTarget;
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = initialize_storage(directory.path()).unwrap();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let publication = storage
+            .begin_publication(PublishTarget::CacheInfo, |_| Ok(()))
+            .unwrap();
+        let journals = directory.path().join(".narjar-transactions");
+        let before = fs::read_dir(&journals)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(before.len(), 1, "a staged publication owns a live journal");
+
+        let report = run_flat_gc(
+            GcOptions {
+                data_dir: directory.path().to_owned(),
+                max_bytes: None,
+                target_bytes: Some(0),
+                max_age: None,
+                min_age: Duration::ZERO,
+                protected_roots: None,
+                mode: GcMode::Apply,
+                backend: StorageBackend::Flat,
+            },
+            &storage,
+            &trusted,
+            Some(0),
+            |_, _| Ok(Vec::new()),
+        )
+        .unwrap();
+
+        assert_eq!(report.deleted_narinfos, 0);
+        assert!(
+            journals.join(&before[0]).exists(),
+            "collection must not clear another operation's recovery evidence"
+        );
+        assert!(
+            storage.recovery_required().unwrap(),
+            "only exclusive recovery may certify the cache as clean"
+        );
+        drop(publication);
+        assert!(
+            !journals.join(&before[0]).exists(),
+            "the publication still owns cancellation of its journal"
+        );
+    }
+
+    #[test]
+    fn an_open_flat_reader_finishes_after_gc_unlinks_its_payload() {
+        use std::io::Read;
+
+        let (directory, storage, entry) = pair_fixture();
+        let name = NarFileName::raw(NarHash::parse(TEST_NAR_ID).unwrap());
+        let mut reader = storage.open_nar(name).unwrap().unwrap();
+        let mut prefix = [0; 1];
+        reader.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"n");
+
+        assert_eq!(apply(&storage, &[entry], &[0]).unwrap(), (1, 1));
+        assert!(storage.open_nar(name).unwrap().is_none());
+        assert!(
+            !directory
+                .path()
+                .join(format!("{TEST_STORE_HASH}.narinfo"))
+                .exists()
+        );
+
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).unwrap();
+        assert_eq!(
+            remaining, b"ar",
+            "unlink must not interrupt an opened reader"
+        );
     }
 
     #[test]
