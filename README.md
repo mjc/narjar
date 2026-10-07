@@ -208,8 +208,19 @@ for metric definitions, sample freshness, and accounting rules.
 
 ## Maintenance
 
-Stop the serving process before running commands that inspect or modify its
-data directory:
+GC can run through the serving process:
+
+```sh
+narjar gc --online --data-dir ./cache --target-bytes 100000000000 --dry-run --json
+narjar gc --online --data-dir ./cache --target-bytes 100000000000 --apply --json
+```
+
+Run it as the cache owner. `--online` requires a running daemon and does not
+fall back to offline GC. Recent uploads and advertised publications have a
+ten-minute grace period. Active publication or a changed inventory defers
+collection; serving remains available.
+
+Stop the serving process before running offline maintenance:
 
 ```sh
 narjar doctor --data-dir ./cache --json

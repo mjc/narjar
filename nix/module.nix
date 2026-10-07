@@ -427,6 +427,7 @@
   gcArgs = lib.escapeShellArgs (
     [
       "gc"
+      "--online"
       "--data-dir"
       runtimeDataDir
       "--apply"
@@ -609,7 +610,7 @@ in {
       schedule = lib.mkOption {
         type = lib.types.str;
         default = "weekly";
-        description = "systemd OnCalendar expression for offline garbage collection.";
+        description = "systemd OnCalendar expression for daemon-owned online garbage collection.";
       };
 
       maxBytes = lib.mkOption {
@@ -748,7 +749,10 @@ in {
           ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";
           LoadCredential = map (credential: "${credential.name}:${credential.source}") credentials;
           ExecStart = "${executable} ${serveArgs}";
+          Type = "notify";
+          NotifyAccess = "main";
           Restart = "on-failure";
+          TimeoutStartSec = "1h";
           TimeoutStopSec = lib.mkDefault (cfg.shutdownGraceSeconds + 10);
 
           AmbientCapabilities = "";
@@ -768,6 +772,7 @@ in {
           ProtectProc = "invisible";
           RemoveIPC = true;
           RestrictAddressFamilies = [
+            "AF_UNIX"
             "AF_INET"
             "AF_INET6"
           ];
@@ -814,8 +819,9 @@ in {
       };
     };
     systemd.services.narjar-gc = lib.mkIf cfg.gc.enable {
-      description = "Narjar offline garbage collection";
-      after = ["network.target"];
+      description = "Narjar online garbage collection";
+      requires = ["narjar.service"];
+      after = ["narjar.service"];
       unitConfig.RequiresMountsFor = [cfg.dataDir];
 
       serviceConfig =
@@ -823,10 +829,9 @@ in {
         // serviceIdentityConfig
         // {
           Type = "oneshot";
-          ExecStartPre = "+${pkgs.systemd}/bin/systemctl stop narjar.service";
           ExecStart = "${executable} ${gcArgs}";
-          ExecStopPost = "+${pkgs.systemd}/bin/systemctl start narjar.service";
-          TimeoutStartSec = "infinity";
+          RestrictAddressFamilies = ["AF_UNIX"];
+          TimeoutStartSec = "1h";
         };
     };
 
