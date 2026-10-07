@@ -276,7 +276,17 @@ in
   assert (customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.Group == "narjar");
   assert (customRuntimeConfig.systemd.services.narjar.serviceConfig.StateDirectory == "narjar");
   assert (customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.StateDirectory == "narjar");
-  assert (builtins.substring 0 1 customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.ExecStartPre == "+");
+  assert (lib.hasInfix "--online" customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.ExecStart);
+  assert !(customRuntimeConfig.systemd.services.narjar-gc.serviceConfig ? ExecStartPre);
+  assert !(customRuntimeConfig.systemd.services.narjar-gc.serviceConfig ? ExecStopPost);
+  assert !(fixedUserConfig.systemd.services.narjar-gc.serviceConfig ? ExecStartPre);
+  assert !(fixedUserConfig.systemd.services.narjar-gc.serviceConfig ? ExecStopPost);
+  assert (builtins.elem "narjar.service" customRuntimeConfig.systemd.services.narjar-gc.requires);
+  assert (builtins.elem "narjar.service" customRuntimeConfig.systemd.services.narjar-gc.after);
+  assert (defaultConfig.systemd.services.narjar.serviceConfig.Type == "notify");
+  assert (defaultConfig.systemd.services.narjar.serviceConfig.NotifyAccess == "main");
+  assert (builtins.elem "AF_UNIX" defaultConfig.systemd.services.narjar.serviceConfig.RestrictAddressFamilies);
+  assert !(defaultConfig.services.narjar.gc.enable);
   assert (fixedUserConfig.systemd.services.narjar.serviceConfig.User == "narjar");
   assert (fixedUserConfig.systemd.services.narjar-gc.serviceConfig.User == "narjar");
   assert (fixedUserConfig.systemd.services.narjar.serviceConfig.Group == "narjar");

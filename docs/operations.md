@@ -92,6 +92,9 @@ bind upload identities to canonical raw identities; egress receipts in
 `.narjar-egress/` bind raw identities to generated compressed downloads.
 Preserve these along with `.narjar-layout` and the recovery records.
 
+The daemon creates a private `.narjar-control/gc.sock` for local online GC.
+It is not an HTTP endpoint and does not need proxy configuration.
+
 See the [filesystem requirements](https://github.com/mjc/narjar/blob/main/docs/filesystem-capability-adr.md) for
 publication and synchronization requirements. Narjar does not manage
 filesystems or ZFS properties. Logical byte totals do not measure physical
@@ -122,13 +125,15 @@ for read-only storage. Unexpected I/O and synchronization failures return 500.
 A failure after response headers are sent closes the connection instead of
 changing its status.
 
-SIGINT and SIGTERM stop admission and drain request/publication workers up to
+SIGINT and SIGTERM stop admission and drain active collection and request/publication workers up to
 `--shutdown-grace-seconds` (default 30). A second signal exits immediately.
 The NixOS module's default stop timeout is the grace period plus 10 seconds.
+Systemd waits for the daemon's readiness notification before starting dependent
+units, including online GC. Startup recovery has a one-hour service timeout.
 
 ## Recovery and maintenance
 
-Serving and maintenance take the same exclusive DATA lock. Stop the server
+Serving and offline maintenance take the same exclusive DATA lock. Stop the server
 before running offline commands:
 
 ~~~sh
@@ -178,6 +183,37 @@ narjar gc --data-dir /var/lib/narjar --target-bytes 6442450944 --dry-run --json
 narjar gc --data-dir /var/lib/narjar --target-bytes 6442450944 --apply --json
 ~~~
 
+Add `--online` to either command to ask the running daemon to collect. Run it
+as the cache owner and pass the configured storage backend. The command fails
+if no daemon is running, the collector is busy, or the backend differs. Online
+mode never stops the server or falls back to offline collection.
+
+Linux uses a descriptor-relative socket address, so long data-directory paths
+work. On macOS, the control socket pathname must fit the platform's Unix socket
+limit. If it does not, the daemon reports that online GC is unavailable and
+continues serving; offline maintenance still works with the server stopped.
+
+Online GC supports flat and chunked storage. Inventory and chunk marking run
+without excluding publication. A publication or metadata advertisement that
+changes the scan invalidates it before deletion; active uploads, binding, and
+chunked reads can return busy instead. Retry the explicit command later.
+During deletion, reads of retained objects continue. Retiring metadata returns
+a miss; already-open flat transfers finish through their descriptors.
+
+Online collection enforces at least ten minutes of age protection. Accepted
+canonical uploads and successfully advertised narinfos get a ten-minute grace,
+including the advertised publication's transitive dependencies. Protection is
+renewed after metadata delivery. The daemon retains at most 4096 recent object
+keys; overflow protects all objects for the grace instead of dropping live
+protection. Startup also protects all objects for ten minutes because previous
+advertisements are not retained in memory. A size target does not override
+these protections. Cached metadata does not guarantee payload availability
+after the grace expires.
+
+Online GC does not perform offline recovery or clear publication journals.
+Unresolved publication records defer collection. Failed or interrupted deletion
+leaves recovery evidence for restart or offline maintenance.
+
 GC validates published inventory before deleting anything and selects
 publications by narinfo modification time. `--min-age-seconds` protects recent
 publications and orphans. `--protected-roots` takes store paths or hashes,
@@ -213,6 +249,9 @@ mode. There is no separate JSON statistics route.
 Metrics include cache hits/misses/failures by object type and method; request
 and connection outcomes; transferred bytes; request/publication durations;
 process memory and CPU; storage capacity; queue depth; and maintenance results.
+`narjar_online_gc_requests_total` distinguishes successful passes, unmet targets,
+contention, invalidated inventory, and failures. Existing maintenance series
+report the last pass's duration and logically reclaimed objects and bytes.
 The exposition's HELP text describes each series. Labels do not contain
 paths, hashes, token names, or request IDs.
 
@@ -240,7 +279,7 @@ systemd credentials; do not put secret contents in Nix expressions.
 `auth.writeTokens` must contain Narjar's hashed token records, not a plaintext
 token. See the [README example](../README.md#nixos-service).
 
-Scheduled offline GC is disabled by default:
+Scheduled online GC is disabled by default:
 
 ~~~nix
 services.narjar.gc = {
@@ -253,8 +292,8 @@ services.narjar.gc = {
 };
 ~~~
 
-The GC unit stops the server, runs collection, and starts it again even after
-a failed pass. `maxBytes` starts collection above that limit and supplies the
+The GC unit requests collection through the running daemon; it does not stop
+or restart the service. `maxBytes` starts collection above that limit and supplies the
 target if `targetBytes` is unset. When both are set, the target must not exceed
 the maximum.
 
