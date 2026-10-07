@@ -124,13 +124,14 @@ fn attempt_socket_connection(
     deadline: Instant,
 ) -> io::Result<ConnectionAttempt> {
     let remaining = connection_time_remaining(deadline)?;
-    let socket = rustix::net::socket_with(
+    let socket = rustix::net::socket(
         rustix::net::AddressFamily::UNIX,
         rustix::net::SocketType::STREAM,
-        rustix::net::SocketFlags::NONBLOCK | rustix::net::SocketFlags::CLOEXEC,
         None,
     )?;
+    rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
     let stream = UnixStream::from(socket);
+    stream.set_nonblocking(true)?;
     match rustix::net::connect(&stream, address) {
         Ok(()) => {
             stream.set_nonblocking(false)?;
@@ -227,6 +228,26 @@ fn remove_stale_socket(path: &Path, endpoint: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_control_streams_close_on_exec_and_use_blocking_deadline_io() {
+        let root = tempfile::tempdir().unwrap();
+        let bound = BoundSocket::bind(root.path()).unwrap();
+        let stream = connect(root.path()).unwrap();
+        assert!(
+            rustix::io::fcntl_getfd(&stream)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC),
+            "a control descriptor must not leak into an executed child"
+        );
+        assert!(
+            !rustix::fs::fcntl_getfl(&stream)
+                .unwrap()
+                .contains(rustix::fs::OFlags::NONBLOCK),
+            "connected streams must honor the protocol's read/write deadlines"
+        );
+        assert!(bound.listener.accept().is_ok());
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
