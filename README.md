@@ -101,7 +101,8 @@ Valid publications for the same full store path are skipped, even when a local
 build has a different NAR hash, size, or references. The first valid publication
 wins. `--refresh` forces uploads but does not replace existing metadata; a
 concurrent publication of the same path is also treated as destination-present.
-Other immutable conflicts fail the push; `--ignore-conflicts` skips them.
+Other destination narinfo conflicts fail the push; `--ignore-conflicts` skips
+those conflicts. Payload upload failures still abort.
 
 ### Skip paths available from another cache
 
@@ -175,28 +176,8 @@ The server keeps compressed downloads for reuse. Narinfo describes the served
 bytes and retains the original NAR signatures. Payloads are committed before
 the metadata that references them.
 
-Server defaults:
-
-| Option | Default |
-| --- | --- |
-| `--listen` | `127.0.0.1:5000` |
-| `--workers` | `8` |
-| `--max-in-flight` | `64` |
-| `--max-nar-bytes` | 16 GiB |
-| `--max-encoded-nar-bytes` | 16 GiB |
-| `--max-decoder-memory-bytes` | 128 MiB per compressed upload |
-| `--min-free-bytes` | 1 GiB |
-| `--egress-compression` | `none` |
-| `--storage-backend` | `flat` |
-
 Run `narjar serve --help` for all options and their `NARJAR_*` environment
 variables.
-
-Compressed uploads are limited by both their encoded size and decoded NAR
-size. XZ dictionary memory and Zstd frame windows are checked against
-`maxDecoderMemoryBytes` before decoder buffers are allocated. At most `workers`
-decoders run at once, with a combined decoder memory limit of
-`workers × maxDecoderMemoryBytes`.
 
 A Linux deployment with 32 workers measured 16,676 KiB (16.3 MiB) process RSS
 after four days of uptime, using flat storage and uncompressed downloads.
@@ -259,25 +240,12 @@ devenv tasks run check:doc
 nix flake check -L --no-update-lock-file
 ```
 
-Linux CI also runs the locked real-Nix app against both storage backends:
-
-```sh
-nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend flat
-nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend chunked
-```
-
 Run shell commands through `devenv shell -- <command>` unless `DEVENV_ROOT`
-already points at the checkout. The end-to-end gates check transfers into
-independent Nix stores, signature trust, compression, interrupted uploads,
-restart, and offline GC.
+already points at the checkout.
 
 Further documentation:
 
 - [Architecture](https://github.com/mjc/narjar/blob/main/docs/architecture.md)
 - [Binary cache protocol](https://github.com/mjc/narjar/blob/main/docs/protocol-v0.1.md)
 - [Filesystem requirements](https://github.com/mjc/narjar/blob/main/docs/filesystem-capability-adr.md)
-- [Release procedure](https://github.com/mjc/narjar/blob/main/docs/release.md)
-- [Operational risks](https://github.com/mjc/narjar/blob/main/docs/risk-register.md)
 - [NixOS module](https://github.com/mjc/narjar/blob/main/nix/module.nix)
-- [Benchmark tools](https://github.com/mjc/narjar/blob/main/docs/benchmark-scripts.md)
-- [CPU and heap profiling](https://github.com/mjc/narjar/blob/main/scripts/profile.sh)

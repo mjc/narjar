@@ -27,7 +27,6 @@ pub enum LogicalNar {}
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EncodedFile {}
 
-/// A SHA-256 digest whose purpose remains part of its compile-time type.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 /// A SHA-256 digest tagged with the kind of bytes it identifies.

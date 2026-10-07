@@ -90,8 +90,8 @@ Realisation metadata, when used, is a separate JSON object at
 registration to that namespace:
 [binary-cache-store.cc lines 470-497](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/binary-cache-store.cc#L470-L497).
 No realisation request occurred for the tested source-path/content-addressed
-fixtures. Narjar v0.1 reserves the route and returns 404/405; realisations
-are unsupported.
+fixtures. Narjar v0.1 does not implement this route: reads and authenticated
+writes return 404.
 
 ## Authentication and redirects
 
@@ -128,21 +128,6 @@ an interrupted PUT invisible, discard or reconcile its temporary, and accept a
 later full-body retry idempotently:
 [resume setup](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/filetransfer.cc#L383-L384),
 [retry classification](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/filetransfer.cc#L437-L532).
-
-## Contract consequences for Narjar
-
-- A path is visible only after its final narinfo is durably published.
-- A NAR may exist without a narinfo after a crash; that state is unreachable
-  garbage, not a readable cache entry.
-- Incoming bodies must stream to a same-filesystem temporary file. Never buffer
-  a NAR in memory.
-- Verify length/hash and durability before publication; Narjar uses a
-  temporary-file write, sync, and no-replace hard link for both the NAR and
-  narinfo final objects.
-- Existing identical objects are idempotent success. Conflicting attempts must
-  not overwrite published content.
-- GET and HEAD share metadata and status behavior; HEAD sends no body.
-- TLS terminates at a reverse proxy; Narjar serves plain HTTP.
 
 ## Capture details
 

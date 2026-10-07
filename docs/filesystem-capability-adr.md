@@ -17,7 +17,8 @@ Both backends require:
 - an exclusive local `flock` lease.
 
 HTTP delivery uses `sendfile` where available, with a read/write fallback.
-Capacity and readiness checks use `fstatvfs`, file checks, and the lease.
+Capacity and readiness probes use `fstatvfs`; startup validates the fixed
+layout and acquires the exclusive lease.
 
 ## Chunked storage
 
@@ -42,19 +43,6 @@ replacement is encoded, hashed, flushed, and synced before the rename. The
 raw-NAR/codec lock covers repair; source and destination directories are
 synced before publication completes. This does not allow replacement of
 uploaded objects or narinfos.
-
-## Supported platforms
-
-Linux CI exercises real Nix transfers with both backends. Apple Silicon CI
-builds the package and tests flat storage. Module checks evaluate configuration
-and generated startup scripts. See the
-[workflow](../.github/workflows/flake.yml) and
-[module checks](../nix/module-eval-test.nix).
-
-ZFS is the primary deployment filesystem. `compression=zstd` (`zstd-3`) is
-the recommended compression setting; Narjar does not set or check it.
-Compression, CoW, sparse extents, and snapshots affect physical space usage.
-Narjar's logical byte totals do not measure those effects.
 
 ## Unsupported operations
 
