@@ -752,7 +752,7 @@ upstream fills, native-source leases, online retention, per-object popularity,
 distinct clients, or build-time savings. Monitor host ARC, disk, and network
 pressure separately. Omitted measurements are not zero.
 
-## Filesystem support boundary
+## Filesystem requirements
 
 Narjar's required filesystem contract is limited to regular files and
 directories, no-follow path checks, file and directory sync, same-filesystem
@@ -760,28 +760,16 @@ no-replace hard links, unlink, enumeration, and an exclusive local lease. The
 service does not detect or configure a filesystem-specific backend.
 
 Linux chunked storage additionally requires `syncfs` to make newly linked
-chunks durable before manifest publication. Darwin/APFS has a native package
-and test lane for flat storage; host-specific crash-durability guarantees remain
-unverified. See the [filesystem capability ADR](filesystem-capability-adr.md)
-for backend-specific durability requirements and remaining conformance gaps.
-
-| Environment | Current classification | Meaning |
-| --- | --- | --- |
-| NixOS module evaluation | configuration only | Covers module options and generated units, not filesystem or service runtime behavior. |
-| XFS, btrfs, ZFS, and Darwin APFS | unverified host-specific behavior | Portable tests do not establish filesystem-specific crash durability. |
-| tmpfs | non-persistent fixture only | Useful for tests; it is not a durable cache or a backup target. |
-| bind-mounted DATA | depends on the mounted underlying filesystem | Validate the mounted DATA path and its ownership; the container/image filesystem is not the storage contract. |
-| overlay, NFS, SMB, and FUSE | unsupported or unverified | Link, lock, sync, and transaction-recovery conformance is not established. |
+chunks durable before manifest publication. Use flat storage on macOS.
+See the [filesystem requirements](filesystem-capability-adr.md).
 
 For a Narjar-only ZFS dataset, use
 `sync=standard`, checksums enabled, `dedup=off`, `atime=off`, the default record
 size and cache topology, and no special vdev or SLOG requirement. The
-[filesystem requirements](filesystem-capability-adr.md#support-boundary) and
+[filesystem requirements](filesystem-capability-adr.md#supported-platforms) and
 [architecture](architecture.md#canonical-storage-backends) recommend
 `compression=zstd` (the OpenZFS alias for `zstd-3`). Narjar does not set or verify
-ZFS properties. These settings do not establish performance or filesystem
-conformance. Other compression levels, record sizes, ARC policies, and
-deduplication need workload-specific measurements. `sync=disabled` violates
+ZFS properties. `sync=disabled` violates
 the durability contract.
 
 ## Graceful shutdown
@@ -898,10 +886,7 @@ The module sets `RequiresMountsFor` for the configured data path. If mount
 integration does not provide a path mount unit, supply a readiness dependency.
 Narjar never mounts or creates the dataset.
 The `module-evaluation` check covers generated service configuration and valid
-and invalid `dataDir` declarations. CI does not boot NixOS VMs, so it does not
-verify service activation under systemd hardening. Portable checks do not cover
-block-device, tmpfs, unmount/remount, cross-filesystem, quota/inode exhaustion,
-or read-only-remount conformance. See the [filesystem support boundary](#filesystem-support-boundary).
+and invalid `dataDir` declarations.
 
 `GET /healthz` is the liveness endpoint. `GET /readyz` is the readiness
 endpoint and requires a read token when private-read mode is enabled.

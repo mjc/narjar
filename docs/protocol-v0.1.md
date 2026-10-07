@@ -205,6 +205,4 @@ offline GC with a protected closure. It records the Nix version and commands.
 Repository Rust tests cover route, header, authentication, size, hash,
 signature, and range edge cases. The static ELF and closure checks establish
 packaging properties separately; the end-to-end app uses the normal package.
-Historical captures cover only their recorded versions. TLS proxy behavior
-and filesystem power-loss durability require deployment testing. See the
-[release procedure](release.md#validate-the-candidate).
+See the [release procedure](release.md#validate-the-candidate).

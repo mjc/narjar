@@ -177,8 +177,7 @@ The default `flat` backend stores each canonical, uncompressed NAR as a file.
 The optional `chunked` backend splits NARs into content-defined chunks and
 deduplicates them across objects. Choose it with
 `init --storage-backend chunked`, and pass the same backend to serving and
-maintenance commands. macOS rejects chunked storage before initialization;
-use flat storage there. APFS-specific power-loss durability is unverified.
+maintenance commands. Chunked storage requires Linux; use flat storage on macOS.
 
 `push --compression` controls the uploaded representation.
 `serve --egress-compression` controls the representation advertised to Nix
@@ -285,8 +284,7 @@ nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend chunked
 Run shell commands through `devenv shell -- <command>` unless `DEVENV_ROOT`
 already points at the checkout. The end-to-end gates check transfers into
 independent Nix stores, signature trust, compression, interrupted uploads,
-restart, and offline GC. They do not boot NixOS VMs or establish
-filesystem-specific power-loss guarantees.
+restart, and offline GC.
 
 Further documentation:
 

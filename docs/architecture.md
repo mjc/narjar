@@ -46,7 +46,7 @@ TLS reverse proxy -> Narjar -> immutable files
 Narjar knows Nix binary-cache metadata and NAR hashes. It does not know how to
 build, realise, register, mount, or garbage-collect a native Nix store.
 
-Required DATA filesystem capabilities and support boundaries are in the
+Required DATA filesystem operations are in the
 [filesystem requirements](filesystem-capability-adr.md).
 
 ## Client-signed ingestion
@@ -361,21 +361,16 @@ negative cache until --refresh; the server cannot invalidate client caches.
 - Multiple HTTP ranges or conditional mutation.
 - Availability guarantees across multiple processes or hosts.
 
-## Verification boundaries
+## Tests
 
 The [flake workflow](../.github/workflows/flake.yml) runs the locked
 `nix-e2e` app for both flat and chunked storage on Linux. It uses a real server
 and independent Nix stores to check transfers, signatures, compression,
 interruption, restart, and offline GC. The module check evaluates configuration
 assertions and checks generated pre-start scripts at build time without
-import-from-derivation. Neither check boots a NixOS VM.
+import-from-derivation.
 
-The static ELF and runtime closure checks cover packaging properties. They do
-not establish behavior on a separate host without Nix, TLS proxy correctness,
-or filesystem-specific power-loss durability. Darwin package tests cover flat
-storage; they do not establish APFS crash durability. See the
-[filesystem support boundary](filesystem-capability-adr.md#support-boundary).
-
-Benchmark reports describe specific workloads and hosts, not general performance
-or physical-space guarantees. Current release checks are in the
-[release procedure](release.md).
+The static ELF and runtime closure checks inspect package linkage and
+dependencies. Separate Linux and macOS runners install the Cargo archive
+without Nix and run CLI smoke tests. Darwin package tests cover flat storage.
+Current release checks are in the [release procedure](release.md).

@@ -27,12 +27,8 @@ the chunk durability step before publication of the manifest. There is no
 single-file sync fallback. A chunk directory without a manifest cannot
 reconstruct a NAR.
 
-macOS rejects this backend before initialization. Ordinary Apple `fsync`
-does not provide the device-cache and ordering guarantees required here;
-see [fsync(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html)
-and [fcntl(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html).
-Flat storage is supported on Apple Silicon macOS, but APFS-specific
-power-loss durability is unverified.
+macOS rejects this backend before initialization because the chunk publication
+barrier uses Linux `syncfs`. Use flat storage on macOS.
 
 ## Replacement and repair
 
@@ -47,19 +43,13 @@ raw-NAR/codec lock covers repair; source and destination directories are
 synced before publication completes. This does not allow replacement of
 uploaded objects or narinfos.
 
-## Support boundary
+## Supported platforms
 
 Linux CI exercises real Nix transfers with both backends. Apple Silicon CI
-builds the package and tests flat storage. Module evaluation and generated
-startup-script checks run without booting a VM. See the
+builds the package and tests flat storage. Module checks evaluate configuration
+and generated startup scripts. See the
 [workflow](../.github/workflows/flake.yml) and
 [module checks](../nix/module-eval-test.nix).
-
-There is no dedicated block-device or remount conformance test. XFS, btrfs,
-ZFS-specific behavior, overlay and bind-mount variants, quota/inode exhaustion,
-and read-only remounts are not established by these checks. NFS, SMB, and FUSE
-are unsupported or unverified; they require evidence for link, lock, sync,
-and recovery behavior before use as durable DATA.
 
 ZFS is the primary deployment filesystem. `compression=zstd` (`zstd-3`) is
 the recommended compression setting; Narjar does not set or check it.

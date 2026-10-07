@@ -22,9 +22,7 @@ See [credential operations](operations.md#cli).
 Narjar serves plain HTTP. Use a TLS reverse proxy for remote access, restrict
 direct access to a trusted network, disable PUT buffering, preserve
 Content-Length and Authorization, align limits and timeouts, and redact
-credentials from logs. Loopback end-to-end CI does not validate a deployment's
-certificate, buffering, or timeout configuration. Client HTTPS support does
-not provide TLS termination for the server.
+credentials from logs.
 
 ## Untrusted input and bounded resources
 
@@ -51,12 +49,6 @@ raw NAR; chunked storage synchronizes chunks before publishing its authoritative
 manifest. Narinfo is the store-path visibility marker. Transactions and recovery
 markers distinguish interrupted work from completed publications.
 
-Fault tests and interrupted-upload CI cover process-level failures. They do
-not establish power-loss behavior on every filesystem or device. Chunked
-storage requires Linux `syncfs` and is rejected on macOS; APFS-specific flat
-crash durability also remains unverified. Follow the
-[filesystem capability contract](filesystem-capability-adr.md).
-
 Ordinary availability checks do not detect every same-size out-of-band
 mutation. Run offline `verify` or `reconcile --verify-hashes` for full content
 verification. Quarantine affected narinfos before repairing payloads. Preserve
@@ -78,16 +70,12 @@ GC reports logical file lengths, which do not predict physical bytes freed
 under compression, CoW, or snapshots. Measure destination capacity separately.
 See [backup and restore](operations.md#backup-and-restore).
 
-## Packaging and performance claims
+## Packaging
 
 The flake builds Linux and Apple Silicon packages; CI tests Darwin flat storage
 and real Nix transfers on Linux. Static ELF and runtime closure checks reject
 dynamic linkage or prohibited runtime dependencies. The generated module
-scripts are inspected at build time without import-from-derivation; module
-evaluation alone does not execute a systemd service. Native-store serving is
-disabled by the module until that HTTP path is implemented.
+scripts are inspected at build time without import-from-derivation. Native-store
+serving is disabled by the module until that HTTP path is implemented.
 
 Dependency checks use the [advisory check](dependency-advisories.md).
-Performance, memory, physical storage savings, and filesystem recovery need
-measurements on the deployed workload. Archived benchmarks cover their
-recorded conditions, not general guarantees or release requirements.

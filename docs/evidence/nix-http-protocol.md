@@ -144,15 +144,12 @@ later full-body retry idempotently:
 - GET and HEAD share metadata and status behavior; HEAD sends no body.
 - TLS terminates at a reverse proxy; Narjar serves plain HTTP.
 
-## Explicit evidence boundaries
+## Capture details
 
 - Nix client HTTP behavior is captured on real Darwin sockets for Nix 2.31.5
-  and 2.35.2. Narjar's separate Apple Silicon CI builds and tests flat storage;
-  these traces do not test its macOS server or chunked durability.
+  and 2.35.2.
 - TLS verification and CA selection are libcurl/Nix client responsibilities;
-  Narjar terminates plain HTTP behind a trusted proxy. The production proxy
-  buffering and timeout configuration must be validated for each deployment;
-  the loopback CI gates do not test TLS proxy behavior:
+  Narjar serves plain HTTP behind a TLS proxy:
   [filetransfer.cc lines 363-377](https://github.com/NixOS/nix/blob/2.31.5/src/libstore/filetransfer.cc#L363-L377).
 - No live realisation request was produced by the captured corpus. The exact
   namespace is source-backed and explicitly unsupported in v0.1.

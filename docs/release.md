@@ -82,12 +82,6 @@ credentials through OIDC. See the
    independent-store substitution, signatures, corruption rejection, all
    raw/XZ/Zstd directions, interruption, restart, and protected-closure GC.
 
-Module checks inspect configuration and generated startup scripts without
-booting a VM. TLS proxy behavior and filesystem-specific power-loss durability
-need deployment testing. Preserve the
-[filesystem support boundary](filesystem-capability-adr.md#support-boundary)
-in release notes. Historical benchmarks are not release requirements.
-
 ## Start a release
 
 1. Create, verify, and push an annotated signed tag on the reviewed commit:
@@ -104,7 +98,7 @@ in release notes. Historical benchmarks are not release requirements.
      -f tag=vX.Y.Z -F notes=@release-notes.md
    ```
 
-   Notes should describe the changes and filesystem support boundary. The
+   Notes should describe the changes and supported platforms. The
    workflow currently accepts stable `vX.Y.Z` tags, not prerelease versions.
 3. Inspect the candidate artifacts and passing checks, then approve the
    `publish` job in GitHub. Approval authorizes both crates.io and GitHub
