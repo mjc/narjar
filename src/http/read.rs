@@ -382,6 +382,7 @@ fn respond_nar_bytes(
         Ok(None) => return not_found(guard, request),
         Err(_) => return internal_error(guard, request),
     };
+    opened.record_served_access(storage, name);
     match opened.body {
         NarReadBody::File(file) => {
             let response =
