@@ -78,7 +78,11 @@ pub(crate) fn collect(
     options: GcOptions,
     retry: RetryPolicy,
 ) -> io::Result<GcReport> {
-    retry::request_with_retry(retry, || request_collection(data_dir, &options), thread::sleep)
+    retry::request_with_retry(
+        retry,
+        || request_collection(data_dir, &options),
+        thread::sleep,
+    )
 }
 
 fn request_collection(data_dir: &Path, options: &GcOptions) -> io::Result<Reply> {
@@ -460,7 +464,9 @@ mod tests {
             |_| Reply::Failed(ControlFailure::Stopping),
         )
         .unwrap();
-        let error = collect(&root, options(), RetryPolicy::default()).err().unwrap();
+        let error = collect(&root, options(), RetryPolicy::default())
+            .err()
+            .unwrap();
         service
             .finish(Instant::now() + Duration::from_secs(2))
             .unwrap();
@@ -503,7 +509,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
-        let report = collect(root.path(), request);
+        let report = collect(root.path(), request, RetryPolicy::default());
         service
             .finish(Instant::now() + Duration::from_secs(2))
             .unwrap();
@@ -531,7 +537,7 @@ mod tests {
             .collect::<String>();
         request.protected_roots =
             crate::cache::storage::gc::ProtectedRoots::parse(&oversized).unwrap();
-        let result = collect(root.path(), request);
+        let result = collect(root.path(), request, RetryPolicy::default());
         service
             .finish(Instant::now() + Duration::from_secs(2))
             .unwrap();
