@@ -310,7 +310,7 @@ impl Storage {
         self.activity.snapshot(self.backend())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "macos")))]
     pub(super) const fn chunk_store(&self) -> Option<&ChunkStore> {
         self.payloads.chunk_store()
     }

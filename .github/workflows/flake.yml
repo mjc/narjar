@@ -56,6 +56,8 @@ jobs:
         run: test "$(uname -m)" = arm64
       - name: Build the Darwin package
         run: nix build -L --no-update-lock-file .#packages.aarch64-darwin.default
+      - name: Run Darwin Clippy with warnings denied
+        run: nix build -L --no-update-lock-file .#checks.aarch64-darwin.clippy
       - name: Run the Darwin Narjar package tests
         run: nix build -L --no-update-lock-file .#checks.aarch64-darwin.tests
 

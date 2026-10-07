@@ -381,11 +381,7 @@ fn chunked_upload_enforces_encoded_size_before_creating_staging() {
 
 #[test]
 fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
-    for backend in [
-        StorageBackend::Flat,
-        #[cfg(not(target_os = "macos"))]
-        StorageBackend::Chunked,
-    ] {
+    let check_backend = |backend: StorageBackend| {
         let (_directory, storage) = storage_fixture(backend.try_into().unwrap());
         let raw = vec![b'u'; 100_000];
         let hash = NarHash::from_digest(Sha256::digest(&raw).into());
@@ -420,7 +416,10 @@ fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
         );
         assert_eq!(activity.upload_created_logical_bytes, raw.len() as u64);
         assert_eq!(activity.upload_identical_logical_bytes, raw.len() as u64);
-    }
+    };
+    check_backend(StorageBackend::Flat);
+    #[cfg(not(target_os = "macos"))]
+    check_backend(StorageBackend::Chunked);
 }
 
 #[test]
