@@ -39,6 +39,7 @@ impl PayloadStorage {
 
 #[derive(Debug)]
 pub struct Storage {
+    pub(super) access: super::access::AccessRecorder,
     #[cfg(test)]
     pub(super) layout: Layout,
     pub(super) root: File,
@@ -75,6 +76,7 @@ pub(crate) struct StorageActivity {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StorageActivitySnapshot {
+    pub(crate) access_records: super::access::AccessRecordStats,
     pub(crate) backend: StorageBackend,
     pub(crate) upload_validated_logical_bytes: u64,
     pub(crate) upload_created_logical_bytes: u64,
@@ -158,6 +160,7 @@ impl StorageActivity {
         use std::sync::atomic::Ordering::Relaxed;
 
         StorageActivitySnapshot {
+            access_records: Default::default(),
             backend,
             upload_validated_logical_bytes: self.upload_validated_logical_bytes.load(Relaxed),
             upload_created_logical_bytes: self.upload_created_logical_bytes.load(Relaxed),
@@ -181,6 +184,7 @@ impl StorageActivity {
 impl Default for StorageActivitySnapshot {
     fn default() -> Self {
         Self {
+            access_records: Default::default(),
             backend: StorageBackend::Flat,
             upload_validated_logical_bytes: 0,
             upload_created_logical_bytes: 0,
@@ -200,7 +204,7 @@ impl Default for StorageActivitySnapshot {
     }
 }
 
-fn increment_saturating(counter: &AtomicU64, amount: u64) {
+pub(super) fn increment_saturating(counter: &AtomicU64, amount: u64) {
     use std::sync::atomic::Ordering::Relaxed;
 
     let _ = counter.fetch_update(Relaxed, Relaxed, |value| Some(value.saturating_add(amount)));
@@ -309,7 +313,10 @@ impl Storage {
     }
 
     pub(crate) fn activity_snapshot(&self) -> StorageActivitySnapshot {
-        self.activity.snapshot(self.backend())
+        StorageActivitySnapshot {
+            access_records: self.access.snapshot(),
+            ..self.activity.snapshot(self.backend())
+        }
     }
 
     #[cfg(test)]

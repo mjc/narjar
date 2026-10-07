@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File},
     io::Write,
-    num::{NonZeroU64, NonZeroUsize},
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -20,7 +20,9 @@ use narjar::__private::{
         CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, CACHE_RECOVERY_MARKERS, CachePolicies,
         CleanupOutcome, Directory, LAYOUT_DESCRIPTOR, ReconcileClass, Storage, StorageBackend,
         StorageCapacity, StoreHash, SupportedStorageBackend, capacity_from_statvfs,
-        gc::{self, GcMode, GcOptions, GcReport},
+        gc::{
+            self, EvictionOrder, FreeSpaceThresholds, GcMode, GcOptions, GcReport, RetentionOptions,
+        },
         private_file_mode_is_valid, storage_directories,
     },
 };
@@ -480,6 +482,8 @@ fn print_structural_entry(
 
 #[derive(Args)]
 pub(crate) struct Gc {
+    #[command(flatten)]
+    retention: GcRetentionArgs,
     #[arg(long)]
     data_dir: PathBuf,
     #[arg(long)]
@@ -516,6 +520,70 @@ enum CollectionExecution {
     Online,
 }
 
+#[derive(Args)]
+struct GcRetentionArgs {
+    /// Order pressure evictions by publication or last-use time; age expiration is unchanged.
+    #[arg(long, default_value = "publication")]
+    eviction_order: EvictionOrder,
+    /// Maximum selected publications and orphans in a single pass.
+    #[arg(long)]
+    max_deletions: Option<NonZeroUsize>,
+    /// Start a bounded physical-pressure pass below this available byte count.
+    #[arg(long, requires = "target_free_bytes")]
+    min_free_bytes: Option<u64>,
+    /// Desired measured free space; requires a minimum and a deletion cap.
+    #[arg(long, requires_all = ["min_free_bytes", "max_deletions"])]
+    target_free_bytes: Option<u64>,
+    /// Total attempts for online Busy/Changed responses, at most 16.
+    #[arg(long, default_value = "1")]
+    retry_attempts: NonZeroU32,
+    /// Delay between contention retries, at most 30000 ms.
+    #[arg(long, default_value_t = 1000)]
+    retry_delay_millis: u64,
+}
+
+impl Default for GcRetentionArgs {
+    fn default() -> Self {
+        Self {
+            eviction_order: EvictionOrder::Publication,
+            max_deletions: None,
+            min_free_bytes: None,
+            target_free_bytes: None,
+            retry_attempts: NonZeroU32::new(1).unwrap(),
+            retry_delay_millis: 1000,
+        }
+    }
+}
+
+impl GcRetentionArgs {
+    fn into_policies(self) -> Result<(RetentionOptions, crate::control::RetryPolicy), Error> {
+        let free_space = match (self.min_free_bytes, self.target_free_bytes) {
+            (None, None) => None,
+            (Some(minimum), Some(target)) => {
+                Some(FreeSpaceThresholds::new(minimum, target).map_err(runtime)?)
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Error::runtime(
+                    "physical GC requires both --min-free-bytes and --target-free-bytes",
+                ));
+            }
+        };
+        let retry = crate::control::RetryPolicy::new(
+            self.retry_attempts,
+            Duration::from_millis(self.retry_delay_millis),
+        )
+        .map_err(runtime)?;
+        Ok((
+            RetentionOptions {
+                eviction_order: self.eviction_order,
+                max_deletions: self.max_deletions,
+                free_space,
+            },
+            retry,
+        ))
+    }
+}
+
 impl CollectionExecution {
     fn from_online_flag(online: bool) -> Self {
         match online {
@@ -539,6 +607,7 @@ fn parse_gc_retention_period(value: &str) -> Result<Duration, String> {
 
 pub(crate) fn gc(options: Gc) -> Result<(), Error> {
     let Gc {
+        retention,
         data_dir,
         max_bytes,
         target_bytes,
@@ -552,12 +621,21 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         execution,
         storage_backend,
     } = options;
+    match (execution, retention.retry_attempts.get()) {
+        (CollectionExecution::Offline, 2..) => {
+            return Err(Error::runtime("--retry-attempts requires --online"));
+        }
+        (CollectionExecution::Online, _) | (CollectionExecution::Offline, 1) => {}
+        (CollectionExecution::Offline, 0) => unreachable!("retry attempts are nonzero"),
+    }
+    let (retention, retry) = retention.into_policies()?;
     let maintenance_record = if apply {
         MaintenanceRecord::new(MaintenanceOperation::Gc, MaintenanceMode::GcApply)
     } else {
         MaintenanceRecord::new(MaintenanceOperation::Gc, MaintenanceMode::GcDryRun)
     };
     let options = GcOptions {
+        retention,
         data_dir,
         max_bytes,
         target_bytes,
@@ -567,8 +645,9 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         mode: if apply { GcMode::Apply } else { GcMode::DryRun },
         backend: storage_backend,
     };
+    options.validate_policy().map_err(runtime)?;
     let report = match execution {
-        CollectionExecution::Online => crate::control::collect(options).map_err(runtime)?,
+        CollectionExecution::Online => crate::control::collect(options, retry).map_err(runtime)?,
         CollectionExecution::Offline => {
             let session = MaintenanceSession::open(
                 &options.data_dir,
@@ -593,6 +672,11 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
     if json {
         write_json_line(std::io::stdout().lock(), &report)?;
     } else {
+        println!(
+            "limit_reached={} physical_space={}",
+            report.limit_reached,
+            serde_json::to_string(&report.physical_space).map_err(runtime)?
+        );
         println!(
             "accounting_basis={} dry_run={} before_bytes={} after_bytes={} target_met={} candidates={} protected={} eligible={} evicted={} shared={} orphaned={} temporary={} malformed={} missing_roots={} missing_references={} protected_bytes={} eligible_bytes={} evicted_bytes={} shared_bytes={} orphaned_bytes={} temporary_bytes={} malformed_bytes={} deleted_narinfos={} deleted_nars={} deleted_orphans={}",
             report.accounting_basis,
@@ -1451,6 +1535,7 @@ machine other.example password other-secret
         .expect("cache should initialize");
 
         gc(Gc {
+            retention: Default::default(),
             data_dir: directory.path().to_owned(),
             max_bytes: None,
             target_bytes: Some(0),
@@ -1517,6 +1602,7 @@ machine other.example password other-secret
             .expect("first operation should hold the cache lock");
 
         let result = gc(Gc {
+            retention: Default::default(),
             data_dir: directory.path().to_owned(),
             max_bytes: None,
             target_bytes: Some(0),
@@ -1652,6 +1738,7 @@ machine other.example password other-secret
         let published_destination = directory.path().join("nix-cache-info");
 
         gc(Gc {
+            retention: Default::default(),
             data_dir: directory.path().to_owned(),
             max_bytes: None,
             target_bytes: Some(u64::MAX),

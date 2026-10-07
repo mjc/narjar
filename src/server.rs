@@ -630,6 +630,11 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         authorizer,
         trusted_keys,
     } = initialize_server_resources(&config)?;
+    if config.track_access {
+        storage
+            .enable_access_tracking()
+            .map_err(|error| Error::runtime(format!("cannot enable access tracking: {error}")))?;
+    }
     let metrics = Arc::new(Metrics::default());
 
     let listener = TcpListener::bind(config.listen)

@@ -221,6 +221,21 @@ pub enum NarInfoDeletion {
 
 pub(crate) struct OpenedNar<'storage> {
     pub(crate) body: NarReadBody<'storage>,
+    identity: NarIdentity,
+}
+
+impl OpenedNar<'_> {
+    pub(crate) fn record_served_access(&self, storage: &Storage, name: NarFileName) {
+        storage
+            .access
+            .record(super::access::AccessKey::Payload(name));
+        let canonical = NarFileName::raw(self.identity.hash());
+        if canonical != name {
+            storage
+                .access
+                .record(super::access::AccessKey::Payload(canonical));
+        }
+    }
 }
 
 pub(super) struct OwnedTemporary<'storage> {
@@ -327,6 +342,10 @@ impl BoundNarInfo<'_> {
 }
 
 impl Storage {
+    pub fn enable_access_tracking(&self) -> Result<(), StorageError> {
+        self.access.enable(&self.root)?;
+        Ok(())
+    }
     pub(crate) fn publish_narinfo_with_claims(
         &self,
         claims: &NarInfoClaims,
@@ -675,17 +694,17 @@ impl Storage {
                 else {
                     return Ok(None);
                 };
-                if store
+                let Some(manifest) = store
                     .validate_manifest(hash)
                     .map_err(storage_error_for_chunk_store)?
-                    .is_none()
-                {
+                else {
                     return Ok(None);
-                }
+                };
                 let reader = store
                     .open_verified_reader(hash, range, MAX_CHUNK_MANIFEST_BYTES)
                     .map_err(storage_error_for_chunk_store)?;
                 Ok(Some(OpenedNar {
+                    identity: manifest.identity(),
                     body: NarReadBody::Chunked {
                         reader: Box::new(reader),
                         _activity: activity,
@@ -694,8 +713,9 @@ impl Storage {
             }
             (PayloadStorage::Flat | PayloadStorage::Chunked(_), None)
             | (PayloadStorage::Flat, Some(_)) => self.open_nar(name)?.map_or(Ok(None), |file| {
-                self.validated_delivery_identity(name, &file)?;
+                let identity = self.validated_delivery_identity(name, &file)?;
                 Ok(Some(OpenedNar {
+                    identity,
                     body: NarReadBody::File(file),
                 }))
             }),
@@ -755,6 +775,8 @@ impl Storage {
                 let bytes =
                     crate::records::read_bounded_bytes(file, crate::narinfo::MAX_NARINFO_BYTES)
                         .map_err(io::Error::from)?;
+                self.access
+                    .record(super::access::AccessKey::Publication(*store));
                 Ok(AdvertisedNarInfo {
                     bytes,
                     _activity: activity.advertise(*store)?,

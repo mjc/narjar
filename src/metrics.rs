@@ -1281,6 +1281,16 @@ fn append_readiness_reason(output: &mut String, readiness: StorageReadiness) {
 }
 
 fn append_storage_activity_metrics(output: &mut String, activity: StorageActivitySnapshot) {
+    output.push_str("# HELP narjar_access_records_total Coalesced retention-hint recording outcomes.\n# TYPE narjar_access_records_total counter\n");
+    for (outcome, value) in [
+        ("written", activity.access_records.written),
+        ("coalesced", activity.access_records.coalesced),
+        ("failed", activity.access_records.failed),
+    ] {
+        output.push_str(&format!(
+            "narjar_access_records_total{{outcome=\"{outcome}\"}} {value}\n"
+        ));
+    }
     output.push_str(
         "# HELP narjar_nar_upload_validated_logical_bytes_total Logical NAR bytes in uploads whose complete encoded representation and decoded hash/size validation succeeded; this does not validate NAR grammar or signatures.\n# TYPE narjar_nar_upload_validated_logical_bytes_total counter\n",
     );
@@ -3701,6 +3711,21 @@ mod tests {
         assert!(exposition.contains(
             "narjar_nar_upload_committed_logical_bytes_total{outcome=\"identical\"} 100"
         ));
+    }
+
+    #[test]
+    fn access_hint_outcomes_are_exposed_even_without_a_population_scan() {
+        let mut activity = StorageActivitySnapshot::default();
+        activity.access_records.written = 3;
+        activity.access_records.coalesced = 7;
+        activity.access_records.failed = 1;
+        let mut exposition = String::new();
+        append_storage_activity_metrics(&mut exposition, activity);
+        for (outcome, count) in [("written", 3), ("coalesced", 7), ("failed", 1)] {
+            assert!(exposition.contains(&format!(
+                "narjar_access_records_total{{outcome=\"{outcome}\"}} {count}\n"
+            )));
+        }
     }
 
     #[test]

@@ -61,9 +61,14 @@ pub fn storage_root_entries() -> impl Iterator<Item = &'static str> {
 }
 
 pub(super) fn storage_root_files() -> impl Iterator<Item = &'static str> {
-    [LAYOUT_DESCRIPTOR, DESCRIPTOR_DRAFT, "lock"]
-        .into_iter()
-        .chain(CACHE_RECOVERY_MARKERS)
+    [
+        LAYOUT_DESCRIPTOR,
+        DESCRIPTOR_DRAFT,
+        "lock",
+        super::gc::PRESSURE_HINT,
+    ]
+    .into_iter()
+    .chain(CACHE_RECOVERY_MARKERS)
 }
 
 pub(super) fn storage_root_directories() -> impl Iterator<Item = &'static str> {
@@ -71,7 +76,7 @@ pub(super) fn storage_root_directories() -> impl Iterator<Item = &'static str> {
         .iter()
         .copied()
         .chain(CHUNK_DIRECTORIES.iter().copied())
-        .chain([".narjar-control"])
+        .chain([".narjar-control", super::access::ACCESS_DIRECTORY])
         .filter(|name| !name.contains('/'))
 }
 
@@ -292,6 +297,7 @@ impl CacheLayout {
         };
         let recovery = RecoveryState::new(&self.root)?;
         Ok(Storage {
+            access: Default::default(),
             #[cfg(test)]
             layout: self.test_layout,
             root: self.root,

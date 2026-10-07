@@ -24,6 +24,8 @@ use narjar::__private::{
 use serde::{Deserialize, Serialize};
 
 mod protocol;
+mod retry;
+pub(crate) use retry::RetryPolicy;
 mod socket;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -70,19 +72,19 @@ enum ControlFailure {
     Storage(String),
 }
 
-pub(crate) fn collect(mut options: GcOptions) -> io::Result<GcReport> {
+pub(crate) fn collect(mut options: GcOptions, retry: RetryPolicy) -> io::Result<GcReport> {
     options.protected_roots = options
         .protected_roots
         .map(std::path::absolute)
         .transpose()?;
+    retry::request_with_retry(retry, || request_collection(&options), thread::sleep)
+}
+
+fn request_collection(options: &GcOptions) -> io::Result<Reply> {
     let mut connection = socket::connect(&options.data_dir).map_err(|error| io::Error::new(error.kind(), format!("cannot connect to running narjar: {error}; online GC does not fall back to offline GC")))?;
     connection.set_write_timeout(Some(REQUEST_TIMEOUT))?;
     protocol::write_frame(&mut connection, &options)?;
-    let reply: Reply = protocol::read_frame(DeadlineReader::new(&mut connection, REPORT_TIMEOUT))?;
-    match reply {
-        Reply::Completed(report) => Ok(*report),
-        Reply::Failed(error) => Err(io::Error::other(error)),
-    }
+    protocol::read_frame(DeadlineReader::new(&mut connection, REPORT_TIMEOUT))
 }
 
 struct CollectionJob {
@@ -409,6 +411,7 @@ mod tests {
 
     fn options(root: &Path) -> GcOptions {
         GcOptions {
+            retention: Default::default(),
             data_dir: root.to_owned(),
             max_bytes: None,
             target_bytes: Some(0),
@@ -447,7 +450,23 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
-        let report = collect(options(root.path())).unwrap();
+        let mut attempts = 0;
+        let mut delays = 0;
+        let report = retry::request_with_retry(
+            RetryPolicy::new(std::num::NonZeroU32::new(3).unwrap(), Duration::ZERO).unwrap(),
+            || {
+                attempts += 1;
+                match attempts {
+                    1 => Ok(Reply::Failed(ControlFailure::Busy)),
+                    2 => Ok(Reply::Failed(ControlFailure::Changed)),
+                    _ => request_collection(&options(root.path())),
+                }
+            },
+            |_| delays += 1,
+        )
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(delays, 2);
         assert!(!report.dry_run);
         assert_eq!(report.after_bytes, 0);
         assert!(report.target_met);
@@ -473,7 +492,7 @@ mod tests {
     #[test]
     fn online_errors_distinguish_policy_backend_and_absent_daemon_without_offline_fallback() {
         let (root, storage, trusted) = fixture();
-        let error = match collect(options(root.path())) {
+        let error = match collect(options(root.path()), RetryPolicy::default()) {
             Err(error) => error,
             Ok(_) => panic!("no daemon"),
         };
@@ -488,7 +507,7 @@ mod tests {
         .unwrap();
         let mut wrong_backend = options(root.path());
         wrong_backend.backend = StorageBackend::Chunked;
-        let error = match collect(wrong_backend) {
+        let error = match collect(wrong_backend, RetryPolicy::default()) {
             Err(error) => error,
             Ok(_) => panic!("backend mismatch"),
         };
@@ -499,7 +518,7 @@ mod tests {
         let mut invalid = options(root.path());
         invalid.max_bytes = Some(1);
         invalid.target_bytes = Some(2);
-        let error = match collect(invalid) {
+        let error = match collect(invalid, RetryPolicy::default()) {
             Err(error) => error,
             Ok(_) => panic!("invalid policy"),
         };
@@ -530,9 +549,9 @@ mod tests {
         .unwrap();
         std::thread::scope(|scope| {
             let release = ReleaseCollectorOnDrop(&release_tx);
-            let first = scope.spawn(|| collect(options(root.path())));
+            let first = scope.spawn(|| collect(options(root.path()), RetryPolicy::default()));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            let second = match collect(options(root.path())) {
+            let second = match collect(options(root.path()), RetryPolicy::default()) {
                 Err(error) => error,
                 Ok(_) => panic!("busy collector"),
             };
@@ -582,7 +601,7 @@ mod tests {
             .unwrap();
         assert_eq!(connection.read(&mut byte).unwrap(), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
-        assert!(collect(options(root.path())).is_err());
+        assert!(collect(options(root.path()), RetryPolicy::default()).is_err());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         service
             .finish(Instant::now() + Duration::from_secs(5))
@@ -666,7 +685,7 @@ mod tests {
         .unwrap();
         thread::scope(|scope| {
             let release = ReleaseCollectorOnDrop(&release_tx);
-            let client = scope.spawn(|| collect(options(root.path())));
+            let client = scope.spawn(|| collect(options(root.path()), RetryPolicy::default()));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             service.shutdown.stop();
             assert!(
@@ -700,7 +719,7 @@ mod tests {
         .unwrap();
         thread::scope(|scope| {
             let release = ReleaseCollectorOnDrop(&release_tx);
-            let client = scope.spawn(|| collect(options(root.path())));
+            let client = scope.spawn(|| collect(options(root.path()), RetryPolicy::default()));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let error = service.finish(Instant::now()).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);

@@ -25,6 +25,12 @@ use crate::{
     },
 };
 
+#[path = "gc/retention.rs"]
+mod retention;
+pub(super) use retention::PRESSURE_HINT;
+use retention::PhysicalPressure;
+pub use retention::{EvictionOrder, FreeSpaceThresholds, PhysicalSpaceReport, RetentionOptions};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum GcMode {
     DryRun,
@@ -33,6 +39,7 @@ pub enum GcMode {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct GcOptions {
+    pub retention: RetentionOptions,
     pub data_dir: PathBuf,
     pub max_bytes: Option<u64>,
     pub target_bytes: Option<u64>,
@@ -52,6 +59,9 @@ impl GcOptions {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct GcReport {
+    pub pending_expired: usize,
+    pub limit_reached: bool,
+    pub physical_space: PhysicalSpaceReport,
     pub accounting_basis: AccountingBasis,
     pub dry_run: bool,
     pub before_bytes: u64,
@@ -168,6 +178,7 @@ struct ProtectionReport {
 }
 
 struct Entry {
+    last_use: SystemTime,
     store: StoreHash,
     store_path: String,
     references: Vec<String>,
@@ -250,6 +261,7 @@ fn inspect_trusted_gc_publication(
 }
 
 struct ChunkedEntry {
+    last_use: SystemTime,
     store: StoreHash,
     store_path: String,
     references: Vec<String>,
@@ -264,6 +276,8 @@ struct ChunkedEntry {
 }
 
 struct ChunkedGcReportInput<'a> {
+    pending_expired: usize,
+    limit_reached: bool,
     before_entries: &'a [ChunkedEntry],
     before_bytes: u64,
     after_bytes: u64,
@@ -318,6 +332,7 @@ struct Orphan {
 
 #[derive(Clone, Copy)]
 struct RetentionPolicy {
+    budget: RetentionOptions,
     pressure_target: Option<u64>,
     max_age: Option<Duration>,
     min_age: Duration,
@@ -337,14 +352,16 @@ impl RetentionPolicy {
         target_bytes: Option<u64>,
         now: SystemTime,
     ) -> Self {
-        Self::for_limits(
+        let mut policy = Self::for_limits(
             current_bytes,
             target_bytes,
             options.max_bytes,
             options.max_age,
             options.min_age,
             now,
-        )
+        );
+        policy.budget = options.retention;
+        policy
     }
 
     fn for_limits(
@@ -356,6 +373,7 @@ impl RetentionPolicy {
         now: SystemTime,
     ) -> Self {
         Self {
+            budget: RetentionOptions::default(),
             pressure_target: pressure_target(current_bytes, target_bytes, max_bytes),
             max_age,
             min_age,
@@ -459,19 +477,74 @@ fn run_with_access(
     trusted: &TrustedPublicKeys,
     access: CollectionAccess<'_>,
 ) -> Result<GcReport, StorageError> {
+    run_with_capacity_measurement(options, storage, trusted, access, |storage| {
+        Ok(super::fs::filesystem_space(&storage.root)?)
+    })
+}
+
+fn run_with_capacity_measurement(
+    mut options: GcOptions,
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
+    access: CollectionAccess<'_>,
+    mut measure: impl FnMut(&Storage) -> Result<super::StorageCapacity, StorageError>,
+) -> Result<GcReport, StorageError> {
     let target_bytes = gc_target_bytes(&options)?;
     let mode = options.mode;
-    let pass = match &storage.payloads {
-        PayloadStorage::Chunked(chunk_store) => {
-            run_chunked(options, storage, chunk_store, trusted, target_bytes, access)?
-        }
-        PayloadStorage::Flat => run_flat_gc(options, storage, trusted, target_bytes, access, scan)?,
+    let thresholds = options.retention.free_space;
+    let physical = match thresholds {
+        None => PhysicalPressure::Unconfigured,
+        Some(thresholds) => thresholds.measure_cycle(
+            measure(storage)?.available_bytes,
+            retention::unfinished_pressure_cycle(&storage.root),
+        ),
     };
-    pass.finish(storage, mode)
+    let triggered = physical.requires_collection();
+    if triggered {
+        options.max_bytes = Some(0);
+        options.target_bytes = Some(0);
+    }
+    let selection_target = match triggered {
+        true => Some(0),
+        false => target_bytes,
+    };
+    let pass = match &storage.payloads {
+        PayloadStorage::Chunked(chunk_store) => run_chunked(
+            options,
+            storage,
+            chunk_store,
+            trusted,
+            selection_target,
+            access,
+        )?,
+        PayloadStorage::Flat => {
+            run_flat_gc(options, storage, trusted, selection_target, access, scan)?
+        }
+    };
+    let mut report = pass.finish(storage, mode)?;
+    let after = match (&physical, mode) {
+        (PhysicalPressure::Collect { .. }, GcMode::Apply) => {
+            Some(measure(storage)?.available_bytes)
+        }
+        _ => None,
+    };
+    report.physical_space = physical.report(after);
+    if mode == GcMode::Apply {
+        retention::record_pressure_cycle(&storage.root, thresholds, &report.physical_space);
+    }
+    report.target_met = target_bytes.is_none_or(|target| report.after_bytes <= target)
+        && report.physical_space.target_met()
+        && report.pending_expired == 0;
+    Ok(report)
 }
 
 fn gc_target_bytes(options: &GcOptions) -> Result<Option<u64>, StorageError> {
-    if options.max_bytes.is_none() && options.target_bytes.is_none() && options.max_age.is_none() {
+    options.retention.validate()?;
+    if options.max_bytes.is_none()
+        && options.target_bytes.is_none()
+        && options.max_age.is_none()
+        && options.retention.free_space.is_none()
+    {
         return Err(invalid("at least one retention policy is required"));
     }
     if options
@@ -502,6 +575,9 @@ fn run_flat_gc<'storage>(
     mut scan_entries: impl FnMut(&Storage, &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError>,
 ) -> Result<CollectedPass<'storage>, StorageError> {
     let mut entries = scan_entries(storage, trusted)?;
+    if options.retention.eviction_order == EvictionOrder::LastUse {
+        update_flat_last_use(storage, &mut entries);
+    }
     entries.iter_mut().for_each(|entry| {
         entry.protected |= access.protects(ProtectedObject::Publication(entry.store))
             || access.protects_nar_name(&entry.raw_nar_name);
@@ -532,9 +608,41 @@ fn run_flat_gc<'storage>(
         after_publications + orphan_bytes(&orphans),
         policy,
         &access,
+        options.retention.remaining_deletions(selected.len()),
     );
     let projected_after_bytes =
         logical_after_bytes(&entries, &selected, &orphans, &selected_orphans);
+    let limit_reached = options
+        .retention
+        .max_deletions
+        .is_some_and(|limit| selected.len() + selected_orphans.len() >= limit.get())
+        && flat_retention_has_remaining_candidates(
+            &entries,
+            &selected,
+            &orphans,
+            &selected_orphans,
+            projected_after_bytes,
+            policy,
+            &access,
+        );
+    let pending_expired = entries
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            !selected.contains(index)
+                && policy.reason(entry.modified, entry.protected, 0)
+                    == Some(CollectionReason::MaximumAge)
+        })
+        .count()
+        + orphans
+            .iter()
+            .enumerate()
+            .filter(|(index, orphan)| {
+                !selected_orphans.contains(index)
+                    && policy.reason(orphan.modified, access.protects_nar_name(&orphan.name), 0)
+                        == Some(CollectionReason::MaximumAge)
+            })
+            .count();
     let mut after_bytes = projected_after_bytes;
     let dry_run = options.mode == GcMode::DryRun;
     let retiring = retiring_flat_objects(&entries, &selected, &orphans, &selected_orphans);
@@ -563,6 +671,9 @@ fn run_flat_gc<'storage>(
     Ok(CollectedPass {
         permit,
         report: GcReport {
+            pending_expired,
+            limit_reached,
+            physical_space: PhysicalSpaceReport::default(),
             accounting_basis: AccountingBasis::Logical,
             dry_run,
             before_bytes,
@@ -680,6 +791,7 @@ fn scan_with_directory_names(
             };
 
         entries.push(Entry {
+            last_use: modified,
             store,
             store_path,
             references,
@@ -705,6 +817,9 @@ fn run_chunked<'storage>(
     access: CollectionAccess<'storage>,
 ) -> Result<CollectedPass<'storage>, StorageError> {
     let mut entries = scan_chunked(storage, chunk_store, trusted)?;
+    if options.retention.eviction_order == EvictionOrder::LastUse {
+        update_chunked_last_use(storage, &mut entries);
+    }
     entries.iter_mut().for_each(|entry| {
         entry.protected |= access.protects(ProtectedObject::Publication(entry.store))
             || access.protects(ProtectedObject::CanonicalNar(entry.raw_hash));
@@ -753,16 +868,41 @@ fn run_chunked<'storage>(
     let orphaned_bytes = chunked_orphan_bytes(chunk_store, &entries, &orphans)?;
     let protected_bytes =
         chunked_bytes_for_entries(chunk_store, entries.iter().filter(|entry| entry.protected))?;
+    let policy = RetentionPolicy::new(&options, before_bytes, target_bytes, now);
     let selected = select_chunked(
         chunk_store,
         &entries,
         &orphans,
         before_bytes,
-        RetentionPolicy::new(&options, before_bytes, target_bytes, now),
+        policy,
         &access,
     )?;
     let after_bytes = chunked_projected_bytes(chunk_store, &entries, &orphans, &selected)?;
     let evicted = selected.entries.len() + selected.manifests.len() + selected.outputs.len();
+    let limit_reached = options
+        .retention
+        .max_deletions
+        .is_some_and(|limit| evicted >= limit.get())
+        && chunked_candidates(&entries, &orphans).any(|candidate| {
+            !candidate.selected(&selected)
+                && policy
+                    .reason(
+                        candidate.modified(&entries, &orphans),
+                        candidate.protected(&entries, &orphans, &access),
+                        after_bytes,
+                    )
+                    .is_some()
+        });
+    let pending_expired = chunked_candidates(&entries, &orphans)
+        .filter(|candidate| {
+            !candidate.selected(&selected)
+                && policy.reason(
+                    candidate.modified(&entries, &orphans),
+                    candidate.protected(&entries, &orphans, &access),
+                    0,
+                ) == Some(CollectionReason::MaximumAge)
+        })
+        .count();
     let dry_run = options.mode == GcMode::DryRun;
     let live_manifests =
         retained_chunked_manifests(&entries, &orphans, &selected).collect::<BTreeSet<_>>();
@@ -794,6 +934,8 @@ fn run_chunked<'storage>(
     Ok(CollectedPass {
         permit,
         report: chunked_report(ChunkedGcReportInput {
+            pending_expired,
+            limit_reached,
             before_entries: &entries,
             before_bytes,
             after_bytes,
@@ -1029,6 +1171,7 @@ fn scan_chunked(
             }
         };
         entries.push(ChunkedEntry {
+            last_use: modified,
             store,
             store_path,
             references,
@@ -1257,24 +1400,7 @@ fn select_chunked(
     policy: RetentionPolicy,
     access: &CollectionAccess<'_>,
 ) -> Result<ChunkedSelection, StorageError> {
-    let mut order = entries
-        .iter()
-        .enumerate()
-        .map(|(index, _)| ChunkedCandidate::Entry(index))
-        .chain(
-            orphans
-                .manifests
-                .iter()
-                .enumerate()
-                .map(|(index, _)| ChunkedCandidate::Manifest(index)),
-        )
-        .chain(
-            orphans
-                .outputs
-                .iter()
-                .enumerate()
-                .map(|(index, _)| ChunkedCandidate::Output(index)),
-        )
+    let mut order = chunked_candidates(entries, orphans)
         .filter(|candidate| {
             policy
                 .reason(
@@ -1286,8 +1412,8 @@ fn select_chunked(
         })
         .collect::<Vec<_>>();
     order.sort_unstable_by(|left, right| {
-        left.modified(entries, orphans)
-            .cmp(&right.modified(entries, orphans))
+        left.eviction_time(entries, orphans, policy.budget.eviction_order)
+            .cmp(&right.eviction_time(entries, orphans, policy.budget.eviction_order))
             .then_with(|| {
                 left.name(entries, orphans)
                     .cmp(right.name(entries, orphans))
@@ -1304,8 +1430,13 @@ fn select_chunked(
     let mut selected = ChunkedSelection::default();
     maximum_age
         .into_iter()
+        .take(policy.budget.remaining_deletions(0))
         .for_each(|candidate| selected.include(candidate));
-    for candidate in pressure_candidates {
+    let age_selected = selected.entries.len() + selected.manifests.len() + selected.outputs.len();
+    for candidate in pressure_candidates
+        .into_iter()
+        .take(policy.budget.remaining_deletions(age_selected))
+    {
         let remaining = chunked_projected_bytes(chunk_store, entries, orphans, &selected)?;
         if policy
             .reason(
@@ -1321,7 +1452,38 @@ fn select_chunked(
     Ok(selected)
 }
 
+fn chunked_candidates(
+    entries: &[ChunkedEntry],
+    orphans: &ChunkedOrphans,
+) -> impl Iterator<Item = ChunkedCandidate> {
+    (0..entries.len())
+        .map(ChunkedCandidate::Entry)
+        .chain((0..orphans.manifests.len()).map(ChunkedCandidate::Manifest))
+        .chain((0..orphans.outputs.len()).map(ChunkedCandidate::Output))
+}
+
 impl ChunkedCandidate {
+    fn selected(self, selection: &ChunkedSelection) -> bool {
+        match self {
+            Self::Entry(index) => selection.entries.contains(&index),
+            Self::Manifest(index) => selection.manifests.contains(&index),
+            Self::Output(index) => selection.outputs.contains(&index),
+        }
+    }
+    fn eviction_time(
+        self,
+        entries: &[ChunkedEntry],
+        orphans: &ChunkedOrphans,
+        order: EvictionOrder,
+    ) -> SystemTime {
+        match (self, order) {
+            (Self::Entry(index), EvictionOrder::LastUse) => entries[index].last_use,
+            (_, EvictionOrder::Publication)
+            | (Self::Manifest(_) | Self::Output(_), EvictionOrder::LastUse) => {
+                self.modified(entries, orphans)
+            }
+        }
+    }
     fn modified(self, entries: &[ChunkedEntry], orphans: &ChunkedOrphans) -> SystemTime {
         match self {
             Self::Entry(index) => entries[index].modified,
@@ -1435,6 +1597,12 @@ fn apply_marked_chunked(
     if !selected.entries.is_empty() {
         root.sync_all()?;
     }
+    selected.entries.iter().for_each(|&index| {
+        super::access::forget(
+            &root,
+            super::access::AccessKey::Publication(entries[index].store),
+        );
+    });
     let selected_outputs = selected
         .entries
         .iter()
@@ -1462,11 +1630,11 @@ fn apply_marked_chunked(
         )
         .collect::<BTreeSet<_>>();
     let mut deleted_outputs = 0;
-    for name in selected_outputs {
-        if live_outputs.contains(&name) {
+    for name in &selected_outputs {
+        if live_outputs.contains(name) {
             continue;
         }
-        match unlink_at(&nar_directory, &name) {
+        match unlink_at(&nar_directory, name) {
             Ok(()) => deleted_outputs += 1,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -1475,7 +1643,26 @@ fn apply_marked_chunked(
     if deleted_outputs > 0 {
         nar_directory.sync_all()?;
     }
+    selected_outputs
+        .iter()
+        .filter(|name| !live_outputs.contains(*name))
+        .filter_map(|name| payload_access_key(name))
+        .for_each(|key| super::access::forget(&root, key));
     let sweep = sweep.sweep().map_err(chunk_store_error)?;
+    let retained = retained_chunked_manifests(entries, orphans, selected).collect::<BTreeSet<_>>();
+    entries
+        .iter()
+        .map(|entry| entry.raw_hash)
+        .chain(orphans.manifests.iter().map(|manifest| manifest.hash))
+        .filter(|hash| !retained.contains(hash))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .for_each(|hash| {
+            super::access::forget(
+                &root,
+                super::access::AccessKey::Payload(NarFileName::raw(hash)),
+            )
+        });
     Ok((
         selected.entries.len(),
         sweep.deleted_manifests,
@@ -1515,6 +1702,9 @@ fn chunked_report(input: ChunkedGcReportInput<'_>) -> GcReport {
     let deleted_nars = input.deleted.1;
     let deleted_orphans = input.deleted.2;
     GcReport {
+        pending_expired: input.pending_expired,
+        limit_reached: input.limit_reached,
+        physical_space: PhysicalSpaceReport::default(),
         accounting_basis: AccountingBasis::Logical,
         dry_run: input.dry_run,
         before_bytes: input.before_bytes,
@@ -1811,6 +2001,74 @@ fn reference_counts(entries: &[Entry]) -> BTreeMap<OsString, u64> {
     references
 }
 
+fn flat_eviction_time(entry: &Entry, order: EvictionOrder) -> SystemTime {
+    match order {
+        EvictionOrder::Publication => entry.modified,
+        EvictionOrder::LastUse => entry.last_use,
+    }
+}
+
+fn flat_retention_has_remaining_candidates(
+    entries: &[Entry],
+    selected: &[usize],
+    orphans: &[Orphan],
+    selected_orphans: &[usize],
+    remaining: u64,
+    policy: RetentionPolicy,
+    access: &CollectionAccess<'_>,
+) -> bool {
+    entries.iter().enumerate().any(|(index, entry)| {
+        !selected.contains(&index)
+            && policy
+                .reason(entry.modified, entry.protected, remaining)
+                .is_some()
+    }) || orphans.iter().enumerate().any(|(index, orphan)| {
+        !selected_orphans.contains(&index)
+            && policy
+                .reason(
+                    orphan.modified,
+                    access.protects_nar_name(&orphan.name),
+                    remaining,
+                )
+                .is_some()
+    })
+}
+
+fn payload_access_key(name: &OsStr) -> Option<super::access::AccessKey> {
+    name.to_str()
+        .and_then(|name| NarFileName::parse(name).ok())
+        .map(super::access::AccessKey::Payload)
+}
+
+fn update_flat_last_use(storage: &Storage, entries: &mut [Entry]) {
+    entries.iter_mut().for_each(|entry| {
+        let keys = std::iter::once(super::access::AccessKey::Publication(entry.store))
+            .chain(entry_payload_names(entry).filter_map(|name| payload_access_key(name)));
+        entry.last_use = super::access::last_use(&storage.root, keys)
+            .unwrap_or(entry.modified)
+            .max(entry.modified);
+    })
+}
+
+fn update_chunked_last_use(storage: &Storage, entries: &mut [ChunkedEntry]) {
+    entries.iter_mut().for_each(|entry| {
+        let keys = [
+            super::access::AccessKey::Publication(entry.store),
+            super::access::AccessKey::Payload(NarFileName::raw(entry.raw_hash)),
+        ]
+        .into_iter()
+        .chain(
+            entry
+                .output_name
+                .iter()
+                .filter_map(|name| payload_access_key(name)),
+        );
+        entry.last_use = super::access::last_use(&storage.root, keys)
+            .unwrap_or(entry.modified)
+            .max(entry.modified);
+    })
+}
+
 fn select(entries: &[Entry], current_bytes: u64, policy: RetentionPolicy) -> Vec<usize> {
     let mut references = reference_counts(entries);
     let sizes = payload_sizes(entries);
@@ -1825,36 +2083,34 @@ fn select(entries: &[Entry], current_bytes: u64, policy: RetentionPolicy) -> Vec
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     order.sort_unstable_by(|&left, &right| {
-        entries[left]
-            .modified
-            .cmp(&entries[right].modified)
+        flat_eviction_time(&entries[left], policy.budget.eviction_order)
+            .cmp(&flat_eviction_time(
+                &entries[right],
+                policy.budget.eviction_order,
+            ))
             .then_with(|| entries[left].store.cmp(&entries[right].store))
     });
 
     let mut remaining = current_bytes;
-    let mut selected = Vec::new();
-    for index in order {
-        let entry = &entries[index];
-        if policy
-            .reason(entry.modified, entry.protected, remaining)
-            .is_none()
-        {
-            continue;
-        }
-
-        selected.push(index);
-        remaining = remaining.saturating_sub(entry.narinfo_bytes);
-        for name in entry_payload_names(entry) {
-            let count = references
-                .get_mut(name)
-                .expect("scanned payload reference count");
-            *count -= 1;
-            if *count == 0 {
-                remaining = remaining.saturating_sub(sizes[name]);
+    order
+        .into_iter()
+        .filter_map(|index| {
+            let entry = &entries[index];
+            policy.reason(entry.modified, entry.protected, remaining)?;
+            remaining = remaining.saturating_sub(entry.narinfo_bytes);
+            for name in entry_payload_names(entry) {
+                let count = references
+                    .get_mut(name)
+                    .expect("scanned payload reference count");
+                *count -= 1;
+                if *count == 0 {
+                    remaining = remaining.saturating_sub(sizes[name]);
+                }
             }
-        }
-    }
-    selected
+            Some(index)
+        })
+        .take(policy.budget.remaining_deletions(0))
+        .collect()
 }
 
 fn select_orphans(
@@ -1862,6 +2118,7 @@ fn select_orphans(
     current_bytes: u64,
     policy: RetentionPolicy,
     access: &CollectionAccess<'_>,
+    remaining_deletions: usize,
 ) -> Vec<usize> {
     let mut order = orphans
         .iter()
@@ -1885,23 +2142,20 @@ fn select_orphans(
     });
 
     let mut remaining = current_bytes;
-    let mut selected = Vec::new();
-    for index in order {
-        let orphan = &orphans[index];
-        if policy
-            .reason(
+    order
+        .into_iter()
+        .filter_map(|index| {
+            let orphan = &orphans[index];
+            policy.reason(
                 orphan.modified,
                 access.protects_nar_name(&orphan.name),
                 remaining,
-            )
-            .is_none()
-        {
-            continue;
-        }
-        selected.push(index);
-        remaining = remaining.saturating_sub(orphan.bytes);
-    }
-    selected
+            )?;
+            remaining = remaining.saturating_sub(orphan.bytes);
+            Some(index)
+        })
+        .take(remaining_deletions)
+        .collect()
 }
 
 fn logical_after_bytes(
@@ -1992,6 +2246,7 @@ fn apply_with_checkpoint(
         unlink_at(&root, &entry.narinfo_name)?;
         checkpoint(FailurePoint::AfterNarinfoDeleteBeforeSync)?;
         root.sync_all()?;
+        super::access::forget(&root, super::access::AccessKey::Publication(entry.store));
         checkpoint(FailurePoint::AfterNarinfoSyncBeforeNarDelete)?;
         let mut deleted_payload = false;
         let mut deleted_raw_nar = false;
@@ -2010,6 +2265,10 @@ fn apply_with_checkpoint(
         }
         if deleted_payload {
             nar_directory.sync_all()?;
+            entry_payload_names(entry)
+                .filter(|name| references[*name] == 0)
+                .filter_map(|name| payload_access_key(name))
+                .for_each(|key| super::access::forget(&root, key));
         }
         if deleted_raw_nar {
             deleted_nars += 1;
@@ -2040,6 +2299,10 @@ fn apply_orphans_with_failure(
     if !selected.is_empty() {
         nar_directory.sync_all()?;
     }
+    selected
+        .iter()
+        .filter_map(|&index| payload_access_key(&orphans[index].name))
+        .for_each(|key| super::access::forget(&storage.root, key));
     Ok(selected.len())
 }
 
@@ -2075,6 +2338,416 @@ mod tests {
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
         CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
             .and_then(|creation| creation.create_or_complete())
+    }
+
+    #[test]
+    fn a_physical_pressure_cycle_keeps_collecting_between_minimum_and_target() {
+        let (directory, storage, _) = scannable_pair_fixture();
+        write_signed_raw_metadata(
+            directory.path(),
+            TEST_SECOND_STORE_HASH,
+            crate::object::NarIdentity::new(
+                NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+                3.into(),
+            ),
+            Vec::new(),
+        );
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let mut deleted = 0;
+        for (before, after) in [(80, 150), (150, 200)] {
+            let mut options = online_options(directory.path());
+            options.target_bytes = None;
+            options.retention = RetentionOptions {
+                max_deletions: std::num::NonZeroUsize::new(1),
+                free_space: Some(FreeSpaceThresholds::new(100, 200).unwrap()),
+                ..Default::default()
+            };
+            let mut measurements = [before, after].into_iter();
+            let report = run_with_capacity_measurement(
+                options,
+                &storage,
+                &trusted,
+                CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
+                |storage| {
+                    let mut capacity = storage.capacity()?;
+                    capacity.available_bytes = measurements.next().unwrap();
+                    Ok(capacity)
+                },
+            )
+            .unwrap();
+            deleted += report.deleted_narinfos;
+        }
+        assert_eq!(
+            deleted, 2,
+            "an unfinished cycle must not become idle merely because the minimum was crossed"
+        );
+    }
+
+    #[test]
+    fn skipped_pressure_candidates_do_not_spend_the_deletion_budget_before_expired_entries() {
+        let (_, _, mut entries) = mixed_pair_fixture();
+        let (_, _, third) = pair_fixture();
+        entries.push(third);
+        let now = UNIX_EPOCH + Duration::from_secs(1000);
+        for (index, entry) in entries.iter_mut().enumerate() {
+            entry.last_use = UNIX_EPOCH + Duration::from_secs(100 * (index as u64 + 1));
+            entry.modified = if index == 2 {
+                UNIX_EPOCH
+            } else {
+                now - Duration::from_secs(10)
+            };
+        }
+        let policy = RetentionPolicy {
+            budget: RetentionOptions {
+                eviction_order: EvictionOrder::LastUse,
+                max_deletions: std::num::NonZeroUsize::new(2),
+                ..Default::default()
+            },
+            ..RetentionPolicy::for_limits(
+                100,
+                Some(92),
+                None,
+                Some(Duration::from_secs(500)),
+                Duration::ZERO,
+                now,
+            )
+        };
+        assert_eq!(
+            select(&entries, 100, policy),
+            [0, 2],
+            "a skipped pressure candidate cannot hide a later expired publication"
+        );
+    }
+
+    #[test]
+    fn passive_payload_size_inspection_does_not_record_read_use() {
+        let (_directory, storage, entry) = scannable_pair_fixture();
+        storage.enable_access_tracking().unwrap();
+        let name = NarFileName::parse(entry.nar_name.to_str().unwrap()).unwrap();
+        assert_eq!(storage.nar_size(name).unwrap(), Some(3));
+        let opened = storage.open_nar_range(name, 0..3).unwrap().unwrap();
+        assert_eq!(
+            super::super::access::last_use(
+                &storage.root,
+                [super::super::access::AccessKey::Payload(name)]
+            ),
+            None
+        );
+        opened.record_served_access(&storage, name);
+        assert!(
+            super::super::access::last_use(
+                &storage.root,
+                [super::super::access::AccessKey::Payload(name)]
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn advisory_access_cleanup_cannot_interrupt_authoritative_gc_deletion() {
+        let (directory, storage, entry) = pair_fixture();
+        storage.enable_access_tracking().unwrap();
+        fs::create_dir(
+            directory
+                .path()
+                .join(super::super::access::ACCESS_DIRECTORY)
+                .join(&entry.narinfo_name),
+        )
+        .unwrap();
+        apply(&storage, &[entry], &[0]).expect(
+            "a malformed access hint must not interrupt metadata fsync and payload deletion",
+        );
+        assert!(
+            !directory
+                .path()
+                .join(format!("{TEST_STORE_HASH}.narinfo"))
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(format!("nar/{TEST_NAR_ID}.nar"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn bounded_physical_pressure_reports_measured_capacity_not_logical_reclamation() {
+        for after in [80, 180] {
+            let (directory, storage, _) = scannable_pair_fixture();
+            write_signed_raw_metadata(
+                directory.path(),
+                TEST_SECOND_STORE_HASH,
+                crate::object::NarIdentity::new(
+                    NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+                    3.into(),
+                ),
+                Vec::new(),
+            );
+            let trusted =
+                TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+            let mut options = online_options(directory.path());
+            options.target_bytes = None;
+            options.retention = RetentionOptions {
+                max_deletions: std::num::NonZeroUsize::new(1),
+                free_space: Some(FreeSpaceThresholds::new(100, 180).unwrap()),
+                ..Default::default()
+            };
+            let mut measurements = [80, after].into_iter();
+            let report = run_with_capacity_measurement(
+                options,
+                &storage,
+                &trusted,
+                CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
+                |storage| {
+                    let mut capacity = storage.capacity()?;
+                    capacity.available_bytes = measurements
+                        .next()
+                        .expect("one pre-pass and one post-pass measurement");
+                    Ok(capacity)
+                },
+            )
+            .unwrap();
+            assert_eq!(report.deleted_narinfos, 1);
+            assert!(
+                report.limit_reached,
+                "the bounded batch leaves another pressure candidate"
+            );
+            assert_eq!(
+                report.target_met,
+                after >= 180,
+                "a cap does not override a satisfied physical target or invent snapshot reclamation"
+            );
+            assert!(measurements.next().is_none());
+            match report.physical_space {
+                PhysicalSpaceReport::Pressure {
+                    before_bytes,
+                    after_bytes,
+                    target_bytes,
+                } => assert_eq!((before_bytes, after_bytes, target_bytes), (80, after, 180)),
+                _ => panic!("physical pressure must be reported explicitly"),
+            }
+        }
+    }
+
+    #[test]
+    fn capped_age_only_collection_reports_remaining_expiration_work() {
+        let (directory, storage, _) = scannable_pair_fixture();
+        write_signed_raw_metadata(
+            directory.path(),
+            TEST_SECOND_STORE_HASH,
+            crate::object::NarIdentity::new(
+                NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+                3.into(),
+            ),
+            Vec::new(),
+        );
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let mut options = online_options(directory.path());
+        options.target_bytes = None;
+        options.max_age = Some(Duration::ZERO);
+        options.retention.max_deletions = std::num::NonZeroUsize::new(1);
+        let report = run_with_access(
+            options,
+            &storage,
+            &trusted,
+            CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(report.pending_expired, 1);
+        assert!(report.limit_reached);
+        assert!(
+            !report.target_met,
+            "age-only passes must not claim they expired everything after reaching the cap"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chunked_age_and_pressure_selection_share_one_budget_across_orphan_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = initialize_chunked_storage(directory.path()).unwrap();
+        let orphans = ChunkedOrphans {
+            outputs: (0..3)
+                .map(|index| Orphan {
+                    name: NarFileName::raw(NarHash::from_digest([index; 32]))
+                        .to_string()
+                        .into(),
+                    bytes: 100,
+                    modified: UNIX_EPOCH,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for max_age in [None, Some(Duration::ZERO)] {
+            let options = GcOptions {
+                max_age,
+                retention: RetentionOptions {
+                    max_deletions: std::num::NonZeroUsize::new(1),
+                    ..Default::default()
+                },
+                ..online_options(directory.path())
+            };
+            let selected = select_chunked(
+                storage.chunk_store().unwrap(),
+                &[],
+                &orphans,
+                300,
+                RetentionPolicy::new(&options, 300, Some(0), SystemTime::now()),
+                &CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(selected.outputs.len(), 1);
+            assert!(selected.entries.is_empty() && selected.manifests.is_empty());
+        }
+    }
+
+    #[test]
+    fn last_use_orders_pressure_eviction_without_redefining_publication_age() {
+        let (directory, storage, original) = scannable_pair_fixture();
+        write_signed_raw_metadata(
+            directory.path(),
+            TEST_SECOND_STORE_HASH,
+            crate::object::NarIdentity::new(
+                NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+                3.into(),
+            ),
+            Vec::new(),
+        );
+        let old = SystemTime::now() - Duration::from_secs(86400);
+        File::open(directory.path().join(&original.narinfo_name))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        File::open(
+            directory
+                .path()
+                .join(format!("{TEST_SECOND_STORE_HASH}.narinfo")),
+        )
+        .unwrap()
+        .set_modified(old + Duration::from_secs(10))
+        .unwrap();
+        storage.enable_access_tracking().unwrap();
+        assert!(
+            storage
+                .read_advertised_narinfo(&original.store)
+                .unwrap()
+                .is_some()
+        );
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let mut entries = scan(&storage, &trusted).unwrap();
+        update_flat_last_use(&storage, &mut entries);
+        let options = GcOptions {
+            retention: RetentionOptions {
+                eviction_order: EvictionOrder::LastUse,
+                max_deletions: std::num::NonZeroUsize::new(1),
+                ..Default::default()
+            },
+            ..online_options(directory.path())
+        };
+        let policy =
+            RetentionPolicy::new(&options, total_bytes(&entries), Some(0), SystemTime::now());
+        let selected = select(&entries, total_bytes(&entries), policy);
+        assert_eq!(
+            entries[selected[0]].store.as_str(),
+            TEST_SECOND_STORE_HASH,
+            "the recently read oldest publication is retained under pressure"
+        );
+        let aged = RetentionPolicy {
+            max_age: Some(Duration::from_secs(60)),
+            budget: RetentionOptions {
+                max_deletions: None,
+                ..options.retention
+            },
+            ..policy
+        };
+        assert_eq!(
+            select(&entries, total_bytes(&entries), aged).len(),
+            2,
+            "maximum publication age still expires hot and cold entries"
+        );
+    }
+
+    #[test]
+    fn a_bounded_apply_matches_its_projection_and_retains_shared_payloads() {
+        let (directory, storage, original) = scannable_pair_fixture();
+        write_signed_raw_metadata(
+            directory.path(),
+            TEST_SECOND_STORE_HASH,
+            crate::object::NarIdentity::new(
+                NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+                3.into(),
+            ),
+            Vec::new(),
+        );
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let mut options = online_options(directory.path());
+        options.retention.max_deletions = std::num::NonZeroUsize::new(1);
+        let report = run_with_access(
+            options,
+            &storage,
+            &trusted,
+            CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(report.deleted_narinfos, 1);
+        assert_eq!(report.deleted_nars, 0);
+        assert!(report.limit_reached);
+        assert!(!report.target_met);
+        assert_eq!(
+            report.after_bytes,
+            total_bytes(&scan(&storage, &trusted).unwrap())
+        );
+        assert!(
+            directory
+                .path()
+                .join("nar")
+                .join(original.nar_name)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_flat_pass_caps_publication_deletions_even_when_its_byte_target_is_unmet() {
+        let (_, _, entry) = pair_fixture();
+        let entries = [entry];
+        let policy = RetentionPolicy {
+            budget: RetentionOptions {
+                max_deletions: std::num::NonZeroUsize::new(1),
+                ..Default::default()
+            },
+            ..RetentionPolicy::for_limits(
+                100,
+                Some(0),
+                None,
+                None,
+                Duration::ZERO,
+                SystemTime::now(),
+            )
+        };
+        let selected = select(&entries, 100, policy);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(policy.budget.remaining_deletions(selected.len()), 0);
+        let orphans = [Orphan {
+            name: OsString::from("orphan"),
+            bytes: 100,
+            modified: UNIX_EPOCH,
+        }];
+        let directory = tempfile::tempdir().unwrap();
+        let storage = initialize_storage(directory.path()).unwrap();
+        let access = CollectionAccess::Offline(storage.collection.snapshot().unwrap());
+        let exhausted_policy = RetentionPolicy {
+            budget: RetentionOptions {
+                max_deletions: std::num::NonZeroUsize::new(1),
+                ..Default::default()
+            },
+            ..policy
+        };
+        let selected_orphans = select_orphans(&orphans, 100, exhausted_policy, &access, 0);
+        assert!(
+            selected_orphans.is_empty(),
+            "the publication used the pass's only deletion slot"
+        );
     }
 
     #[test]
@@ -2272,6 +2945,7 @@ mod tests {
     fn flat_and_chunked_gc_both_wait_until_maximum_pressure_is_crossed() {
         let now = SystemTime::now();
         let mut flat_entries = [Entry {
+            last_use: UNIX_EPOCH,
             store: StoreHash::parse(TEST_STORE_HASH).unwrap(),
             store_path: String::new(),
             references: Vec::new(),
@@ -2289,6 +2963,7 @@ mod tests {
                 &flat_entries,
                 100,
                 RetentionPolicy {
+                    budget: Default::default(),
                     pressure_target: None,
                     max_age: None,
                     min_age: Duration::ZERO,
@@ -2302,6 +2977,7 @@ mod tests {
                 &flat_entries,
                 100,
                 RetentionPolicy {
+                    budget: Default::default(),
                     pressure_target: Some(0),
                     max_age: None,
                     min_age: Duration::ZERO,
@@ -2337,6 +3013,7 @@ mod tests {
         let chunk_store = storage.chunk_store().unwrap();
         let physical = chunk_store.physical_bytes().unwrap();
         let mut entries = [ChunkedEntry {
+            last_use: UNIX_EPOCH,
             store: StoreHash::parse(TEST_STORE_HASH).unwrap(),
             store_path: String::new(),
             references: Vec::new(),
@@ -2476,6 +3153,7 @@ mod tests {
         .expect("default trust configuration should load");
         let result = run_flat_gc(
             GcOptions {
+                retention: Default::default(),
                 data_dir: directory.path().to_owned(),
                 max_bytes: None,
                 target_bytes: Some(0),
@@ -2526,6 +3204,7 @@ mod tests {
         fs::write(&nar_path, b"nar").expect("NAR should be written");
 
         let entry = Entry {
+            last_use: UNIX_EPOCH,
             store,
             store_path: format!("/nix/store/{TEST_STORE_HASH}-narjar"),
             references: Vec::new(),
@@ -2552,6 +3231,7 @@ mod tests {
             .expect("Zstd NAR should be written");
 
         let raw_entry = Entry {
+            last_use: UNIX_EPOCH,
             store: StoreHash::parse(TEST_STORE_HASH).expect("store hash should parse"),
             store_path: format!("/nix/store/{TEST_STORE_HASH}-narjar"),
             references: Vec::new(),
@@ -2565,6 +3245,7 @@ mod tests {
             protected: false,
         };
         let compressed_entry = Entry {
+            last_use: UNIX_EPOCH,
             store: StoreHash::parse(TEST_SECOND_STORE_HASH)
                 .expect("second store hash should parse"),
             store_path: format!("/nix/store/{TEST_SECOND_STORE_HASH}-narjar"),
@@ -2688,6 +3369,7 @@ mod tests {
 
         let report = run_flat_gc(
             GcOptions {
+                retention: Default::default(),
                 data_dir: directory.path().to_owned(),
                 max_bytes: None,
                 target_bytes: Some(0),
@@ -2769,6 +3451,7 @@ mod tests {
 
     fn online_options(directory: &Path) -> GcOptions {
         GcOptions {
+            retention: Default::default(),
             data_dir: directory.to_owned(),
             max_bytes: None,
             target_bytes: Some(0),
@@ -3481,6 +4164,7 @@ mod tests {
         drop(storage);
 
         let report = run(GcOptions {
+            retention: Default::default(),
             data_dir: directory.path().to_owned(),
             max_bytes: None,
             target_bytes: Some(0),
@@ -3540,6 +4224,7 @@ mod tests {
 
         let grace = Duration::from_secs(24 * 60 * 60);
         let gc_options = |mode| GcOptions {
+            retention: Default::default(),
             data_dir: directory.path().to_owned(),
             max_bytes: Some(1),
             target_bytes: Some(0),
@@ -3640,6 +4325,7 @@ mod tests {
             drop(storage);
 
             let gc_options = |mode| GcOptions {
+                retention: Default::default(),
                 data_dir: directory.path().to_owned(),
                 max_bytes: None,
                 target_bytes: None,
@@ -3724,6 +4410,7 @@ mod tests {
 
         let now = SystemTime::now();
         let entries = [ChunkedEntry {
+            last_use: UNIX_EPOCH,
             store: StoreHash::parse(TEST_STORE_HASH).unwrap(),
             store_path: String::new(),
             references: Vec::new(),
@@ -3886,6 +4573,7 @@ mod tests {
             .recover_for_mutation(&trusted)
             .expect("probe should start with recovered storage");
         let options = GcOptions {
+            retention: Default::default(),
             data_dir: path.into(),
             max_bytes: None,
             target_bytes: Some(0),

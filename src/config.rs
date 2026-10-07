@@ -15,6 +15,7 @@ use crate::native_store::{NativeStoreOptions, NativeStoreSettings};
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
+    pub(crate) track_access: bool,
     pub(crate) data_dir: PathBuf,
     pub(crate) listen: SocketAddr,
     pub(crate) workers: NonZeroUsize,
@@ -171,6 +172,9 @@ impl ServeSourceChoice {
 
 #[derive(Args)]
 pub(crate) struct ServeArgs {
+    /// Record coalesced read-use hints for last-use GC ordering.
+    #[arg(long, env = "NARJAR_TRACK_ACCESS")]
+    track_access: bool,
     #[arg(long, env = "NARJAR_DATA_DIR", value_parser = non_empty_path)]
     data_dir: PathBuf,
     #[arg(long, env = "NARJAR_LISTEN", default_value = "127.0.0.1:5000")]
@@ -245,6 +249,7 @@ impl TryFrom<ServeArgs> for ServeConfig {
         )
         .map_err(|error| error.to_string())?;
         Ok(Self {
+            track_access: args.track_access,
             data_dir: args.data_dir,
             listen: args.listen,
             workers: args.workers,

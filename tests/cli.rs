@@ -35,6 +35,7 @@ const CONFIG_ENV: &[&str] = &[
     "NARJAR_MAX_NAR_BYTES",
     "NARJAR_MIN_FREE_BYTES",
     "NARJAR_EGRESS_COMPRESSION",
+    "NARJAR_TRACK_ACCESS",
     "NARJAR_SHUTDOWN_GRACE_SECONDS",
     "NARJAR_IO_TIMEOUT_SECONDS",
     "NARJAR_PUSH_TIMEOUT_SECONDS",
@@ -2384,6 +2385,77 @@ fn gc_delete_older_than_rejects_invalid_periods_and_conflicting_age_units() {
             "the days flag must be recognized; invalid values fail during argument parsing"
         );
     }
+}
+
+#[test]
+fn unattended_retention_rejects_partial_unbounded_and_invalid_cli_policies() {
+    for policy in [
+        vec!["--min-free-bytes", "10"],
+        vec!["--min-free-bytes", "10", "--target-free-bytes", "20"],
+        vec!["--max-deletions", "0"],
+        vec!["--eviction-order", "unknown"],
+        vec!["--online", "--retry-attempts", "0"],
+        vec!["--online", "--retry-attempts", "17"],
+        vec!["--online", "--retry-delay-millis", "30001"],
+        vec!["--retry-attempts", "2"],
+        vec![
+            "--min-free-bytes",
+            "20",
+            "--target-free-bytes",
+            "10",
+            "--max-deletions",
+            "1",
+        ],
+    ] {
+        let result = run(&[
+            vec!["gc", "--data-dir", "/unused-cache", "--target-bytes", "0"],
+            policy,
+        ]
+        .concat());
+        assert!(!result.status.success());
+        assert!(
+            !String::from_utf8_lossy(&result.stderr).contains("unexpected argument"),
+            "every retention option must be recognized"
+        );
+        assert!(
+            !String::from_utf8_lossy(&result.stderr).contains("No such file"),
+            "invalid policy must fail before opening storage"
+        );
+    }
+}
+
+#[test]
+fn read_use_hints_are_only_created_for_successfully_resolved_http_payloads() {
+    let server = RunningServer::start_with_args("read-use-hints", &["--track-access"]);
+    let path = format!("/nar/{NARJAR_HASH}.nar");
+    let upload = server.request_with_body("PUT", &path, &[], NAR_BYTES);
+    assert!(
+        upload.starts_with(b"HTTP/1.1 201"),
+        "{}",
+        String::from_utf8_lossy(&upload)
+    );
+    let hint = server
+        .data_dir
+        .join(".narjar-access")
+        .join(format!("{NARJAR_HASH}.nar"));
+    assert!(!hint.exists(), "upload and validation are not reads");
+    let rejected = server.request_with_headers("GET", &path, &[("Range", "bytes=99-100")]);
+    assert!(rejected.starts_with(b"HTTP/1.1 416"));
+    assert!(!hint.exists(), "unsatisfiable range must not record use");
+    let head = server.request("HEAD", &path);
+    assert!(head.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(fs::metadata(&hint).unwrap().len(), 0);
+    let previous = fs::metadata(&hint).unwrap().modified().unwrap();
+    let get = server.request("GET", &path);
+    assert!(get.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(
+        fs::metadata(&hint).unwrap().modified().unwrap(),
+        previous,
+        "a repeated request is coalesced"
+    );
+    let range = server.request_with_headers("GET", &path, &[("Range", "bytes=1-2")]);
+    assert!(range.starts_with(b"HTTP/1.1 206"));
+    assert_eq!(fs::metadata(&hint).unwrap().modified().unwrap(), previous);
 }
 
 #[test]
@@ -7873,6 +7945,7 @@ fn library_gc_requires_the_same_private_policies_as_startup_before_either_mode()
     let data_dir = init_data_dir("library-gc-required-policies");
     let collect = |mode| {
         narjar::__private::storage::gc::run(GcOptions {
+            retention: Default::default(),
             data_dir: data_dir.path().to_owned(),
             max_bytes: None,
             target_bytes: Some(0),
@@ -7935,6 +8008,7 @@ fn library_gc_dry_run_preserves_pending_recovery_state() {
         .expect("recovery marker should be private");
 
     let report = narjar::__private::storage::gc::run(GcOptions {
+        retention: Default::default(),
         data_dir: data_dir.path().to_owned(),
         max_bytes: None,
         target_bytes: Some(0),

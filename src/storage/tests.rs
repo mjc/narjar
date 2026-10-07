@@ -283,6 +283,7 @@ fn online_gc_cannot_sweep_incrementally_published_chunks_before_ingestion_commit
         crate::narinfo::TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap())
             .unwrap();
     let online_options = || super::gc::GcOptions {
+        retention: Default::default(),
         data_dir: directory.path().to_owned(),
         max_bytes: None,
         target_bytes: Some(0),
@@ -845,6 +846,45 @@ fn compressed_delivery_rejects_same_size_corruption() {
         storage.open_nar_range(name, 0..encoded_size.get()),
         Err(StorageError::NarMismatch)
     ));
+}
+
+#[test]
+fn serving_a_compressed_derivative_records_use_of_its_shared_canonical_nar() {
+    for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
+        let (_directory, storage) = flat_storage_fixture();
+        storage.enable_access_tracking().unwrap();
+        let raw = vec![b'c'; 4096];
+        let identity = upload_raw_nar(
+            &storage,
+            &raw,
+            super::NarUploadPolicy::new(raw.len() as u64, 0),
+        );
+        let (name, size) = storage
+            .compressed_representation_for_test(identity, codec, 0)
+            .unwrap();
+        let keys = [
+            super::access::AccessKey::Payload(name),
+            super::access::AccessKey::Payload(NarFileName::raw(identity.hash())),
+        ];
+        assert_eq!(
+            super::access::last_use(&storage.root, keys),
+            None,
+            "materialization is not a client read"
+        );
+        let opened = storage
+            .open_nar_range(name, 0..size.get())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::access::last_use(&storage.root, keys),
+            None,
+            "inspection must remain passive"
+        );
+        opened.record_served_access(&storage, name);
+        for key in keys {
+            assert!(super::access::last_use(&storage.root, [key]).is_some());
+        }
+    }
 }
 
 fn compressed_bytes(encoding: WireEncoding, raw: &[u8]) -> Vec<u8> {
