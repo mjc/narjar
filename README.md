@@ -1,14 +1,11 @@
 # narjar
 
-A filesystem-backed HTTP binary cache for Nix, written in Rust.
+A filesystem-backed HTTP binary cache for Nix, written in Rust with low memory usage.
 
-Narjar stores Nix build outputs and serves them through the binary cache
-protocol. It includes a cache server, a parallel closure uploader, and
-commands for verification and garbage collection. The server runs without a
-Nix installation or a database.
-
-Uploads and downloads support uncompressed NARs, Zstd, and XZ. Upload
-compression, storage layout, and download compression are configured separately.
+Run your own binary cache and manage cached data from the command line.
+The server runs without a Nix installation or a database. Use `narjar push`
+with your existing Nix installation to upload store paths and their dependencies.
+Uploads and downloads support uncompressed NARs, Zstd, and XZ.
 
 ## Installation
 
@@ -39,9 +36,8 @@ nix run github:mjc/narjar -- --help
 
 ## Create a cache
 
-Use `narjar setup` for a standalone first run. It initializes the cache,
-generates a producer key pair and write token, installs the public key in the
-cache, writes a private netrc file, and prints the server and push commands.
+`narjar setup` creates a cache, signing keys, and upload credentials, then prints
+the commands to start the server and upload a store path.
 The data and credentials directories must not already exist; their parent
 directories must exist.
 
@@ -53,53 +49,21 @@ narjar setup \
   --listen 127.0.0.1:5000
 ```
 
-In a terminal, setup asks before creating files. Use `--yes` with explicit
-options in scripts. Defaults are `./narjar-data`, `./narjar-credentials`,
-`http://127.0.0.1:5000`, and `127.0.0.1:5000`. Use `--private-read` to create a
-read token as well as the write token. The private signing key, tokens, and
-netrc are stored outside the cache directory with mode `0600`; the credentials
-directory has mode `0700`. Setup does not start the server.
+Run the server command printed by setup. Setup does not start it for you.
+In a terminal, it asks before creating files; use `--yes` with explicit options
+in scripts. Without options, it uses `./narjar-data`, `./narjar-credentials`,
+`http://127.0.0.1:5000`, and `127.0.0.1:5000`.
+
+The public key is installed in the cache's `trusted-public-keys` file. The
+private key (`producer.sec`), tokens, and netrc file are stored outside the
+cache with mode `0600`; the credentials directory has mode `0700`.
 Keep the credentials directory out of source control and protect its backups.
-The generated netrc is for writes; with `--private-read`, configure consumers
-with the separate `read.token` value.
+Use `--private-read` to create a read token in addition to the write token.
+The generated netrc is for uploads; configure consumers with `read.token`.
+Setup never prints a secret.
 
 Narjar speaks HTTP. For remote access, run it behind a TLS reverse proxy and
-use an HTTPS cache URL. The server verifies metadata with the public keys in
-`trusted-public-keys`; the uploader holds `producer.sec`. Setup prints the
-commands to start the server and push a store path. It never prints a secret.
-
-## NixOS service
-
-The NixOS module initializes the data directory before service startup, installs
-credential files from host paths, and configures the server through native
-options. Secret files must be supplied by a secret manager or another path
-outside the Nix store.
-
-```nix
-services.narjar = {
-  enable = true;
-  dataDir = "/var/lib/narjar";
-  listen = "0.0.0.0:5000";
-  egressCompression = "zstd";
-  storageBackend = "flat";
-  auth = {
-    writeTokens = "/run/secrets/narjar-write.tokens";
-    trustedPublicKeys = "/run/secrets/narjar-trusted-public-keys";
-  };
-};
-```
-
-`writeTokens` is a Narjar token-hash file, and `trustedPublicKeys` contains the
-cache signing public keys. Set `privateRead = true` and `auth.readTokens` to
-require read authentication. The module also exposes `cachePriority`,
-`dynamicUser`, `workers`, `maxInFlight`, `maxNarBytes`,
-`maxEncodedNarBytes`, `maxDecoderMemoryBytes`, `minFreeBytes`,
-`shutdownGraceSeconds`, `ioTimeoutSeconds`, `statsInventory`,
-`statsInventoryIntervalSeconds`, `statsFilesystemSample`, and
-`statsZfsDataset`. Scheduled collection is configured under `gc` with
-`enable`, `schedule`, `maxBytes`, `targetBytes`, `maxAgeSeconds`,
-`minAgeSeconds`, and `protectedRoots`. Initialization, serving, and collection
-use the selected `storageBackend` consistently.
+use an HTTPS cache URL.
 
 ## Push a closure
 
@@ -125,12 +89,9 @@ parallel, up to `--jobs`. It serializes NARs and signs their metadata directly,
 without invoking Nix subprocesses.
 
 The command takes concrete `/nix/store/...` paths. It needs read access to the
-store and its SQLite metadata database, plus access to Nix's rooting mechanism.
-Normal unprivileged users retain temporary roots through the native Nix daemon
-socket for the duration of the push. Direct writable-store access uses a GC
-read lock while registering paths in Nix's locked `temproots/<pid>` file and
-reading metadata. Closing the file releases those roots, including after a
-forced exit; the next Nix GC removes the stale file.
+store and its SQLite metadata database and keeps temporary GC roots for the
+duration of the upload. See [push details](https://github.com/mjc/narjar/blob/main/docs/operations.md#cli)
+for native-store access and rooting.
 
 Netrc credentials are sent over HTTPS unless `--insecure-http` is supplied.
 That flag is needed for the local HTTP example above. Upload requests have a
@@ -171,6 +132,33 @@ using a multi-user installation.
 Nix verifies the producer's signatures. A write token grants upload access;
 it does not replace signature verification.
 
+## NixOS service
+
+The NixOS module initializes the cache and installs credentials before starting
+the server. Secret files must be supplied by a secret manager or another path
+outside the Nix store.
+
+```nix
+services.narjar = {
+  enable = true;
+  dataDir = "/var/lib/narjar";
+  listen = "0.0.0.0:5000";
+  egressCompression = "zstd";
+  storageBackend = "flat";
+  auth = {
+    writeTokens = "/run/secrets/narjar-write.tokens";
+    trustedPublicKeys = "/run/secrets/narjar-trusted-public-keys";
+  };
+};
+```
+
+`writeTokens` is a Narjar token-hash file, and `trustedPublicKeys` contains the
+cache signing public keys. Set `privateRead = true` and `auth.readTokens` to
+require read authentication. The module exposes server limits, metrics, and
+scheduled GC options; see the [module options](https://github.com/mjc/narjar/blob/main/nix/module.nix)
+and [service configuration](https://github.com/mjc/narjar/blob/main/docs/operations.md#deployment).
+Initialization, serving, and collection use the selected `storageBackend`.
+
 ## Storage and compression
 
 The default `flat` backend stores each canonical, uncompressed NAR as a file.
@@ -179,14 +167,13 @@ deduplicates them across objects. Choose it with
 `init --storage-backend chunked`, and pass the same backend to serving and
 maintenance commands. Chunked storage requires Linux; use flat storage on macOS.
 
-`push --compression` controls the uploaded representation.
-`serve --egress-compression` controls the representation advertised to Nix
-clients. Both accept `none`, `zstd`, and `xz`, and default to `none`.
+Upload and download compression are independent: `push --compression` selects
+the upload format, and `serve --egress-compression` selects the download format.
+Both accept `none`, `zstd`, and `xz`, and default to `none`.
 
-Compressed downloads are stored as reusable derivatives of the canonical NAR.
-Narjar rewrites the narinfo transport fields to describe the served bytes while
-preserving the signed NAR identity. Payloads are committed before the metadata
-that references them.
+The server keeps compressed downloads for reuse. Narinfo describes the served
+bytes and retains the original NAR signatures. Payloads are committed before
+the metadata that references them.
 
 Server defaults:
 
@@ -207,16 +194,14 @@ variables.
 
 Compressed uploads are limited by both their encoded size and decoded NAR
 size. XZ dictionary memory and Zstd frame windows are checked against
-`maxDecoderMemoryBytes` before decoder buffers are allocated. Upload decoding
-runs on publication workers, so at most `workers` decoders run at once; the
-configured worst-case decoder working memory is therefore
+`maxDecoderMemoryBytes` before decoder buffers are allocated. At most `workers`
+decoders run at once, with a combined decoder memory limit of
 `workers × maxDecoderMemoryBytes`.
 
 A Linux deployment with 32 workers measured 16,676 KiB (16.3 MiB) process RSS
-after four days of uptime, using flat storage and uncompressed downloads. This is
-an observed footprint, not a peak-memory bound; compressed uploads and
-concurrent requests can increase memory use. Process RSS does not include
-the system's filesystem caches.
+after four days of uptime, using flat storage and uncompressed downloads.
+Compressed uploads and concurrent requests can use more memory. Process RSS
+excludes the system's filesystem caches.
 
 ## Monitoring
 
