@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use clap::Args;
+use clap::{Args, builder::TypedValueParser};
 use data_encoding::BASE64;
 use narjar::__private::{
     inventory::{Inventory, InventoryClass, InventoryEntry, VerificationMode},
@@ -503,10 +503,26 @@ pub(crate) struct Gc {
     #[arg(long)]
     json: bool,
     /// Request collection from the running daemon; never stop it or fall back.
-    #[arg(long)]
-    online: bool,
+    #[arg(long = "online", action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolValueParser::new().map(CollectionExecution::from_online_flag))]
+    execution: CollectionExecution,
     #[arg(long, default_value = "flat")]
     storage_backend: StorageBackend,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionExecution {
+    Offline,
+    Online,
+}
+
+impl CollectionExecution {
+    fn from_online_flag(online: bool) -> Self {
+        match online {
+            false => Self::Offline,
+            true => Self::Online,
+        }
+    }
 }
 
 fn parse_gc_retention_period(value: &str) -> Result<Duration, String> {
@@ -533,7 +549,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         dry_run: _,
         apply,
         json,
-        online,
+        execution,
         storage_backend,
     } = options;
     let maintenance_record = if apply {
@@ -551,9 +567,9 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         mode: if apply { GcMode::Apply } else { GcMode::DryRun },
         backend: storage_backend,
     };
-    let report = match online {
-        true => crate::control::collect(options).map_err(runtime)?,
-        false => {
+    let report = match execution {
+        CollectionExecution::Online => crate::control::collect(options).map_err(runtime)?,
+        CollectionExecution::Offline => {
             let session = MaintenanceSession::open(
                 &options.data_dir,
                 storage_backend,
@@ -1312,6 +1328,24 @@ mod tests {
     }
 
     #[test]
+    fn the_online_flag_is_parsed_into_an_explicit_collection_execution_mode() {
+        use clap::Parser;
+        for (extra_args, expected) in [
+            (vec![], CollectionExecution::Offline),
+            (vec!["--online"], CollectionExecution::Online),
+        ] {
+            let cli = crate::Cli::try_parse_from(
+                [vec!["narjar", "gc", "--data-dir", "/cache"], extra_args].concat(),
+            )
+            .unwrap();
+            let crate::Command::Gc(options) = cli.command else {
+                panic!("GC command")
+            };
+            assert_eq!(options.execution, expected);
+        }
+    }
+
+    #[test]
     fn json_lines_preserve_strings_and_end_with_one_newline() {
         let record = FindingRecord {
             class: "invalid",
@@ -1427,7 +1461,7 @@ machine other.example password other-secret
             dry_run: false,
             apply: false,
             json: false,
-            online: false,
+            execution: CollectionExecution::Offline,
             storage_backend: StorageBackend::Flat,
         })
         .expect("dry-run GC should complete");
@@ -1493,7 +1527,7 @@ machine other.example password other-secret
             dry_run: false,
             apply: false,
             json: false,
-            online: false,
+            execution: CollectionExecution::Offline,
             storage_backend: StorageBackend::Flat,
         });
         assert!(
@@ -1628,7 +1662,7 @@ machine other.example password other-secret
             dry_run: false,
             apply: true,
             json: false,
-            online: false,
+            execution: CollectionExecution::Offline,
             storage_backend: StorageBackend::Flat,
         })
         .expect("GC must recover before applying maintenance");
