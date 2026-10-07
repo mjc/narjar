@@ -169,6 +169,28 @@
       targetBytes = 1000;
     };
   };
+  ageDaysGcConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      maxAgeDays = 7;
+    };
+  };
+  conflictingGcAgeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      maxAgeDays = 7;
+      maxAgeSeconds = 60;
+    };
+  };
+  overflowingGcAgeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      maxAgeDays = 213503982334602;
+    };
+  };
   invalidCompressionConfig = configuration {
     dataDir = "/var/lib/narjar";
     egressCompression = "brotli";
@@ -247,6 +269,11 @@ in
   assert gcThresholdAssertion.message == gcThresholdMessage;
   assert evaluatesConfig equalGcThresholdConfig;
   assert evaluatesConfig lowerGcTargetConfig;
+  assert evaluatesConfig ageDaysGcConfig;
+  assert lib.hasInfix "--delete-older-than 7d" ageDaysGcConfig.systemd.services.narjar-gc.serviceConfig.ExecStart;
+  assert !(lib.hasInfix "--max-age-seconds" ageDaysGcConfig.systemd.services.narjar-gc.serviceConfig.ExecStart);
+  assert !(evaluatesConfig conflictingGcAgeConfig);
+  assert !(evaluatesConfig overflowingGcAgeConfig);
   assert defaultConfig.systemd.services.narjar.serviceConfig.TimeoutStopSec == 40;
   assert longShutdownConfig.systemd.services.narjar.serviceConfig.TimeoutStopSec == 310;
   assert lib.hasInfix "--shutdown-grace-seconds 300" longShutdownConfig.systemd.services.narjar.serviceConfig.ExecStart;

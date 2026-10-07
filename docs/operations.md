@@ -183,7 +183,20 @@ narjar gc --data-dir /var/lib/narjar --target-bytes 6442450944 --dry-run --json
 narjar gc --data-dir /var/lib/narjar --target-bytes 6442450944 --apply --json
 ~~~
 
-Add `--online` to either command to ask the running daemon to collect. Run it
+For age-based retention, use the same period syntax as `nix-collect-garbage`:
+
+~~~sh
+narjar gc --online --data-dir /var/lib/narjar --delete-older-than 7d --dry-run --json
+narjar gc --online --data-dir /var/lib/narjar --delete-older-than 7d --apply --json
+~~~
+
+`7d` means seven 24-hour days. Age is measured from narinfo modification time
+for publications and payload modification time for orphans, not last access.
+Protected roots, minimum age, and online grace still apply. The seconds-based
+`--max-age-seconds` option is mutually exclusive with `--delete-older-than`.
+The NixOS module exposes this as `services.narjar.gc.maxAgeDays = 7`.
+
+`--online` asks the running daemon to collect. Run it
 as the cache owner and pass the configured storage backend. The command fails
 if no daemon is running, the collector is busy, or the backend differs. Online
 mode never stops the server or falls back to offline collection.

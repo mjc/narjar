@@ -486,8 +486,12 @@ pub(crate) struct Gc {
     max_bytes: Option<u64>,
     #[arg(long)]
     target_bytes: Option<u64>,
+    /// Collect eligible publications and orphan payloads at least this many seconds old.
     #[arg(long)]
     max_age_seconds: Option<u64>,
+    /// Collect eligible publications and orphan payloads older than PERIOD, e.g. 7d (24 hours per day).
+    #[arg(long, value_name = "PERIOD", value_parser = parse_gc_retention_period, allow_hyphen_values = true, conflicts_with = "max_age_seconds")]
+    delete_older_than: Option<Duration>,
     #[arg(long, default_value_t = 0)]
     min_age_seconds: u64,
     #[arg(long)]
@@ -505,12 +509,25 @@ pub(crate) struct Gc {
     storage_backend: StorageBackend,
 }
 
+fn parse_gc_retention_period(value: &str) -> Result<Duration, String> {
+    let days = value
+        .strip_suffix('d')
+        .ok_or_else(|| "expected a whole number of days followed by 'd', e.g. 7d".to_owned())?
+        .parse::<u64>()
+        .map_err(|error| error.to_string())?;
+    let seconds = days
+        .checked_mul(24 * 60 * 60)
+        .ok_or_else(|| "day count exceeds the supported age limit".to_owned())?;
+    Ok(Duration::from_secs(seconds))
+}
+
 pub(crate) fn gc(options: Gc) -> Result<(), Error> {
     let Gc {
         data_dir,
         max_bytes,
         target_bytes,
         max_age_seconds,
+        delete_older_than,
         min_age_seconds,
         protected_roots,
         dry_run: _,
@@ -528,7 +545,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         data_dir,
         max_bytes,
         target_bytes,
-        max_age: max_age_seconds.map(std::time::Duration::from_secs),
+        max_age: delete_older_than.or_else(|| max_age_seconds.map(Duration::from_secs)),
         min_age: std::time::Duration::from_secs(min_age_seconds),
         protected_roots,
         mode: if apply { GcMode::Apply } else { GcMode::DryRun },
@@ -1284,6 +1301,17 @@ mod tests {
     use narjar::__private::storage::{CacheCreation, Directory, SupportedStorageBackend};
 
     #[test]
+    fn gc_day_periods_have_exact_checked_duration_values() {
+        for days in [0, 7, u64::MAX / 86_400] {
+            assert_eq!(
+                parse_gc_retention_period(&format!("{days}d")).unwrap(),
+                Duration::from_secs(days * 86_400)
+            );
+        }
+        assert!(parse_gc_retention_period(&format!("{}d", u64::MAX / 86_400 + 1)).is_err());
+    }
+
+    #[test]
     fn json_lines_preserve_strings_and_end_with_one_newline() {
         let record = FindingRecord {
             class: "invalid",
@@ -1393,6 +1421,7 @@ machine other.example password other-secret
             max_bytes: None,
             target_bytes: Some(0),
             max_age_seconds: None,
+            delete_older_than: None,
             min_age_seconds: 0,
             protected_roots: None,
             dry_run: false,
@@ -1458,6 +1487,7 @@ machine other.example password other-secret
             max_bytes: None,
             target_bytes: Some(0),
             max_age_seconds: None,
+            delete_older_than: None,
             min_age_seconds: 0,
             protected_roots: None,
             dry_run: false,
@@ -1592,6 +1622,7 @@ machine other.example password other-secret
             max_bytes: None,
             target_bytes: Some(u64::MAX),
             max_age_seconds: None,
+            delete_older_than: None,
             min_age_seconds: 0,
             protected_roots: None,
             dry_run: false,
