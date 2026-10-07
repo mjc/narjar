@@ -27,13 +27,31 @@ enum CollectionPhase {
 #[derive(Debug)]
 struct Activity {
     generation: u64,
-    active: usize,
+    mutations: usize,
+    readers: BTreeMap<ProtectedObject, usize>,
     phase: CollectionPhase,
     protect_all_until: Instant,
     recent: BTreeMap<ProtectedObject, Instant>,
 }
 
 impl Activity {
+    fn retiring_object_has_a_reader(&self, retiring: &ObjectSelection) -> bool {
+        self.readers.keys().any(|object| retiring.contains(*object))
+    }
+
+    fn retiring_object_gained_protection(
+        &self,
+        retiring: &ObjectSelection,
+        snapshot: &CollectionSnapshot<'_>,
+    ) -> bool {
+        (!retiring.is_empty() && self.protect_all_until > snapshot.protect_all_until)
+            || self.recent.iter().any(|(object, until)| {
+                *until > Instant::now()
+                    && retiring.contains(*object)
+                    && !snapshot.protection.contains(*object)
+            })
+    }
+
     fn invalidate_snapshot(&mut self) -> Result<(), StorageError> {
         self.generation = self
             .generation
@@ -72,7 +90,8 @@ impl CollectionCoordinator {
         Self {
             activity: Mutex::new(Activity {
                 generation: 0,
-                active: 0,
+                mutations: 0,
+                readers: BTreeMap::new(),
                 phase: CollectionPhase::Idle,
                 protect_all_until: now + ONLINE_GC_GRACE,
                 recent: BTreeMap::new(),
@@ -90,7 +109,7 @@ impl CollectionCoordinator {
     pub(super) fn mutation(&self) -> Result<ActivityLease<'_>, StorageError> {
         let mut activity = self.wait_until_not_deleting()?;
         activity.invalidate_snapshot()?;
-        self.admit_activity(activity)
+        self.admit_activity(activity, ActivityKind::Mutation)
     }
 
     pub(super) fn reader(
@@ -105,7 +124,8 @@ impl CollectionCoordinator {
         if retiring {
             return Ok(None);
         }
-        self.admit_activity(activity).map(Some)
+        self.admit_activity(activity, ActivityKind::Reader(object))
+            .map(Some)
     }
 
     fn wait_until_not_deleting(&self) -> Result<MutexGuard<'_, Activity>, StorageError> {
@@ -120,13 +140,18 @@ impl CollectionCoordinator {
     fn admit_activity(
         &self,
         mut activity: MutexGuard<'_, Activity>,
+        kind: ActivityKind,
     ) -> Result<ActivityLease<'_>, StorageError> {
-        activity.active = activity
-            .active
+        let count = match kind {
+            ActivityKind::Mutation => &mut activity.mutations,
+            ActivityKind::Reader(object) => activity.readers.entry(object).or_default(),
+        };
+        *count = count
             .checked_add(1)
             .ok_or_else(|| io::Error::other("collection activity count exhausted"))?;
         Ok(ActivityLease {
             coordinator: self,
+            kind,
             advertisement: None,
         })
     }
@@ -137,7 +162,7 @@ impl CollectionCoordinator {
 
     fn snapshot_at(&self, now: Instant) -> Result<CollectionSnapshot<'_>, StorageError> {
         let mut activity = self.lock()?;
-        if activity.phase != CollectionPhase::Idle || activity.active != 0 {
+        if activity.phase != CollectionPhase::Idle || activity.mutations != 0 {
             return Err(StorageError::CollectionBusy);
         }
         activity.phase = CollectionPhase::Scanning;
@@ -156,13 +181,21 @@ impl CollectionCoordinator {
         Ok(CollectionSnapshot {
             lease: CollectionLease { coordinator: self },
             generation: activity.generation,
+            protect_all_until: activity.protect_all_until,
             protection,
         })
     }
 }
 
+#[derive(Clone, Copy)]
+enum ActivityKind {
+    Mutation,
+    Reader(ProtectedObject),
+}
+
 pub(crate) struct ActivityLease<'coordinator> {
     coordinator: &'coordinator CollectionCoordinator,
+    kind: ActivityKind,
     advertisement: Option<ProtectedObject>,
 }
 
@@ -170,7 +203,6 @@ impl ActivityLease<'_> {
     pub(super) fn advertise(mut self, store: StoreHash) -> Result<Self, StorageError> {
         let object = ProtectedObject::Publication(store);
         let mut activity = self.coordinator.lock()?;
-        activity.invalidate_snapshot()?;
         activity.protect(object, Instant::now());
         drop(activity);
         self.advertisement = Some(object);
@@ -197,13 +229,26 @@ impl Drop for ActivityLease<'_> {
         if let Some(object) = self.advertisement {
             activity.protect(object, Instant::now());
         }
-        activity.active -= 1;
+        match self.kind {
+            ActivityKind::Mutation => activity.mutations -= 1,
+            ActivityKind::Reader(object) => {
+                let count = activity
+                    .readers
+                    .get_mut(&object)
+                    .expect("reader lease owns its count");
+                *count -= 1;
+                if *count == 0 {
+                    activity.readers.remove(&object);
+                }
+            }
+        }
     }
 }
 
 pub(super) struct CollectionSnapshot<'coordinator> {
     lease: CollectionLease<'coordinator>,
     generation: u64,
+    protect_all_until: Instant,
     pub(super) protection: ObjectSelection,
 }
 
@@ -217,10 +262,12 @@ impl<'coordinator> CollectionSnapshot<'coordinator> {
         retiring: ObjectSelection,
     ) -> Result<CollectionLease<'coordinator>, StorageError> {
         let mut activity = self.lease.coordinator.lock()?;
-        if activity.active != 0 {
+        if activity.mutations != 0 || activity.retiring_object_has_a_reader(&retiring) {
             return Err(StorageError::CollectionBusy);
         }
-        if activity.generation != self.generation {
+        if activity.generation != self.generation
+            || activity.retiring_object_gained_protection(&retiring, &self)
+        {
             return Err(StorageError::CollectionChanged);
         }
         activity.phase = CollectionPhase::Deleting(retiring);
@@ -236,6 +283,13 @@ pub(super) enum ObjectSelection {
 }
 
 impl ObjectSelection {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::All => false,
+            Self::Objects(objects) => objects.is_empty(),
+        }
+    }
+
     pub(super) fn contains_nar_name(&self, name: &std::ffi::OsStr) -> bool {
         match self {
             Self::All => true,
@@ -273,6 +327,138 @@ impl Drop for CollectionLease<'_> {
 mod tests {
     use super::*;
 
+    fn aged_coordinator() -> CollectionCoordinator {
+        CollectionCoordinator::new(Instant::now() - ONLINE_GC_GRACE)
+    }
+
+    fn publication(index: u8) -> ProtectedObject {
+        ProtectedObject::Publication(StoreHash::parse(&format!("{index:032o}")).unwrap())
+    }
+
+    #[test]
+    fn a_retained_reader_allows_scanning_and_retirement_of_an_unrelated_object() {
+        let coordinator = aged_coordinator();
+        let retained = publication(1);
+        let retired = publication(2);
+        let read = coordinator.reader(retained).unwrap().unwrap();
+        let snapshot = coordinator
+            .snapshot()
+            .expect("retained traffic must not block scanning");
+        let permit = snapshot
+            .authorize_retirement(ObjectSelection::Objects([retired].into_iter().collect()))
+            .expect("an unrelated active reader must not prevent reclamation");
+        drop(permit);
+        drop(read);
+    }
+
+    #[test]
+    fn advertisements_of_retained_objects_do_not_invalidate_an_in_progress_scan() {
+        let coordinator = aged_coordinator();
+        let snapshot = coordinator.snapshot().unwrap();
+        let retained = publication(1);
+        for _ in 0..16 {
+            drop(
+                coordinator
+                    .reader(retained)
+                    .unwrap()
+                    .unwrap()
+                    .advertise(StoreHash::parse("00000000000000000000000000000001").unwrap())
+                    .unwrap(),
+            );
+        }
+        snapshot
+            .authorize_retirement(ObjectSelection::Objects(
+                [publication(2)].into_iter().collect(),
+            ))
+            .expect("steady reads of retained metadata must not starve online GC");
+    }
+
+    #[test]
+    fn a_completed_advertisement_of_a_retiring_object_invalidates_its_selection() {
+        let coordinator = aged_coordinator();
+        let snapshot = coordinator.snapshot().unwrap();
+        let retired = publication(1);
+        drop(
+            coordinator
+                .reader(retired)
+                .unwrap()
+                .unwrap()
+                .advertise(StoreHash::parse("00000000000000000000000000000001").unwrap())
+                .unwrap(),
+        );
+        assert!(matches!(
+            snapshot
+                .authorize_retirement(ObjectSelection::Objects([retired].into_iter().collect())),
+            Err(StorageError::CollectionChanged)
+        ));
+    }
+
+    #[test]
+    fn a_reader_of_a_retiring_object_blocks_retirement_until_its_lease_ends() {
+        let coordinator = aged_coordinator();
+        let snapshot = coordinator.snapshot().unwrap();
+        let retired = publication(1);
+        let read = coordinator.reader(retired).unwrap().unwrap();
+        assert!(matches!(
+            snapshot
+                .authorize_retirement(ObjectSelection::Objects([retired].into_iter().collect())),
+            Err(StorageError::CollectionBusy)
+        ));
+        drop(read);
+        coordinator
+            .snapshot()
+            .unwrap()
+            .authorize_retirement(ObjectSelection::Objects([retired].into_iter().collect()))
+            .unwrap();
+    }
+
+    #[test]
+    fn every_reader_of_a_selected_object_must_release_its_own_pin() {
+        let coordinator = aged_coordinator();
+        let retired = publication(1);
+        let first = coordinator.reader(retired).unwrap().unwrap();
+        let second = coordinator.reader(retired).unwrap().unwrap();
+        drop(first);
+        assert!(matches!(
+            coordinator
+                .snapshot()
+                .unwrap()
+                .authorize_retirement(ObjectSelection::Objects([retired].into_iter().collect())),
+            Err(StorageError::CollectionBusy)
+        ));
+        drop(second);
+        assert!(
+            coordinator.lock().unwrap().readers.is_empty(),
+            "finished readers must not leave a resident object catalog"
+        );
+        coordinator
+            .snapshot()
+            .unwrap()
+            .authorize_retirement(ObjectSelection::Objects([retired].into_iter().collect()))
+            .unwrap();
+    }
+
+    #[test]
+    fn protection_overflow_during_a_scan_defers_nonempty_retirement() {
+        let coordinator = aged_coordinator();
+        let snapshot = coordinator.snapshot().unwrap();
+        let protection = coordinator.reader(publication(1)).unwrap().unwrap();
+        for index in 0..=RECENT_OBJECT_LIMIT {
+            let mut digest = [0; 32];
+            digest[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            protection
+                .protect(ProtectedObject::CanonicalNar(NarHash::from_digest(digest)))
+                .unwrap();
+        }
+        drop(protection);
+        assert!(matches!(
+            snapshot.authorize_retirement(ObjectSelection::Objects(
+                [publication(2)].into_iter().collect()
+            )),
+            Err(StorageError::CollectionChanged)
+        ));
+    }
+
     #[test]
     fn a_completed_mutation_invalidates_an_unlocked_inventory_snapshot() {
         let now = Instant::now();
@@ -292,8 +478,7 @@ mod tests {
     #[test]
     fn an_active_operation_defers_collection_without_holding_a_mutex() {
         let coordinator = CollectionCoordinator::default();
-        let object = ProtectedObject::CanonicalNar(NarHash::from_digest([42; 32]));
-        let operation = coordinator.reader(object).unwrap().unwrap();
+        let operation = coordinator.mutation().unwrap();
         assert!(matches!(
             coordinator.snapshot(),
             Err(StorageError::CollectionBusy)
@@ -316,7 +501,8 @@ mod tests {
                 activity.phase,
                 CollectionPhase::Deleting(ObjectSelection::All)
             );
-            assert_eq!(activity.active, 0);
+            assert_eq!(activity.mutations, 0);
+            assert!(activity.readers.is_empty());
             drop(activity);
             assert!(matches!(
                 coordinator.snapshot(),

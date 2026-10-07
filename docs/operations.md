@@ -207,9 +207,11 @@ limit. If it does not, the daemon reports that online GC is unavailable and
 continues serving; offline maintenance still works with the server stopped.
 
 Online GC supports flat and chunked storage. Inventory and chunk marking run
-without excluding publication. A publication or metadata advertisement that
-changes the scan invalidates it before deletion; active uploads, binding, and
-chunked reads can return busy instead. Retry the explicit command later.
+without excluding publication. Mutations invalidate the scan before deletion.
+New advertisements defer deletion only when they protect a selected object or
+its dependent publication. Active uploads and binding can return busy; a
+chunked read defers only retirement of its own canonical object. Unrelated
+metadata and payload reads do not block collection. Retry a deferred command later.
 During deletion, reads of retained objects continue. Retiring metadata returns
 a miss; already-open flat transfers finish through their descriptors.
 

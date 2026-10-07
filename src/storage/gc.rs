@@ -2782,7 +2782,12 @@ mod tests {
         }
     }
 
-    fn write_signed_raw_metadata(root: &Path, store: &str, identity: crate::object::NarIdentity) {
+    fn write_signed_raw_metadata(
+        root: &Path,
+        store: &str,
+        identity: crate::object::NarIdentity,
+        references: Vec<String>,
+    ) {
         use data_encoding::BASE64;
         use ed25519_dalek::{Signer, SigningKey};
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -2791,7 +2796,7 @@ mod tests {
             None,
             None,
             identity,
-            Vec::new(),
+            references,
             Vec::new(),
         )
         .unwrap();
@@ -2824,6 +2829,7 @@ mod tests {
             directory.path(),
             TEST_SECOND_STORE_HASH,
             crate::object::NarIdentity::new(hash, crate::object::NarSize::new(3)),
+            Vec::new(),
         );
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
         let entries = scan(&storage, &trusted).unwrap();
@@ -2943,10 +2949,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!advertisement.bytes.is_empty());
-        assert!(matches!(
-            storage.collection.snapshot(),
-            Err(StorageError::CollectionBusy)
-        ));
+        let snapshot = storage.collection.snapshot().unwrap();
+        assert!(
+            snapshot
+                .protection
+                .contains(ProtectedObject::Publication(entry.store))
+        );
+        drop(snapshot);
         drop(advertisement);
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
         let report = run_online(online_options(directory.path()), &storage, &trusted).unwrap();
@@ -3168,6 +3177,69 @@ mod tests {
             storage.collection.snapshot().is_ok(),
             "an invalidated pass releases its capability"
         );
+    }
+
+    #[test]
+    fn advertisements_during_collection_defer_only_deletion_of_their_dependencies() {
+        for depends_on_victim in [false, true] {
+            let (directory, mut storage, victim) = scannable_pair_fixture();
+            age_publication(directory.path(), &victim);
+            let hash = NarHash::from_digest(sha2::Sha256::digest(b"nar").into());
+            write_signed_raw_metadata(
+                directory.path(),
+                TEST_SECOND_STORE_HASH,
+                crate::object::NarIdentity::new(hash, crate::object::NarSize::new(3)),
+                depends_on_victim
+                    .then(|| victim.store_path.clone())
+                    .into_iter()
+                    .collect(),
+            );
+            storage.collection = super::super::collection::CollectionCoordinator::new(
+                std::time::Instant::now() - ONLINE_GC_GRACE,
+            );
+            let trusted =
+                TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+            let mut options = online_options(directory.path());
+            options.target_bytes = None;
+            options.max_age = Some(ONLINE_GC_GRACE);
+            let access = CollectionAccess::Online(storage.collection.snapshot().unwrap());
+            let result = run_flat_gc(
+                options,
+                &storage,
+                &trusted,
+                None,
+                access,
+                |storage, trusted| {
+                    let entries = scan(storage, trusted)?;
+                    let retained = StoreHash::parse(TEST_SECOND_STORE_HASH).unwrap();
+                    for _ in 0..16 {
+                        drop(storage.read_advertised_narinfo(&retained)?.unwrap());
+                    }
+                    Ok(entries)
+                },
+            );
+            if depends_on_victim {
+                assert!(
+                    matches!(result, Err(StorageError::CollectionChanged)),
+                    "a newly advertised dependent must keep the selected dependency alive"
+                );
+                assert!(directory.path().join(&victim.narinfo_name).exists());
+            } else {
+                let pass = result.expect("unrelated metadata traffic must allow the real deletion");
+                assert_eq!(pass.report.deleted_narinfos, 1);
+                assert!(!directory.path().join(&victim.narinfo_name).exists());
+            }
+            assert!(
+                directory
+                    .path()
+                    .join(format!("{TEST_SECOND_STORE_HASH}.narinfo"))
+                    .exists()
+            );
+            assert!(
+                directory.path().join("nar").join(&victim.nar_name).exists(),
+                "the retained publication still needs its shared canonical payload"
+            );
+        }
     }
 
     #[test]
