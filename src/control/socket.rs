@@ -89,16 +89,19 @@ fn directory_socket_address(directory: &File, path: &Path) -> io::Result<PathBuf
     #[cfg(not(target_os = "linux"))]
     {
         let _ = directory;
-        rustix::net::SocketAddrUnix::new(path).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "online GC socket pathname exceeds this platform's Unix socket limit: {error}"
-                ),
-            )
-        })?;
-        Ok(path.to_owned())
+        checked_listener_socket_path(path)
     }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn checked_listener_socket_path(path: &Path) -> io::Result<PathBuf> {
+    std::os::unix::net::SocketAddr::from_pathname(path).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("online GC socket pathname exceeds this platform's Unix socket limit: {error}"),
+        )
+    })?;
+    Ok(path.to_owned())
 }
 
 enum ConnectionAttempt {
@@ -226,6 +229,31 @@ fn remove_stale_socket(path: &Path, endpoint: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_listener_pathnames_reserve_space_for_the_terminating_nul() {
+        let first_rejected_length = (1..=256)
+            .find(|length| {
+                std::os::unix::net::SocketAddr::from_pathname("g".repeat(*length)).is_err()
+            })
+            .expect("the platform has a finite Unix socket pathname limit");
+
+        let accepted_path = PathBuf::from("g".repeat(first_rejected_length - 1));
+        assert_eq!(
+            checked_listener_socket_path(&accepted_path).unwrap(),
+            accepted_path,
+            "the longest listener-compatible pathname remains available for online GC"
+        );
+
+        for length in [first_rejected_length, first_rejected_length + 1] {
+            let path = PathBuf::from("g".repeat(length));
+            let error = checked_listener_socket_path(&path).expect_err(
+                "a pathname rejected by the listener must disable online GC, not serving",
+            );
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("socket pathname"));
+        }
+    }
 
     #[test]
     fn connected_control_streams_close_on_exec_and_use_blocking_deadline_io() {
