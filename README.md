@@ -4,7 +4,7 @@ A filesystem-backed HTTP binary cache for Nix, written in Rust with low memory u
 
 `narjar push` reads directly from your local Nix store and uploads paths with
 their dependencies in parallel. The cache server runs without a Nix installation
-or a database, with commands to verify and garbage-collect cached data.
+or an external database, with commands to verify and garbage-collect cached data.
 Uploads and downloads support uncompressed NARs, Zstd, and XZ.
 
 ## Installation

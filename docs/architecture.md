@@ -10,8 +10,8 @@ chunks. The server materializes deterministic compressed egress derivatives
 on demand.
 
 Filesystem metadata, identity receipts, and publication recovery records are
-the server's persistent state. It has no database or private signing key and
-does not expose a native /nix/store or invoke Nix. Retention is an
+the server's persistent state. It needs no external database or private signing
+key and does not expose a native /nix/store or invoke Nix. Retention is an
 operator-invoked offline pass; there is no online or background GC. Optional
 background cache-population sampling supplies metrics.
 
