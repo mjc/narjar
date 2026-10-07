@@ -183,7 +183,7 @@ fn a_lazy_chunk_reader_defers_collection_until_its_final_unopened_chunk_is_read(
     let mut first = [0; 1];
     reader.read_exact(&mut first).unwrap();
     assert!(matches!(
-        storage.collection.snapshot(),
+        storage.collection.snapshot().unwrap().authorize_deletion(),
         Err(StorageError::CollectionBusy)
     ));
     let mut remainder = Vec::new();
