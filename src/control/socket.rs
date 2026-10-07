@@ -151,20 +151,40 @@ fn attempt_socket_connection(
 }
 
 fn complete_pending_connection(stream: UnixStream, deadline: Instant) -> io::Result<UnixStream> {
-    let timeout = rustix::event::Timespec::try_from(connection_time_remaining(deadline)?)
-        .map_err(io::Error::other)?;
-    let mut descriptor = [rustix::event::PollFd::new(
-        &stream,
-        rustix::event::PollFlags::OUT,
-    )];
-    if rustix::event::poll(&mut descriptor, Some(&timeout))? == 0 {
-        return Err(io::ErrorKind::TimedOut.into());
-    }
+    wait_for_socket_event_before_deadline(&stream, rustix::event::PollFlags::OUT, deadline)?;
     if let Some(error) = stream.take_error()? {
         return Err(error);
     }
     stream.set_nonblocking(false)?;
     Ok(stream)
+}
+
+pub(super) fn wait_for_socket_event_before_deadline(
+    stream: &UnixStream,
+    events: rustix::event::PollFlags,
+    deadline: Instant,
+) -> io::Result<()> {
+    std::iter::repeat_with(|| poll_control_socket_once(stream, events, deadline))
+        .find_map(|result| match result {
+            Ok(0) => Some(Err(io::ErrorKind::TimedOut.into())),
+            Ok(_) => Some(Ok(())),
+            Err(error) => match error.kind() {
+                io::ErrorKind::Interrupted => None,
+                _ => Some(Err(error)),
+            },
+        })
+        .expect("interrupted socket polls terminate at their deadline")
+}
+
+fn poll_control_socket_once(
+    stream: &UnixStream,
+    events: rustix::event::PollFlags,
+    deadline: Instant,
+) -> io::Result<usize> {
+    let timeout = rustix::event::Timespec::try_from(connection_time_remaining(deadline)?)
+        .map_err(io::Error::other)?;
+    let mut descriptor = [rustix::event::PollFd::new(stream, events)];
+    rustix::event::poll(&mut descriptor, Some(&timeout)).map_err(Into::into)
 }
 
 fn connection_time_remaining(deadline: Instant) -> io::Result<Duration> {
