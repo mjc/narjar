@@ -35,6 +35,30 @@ use narjar::__private::metrics::{ConnectionOutcome, Metrics, PopulationScanFailu
 
 mod idle;
 
+fn notify_service_ready(socket: Option<&std::ffi::OsStr>) -> io::Result<()> {
+    let Some(socket) = socket else {
+        return Ok(());
+    };
+    let sender = std::os::unix::net::UnixDatagram::unbound()?;
+    sender.set_nonblocking(true)?;
+    match socket.as_encoded_bytes() {
+        [b'/', ..] => sender.send_to(b"READY=1", std::path::Path::new(socket))?,
+        #[cfg(target_os = "linux")]
+        [b'@', name @ ..] => {
+            use std::os::linux::net::SocketAddrExt;
+            let address = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+            sender.send_to_addr(b"READY=1", &address)?
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NOTIFY_SOCKET must be an absolute Unix socket path or Linux abstract address",
+            ));
+        }
+    };
+    Ok(())
+}
+
 struct Admissions {
     limit: usize,
     in_flight: AtomicUsize,
@@ -631,6 +655,24 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .map_err(|error| Error::runtime(format!("cannot start population sampler: {error}")))?;
     let signal_count = Arc::new(AtomicUsize::new(0));
     install_signal_handlers(Arc::clone(&stopping), signal_count)?;
+    let control = match crate::control::ControlService::start(
+        &config.data_dir,
+        Arc::clone(&storage),
+        Arc::clone(&trusted_keys),
+        Arc::clone(&metrics),
+        Arc::clone(&stopping),
+    ) {
+        Ok(control) => Some(control),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            eprintln!("narjar: online GC unavailable: {error}");
+            None
+        }
+        Err(error) => {
+            return Err(Error::runtime(format!(
+                "cannot start maintenance control: {error}"
+            )));
+        }
+    };
 
     println!(
         "listening http://{} workers={} max_in_flight={} max_nar_bytes={} max_encoded_nar_bytes={} max_decoder_memory_bytes={} max_concurrent_decoders={} min_free_bytes={} shutdown_grace_seconds={} io_timeout_seconds={}",
@@ -702,6 +744,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let handles = spawn_request_workers(config.workers.get(), receiver.clone(), request_context);
     drop(receiver);
 
+    notify_service_ready(std::env::var_os("NOTIFY_SOCKET").as_deref())
+        .map_err(|error| Error::runtime(format!("cannot report service readiness: {error}")))?;
+
     run_accept_loop(
         listener,
         AcceptLoopContext {
@@ -723,6 +768,10 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
 
     let deadline = Instant::now() + Duration::from_secs(config.shutdown_grace_seconds.get());
+    control
+        .map(|control| control.finish(deadline))
+        .transpose()
+        .map_err(|error| Error::runtime(format!("maintenance shutdown failed: {error}")))?;
     while handles.iter().any(|handle| !handle.is_finished()) {
         if Instant::now() >= deadline {
             return Err(Error::runtime("shutdown grace period expired"));
@@ -808,6 +857,44 @@ mod tests {
 
     use super::{Admissions, configure_accepted_socket, request_read_failure_outcome};
     use narjar::__private::metrics::ConnectionOutcome;
+
+    #[test]
+    fn standalone_serving_needs_no_notification_socket() {
+        super::notify_service_ready(None).unwrap();
+    }
+
+    #[test]
+    fn notification_requires_an_absolute_or_abstract_address() {
+        for address in ["", "relative.sock"] {
+            assert_eq!(
+                super::notify_service_ready(Some(address.as_ref()))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_can_receive_readiness_on_its_abstract_socket() {
+        use std::os::{
+            linux::net::SocketAddrExt,
+            unix::net::{SocketAddr, UnixDatagram},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let name = directory.path().as_os_str().as_encoded_bytes();
+        let receiver =
+            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(name).unwrap()).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let socket = std::ffi::OsString::from(format!("@{}", directory.path().display()));
+        super::notify_service_ready(Some(&socket)).unwrap();
+        let mut message = [0; 32];
+        let size = receiver.recv(&mut message).unwrap();
+        assert_eq!(&message[..size], b"READY=1");
+    }
 
     #[test]
     fn aborted_pending_connections_do_not_stop_accepting_requests() {

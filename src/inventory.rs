@@ -301,6 +301,8 @@ fn classify_storage_failure(error: &crate::storage::StorageError) -> Option<Inve
         crate::storage::StorageError::NarMismatch => Some(InventoryClass::HashOrSizeMismatch),
         crate::storage::StorageError::Io(error) => classify_io_failure(error),
         crate::storage::StorageError::Conflict
+        | crate::storage::StorageError::CollectionBusy
+        | crate::storage::StorageError::CollectionChanged
         | crate::storage::StorageError::DecodedSizeLimitExceeded
         | crate::storage::StorageError::DecoderMemoryLimitExceeded
         | crate::storage::StorageError::InsufficientSpace

@@ -38,7 +38,7 @@ use crate::{
 mod lifecycle;
 mod maintenance_session;
 pub(crate) use lifecycle::{Init, Key, generate_key_pair, init, initialize_cache, key};
-use maintenance_session::{MaintenanceRecord, MaintenanceSession};
+use maintenance_session::{MaintenanceRecord, MaintenanceSession, record_maintenance_result};
 
 #[derive(Args)]
 pub(crate) struct Reconcile {
@@ -498,6 +498,9 @@ pub(crate) struct Gc {
     apply: bool,
     #[arg(long)]
     json: bool,
+    /// Request collection from the running daemon; never stop it or fall back.
+    #[arg(long)]
+    online: bool,
     #[arg(long, default_value = "flat")]
     storage_backend: StorageBackend,
 }
@@ -513,6 +516,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         dry_run: _,
         apply,
         json,
+        online,
         storage_backend,
     } = options;
     let maintenance_record = if apply {
@@ -520,7 +524,6 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
     } else {
         MaintenanceRecord::new(MaintenanceOperation::Gc, MaintenanceMode::GcDryRun)
     };
-    let session = MaintenanceSession::open(&data_dir, storage_backend, Some(maintenance_record))?;
     let options = GcOptions {
         data_dir,
         max_bytes,
@@ -531,17 +534,27 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         mode: if apply { GcMode::Apply } else { GcMode::DryRun },
         backend: storage_backend,
     };
-    let report = match apply {
-        true => session.run_mutation(|recovered, trusted| {
-            gc::run_apply(options, recovered, trusted)
-                .map_err(runtime)
-                .map(gc_successful_maintenance_result)
-        })?,
-        false => session.run_inspection(|storage, trusted| {
-            gc::run_dry_run(options, storage, trusted)
-                .map_err(runtime)
-                .map(gc_successful_maintenance_result)
-        })?,
+    let report = match online {
+        true => crate::control::collect(options).map_err(runtime)?,
+        false => {
+            let session = MaintenanceSession::open(
+                &options.data_dir,
+                storage_backend,
+                Some(maintenance_record),
+            )?;
+            match apply {
+                true => session.run_mutation(|recovered, trusted| {
+                    gc::run_apply(options, recovered, trusted)
+                        .map_err(runtime)
+                        .map(gc_successful_maintenance_result)
+                })?,
+                false => session.run_inspection(|storage, trusted| {
+                    gc::run_dry_run(options, storage, trusted)
+                        .map_err(runtime)
+                        .map(gc_successful_maintenance_result)
+                })?,
+            }
+        }
     };
 
     if json {
@@ -577,6 +590,22 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn collect_online(
+    options: GcOptions,
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
+) -> Result<GcReport, narjar::__private::storage::StorageError> {
+    let mode = match options.mode {
+        GcMode::Apply => MaintenanceMode::GcApply,
+        GcMode::DryRun => MaintenanceMode::GcDryRun,
+    };
+    let recorder = MaintenanceRecord::new(MaintenanceOperation::Gc, mode).start(&options.data_dir);
+    record_maintenance_result(
+        recorder,
+        gc::run_online(options, storage, trusted).map(gc_successful_maintenance_result),
+    )
 }
 
 fn gc_successful_maintenance_result(
@@ -1369,6 +1398,7 @@ machine other.example password other-secret
             dry_run: false,
             apply: false,
             json: false,
+            online: false,
             storage_backend: StorageBackend::Flat,
         })
         .expect("dry-run GC should complete");
@@ -1433,6 +1463,7 @@ machine other.example password other-secret
             dry_run: false,
             apply: false,
             json: false,
+            online: false,
             storage_backend: StorageBackend::Flat,
         });
         assert!(
@@ -1566,6 +1597,7 @@ machine other.example password other-secret
             dry_run: false,
             apply: true,
             json: false,
+            online: false,
             storage_backend: StorageBackend::Flat,
         })
         .expect("GC must recover before applying maintenance");
