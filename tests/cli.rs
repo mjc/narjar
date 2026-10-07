@@ -1997,9 +1997,15 @@ impl Deref for TestDir {
 }
 
 fn data_dir(test: &str) -> TestDir {
+    // Long diagnostic prefixes can exhaust macOS's Unix socket pathname limit.
+    let prefix = if cfg!(target_os = "macos") {
+        "nj-".to_owned()
+    } else {
+        format!("narjar-{test}-")
+    };
     TestDir(
         tempfile::Builder::new()
-            .prefix(&format!("narjar-{test}-"))
+            .prefix(&prefix)
             .tempdir()
             .expect("test data directory should be created"),
     )
@@ -2563,6 +2569,7 @@ fn systemd_readiness_is_sent_only_when_the_http_workers_and_online_gc_socket_are
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn online_gc_uses_the_running_chunked_daemon_without_interrupting_cache_reads() {
     assert_online_gc_preserves_new_publication("online-gc-chunked", "chunked");
 }
@@ -2847,7 +2854,6 @@ impl RunningServer {
         Self::start_path_with_owner(data_dir, temp_dir, workers, extra_args)
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn start_with_existing_path(data_dir: PathBuf, owner: TestDir, extra_args: &[&str]) -> Self {
         Self::start_path_with_owner(data_dir, owner, 1, extra_args)
     }

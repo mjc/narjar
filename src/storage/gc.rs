@@ -1405,7 +1405,7 @@ fn retained_chunked_manifests<'a>(
         )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 fn apply_chunked(
     storage: &Storage,
     chunk_store: &ChunkStore,
@@ -2050,10 +2050,7 @@ fn invalid(message: impl Into<String>) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(target_os = "macos"))]
-    use crate::storage::NarUploadPolicy;
-    use crate::storage::{CacheCreation, Directory};
-    #[cfg(not(target_os = "macos"))]
+    use crate::storage::{CacheCreation, Directory, NarUploadPolicy};
     use sha2::Digest;
     use std::{
         fs,
