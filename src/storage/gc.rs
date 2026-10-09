@@ -592,6 +592,12 @@ fn run_flat_gc<'storage>(
     })
 }
 
+fn selected_index_mask(length: usize, selected: &[usize]) -> Vec<bool> {
+    let mut mask = vec![false; length];
+    selected.iter().for_each(|&index| mask[index] = true);
+    mask
+}
+
 fn retiring_flat_objects(
     entries: &[Entry],
     selected: &[usize],
@@ -608,16 +614,17 @@ fn retiring_flat_objects(
         }),
         selected.iter().map(|&index| entries[index].store),
     );
+    let selection = selected_index_mask(entries.len(), selected);
     let retained_payloads = entries
         .iter()
         .enumerate()
-        .filter(|(index, _)| !selected.contains(index))
+        .filter(|(index, _)| !selection[*index])
         .flat_map(|(_, entry)| entry_payload_names(entry))
         .collect::<BTreeSet<_>>();
     entries
         .iter()
         .enumerate()
-        .filter(|(index, _)| selected.contains(index))
+        .filter(|(index, _)| selection[*index])
         .flat_map(|(_, entry)| entry_payload_names(entry))
         .chain(selected_orphans.iter().map(|&index| &orphans[index].name))
         .filter(|name| !retained_payloads.contains(name))
@@ -1388,19 +1395,21 @@ fn retiring_publications<'a>(
 fn retained_chunked_manifests<'a>(
     entries: &'a [ChunkedEntry],
     orphans: &'a ChunkedOrphans,
-    selected: &'a ChunkedSelection,
+    selected: &ChunkedSelection,
 ) -> impl Iterator<Item = NarHash> + 'a {
+    let entries_selected = selected_index_mask(entries.len(), &selected.entries);
+    let manifests_selected = selected_index_mask(orphans.manifests.len(), &selected.manifests);
     entries
         .iter()
         .enumerate()
-        .filter(|(index, _)| !selected.entries.contains(index))
+        .filter(move |(index, _)| !entries_selected[*index])
         .map(|(_, entry)| entry.raw_hash)
         .chain(
             orphans
                 .manifests
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| !selected.manifests.contains(index))
+                .filter(move |(index, _)| !manifests_selected[*index])
                 .map(|(_, manifest)| manifest.hash),
         )
 }
@@ -2074,6 +2083,96 @@ mod tests {
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
         CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
             .and_then(|creation| creation.create_or_complete())
+    }
+
+    #[test]
+    fn flat_retirement_preserves_shared_payloads_with_out_of_order_selections() {
+        let shared = NarHash::from_digest([1; 32]);
+        let unique = NarHash::from_digest([2; 32]);
+        let orphan = NarHash::from_digest([3; 32]);
+        let entries = [shared, shared, unique]
+            .into_iter()
+            .enumerate()
+            .map(|(index, hash)| {
+                let store = StoreHash::parse(&format!("{index:032}")).unwrap();
+                let name = OsString::from(NarFileName::raw(hash).to_string());
+                Entry {
+                    store,
+                    store_path: format!("/nix/store/{}-retirement", store.as_str()),
+                    references: Vec::new(),
+                    narinfo_name: format!("{}.narinfo", store.as_str()).into(),
+                    nar_name: name.clone(),
+                    raw_nar_name: name,
+                    narinfo_bytes: 1,
+                    nar_bytes: 1,
+                    raw_nar_bytes: 1,
+                    modified: UNIX_EPOCH,
+                    protected: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let orphans = [shared, orphan].map(|hash| Orphan {
+            name: NarFileName::raw(hash).to_string().into(),
+            bytes: 1,
+            modified: UNIX_EPOCH,
+        });
+        assert_eq!(
+            retiring_flat_objects(&entries, &[2, 0], &orphans, &[1, 0]),
+            BTreeSet::from([
+                ProtectedObject::Publication(entries[0].store),
+                ProtectedObject::Publication(entries[2].store),
+                ProtectedObject::CanonicalNar(unique),
+                ProtectedObject::CanonicalNar(orphan),
+            ]),
+            "retained references must protect payloads even when selected entries and orphans share them"
+        );
+    }
+
+    #[test]
+    fn chunked_retention_keeps_unselected_publications_and_orphan_manifests() {
+        let hashes = [0, 1, 2, 3, 4, 5].map(|index| NarHash::from_digest([index; 32]));
+        let entries = hashes[..3]
+            .iter()
+            .enumerate()
+            .map(|(index, &raw_hash)| {
+                let store = StoreHash::parse(&format!("{index:032}")).unwrap();
+                ChunkedEntry {
+                    store,
+                    store_path: format!("/nix/store/{}-retention", store.as_str()),
+                    references: Vec::new(),
+                    narinfo_name: format!("{}.narinfo", store.as_str()).into(),
+                    output_name: None,
+                    output_bytes: 0,
+                    raw_hash,
+                    manifest_bytes: 1,
+                    narinfo_bytes: 1,
+                    modified: UNIX_EPOCH,
+                    protected: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let orphans = ChunkedOrphans {
+            manifests: hashes[3..]
+                .iter()
+                .map(|&hash| ChunkManifestFile {
+                    name: hash.to_string().into(),
+                    hash,
+                    bytes: 1,
+                    modified: UNIX_EPOCH,
+                })
+                .collect(),
+            ..ChunkedOrphans::default()
+        };
+        let selected = ChunkedSelection {
+            entries: vec![2, 0],
+            manifests: vec![2, 0],
+            ..ChunkedSelection::default()
+        };
+        assert_eq!(
+            retained_chunked_manifests(&entries, &orphans, &selected).collect::<Vec<_>>(),
+            vec![hashes[1], hashes[4]],
+            "publication and orphan selection indexes belong to separate inventories"
+        );
     }
 
     #[test]
