@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use clap::Args;
+use clap::{Args, builder::TypedValueParser};
 use data_encoding::BASE64;
 use narjar::__private::{
     inventory::{Inventory, InventoryClass, InventoryEntry, VerificationMode},
@@ -38,7 +38,7 @@ use crate::{
 mod lifecycle;
 mod maintenance_session;
 pub(crate) use lifecycle::{Init, Key, generate_key_pair, init, initialize_cache, key};
-use maintenance_session::{MaintenanceRecord, MaintenanceSession};
+use maintenance_session::{MaintenanceRecord, MaintenanceSession, record_maintenance_result};
 
 #[derive(Args)]
 pub(crate) struct Reconcile {
@@ -486,8 +486,12 @@ pub(crate) struct Gc {
     max_bytes: Option<u64>,
     #[arg(long)]
     target_bytes: Option<u64>,
+    /// Collect eligible publications and orphan payloads at least this many seconds old.
     #[arg(long)]
     max_age_seconds: Option<u64>,
+    /// Collect eligible publications and orphan payloads older than PERIOD, e.g. 7d (24 hours per day).
+    #[arg(long, value_name = "PERIOD", value_parser = parse_gc_retention_period, allow_hyphen_values = true, conflicts_with = "max_age_seconds")]
+    delete_older_than: Option<Duration>,
     #[arg(long, default_value_t = 0)]
     min_age_seconds: u64,
     #[arg(long)]
@@ -498,8 +502,39 @@ pub(crate) struct Gc {
     apply: bool,
     #[arg(long)]
     json: bool,
+    /// Request collection from the running daemon; never stop it or fall back.
+    #[arg(long = "online", action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolValueParser::new().map(CollectionExecution::from_online_flag))]
+    execution: CollectionExecution,
     #[arg(long, default_value = "flat")]
     storage_backend: StorageBackend,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionExecution {
+    Offline,
+    Online,
+}
+
+impl CollectionExecution {
+    fn from_online_flag(online: bool) -> Self {
+        match online {
+            false => Self::Offline,
+            true => Self::Online,
+        }
+    }
+}
+
+fn parse_gc_retention_period(value: &str) -> Result<Duration, String> {
+    let days = value
+        .strip_suffix('d')
+        .ok_or_else(|| "expected a whole number of days followed by 'd', e.g. 7d".to_owned())?
+        .parse::<u64>()
+        .map_err(|error| error.to_string())?;
+    let seconds = days
+        .checked_mul(24 * 60 * 60)
+        .ok_or_else(|| "day count exceeds the supported age limit".to_owned())?;
+    Ok(Duration::from_secs(seconds))
 }
 
 pub(crate) fn gc(options: Gc) -> Result<(), Error> {
@@ -508,11 +543,13 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         max_bytes,
         target_bytes,
         max_age_seconds,
+        delete_older_than,
         min_age_seconds,
         protected_roots,
         dry_run: _,
         apply,
         json,
+        execution,
         storage_backend,
     } = options;
     let maintenance_record = if apply {
@@ -520,28 +557,37 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
     } else {
         MaintenanceRecord::new(MaintenanceOperation::Gc, MaintenanceMode::GcDryRun)
     };
-    let session = MaintenanceSession::open(&data_dir, storage_backend, Some(maintenance_record))?;
     let options = GcOptions {
         data_dir,
         max_bytes,
         target_bytes,
-        max_age: max_age_seconds.map(std::time::Duration::from_secs),
+        max_age: delete_older_than.or_else(|| max_age_seconds.map(Duration::from_secs)),
         min_age: std::time::Duration::from_secs(min_age_seconds),
         protected_roots,
         mode: if apply { GcMode::Apply } else { GcMode::DryRun },
         backend: storage_backend,
     };
-    let report = match apply {
-        true => session.run_mutation(|recovered, trusted| {
-            gc::run_apply(options, recovered, trusted)
-                .map_err(runtime)
-                .map(gc_successful_maintenance_result)
-        })?,
-        false => session.run_inspection(|storage, trusted| {
-            gc::run_dry_run(options, storage, trusted)
-                .map_err(runtime)
-                .map(gc_successful_maintenance_result)
-        })?,
+    let report = match execution {
+        CollectionExecution::Online => crate::control::collect(options).map_err(runtime)?,
+        CollectionExecution::Offline => {
+            let session = MaintenanceSession::open(
+                &options.data_dir,
+                storage_backend,
+                Some(maintenance_record),
+            )?;
+            match apply {
+                true => session.run_mutation(|recovered, trusted| {
+                    gc::run_apply(options, recovered, trusted)
+                        .map_err(runtime)
+                        .map(gc_successful_maintenance_result)
+                })?,
+                false => session.run_inspection(|storage, trusted| {
+                    gc::run_dry_run(options, storage, trusted)
+                        .map_err(runtime)
+                        .map(gc_successful_maintenance_result)
+                })?,
+            }
+        }
     };
 
     if json {
@@ -577,6 +623,22 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn collect_online(
+    options: GcOptions,
+    storage: &Storage,
+    trusted: &TrustedPublicKeys,
+) -> Result<GcReport, narjar::__private::storage::StorageError> {
+    let mode = match options.mode {
+        GcMode::Apply => MaintenanceMode::GcApply,
+        GcMode::DryRun => MaintenanceMode::GcDryRun,
+    };
+    let recorder = MaintenanceRecord::new(MaintenanceOperation::Gc, mode).start(&options.data_dir);
+    record_maintenance_result(
+        recorder,
+        gc::run_online(options, storage, trusted).map(gc_successful_maintenance_result),
+    )
 }
 
 fn gc_successful_maintenance_result(
@@ -1255,6 +1317,35 @@ mod tests {
     use narjar::__private::storage::{CacheCreation, Directory, SupportedStorageBackend};
 
     #[test]
+    fn gc_day_periods_have_exact_checked_duration_values() {
+        for days in [0, 7, u64::MAX / 86_400] {
+            assert_eq!(
+                parse_gc_retention_period(&format!("{days}d")).unwrap(),
+                Duration::from_secs(days * 86_400)
+            );
+        }
+        assert!(parse_gc_retention_period(&format!("{}d", u64::MAX / 86_400 + 1)).is_err());
+    }
+
+    #[test]
+    fn the_online_flag_is_parsed_into_an_explicit_collection_execution_mode() {
+        use clap::Parser;
+        for (extra_args, expected) in [
+            (vec![], CollectionExecution::Offline),
+            (vec!["--online"], CollectionExecution::Online),
+        ] {
+            let cli = crate::Cli::try_parse_from(
+                [vec!["narjar", "gc", "--data-dir", "/cache"], extra_args].concat(),
+            )
+            .unwrap();
+            let crate::Command::Gc(options) = cli.command else {
+                panic!("GC command")
+            };
+            assert_eq!(options.execution, expected);
+        }
+    }
+
+    #[test]
     fn json_lines_preserve_strings_and_end_with_one_newline() {
         let record = FindingRecord {
             class: "invalid",
@@ -1364,11 +1455,13 @@ machine other.example password other-secret
             max_bytes: None,
             target_bytes: Some(0),
             max_age_seconds: None,
+            delete_older_than: None,
             min_age_seconds: 0,
             protected_roots: None,
             dry_run: false,
             apply: false,
             json: false,
+            execution: CollectionExecution::Offline,
             storage_backend: StorageBackend::Flat,
         })
         .expect("dry-run GC should complete");
@@ -1428,11 +1521,13 @@ machine other.example password other-secret
             max_bytes: None,
             target_bytes: Some(0),
             max_age_seconds: None,
+            delete_older_than: None,
             min_age_seconds: 0,
             protected_roots: None,
             dry_run: false,
             apply: false,
             json: false,
+            execution: CollectionExecution::Offline,
             storage_backend: StorageBackend::Flat,
         });
         assert!(
@@ -1561,11 +1656,13 @@ machine other.example password other-secret
             max_bytes: None,
             target_bytes: Some(u64::MAX),
             max_age_seconds: None,
+            delete_older_than: None,
             min_age_seconds: 0,
             protected_roots: None,
             dry_run: false,
             apply: true,
             json: false,
+            execution: CollectionExecution::Offline,
             storage_backend: StorageBackend::Flat,
         })
         .expect("GC must recover before applying maintenance");

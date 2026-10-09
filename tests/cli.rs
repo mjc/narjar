@@ -30,6 +30,7 @@ use tempfile::TempDir;
 use std::sync::{Barrier, atomic::AtomicU64};
 
 const CONFIG_ENV: &[&str] = &[
+    "NOTIFY_SOCKET",
     "NARJAR_DATA_DIR",
     "NARJAR_LISTEN",
     "NARJAR_WORKERS",
@@ -1996,9 +1997,15 @@ impl Deref for TestDir {
 }
 
 fn data_dir(test: &str) -> TestDir {
+    // Long diagnostic prefixes can exhaust macOS's Unix socket pathname limit.
+    let prefix = if cfg!(target_os = "macos") {
+        "nj-".to_owned()
+    } else {
+        format!("narjar-{test}-")
+    };
     TestDir(
         tempfile::Builder::new()
-            .prefix(&format!("narjar-{test}-"))
+            .prefix(&prefix)
             .tempdir()
             .expect("test data directory should be created"),
     )
@@ -2305,6 +2312,422 @@ struct RunningServer {
     address: String,
 }
 
+#[test]
+fn online_gc_uses_the_running_flat_daemon_without_interrupting_cache_reads() {
+    assert_online_gc_preserves_new_publication("online-gc-flat", "flat");
+}
+
+#[test]
+fn gc_delete_older_than_deletes_old_payloads_and_preserves_recent_ones() {
+    let data = data_dir("gc-age-days");
+    let initialized = run(&["init", "--data-dir", data.to_str().unwrap()]);
+    assert!(initialized.status.success());
+    let old_payload = data.join(format!("nar/{NARJAR_HASH}.nar"));
+    fs::write(&old_payload, NAR_BYTES).unwrap();
+    let old_time = std::time::SystemTime::now() - Duration::from_secs(14 * 24 * 60 * 60);
+    fs::File::open(&old_payload)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old_time))
+        .unwrap();
+    let recent_bytes = b"recent NAR payload";
+    let recent_payload = data.join(format!("nar/{}.nar", nix32_sha256(recent_bytes)));
+    fs::write(&recent_payload, recent_bytes).unwrap();
+
+    let args = [
+        "gc",
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--delete-older-than",
+        "7d",
+        "--json",
+    ];
+    let preview = run(&args);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["candidates"], 1);
+    assert!(
+        old_payload.exists(),
+        "GC defaults to a non-deleting preview"
+    );
+    assert!(recent_payload.exists());
+
+    let applied = run(&[args.as_slice(), &["--apply"]].concat());
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(report["deleted_orphans"], 1);
+    assert!(
+        !old_payload.exists(),
+        "the fourteen-day-old payload is collected"
+    );
+    assert_eq!(fs::read(&recent_payload).unwrap(), recent_bytes);
+}
+
+#[test]
+fn gc_delete_older_than_rejects_invalid_periods_and_conflicting_age_units() {
+    for age_args in [
+        vec!["--delete-older-than", "18446744073709551615d"],
+        vec!["--delete-older-than", "-1d"],
+        vec!["--delete-older-than", "1.5d"],
+        vec!["--delete-older-than", "7"],
+        vec!["--delete-older-than", "7h"],
+        vec!["--delete-older-than", "7d", "--max-age-seconds", "1"],
+    ] {
+        let result = run(&[vec!["gc", "--data-dir", "/unused-cache"], age_args].concat());
+        assert_eq!(result.status.code(), Some(2));
+        assert!(
+            !String::from_utf8_lossy(&result.stderr).contains("unexpected argument"),
+            "the days flag must be recognized; invalid values fail during argument parsing"
+        );
+    }
+}
+
+#[test]
+fn gc_delete_older_than_preserves_protected_and_recent_publications_and_shared_payloads() {
+    let data = init_data_dir("gc-age-publications");
+    write_test_trusted_public_keys(data.join("trusted-public-keys"));
+    let payload = data.join(format!("nar/{NARJAR_HASH}.nar"));
+    fs::write(&payload, NAR_BYTES).unwrap();
+    let recent_store = "22222222222222222222222222222222";
+    let old_time = std::time::SystemTime::now() - Duration::from_secs(14 * 24 * 60 * 60);
+    for store in [STORE_HASH, ABSENT_STORE_HASH, recent_store] {
+        let metadata = data.join(format!("{store}.narinfo"));
+        fs::write(
+            &metadata,
+            signed_narinfo_for(store, NARJAR_HASH, NAR_BYTES.len() as u64),
+        )
+        .unwrap();
+        if store != recent_store {
+            fs::File::open(metadata)
+                .unwrap()
+                .set_modified(old_time)
+                .unwrap();
+        }
+    }
+    let roots = data.join("protected-roots");
+    fs::write(&roots, format!("{ABSENT_STORE_HASH}\n")).unwrap();
+    let result = run(&[
+        "gc",
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--delete-older-than",
+        "7d",
+        "--protected-roots",
+        roots.to_str().unwrap(),
+        "--apply",
+        "--json",
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["deleted_narinfos"], 1);
+    assert_eq!(report["deleted_nars"], 0);
+    assert!(!data.join(format!("{STORE_HASH}.narinfo")).exists());
+    assert!(
+        data.join(format!("{ABSENT_STORE_HASH}.narinfo")).exists(),
+        "age cannot override an explicitly protected root"
+    );
+    assert!(
+        data.join(format!("{recent_store}.narinfo")).exists(),
+        "a recent publication cannot be evicted by the age-only policy"
+    );
+    assert_eq!(
+        fs::read(payload).unwrap(),
+        NAR_BYTES,
+        "retained publications still reference the shared canonical payload"
+    );
+}
+
+#[test]
+fn a_long_data_directory_does_not_prevent_the_cache_server_from_starting() {
+    let owner = data_dir("long-control-path");
+    let data = owner.join("long-cache-root-".repeat(12));
+    fs::create_dir(&data).unwrap();
+    let init = run(&["init", "--data-dir", data.to_str().unwrap()]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    write_test_trusted_public_keys(data.join("trusted-public-keys"));
+    let server = RunningServer::start_with_existing_path(data, owner, &[]);
+    assert!(
+        response_parts(&server.request("GET", "/healthz"))
+            .0
+            .starts_with("HTTP/1.1 200")
+    );
+    let gc = run(&[
+        "gc",
+        "--data-dir",
+        server.data_dir.to_str().unwrap(),
+        "--online",
+        "--target-bytes",
+        "0",
+        "--json",
+    ]);
+    #[cfg(target_os = "linux")]
+    assert!(
+        gc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert!(!gc.status.success());
+        assert!(String::from_utf8_lossy(&gc.stderr).contains("socket pathname"));
+    }
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn systemd_readiness_is_sent_only_when_the_http_workers_and_online_gc_socket_are_available() {
+    use std::os::unix::net::UnixDatagram;
+    let owner = data_dir("notify");
+    let data = owner.join("cache");
+    fs::create_dir(&data).unwrap();
+    assert!(
+        run(&["init", "--data-dir", data.to_str().unwrap()])
+            .status
+            .success()
+    );
+    write_test_trusted_public_keys(data.join("trusted-public-keys"));
+    let notify_path = owner.join("notify.sock");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    notify
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let child = command()
+        .env("NOTIFY_SOCKET", &notify_path)
+        .args([
+            "serve",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--min-free-bytes",
+            "0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = RunningServer {
+        child: Some(child),
+        data_dir: data,
+        temp_dir: Some(owner),
+        startup_line: String::new(),
+        address: String::new(),
+    };
+    let mut message = [0; 128];
+    let received = notify
+        .recv(&mut message)
+        .expect("the daemon must report application readiness, not just execute successfully");
+    assert_eq!(&message[..received], b"READY=1");
+    BufReader::new(server.child.as_mut().unwrap().stdout.take().unwrap())
+        .read_line(&mut server.startup_line)
+        .unwrap();
+    server.address = server
+        .startup_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .strip_prefix("http://")
+        .unwrap()
+        .to_owned();
+    assert!(
+        response_parts(&server.request("GET", "/healthz"))
+            .0
+            .starts_with("HTTP/1.1 200")
+    );
+    let gc = run(&[
+        "gc",
+        "--data-dir",
+        server.data_dir.to_str().unwrap(),
+        "--online",
+        "--target-bytes",
+        "0",
+        "--json",
+    ]);
+    assert!(
+        gc.status.success(),
+        "readiness must include the maintenance socket: {}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn online_gc_uses_the_running_chunked_daemon_without_interrupting_cache_reads() {
+    assert_online_gc_preserves_new_publication("online-gc-chunked", "chunked");
+}
+
+fn assert_online_gc_preserves_new_publication(test: &str, backend: &str) {
+    let server = RunningServer::start_with_args(test, &["--storage-backend", backend]);
+    let payload_path = format!("/nar/{NARJAR_HASH}.nar");
+    let metadata_path = format!("/{STORE_HASH}.narinfo");
+    let metadata = signed_narinfo_for(STORE_HASH, NARJAR_HASH, NAR_BYTES.len() as u64);
+    assert!(
+        response_parts(&server.request_with_body("PUT", &payload_path, &[], NAR_BYTES))
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n")
+    );
+    assert!(
+        response_parts(&server.request_with_body("PUT", &metadata_path, &[], metadata.as_bytes()))
+            .0
+            .starts_with("HTTP/1.1 201 Created\r\n")
+    );
+    let process = server.child.as_ref().unwrap().id();
+    for mode in ["--dry-run", "--apply"] {
+        let output = run(&[
+            "gc",
+            "--online",
+            "--data-dir",
+            server.data_dir.to_str().unwrap(),
+            "--storage-backend",
+            backend,
+            mode,
+            "--target-bytes",
+            "0",
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["protected"], 1,
+            "recent upload/advertisement is protected"
+        );
+        assert_eq!(report["deleted_narinfos"], 0);
+        assert_eq!(
+            report["target_met"], false,
+            "grace takes precedence over the target"
+        );
+        assert_eq!(server.child.as_ref().unwrap().id(), process);
+        assert_eq!(
+            response_parts(&server.request("GET", &payload_path)).1,
+            NAR_BYTES
+        );
+        assert!(
+            response_parts(&server.request("HEAD", &payload_path))
+                .0
+                .starts_with("HTTP/1.1 200 OK\r\n")
+        );
+        let range = server.request_with_headers("GET", &payload_path, &[("Range", "bytes=1-3")]);
+        assert!(
+            response_parts(&range)
+                .0
+                .starts_with("HTTP/1.1 206 Partial Content\r\n")
+        );
+        assert_eq!(response_parts(&range).1, b"arj");
+        for path in [&*metadata_path, "/healthz", "/readyz", "/metrics"] {
+            assert!(
+                response_parts(&server.request("GET", path))
+                    .0
+                    .starts_with("HTTP/1.1 200 OK\r\n"),
+                "{path}"
+            );
+        }
+    }
+    let exposition = response_parts(&server.request("GET", "/metrics")).1;
+    assert!(
+        String::from_utf8_lossy(&exposition)
+            .contains("narjar_online_gc_requests_total{outcome=\"target_not_reached\"} 2")
+    );
+    let root = server.data_dir.clone();
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+    assert!(!root.join(".narjar-control/gc.sock").exists());
+}
+
+#[test]
+fn online_gc_reports_active_upload_without_stopping_or_using_offline_collection() {
+    let server = RunningServer::start("online-gc-active-upload");
+    let upload =
+        server.open_upload_after_continue(&format!("/nar/{NARJAR_HASH}.nar"), NAR_BYTES.len());
+    let output = run(&[
+        "gc",
+        "--online",
+        "--data-dir",
+        server.data_dir.to_str().unwrap(),
+        "--apply",
+        "--target-bytes",
+        "0",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("busy"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        response_parts(&server.request("GET", "/healthz"))
+            .0
+            .starts_with("HTTP/1.1 200 OK\r\n")
+    );
+    let exposition = response_parts(&server.request("GET", "/metrics")).1;
+    assert!(
+        String::from_utf8_lossy(&exposition)
+            .contains("narjar_online_gc_requests_total{outcome=\"busy\"} 1")
+    );
+    drop(upload);
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn online_gc_resolves_a_relative_root_list_in_the_clients_working_directory() {
+    let server = RunningServer::start("online-gc-relative-roots");
+    let client = tempfile::tempdir().unwrap();
+    fs::write(
+        client.path().join("roots.txt"),
+        format!("{ABSENT_STORE_HASH}\n"),
+    )
+    .unwrap();
+    let output = command()
+        .current_dir(client.path())
+        .args([
+            "gc",
+            "--online",
+            "--data-dir",
+            server.data_dir.to_str().unwrap(),
+            "--target-bytes",
+            "0",
+            "--protected-roots",
+            "roots.txt",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["missing_roots"], 1,
+        "the daemon must read the client's root list"
+    );
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
 struct HttpExchange {
     request: Vec<u8>,
     response: Vec<u8>,
@@ -2431,7 +2854,6 @@ impl RunningServer {
         Self::start_path_with_owner(data_dir, temp_dir, workers, extra_args)
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn start_with_existing_path(data_dir: PathBuf, owner: TestDir, extra_args: &[&str]) -> Self {
         Self::start_path_with_owner(data_dir, owner, 1, extra_args)
     }

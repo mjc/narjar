@@ -208,8 +208,19 @@ for metric definitions, sample freshness, and accounting rules.
 
 ## Maintenance
 
-Stop the serving process before running commands that inspect or modify its
-data directory:
+GC can run through the serving process:
+
+```sh
+narjar gc --online --data-dir ./cache --target-bytes 100000000000 --dry-run --json
+narjar gc --online --data-dir ./cache --target-bytes 100000000000 --apply --json
+```
+
+Run it as the cache owner. `--online` requires a running daemon and does not
+fall back to offline GC. Recent uploads and advertised publications have a
+ten-minute grace period. Active publication or a changed inventory defers
+collection; serving remains available.
+
+Stop the serving process before running offline maintenance:
 
 ```sh
 narjar doctor --data-dir ./cache --json
@@ -222,6 +233,9 @@ narjar gc --data-dir ./cache --target-bytes 100000000000 --apply --json
 
 Garbage collection defaults to a dry run. Its byte totals use logical file
 lengths; filesystem compression and snapshots affect actual reclaimed space.
+Use `--delete-older-than 7d` instead of a byte target for seven-day retention;
+protected roots and the online grace period still apply. Scheduled NixOS
+collection accepts `services.narjar.gc.maxAgeDays = 7`.
 `delete --store-hash HASH` removes a path's metadata; GC reclaims unreferenced
 payloads.
 

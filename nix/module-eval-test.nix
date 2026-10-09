@@ -169,6 +169,28 @@
       targetBytes = 1000;
     };
   };
+  ageDaysGcConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      maxAgeDays = 7;
+    };
+  };
+  conflictingGcAgeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      maxAgeDays = 7;
+      maxAgeSeconds = 60;
+    };
+  };
+  overflowingGcAgeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    gc = {
+      enable = true;
+      maxAgeDays = 213503982334602;
+    };
+  };
   invalidCompressionConfig = configuration {
     dataDir = "/var/lib/narjar";
     egressCompression = "brotli";
@@ -247,6 +269,11 @@ in
   assert gcThresholdAssertion.message == gcThresholdMessage;
   assert evaluatesConfig equalGcThresholdConfig;
   assert evaluatesConfig lowerGcTargetConfig;
+  assert evaluatesConfig ageDaysGcConfig;
+  assert lib.hasInfix "--delete-older-than 7d" ageDaysGcConfig.systemd.services.narjar-gc.serviceConfig.ExecStart;
+  assert !(lib.hasInfix "--max-age-seconds" ageDaysGcConfig.systemd.services.narjar-gc.serviceConfig.ExecStart);
+  assert !(evaluatesConfig conflictingGcAgeConfig);
+  assert !(evaluatesConfig overflowingGcAgeConfig);
   assert defaultConfig.systemd.services.narjar.serviceConfig.TimeoutStopSec == 40;
   assert longShutdownConfig.systemd.services.narjar.serviceConfig.TimeoutStopSec == 310;
   assert lib.hasInfix "--shutdown-grace-seconds 300" longShutdownConfig.systemd.services.narjar.serviceConfig.ExecStart;
@@ -276,7 +303,17 @@ in
   assert (customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.Group == "narjar");
   assert (customRuntimeConfig.systemd.services.narjar.serviceConfig.StateDirectory == "narjar");
   assert (customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.StateDirectory == "narjar");
-  assert (builtins.substring 0 1 customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.ExecStartPre == "+");
+  assert (lib.hasInfix "--online" customRuntimeConfig.systemd.services.narjar-gc.serviceConfig.ExecStart);
+  assert !(customRuntimeConfig.systemd.services.narjar-gc.serviceConfig ? ExecStartPre);
+  assert !(customRuntimeConfig.systemd.services.narjar-gc.serviceConfig ? ExecStopPost);
+  assert !(fixedUserConfig.systemd.services.narjar-gc.serviceConfig ? ExecStartPre);
+  assert !(fixedUserConfig.systemd.services.narjar-gc.serviceConfig ? ExecStopPost);
+  assert (builtins.elem "narjar.service" customRuntimeConfig.systemd.services.narjar-gc.requires);
+  assert (builtins.elem "narjar.service" customRuntimeConfig.systemd.services.narjar-gc.after);
+  assert (defaultConfig.systemd.services.narjar.serviceConfig.Type == "notify");
+  assert (defaultConfig.systemd.services.narjar.serviceConfig.NotifyAccess == "main");
+  assert (builtins.elem "AF_UNIX" defaultConfig.systemd.services.narjar.serviceConfig.RestrictAddressFamilies);
+  assert !(defaultConfig.services.narjar.gc.enable);
   assert (fixedUserConfig.systemd.services.narjar.serviceConfig.User == "narjar");
   assert (fixedUserConfig.systemd.services.narjar-gc.serviceConfig.User == "narjar");
   assert (fixedUserConfig.systemd.services.narjar.serviceConfig.Group == "narjar");

@@ -579,6 +579,32 @@ sign_path "$gc_root"
 native_push_to "$gc_root"
 gc_roots="$temp_root/gc-roots"
 printf '%s\n' "$gc_root" > "$gc_roots"
+
+scenario 'online GC and real-Nix substitution share the running daemon'
+online_root="$temp_root/online-gc-store"
+substitute "$online_root" "$trusted_key" "$gc_root" >"$temp_root/online-substitution.log" 2>&1 &
+online_substitution=$!
+if ! run narjar gc --data-dir "$data_dir" --storage-backend "$storage_backend" \
+  --online --max-age-seconds 0 --protected-roots "$gc_roots" --apply --json \
+  >"$temp_root/online-gc.log" 2>&1; then
+  grep -Eq 'busy|inventory changed' "$temp_root/online-gc.log" || {
+    cat "$temp_root/online-gc.log" >&2
+    fail 'online GC failed instead of reporting contention'
+  }
+fi
+if ! wait "$online_substitution"; then
+  cat "$temp_root/online-substitution.log" >&2
+  fail 'real-Nix substitution failed while online GC ran'
+fi
+run narjar gc --data-dir "$data_dir" --storage-backend "$storage_backend" \
+  --online --max-age-seconds 0 --protected-roots "$gc_roots" --apply --json
+expect_file "$online_root$gc_root"
+expect_file "$online_root$gc_base"
+run cmp "$gc_root" "$online_root$gc_root"
+run cmp "$gc_base" "$online_root$gc_base"
+kill -0 "$server_pid" || fail 'online GC stopped the daemon'
+cache_curl "$server_url/healthz"
+
 stop_server
 run narjar gc --data-dir "$data_dir" \
   --storage-backend "$storage_backend" \

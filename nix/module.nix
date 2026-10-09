@@ -427,6 +427,7 @@
   gcArgs = lib.escapeShellArgs (
     [
       "gc"
+      "--online"
       "--data-dir"
       runtimeDataDir
       "--apply"
@@ -444,6 +445,10 @@
     ++ lib.optionals (cfg.gc.maxAgeSeconds != null) [
       "--max-age-seconds"
       (toString cfg.gc.maxAgeSeconds)
+    ]
+    ++ lib.optionals (cfg.gc.maxAgeDays != null) [
+      "--delete-older-than"
+      "${toString cfg.gc.maxAgeDays}d"
     ]
     ++ lib.optionals (cfg.gc.minAgeSeconds != 0) [
       "--min-age-seconds"
@@ -609,7 +614,7 @@ in {
       schedule = lib.mkOption {
         type = lib.types.str;
         default = "weekly";
-        description = "systemd OnCalendar expression for offline garbage collection.";
+        description = "systemd OnCalendar expression for daemon-owned online garbage collection.";
       };
 
       maxBytes = lib.mkOption {
@@ -628,6 +633,12 @@ in {
         type = lib.types.nullOr lib.types.ints.unsigned;
         default = null;
         description = "Maximum publication age in seconds.";
+      };
+
+      maxAgeDays = lib.mkOption {
+        type = lib.types.nullOr (lib.types.ints.between 0 213503982334601);
+        default = null;
+        description = "Collect eligible publications and orphan payloads at least this many 24-hour days old. Mutually exclusive with maxAgeSeconds; protected roots and online grace still apply.";
       };
 
       minAgeSeconds = lib.mkOption {
@@ -676,8 +687,13 @@ in {
           !cfg.gc.enable
           || cfg.gc.maxBytes != null
           || cfg.gc.targetBytes != null
-          || cfg.gc.maxAgeSeconds != null;
-        message = "services.narjar.gc requires maxBytes, targetBytes, or maxAgeSeconds";
+          || cfg.gc.maxAgeSeconds != null
+          || cfg.gc.maxAgeDays != null;
+        message = "services.narjar.gc requires maxBytes, targetBytes, maxAgeSeconds, or maxAgeDays";
+      }
+      {
+        assertion = cfg.gc.maxAgeSeconds == null || cfg.gc.maxAgeDays == null;
+        message = "services.narjar.gc.maxAgeSeconds and maxAgeDays are mutually exclusive";
       }
       {
         assertion =
@@ -748,7 +764,10 @@ in {
           ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";
           LoadCredential = map (credential: "${credential.name}:${credential.source}") credentials;
           ExecStart = "${executable} ${serveArgs}";
+          Type = "notify";
+          NotifyAccess = "main";
           Restart = "on-failure";
+          TimeoutStartSec = "1h";
           TimeoutStopSec = lib.mkDefault (cfg.shutdownGraceSeconds + 10);
 
           AmbientCapabilities = "";
@@ -768,6 +787,7 @@ in {
           ProtectProc = "invisible";
           RemoveIPC = true;
           RestrictAddressFamilies = [
+            "AF_UNIX"
             "AF_INET"
             "AF_INET6"
           ];
@@ -814,8 +834,9 @@ in {
       };
     };
     systemd.services.narjar-gc = lib.mkIf cfg.gc.enable {
-      description = "Narjar offline garbage collection";
-      after = ["network.target"];
+      description = "Narjar online garbage collection";
+      requires = ["narjar.service"];
+      after = ["narjar.service"];
       unitConfig.RequiresMountsFor = [cfg.dataDir];
 
       serviceConfig =
@@ -823,10 +844,9 @@ in {
         // serviceIdentityConfig
         // {
           Type = "oneshot";
-          ExecStartPre = "+${pkgs.systemd}/bin/systemctl stop narjar.service";
           ExecStart = "${executable} ${gcArgs}";
-          ExecStopPost = "+${pkgs.systemd}/bin/systemctl start narjar.service";
-          TimeoutStartSec = "infinity";
+          RestrictAddressFamilies = ["AF_UNIX"];
+          TimeoutStartSec = "1h";
         };
     };
 

@@ -71,6 +71,7 @@ pub(super) fn storage_root_directories() -> impl Iterator<Item = &'static str> {
         .iter()
         .copied()
         .chain(CHUNK_DIRECTORIES.iter().copied())
+        .chain([".narjar-control"])
         .filter(|name| !name.contains('/'))
 }
 
@@ -296,6 +297,7 @@ impl CacheLayout {
             root: self.root,
             payloads,
             recovery,
+            collection: Default::default(),
             delivery_validation: DeliveryValidationCache::default(),
             publication_locks: Mutex::new(HashMap::new()),
             staging_budget: Arc::new(Mutex::new(Default::default())),
