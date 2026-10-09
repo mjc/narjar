@@ -2,7 +2,7 @@
 
 use std::{
     io::{self, Read},
-    os::unix::net::UnixStream,
+    os::unix::net::{UnixListener, UnixStream},
     path::Path,
     sync::{
         Arc,
@@ -21,6 +21,7 @@ use narjar::__private::{
         gc::{GcOptions, GcReport},
     },
 };
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 mod protocol;
@@ -165,7 +166,15 @@ impl ControlService {
             match thread::Builder::new()
                 .name("narjar-control".into())
                 .spawn(move || {
-                    dispatch_requests(socket, sender, &busy, &stopping, &daemon_stopping, &metrics)
+                    dispatch_requests(
+                        socket,
+                        sender,
+                        &busy,
+                        &stopping,
+                        &daemon_stopping,
+                        &metrics,
+                        |listener| listener.accept().map(|(connection, _)| connection),
+                    )
                 }) {
                 Ok(dispatcher) => dispatcher,
                 Err(error) => {
@@ -235,18 +244,30 @@ fn dispatch_requests(
     stopping: &AtomicBool,
     daemon_stopping: &AtomicBool,
     metrics: &Metrics,
+    mut accept: impl FnMut(&UnixListener) -> io::Result<UnixStream>,
 ) -> io::Result<()> {
     std::iter::repeat_with(|| ())
         .take_while(|_| !is_stopping(stopping, daemon_stopping))
         .try_for_each(|_| {
-            match bound.listener.accept() {
-                Ok((connection, _)) => {
+            match accept(&bound.listener) {
+                Ok(connection) => {
                     let _ = queue_collection_request(connection, &jobs, busy, metrics);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::park_timeout(Duration::from_millis(100))
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if error.kind() == io::ErrorKind::ConnectionAborted
+                        || error.raw_os_error().is_some_and(|code| {
+                            [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM]
+                                .iter()
+                                .any(|errno| errno.raw_os_error() == code)
+                        }) =>
+                {
+                    eprintln!("narjar: online GC accept failed; retrying: {error}");
+                    thread::park_timeout(Duration::from_millis(100));
+                }
                 Err(error) => return Err(error),
             }
             Ok(())
@@ -434,6 +455,117 @@ mod tests {
         let (_, trusted) = CachePolicies::load(&directory).unwrap().into_parts();
         storage.recover_for_mutation(&trusted).unwrap();
         (root, Arc::new(storage), Arc::new(trusted))
+    }
+
+    #[test]
+    fn transient_accept_errors_preserve_the_listener_and_admit_the_next_request() {
+        let root = tempfile::tempdir().unwrap();
+        let bound = socket::BoundSocket::bind(root.path()).unwrap();
+        let mut client = socket::connect(root.path()).unwrap();
+        protocol::write_frame(&mut client, &options(root.path())).unwrap();
+        let (sender, receiver) = bounded(1);
+        let busy = AtomicBool::new(false);
+        let stopping = AtomicBool::new(false);
+        let daemon_stopping = AtomicBool::new(false);
+        let metrics = Metrics::default();
+        let mut errors = [
+            Errno::AGAIN,
+            Errno::INTR,
+            Errno::CONNABORTED,
+            Errno::MFILE,
+            Errno::NFILE,
+            Errno::NOBUFS,
+            Errno::NOMEM,
+        ]
+        .into_iter();
+        dispatch_requests(
+            bound,
+            sender,
+            &busy,
+            &stopping,
+            &daemon_stopping,
+            &metrics,
+            |listener| {
+                assert!(socket::socket_path(root.path()).exists());
+                if let Some(error) = errors.next() {
+                    return Err(error.into());
+                }
+                let (connection, _) = listener.accept()?;
+                stopping.store(true, Ordering::Release);
+                Ok(connection)
+            },
+        )
+        .expect("transient accept failures must leave collection usable");
+        let mut job = receiver
+            .try_recv()
+            .expect("the next request must be queued");
+        assert_eq!(job.options.data_dir, root.path());
+        send_recorded_reply(
+            &mut job.connection,
+            Reply::Failed(ControlFailure::Changed),
+            &metrics,
+        );
+        assert!(matches!(
+            protocol::read_frame::<Reply>(&mut client).unwrap(),
+            Reply::Failed(ControlFailure::Changed)
+        ));
+        assert!(!socket::socket_path(root.path()).exists());
+    }
+
+    #[test]
+    fn shutdown_during_a_transient_accept_error_stops_before_accepting_again() {
+        for daemon_shutdown in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let bound = socket::BoundSocket::bind(root.path()).unwrap();
+            let (sender, _receiver) = bounded(1);
+            let stopping = AtomicBool::new(false);
+            let daemon_stopping = AtomicBool::new(false);
+            let mut calls = 0;
+            dispatch_requests(
+                bound,
+                sender,
+                &AtomicBool::new(false),
+                &stopping,
+                &daemon_stopping,
+                &Metrics::default(),
+                |_| {
+                    calls += 1;
+                    if daemon_shutdown {
+                        &daemon_stopping
+                    } else {
+                        &stopping
+                    }
+                    .store(true, Ordering::Release);
+                    Err(rustix::io::Errno::MFILE.into())
+                },
+            )
+            .expect("shutdown during resource exhaustion must finish normally");
+            assert_eq!(calls, 1);
+            assert!(!socket::socket_path(root.path()).exists());
+        }
+    }
+
+    #[test]
+    fn a_fatal_accept_error_is_returned_and_removes_the_owned_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let bound = socket::BoundSocket::bind(root.path()).unwrap();
+        let (sender, receiver) = bounded(1);
+        let error = dispatch_requests(
+            bound,
+            sender,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &Metrics::default(),
+            |_| Err(rustix::io::Errno::BADF.into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::BADF.raw_os_error())
+        );
+        assert!(receiver.recv().is_err());
+        assert!(!socket::socket_path(root.path()).exists());
     }
 
     #[test]
