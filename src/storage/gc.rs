@@ -1,9 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
-    fs::{self, File},
+    fs::File,
     io,
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, SystemTime},
 };
 
@@ -25,6 +25,10 @@ use crate::{
     },
 };
 
+#[path = "gc/roots.rs"]
+mod roots;
+pub use roots::ProtectedRoots;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum GcMode {
     DryRun,
@@ -33,12 +37,11 @@ pub enum GcMode {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct GcOptions {
-    pub data_dir: PathBuf,
     pub max_bytes: Option<u64>,
     pub target_bytes: Option<u64>,
     pub max_age: Option<Duration>,
     pub min_age: Duration,
-    pub protected_roots: Option<PathBuf>,
+    pub protected_roots: ProtectedRoots,
     pub mode: GcMode,
     pub backend: StorageBackend,
 }
@@ -382,10 +385,10 @@ impl RetentionPolicy {
     }
 }
 
-pub fn run(options: GcOptions) -> Result<GcReport, StorageError> {
+pub fn run(data_dir: &Path, options: GcOptions) -> Result<GcReport, StorageError> {
     let backend = SupportedStorageBackend::try_from(options.backend)
         .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
-    let root = Directory::open(&options.data_dir)?;
+    let root = Directory::open(data_dir)?;
     let storage = Storage::open(&root, backend)?;
     let (_, trusted) = super::CachePolicies::load(&root)?.into_parts();
     match options.mode {
@@ -506,14 +509,14 @@ fn run_flat_gc<'storage>(
         entry.protected |= access.protects(ProtectedObject::Publication(entry.store))
             || access.protects_nar_name(&entry.raw_nar_name);
     });
-    let protection = protect(&mut entries, options.protected_roots.as_deref(), |entry| {
+    let protection = protect(&mut entries, &options.protected_roots, |entry| {
         ProtectionNode {
             store: &entry.store,
             store_path: &entry.store_path,
             references: &entry.references,
             protected: &mut entry.protected,
         }
-    })?;
+    });
     let orphans = scan_orphans(storage, &entries)?;
     let protected_bytes = category_bytes(&entries, |entry| entry.protected);
 
@@ -716,14 +719,14 @@ fn run_chunked<'storage>(
         entry.protected |= access.protects(ProtectedObject::Publication(entry.store))
             || access.protects(ProtectedObject::CanonicalNar(entry.raw_hash));
     });
-    let protection = protect(&mut entries, options.protected_roots.as_deref(), |entry| {
+    let protection = protect(&mut entries, &options.protected_roots, |entry| {
         ProtectionNode {
             store: &entry.store,
             store_path: &entry.store_path,
             references: &entry.references,
             protected: &mut entry.protected,
         }
-    })?;
+    });
     let now = SystemTime::now();
     let orphans = scan_chunked_orphans(storage, chunk_store, &entries)?;
     let before_bytes = chunked_before_bytes(storage, chunk_store, &entries)?;
@@ -1697,23 +1700,10 @@ struct ProtectionNode<'a> {
 
 fn protect<E>(
     entries: &mut [E],
-    path: Option<&Path>,
+    roots: &ProtectedRoots,
     project: impl for<'a> Fn(&'a mut E) -> ProtectionNode<'a>,
-) -> Result<ProtectionReport, StorageError> {
-    let contents = path
-        .map(fs::read_to_string)
-        .transpose()?
-        .unwrap_or_default();
-    let roots = contents
-        .lines()
-        .map(str::trim)
-        .filter(|root| !root.is_empty())
-        .try_fold(BTreeSet::new(), |mut roots, root| {
-            validate_root(root)?;
-            roots.insert(root.to_owned());
-            Ok::<_, StorageError>(roots)
-        })?;
-
+) -> ProtectionReport {
+    let roots = roots.values();
     let mut pending = roots.iter().cloned().collect::<Vec<_>>();
     let mut missing_roots = BTreeSet::new();
     let mut missing_references = BTreeSet::new();
@@ -1756,7 +1746,7 @@ fn protect<E>(
     })
     .for_each(drop);
 
-    Ok(ProtectionReport {
+    ProtectionReport {
         protected: entries
             .iter_mut()
             .map(project)
@@ -1764,20 +1754,7 @@ fn protect<E>(
             .count(),
         missing_roots: missing_roots.len(),
         missing_references: missing_references.len(),
-    })
-}
-
-fn validate_root(root: &str) -> Result<(), StorageError> {
-    if StoreHash::parse(root).is_ok() {
-        return Ok(());
     }
-    let basename = root
-        .strip_prefix("/nix/store/")
-        .and_then(|value| value.split_once('-').map(|(hash, _)| hash))
-        .ok_or_else(|| invalid(format!("invalid protected root: {root}")))?;
-    StoreHash::parse(basename)
-        .map(|_| ())
-        .map_err(|_| invalid(format!("invalid protected root: {root}")))
 }
 
 fn total_bytes(entries: &[Entry]) -> u64 {
@@ -2182,7 +2159,7 @@ mod tests {
             std::time::Instant::now() - ONLINE_GC_GRACE - Duration::from_secs(1),
         );
         let store = entry.store;
-        let mut options = online_options(directory.path());
+        let mut options = online_options();
         options.mode = GcMode::DryRun;
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
         let mut entries = Some(vec![entry]);
@@ -2241,7 +2218,12 @@ mod tests {
         )
         .unwrap();
         let projections = std::cell::Cell::new(0);
-        let report = protect(&mut entries, Some(&path), |entry| {
+        let roots = ProtectedRoots::load(Some(&path)).unwrap();
+        let roots = crate::records::decode_complete::<ProtectedRoots>(
+            &postcard::to_allocvec(&roots).unwrap(),
+        )
+        .unwrap();
+        let report = protect(&mut entries, &roots, |entry| {
             projections.set(projections.get() + 1);
             ProtectionNode {
                 store: &entry.store,
@@ -2249,8 +2231,7 @@ mod tests {
                 references: &entry.references,
                 protected: &mut entry.protected,
             }
-        })
-        .unwrap();
+        });
         assert_eq!(
             (
                 report.protected,
@@ -2574,12 +2555,11 @@ mod tests {
         .expect("default trust configuration should load");
         let result = run_flat_gc(
             GcOptions {
-                data_dir: directory.path().to_owned(),
                 max_bytes: None,
                 target_bytes: Some(0),
                 max_age: None,
                 min_age: Duration::ZERO,
-                protected_roots: None,
+                protected_roots: ProtectedRoots::default(),
                 mode: GcMode::Apply,
                 backend: StorageBackend::Flat,
             },
@@ -2786,12 +2766,11 @@ mod tests {
 
         let report = run_flat_gc(
             GcOptions {
-                data_dir: directory.path().to_owned(),
                 max_bytes: None,
                 target_bytes: Some(0),
                 max_age: None,
                 min_age: Duration::ZERO,
-                protected_roots: None,
+                protected_roots: ProtectedRoots::default(),
                 mode: GcMode::Apply,
                 backend: StorageBackend::Flat,
             },
@@ -2865,14 +2844,13 @@ mod tests {
         (directory, storage, entry)
     }
 
-    fn online_options(directory: &Path) -> GcOptions {
+    fn online_options() -> GcOptions {
         GcOptions {
-            data_dir: directory.to_owned(),
             max_bytes: None,
             target_bytes: Some(0),
             max_age: None,
             min_age: Duration::ZERO,
-            protected_roots: None,
+            protected_roots: ProtectedRoots::default(),
             mode: GcMode::Apply,
             backend: StorageBackend::Flat,
         }
@@ -3026,7 +3004,7 @@ mod tests {
         let (directory, storage, entry) = scannable_pair_fixture();
         age_publication(directory.path(), &entry);
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
-        let report = run_online(online_options(directory.path()), &storage, &trusted).unwrap();
+        let report = run_online(online_options(), &storage, &trusted).unwrap();
         assert_eq!(report.deleted_narinfos, 0);
         assert_eq!(report.protected, 1);
         assert!(directory.path().join(&entry.narinfo_name).exists());
@@ -3054,7 +3032,7 @@ mod tests {
         drop(snapshot);
         drop(advertisement);
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
-        let report = run_online(online_options(directory.path()), &storage, &trusted).unwrap();
+        let report = run_online(online_options(), &storage, &trusted).unwrap();
         assert_eq!(report.protected, 1);
         assert_eq!(report.deleted_narinfos, 0);
         assert!(directory.path().join("nar").join(&entry.nar_name).exists());
@@ -3087,13 +3065,14 @@ mod tests {
                 protected: index == 0,
             })
             .collect::<Vec<_>>();
-        let report = protect(&mut nodes, None, |node| ProtectionNode {
-            store: &node.store,
-            store_path: &node.path,
-            references: &node.references,
-            protected: &mut node.protected,
-        })
-        .unwrap();
+        let report = protect(&mut nodes, &ProtectedRoots::default(), |node| {
+            ProtectionNode {
+                store: &node.store,
+                store_path: &node.path,
+                references: &node.references,
+                protected: &mut node.protected,
+            }
+        });
         assert_eq!(
             report.protected, 3,
             "advertising A must retain A -> B -> C for substitution"
@@ -3192,7 +3171,7 @@ mod tests {
             drop(storage.read_advertised_narinfo(&root).unwrap().unwrap());
             let trusted =
                 TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
-            let mut options = online_options(directory.path());
+            let mut options = online_options();
             options.backend = backend.backend();
             let report = run_online(options, &storage, &trusted).unwrap();
             assert_eq!(report.protected, 3, "{:?}: A -> B -> C", backend.backend());
@@ -3253,7 +3232,7 @@ mod tests {
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
         let access = CollectionAccess::Online(storage.collection.snapshot().unwrap());
         let result = run_flat_gc(
-            online_options(directory.path()),
+            online_options(),
             &storage,
             &trusted,
             Some(0),
@@ -3295,7 +3274,7 @@ mod tests {
             );
             let trusted =
                 TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
-            let mut options = online_options(directory.path());
+            let mut options = online_options();
             options.target_bytes = None;
             options.max_age = Some(ONLINE_GC_GRACE);
             let access = CollectionAccess::Online(storage.collection.snapshot().unwrap());
@@ -3350,7 +3329,7 @@ mod tests {
         let journals = directory.path().join(".narjar-transactions");
         assert_eq!(fs::read_dir(&journals).unwrap().count(), 1);
         assert!(matches!(
-            run_online(online_options(directory.path()), &storage, &trusted),
+            run_online(online_options(), &storage, &trusted),
             Err(StorageError::CollectionBusy)
         ));
         assert_eq!(fs::read_dir(&journals).unwrap().count(), 1);
@@ -3369,25 +3348,25 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            run_dry_run(online_options(directory.path()), &storage, &trusted),
+            run_dry_run(online_options(), &storage, &trusted),
             Err(StorageError::CollectionBusy)
         ));
         assert!(matches!(
-            run_apply(online_options(directory.path()), &recovered, &trusted),
+            run_apply(online_options(), &recovered, &trusted),
             Err(StorageError::CollectionBusy)
         ));
         drop(publication);
         let scanning = storage.collection.snapshot().unwrap();
         assert!(matches!(
-            run_dry_run(online_options(directory.path()), &storage, &trusted),
+            run_dry_run(online_options(), &storage, &trusted),
             Err(StorageError::CollectionBusy)
         ));
         assert!(matches!(
-            run_online(online_options(directory.path()), &storage, &trusted),
+            run_online(online_options(), &storage, &trusted),
             Err(StorageError::CollectionBusy)
         ));
         drop(scanning);
-        assert!(run_dry_run(online_options(directory.path()), &storage, &trusted).is_ok());
+        assert!(run_dry_run(online_options(), &storage, &trusted).is_ok());
     }
 
     #[test]
@@ -3401,7 +3380,7 @@ mod tests {
         let before_journals = fs::read_dir(&journals).unwrap().count();
         assert_eq!(before_journals, 0);
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
-        let report = run_online(online_options(directory.path()), &storage, &trusted).unwrap();
+        let report = run_online(online_options(), &storage, &trusted).unwrap();
         assert_eq!(report.deleted_narinfos, 1);
         assert_eq!(report.deleted_nars, 1);
         let remaining = scan(&storage, &trusted).unwrap();
@@ -3441,7 +3420,7 @@ mod tests {
             .unwrap();
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
         assert!(matches!(
-            run_online(online_options(directory.path()), &storage, &trusted),
+            run_online(online_options(), &storage, &trusted),
             Err(StorageError::CollectionBusy)
         ));
         assert!(directory.path().join("nar").join(&entry.nar_name).exists());
@@ -3476,7 +3455,7 @@ mod tests {
             .set_modified(SystemTime::now() - ONLINE_GC_GRACE - Duration::from_secs(1))
             .unwrap();
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
-        let report = run_online(online_options(directory.path()), &storage, &trusted).unwrap();
+        let report = run_online(online_options(), &storage, &trusted).unwrap();
         assert_eq!(report.orphaned, 1);
         assert_eq!(report.eligible, 0);
         assert_eq!(report.deleted_orphans, 0);
@@ -3534,7 +3513,7 @@ mod tests {
             .iter()
             .for_each(|path| fs::write(path, b"preserve me").unwrap());
         for mode in [GcMode::DryRun, GcMode::Apply] {
-            let mut options = online_options(directory.path());
+            let mut options = online_options();
             options.backend = StorageBackend::Chunked;
             options.mode = mode;
             let report = run_online(options, &storage, &trusted).unwrap();
@@ -3578,16 +3557,18 @@ mod tests {
         assert!(before.chunks > 0);
         drop(storage);
 
-        let report = run(GcOptions {
-            data_dir: directory.path().to_owned(),
-            max_bytes: None,
-            target_bytes: Some(0),
-            max_age: None,
-            min_age: Duration::ZERO,
-            protected_roots: None,
-            mode: GcMode::Apply,
-            backend: StorageBackend::Chunked,
-        })
+        let report = run(
+            directory.path(),
+            GcOptions {
+                max_bytes: None,
+                target_bytes: Some(0),
+                max_age: None,
+                min_age: Duration::ZERO,
+                protected_roots: ProtectedRoots::default(),
+                mode: GcMode::Apply,
+                backend: StorageBackend::Chunked,
+            },
+        )
         .expect("chunked GC should complete");
 
         assert_eq!(report.deleted_narinfos, 0);
@@ -3638,23 +3619,24 @@ mod tests {
 
         let grace = Duration::from_secs(24 * 60 * 60);
         let gc_options = |mode| GcOptions {
-            data_dir: directory.path().to_owned(),
             max_bytes: Some(1),
             target_bytes: Some(0),
             max_age: None,
             min_age: grace,
-            protected_roots: None,
+            protected_roots: ProtectedRoots::default(),
             mode,
             backend: StorageBackend::Chunked,
         };
-        let recent_dry_run = run(gc_options(GcMode::DryRun)).expect("inspect recent orphan");
+        let recent_dry_run =
+            run(directory.path(), gc_options(GcMode::DryRun)).expect("inspect recent orphan");
         assert_eq!(recent_dry_run.evicted, 0);
         assert_eq!(recent_dry_run.orphaned, 2);
         assert_eq!(recent_dry_run.eligible_bytes, 0);
         assert_eq!(recent_dry_run.orphaned_bytes, recent_dry_run.before_bytes);
         assert_eq!(recent_dry_run.after_bytes, recent_dry_run.before_bytes);
 
-        let recent_apply = run(gc_options(GcMode::Apply)).expect("retain recent orphan");
+        let recent_apply =
+            run(directory.path(), gc_options(GcMode::Apply)).expect("retain recent orphan");
         assert_eq!(recent_apply.after_bytes, recent_apply.before_bytes);
         assert!(output.exists());
         assert!(manifest_path.exists());
@@ -3668,13 +3650,15 @@ mod tests {
                 .set_times(fs::FileTimes::new().set_modified(expired))
                 .unwrap();
         }
-        let expired_dry_run = run(gc_options(GcMode::DryRun)).expect("project expired orphans");
+        let expired_dry_run =
+            run(directory.path(), gc_options(GcMode::DryRun)).expect("project expired orphans");
         assert_eq!(expired_dry_run.evicted, 2);
         assert_eq!(expired_dry_run.eligible_bytes, expired_dry_run.before_bytes);
         assert_eq!(expired_dry_run.orphaned_bytes, expired_dry_run.before_bytes);
         assert_eq!(expired_dry_run.after_bytes, 0);
 
-        let expired_apply = run(gc_options(GcMode::Apply)).expect("collect expired orphans");
+        let expired_apply =
+            run(directory.path(), gc_options(GcMode::Apply)).expect("collect expired orphans");
         assert_eq!(expired_apply.after_bytes, expired_dry_run.after_bytes);
         assert!(!output.exists());
         assert!(!manifest_path.exists());
@@ -3738,21 +3722,20 @@ mod tests {
             drop(storage);
 
             let gc_options = |mode| GcOptions {
-                data_dir: directory.path().to_owned(),
                 max_bytes: None,
                 target_bytes: None,
                 max_age: Some(Duration::ZERO),
                 min_age: Duration::ZERO,
-                protected_roots: None,
+                protected_roots: ProtectedRoots::default(),
                 mode,
                 backend: StorageBackend::Chunked,
             };
-            let dry_run = run(gc_options(GcMode::DryRun))
+            let dry_run = run(directory.path(), gc_options(GcMode::DryRun))
                 .unwrap_or_else(|error| panic!("dry-run must collect {damage}: {error}"));
             assert_eq!(dry_run.evicted, 1, "{damage}");
             assert_eq!(dry_run.after_bytes, 0, "{damage}");
 
-            let applied = run(gc_options(GcMode::Apply))
+            let applied = run(directory.path(), gc_options(GcMode::Apply))
                 .unwrap_or_else(|error| panic!("apply must collect {damage}: {error}"));
             assert_eq!(applied.after_bytes, dry_run.after_bytes, "{damage}");
             assert!(!manifest_path.exists(), "{damage}");
@@ -3984,12 +3967,11 @@ mod tests {
             .recover_for_mutation(&trusted)
             .expect("probe should start with recovered storage");
         let options = GcOptions {
-            data_dir: path.into(),
             max_bytes: None,
             target_bytes: Some(0),
             max_age: None,
             min_age: Duration::ZERO,
-            protected_roots: None,
+            protected_roots: ProtectedRoots::default(),
             mode: GcMode::Apply,
             backend: StorageBackend::Flat,
         };

@@ -20,7 +20,7 @@ use narjar::__private::{
         CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, CACHE_RECOVERY_MARKERS, CachePolicies,
         CleanupOutcome, Directory, LAYOUT_DESCRIPTOR, ReconcileClass, Storage, StorageBackend,
         StorageCapacity, StoreHash, SupportedStorageBackend, capacity_from_statvfs,
-        gc::{self, GcMode, GcOptions, GcReport},
+        gc::{self, GcMode, GcOptions, GcReport, ProtectedRoots},
         private_file_mode_is_valid, storage_directories,
     },
 };
@@ -558,23 +558,21 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
         MaintenanceRecord::new(MaintenanceOperation::Gc, MaintenanceMode::GcDryRun)
     };
     let options = GcOptions {
-        data_dir,
         max_bytes,
         target_bytes,
         max_age: delete_older_than.or_else(|| max_age_seconds.map(Duration::from_secs)),
         min_age: std::time::Duration::from_secs(min_age_seconds),
-        protected_roots,
+        protected_roots: ProtectedRoots::load(protected_roots.as_deref()).map_err(runtime)?,
         mode: if apply { GcMode::Apply } else { GcMode::DryRun },
         backend: storage_backend,
     };
     let report = match execution {
-        CollectionExecution::Online => crate::control::collect(options).map_err(runtime)?,
+        CollectionExecution::Online => {
+            crate::control::collect(&data_dir, options).map_err(runtime)?
+        }
         CollectionExecution::Offline => {
-            let session = MaintenanceSession::open(
-                &options.data_dir,
-                storage_backend,
-                Some(maintenance_record),
-            )?;
+            let session =
+                MaintenanceSession::open(&data_dir, storage_backend, Some(maintenance_record))?;
             match apply {
                 true => session.run_mutation(|recovered, trusted| {
                     gc::run_apply(options, recovered, trusted)
@@ -626,6 +624,7 @@ pub(crate) fn gc(options: Gc) -> Result<(), Error> {
 }
 
 pub(crate) fn collect_online(
+    data_dir: &Path,
     options: GcOptions,
     storage: &Storage,
     trusted: &TrustedPublicKeys,
@@ -634,7 +633,7 @@ pub(crate) fn collect_online(
         GcMode::Apply => MaintenanceMode::GcApply,
         GcMode::DryRun => MaintenanceMode::GcDryRun,
     };
-    let recorder = MaintenanceRecord::new(MaintenanceOperation::Gc, mode).start(&options.data_dir);
+    let recorder = MaintenanceRecord::new(MaintenanceOperation::Gc, mode).start(data_dir);
     record_maintenance_result(
         recorder,
         gc::run_online(options, storage, trusted).map(gc_successful_maintenance_result),

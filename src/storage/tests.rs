@@ -283,12 +283,11 @@ fn online_gc_cannot_sweep_incrementally_published_chunks_before_ingestion_commit
         crate::narinfo::TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap())
             .unwrap();
     let online_options = || super::gc::GcOptions {
-        data_dir: directory.path().to_owned(),
         max_bytes: None,
         target_bytes: Some(0),
         max_age: None,
         min_age: Duration::ZERO,
-        protected_roots: None,
+        protected_roots: Default::default(),
         mode: super::gc::GcMode::Apply,
         backend: StorageBackend::Chunked,
     };

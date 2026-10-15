@@ -71,12 +71,8 @@ enum ControlFailure {
     Storage(String),
 }
 
-pub(crate) fn collect(mut options: GcOptions) -> io::Result<GcReport> {
-    options.protected_roots = options
-        .protected_roots
-        .map(std::path::absolute)
-        .transpose()?;
-    let mut connection = socket::connect(&options.data_dir).map_err(|error| io::Error::new(error.kind(), format!("cannot connect to running narjar: {error}; online GC does not fall back to offline GC")))?;
+pub(crate) fn collect(data_dir: &Path, options: GcOptions) -> io::Result<GcReport> {
+    let mut connection = socket::connect(data_dir).map_err(|error| io::Error::new(error.kind(), format!("cannot connect to running narjar: {error}; online GC does not fall back to offline GC")))?;
     connection.set_write_timeout(Some(REQUEST_TIMEOUT))?;
     protocol::write_frame(&mut connection, &options)?;
     let reply: Reply = protocol::read_frame(DeadlineReader::new(&mut connection, REPORT_TIMEOUT))?;
@@ -324,7 +320,7 @@ fn run_collection(
     root: &Path,
     storage: &Storage,
     trusted: &TrustedPublicKeys,
-    mut options: GcOptions,
+    options: GcOptions,
 ) -> Reply {
     if options.backend != storage.backend() {
         return Reply::Failed(ControlFailure::BackendMismatch);
@@ -332,8 +328,7 @@ fn run_collection(
     if let Err(error) = options.validate_policy() {
         return Reply::Failed(ControlFailure::Policy(error.to_string()));
     }
-    options.data_dir = root.to_owned();
-    match crate::operator::collect_online(options, storage, trusted) {
+    match crate::operator::collect_online(root, options, storage, trusted) {
         Ok(report) => Reply::Completed(Box::new(report)),
         Err(StorageError::CollectionBusy) => Reply::Failed(ControlFailure::Busy),
         Err(StorageError::CollectionChanged) => Reply::Failed(ControlFailure::Changed),
@@ -428,17 +423,44 @@ mod tests {
         );
     }
 
-    fn options(root: &Path) -> GcOptions {
+    fn options() -> GcOptions {
         GcOptions {
-            data_dir: root.to_owned(),
             max_bytes: None,
             target_bytes: Some(0),
             max_age: None,
             min_age: Duration::ZERO,
-            protected_roots: None,
+            protected_roots: Default::default(),
             mode: GcMode::Apply,
             backend: StorageBackend::Flat,
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn online_requests_accept_non_utf8_cache_paths_without_serializing_them() {
+        use std::os::unix::ffi::OsStringExt;
+        // ZFS can require UTF-8 names; tmpfs lets this exercise the wire boundary.
+        let parent = tempfile::tempdir_in("/dev/shm").unwrap();
+        let root = parent
+            .path()
+            .join(std::ffi::OsString::from_vec(b"cache-\xff".to_vec()));
+        std::fs::create_dir(&root).unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let service = ControlService::start_with_collector(
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            metrics,
+            |_| Reply::Failed(ControlFailure::Stopping),
+        )
+        .unwrap();
+        let error = collect(&root, options()).err().unwrap();
+        service
+            .finish(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            error.to_string().contains("shutting down"),
+            "valid Unix paths must reach the collector: {error}"
+        );
     }
 
     fn fixture() -> (tempfile::TempDir, Arc<Storage>, Arc<TrustedPublicKeys>) {
@@ -458,11 +480,64 @@ mod tests {
     }
 
     #[test]
+    fn a_roots_source_removed_after_client_loading_is_not_reopened_by_the_daemon() {
+        let (root, storage, trusted) = fixture();
+        let source = root.path().join("caller-roots");
+        std::fs::write(&source, "00000000000000000000000000000000\n").unwrap();
+        let mut request = options();
+        request.protected_roots =
+            narjar::__private::storage::gc::ProtectedRoots::load(Some(&source)).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        let service = ControlService::start(
+            root.path(),
+            storage,
+            trusted,
+            Arc::new(Metrics::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let report = collect(root.path(), request);
+        service
+            .finish(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(report.unwrap().missing_roots, 1);
+    }
+
+    #[test]
+    fn oversized_root_sets_never_send_a_partial_request_or_enter_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let service = ControlService::start_with_collector(
+            root.path(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Metrics::default()),
+            move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Reply::Failed(ControlFailure::Stopping)
+            },
+        )
+        .unwrap();
+        let mut request = options();
+        let oversized = (0..=protocol::MAX_FRAME_BYTES / 32)
+            .map(|index| format!("{index:032}\n"))
+            .collect::<String>();
+        request.protected_roots =
+            narjar::__private::storage::gc::ProtectedRoots::parse(&oversized).unwrap();
+        let result = collect(root.path(), request);
+        service
+            .finish(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn transient_accept_errors_preserve_the_listener_and_admit_the_next_request() {
         let root = tempfile::tempdir().unwrap();
         let bound = socket::BoundSocket::bind(root.path()).unwrap();
         let mut client = socket::connect(root.path()).unwrap();
-        protocol::write_frame(&mut client, &options(root.path())).unwrap();
+        protocol::write_frame(&mut client, &options()).unwrap();
         let (sender, receiver) = bounded(1);
         let busy = AtomicBool::new(false);
         let stopping = AtomicBool::new(false);
@@ -499,7 +574,7 @@ mod tests {
         let mut job = receiver
             .try_recv()
             .expect("the next request must be queued");
-        assert_eq!(job.options.data_dir, root.path());
+        assert_eq!(job.options.target_bytes, Some(0));
         send_recorded_reply(
             &mut job.connection,
             Reply::Failed(ControlFailure::Changed),
@@ -579,7 +654,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
-        let report = collect(options(root.path())).unwrap();
+        let report = collect(root.path(), options()).unwrap();
         assert!(!report.dry_run);
         assert_eq!(report.after_bytes, 0);
         assert!(report.target_met);
@@ -605,7 +680,7 @@ mod tests {
     #[test]
     fn online_errors_distinguish_policy_backend_and_absent_daemon_without_offline_fallback() {
         let (root, storage, trusted) = fixture();
-        let error = match collect(options(root.path())) {
+        let error = match collect(root.path(), options()) {
             Err(error) => error,
             Ok(_) => panic!("no daemon"),
         };
@@ -618,9 +693,9 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
-        let mut wrong_backend = options(root.path());
+        let mut wrong_backend = options();
         wrong_backend.backend = StorageBackend::Chunked;
-        let error = match collect(wrong_backend) {
+        let error = match collect(root.path(), wrong_backend) {
             Err(error) => error,
             Ok(_) => panic!("backend mismatch"),
         };
@@ -628,10 +703,10 @@ mod tests {
             error.get_ref().unwrap().downcast_ref::<ControlFailure>(),
             Some(ControlFailure::BackendMismatch)
         ));
-        let mut invalid = options(root.path());
+        let mut invalid = options();
         invalid.max_bytes = Some(1);
         invalid.target_bytes = Some(2);
-        let error = match collect(invalid) {
+        let error = match collect(root.path(), invalid) {
             Err(error) => error,
             Ok(_) => panic!("invalid policy"),
         };
@@ -662,9 +737,9 @@ mod tests {
         .unwrap();
         std::thread::scope(|scope| {
             let release = ReleaseCollectorOnDrop(&release_tx);
-            let first = scope.spawn(|| collect(options(root.path())));
+            let first = scope.spawn(|| collect(root.path(), options()));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            let second = match collect(options(root.path())) {
+            let second = match collect(root.path(), options()) {
                 Err(error) => error,
                 Ok(_) => panic!("busy collector"),
             };
@@ -706,7 +781,7 @@ mod tests {
         )
         .unwrap();
         let mut connection = socket::connect(root.path()).unwrap();
-        connection.write_all(b"NGC1\xff\xff\xff\xff").unwrap();
+        connection.write_all(b"NGC2\xff\xff\xff\xff").unwrap();
         connection.shutdown(std::net::Shutdown::Write).unwrap();
         let mut byte = [0];
         connection
@@ -714,7 +789,7 @@ mod tests {
             .unwrap();
         assert_eq!(connection.read(&mut byte).unwrap(), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
-        assert!(collect(options(root.path())).is_err());
+        assert!(collect(root.path(), options()).is_err());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         service
             .finish(Instant::now() + Duration::from_secs(5))
@@ -723,10 +798,9 @@ mod tests {
 
     #[test]
     fn accepted_nonblocking_streams_become_blocking_before_queueing_and_replying() {
-        let root = tempfile::tempdir().unwrap();
         let (connection, mut client) = UnixStream::pair().unwrap();
         connection.set_nonblocking(true).unwrap();
-        protocol::write_frame(&mut client, &options(root.path())).unwrap();
+        protocol::write_frame(&mut client, &options()).unwrap();
         let (sender, receiver) = bounded(1);
         let busy = AtomicBool::new(false);
         queue_collection_request(connection, &sender, &busy, &Metrics::default()).unwrap();
@@ -749,9 +823,8 @@ mod tests {
 
     #[test]
     fn a_closed_collection_queue_releases_admission_and_reports_stopping() {
-        let root = tempfile::tempdir().unwrap();
         let (connection, mut client) = UnixStream::pair().unwrap();
-        protocol::write_frame(&mut client, &options(root.path())).unwrap();
+        protocol::write_frame(&mut client, &options()).unwrap();
         let (sender, receiver) = bounded(1);
         drop(receiver);
         let busy = AtomicBool::new(false);
@@ -769,7 +842,7 @@ mod tests {
     #[test]
     fn expired_deadlines_reject_an_available_partial_frame_without_extending_the_budget() {
         let (mut connection, mut peer) = UnixStream::pair().unwrap();
-        peer.write_all(b"NGC1").unwrap();
+        peer.write_all(b"NGC2").unwrap();
         let mut reader = DeadlineReader {
             connection: &mut connection,
             deadline: Instant::now(),
@@ -798,7 +871,7 @@ mod tests {
         .unwrap();
         thread::scope(|scope| {
             let release = ReleaseCollectorOnDrop(&release_tx);
-            let client = scope.spawn(|| collect(options(root.path())));
+            let client = scope.spawn(|| collect(root.path(), options()));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             service.shutdown.stop();
             assert!(
@@ -832,7 +905,7 @@ mod tests {
         .unwrap();
         thread::scope(|scope| {
             let release = ReleaseCollectorOnDrop(&release_tx);
-            let client = scope.spawn(|| collect(options(root.path())));
+            let client = scope.spawn(|| collect(root.path(), options()));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let error = service.finish(Instant::now()).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);

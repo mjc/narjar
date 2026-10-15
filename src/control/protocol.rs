@@ -5,7 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 pub(super) const MAX_FRAME_BYTES: usize = 16 * 1024;
 const HEADER_BYTES: usize = 8;
-const MAGIC: &[u8; 4] = b"NGC1";
+const MAGIC: &[u8; 4] = b"NGC2";
 
 pub(super) fn read_frame<T: DeserializeOwned>(mut reader: impl Read) -> io::Result<T> {
     let mut header = [0; HEADER_BYTES];
@@ -65,8 +65,8 @@ mod tests {
     #[test]
     fn unsupported_versions_and_oversized_headers_are_rejected_before_reading_a_body() {
         for header in [
-            *b"NGC2\0\0\0\x01",
-            [b'N', b'G', b'C', b'1', 255, 255, 255, 255],
+            *b"NGC1\0\0\0\x01",
+            [b'N', b'G', b'C', b'2', 255, 255, 255, 255],
         ] {
             assert_eq!(
                 read_frame::<u64>(&header[..]).unwrap_err().kind(),

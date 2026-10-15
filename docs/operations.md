@@ -232,7 +232,11 @@ leaves recovery evidence for restart or offline maintenance.
 GC validates published inventory before deleting anything and selects
 publications by narinfo modification time. `--min-age-seconds` protects recent
 publications and orphans. `--protected-roots` takes store paths or hashes,
-one per line, and retains their transitive references.
+one per line, and retains their transitive references. The CLI reads this file
+before collection, including in online mode. Relative paths and `/dev/stdin`
+refer to the invoking process, not the daemon. Sources are limited to 1 MiB;
+online requests, including the validated roots, must fit the 16 KiB control
+frame. Unreadable, invalid, and oversized inputs fail without collecting.
 
 Apply removes and syncs metadata before reclaiming payloads. Shared raw files
 and chunks survive while referenced by a remaining publication.

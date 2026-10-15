@@ -2390,6 +2390,95 @@ fn gc_delete_older_than_rejects_invalid_periods_and_conflicting_age_units() {
 }
 
 #[test]
+fn online_gc_reads_protected_roots_from_the_clients_stdin_not_the_daemons() {
+    let server = RunningServer::start("gc-stdin");
+    let mut client = command()
+        .args([
+            "gc",
+            "--online",
+            "--data-dir",
+            server.data_dir.to_str().unwrap(),
+            "--protected-roots",
+            "/dev/stdin",
+            "--target-bytes",
+            "0",
+            "--dry-run",
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    client
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{ABSENT_STORE_HASH}\n").as_bytes())
+        .unwrap();
+    let result = client.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        report["missing_roots"], 1,
+        "the caller's explicit root must reach the daemon even when its stdin is null"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn online_gc_resolves_non_utf8_roots_filenames_in_the_client() {
+    use std::os::unix::ffi::OsStringExt;
+    let server = RunningServer::start("gc-bytes");
+    let directory = tempfile::tempdir_in("/dev/shm").unwrap();
+    let source = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"roots-\xff".to_vec()));
+    fs::write(&source, format!("{ABSENT_STORE_HASH}\n")).unwrap();
+    let result = command()
+        .args(["gc", "--online", "--data-dir"])
+        .arg(&server.data_dir)
+        .args(["--protected-roots"])
+        .arg(&source)
+        .args(["--target-bytes", "0", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["missing_roots"], 1);
+}
+
+#[test]
+fn invalid_protected_roots_abort_before_an_online_collector_can_be_contacted() {
+    let directory = data_dir("gc-invalid");
+    let source = directory.join("roots");
+    fs::write(&source, "not-a-root\n").unwrap();
+    let result = command()
+        .args(["gc", "--online", "--data-dir"])
+        .arg(directory.path())
+        .args(["--protected-roots"])
+        .arg(&source)
+        .args(["--target-bytes", "0", "--apply"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(error.contains("invalid protected root"), "{error}");
+    assert!(
+        !error.contains("cannot connect"),
+        "invalid roots must be checked locally before opening the control connection"
+    );
+}
+
+#[test]
 fn gc_delete_older_than_preserves_protected_and_recent_publications_and_shared_payloads() {
     let data = init_data_dir("gc-age-publications");
     write_test_trusted_public_keys(data.join("trusted-public-keys"));
@@ -2907,6 +2996,7 @@ impl RunningServer {
                 &workers.to_string(),
             ])
             .args(extra_args)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         process.spawn().expect("narjar should start")
@@ -7876,16 +7966,18 @@ fn gc_rejects_symlinked_narinfo_without_removing_it() {
 fn library_gc_requires_the_same_private_policies_as_startup_before_either_mode() {
     let data_dir = init_data_dir("library-gc-required-policies");
     let collect = |mode| {
-        narjar::__private::storage::gc::run(GcOptions {
-            data_dir: data_dir.path().to_owned(),
-            max_bytes: None,
-            target_bytes: Some(0),
-            max_age: None,
-            min_age: Duration::ZERO,
-            protected_roots: None,
-            mode,
-            backend: narjar::__private::storage::StorageBackend::Flat,
-        })
+        narjar::__private::storage::gc::run(
+            data_dir.path(),
+            GcOptions {
+                max_bytes: None,
+                target_bytes: Some(0),
+                max_age: None,
+                min_age: Duration::ZERO,
+                protected_roots: Default::default(),
+                mode,
+                backend: narjar::__private::storage::StorageBackend::Flat,
+            },
+        )
     };
     let clean = data_dir.join(".narjar-clean");
     let original_marker = fs::read(&clean).unwrap();
@@ -7938,16 +8030,18 @@ fn library_gc_dry_run_preserves_pending_recovery_state() {
     fs::set_permissions(&recovery_marker, fs::Permissions::from_mode(0o600))
         .expect("recovery marker should be private");
 
-    let report = narjar::__private::storage::gc::run(GcOptions {
-        data_dir: data_dir.path().to_owned(),
-        max_bytes: None,
-        target_bytes: Some(0),
-        max_age: None,
-        min_age: Duration::ZERO,
-        protected_roots: None,
-        mode: GcMode::DryRun,
-        backend: narjar::__private::storage::StorageBackend::Flat,
-    })
+    let report = narjar::__private::storage::gc::run(
+        data_dir.path(),
+        GcOptions {
+            max_bytes: None,
+            target_bytes: Some(0),
+            max_age: None,
+            min_age: Duration::ZERO,
+            protected_roots: Default::default(),
+            mode: GcMode::DryRun,
+            backend: narjar::__private::storage::StorageBackend::Flat,
+        },
+    )
     .expect("library dry-run should inspect without completing recovery");
 
     assert!(report.dry_run);
