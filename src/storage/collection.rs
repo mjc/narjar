@@ -86,6 +86,17 @@ impl Default for CollectionCoordinator {
 }
 
 impl CollectionCoordinator {
+    #[cfg(test)]
+    pub(super) fn without_startup_grace() -> Self {
+        let mut coordinator = Self::default();
+        coordinator
+            .activity
+            .get_mut()
+            .expect("unshared test coordinator")
+            .protect_all_until = Instant::now();
+        coordinator
+    }
+
     pub(super) fn new(now: Instant) -> Self {
         Self {
             activity: Mutex::new(Activity {
@@ -327,17 +338,13 @@ impl Drop for CollectionLease<'_> {
 mod tests {
     use super::*;
 
-    fn aged_coordinator() -> CollectionCoordinator {
-        CollectionCoordinator::new(Instant::now() - ONLINE_GC_GRACE)
-    }
-
     fn publication(index: u8) -> ProtectedObject {
         ProtectedObject::Publication(StoreHash::parse(&format!("{index:032o}")).unwrap())
     }
 
     #[test]
     fn a_retained_reader_allows_scanning_and_retirement_of_an_unrelated_object() {
-        let coordinator = aged_coordinator();
+        let coordinator = CollectionCoordinator::without_startup_grace();
         let retained = publication(1);
         let retired = publication(2);
         let read = coordinator.reader(retained).unwrap().unwrap();
@@ -353,7 +360,7 @@ mod tests {
 
     #[test]
     fn advertisements_of_retained_objects_do_not_invalidate_an_in_progress_scan() {
-        let coordinator = aged_coordinator();
+        let coordinator = CollectionCoordinator::without_startup_grace();
         let snapshot = coordinator.snapshot().unwrap();
         let retained = publication(1);
         for _ in 0..16 {
@@ -375,7 +382,7 @@ mod tests {
 
     #[test]
     fn a_completed_advertisement_of_a_retiring_object_invalidates_its_selection() {
-        let coordinator = aged_coordinator();
+        let coordinator = CollectionCoordinator::without_startup_grace();
         let snapshot = coordinator.snapshot().unwrap();
         let retired = publication(1);
         drop(
@@ -395,7 +402,7 @@ mod tests {
 
     #[test]
     fn a_reader_of_a_retiring_object_blocks_retirement_until_its_lease_ends() {
-        let coordinator = aged_coordinator();
+        let coordinator = CollectionCoordinator::without_startup_grace();
         let snapshot = coordinator.snapshot().unwrap();
         let retired = publication(1);
         let read = coordinator.reader(retired).unwrap().unwrap();
@@ -414,7 +421,7 @@ mod tests {
 
     #[test]
     fn every_reader_of_a_selected_object_must_release_its_own_pin() {
-        let coordinator = aged_coordinator();
+        let coordinator = CollectionCoordinator::without_startup_grace();
         let retired = publication(1);
         let first = coordinator.reader(retired).unwrap().unwrap();
         let second = coordinator.reader(retired).unwrap().unwrap();
@@ -440,7 +447,7 @@ mod tests {
 
     #[test]
     fn protection_overflow_during_a_scan_defers_nonempty_retirement() {
-        let coordinator = aged_coordinator();
+        let coordinator = CollectionCoordinator::without_startup_grace();
         let snapshot = coordinator.snapshot().unwrap();
         let protection = coordinator.reader(publication(1)).unwrap().unwrap();
         for index in 0..=RECENT_OBJECT_LIMIT {

@@ -2155,9 +2155,8 @@ mod tests {
     #[test]
     fn an_online_dry_run_does_not_hide_the_publications_it_would_evict() {
         let (directory, mut storage, entry) = pair_fixture();
-        storage.collection = super::super::collection::CollectionCoordinator::new(
-            std::time::Instant::now() - ONLINE_GC_GRACE - Duration::from_secs(1),
-        );
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
         let store = entry.store;
         let mut options = online_options();
         options.mode = GcMode::DryRun;
@@ -3015,9 +3014,8 @@ mod tests {
     fn a_completed_advertisement_protects_aged_metadata_and_its_payload() {
         let (directory, mut storage, entry) = scannable_pair_fixture();
         age_publication(directory.path(), &entry);
-        storage.collection = super::super::collection::CollectionCoordinator::new(
-            std::time::Instant::now() - ONLINE_GC_GRACE,
-        );
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
         let advertisement = storage
             .read_advertised_narinfo(&entry.store)
             .unwrap()
@@ -3164,9 +3162,8 @@ mod tests {
                     .unwrap();
             }
             // Model an aged daemon: reset only the test coordinator, not content or signatures.
-            storage.collection = super::super::collection::CollectionCoordinator::new(
-                std::time::Instant::now() - ONLINE_GC_GRACE,
-            );
+            storage.collection =
+                super::super::collection::CollectionCoordinator::without_startup_grace();
             let root = StoreHash::parse(TEST_STORE_HASH).unwrap();
             drop(storage.read_advertised_narinfo(&root).unwrap().unwrap());
             let trusted =
@@ -3269,9 +3266,8 @@ mod tests {
                     .into_iter()
                     .collect(),
             );
-            storage.collection = super::super::collection::CollectionCoordinator::new(
-                std::time::Instant::now() - ONLINE_GC_GRACE,
-            );
+            storage.collection =
+                super::super::collection::CollectionCoordinator::without_startup_grace();
             let trusted =
                 TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
             let mut options = online_options();
@@ -3373,9 +3369,8 @@ mod tests {
     fn online_collection_projection_matches_deletion_without_certifying_offline_recovery() {
         let (directory, mut storage, entry) = scannable_pair_fixture();
         age_publication(directory.path(), &entry);
-        storage.collection = super::super::collection::CollectionCoordinator::new(
-            std::time::Instant::now() - ONLINE_GC_GRACE,
-        );
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
         let journals = directory.path().join(".narjar-transactions");
         let before_journals = fs::read_dir(&journals).unwrap().count();
         assert_eq!(before_journals, 0);
@@ -3399,9 +3394,8 @@ mod tests {
     fn online_collection_preserves_the_destination_needed_by_an_unresolved_published_journal() {
         let (directory, mut storage, entry) = scannable_pair_fixture();
         age_publication(directory.path(), &entry);
-        storage.collection = super::super::collection::CollectionCoordinator::new(
-            std::time::Instant::now() - ONLINE_GC_GRACE,
-        );
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
         let mut transaction = storage
             .recovery
             .begin(Path::new("nar/.tmp/nar-123-0000000000000001.part"))
@@ -3435,9 +3429,8 @@ mod tests {
     fn an_accepted_raw_upload_survives_orphan_collection_until_metadata_arrives() {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = initialize_storage(directory.path()).unwrap();
-        storage.collection = super::super::collection::CollectionCoordinator::new(
-            std::time::Instant::now() - ONLINE_GC_GRACE,
-        );
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
         let raw = b"upload awaiting a separate narinfo PUT";
         let hash = NarHash::from_digest(sha2::Sha256::digest(raw).into());
         let name = NarFileName::raw(hash);
