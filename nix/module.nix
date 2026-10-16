@@ -373,7 +373,7 @@
     descendant_count=$(${pkgs.zfs}/bin/zfs list -H -r -o name "$dataset" | ${pkgs.coreutils}/bin/wc -l)
     test "$descendant_count" -eq 1
 
-    properties=$(${pkgs.zfs}/bin/zfs get -Hp -o property,value ${lib.escapeShellArgs zfsProperties} "$dataset")
+    properties=$(${pkgs.zfs}/bin/zfs get -Hp -o property,value ${lib.escapeShellArg (lib.concatStringsSep "," zfsProperties)} "$dataset")
     temporary_file=$(${pkgs.coreutils}/bin/mktemp "$sample_directory/.sample.XXXXXX")
     printf '%s\n' "$properties" | ${pkgs.jq}/bin/jq -Rn \
       --arg storage_root "$storage_root" \

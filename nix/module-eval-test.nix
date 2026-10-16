@@ -30,12 +30,26 @@
     nativeStoreEnable ? false,
     nativeStateDir ? "/nix/var/nix",
     nativeRootsDir ? "/nix/var/nix/gcroots/auto/narjar",
+    collectorPackages ? null,
     gc ? {},
   }:
     (import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = pkgs.system;
       modules = [
-        module
+        (
+          if collectorPackages == null
+          then module
+          else
+            {
+              config,
+              lib,
+              ...
+            }:
+              module {
+                inherit config lib;
+                pkgs = collectorPackages;
+              }
+        )
         base
         {
           services.narjar = {
@@ -236,6 +250,165 @@
   nativeStorePreStartScript = lib.removePrefix "+" nativeStorePreStartCommand;
   customNativeStorePreStartScript = lib.removePrefix "+" customNativeStorePreStartCommand;
   fixedUserPreStartScript = lib.removePrefix "+" fixedUserConfig.systemd.services.narjar.serviceConfig.ExecStartPre;
+  collectorZfs = pkgs.writeShellScriptBin "zfs" ''
+    set -eu
+    ${pkgs.jq}/bin/jq -cn --args '$ARGS.positional' -- "$@" >> "$TEST_ZFS_LOG"
+    test "$#" -eq 6
+    case "$1 $2" in
+      'get -H')
+        test "$3" = -o && test "$4" = value
+        test "$5" = mountpoint && test "$6" = "$TEST_DATASET"
+        printf '%s\n' "$TEST_DATA_DIR"
+        ;;
+      'list -H')
+        test "$3" = -r && test "$4" = -o
+        test "$5" = name && test "$6" = "$TEST_DATASET"
+        printf '%s\n' "$TEST_DATASET"
+        ;;
+      'get -Hp')
+        test "$3" = -o && test "$4" = property,value
+        test "$5" = "$TEST_PROPERTIES" && test "$6" = "$TEST_DATASET"
+        printf '%s\t%s\n' \
+          mountpoint "$TEST_DATA_DIR" \
+          used "''${TEST_USED_BYTES:-123}" logicalused 456 \
+          referenced 100 logicalreferenced 400 \
+          usedbydataset 80 usedbysnapshots 20 usedbychildren 10 \
+          usedbyrefreservation 13 available 987654 \
+          compressratio 3.70x refcompressratio 4.00x \
+          compression zstd-3 recordsize 131072
+        ;;
+      *) exit 1 ;;
+    esac
+  '';
+  collectorFindmnt = pkgs.writeShellScriptBin "findmnt" ''
+    set -eu
+    ${pkgs.jq}/bin/jq -cn --args '$ARGS.positional' -- "$@" >> "$TEST_FINDMNT_LOG"
+    test "$#" -eq 6
+    test "$1" = --noheadings && test "$2" = --raw && test "$3" = --output
+    test "$5" = --target && test "$6" = "$TEST_DATA_DIR"
+    case "$4" in
+      SOURCE) printf '%s\n' "$TEST_DATASET" ;;
+      FSTYPE) printf '%s\n' zfs ;;
+      *) exit 1 ;;
+    esac
+  '';
+  # Keep the generated collector intact: only redirect its fixed /run output
+  # into the sandbox, and observe the actual no-copy replacement operation.
+  collectorMktemp = pkgs.writeShellScript "collector-mktemp" ''
+    set -eu
+    test "$#" -eq 1 && test "$1" = /run/narjar-zfs-stats/.sample.XXXXXX
+    exec ${pkgs.coreutils}/bin/mktemp "$TEST_SAMPLE_DIR/.sample.XXXXXX"
+  '';
+  collectorMv = pkgs.writeShellScript "collector-mv" ''
+    set -eu
+    test "$#" -eq 4 && test "$1" = -fT && test "$2" = --
+    test "$4" = /run/narjar-zfs-stats/sample.json
+    test "''${3%/*}" = "$TEST_SAMPLE_DIR"
+    test "$(${pkgs.coreutils}/bin/stat -c %a "$3")" = 644
+    cmp "$TEST_SAMPLE_DIR/sample.json" "$TEST_SAMPLE_DIR/previous.json"
+    ${pkgs.jq}/bin/jq -e '.schema_version == 1 and .used_bytes == 123' "$3" > /dev/null
+    printf 'replace\n' >> "$TEST_REPLACEMENTS"
+    exec ${pkgs.coreutils}/bin/mv -fT -- "$3" "$TEST_SAMPLE_DIR/sample.json"
+  '';
+  collectorCoreutils = pkgs.runCommand "narjar-collector-test-coreutils" {} ''
+    mkdir -p "$out/bin"
+    for executable in ${pkgs.coreutils}/bin/*; do
+      name=''${executable##*/}
+      case "$name" in mktemp|mv) continue ;; esac
+      ln -s "$executable" "$out/bin/$name"
+    done
+    ln -s ${collectorMktemp} "$out/bin/mktemp"
+    ln -s ${collectorMv} "$out/bin/mv"
+  '';
+  collectorConfig = configuration {
+    dataDir = "/var/lib/narjar collector";
+    statsZfsDataset = "tank/private-narjar";
+    privateRead = true;
+    readTokens = "/run/private-credential-marker.tokens";
+    collectorPackages =
+      pkgs
+      // {
+        zfs = collectorZfs;
+        util-linux = collectorFindmnt;
+        coreutils = collectorCoreutils;
+      };
+  };
+  collectorCheck =
+    pkgs.runCommand "narjar-module-zfs-collector-check" {
+      nativeBuildInputs = [pkgs.jq];
+    } ''
+      export TEST_DATA_DIR='/var/lib/narjar collector'
+      export TEST_DATASET=tank/private-narjar
+      export TEST_PROPERTIES=mountpoint,used,logicalused,referenced,logicalreferenced,usedbydataset,usedbysnapshots,usedbychildren,usedbyrefreservation,available,compressratio,refcompressratio,compression,recordsize
+      export TEST_SAMPLE_DIR="$TMPDIR/samples with spaces"
+      export TEST_ZFS_LOG="$TMPDIR/zfs-argv.jsonl"
+      export TEST_FINDMNT_LOG="$TMPDIR/findmnt-argv.jsonl"
+      export TEST_REPLACEMENTS="$TMPDIR/replacements"
+      mkdir -p "$TEST_SAMPLE_DIR"
+      printf '%s\n' '{"previous":"complete sample"}' > "$TEST_SAMPLE_DIR/sample.json"
+      cp "$TEST_SAMPLE_DIR/sample.json" "$TEST_SAMPLE_DIR/previous.json"
+      started=$(date +%s)
+      if ! ${collectorConfig.systemd.services.narjar-zfs-stats.serviceConfig.ExecStart} > "$TMPDIR/stdout" 2> "$TMPDIR/stderr"; then
+        cat "$TMPDIR/stderr" >&2
+        if test -s "$TEST_ZFS_LOG"; then cat "$TEST_ZFS_LOG" >&2; fi
+        echo 'generated ZFS collector failed; expected one comma-separated property-list argument' >&2
+        exit 1
+      fi
+      completed=$(date +%s)
+      test ! -s "$TMPDIR/stdout" && test ! -s "$TMPDIR/stderr"
+      jq -es --arg dataset "$TEST_DATASET" --arg properties "$TEST_PROPERTIES" '
+        . == [
+          ["get", "-H", "-o", "value", "mountpoint", $dataset],
+          ["list", "-H", "-r", "-o", "name", $dataset],
+          ["get", "-Hp", "-o", "property,value", $properties, $dataset]
+        ]' "$TEST_ZFS_LOG"
+      jq -es --arg root "$TEST_DATA_DIR" '
+        . == [
+          ["--noheadings", "--raw", "--output", "SOURCE", "--target", $root],
+          ["--noheadings", "--raw", "--output", "FSTYPE", "--target", $root]
+        ]' "$TEST_FINDMNT_LOG"
+      jq -e --arg root "$TEST_DATA_DIR" --arg dataset "$TEST_DATASET" \
+        --argjson started "$started" --argjson completed "$completed" '
+        .sampled_at_unix_seconds as $time |
+        ($time | type == "number") and ($time >= $started and $time <= $completed) and
+        . == {
+          schema_version: 1,
+          storage_root: ($root | sub("^/var/lib/"; "/var/lib/private/")),
+          dataset: $dataset, mountpoint: $root, sampled_at_unix_seconds: $time,
+          used_bytes: 123, logical_used_bytes: 456,
+          referenced_bytes: 100, logical_referenced_bytes: 400,
+          used_by_dataset_bytes: 80, used_by_snapshots_bytes: 20,
+          used_by_children_bytes: 10, used_by_refreservation_bytes: 13,
+          available_bytes: 987654, compression_ratio: "3.70x",
+          referenced_compression_ratio: "4.00x", compression: "zstd-3",
+          record_size_bytes: 131072
+        }' "$TEST_SAMPLE_DIR/sample.json"
+      test "$(cat "$TEST_REPLACEMENTS")" = replace
+      cp "$TEST_SAMPLE_DIR/sample.json" "$TEST_SAMPLE_DIR/previous.json"
+      export TEST_USED_BYTES=invalid
+      if ${collectorConfig.systemd.services.narjar-zfs-stats.serviceConfig.ExecStart} > "$TMPDIR/failed-stdout" 2> "$TMPDIR/failed-stderr"; then
+        echo 'collector accepted malformed numeric output' >&2
+        exit 1
+      fi
+      cmp "$TEST_SAMPLE_DIR/sample.json" "$TEST_SAMPLE_DIR/previous.json"
+      test "$(cat "$TEST_REPLACEMENTS")" = replace
+      test ! -s "$TMPDIR/failed-stdout"
+      if grep -E '/var/lib/|tank/private-narjar|private-credential-marker' "$TMPDIR/failed-stderr"; then
+        echo 'collector leaked local provenance or credentials in diagnostics' >&2
+        exit 1
+      fi
+      if grep -F private-credential-marker "$TEST_SAMPLE_DIR/sample.json"; then
+        echo 'collector leaked credentials in its sample' >&2
+        exit 1
+      fi
+      for temporary_file in "$TEST_SAMPLE_DIR"/.sample.*; do
+        if test -e "$temporary_file"; then
+          echo 'collector left temporary samples behind' >&2
+          exit 1
+        fi
+      done
+      touch "$out"
+    '';
   # Inspect generated files only in the builder. The returned string keeps this
   # derivation's context, so the flake's writeText check builds it without IFD.
   preStartCheck =
@@ -330,4 +503,4 @@ in
   assert (lib.any (assertion: assertion.message == "services.narjar.nativeStore cannot be enabled until native-store HTTP serving is implemented" && !assertion.assertion) nativeStoreConfig.assertions);
   assert lib.hasPrefix "+" nativeStorePreStartCommand;
   assert lib.hasPrefix "+" customNativeStorePreStartCommand;
-  assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules)); "narjar module assertions passed; generated preStart check: ${preStartCheck}"
+  assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules)); "narjar module assertions passed; generated preStart check: ${preStartCheck}; generated collector check: ${collectorCheck}"
