@@ -8,6 +8,7 @@ use std::{
 
 use super::backend::StorageBackend;
 use super::chunk_store::ChunkStore;
+use super::collection::CollectionCoordinator;
 #[cfg(test)]
 use super::publication::Layout;
 use super::publication::{ProcessLock, StagingBudget};
@@ -43,6 +44,7 @@ pub struct Storage {
     pub(super) root: File,
     pub(super) payloads: PayloadStorage,
     pub(super) recovery: RecoveryState,
+    pub(super) collection: CollectionCoordinator,
     pub(super) delivery_validation: DeliveryValidationCache,
     pub(super) publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     pub(super) staging_budget: Arc<Mutex<StagingBudget>>,

@@ -9,6 +9,7 @@ use std::{
 use rustix::fs::OFlags;
 
 use super::{
+    collection::ActivityLease,
     fs::{StorageCapacity, filesystem_space, lock_exclusive, open_at, private_file_mode_is_valid},
     operations::OwnedTemporary,
     recovery::{PublicationState, PublicationTransaction},
@@ -103,6 +104,7 @@ pub(super) struct StagedPublication<'storage, Checkpoint, State> {
     publication: OwnedPublication<'storage>,
     checkpoint: Checkpoint,
     _state: State,
+    _activity: ActivityLease<'storage>,
 }
 
 impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
@@ -112,6 +114,7 @@ impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
         temporary: OwnedTemporary<'storage>,
         transaction: PublicationTransaction,
         checkpoint: Checkpoint,
+        activity: ActivityLease<'storage>,
     ) -> Self {
         Self {
             storage,
@@ -119,6 +122,7 @@ impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
             publication: OwnedPublication::new(temporary, transaction),
             checkpoint,
             _state: Streaming::new(()),
+            _activity: activity,
         }
     }
 }
@@ -153,6 +157,7 @@ where
             publication,
             checkpoint,
             _state: _,
+            _activity,
         } = self;
         Ok(StagedPublication {
             storage,
@@ -160,6 +165,7 @@ where
             publication,
             checkpoint,
             _state: Validated::new(()),
+            _activity,
         })
     }
 }
@@ -175,6 +181,7 @@ where
             publication,
             checkpoint,
             _state: _,
+            _activity,
         } = self;
         let (temporary, transaction) = publication.into_parts();
         let temporary = temporary.into_file();
@@ -421,6 +428,10 @@ pub enum PublishOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("collection deferred while cache operations are active")]
+    CollectionBusy,
+    #[error("collection inventory changed during scanning")]
+    CollectionChanged,
     #[error("immutable destination has different contents")]
     Conflict,
     #[error("decoded NAR exceeds configured size limit")]

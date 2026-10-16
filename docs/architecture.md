@@ -41,6 +41,7 @@ DATA/
   .narjar-chunks/                shared raw chunks, sharded by hash
   .narjar-ingress/               compressed upload-to-raw receipts
   .narjar-egress/                raw-to-compressed download receipts
+  .narjar-control/gc.sock        private daemon maintenance socket
   .tmp/                         metadata and receipt staging
   <store-hash>.narinfo
   nix-cache-info
@@ -81,7 +82,14 @@ published references before serving. This availability scan checks types,
 sizes, manifests, and chunk presence, not every payload hash. Full content
 verification is an offline command.
 
-Maintenance and serving share an exclusive process lock. Delete and GC remove
+Offline maintenance and serving share an exclusive process lock. Online GC
+uses the daemon's storage owner through a bounded private Unix socket.
+Publication capabilities invalidate an unlocked collection snapshot when a
+mutation begins. Deletion requires a current snapshot and no active mutation.
+Recent upload and metadata-advertisement protection retains substitution
+dependencies; lazy chunked readers retain their backing chunks.
+
+Delete and GC remove
 and sync narinfo before reclaiming content. Shared files and chunks remain
 while any retained publication references them. Crashes may leave orphan
 data, which does not publish a store path.

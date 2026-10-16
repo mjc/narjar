@@ -307,6 +307,13 @@ impl RecoveryState {
         self.create_marker(OsStr::new(".narjar-recovery"))
     }
 
+    pub(super) fn ensure_no_pending_publications(&self) -> Result<(), StorageError> {
+        match self.transaction_entries()?.is_empty() {
+            true => Ok(()),
+            false => Err(StorageError::CollectionBusy),
+        }
+    }
+
     fn transaction_entries(&self) -> Result<Vec<TransactionEntry>, StorageError> {
         let entries = read_dir_names(&self.transactions)?
             .into_iter()

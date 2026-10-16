@@ -69,6 +69,27 @@ enum RecordedPublication {
     Conflict,
     Failure,
 }
+
+#[derive(Clone, Copy, Debug, Enum)]
+pub enum OnlineGcOutcome {
+    Success,
+    TargetNotReached,
+    Busy,
+    InventoryChanged,
+    Failure,
+}
+
+impl OnlineGcOutcome {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::TargetNotReached => "target_not_reached",
+            Self::Busy => "busy",
+            Self::InventoryChanged => "inventory_changed",
+            Self::Failure => "failure",
+        }
+    }
+}
 // A 5-second sampler needs both endpoints to cover an exact five-minute window.
 const TRAFFIC_SAMPLE_CAPACITY: usize = 61;
 #[cfg(target_os = "linux")]
@@ -231,6 +252,7 @@ pub struct Metrics {
     connection_outcomes: EnumMap<ConnectionOutcome, AtomicU64>,
     response_transfer_failures: EnumMap<ResponseTransferFailureKind, AtomicU64>,
     publication_outcomes: EnumMap<RecordedPublication, AtomicU64>,
+    online_gc_outcomes: EnumMap<OnlineGcOutcome, AtomicU64>,
     completed_responses: AtomicU64,
     aborted_responses: AtomicU64,
     nar_get_lookups: EnumMap<CacheLookupOutcome, AtomicU64>,
@@ -293,6 +315,7 @@ impl Default for Metrics {
             connection_outcomes: EnumMap::default(),
             response_transfer_failures: EnumMap::default(),
             publication_outcomes: EnumMap::default(),
+            online_gc_outcomes: EnumMap::default(),
             completed_responses: AtomicU64::new(0),
             aborted_responses: AtomicU64::new(0),
             nar_get_lookups: EnumMap::default(),
@@ -356,6 +379,10 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    pub fn online_gc_completed(&self, outcome: OnlineGcOutcome) {
+        saturating_atomic_add(&self.online_gc_outcomes[outcome], 1);
+    }
+
     pub(crate) fn request(&self, method: RequestMethod, route: RequestRoute) -> RequestGuard<'_> {
         self.requests_in_flight.fetch_add(1, Ordering::Relaxed);
         RequestGuard {
@@ -417,6 +444,11 @@ impl Metrics {
             connections: self.connection_stats(),
             response_transfer_failures: self.response_transfer_failure_stats(),
             publication_outcomes: self.publication_outcome_stats(),
+            online_gc_outcomes: self
+                .online_gc_outcomes
+                .iter()
+                .map(|(outcome, count)| (outcome, count.load(Ordering::Relaxed)))
+                .collect(),
             storage_activity: StorageActivitySnapshot::default(),
             process: ProcessStats {
                 started_at_unix_seconds: self.started_at_unix_seconds,
@@ -1017,7 +1049,18 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
     );
     append_filesystem_metrics(&mut output, &snapshot.filesystem);
     append_maintenance_metrics(&mut output, &snapshot.maintenance);
+    append_online_gc_metrics(&mut output, &snapshot.online_gc_outcomes);
     output
+}
+
+fn append_online_gc_metrics(output: &mut String, outcomes: &EnumMap<OnlineGcOutcome, u64>) {
+    output.push_str("# HELP narjar_online_gc_requests_total Daemon-owned collection requests by outcome.\n# TYPE narjar_online_gc_requests_total counter\n");
+    outcomes.iter().for_each(|(outcome, count)| {
+        output.push_str(&format!(
+            "narjar_online_gc_requests_total{{outcome=\"{}\"}} {count}\n",
+            outcome.label()
+        ));
+    });
 }
 
 fn append_http_request_metrics(output: &mut String, snapshot: &StatsSnapshot) {
@@ -2284,6 +2327,7 @@ pub struct StatsSnapshot {
     pub connections: ConnectionStats,
     pub response_transfer_failures: ResponseTransferFailureStats,
     pub publication_outcomes: PublicationOutcomeStats,
+    pub online_gc_outcomes: EnumMap<OnlineGcOutcome, u64>,
     pub(crate) storage_activity: StorageActivitySnapshot,
     pub process: ProcessStats,
     pub cache: CacheStats,

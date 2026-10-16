@@ -1,4 +1,5 @@
 mod config;
+mod control;
 mod error;
 mod http_url;
 mod narinfo_signing;

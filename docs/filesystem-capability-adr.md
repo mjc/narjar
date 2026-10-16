@@ -16,6 +16,8 @@ Both backends require:
 - unlink and directory synchronization; and
 - an exclusive local `flock` lease.
 
+Online GC also requires a private local Unix-domain socket in DATA.
+
 HTTP delivery uses `sendfile` where available, with a read/write fallback.
 Capacity and readiness probes use `fstatvfs`; startup validates the fixed
 layout and acquires the exclusive lease.
@@ -47,6 +49,6 @@ uploaded objects or narinfos.
 ## Unsupported operations
 
 Narjar has no backend migration, legacy-layout fallback, mixed-layout reads,
-cross-filesystem publication fallback, online GC, or filesystem management
+cross-filesystem publication fallback, or filesystem management
 API. Publication does not require `renameat2`, `O_TMPFILE`, reflinks, NOCOW,
 fs-verity, direct I/O, or io_uring.

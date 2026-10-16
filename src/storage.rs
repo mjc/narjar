@@ -8,6 +8,8 @@ pub(crate) mod chunk_store;
 #[allow(dead_code)]
 #[path = "storage/chunked.rs"]
 pub(crate) mod chunked;
+#[path = "storage/collection.rs"]
+mod collection;
 #[path = "storage/compression.rs"]
 mod compression;
 #[path = "storage/directory.rs"]
@@ -86,6 +88,7 @@ pub use recovery::RecoveryStatus;
 pub use state::Storage;
 pub(crate) use state::StorageActivitySnapshot;
 
+pub(crate) use operations::AdvertisedNarInfo;
 pub use operations::{NarInfoDeletion, NarMatch, RecoveredStorage, StorageReadiness};
 pub use population::PopulationCounts;
 pub use reconcile::{CleanupOutcome, ReconcileClass, ReconcileEntry, ReconcileReport};

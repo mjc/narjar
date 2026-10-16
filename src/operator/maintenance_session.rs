@@ -26,6 +26,16 @@ impl MaintenanceRecord {
     pub(super) const fn new(operation: MaintenanceOperation, mode: MaintenanceMode) -> Self {
         Self { operation, mode }
     }
+
+    pub(super) fn start(self, root: &Path) -> Option<MaintenanceRecorder> {
+        match MaintenanceRecorder::begin(root, self.operation, self.mode) {
+            Ok(recorder) => Some(recorder),
+            Err(error) => {
+                eprintln!("could not record maintenance start: {error}");
+                None
+            }
+        }
+    }
 }
 
 pub(super) struct MaintenanceSession {
@@ -86,15 +96,7 @@ impl MaintenanceSession {
     }
 
     fn start_recording(&self) -> Option<MaintenanceRecorder> {
-        self.record.and_then(|record| {
-            match MaintenanceRecorder::begin(&self.data_dir, record.operation, record.mode) {
-                Ok(recorder) => Some(recorder),
-                Err(error) => {
-                    eprintln!("could not record maintenance start: {error}");
-                    None
-                }
-            }
-        })
+        self.record.and_then(|record| record.start(&self.data_dir))
     }
 }
 
@@ -104,10 +106,10 @@ fn report_recovery_completion(status: RecoveryStatus) {
     }
 }
 
-fn record_maintenance_result<T>(
+pub(super) fn record_maintenance_result<T, E>(
     recorder: Option<MaintenanceRecorder>,
-    result: Result<(T, MaintenanceOutcome, MaintenanceValues), Error>,
-) -> Result<T, Error> {
+    result: Result<(T, MaintenanceOutcome, MaintenanceValues), E>,
+) -> Result<T, E> {
     match result {
         Ok((value, outcome, values)) => {
             finish_maintenance(recorder, outcome, values);

@@ -33,6 +33,7 @@ use super::{
     cache_info::{MAX_CACHE_INFO_BYTES, validate as validate_cache_info},
     chunk_store::{ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
     chunked::ChunkProfile,
+    collection::{ActivityLease, ProtectedObject},
     compression::{
         IngestionReceipt, ReceivedNar, compressed_file_identity, encoded_file_matches,
         nar_file_matches, receive_uploaded_nar,
@@ -60,6 +61,11 @@ use super::{
 use super::publication::injected_fault;
 
 pub(super) const MAX_INGESTION_RECEIPT_BYTES: u64 = 256;
+
+pub(crate) struct AdvertisedNarInfo<'storage> {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) _activity: ActivityLease<'storage>,
+}
 
 #[allow(dead_code)]
 pub(super) fn storage_error_for_chunk_store(error: ChunkStoreError) -> StorageError {
@@ -357,6 +363,7 @@ impl Storage {
         trusted_keys: &TrustedPublicKeys,
         mut report_progress: impl FnMut(crate::inventory::NarInfoCount),
     ) -> Result<RecoveryStatus, StorageError> {
+        let snapshot = self.collection.snapshot()?;
         let status = match self.recovery_required_for()? {
             false => RecoveryStatus::NotRequired,
             true => match Inventory::can_recover(self, trusted_keys, &mut report_progress)? {
@@ -374,7 +381,8 @@ impl Storage {
                 }
             },
         };
-        self.finish_recovery()?;
+        let _exclusive_cleanup = snapshot.authorize_deletion()?;
+        self.finish_recovery_under_exclusion()?;
         Ok(status)
     }
 
@@ -392,6 +400,11 @@ impl Storage {
 
     /// Cleans abandoned publication state after published references were checked.
     pub fn finish_recovery(&self) -> Result<(), StorageError> {
+        let _exclusive_cleanup = self.collection.snapshot()?.authorize_deletion()?;
+        self.finish_recovery_under_exclusion()
+    }
+
+    pub(super) fn finish_recovery_under_exclusion(&self) -> Result<(), StorageError> {
         self.remove_orphan_validation_evidence()?;
         self.remove_orphan_ingestion_receipts()?;
         self.remove_orphan_egress_receipts()?;
@@ -473,6 +486,7 @@ impl Storage {
         policy: NarUploadPolicy,
         reservation: StagingReservation,
     ) -> Result<PublishOutcome, StorageError> {
+        let activity = self.collection.mutation()?;
         let mut destination = store
             .begin_ingest_with_reservation(
                 ChunkProfile::MinCdcHash4V2,
@@ -498,6 +512,7 @@ impl Storage {
         self.activity
             .record_upload_publication(outcome, identity.size().get());
         self.publish_ingestion_receipt_for_received_nar(received)?;
+        activity.protect(ProtectedObject::CanonicalNar(identity.hash()))?;
         completed.release_reservation();
         Ok(outcome)
     }
@@ -654,6 +669,12 @@ impl Storage {
     ) -> Result<Option<OpenedNar<'_>>, StorageError> {
         match (&self.payloads, name.raw_hash()) {
             (PayloadStorage::Chunked(store), Some(hash)) => {
+                let Some(activity) = self
+                    .collection
+                    .reader(ProtectedObject::CanonicalNar(hash))?
+                else {
+                    return Ok(None);
+                };
                 if store
                     .validate_manifest(hash)
                     .map_err(storage_error_for_chunk_store)?
@@ -665,7 +686,10 @@ impl Storage {
                     .open_verified_reader(hash, range, MAX_CHUNK_MANIFEST_BYTES)
                     .map_err(storage_error_for_chunk_store)?;
                 Ok(Some(OpenedNar {
-                    body: NarReadBody::Chunked(Box::new(reader)),
+                    body: NarReadBody::Chunked {
+                        reader: Box::new(reader),
+                        _activity: activity,
+                    },
                 }))
             }
             (PayloadStorage::Flat | PayloadStorage::Chunked(_), None)
@@ -716,6 +740,29 @@ impl Storage {
         open_optional_at(&directory, OsStr::new(&name))
     }
 
+    pub(crate) fn read_advertised_narinfo(
+        &self,
+        store: &StoreHash,
+    ) -> Result<Option<AdvertisedNarInfo<'_>>, StorageError> {
+        let Some(activity) = self
+            .collection
+            .reader(ProtectedObject::Publication(*store))?
+        else {
+            return Ok(None);
+        };
+        self.open_narinfo(store)?
+            .map(|file| {
+                let bytes =
+                    crate::records::read_bounded_bytes(file, crate::narinfo::MAX_NARINFO_BYTES)
+                        .map_err(io::Error::from)?;
+                Ok(AdvertisedNarInfo {
+                    bytes,
+                    _activity: activity.advertise(*store)?,
+                })
+            })
+            .transpose()
+    }
+
     pub fn is_ready(&self, min_free_bytes: u64) -> Result<StorageReadiness, StorageError> {
         let directory = self.nar_temp_directory()?;
         let space = filesystem_space(&directory)?;
@@ -762,10 +809,12 @@ impl Storage {
         &self,
         entry: &ReconcileEntry,
     ) -> Result<reconcile::CleanupOutcome, StorageError> {
+        let _activity = self.collection.mutation()?;
         reconcile::cleanup_stale_temp(self, entry)
     }
 
     pub fn delete_narinfo(&self, store: &StoreHash) -> Result<NarInfoDeletion, StorageError> {
+        let _activity = self.collection.mutation()?;
         let root = self.root_directory()?;
         let name = OsString::from(format!("{}.narinfo", store.as_str()));
         match entry_is_regular_at(&root, &name) {
@@ -800,6 +849,7 @@ impl Storage {
     where
         Checkpoint: FnMut(PublishBoundary) -> Result<(), StorageError>,
     {
+        let activity = self.collection.mutation()?;
         let destination = target.destination();
         destination.validate_path()?;
         let temp_name = self.next_temp_name(&target);
@@ -815,6 +865,7 @@ impl Storage {
             temporary,
             transaction,
             checkpoint,
+            activity,
         ))
     }
 
@@ -837,6 +888,7 @@ impl Storage {
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
         let mut progress = PublicationProgress::Pending(TemporaryLocation::Staging);
+        let _activity = self.collection.mutation()?;
         let result = (|| {
             let root = self.root_directory()?;
             let destination_directory = destination.path.open_parent(&root)?;
