@@ -1782,12 +1782,9 @@ fn append_process_metrics(output: &mut String, sample: &SampleState<ProcessResou
         resources.user_cpu_seconds,
         resources.system_cpu_seconds,
     ));
-    let source = match resources.source {
-        ProcessResourceSource::LinuxProcfs => "linux_procfs",
-    };
-    output.push_str(&format!(
-        "# HELP narjar_process_resource_source_info Source of process resource measurements.\n# TYPE narjar_process_resource_source_info gauge\nnarjar_process_resource_source_info{{source=\"{source}\"}} 1\n"
-    ));
+    output.push_str(
+        "# HELP narjar_process_resource_source_info Source of process resource measurements.\n# TYPE narjar_process_resource_source_info gauge\nnarjar_process_resource_source_info{source=\"linux_procfs\"} 1\n"
+    );
     if let Some(high_water_bytes) = resources.high_water_bytes {
         output.push_str(&format!(
             "# HELP narjar_process_high_water_memory_bytes Process high-water resident memory in bytes.\n# TYPE narjar_process_high_water_memory_bytes gauge\nnarjar_process_high_water_memory_bytes{{state=\"{state}\"}} {high_water_bytes}\n"
@@ -2182,7 +2179,6 @@ fn sample_process_resources() -> Result<ProcessResources, ()> {
     let open_file_descriptors = process_open_file_descriptors();
     let (user_cpu_seconds, system_cpu_seconds) = process_cpu_seconds()?;
     Ok(ProcessResources {
-        source: ProcessResourceSource::LinuxProcfs,
         resident_bytes,
         high_water_bytes,
         user_cpu_seconds,
@@ -2572,18 +2568,12 @@ impl PopulationScanCoverage {
 
 #[derive(Clone, Debug)]
 pub struct ProcessResources {
-    pub source: ProcessResourceSource,
     pub resident_bytes: u64,
     pub high_water_bytes: Option<u64>,
     pub user_cpu_seconds: f64,
     pub system_cpu_seconds: f64,
     pub threads: Option<u64>,
     pub open_file_descriptors: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ProcessResourceSource {
-    LinuxProcfs,
 }
 
 #[derive(Clone, Debug)]
@@ -3991,6 +3981,31 @@ mod tests {
             unavailable,
             super::SampleState::Unavailable { .. }
         ));
+    }
+
+    #[test]
+    fn a_measured_procfs_sample_reports_its_source_and_values_on_every_platform() {
+        let mut snapshot = Metrics::default().snapshot();
+        snapshot.process.resources = super::SampleState::Measured {
+            sampled_at_unix_seconds: 42,
+            value: super::ProcessResources {
+                resident_bytes: 4096,
+                high_water_bytes: Some(8192),
+                user_cpu_seconds: 1.5,
+                system_cpu_seconds: 0.5,
+                threads: Some(2),
+                open_file_descriptors: Some(3),
+            },
+        };
+        let exposition = render_prometheus(&snapshot);
+        assert!(
+            exposition.contains("narjar_process_resource_source_info{source=\"linux_procfs\"} 1")
+        );
+        assert!(
+            exposition.contains("narjar_process_resident_memory_bytes{state=\"measured\"} 4096")
+        );
+        assert!(exposition.contains("narjar_process_cpu_seconds_total{mode=\"user\"} 1.5"));
+        assert!(exposition.contains("narjar_process_cpu_seconds_total{mode=\"system\"} 0.5"));
     }
 
     #[cfg(target_os = "linux")]

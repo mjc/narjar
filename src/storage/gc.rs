@@ -2067,6 +2067,47 @@ mod tests {
     }
 
     #[test]
+    fn offline_flat_gc_projects_then_removes_an_unreferenced_raw_nar() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = initialize_storage(directory.path()).unwrap();
+        install_private_cache_policies(directory.path()).unwrap();
+        let raw = b"unreferenced raw nar";
+        let hash = NarHash::from_digest(sha2::Sha256::digest(raw).into());
+        storage
+            .publish_nar(
+                NarFileName::raw(hash),
+                io::Cursor::new(raw),
+                raw.len() as u64,
+                NarUploadPolicy::new(raw.len() as u64, 0),
+            )
+            .unwrap();
+        drop(storage);
+        let payload = directory.path().join(format!("nar/{hash}.nar"));
+
+        for mode in [GcMode::DryRun, GcMode::Apply] {
+            let report = run(
+                directory.path(),
+                GcOptions {
+                    max_bytes: None,
+                    target_bytes: Some(0),
+                    max_age: None,
+                    min_age: Duration::ZERO,
+                    protected_roots: ProtectedRoots::default(),
+                    mode,
+                    backend: StorageBackend::Flat,
+                },
+            )
+            .unwrap();
+            let dry_run = matches!(mode, GcMode::DryRun);
+            assert_eq!(report.dry_run, dry_run);
+            assert_eq!(report.before_bytes, raw.len() as u64);
+            assert_eq!(report.after_bytes, 0);
+            assert!(report.target_met);
+            assert_eq!(payload.exists(), dry_run);
+        }
+    }
+
+    #[test]
     fn flat_retirement_preserves_shared_payloads_with_out_of_order_selections() {
         let shared = NarHash::from_digest([1; 32]);
         let unique = NarHash::from_digest([2; 32]);
@@ -2253,13 +2294,18 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     fn initialize_chunked_storage(path: &Path) -> Result<Storage, StorageError> {
-        use std::os::unix::fs::PermissionsExt;
-
         let storage = CacheCreation::prepare(
             &Directory::open(path)?,
             StorageBackend::Chunked.try_into().unwrap(),
         )
         .and_then(|creation| creation.create_or_complete())?;
+        install_private_cache_policies(path)?;
+        Ok(storage)
+    }
+
+    fn install_private_cache_policies(path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
         fs::create_dir_all(path.join("auth"))?;
         fs::set_permissions(path.join("auth"), fs::Permissions::from_mode(0o700))?;
         for (name, contents) in [
@@ -2273,7 +2319,7 @@ mod tests {
             fs::write(path.join(name), contents)?;
             fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600))?;
         }
-        Ok(storage)
+        Ok(())
     }
 
     fn select_candidates(
