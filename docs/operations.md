@@ -274,11 +274,30 @@ report the last pass's duration and logically reclaimed objects and bytes.
 The exposition's HELP text describes each series. Labels do not contain
 paths, hashes, token names, or request IDs.
 
-Hit ratio is hits divided by hits plus misses; failures are separate.
+Hit ratio is hits divided by hits plus misses; failures are separate. A narinfo
+hit means committed metadata was read successfully. Reads trust immutable disk
+contents: they do not recheck signatures or backing payloads. Payload lookup
+and transfer failures are counted when those operations observe them. This is
+a server lookup ratio, not a build-success or end-to-end integrity measure.
+
 Counters reset on restart. Outgoing bytes count successful socket writes,
 including partial responses; they do not prove receipt by the client.
 Logical-byte counters do not measure filesystem compression or physical disk
 use.
+
+`narjar_build_info` identifies the version, storage backend and egress codec;
+`narjar_stats_schema_version` identifies the exposition contract. Recent
+artifact request and byte rates report their actual one-/five-minute sample
+coverage. Reporting traffic is excluded. Full and range GET delivery durations
+have separate histograms; HEAD and error responses do not enter those two
+distributions. Interrupted transfers retain their measured bytes and duration.
+
+Process resources and filesystem capacity are sampled every five seconds.
+`/metrics` reads the cached capacity sample, including its timestamp and state,
+without probing the filesystem. Failed refreshes retain the last values as
+stale and report readiness as unknown, not healthy. `/readyz` still performs a
+current readiness check. Sampled headroom is an observation, not an admission
+guarantee; connection, worker and queue gauges come from their live owners.
 
 Population sampling is disabled by default. Enable it with
 `--stats-inventory-interval-seconds 900`; metrics requests use the last sample

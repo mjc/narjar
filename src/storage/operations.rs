@@ -205,6 +205,20 @@ pub enum StorageReadiness {
 }
 
 impl StorageReadiness {
+    pub(crate) fn from_capacity(space: StorageCapacity, min_free_bytes: u64) -> Self {
+        match space.required_capacity(min_free_bytes) {
+            Ok(()) => Self::Ready,
+            Err(StorageError::InsufficientSpace) => Self::LowSpace,
+            Err(StorageError::InsufficientInodes) => Self::NoInodes,
+            Err(StorageError::Io(error))
+                if error.raw_os_error() == Some(rustix::io::Errno::ROFS.raw_os_error()) =>
+            {
+                Self::ReadOnly
+            }
+            Err(_) => Self::ProbeFailed,
+        }
+    }
+
     pub(crate) const fn is_ready(self) -> bool {
         match self {
             Self::Ready => true,
@@ -764,23 +778,14 @@ impl Storage {
     }
 
     pub fn is_ready(&self, min_free_bytes: u64) -> Result<StorageReadiness, StorageError> {
-        let directory = self.nar_temp_directory()?;
-        let space = filesystem_space(&directory)?;
-        Ok(match space.required_capacity(min_free_bytes) {
-            Ok(()) => StorageReadiness::Ready,
-            Err(StorageError::InsufficientSpace) => StorageReadiness::LowSpace,
-            Err(StorageError::InsufficientInodes) => StorageReadiness::NoInodes,
-            Err(StorageError::Io(error))
-                if error.raw_os_error() == Some(rustix::io::Errno::ROFS.raw_os_error()) =>
-            {
-                StorageReadiness::ReadOnly
-            }
-            Err(_) => StorageReadiness::ProbeFailed,
-        })
+        Ok(StorageReadiness::from_capacity(
+            self.staging_filesystem_capacity()?,
+            min_free_bytes,
+        ))
     }
 
-    pub(crate) fn capacity(&self) -> Result<StorageCapacity, StorageError> {
-        let directory = self.nar_directory()?;
+    fn staging_filesystem_capacity(&self) -> Result<StorageCapacity, StorageError> {
+        let directory = self.nar_temp_directory()?;
         Ok(filesystem_space(&directory)?)
     }
 
@@ -789,7 +794,7 @@ impl Storage {
             .staging_budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let capacity = self.capacity()?;
+        let capacity = self.staging_filesystem_capacity()?;
         Ok((capacity, staging.outstanding_bytes()))
     }
 
