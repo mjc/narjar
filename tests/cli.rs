@@ -7177,6 +7177,32 @@ fn health_is_public_but_private_read_protects_readiness_and_metrics() {
 }
 
 #[test]
+fn metrics_keep_the_last_capacity_sample_when_the_payload_directory_is_unavailable() {
+    let server = RunningServer::start("metrics-cached-capacity");
+    let (_, first) = response_parts(&server.request("GET", "/metrics"));
+    let first = String::from_utf8(first).unwrap();
+    assert!(first.contains("narjar_storage_capacity_sample_state{state=\"measured\"} 1\n"));
+    assert!(first.contains("narjar_storage_capacity_bytes{kind=\"available\"} "));
+
+    // Break future descriptor-relative capacity probes without touching the
+    // server's cached observation or any production cache.
+    let payloads = server.data_dir.join("nar");
+    let parked = server.data_dir.join("parked-nar");
+    fs::rename(&payloads, &parked).unwrap();
+    let (headers, body) = response_parts(&server.request("GET", "/metrics"));
+    let (ready, _) = response_parts(&server.request("GET", "/readyz"));
+    fs::rename(&parked, &payloads).unwrap();
+    let (signal, status) = server.stop();
+
+    assert_clean_shutdown(signal, status);
+    assert_http_status_line(&headers, "200 OK");
+    assert_http_status_line(&ready, "503 Service Unavailable");
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("narjar_storage_capacity_bytes{kind=\"available\"} "));
+    assert!(body.contains("narjar_storage_capacity_sample_timestamp_seconds "));
+}
+
+#[test]
 fn readiness_fails_without_affecting_liveness_when_space_is_reserved() {
     let server = RunningServer::start_with_args(
         "operator-not-ready",

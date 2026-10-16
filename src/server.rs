@@ -31,7 +31,7 @@ use crate::{
     config::{ServeConfig, ServeSource},
     error::Error,
 };
-use narjar::__private::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure};
+use narjar::__private::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure, WorkerKind};
 
 mod idle;
 
@@ -98,21 +98,6 @@ impl Drop for Admission {
         let in_flight = self.admissions.in_flight.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(in_flight > 0);
         self.metrics.connection_released();
-    }
-}
-
-struct PublicationActivity(Arc<Metrics>);
-
-impl PublicationActivity {
-    fn start(metrics: Arc<Metrics>) -> Self {
-        metrics.publication_worker_started();
-        Self(metrics)
-    }
-}
-
-impl Drop for PublicationActivity {
-    fn drop(&mut self) {
-        self.0.publication_worker_finished();
     }
 }
 
@@ -244,7 +229,7 @@ fn respond_to_queued_publication(
         queued_at,
     } = publication;
     context.metrics.publication_dequeued(queued_at);
-    let _activity = PublicationActivity::start(Arc::clone(&context.metrics));
+    let _activity = context.metrics.worker(WorkerKind::Publication);
     if let Err(error) = request.acknowledge_body() {
         if let Some(outcome) = Metrics::socket_read_failure(error.kind()) {
             context.metrics.record_connection_outcome(outcome);
@@ -277,6 +262,7 @@ fn spawn_request_workers(
 
 fn run_request_worker(receiver: Receiver<AcceptedRequest>, context: RequestWorkerContext) {
     receiver.iter().for_each(|accepted| {
+        let _activity = context.metrics.worker(WorkerKind::Request);
         context.metrics.connection_dequeued();
         let AcceptedRequest { stream, _admission } = accepted;
         let mut admission = Some(_admission);
@@ -505,6 +491,7 @@ fn recover_server_storage(
 fn spawn_metrics_sampler(
     config: &ServeConfig,
     metrics: Arc<Metrics>,
+    storage: Arc<Storage>,
     stopping: Arc<AtomicBool>,
 ) -> io::Result<thread::JoinHandle<()>> {
     let filesystem_sample = config
@@ -512,11 +499,14 @@ fn spawn_metrics_sampler(
         .as_ref()
         .map(|path| (path.clone(), config.data_dir.clone()));
     let maintenance_root = config.data_dir.clone();
+    let min_free_bytes = config.min_free_bytes;
+    metrics.sample_storage_capacity(&storage, min_free_bytes);
     thread::Builder::new()
         .name("narjar-metrics-sampler".to_owned())
         .spawn(move || {
             while !stopping.load(Ordering::Acquire) {
                 metrics.sample_periodic();
+                metrics.sample_storage_capacity(&storage, min_free_bytes);
                 metrics.sample_maintenance_sidecar(&maintenance_root);
                 if let Some((path, root)) = &filesystem_sample {
                     metrics.sample_filesystem_sidecar(path, root);
@@ -630,7 +620,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         authorizer,
         trusted_keys,
     } = initialize_server_resources(&config)?;
-    let metrics = Arc::new(Metrics::default());
+    let metrics = Arc::new(Metrics::new(config.egress_compression()));
 
     let listener = TcpListener::bind(config.listen)
         .map_err(|error| Error::runtime(format!("cannot listen on {}: {error}", config.listen)))?;
@@ -638,9 +628,13 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         .set_nonblocking(true)
         .map_err(|error| Error::runtime(format!("cannot configure listener: {error}")))?;
     let stopping = Arc::new(AtomicBool::new(false));
-    let metrics_sampler =
-        spawn_metrics_sampler(&config, Arc::clone(&metrics), Arc::clone(&stopping))
-            .map_err(|error| Error::runtime(format!("cannot start metrics sampler: {error}")))?;
+    let metrics_sampler = spawn_metrics_sampler(
+        &config,
+        Arc::clone(&metrics),
+        Arc::clone(&storage),
+        Arc::clone(&stopping),
+    )
+    .map_err(|error| Error::runtime(format!("cannot start metrics sampler: {error}")))?;
     let population_sampler = config
         .stats_inventory_interval_seconds
         .map(|interval| {

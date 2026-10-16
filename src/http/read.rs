@@ -693,14 +693,15 @@ fn respond_protected_operator(
         metrics.auth_failure(false);
         return unauthorized(guard, request);
     }
-    let readiness = storage
-        .is_ready(min_free_bytes)
-        .unwrap_or(StorageReadiness::ProbeFailed);
     match operator {
-        ProtectedOperatorRoute::Readiness => respond_readiness(request, readiness, guard),
-        ProtectedOperatorRoute::Metrics => {
-            respond_metrics(request, storage, metrics, readiness, min_free_bytes, guard)
-        }
+        ProtectedOperatorRoute::Readiness => respond_readiness(
+            request,
+            storage
+                .is_ready(min_free_bytes)
+                .unwrap_or(StorageReadiness::ProbeFailed),
+            guard,
+        ),
+        ProtectedOperatorRoute::Metrics => respond_metrics(request, storage, metrics, guard),
     }
 }
 
@@ -735,23 +736,11 @@ fn respond_metrics(
     request: Request,
     storage: &Storage,
     metrics: &Metrics,
-    readiness: StorageReadiness,
-    min_free_bytes: u64,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
     let temporary_objects = storage.temporary_objects();
     metrics.set_temp_objects(temporary_objects);
-    let (capacity, staging_bytes) = storage
-        .capacity_and_staging()
-        .map(|(capacity, staging_bytes)| (Some(capacity), staging_bytes))
-        .unwrap_or((None, 0));
-    let mut snapshot = metrics.snapshot(
-        readiness,
-        capacity,
-        temporary_objects,
-        min_free_bytes,
-        staging_bytes,
-    );
+    let mut snapshot = metrics.snapshot();
     snapshot.storage_activity = storage.activity_snapshot();
     let response = prevent_operator_and_auth_response_caching(
         Response::from_string(render_prometheus(&snapshot))
@@ -835,10 +824,7 @@ mod tests {
         record_nar_open_outcome(&guard, &missing_after_size, Instant::now());
         drop(guard);
 
-        let lookup = metrics
-            .snapshot(StorageReadiness::Ready, None, 0, 0, 0)
-            .cache
-            .nar_get;
+        let lookup = metrics.snapshot().cache.nar_get;
         assert_eq!(lookup.hits, 0);
         assert_eq!(lookup.failures, 1);
         assert_eq!(lookup.hit_ratio, None);

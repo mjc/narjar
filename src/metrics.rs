@@ -17,8 +17,9 @@ use serde::Deserialize;
 use crate::{
     http_server::Method,
     maintenance,
+    object::WireEncoding,
     storage::{
-        CapacityErrorKind, PopulationCounts, PublishOutcome, StorageActivitySnapshot,
+        CapacityErrorKind, PopulationCounts, PublishOutcome, Storage, StorageActivitySnapshot,
         StorageBackend, StorageCapacity, StorageError, StorageReadiness,
     },
 };
@@ -77,6 +78,12 @@ pub enum OnlineGcOutcome {
     Busy,
     InventoryChanged,
     Failure,
+}
+
+#[derive(Clone, Copy, Debug, Enum)]
+pub enum WorkerKind {
+    Request,
+    Publication,
 }
 
 impl OnlineGcOutcome {
@@ -248,6 +255,7 @@ impl NarRangeOutcome {
 
 #[derive(Debug)]
 pub struct Metrics {
+    egress_compression: WireEncoding,
     requests: EnumMap<RequestMethod, EnumMap<RequestRoute, EnumMap<RecordedStatus, AtomicU64>>>,
     connection_outcomes: EnumMap<ConnectionOutcome, AtomicU64>,
     response_transfer_failures: EnumMap<ResponseTransferFailureKind, AtomicU64>,
@@ -265,6 +273,7 @@ pub struct Metrics {
     started_at: Instant,
     traffic_samples: Mutex<TrafficSamples>,
     process_sample: Mutex<SampleState<ProcessResources>>,
+    capacity_sample: Mutex<SampleState<CapacityStats>>,
     population_sample: Mutex<PopulationSamples>,
     filesystem_sample: Mutex<SampleState<FilesystemStats>>,
     maintenance_sample: Mutex<SampleState<maintenance::Snapshot>>,
@@ -273,7 +282,7 @@ pub struct Metrics {
     connections_limit: AtomicU64,
     queued_connections: AtomicU64,
     request_queue_capacity: AtomicU64,
-    active_publication_workers: AtomicU64,
+    active_workers: EnumMap<WorkerKind, AtomicU64>,
     publication_worker_limit: AtomicU64,
     publication_queue_capacity: AtomicU64,
     declared_upload_bytes: AtomicU64,
@@ -292,17 +301,12 @@ pub struct Metrics {
     capacity_quota: AtomicU64,
     capacity_inodes: AtomicU64,
     capacity_read_only: AtomicU64,
-    publications: AtomicU64,
-    publication_count: AtomicU64,
-    publication_micros: AtomicU64,
-    publication_max_micros: AtomicU64,
     publication_queue_depth: AtomicU64,
-    publication_queue_wait_count: AtomicU64,
-    publication_queue_wait_micros: AtomicU64,
-    publication_queue_wait_max_micros: AtomicU64,
     nar_lookup_latency: DurationHistogram,
     narinfo_lookup_latency: DurationHistogram,
     nar_delivery_latency: DurationHistogram,
+    nar_full_delivery_latency: DurationHistogram,
+    nar_range_delivery_latency: DurationHistogram,
     narinfo_delivery_latency: DurationHistogram,
     publication_latency: DurationHistogram,
     publication_queue_wait_latency: DurationHistogram,
@@ -311,6 +315,7 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
+            egress_compression: WireEncoding::Raw,
             requests: EnumMap::default(),
             connection_outcomes: EnumMap::default(),
             response_transfer_failures: EnumMap::default(),
@@ -331,6 +336,7 @@ impl Default for Metrics {
             started_at: Instant::now(),
             traffic_samples: Mutex::new(TrafficSamples::default()),
             process_sample: Mutex::new(SampleState::NeverSampled),
+            capacity_sample: Mutex::new(SampleState::NeverSampled),
             population_sample: Mutex::new(PopulationSamples::default()),
             filesystem_sample: Mutex::new(SampleState::Unavailable {
                 reason: "not_configured".to_owned(),
@@ -341,7 +347,7 @@ impl Default for Metrics {
             connections_limit: AtomicU64::new(0),
             queued_connections: AtomicU64::new(0),
             request_queue_capacity: AtomicU64::new(0),
-            active_publication_workers: AtomicU64::new(0),
+            active_workers: EnumMap::default(),
             publication_worker_limit: AtomicU64::new(0),
             publication_queue_capacity: AtomicU64::new(0),
             declared_upload_bytes: AtomicU64::new(0),
@@ -360,17 +366,12 @@ impl Default for Metrics {
             capacity_quota: AtomicU64::new(0),
             capacity_inodes: AtomicU64::new(0),
             capacity_read_only: AtomicU64::new(0),
-            publications: AtomicU64::new(0),
-            publication_count: AtomicU64::new(0),
-            publication_micros: AtomicU64::new(0),
-            publication_max_micros: AtomicU64::new(0),
             publication_queue_depth: AtomicU64::new(0),
-            publication_queue_wait_count: AtomicU64::new(0),
-            publication_queue_wait_micros: AtomicU64::new(0),
-            publication_queue_wait_max_micros: AtomicU64::new(0),
             nar_lookup_latency: DurationHistogram::default(),
             narinfo_lookup_latency: DurationHistogram::default(),
             nar_delivery_latency: DurationHistogram::default(),
+            nar_full_delivery_latency: DurationHistogram::default(),
+            nar_range_delivery_latency: DurationHistogram::default(),
             narinfo_delivery_latency: DurationHistogram::default(),
             publication_latency: DurationHistogram::default(),
             publication_queue_wait_latency: DurationHistogram::default(),
@@ -379,6 +380,13 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    pub fn new(egress_compression: WireEncoding) -> Self {
+        Self {
+            egress_compression,
+            ..Self::default()
+        }
+    }
+
     pub fn online_gc_completed(&self, outcome: OnlineGcOutcome) {
         saturating_atomic_add(&self.online_gc_outcomes[outcome], 1);
     }
@@ -409,14 +417,7 @@ impl Metrics {
         counters[outcome].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn snapshot(
-        &self,
-        readiness: StorageReadiness,
-        capacity: Option<StorageCapacity>,
-        temporary_objects: u64,
-        min_free_bytes: u64,
-        staging_bytes: u64,
-    ) -> StatsSnapshot {
+    pub(crate) fn snapshot(&self) -> StatsSnapshot {
         let traffic_bytes_overflowed = self.traffic_bytes_overflowed.load(Ordering::Relaxed);
         let traffic_rates = self.recent_traffic_rates(traffic_bytes_overflowed);
         let process_resources = self
@@ -440,6 +441,7 @@ impl Metrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         StatsSnapshot {
+            egress_compression: self.egress_compression,
             http_requests: self.http_request_counts(),
             connections: self.connection_stats(),
             response_transfer_failures: self.response_transfer_failure_stats(),
@@ -468,13 +470,7 @@ impl Metrics {
             latency: self.latency_snapshot(),
             traffic: self.traffic_stats(traffic_bytes_overflowed, traffic_rates),
             reliability: self.reliability_stats(),
-            pressure: self.pressure_stats(
-                readiness,
-                capacity,
-                temporary_objects,
-                min_free_bytes,
-                staging_bytes,
-            ),
+            pressure: self.pressure_stats(),
             inventory: population.last_complete,
             inventory_attempt: population.last_attempt,
             filesystem,
@@ -528,28 +524,34 @@ impl Metrics {
         }
     }
 
-    fn pressure_stats(
-        &self,
-        readiness: StorageReadiness,
-        capacity: Option<StorageCapacity>,
-        temporary_objects: u64,
-        min_free_bytes: u64,
-        staging_bytes: u64,
-    ) -> PressureStats {
+    fn pressure_stats(&self) -> PressureStats {
+        let capacity = self
+            .capacity_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let readiness = match &capacity {
+            SampleState::Measured { value, .. } => value.readiness,
+            SampleState::NeverSampled
+            | SampleState::Unavailable { .. }
+            | SampleState::Stale { .. } => StorageReadiness::ProbeFailed,
+        };
         PressureStats {
             readiness,
-            temporary_objects,
+            temporary_objects: self.temp_objects.load(Ordering::Relaxed),
             connections_in_flight: self.connections_in_flight.load(Ordering::Relaxed),
             connections_limit: self.connections_limit.load(Ordering::Relaxed),
             request_queue_depth: self.queued_connections.load(Ordering::Relaxed),
             request_queue_capacity: self.request_queue_capacity.load(Ordering::Relaxed),
-            active_publication_workers: self.active_publication_workers.load(Ordering::Relaxed),
+            active_request_workers: self.active_workers[WorkerKind::Request]
+                .load(Ordering::Relaxed),
+            request_worker_limit: self.publication_worker_limit.load(Ordering::Relaxed),
+            active_publication_workers: self.active_workers[WorkerKind::Publication]
+                .load(Ordering::Relaxed),
             publication_worker_limit: self.publication_worker_limit.load(Ordering::Relaxed),
             publication_queue_depth: self.publication_queue_depth.load(Ordering::Relaxed),
             publication_queue_capacity: self.publication_queue_capacity.load(Ordering::Relaxed),
-            capacity: capacity.map(|capacity| {
-                CapacityStats::from_storage(capacity, min_free_bytes, staging_bytes)
-            }),
+            capacity,
         }
     }
 
@@ -682,14 +684,10 @@ impl Metrics {
         self.queued_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub fn publication_worker_started(&self) {
-        self.active_publication_workers
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn publication_worker_finished(&self) {
-        self.active_publication_workers
-            .fetch_sub(1, Ordering::Relaxed);
+    pub fn worker(&self, kind: WorkerKind) -> WorkerGuard<'_> {
+        let counter = &self.active_workers[kind];
+        counter.fetch_add(1, Ordering::Relaxed);
+        WorkerGuard(counter)
     }
 
     pub fn sample_periodic(&self) {
@@ -706,6 +704,7 @@ impl Metrics {
             at: Instant::now(),
             upload_bytes: self.received_upload_bytes.load(Ordering::Relaxed),
             download_bytes: self.bytes_out.load(Ordering::Relaxed),
+            artifact_requests: self.terminal_artifact_request_count(),
             process_cpu_seconds,
             byte_counters_overflowed: self.traffic_bytes_overflowed.load(Ordering::Relaxed),
         });
@@ -721,6 +720,45 @@ impl Metrics {
             unix_seconds_now(),
             "procfs_read_failed",
         );
+    }
+
+    fn terminal_artifact_request_count(&self) -> Option<u64> {
+        self.requests
+            .values()
+            .flat_map(|routes| routes.iter())
+            .filter(|(route, _)| route.is_artifact())
+            .flat_map(|(_, statuses)| statuses.values())
+            .map(|count| count.load(Ordering::Relaxed))
+            .try_fold(0_u64, |total, count| match count {
+                u64::MAX => None,
+                count => total.checked_add(count),
+            })
+    }
+
+    pub fn sample_storage_capacity(&self, storage: &Storage, min_free_bytes: u64) {
+        self.record_capacity_sample(
+            storage.capacity_and_staging(),
+            min_free_bytes,
+            unix_seconds_now(),
+        );
+    }
+
+    fn record_capacity_sample(
+        &self,
+        result: Result<(StorageCapacity, u64), StorageError>,
+        min_free_bytes: u64,
+        sampled_at: u64,
+    ) {
+        let result = result
+            .map(|(capacity, staging)| {
+                CapacityStats::from_storage(capacity, min_free_bytes, staging)
+            })
+            .map_err(|_| ());
+        let mut previous = self
+            .capacity_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *previous = next_sample_state(&previous, result, sampled_at, "capacity_probe_failed");
     }
 
     pub fn sample_filesystem_sidecar(&self, path: &Path, expected_root: &Path) {
@@ -820,12 +858,6 @@ impl Metrics {
 
     pub(crate) fn publication(&self, elapsed: Duration) {
         self.publication_latency.observe(elapsed);
-        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
-        self.publications.fetch_add(1, Ordering::Relaxed);
-        self.publication_count.fetch_add(1, Ordering::Relaxed);
-        self.publication_micros.fetch_add(micros, Ordering::Relaxed);
-        self.publication_max_micros
-            .fetch_max(micros, Ordering::Relaxed);
     }
 
     pub fn record_publication_result(&self, result: &Result<PublishOutcome, StorageError>) {
@@ -843,6 +875,8 @@ impl Metrics {
             nar_lookup: self.nar_lookup_latency.snapshot(),
             narinfo_lookup: self.narinfo_lookup_latency.snapshot(),
             nar_delivery: self.nar_delivery_latency.snapshot(),
+            nar_full_delivery: self.nar_full_delivery_latency.snapshot(),
+            nar_range_delivery: self.nar_range_delivery_latency.snapshot(),
             narinfo_delivery: self.narinfo_delivery_latency.snapshot(),
             publication: self.publication_latency.snapshot(),
             publication_queue_wait: self.publication_queue_wait_latency.snapshot(),
@@ -861,15 +895,8 @@ impl Metrics {
     pub fn publication_dequeued(&self, queued_at: Instant) {
         let queued = self.publication_queue_depth.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(queued > 0);
-        let micros = queued_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         self.publication_queue_wait_latency
-            .observe(Duration::from_micros(micros));
-        self.publication_queue_wait_count
-            .fetch_add(1, Ordering::Relaxed);
-        self.publication_queue_wait_micros
-            .fetch_add(micros, Ordering::Relaxed);
-        self.publication_queue_wait_max_micros
-            .fetch_max(micros, Ordering::Relaxed);
+            .observe(queued_at.elapsed());
     }
 
     pub(crate) fn capacity_failure(&self, kind: CapacityErrorKind) {
@@ -899,13 +926,16 @@ impl Metrics {
         } else {
             StorageReadiness::LowSpace
         };
-        render_prometheus(&self.snapshot(
-            readiness,
-            capacity,
-            self.temp_objects.load(Ordering::Relaxed),
-            min_free_bytes,
-            staging_bytes,
-        ))
+        let mut snapshot = self.snapshot();
+        snapshot.pressure.readiness = readiness;
+        snapshot.pressure.capacity = match capacity {
+            Some(capacity) => SampleState::Measured {
+                sampled_at_unix_seconds: unix_seconds_now(),
+                value: CapacityStats::from_storage(capacity, min_free_bytes, staging_bytes),
+            },
+            None => SampleState::NeverSampled,
+        };
+        render_prometheus(&snapshot)
     }
 }
 
@@ -1038,7 +1068,7 @@ pub(crate) fn render_prometheus(snapshot: &StatsSnapshot) -> String {
     append_readiness_reason(&mut output, snapshot.pressure.readiness);
     append_pressure_metrics(&mut output, snapshot);
     append_cache_lookup_metrics(&mut output, &snapshot.cache, &snapshot.nar_range_requests);
-    append_capacity_metrics(&mut output, snapshot.pressure.capacity.as_ref());
+    append_capacity_metrics(&mut output, &snapshot.pressure.capacity);
     append_process_metrics(&mut output, &snapshot.process.resources);
     append_latency_metrics(&mut output, &snapshot.latency);
     append_traffic_rate_metrics(&mut output, &snapshot.traffic.recent_rates);
@@ -1074,6 +1104,16 @@ fn append_http_request_metrics(output: &mut String, snapshot: &StatsSnapshot) {
 }
 
 fn append_process_lifecycle_metrics(output: &mut String, snapshot: &StatsSnapshot) {
+    let version = env!("CARGO_PKG_VERSION");
+    let egress = snapshot.egress_compression.compression();
+    let backend = match snapshot.storage_activity.backend {
+        StorageBackend::Flat => "flat",
+        StorageBackend::Chunked => "chunked",
+    };
+    output.push_str(&format!(
+        "# HELP narjar_stats_schema_version Version of the statistics exposition contract.\n# TYPE narjar_stats_schema_version gauge\nnarjar_stats_schema_version 1\n\
+         # HELP narjar_build_info Server version and configured storage and output representation.\n# TYPE narjar_build_info gauge\nnarjar_build_info{{version=\"{version}\",backend=\"{backend}\",egress_compression=\"{egress}\"}} 1\n"
+    ));
     output.push_str(&format!(
         "# HELP narjar_stats_snapshot_timestamp_seconds Unix time when this exposition snapshot was rendered.\n# TYPE narjar_stats_snapshot_timestamp_seconds gauge\nnarjar_stats_snapshot_timestamp_seconds {}\n\
          # HELP narjar_process_start_time_seconds Unix time when this process started.\n# TYPE narjar_process_start_time_seconds gauge\nnarjar_process_start_time_seconds {}\n\
@@ -1099,7 +1139,6 @@ fn append_traffic_and_reliability_metrics(output: &mut String, snapshot: &StatsS
          # HELP narjar_disk_full_total No-space capacity failures.\n# TYPE narjar_disk_full_total counter\nnarjar_disk_full_total {}\n\
          # HELP narjar_capacity_failures_total Capacity failures by reason.\n# TYPE narjar_capacity_failures_total counter\nnarjar_capacity_failures_total{{reason=\"no_space\"}} {}\nnarjar_capacity_failures_total{{reason=\"quota\"}} {}\nnarjar_capacity_failures_total{{reason=\"inodes\"}} {}\nnarjar_capacity_failures_total{{reason=\"read_only\"}} {}\n\
          # HELP narjar_publications_total Publication attempts.\n# TYPE narjar_publications_total counter\nnarjar_publications_total {}\n\
-         # HELP narjar_publication_duration_seconds Publication duration summary.\n# TYPE narjar_publication_duration_seconds summary\nnarjar_publication_duration_seconds_count {}\nnarjar_publication_duration_seconds_sum {}\nnarjar_publication_duration_seconds_max {}\n\
          # HELP narjar_publication_queue_depth Valid PUT requests waiting for the publication worker.\n# TYPE narjar_publication_queue_depth gauge\nnarjar_publication_queue_depth {}\n\
          # HELP narjar_ready Whether the configured destination is ready.\n# TYPE narjar_ready gauge\nnarjar_ready {}\n",
         traffic.declared_upload_bytes, traffic.received_upload_body_bytes,
@@ -1111,21 +1150,36 @@ fn append_traffic_and_reliability_metrics(output: &mut String, snapshot: &StatsS
         reliability.capacity_no_space,
         reliability.capacity_quota, reliability.capacity_inodes,
         reliability.capacity_read_only, snapshot.latency.publication.count,
-        snapshot.latency.publication.sum_seconds,
-        snapshot.latency.publication.max_seconds,
-        snapshot.latency.publication.count,
         snapshot.pressure.publication_queue_depth,
         u8::from(snapshot.pressure.readiness.is_ready()),
     ));
+    append_publication_duration_summary(output, &snapshot.latency.publication);
     output.push_str(&format!(
         "# HELP narjar_traffic_byte_counters_overflowed Whether cumulative traffic byte counters saturated; recent byte rates are omitted when true.\n# TYPE narjar_traffic_byte_counters_overflowed gauge\nnarjar_traffic_byte_counters_overflowed {}\n",
         u8::from(traffic.cumulative_byte_counters_overflowed),
     ));
 }
 
+fn append_publication_duration_summary(output: &mut String, duration: &DurationHistogramSnapshot) {
+    let DurationHistogramSnapshot {
+        count,
+        sum_seconds,
+        max_seconds,
+        ..
+    } = duration;
+    output.push_str(&format!(
+        "# HELP narjar_publication_duration_seconds Publication duration summary.\n# TYPE narjar_publication_duration_seconds summary\nnarjar_publication_duration_seconds_count {count}\nnarjar_publication_duration_seconds_sum {sum_seconds}\nnarjar_publication_duration_seconds_max {max_seconds}\n"
+    ));
+}
+
 fn append_pressure_metrics(output: &mut String, snapshot: &StatsSnapshot) {
     let traffic = &snapshot.traffic;
     let pressure = &snapshot.pressure;
+    output.push_str(&format!(
+        "# HELP narjar_request_workers_active HTTP workers parsing or responding to a request.\n# TYPE narjar_request_workers_active gauge\nnarjar_request_workers_active {}\n\
+         # HELP narjar_request_workers_limit Configured HTTP worker count.\n# TYPE narjar_request_workers_limit gauge\nnarjar_request_workers_limit {}\n",
+        pressure.active_request_workers, pressure.request_worker_limit,
+    ));
     output.push_str(&format!(
         "# HELP narjar_responses_completed_total Responses whose full body was written.\n# TYPE narjar_responses_completed_total counter\nnarjar_responses_completed_total {}\n\
          # HELP narjar_responses_aborted_total Responses that did not finish writing.\n# TYPE narjar_responses_aborted_total counter\nnarjar_responses_aborted_total {}\n\
@@ -1147,7 +1201,7 @@ fn append_pressure_metrics(output: &mut String, snapshot: &StatsSnapshot) {
 
 fn append_cache_lookup_metrics(output: &mut String, cache: &CacheStats, ranges: &NarRangeStats) {
     output.push_str(
-        "# HELP narjar_cache_lookup_outcomes_total Validated cache object lookup outcomes.\n# TYPE narjar_cache_lookup_outcomes_total counter\n",
+        "# HELP narjar_cache_lookup_outcomes_total Cache object lookup outcomes; narinfo reads trust committed immutable metadata without rechecking backing payloads.\n# TYPE narjar_cache_lookup_outcomes_total counter\n",
     );
     for (object, method, lookup) in cache.lookups() {
         append_lookup_metrics(output, object, method, lookup);
@@ -1161,8 +1215,27 @@ fn append_cache_lookup_metrics(output: &mut String, cache: &CacheStats, ranges: 
     }
 }
 
-fn append_capacity_metrics(output: &mut String, capacity: Option<&CapacityStats>) {
-    if let Some(capacity) = capacity {
+fn append_capacity_metrics(output: &mut String, sample: &SampleState<CapacityStats>) {
+    let (state, observation) = match sample {
+        SampleState::NeverSampled => ("never_sampled", None),
+        SampleState::Unavailable { .. } => ("unavailable", None),
+        SampleState::Measured {
+            sampled_at_unix_seconds,
+            value,
+        } => ("measured", Some((*sampled_at_unix_seconds, value))),
+        SampleState::Stale {
+            sampled_at_unix_seconds,
+            value,
+            ..
+        } => ("stale", Some((*sampled_at_unix_seconds, value))),
+    };
+    output.push_str(&format!(
+        "# HELP narjar_storage_capacity_sample_state State of background filesystem-capacity sampling.\n# TYPE narjar_storage_capacity_sample_state gauge\nnarjar_storage_capacity_sample_state{{state=\"{state}\"}} 1\n"
+    ));
+    if let Some((sampled_at, capacity)) = observation {
+        output.push_str(&format!(
+            "# HELP narjar_storage_capacity_sample_timestamp_seconds Unix time of the last successful capacity sample.\n# TYPE narjar_storage_capacity_sample_timestamp_seconds gauge\nnarjar_storage_capacity_sample_timestamp_seconds {sampled_at}\n"
+        ));
         output.push_str(&format!(
             "# HELP narjar_storage_capacity_bytes Destination filesystem bytes.\n# TYPE narjar_storage_capacity_bytes gauge\nnarjar_storage_capacity_bytes{{kind=\"total\"}} {}\nnarjar_storage_capacity_bytes{{kind=\"available\"}} {}\n\
              # HELP narjar_storage_capacity_inodes Destination filesystem inodes.\n# TYPE narjar_storage_capacity_inodes gauge\nnarjar_storage_capacity_inodes{{kind=\"total\"}} {}\nnarjar_storage_capacity_inodes{{kind=\"available\"}} {}\n\
@@ -1741,6 +1814,7 @@ fn append_process_sample_state(output: &mut String, state: &str) {
 }
 
 fn append_traffic_rate_metrics(output: &mut String, rates: &RecentTrafficRates) {
+    output.push_str("# HELP narjar_http_artifact_requests_per_second Recent artifact requests reaching a terminal response outcome per second; reporting requests are excluded.\n# TYPE narjar_http_artifact_requests_per_second gauge\n");
     output.push_str(
         "# HELP narjar_http_upload_bytes_per_second Recent upload body throughput in bytes per second.\n# TYPE narjar_http_upload_bytes_per_second gauge\n# HELP narjar_http_artifact_bytes_per_second Recent artifact response throughput in bytes per second.\n# TYPE narjar_http_artifact_bytes_per_second gauge\n# HELP narjar_traffic_rate_window_coverage_seconds Actual elapsed coverage of a recent traffic rate window.\n# TYPE narjar_traffic_rate_window_coverage_seconds gauge\n# HELP narjar_process_cpu_cores Recent process CPU use in fully occupied core equivalents.\n# TYPE narjar_process_cpu_cores gauge\n",
     );
@@ -1752,6 +1826,11 @@ fn append_traffic_rate_window(output: &mut String, window: &str, rate: Option<&T
     let Some(rate) = rate else {
         return;
     };
+    if let Some(requests) = rate.artifact_requests_per_second {
+        output.push_str(&format!(
+            "narjar_http_artifact_requests_per_second{{window=\"{window}\"}} {requests}\n"
+        ));
+    }
     output.push_str(&format!(
         "narjar_http_upload_bytes_per_second{{window=\"{window}\"}} {}\nnarjar_http_artifact_bytes_per_second{{window=\"{window}\"}} {}\nnarjar_traffic_rate_window_coverage_seconds{{window=\"{window}\"}} {}\n",
         rate.upload_bytes_per_second,
@@ -1772,6 +1851,8 @@ fn append_latency_metrics(output: &mut String, latency: &LatencyStats) {
     append_duration_histogram(output, "nar_lookup", &latency.nar_lookup);
     append_duration_histogram(output, "narinfo_lookup", &latency.narinfo_lookup);
     append_duration_histogram(output, "nar_delivery", &latency.nar_delivery);
+    append_duration_histogram(output, "nar_full_delivery", &latency.nar_full_delivery);
+    append_duration_histogram(output, "nar_range_delivery", &latency.nar_range_delivery);
     append_duration_histogram(output, "narinfo_delivery", &latency.narinfo_delivery);
     append_duration_histogram(output, "publication", &latency.publication);
     append_duration_histogram(
@@ -2199,6 +2280,7 @@ struct TrafficSample {
     at: Instant,
     upload_bytes: u64,
     download_bytes: u64,
+    artifact_requests: Option<u64>,
     process_cpu_seconds: Option<f64>,
     byte_counters_overflowed: bool,
 }
@@ -2234,21 +2316,25 @@ impl TrafficSamples {
         }
     }
 
-    fn rate_over(&self, window_seconds: u64) -> Option<TrafficRate> {
+    fn chronological_samples(&self) -> impl DoubleEndedIterator<Item = TrafficSample> + '_ {
         let oldest_index =
             (self.next + TRAFFIC_SAMPLE_CAPACITY - self.len) % TRAFFIC_SAMPLE_CAPACITY;
-        let samples = (0..self.len)
-            .filter_map(|offset| self.samples[(oldest_index + offset) % TRAFFIC_SAMPLE_CAPACITY]);
-        let mut samples = samples.peekable();
-        let first = samples.next()?;
-        let latest = samples.last().unwrap_or(first);
+        (0..self.len).filter_map(move |offset| {
+            self.samples[(oldest_index + offset) % TRAFFIC_SAMPLE_CAPACITY]
+        })
+    }
+
+    fn rate_over(&self, window_seconds: u64) -> Option<TrafficRate> {
+        let latest = self.chronological_samples().next_back()?;
         if latest.byte_counters_overflowed {
             return None;
         }
-        let cutoff = latest.at - Duration::from_secs(window_seconds);
-        let first_in_window = (0..self.len)
-            .filter_map(|offset| self.samples[(oldest_index + offset) % TRAFFIC_SAMPLE_CAPACITY])
-            .find(|sample| sample.at >= cutoff)?;
+        let first_in_window = self.chronological_samples().find(|sample| {
+            latest
+                .at
+                .checked_duration_since(sample.at)
+                .is_some_and(|elapsed| elapsed <= Duration::from_secs(window_seconds))
+        })?;
         let coverage = latest.at.duration_since(first_in_window.at).as_secs_f64();
         let uploaded_bytes = latest
             .upload_bytes
@@ -2261,6 +2347,11 @@ impl TrafficSamples {
             coverage_seconds: coverage,
             upload_bytes_per_second: uploaded_bytes as f64 / coverage,
             artifact_bytes_per_second: downloaded_bytes as f64 / coverage,
+            artifact_requests_per_second: first_in_window
+                .artifact_requests
+                .zip(latest.artifact_requests)
+                .and_then(|(first, latest)| latest.checked_sub(first))
+                .map(|requests| requests as f64 / coverage),
             process_cpu_cores: match (
                 first_in_window.process_cpu_seconds,
                 latest.process_cpu_seconds,
@@ -2323,6 +2414,7 @@ pub(crate) enum CacheObject {
 
 #[derive(Clone, Debug)]
 pub struct StatsSnapshot {
+    pub egress_compression: WireEncoding,
     pub http_requests: Vec<HttpRequestCount>,
     pub connections: ConnectionStats,
     pub response_transfer_failures: ResponseTransferFailureStats,
@@ -2393,6 +2485,8 @@ pub struct LatencyStats {
     pub nar_lookup: DurationHistogramSnapshot,
     pub narinfo_lookup: DurationHistogramSnapshot,
     pub nar_delivery: DurationHistogramSnapshot,
+    pub nar_full_delivery: DurationHistogramSnapshot,
+    pub nar_range_delivery: DurationHistogramSnapshot,
     pub narinfo_delivery: DurationHistogramSnapshot,
     pub publication: DurationHistogramSnapshot,
     pub publication_queue_wait: DurationHistogramSnapshot,
@@ -2571,6 +2665,7 @@ pub struct TrafficRate {
     pub coverage_seconds: f64,
     pub upload_bytes_per_second: f64,
     pub artifact_bytes_per_second: f64,
+    pub artifact_requests_per_second: Option<f64>,
     pub process_cpu_cores: Option<f64>,
 }
 
@@ -2582,15 +2677,18 @@ pub struct PressureStats {
     pub connections_limit: u64,
     pub request_queue_depth: u64,
     pub request_queue_capacity: u64,
+    pub active_request_workers: u64,
+    pub request_worker_limit: u64,
     pub active_publication_workers: u64,
     pub publication_worker_limit: u64,
     pub publication_queue_depth: u64,
     pub publication_queue_capacity: u64,
-    pub capacity: Option<CapacityStats>,
+    pub capacity: SampleState<CapacityStats>,
 }
 
 #[derive(Clone, Debug)]
 pub struct CapacityStats {
+    pub readiness: StorageReadiness,
     pub total_bytes: u64,
     pub available_bytes: u64,
     pub total_inodes: u64,
@@ -2608,6 +2706,7 @@ impl CapacityStats {
         outstanding_staging_bytes: u64,
     ) -> Self {
         Self {
+            readiness: StorageReadiness::from_capacity(capacity, configured_min_free_bytes),
             total_bytes: capacity.total_bytes,
             available_bytes: capacity.available_bytes,
             total_inodes: capacity.total_inodes,
@@ -2798,7 +2897,7 @@ impl RequestGuard<'_> {
             .completed_responses
             .fetch_add(1, Ordering::Relaxed);
         self.record_artifact_bytes(body_bytes);
-        self.record_delivery_latency(elapsed);
+        self.record_delivery_latency(status, elapsed);
     }
 
     pub(crate) fn record_failed_response(
@@ -2817,13 +2916,22 @@ impl RequestGuard<'_> {
             .fetch_add(1, Ordering::Relaxed);
         self.metrics.record_response_transfer_failure(&transfer);
         self.record_artifact_bytes(transfer.body_bytes);
-        self.record_delivery_latency(elapsed);
+        self.record_delivery_latency(status, elapsed);
     }
 
-    fn record_delivery_latency(&self, elapsed: Duration) {
+    fn record_delivery_latency(&self, status: StatusCode, elapsed: Duration) {
         match self.route {
             RequestRoute::Nar => self.metrics.nar_delivery_latency.observe(elapsed),
             RequestRoute::NarInfo => self.metrics.narinfo_delivery_latency.observe(elapsed),
+            _ => {}
+        }
+        match (self.method, self.route, status) {
+            (RequestMethod::Get, RequestRoute::Nar, StatusCode::OK) => {
+                self.metrics.nar_full_delivery_latency.observe(elapsed)
+            }
+            (RequestMethod::Get, RequestRoute::Nar, StatusCode::PARTIAL_CONTENT) => {
+                self.metrics.nar_range_delivery_latency.observe(elapsed)
+            }
             _ => {}
         }
     }
@@ -2835,8 +2943,11 @@ impl RequestGuard<'_> {
     }
 
     fn record_status(&self, status: StatusCode) {
-        self.metrics.requests[self.method][self.route][RecordedStatus::from_status(status.get())]
-            .fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(
+            &self.metrics.requests[self.method][self.route]
+                [RecordedStatus::from_status(status.get())],
+            1,
+        );
     }
 
     pub(crate) fn record_aborted_response(&self) {
@@ -2844,8 +2955,10 @@ impl RequestGuard<'_> {
             RequestRecordingState::Pending => {}
             RequestRecordingState::Finished => return,
         }
-        self.metrics.requests[self.method][self.route][RecordedStatus::Other]
-            .fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(
+            &self.metrics.requests[self.method][self.route][RecordedStatus::Other],
+            1,
+        );
         self.metrics
             .aborted_responses
             .fetch_add(1, Ordering::Relaxed);
@@ -2856,8 +2969,10 @@ impl Drop for RequestGuard<'_> {
     fn drop(&mut self) {
         match self.recording.replace(RequestRecordingState::Finished) {
             RequestRecordingState::Pending => {
-                self.metrics.requests[self.method][self.route][RecordedStatus::Other]
-                    .fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_add(
+                    &self.metrics.requests[self.method][self.route][RecordedStatus::Other],
+                    1,
+                );
                 self.metrics
                     .aborted_responses
                     .fetch_add(1, Ordering::Relaxed);
@@ -2867,6 +2982,14 @@ impl Drop for RequestGuard<'_> {
         self.metrics
             .requests_in_flight
             .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub struct WorkerGuard<'a>(&'a AtomicU64);
+
+impl Drop for WorkerGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -2976,18 +3099,33 @@ mod tests {
 
     #[test]
     fn process_lifetime_is_exported_with_unix_timestamps() {
-        let snapshot = Metrics::default().snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = Metrics::default().snapshot();
         let exposition = render_prometheus(&snapshot);
         assert!(exposition.contains("narjar_stats_snapshot_timestamp_seconds "));
         assert!(exposition.contains("narjar_process_start_time_seconds "));
         assert!(exposition.contains("narjar_process_uptime_seconds "));
-        assert!(exposition.contains("narjar_readiness{reason=\"available\"} 1"));
+        assert!(exposition.contains("narjar_readiness{reason=\"probe_failed\"} 1"));
         assert!(!exposition.contains("narjar_chunks_total"));
     }
 
     #[test]
     fn readiness_exposition_identifies_the_actual_capacity_reason() {
-        let snapshot = Metrics::default().snapshot(StorageReadiness::NoInodes, None, 0, 0, 0);
+        let metrics = Metrics::default();
+        metrics.record_capacity_sample(
+            Ok((
+                StorageCapacity {
+                    total_bytes: 100,
+                    available_bytes: 40,
+                    total_inodes: 10,
+                    available_inodes: 0,
+                    read_only: false,
+                },
+                0,
+            )),
+            0,
+            10,
+        );
+        let snapshot = metrics.snapshot();
         let exposition = render_prometheus(&snapshot);
         assert!(exposition.contains("narjar_ready 0"));
         assert!(exposition.contains("narjar_readiness{reason=\"no_inodes\"} 1"));
@@ -3012,7 +3150,7 @@ mod tests {
         head.record_nar_range_request(NarRangeOutcome::Partial);
         drop(head);
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         assert_eq!(snapshot.nar_range_requests.get.full, 1);
         assert_eq!(snapshot.nar_range_requests.get.partial, 2);
         assert_eq!(snapshot.nar_range_requests.get.unsatisfiable, 1);
@@ -3063,9 +3201,7 @@ mod tests {
         let started_at = super::unix_seconds_now().saturating_sub(3);
         metrics.record_population_scan(StorageBackend::Flat, Ok(counts), started_at, 2.5);
 
-        let first = metrics
-            .snapshot(StorageReadiness::Ready, None, 0, 0, 0)
-            .inventory;
+        let first = metrics.snapshot().inventory;
         assert!(matches!(
             first,
             super::SampleState::Measured { ref value, .. }
@@ -3105,9 +3241,7 @@ mod tests {
             started_at,
             0.0,
         );
-        let refreshed = metrics
-            .snapshot(StorageReadiness::Ready, None, 0, 0, 0)
-            .inventory;
+        let refreshed = metrics.snapshot().inventory;
         assert!(matches!(
             refreshed,
             super::SampleState::Stale { ref value, .. }
@@ -3179,7 +3313,7 @@ mod tests {
             2.0,
         );
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         assert!(matches!(
             &snapshot.inventory,
             super::SampleState::Stale { value, .. } if value.raw_bytes == 900
@@ -3214,20 +3348,12 @@ mod tests {
     #[test]
     fn lookup_snapshot_separates_hits_misses_and_failures() {
         let metrics = Metrics::default();
-        let empty_exposition =
-            render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        let empty_exposition = render_prometheus(&metrics.snapshot());
         assert!(
             !empty_exposition
                 .contains("narjar_cache_lookup_hit_ratio{object=\"narinfo\",method=\"GET\"}")
         );
-        assert_eq!(
-            metrics
-                .snapshot(StorageReadiness::Ready, None, 0, 0, 0)
-                .cache
-                .narinfo_get
-                .hit_ratio,
-            None
-        );
+        assert_eq!(metrics.snapshot().cache.narinfo_get.hit_ratio, None);
 
         metrics.cache_lookup(
             CacheObject::NarInfo,
@@ -3255,7 +3381,7 @@ mod tests {
             CacheLookupOutcome::Miss,
         );
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         let get = &snapshot.cache.narinfo_get;
         assert_eq!(
             (get.hits, get.misses, get.failures, get.decisions),
@@ -3282,8 +3408,7 @@ mod tests {
         let recorder = Recorder::begin(directory.path(), Operation::Gc, Mode::GcApply)
             .expect("started state should be stored");
         metrics.sample_maintenance_sidecar(directory.path());
-        let exposition =
-            render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        let exposition = render_prometheus(&metrics.snapshot());
         assert!(exposition.contains(
             "narjar_maintenance_started_timestamp_seconds{operation=\"gc\",mode=\"gc_apply\"}"
         ));
@@ -3299,8 +3424,7 @@ mod tests {
             )
             .expect("completion should be durably recorded");
         metrics.sample_maintenance_sidecar(directory.path());
-        let exposition =
-            render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        let exposition = render_prometheus(&metrics.snapshot());
         assert!(exposition.contains("outcome=\"success\""));
         assert!(
             exposition
@@ -3323,7 +3447,7 @@ mod tests {
         )
         .expect("unsafe record should be creatable");
         metrics.sample_maintenance_sidecar(directory.path());
-        let retained = render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        let retained = render_prometheus(&metrics.snapshot());
         assert!(
             retained.contains(
                 "narjar_maintenance_last_bytes{operation=\"gc\",kind=\"reclaimed\"} 8192"
@@ -3404,7 +3528,7 @@ mod tests {
 
         let metrics = Metrics::default();
         metrics.sample_filesystem_sidecar(&sample_path, &storage_root);
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         assert!(matches!(
             snapshot.filesystem,
             SampleState::Measured { ref value, .. } if value.used_bytes == 20
@@ -3414,7 +3538,7 @@ mod tests {
         symlink(temporary.path().join("missing"), &sample_path)
             .expect("sample symlink should be created");
         metrics.sample_filesystem_sidecar(&sample_path, &storage_root);
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         assert!(matches!(
             snapshot.filesystem,
             SampleState::Stale { ref value, .. } if value.used_bytes == 20
@@ -3511,8 +3635,7 @@ mod tests {
         std::fs::write(&sample_path, serde_json::to_vec(&sample).unwrap()).unwrap();
 
         metrics.sample_filesystem_sidecar(&sample_path, &storage_root);
-        let exposition =
-            render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        let exposition = render_prometheus(&metrics.snapshot());
         assert!(
             exposition
                 .contains("narjar_zfs_compression_info{algorithm=\"off\",state=\"measured\"} 1")
@@ -3527,7 +3650,7 @@ mod tests {
         );
         std::fs::write(&sample_path, serde_json::to_vec(&stale_sample).unwrap()).unwrap();
         metrics.sample_filesystem_sidecar(&sample_path, &storage_root);
-        let stale = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let stale = metrics.snapshot();
         assert!(matches!(
             stale.filesystem,
             SampleState::Stale { ref value, .. } if value.used_bytes == 20
@@ -3548,6 +3671,7 @@ mod tests {
                     coverage_seconds: 12.5,
                     upload_bytes_per_second: 3.0,
                     artifact_bytes_per_second: 8.0,
+                    artifact_requests_per_second: Some(2.0),
                     process_cpu_cores: Some(0.25),
                 }),
                 five_minutes: None,
@@ -3555,6 +3679,7 @@ mod tests {
         );
         assert!(exposition.contains("narjar_http_upload_bytes_per_second{window=\"60\"} 3"));
         assert!(exposition.contains("narjar_http_artifact_bytes_per_second{window=\"60\"} 8"));
+        assert!(exposition.contains("narjar_http_artifact_requests_per_second{window=\"60\"} 2\n"));
         assert!(
             exposition.contains("narjar_traffic_rate_window_coverage_seconds{window=\"60\"} 12.5")
         );
@@ -3577,7 +3702,7 @@ mod tests {
         request.record_completed_response(StatusCode::OK, 100, Duration::from_millis(1));
         drop(request);
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         assert_eq!(snapshot.traffic.response_body_bytes, 7);
         assert_eq!(snapshot.traffic.completed_responses, 0);
         assert_eq!(snapshot.traffic.aborted_responses, 1);
@@ -3591,7 +3716,7 @@ mod tests {
         let request = metrics.request(RequestMethod::Get, RequestRoute::NarInfo);
         drop(request);
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         assert_eq!(snapshot.traffic.requests_in_flight, 0);
         assert_eq!(snapshot.traffic.aborted_responses, 1);
         let exposition = render_prometheus(&snapshot);
@@ -3619,8 +3744,7 @@ mod tests {
             );
         }
 
-        let exposition =
-            render_prometheus(&metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0));
+        let exposition = render_prometheus(&metrics.snapshot());
         assert!(exposition.contains("narjar_response_transfer_failures_total{kind=\"timeout\"} 1"));
         assert!(exposition.contains("narjar_response_transfer_failures_total{kind=\"other\"} 1"));
     }
@@ -3634,10 +3758,10 @@ mod tests {
         metrics.connection_admitted();
         metrics.connection_queued();
         metrics.connection_dequeued();
-        metrics.publication_worker_started();
+        let publication = metrics.worker(super::WorkerKind::Publication);
         metrics.publication_enqueued();
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         let pressure = &snapshot.pressure;
         assert_eq!(pressure.connections_in_flight, 1);
         assert_eq!(pressure.connections_limit, 8);
@@ -3656,7 +3780,7 @@ mod tests {
         );
 
         metrics.publication_dequeued(Instant::now());
-        metrics.publication_worker_finished();
+        drop(publication);
         metrics.connection_released();
     }
 
@@ -3672,7 +3796,7 @@ mod tests {
             metrics.record_publication_result(result);
         }
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         assert_eq!(snapshot.publication_outcomes.created, 1);
         assert_eq!(snapshot.publication_outcomes.identical, 1);
         assert_eq!(snapshot.publication_outcomes.conflicts, 1);
@@ -3712,6 +3836,7 @@ mod tests {
             at: start,
             upload_bytes: 100,
             download_bytes: 200,
+            artifact_requests: Some(0),
             process_cpu_seconds: Some(1.0),
             byte_counters_overflowed: false,
         });
@@ -3719,6 +3844,7 @@ mod tests {
             at: start + Duration::from_secs(30),
             upload_bytes: 400,
             download_bytes: 800,
+            artifact_requests: Some(0),
             process_cpu_seconds: Some(1.6),
             byte_counters_overflowed: false,
         });
@@ -3744,6 +3870,7 @@ mod tests {
                 at: start + Duration::from_secs(elapsed_seconds),
                 upload_bytes: 0,
                 download_bytes: 0,
+                artifact_requests: Some(0),
                 process_cpu_seconds: Some(0.0),
                 byte_counters_overflowed: false,
             });
@@ -3769,6 +3896,7 @@ mod tests {
             at: start,
             upload_bytes: 100,
             download_bytes: 200,
+            artifact_requests: Some(0),
             process_cpu_seconds: Some(1.0),
             byte_counters_overflowed: false,
         });
@@ -3776,6 +3904,7 @@ mod tests {
             at: start + Duration::from_secs(30),
             upload_bytes: 50,
             download_bytes: 100,
+            artifact_requests: Some(0),
             process_cpu_seconds: Some(1.5),
             byte_counters_overflowed: false,
         });
@@ -3786,6 +3915,7 @@ mod tests {
             at: start,
             upload_bytes: 100,
             download_bytes: 200,
+            artifact_requests: Some(0),
             process_cpu_seconds: Some(1.0),
             byte_counters_overflowed: false,
         });
@@ -3793,6 +3923,7 @@ mod tests {
             at: start + Duration::from_secs(30),
             upload_bytes: u64::MAX,
             download_bytes: u64::MAX,
+            artifact_requests: Some(0),
             process_cpu_seconds: Some(1.5),
             byte_counters_overflowed: true,
         });
@@ -3808,7 +3939,7 @@ mod tests {
 
         metrics.received_upload_body_bytes(2);
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         assert_eq!(snapshot.traffic.received_upload_body_bytes, u64::MAX);
         assert!(snapshot.traffic.cumulative_byte_counters_overflowed);
         assert!(snapshot.traffic.recent_rates.one_minute.is_none());
@@ -3865,7 +3996,7 @@ mod tests {
         let metrics = Metrics::default();
         metrics.sample_periodic();
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         let super::SampleState::Measured { ref value, .. } = snapshot.process.resources else {
             panic!("Linux procfs sample should be available");
         };
@@ -3910,7 +4041,7 @@ mod tests {
         drop(head);
         drop(lookup);
 
-        let report = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let report = metrics.snapshot();
         assert_eq!(report.latency.narinfo_lookup.count, 1);
         assert_eq!(report.latency.narinfo_lookup.bucket_counts[2], 1);
         assert_eq!(report.latency.nar_delivery.count, 2);
@@ -3959,7 +4090,7 @@ mod tests {
         miss.record_completed_response(StatusCode::NOT_FOUND, 0, Duration::from_millis(2));
         drop(miss);
 
-        let snapshot = metrics.snapshot(StorageReadiness::Ready, None, 0, 0, 0);
+        let snapshot = metrics.snapshot();
         let prometheus = render_prometheus(&snapshot);
 
         assert_eq!(snapshot.cache.narinfo_get.hits, 1);
@@ -3982,6 +4113,203 @@ mod tests {
             prometheus
                 .contains("narjar_cache_lookup_hit_ratio{object=\"narinfo\",method=\"GET\"} 0.5")
         );
+    }
+
+    #[test]
+    fn report_identity_uses_the_configured_codec_and_storage_backend() {
+        use crate::object::{CompressionCodec, WireEncoding};
+        for encoding in [
+            WireEncoding::Raw,
+            CompressionCodec::Xz.into(),
+            CompressionCodec::Zstd.into(),
+        ] {
+            for (backend, name) in [
+                (StorageBackend::Flat, "flat"),
+                (StorageBackend::Chunked, "chunked"),
+            ] {
+                let metrics = Metrics::new(encoding);
+                let mut snapshot = metrics.snapshot();
+                snapshot.storage_activity.backend = backend;
+                let exposition = render_prometheus(&snapshot);
+                assert!(exposition.contains("narjar_stats_schema_version 1\n"));
+                assert!(exposition.contains(&format!(
+                    "narjar_build_info{{version=\"{}\",backend=\"{name}\",egress_compression=\"{}\"}} 1\n",
+                    env!("CARGO_PKG_VERSION"), encoding.compression(),
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn full_and_range_delivery_distributions_exclude_head_and_error_responses() {
+        let metrics = Metrics::default();
+        for (method, status, seconds) in [
+            (RequestMethod::Get, StatusCode::OK, 1),
+            (RequestMethod::Get, StatusCode::PARTIAL_CONTENT, 2),
+            (RequestMethod::Head, StatusCode::OK, 3),
+            (RequestMethod::Head, StatusCode::PARTIAL_CONTENT, 4),
+            (RequestMethod::Get, StatusCode::NOT_FOUND, 5),
+            (RequestMethod::Get, StatusCode::RANGE_NOT_SATISFIABLE, 6),
+        ] {
+            metrics
+                .request(method, RequestRoute::Nar)
+                .record_completed_response(status, 0, Duration::from_secs(seconds));
+        }
+        metrics
+            .request(RequestMethod::Get, RequestRoute::Nar)
+            .record_failed_response(
+                StatusCode::PARTIAL_CONTENT,
+                TransferFailure {
+                    error: std::io::ErrorKind::BrokenPipe.into(),
+                    body_bytes: 7,
+                },
+                Duration::from_secs(7),
+            );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.latency.nar_full_delivery.count, 1);
+        assert_eq!(snapshot.latency.nar_full_delivery.sum_seconds, 1.0);
+        assert_eq!(snapshot.latency.nar_range_delivery.count, 2);
+        assert_eq!(snapshot.latency.nar_range_delivery.sum_seconds, 9.0);
+        assert_eq!(snapshot.traffic.response_body_bytes, 7);
+        assert_eq!(snapshot.traffic.aborted_responses, 1);
+        let exposition = render_prometheus(&snapshot);
+        assert!(exposition.contains(
+            "narjar_operation_duration_seconds_count{operation=\"nar_full_delivery\"} 1\n"
+        ));
+        assert!(exposition.contains(
+            "narjar_operation_duration_seconds_sum{operation=\"nar_range_delivery\"} 9\n"
+        ));
+    }
+
+    #[test]
+    fn worker_activity_is_released_on_completion_and_unwind() {
+        let metrics = Metrics::default();
+        metrics.configure_pressure_limits(8, 2);
+        let publication = metrics.worker(super::WorkerKind::Publication);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _request = metrics.worker(super::WorkerKind::Request);
+            let pressure = metrics.snapshot().pressure;
+            assert_eq!(pressure.active_request_workers, 1);
+            assert_eq!(pressure.active_publication_workers, 1);
+            panic!("request unwinds");
+        }));
+        assert!(result.is_err());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.pressure.active_request_workers, 0);
+        assert_eq!(snapshot.pressure.active_publication_workers, 1);
+        assert_eq!(snapshot.pressure.request_worker_limit, 2);
+        let exposition = render_prometheus(&snapshot);
+        assert!(exposition.contains("narjar_request_workers_active 0\n"));
+        assert!(exposition.contains("narjar_request_workers_limit 2\n"));
+        drop(publication);
+        assert_eq!(metrics.snapshot().pressure.active_publication_workers, 0);
+    }
+
+    #[test]
+    fn request_rates_reuse_terminal_artifact_counters_and_exclude_reporting_traffic() {
+        let metrics = Metrics::default();
+        assert_eq!(metrics.terminal_artifact_request_count(), Some(0));
+        let pending = metrics.request(RequestMethod::Get, RequestRoute::Nar);
+        assert_eq!(metrics.terminal_artifact_request_count(), Some(0));
+        drop(pending);
+        metrics
+            .request(RequestMethod::Get, RequestRoute::NarInfo)
+            .record_completed_response(StatusCode::OK, 0, Duration::ZERO);
+        metrics
+            .request(RequestMethod::Get, RequestRoute::Metrics)
+            .record_completed_response(StatusCode::OK, 0, Duration::ZERO);
+        metrics
+            .request(RequestMethod::Get, RequestRoute::Health)
+            .record_completed_response(StatusCode::OK, 0, Duration::ZERO);
+        assert_eq!(metrics.terminal_artifact_request_count(), Some(2));
+
+        let start = Instant::now();
+        let mut samples = super::TrafficSamples::default();
+        for (seconds, count) in [(0, Some(2)), (30, Some(8)), (60, None)] {
+            samples.record(super::TrafficSample {
+                at: start + Duration::from_secs(seconds),
+                upload_bytes: 0,
+                download_bytes: 0,
+                artifact_requests: count,
+                process_cpu_seconds: None,
+                byte_counters_overflowed: false,
+            });
+            match seconds {
+                0 => assert!(samples.rate_over(60).is_none()),
+                30 => assert_eq!(
+                    samples.rate_over(60).unwrap().artifact_requests_per_second,
+                    Some(0.2)
+                ),
+                60 => assert_eq!(
+                    samples.rate_over(60).unwrap().artifact_requests_per_second,
+                    None
+                ),
+                _ => unreachable!(),
+            }
+        }
+        let mut output = String::new();
+        super::append_traffic_rate_metrics(&mut output, &samples.rates());
+        assert!(!output.contains("narjar_http_artifact_requests_per_second{window="));
+        assert!(output.contains("narjar_http_artifact_bytes_per_second{window=\"60\"} 0\n"));
+    }
+
+    #[test]
+    fn capacity_samples_retain_the_last_measurement_without_claiming_readiness_after_failure() {
+        let metrics = Metrics::default();
+        let initial = render_prometheus(&metrics.snapshot());
+        assert!(
+            initial.contains("narjar_storage_capacity_sample_state{state=\"never_sampled\"} 1\n")
+        );
+        assert!(!initial.contains("narjar_storage_estimated_headroom_bytes "));
+
+        metrics.record_capacity_sample(
+            Ok((
+                StorageCapacity {
+                    total_bytes: 100,
+                    available_bytes: 40,
+                    total_inodes: 10,
+                    available_inodes: 6,
+                    read_only: false,
+                },
+                25,
+            )),
+            10,
+            100,
+        );
+        let measured = metrics.snapshot();
+        assert_eq!(measured.pressure.readiness, StorageReadiness::Ready);
+        let measured = render_prometheus(&measured);
+        assert!(measured.contains("narjar_storage_estimated_headroom_bytes 5\n"));
+        assert!(measured.contains("narjar_storage_capacity_sample_timestamp_seconds 100\n"));
+
+        metrics.record_capacity_sample(Err(StorageError::InsufficientSpace), 10, 105);
+        let stale = metrics.snapshot();
+        assert_eq!(stale.pressure.readiness, StorageReadiness::ProbeFailed);
+        assert!(matches!(
+            stale.pressure.capacity,
+            SampleState::Stale {
+                sampled_at_unix_seconds: 100,
+                ..
+            }
+        ));
+        let stale = render_prometheus(&stale);
+        assert!(stale.contains("narjar_storage_capacity_sample_state{state=\"stale\"} 1\n"));
+        assert!(stale.contains("narjar_storage_estimated_headroom_bytes 5\n"));
+        assert!(stale.contains("narjar_ready 0\n"));
+    }
+
+    #[test]
+    fn publication_summary_exports_count_sum_and_max_in_their_own_units() {
+        let metrics = Metrics::default();
+        metrics.publication(Duration::from_secs(1));
+        metrics.publication(Duration::from_secs(3));
+
+        let exposition = metrics.render(true, None, 0, 0);
+
+        assert!(exposition.contains("narjar_publications_total 2\n"));
+        assert!(exposition.contains("narjar_publication_duration_seconds_count 2\n"));
+        assert!(exposition.contains("narjar_publication_duration_seconds_sum 4\n"));
+        assert!(exposition.contains("narjar_publication_duration_seconds_max 3\n"));
     }
 
     #[test]
