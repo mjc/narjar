@@ -4254,6 +4254,37 @@ mod tests {
     }
 
     #[test]
+    fn background_capacity_detects_a_missing_staging_directory_like_live_readiness() {
+        use crate::storage::{CacheCreation, Directory, SupportedStorageBackend};
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = Directory::open(root.path()).unwrap();
+        let storage = CacheCreation::prepare(&directory, SupportedStorageBackend::FLAT)
+            .and_then(|creation| creation.create_or_complete())
+            .unwrap();
+        let metrics = Metrics::default();
+        metrics.sample_storage_capacity(&storage, 0);
+        assert_eq!(
+            metrics.snapshot().pressure.readiness,
+            StorageReadiness::Ready
+        );
+
+        let staging = root.path().join("nar/.tmp");
+        let parked = root.path().join("parked-staging");
+        std::fs::rename(&staging, &parked).unwrap();
+        assert!(storage.is_ready(0).is_err());
+        metrics.sample_storage_capacity(&storage, 0);
+        let sampled = metrics.snapshot();
+        std::fs::rename(&parked, &staging).unwrap();
+
+        assert_eq!(sampled.pressure.readiness, StorageReadiness::ProbeFailed);
+        assert!(matches!(
+            sampled.pressure.capacity,
+            SampleState::Stale { .. }
+        ));
+    }
+
+    #[test]
     fn capacity_samples_retain_the_last_measurement_without_claiming_readiness_after_failure() {
         let metrics = Metrics::default();
         let initial = render_prometheus(&metrics.snapshot());

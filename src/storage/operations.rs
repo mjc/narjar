@@ -778,13 +778,14 @@ impl Storage {
     }
 
     pub fn is_ready(&self, min_free_bytes: u64) -> Result<StorageReadiness, StorageError> {
-        let directory = self.nar_temp_directory()?;
-        let space = filesystem_space(&directory)?;
-        Ok(StorageReadiness::from_capacity(space, min_free_bytes))
+        Ok(StorageReadiness::from_capacity(
+            self.staging_filesystem_capacity()?,
+            min_free_bytes,
+        ))
     }
 
-    pub(crate) fn capacity(&self) -> Result<StorageCapacity, StorageError> {
-        let directory = self.nar_directory()?;
+    fn staging_filesystem_capacity(&self) -> Result<StorageCapacity, StorageError> {
+        let directory = self.nar_temp_directory()?;
         Ok(filesystem_space(&directory)?)
     }
 
@@ -793,7 +794,7 @@ impl Storage {
             .staging_budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let capacity = self.capacity()?;
+        let capacity = self.staging_filesystem_capacity()?;
         Ok((capacity, staging.outstanding_bytes()))
     }
 
