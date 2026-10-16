@@ -437,7 +437,7 @@
             '';
           fuzzTargetCheck = env.pkgs.runCommand "narjar-fuzz-target-check"
             {
-              nativeBuildInputs = [ env.fuzzToolchain env.pkgs.pkg-config ];
+              nativeBuildInputs = [ env.fuzzToolchain env.pkgs.pkg-config env.pkgs.cargo-nextest ];
               buildInputs = [ env.pkgs.sqlite ];
             }
             ''
@@ -455,6 +455,7 @@
               export RUSTC="${env.fuzzToolchain}/bin/rustc"
               export CARGO_TARGET_DIR="$PWD/target/fuzz"
               cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+              cargo nextest run --locked --manifest-path fuzz/Cargo.toml --test auth_request
               touch "$out"
             '';
           semantic-descriptor = env.pkgs.runCommand "narjar-semantic-descriptor" { } ''

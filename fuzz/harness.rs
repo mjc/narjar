@@ -7,6 +7,7 @@ mod cache;
 use std::{
     io::{Cursor, Write},
     net::{TcpListener, TcpStream},
+    os::unix::fs::OpenOptionsExt,
     thread,
 };
 
@@ -19,6 +20,7 @@ use cache::{
     },
 };
 use narjar::object::{CompressionCodec, FileHash, NarFileName, WireEncoding};
+use sha2::{Digest, Sha256};
 
 fn with_request(input: &[u8], inspect: impl FnOnce(Request)) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fuzz listener");
@@ -40,18 +42,34 @@ pub fn http_request(input: &[u8]) {
     with_request(input, drop);
 }
 
-pub fn auth_request(input: &[u8]) {
+pub fn auth_request(input: &[u8]) -> Option<(bool, bool)> {
+    let mut permissions = None;
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let auth = directory.path().join("auth");
     std::fs::create_dir(&auth).expect("auth directory");
-    std::fs::write(auth.join("write.tokens"), input).expect("write fuzz token file");
-    let root = Directory::open(directory.path()).expect("open auth directory");
-    if let Ok(authorizer) = Authorizer::load(&root) {
-        with_request(input, |request| {
-            let _ = authorizer.allows(&request, Permission::Read);
-            let _ = authorizer.allows(&request, Permission::Write);
-        });
+    let token = format!(
+        "fuzz {}\n",
+        data_encoding::HEXLOWER.encode(&Sha256::digest(b"fuzz-token"))
+    );
+    for name in ["read.tokens", "write.tokens"] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(auth.join(name))
+            .expect("create private fuzz token file")
+            .write_all(token.as_bytes())
+            .expect("write valid fuzz token fixture");
     }
+    let root = Directory::open(directory.path()).expect("open auth directory");
+    let authorizer = Authorizer::load(&root).expect("load valid fuzz token fixtures");
+    with_request(input, |request| {
+        permissions = Some((
+            authorizer.allows(&request, Permission::Read),
+            authorizer.allows(&request, Permission::Write),
+        ));
+    });
+    permissions
 }
 
 fn initialize_cache(root: &Directory) -> Storage {
