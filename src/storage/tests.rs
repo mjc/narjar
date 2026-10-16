@@ -1184,13 +1184,88 @@ fn failed_destination_rollback_retains_recovery_evidence() {
         },
     );
     fs::set_permissions(&nar_directory, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(result.is_err());
+    assert!(matches!(
+        result,
+        Err(StorageError::Io(error)) if error.to_string() == "injected destination sync failure"
+    ));
     assert!(storage.layout().nar_path(hash).exists());
     assert_eq!(transaction_record_count(&storage), 1);
     assert!(storage.recovery_required().unwrap());
     storage.finish_recovery().unwrap();
     assert_eq!(transaction_record_count(&storage), 0);
     assert_eq!(storage.temporary_objects(), 0);
+}
+
+#[test]
+fn a_failed_temporary_cleanup_preserves_the_original_publication_error() {
+    let (_directory, storage) = flat_storage_fixture();
+    let temporary_directory = storage.layout().nar_temp_dir();
+    let result = storage.publish_with(
+        PublishTarget::Nar(NarFileName::raw(NarHash::parse(NAR_ID).unwrap())),
+        Cursor::new(b"NAR bytes"),
+        |boundary| {
+            if boundary == PublishBoundary::BeforeFinalLink {
+                let temporary_path = fs::read_dir(&temporary_directory)?
+                    .next()
+                    .expect("one staging file")?
+                    .path();
+                fs::remove_file(&temporary_path)?;
+                fs::create_dir(&temporary_path)?;
+                return Err(
+                    io::Error::new(io::ErrorKind::ConnectionReset, "publication failed").into(),
+                );
+            }
+            Ok(())
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset
+    ));
+    assert_eq!(transaction_record_count(&storage), 1);
+    assert!(storage.recovery_required().unwrap());
+    let temporary_path = fs::read_dir(&temporary_directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_dir(temporary_path).unwrap();
+    storage.finish_recovery().unwrap();
+    assert_eq!(transaction_record_count(&storage), 0);
+}
+
+#[test]
+fn a_failed_journal_completion_preserves_the_original_publication_error() {
+    let (directory, storage) = flat_storage_fixture();
+    let transactions = directory.path().join(".narjar-transactions");
+    let hash = NarHash::parse(NAR_ID).unwrap();
+    let result = storage.publish_with(
+        PublishTarget::Nar(NarFileName::raw(hash)),
+        Cursor::new(b"NAR bytes"),
+        |boundary| {
+            if boundary == PublishBoundary::AfterParentSync {
+                fs::set_permissions(&transactions, fs::Permissions::from_mode(0o500))?;
+                return Err(
+                    io::Error::new(io::ErrorKind::ConnectionAborted, "publication failed").into(),
+                );
+            }
+            Ok(())
+        },
+    );
+    fs::set_permissions(&transactions, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(
+        result,
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+    ));
+    assert!(storage.layout().nar_path(hash).exists());
+    assert_eq!(storage.temporary_objects(), 0);
+    assert_eq!(transaction_record_count(&storage), 1);
+    assert!(storage.recovery_required().unwrap());
+    storage.finish_recovery().unwrap();
+    assert_eq!(transaction_record_count(&storage), 0);
 }
 
 #[test]

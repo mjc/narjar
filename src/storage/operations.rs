@@ -335,11 +335,11 @@ impl PublicationProgress {
         match (self, result) {
             (progress @ (Self::Unpublished | Self::Durable(_)), result)
             | (progress @ Self::Uncertain(_), result @ Ok(_)) => {
-                progress
+                let completion = progress
                     .temporary_location()
-                    .remove_temporary(storage, temp)?;
-                transaction.complete()?;
-                result
+                    .remove_temporary(storage, temp)
+                    .and_then(|()| transaction.complete());
+                result.and_then(|outcome| completion.map(|()| outcome))
             }
             (Self::Uncertain(location), Err(error)) => {
                 let _ = location.remove_temporary(storage, temp);
@@ -1025,8 +1025,9 @@ impl Storage {
             Ok::<_, StorageError>(())
         })();
         if let Err(error) = barrier {
-            *progress =
-                attempt.rollback_new_link(destination_directory, destination.path.name())?;
+            *progress = attempt
+                .rollback_new_link(destination_directory, destination.path.name())
+                .unwrap_or(*progress);
             return Err(error);
         }
         // The destination is durable even if recording that fact fails. Never
