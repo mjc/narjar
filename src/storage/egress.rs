@@ -10,12 +10,12 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
-use crate::nar_compression::encode_and_measure_nar;
-use crate::object::{
+use crate::cache::nar_compression::encode_and_measure_nar;
+use crate::cache::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
     NarIdentity, NarRepresentation, WireEncoding,
 };
-use crate::records::{BoundedRegularFile, read_bounded_regular_file};
+use crate::cache::records::{BoundedRegularFile, read_bounded_regular_file};
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
 use super::collection::ActivityLease;
@@ -450,7 +450,7 @@ impl Storage {
         sync_directory: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<ExistingDerivative, StorageError> {
         let nar = self.nar_directory()?;
-        open_optional_at(&nar, &output.file_name().os_string())?.map_or(
+        open_optional_at(&nar, output.file_name().to_string().as_ref())?.map_or(
             Ok(ExistingDerivative::Missing),
             |file| {
                 Ok(match encoded_file_matches(&file, output)? {
@@ -622,7 +622,7 @@ impl Storage {
 #[cfg(test)]
 mod durability_tests {
     use super::*;
-    use crate::{
+    use crate::cache::{
         object::{NarHash, NarSize},
         storage::{
             CacheCreation, Directory, SupportedStorageBackend, publication::PublishBoundary,
@@ -665,7 +665,7 @@ mod durability_tests {
             let path = directory
                 .path()
                 .join("nar")
-                .join(output.file_name().os_string());
+                .join(output.file_name().to_string());
             let encoded = fs::read(&path).unwrap();
             let mut corrupt = encoded.clone();
             corrupt[0] ^= 1;

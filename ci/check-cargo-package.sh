@@ -20,7 +20,9 @@ required_package_files=(
   benches/micro.rs
   src/lib.rs
   src/main.rs
+  src/cache.rs
   tests/cli.rs
+  tests/application.rs
   tests/fixtures/nix-2.31.5-http-v0.1.tsv
   tests/gc_scale.rs
   tests/nar_decoder.rs

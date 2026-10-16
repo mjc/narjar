@@ -476,6 +476,7 @@ impl Request {
         })
     }
 
+    #[cfg(test)]
     pub fn body_complete(&self) -> bool {
         self.body_state == BodyState::Complete
     }

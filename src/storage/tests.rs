@@ -24,8 +24,8 @@ use super::{
     CacheCreation, CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage,
     StorageBackend, StorageError, StoreHash, SupportedStorageBackend, capacity_error_kind,
 };
-use crate::narinfo::NarInfoClaims;
-use crate::object::{
+use crate::cache::narinfo::NarInfoClaims;
+use crate::cache::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
     NarHash, NarIdentity, NarRepresentation, NarSize, WireEncoding,
 };
@@ -280,7 +280,7 @@ fn online_gc_cannot_sweep_incrementally_published_chunks_before_ingestion_commit
     let (entered_tx, entered_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let trusted =
-        crate::narinfo::TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap())
+        crate::cache::narinfo::TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap())
             .unwrap();
     let online_options = || super::gc::GcOptions {
         max_bytes: None,

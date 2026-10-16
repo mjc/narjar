@@ -55,7 +55,7 @@ impl DaemonRoots {
         let basename = path
             .strip_prefix("/nix/store/")
             .ok_or_else(|| invalid_protocol("temporary root is not a concrete store path"))?;
-        narjar::__private::storage::validate_store_basename(basename)
+        crate::cache::storage::validate_store_basename(basename)
             .map_err(|_| invalid_protocol("invalid temporary-root store basename"))?;
         self.write_number(ADD_TEMP_ROOT)?;
         self.write_string(path)?;

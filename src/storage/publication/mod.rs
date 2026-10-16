@@ -283,8 +283,10 @@ pub struct NarUploadPolicy {
 }
 
 impl NarUploadPolicy {
+    #[cfg(test)]
     pub const DEFAULT_MAX_DECODER_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 
+    #[cfg(test)]
     pub const fn new(max_bytes: u64, min_free_bytes: u64) -> Self {
         Self {
             max_encoded_bytes: max_bytes,

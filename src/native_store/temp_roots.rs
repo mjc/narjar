@@ -12,7 +12,7 @@ use super::{
     gc::{GcReadLock, lock_file},
     lease::NativeStorePath,
 };
-use narjar::__private::filesystem::{ensure_directory_at, open_directory};
+use crate::cache::filesystem::{ensure_directory_at, open_directory};
 use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
 
 static ROOT_FILES: Mutex<Vec<ProcessFile>> = Mutex::new(Vec::new());

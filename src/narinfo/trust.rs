@@ -8,7 +8,7 @@ use std::{
 use data_encoding::BASE64;
 use ed25519_dalek::VerifyingKey;
 
-use crate::storage::{Directory, StoreHash, open_regular_at};
+use crate::cache::storage::{Directory, StoreHash, open_regular_at};
 
 use super::{
     NamedSignature, NarInfoClaims, NarInfoDocument, NarInfoError, PublishedNarInfoError,

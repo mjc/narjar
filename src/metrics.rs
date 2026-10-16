@@ -10,11 +10,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::http_server::{StatusCode, TransferFailure};
+use crate::cache::http_server::{StatusCode, TransferFailure};
 use enum_map::{Enum, EnumMap};
 use serde::Deserialize;
 
-use crate::{
+use crate::cache::{
     http_server::Method,
     maintenance,
     object::WireEncoding,
@@ -1297,7 +1297,7 @@ fn append_maintenance_metrics(output: &mut String, sample: &SampleState<maintena
             append_maintenance_bytes(output, operation.name(), "examined", run.bytes_examined);
             append_maintenance_bytes(output, operation.name(), "reclaimed", run.bytes_reclaimed);
             if let Some(counts) = run.inventory_class_counts {
-                for (class, count) in crate::inventory::InventoryClass::ALL
+                for (class, count) in crate::cache::inventory::InventoryClass::ALL
                     .into_iter()
                     .zip(counts)
                 {
@@ -1673,18 +1673,16 @@ fn read_zfs_sample(
     now_unix_seconds: u64,
 ) -> Result<(u64, FilesystemStats), &'static str> {
     let sample_file =
-        crate::filesystem::open_regular_at(rustix::fs::CWD, path).map_err(|error| {
+        crate::cache::filesystem::open_regular_at(rustix::fs::CWD, path).map_err(|error| {
             match error.kind() {
                 std::io::ErrorKind::InvalidData => "sample_not_regular_file",
                 _ => "sample_unreadable",
             }
         })?;
-    let bytes =
-        crate::records::read_bounded_bytes(sample_file, MAX_ZFS_SAMPLE_BYTES).map_err(|error| {
-            match error {
-                crate::records::BoundedReadError::TooLarge => "sample_too_large",
-                crate::records::BoundedReadError::Io(_) => "sample_unreadable",
-            }
+    let bytes = crate::cache::records::read_bounded_bytes(sample_file, MAX_ZFS_SAMPLE_BYTES)
+        .map_err(|error| match error {
+            crate::cache::records::BoundedReadError::TooLarge => "sample_too_large",
+            crate::cache::records::BoundedReadError::Io(_) => "sample_unreadable",
         })?;
     let sample: ZfsSampleFile = serde_json::from_slice(&bytes).map_err(|_| "sample_invalid")?;
     if sample.schema_version != 1 {
@@ -1784,12 +1782,9 @@ fn append_process_metrics(output: &mut String, sample: &SampleState<ProcessResou
         resources.user_cpu_seconds,
         resources.system_cpu_seconds,
     ));
-    let source = match resources.source {
-        ProcessResourceSource::LinuxProcfs => "linux_procfs",
-    };
-    output.push_str(&format!(
-        "# HELP narjar_process_resource_source_info Source of process resource measurements.\n# TYPE narjar_process_resource_source_info gauge\nnarjar_process_resource_source_info{{source=\"{source}\"}} 1\n"
-    ));
+    output.push_str(
+        "# HELP narjar_process_resource_source_info Source of process resource measurements.\n# TYPE narjar_process_resource_source_info gauge\nnarjar_process_resource_source_info{source=\"linux_procfs\"} 1\n"
+    );
     if let Some(high_water_bytes) = resources.high_water_bytes {
         output.push_str(&format!(
             "# HELP narjar_process_high_water_memory_bytes Process high-water resident memory in bytes.\n# TYPE narjar_process_high_water_memory_bytes gauge\nnarjar_process_high_water_memory_bytes{{state=\"{state}\"}} {high_water_bytes}\n"
@@ -2184,7 +2179,6 @@ fn sample_process_resources() -> Result<ProcessResources, ()> {
     let open_file_descriptors = process_open_file_descriptors();
     let (user_cpu_seconds, system_cpu_seconds) = process_cpu_seconds()?;
     Ok(ProcessResources {
-        source: ProcessResourceSource::LinuxProcfs,
         resident_bytes,
         high_water_bytes,
         user_cpu_seconds,
@@ -2201,7 +2195,7 @@ fn sample_process_resources() -> Result<ProcessResources, ()> {
 
 #[cfg(target_os = "linux")]
 fn read_bounded_text(path: impl AsRef<Path>, limit: u64) -> Result<String, ()> {
-    let bytes = crate::records::read_bounded_bytes(File::open(path).map_err(|_| ())?, limit)
+    let bytes = crate::cache::records::read_bounded_bytes(File::open(path).map_err(|_| ())?, limit)
         .map_err(|_| ())?;
     String::from_utf8(bytes).map_err(|_| ())
 }
@@ -2518,9 +2512,11 @@ pub enum SampleState<T> {
     Stale {
         sampled_at_unix_seconds: u64,
         value: T,
+        #[allow(dead_code, reason = "Kept in diagnostic snapshots, not metric labels")]
         reason: String,
     },
     Unavailable {
+        #[allow(dead_code, reason = "Kept in diagnostic snapshots, not metric labels")]
         reason: String,
     },
 }
@@ -2572,18 +2568,12 @@ impl PopulationScanCoverage {
 
 #[derive(Clone, Debug)]
 pub struct ProcessResources {
-    pub source: ProcessResourceSource,
     pub resident_bytes: u64,
     pub high_water_bytes: Option<u64>,
     pub user_cpu_seconds: f64,
     pub system_cpu_seconds: f64,
     pub threads: Option<u64>,
     pub open_file_descriptors: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ProcessResourceSource {
-    LinuxProcfs,
 }
 
 #[derive(Clone, Debug)]
@@ -2635,6 +2625,7 @@ pub struct LookupStats {
     pub hits: u64,
     pub misses: u64,
     pub failures: u64,
+    #[cfg_attr(not(test), expect(dead_code, reason = "Inspected in snapshot tests"))]
     pub decisions: u64,
     pub hit_ratio: Option<f64>,
     pub failure_ratio: Option<f64>,
@@ -2661,6 +2652,7 @@ pub struct RecentTrafficRates {
 
 #[derive(Clone, Debug)]
 pub struct TrafficRate {
+    #[cfg_attr(not(test), expect(dead_code, reason = "Inspected in snapshot tests"))]
     pub requested_window_seconds: u64,
     pub coverage_seconds: f64,
     pub upload_bytes_per_second: f64,
@@ -2742,6 +2734,7 @@ pub struct FilesystemStats {
 
 #[derive(Clone, Debug)]
 pub struct PopulationStats {
+    #[allow(dead_code, reason = "Kept in diagnostic snapshots")]
     pub backend: StorageBackend,
     pub structurally_valid_narinfo_entries: u64,
     pub malformed_narinfo_filenames: u64,
@@ -3009,9 +3002,9 @@ mod tests {
         StorageActivitySnapshot, ValidationClass, append_storage_activity_metrics,
         render_prometheus,
     };
-    use crate::http_server::{StatusCode, TransferFailure};
-    use crate::maintenance::{Mode, Operation, Outcome, Recorder, RunValues};
-    use crate::storage::{
+    use crate::cache::http_server::{StatusCode, TransferFailure};
+    use crate::cache::maintenance::{Mode, Operation, Outcome, Recorder, RunValues};
+    use crate::cache::storage::{
         PopulationCounts, PublishOutcome, StorageBackend, StorageCapacity, StorageError,
         StorageReadiness,
     };
@@ -3990,6 +3983,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_measured_procfs_sample_reports_its_source_and_values_on_every_platform() {
+        let mut snapshot = Metrics::default().snapshot();
+        snapshot.process.resources = super::SampleState::Measured {
+            sampled_at_unix_seconds: 42,
+            value: super::ProcessResources {
+                resident_bytes: 4096,
+                high_water_bytes: Some(8192),
+                user_cpu_seconds: 1.5,
+                system_cpu_seconds: 0.5,
+                threads: Some(2),
+                open_file_descriptors: Some(3),
+            },
+        };
+        let exposition = render_prometheus(&snapshot);
+        assert!(
+            exposition.contains("narjar_process_resource_source_info{source=\"linux_procfs\"} 1")
+        );
+        assert!(
+            exposition.contains("narjar_process_resident_memory_bytes{state=\"measured\"} 4096")
+        );
+        assert!(exposition.contains("narjar_process_cpu_seconds_total{mode=\"user\"} 1.5"));
+        assert!(exposition.contains("narjar_process_cpu_seconds_total{mode=\"system\"} 0.5"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn periodic_linux_sample_reports_process_rss_without_request_path_io() {
@@ -4117,7 +4135,7 @@ mod tests {
 
     #[test]
     fn report_identity_uses_the_configured_codec_and_storage_backend() {
-        use crate::object::{CompressionCodec, WireEncoding};
+        use crate::cache::object::{CompressionCodec, WireEncoding};
         for encoding in [
             WireEncoding::Raw,
             CompressionCodec::Xz.into(),
@@ -4255,7 +4273,7 @@ mod tests {
 
     #[test]
     fn background_capacity_detects_a_missing_staging_directory_like_live_readiness() {
-        use crate::storage::{CacheCreation, Directory, SupportedStorageBackend};
+        use crate::cache::storage::{CacheCreation, Directory, SupportedStorageBackend};
 
         let root = tempfile::tempdir().unwrap();
         let directory = Directory::open(root.path()).unwrap();

@@ -16,7 +16,7 @@ use rustix::fs::OFlags;
 use mincdc::{MinCdcHash4, SliceChunker};
 use sha2::{Digest, Sha256};
 
-use crate::object::{NarHash, NarIdentity};
+use crate::cache::object::{NarHash, NarIdentity};
 
 use super::{
     CHUNK_DIRECTORY, MANIFEST_DIRECTORY,
@@ -1497,7 +1497,7 @@ impl<'store> ChunkingWriter<'store> {
     fn record_published_chunk(&mut self, specification: &ChunkSpecification) -> io::Result<()> {
         self.record_file
             .write_all(&specification.nar_end.to_le_bytes())?;
-        self.record_file.write_all(&specification.hash.bytes())?;
+        self.record_file.write_all(specification.hash.as_bytes())?;
         self.previous_end = specification.nar_end;
         self.previous_length = Some(specification.length);
         self.chunk_count = self
@@ -1756,11 +1756,11 @@ fn io_for_storage_error(error: StorageError) -> io::Error {
 }
 
 fn shard_name(hash: ChunkHash) -> String {
-    hex_name(hash.bytes())[..2].to_owned()
+    hex_name(*hash.as_bytes())[..2].to_owned()
 }
 
 fn chunk_name(hash: ChunkHash) -> OsString {
-    hex_name(hash.bytes()).into()
+    hex_name(*hash.as_bytes()).into()
 }
 
 fn manifest_name(hash: NarHash) -> OsString {
@@ -1797,7 +1797,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{ChunkStore, ChunkStoreError, OFlags, remove_abandoned_temps};
-    use crate::{
+    use crate::cache::{
         object::{NarHash, NarIdentity, NarSize},
         storage::{
             StorageBackend,
@@ -1889,7 +1889,7 @@ mod tests {
             available_inodes: 100,
             read_only: false,
         };
-        let reservation = crate::storage::fs::reserve_staging_bytes_for_test(
+        let reservation = crate::cache::storage::fs::reserve_staging_bytes_for_test(
             &budget,
             10,
             input.len() as u64,
@@ -2175,7 +2175,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(outcome, crate::storage::PublishOutcome::Identical);
+        assert_eq!(outcome, crate::cache::storage::PublishOutcome::Identical);
         assert_eq!(syncs.get(), 1);
         assert!(!directory.path().join(temporary_name).exists());
     }

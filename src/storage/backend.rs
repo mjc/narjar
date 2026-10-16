@@ -14,6 +14,10 @@ pub enum StorageBackend {
 pub struct InvalidStorageBackend;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Error variants cover multiple target platforms")
+)]
 pub enum UnsupportedStorageBackend {
     /// Chunked storage has no verified durability contract on macOS.
     #[error("chunked storage is not supported on macOS; choose flat")]
@@ -25,13 +29,8 @@ pub enum UnsupportedStorageBackend {
 
 /// A backend whose publication contract is supported on this platform.
 ///
-/// Storage initialization cannot accept an unchecked backend choice:
-/// ```compile_fail
-/// use narjar::__private::storage::{Directory, Storage, StorageBackend};
-/// fn initialize(root: &Directory) {
-///     let _ = Storage::open(root, StorageBackend::Chunked);
-/// }
-/// ```
+/// Storage initialization takes this capability rather than an unchecked
+/// `StorageBackend` choice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SupportedStorageBackend(pub(super) BackendSupport);
 

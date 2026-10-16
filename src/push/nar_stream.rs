@@ -30,7 +30,7 @@ pub(super) fn local_store_path(store_path: &str) -> Result<PathBuf, PushError> {
         .ok_or_else(|| format!("invalid store path: {store_path}"))?;
     let root =
         std::env::var_os("NIX_STORE_DIR").unwrap_or_else(|| std::ffi::OsString::from("/nix/store"));
-    narjar::__private::storage::validate_store_basename(relative)
+    crate::cache::storage::validate_store_basename(relative)
         .map_err(|_| PushError::new(format!("invalid store path: {store_path}")))?;
     Ok(PathBuf::from(root).join(relative))
 }
@@ -260,7 +260,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn darwin_push_projects_and_sorts_nar_names_but_opens_original_paths_for_every_encoding() {
-        use narjar::__private::nar_compression::encode_and_measure_nar;
+        use crate::cache::nar_compression::encode_and_measure_nar;
         use narjar::object::{CompressedNarIdentity, CompressionCodec};
         let directory = tempfile::tempdir().expect("create case-hacked Nix store fixture");
         for (name, contents) in [

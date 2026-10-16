@@ -6,13 +6,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::cache::maintenance::FILE_NAMES as MAINTENANCE_FILES;
+use crate::cache::storage::{
+    CacheCreation, Directory, StorageBackend, SupportedStorageBackend, storage_root_entries,
+};
 use clap::{Args, Subcommand};
 use data_encoding::BASE64;
 use ed25519_dalek::SigningKey;
-use narjar::__private::maintenance::FILE_NAMES as MAINTENANCE_FILES;
-use narjar::__private::storage::{
-    CacheCreation, Directory, StorageBackend, SupportedStorageBackend, storage_root_entries,
-};
 
 use crate::error::Error;
 

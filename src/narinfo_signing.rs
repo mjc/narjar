@@ -24,9 +24,7 @@ impl NixSigningKey {
         }
         let (name, encoded_secret) = key
             .split_once(':')
-            .filter(|(name, secret)| {
-                narjar::__private::narinfo::valid_name(name) && !secret.is_empty()
-            })
+            .filter(|(name, secret)| crate::cache::narinfo::valid_name(name) && !secret.is_empty())
             .ok_or_else(|| format!("invalid signing key {}", path.display()))?;
         let secret: [u8; 64] = BASE64
             .decode(encoded_secret.as_bytes())

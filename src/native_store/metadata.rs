@@ -1,12 +1,10 @@
 use std::{num::NonZeroU64, path::Path};
 
-use narjar::{
-    __private::narinfo::{NarInfoMetadata, TrustedPublicKeys},
-    object::{NarHash, NarIdentity, NarRepresentation, NarSize},
-};
+use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
 use sqlite::{ConnectionThreadSafe, State};
 
 use super::open_supported_metadata_database;
+use crate::cache::narinfo::{NarInfoMetadata, TrustedPublicKeys};
 use crate::narinfo_signing::NixSigningKey;
 
 pub(crate) struct NativeMetadataSnapshot {
@@ -45,7 +43,7 @@ pub(crate) struct ValidatedNativeClaims {
 }
 
 impl ValidatedNativeClaims {
-    pub(crate) fn claims(&self) -> &narjar::__private::narinfo::NarInfoClaims {
+    pub(crate) fn claims(&self) -> &crate::cache::narinfo::NarInfoClaims {
         self.metadata.claims()
     }
 
@@ -95,7 +93,7 @@ pub(crate) struct SignedNativeNarInfo {
 }
 
 impl SignedNativeNarInfo {
-    pub(crate) fn serialize_raw(self) -> Result<Vec<u8>, narjar::__private::narinfo::NarInfoError> {
+    pub(crate) fn serialize_raw(self) -> Result<Vec<u8>, crate::cache::narinfo::NarInfoError> {
         self.metadata
             .serialize(NarRepresentation::Raw(self.metadata.claims().identity()))
     }
@@ -255,12 +253,10 @@ pub(crate) enum NativeMetadataError {
 
 #[cfg(test)]
 mod tests {
+    use crate::cache::narinfo::{NarInfoMetadata, TrustedPublicKeys};
     use data_encoding::BASE64;
     use ed25519_dalek::{Signer, SigningKey};
-    use narjar::{
-        __private::narinfo::{NarInfoMetadata, TrustedPublicKeys},
-        object::{NarHash, NarIdentity, NarSize},
-    };
+    use narjar::object::{NarHash, NarIdentity, NarSize};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -367,7 +363,7 @@ mod tests {
         assert!(text.contains("FileSize: 289656\n"));
         trusted_keys
             .validate(
-                &narjar::__private::storage::StoreHash::parse("0123456789abcdfghijklmnpqrsvwxyz")
+                &crate::cache::storage::StoreHash::parse("0123456789abcdfghijklmnpqrsvwxyz")
                     .expect("fixture route hash should parse"),
                 bytes,
             )
@@ -396,7 +392,7 @@ mod tests {
             .expect("configured signer projection should serialize");
         trusted_keys
             .validate(
-                &narjar::__private::storage::StoreHash::parse("0123456789abcdfghijklmnpqrsvwxyz")
+                &crate::cache::storage::StoreHash::parse("0123456789abcdfghijklmnpqrsvwxyz")
                     .expect("fixture route hash should parse"),
                 bytes,
             )

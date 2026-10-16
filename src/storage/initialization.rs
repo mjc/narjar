@@ -22,7 +22,7 @@ use super::{
     recovery::RecoveryState,
     state::{DeliveryValidationCache, PayloadStorage, Storage, StorageActivity},
 };
-use crate::{auth::Authorizer, narinfo::TrustedPublicKeys};
+use crate::cache::{auth::Authorizer, narinfo::TrustedPublicKeys};
 
 #[cfg(test)]
 use super::publication::Layout;
@@ -104,15 +104,7 @@ impl CachePolicies {
 }
 
 /// Owns the exclusive directory lease while completing an initialization.
-/// A prepared creation cannot be reused after transferring its lease to storage.
-/// ```compile_fail
-/// use narjar::__private::storage::{CacheCreation, Directory, SupportedStorageBackend};
-/// fn initialize_twice(root: &Directory) {
-///     let creation = CacheCreation::prepare(root, SupportedStorageBackend::FLAT).unwrap();
-///     let _ = creation.create_or_complete();
-///     let _ = creation.create_or_complete();
-/// }
-/// ```
+/// Completing initialization consumes the creation and transfers its lease to storage.
 pub struct CacheCreation {
     layout: CacheLayout,
     descriptor: DescriptorInstallation,

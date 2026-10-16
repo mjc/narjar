@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize};
 
-use crate::object::{CompressedNarIdentity, EncodedIdentity, NarIdentity};
+use crate::cache::object::{CompressedNarIdentity, EncodedIdentity, NarIdentity};
 
 const RECEIPT_VERSION: u8 = 1;
 
@@ -48,7 +48,7 @@ impl<Purpose> CompressedNarReceipt<Purpose> {
 
     pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
         let receipt =
-            crate::records::decode_complete::<SerializedCompressedNarReceipt>(bytes).ok()?;
+            crate::cache::records::decode_complete::<SerializedCompressedNarReceipt>(bytes).ok()?;
         (receipt.version == RECEIPT_VERSION).then_some(Self {
             identity: receipt.identity,
             purpose: PhantomData,

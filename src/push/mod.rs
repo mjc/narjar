@@ -7,13 +7,15 @@ use std::{
 };
 
 use clap::Args;
-use narjar::{
-    __private::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, NarInfoMetadata},
-    object::{NarRepresentation, WireEncoding},
-};
+use narjar::object::{NarRepresentation, WireEncoding};
 use ureq::{Agent, http::StatusCode};
 
-use crate::{error::Error, http_url::HttpUrl, operator::netrc_authorization};
+use crate::{
+    cache::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, NarInfoMetadata},
+    error::Error,
+    http_url::HttpUrl,
+    operator::netrc_authorization,
+};
 
 mod nar_stream;
 mod payload;

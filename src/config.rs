@@ -6,11 +6,9 @@ use std::{
 
 use clap::Args;
 use clap::ValueEnum;
-use narjar::{
-    __private::storage::{StorageBackend, SupportedStorageBackend, UnsupportedStorageBackend},
-    object::WireEncoding,
-};
+use narjar::object::WireEncoding;
 
+use crate::cache::storage::{StorageBackend, SupportedStorageBackend, UnsupportedStorageBackend};
 use crate::native_store::{NativeStoreOptions, NativeStoreSettings};
 
 #[derive(Debug)]
@@ -274,7 +272,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::path::Path;
 
-    use narjar::__private::storage::{StorageBackend, SupportedStorageBackend};
+    use crate::cache::storage::{StorageBackend, SupportedStorageBackend};
     use narjar::object::{CompressionCodec, WireEncoding};
 
     use super::{ServeArgs, ServeConfig, ServeSource, ServeSourceChoice, SourcePreparationError};
@@ -529,7 +527,7 @@ mod tests {
 
     #[test]
     fn native_store_rejects_compressed_or_chunked_output() {
-        use narjar::__private::storage::StorageBackend;
+        use crate::cache::storage::StorageBackend;
         use narjar::object::{CompressionCodec, WireEncoding};
 
         let matches = ServeArgs::augment_args(Command::new("serve"))

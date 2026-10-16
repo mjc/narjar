@@ -6,8 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::cache::storage::{StorageBackend, SupportedStorageBackend};
 use clap::Args;
-use narjar::__private::storage::{StorageBackend, SupportedStorageBackend};
 
 use crate::{
     error::Error,
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(setup.priority, 30);
         assert!(matches!(
             setup.storage_backend,
-            narjar::__private::storage::StorageBackend::Flat
+            crate::cache::storage::StorageBackend::Flat
         ));
         assert!(!setup.private_read);
     }

@@ -2,7 +2,7 @@
 
 use super::compression::{nar_file_matches, nar_file_size_matches};
 use super::{StoreHash, entry_is_regular_at, open_regular_at};
-use crate::object::{NarFileName, NarRepresentation};
+use crate::cache::object::{NarFileName, NarRepresentation};
 use std::{ffi::OsStr, fs::File, io};
 
 pub(crate) enum NarinfoName<'a> {
@@ -72,7 +72,7 @@ pub(crate) struct ReferencedPayload {
 impl ReferencedPayload {
     pub(crate) fn open(directory: &File, payload: NarRepresentation) -> io::Result<Option<Self>> {
         let name = payload.file_name();
-        match open_regular_at(directory, name.os_string()) {
+        match open_regular_at(directory, name.to_string()) {
             Ok(file) => Ok(Some(Self { file, payload })),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),

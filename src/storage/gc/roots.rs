@@ -17,9 +17,11 @@ impl ProtectedRoots {
         match path {
             None => Ok(Self::default()),
             Some(path) => {
-                let bytes =
-                    crate::records::read_bounded_bytes(File::open(path)?, MAX_ROOT_SOURCE_BYTES)
-                        .map_err(std::io::Error::from)?;
+                let bytes = crate::cache::records::read_bounded_bytes(
+                    File::open(path)?,
+                    MAX_ROOT_SOURCE_BYTES,
+                )
+                .map_err(std::io::Error::from)?;
                 let contents =
                     std::str::from_utf8(&bytes).map_err(|error| invalid(error.to_string()))?;
                 Self::parse(contents)
@@ -88,10 +90,10 @@ mod tests {
     #[test]
     fn wire_decoding_cannot_bypass_root_validation() {
         let bytes = postcard::to_allocvec(&BTreeSet::from(["not-a-root"])).unwrap();
-        assert!(crate::records::decode_complete::<ProtectedRoots>(&bytes).is_err());
+        assert!(crate::cache::records::decode_complete::<ProtectedRoots>(&bytes).is_err());
         let roots = ProtectedRoots::parse("00000000000000000000000000000000").unwrap();
         let bytes = postcard::to_allocvec(&roots).unwrap();
-        let decoded: ProtectedRoots = crate::records::decode_complete(&bytes).unwrap();
+        let decoded: ProtectedRoots = crate::cache::records::decode_complete(&bytes).unwrap();
         assert_eq!(decoded.values(), roots.values());
     }
 

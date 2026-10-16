@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::PermissionsExt,
 };
 
-use crate::object::NarFileName;
+use crate::cache::object::NarFileName;
 
 use super::{
     PublishOutcome, StagingReservation, Storage, StorageError,

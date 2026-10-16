@@ -1,12 +1,9 @@
+use crate::cache::storage::gc::{GcMode, GcOptions};
 use data_encoding::{BASE64, BitOrder, Specification};
 use ed25519_dalek::{Signer, SigningKey};
 use lzma_rust2::{XzOptions, XzWriter};
-use narjar::__private::storage::{
-    WireEncoding,
-    gc::{GcMode, GcOptions},
-};
 use narjar::nar_encode::{Encoder, Event as NarEvent};
-use narjar::object::CompressionCodec;
+use narjar::object::{CompressionCodec, WireEncoding};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -2134,11 +2131,11 @@ fn initialization_creates_a_private_root_even_with_a_group_writable_umask() {
         fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    let opened = narjar::__private::storage::Directory::open(&root).unwrap();
+    let opened = crate::cache::storage::Directory::open(&root).unwrap();
     assert!(
-        narjar::__private::storage::Storage::open(
+        crate::cache::storage::Storage::open(
             &opened,
-            narjar::__private::storage::SupportedStorageBackend::FLAT
+            crate::cache::storage::SupportedStorageBackend::FLAT
         )
         .is_ok()
     );
@@ -6504,7 +6501,7 @@ fn setup_refuses_existing_destinations_before_creating_the_other_one() {
 
 #[test]
 fn inventory_scan_recognizes_formats_and_keeps_trusted_references() {
-    use narjar::__private::{
+    use crate::cache::{
         inventory::{Inventory, InventoryClass as Class, VerificationMode as Mode},
         narinfo::TrustedPublicKeys,
         storage::Directory,
@@ -6672,7 +6669,7 @@ fn inventory_scan_recognizes_formats_and_keeps_trusted_references() {
 
 #[test]
 fn metadata_readiness_ignores_unrelated_names_without_opening_payload_directory() {
-    use narjar::__private::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
+    use crate::cache::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
     let directory = TempDir::new().unwrap();
     let root = directory.path();
     let trusted = TrustedPublicKeys::default();
@@ -6693,7 +6690,7 @@ fn metadata_readiness_ignores_unrelated_names_without_opening_payload_directory(
 
 #[test]
 fn metadata_readiness_remains_false_after_any_invalid_narinfo() {
-    use narjar::__private::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
+    use crate::cache::{inventory::Inventory, narinfo::TrustedPublicKeys, storage::Directory};
 
     const OTHER_STORE_HASH: &str = "11111111111111111111111111111111";
     let trusted = TrustedPublicKeys::parse(&format!(
@@ -6724,7 +6721,7 @@ fn metadata_readiness_remains_false_after_any_invalid_narinfo() {
 
 #[test]
 fn inventory_and_trust_keep_using_the_directory_opened_by_run() {
-    use narjar::__private::{
+    use crate::cache::{
         inventory::{Inventory, InventoryClass, VerificationMode},
         narinfo::TrustedPublicKeys,
         storage::Directory,
@@ -6755,7 +6752,7 @@ fn inventory_and_trust_keep_using_the_directory_opened_by_run() {
 
 #[test]
 fn inventory_scan_classifies_names_and_files_before_inspection() {
-    use narjar::__private::{
+    use crate::cache::{
         inventory::{Inventory, InventoryClass as Class, VerificationMode},
         narinfo::TrustedPublicKeys,
         storage::Directory,
@@ -6817,7 +6814,7 @@ fn inventory_scan_classifies_names_and_files_before_inspection() {
 
 #[test]
 fn inventory_scan_propagates_payload_open_errors() {
-    use narjar::__private::{
+    use crate::cache::{
         inventory::{Inventory, VerificationMode},
         narinfo::TrustedPublicKeys,
         storage::Directory,
@@ -7379,11 +7376,11 @@ fn gc_recovers_a_published_nar_before_eviction_and_restart() {
         "recovery marker should be cleared"
     );
 
-    let root = narjar::__private::storage::Directory::open(data_dir.path())
+    let root = crate::cache::storage::Directory::open(data_dir.path())
         .expect("cache root should reopen after GC");
-    let storage = narjar::__private::storage::CacheCreation::prepare(
+    let storage = crate::cache::storage::CacheCreation::prepare(
         &root,
-        narjar::__private::storage::SupportedStorageBackend::FLAT,
+        crate::cache::storage::SupportedStorageBackend::FLAT,
     )
     .and_then(|creation| creation.create_or_complete())
     .expect("cache storage should restart after GC");
@@ -7452,11 +7449,11 @@ fn delete_recovers_a_published_narinfo_before_removing_it() {
         "recovery marker should be cleared"
     );
 
-    let root = narjar::__private::storage::Directory::open(data_dir.path())
+    let root = crate::cache::storage::Directory::open(data_dir.path())
         .expect("cache root should reopen after delete");
-    let storage = narjar::__private::storage::CacheCreation::prepare(
+    let storage = crate::cache::storage::CacheCreation::prepare(
         &root,
-        narjar::__private::storage::SupportedStorageBackend::FLAT,
+        crate::cache::storage::SupportedStorageBackend::FLAT,
     )
     .and_then(|creation| creation.create_or_complete())
     .expect("cache storage should restart after delete");
@@ -7992,7 +7989,7 @@ fn gc_rejects_symlinked_narinfo_without_removing_it() {
 fn library_gc_requires_the_same_private_policies_as_startup_before_either_mode() {
     let data_dir = init_data_dir("library-gc-required-policies");
     let collect = |mode| {
-        narjar::__private::storage::gc::run(
+        crate::cache::storage::gc::run(
             data_dir.path(),
             GcOptions {
                 max_bytes: None,
@@ -8001,13 +7998,13 @@ fn library_gc_requires_the_same_private_policies_as_startup_before_either_mode()
                 min_age: Duration::ZERO,
                 protected_roots: Default::default(),
                 mode,
-                backend: narjar::__private::storage::StorageBackend::Flat,
+                backend: crate::cache::storage::StorageBackend::Flat,
             },
         )
     };
     let clean = data_dir.join(".narjar-clean");
     let original_marker = fs::read(&clean).unwrap();
-    for name in narjar::__private::storage::CACHE_POLICY_FILES {
+    for name in crate::cache::storage::CACHE_POLICY_FILES {
         let path = data_dir.join(name);
         let original = fs::read(&path).unwrap();
         fs::remove_file(&path).unwrap();
@@ -8056,7 +8053,7 @@ fn library_gc_dry_run_preserves_pending_recovery_state() {
     fs::set_permissions(&recovery_marker, fs::Permissions::from_mode(0o600))
         .expect("recovery marker should be private");
 
-    let report = narjar::__private::storage::gc::run(
+    let report = crate::cache::storage::gc::run(
         data_dir.path(),
         GcOptions {
             max_bytes: None,
@@ -8065,7 +8062,7 @@ fn library_gc_dry_run_preserves_pending_recovery_state() {
             min_age: Duration::ZERO,
             protected_roots: Default::default(),
             mode: GcMode::DryRun,
-            backend: narjar::__private::storage::StorageBackend::Flat,
+            backend: crate::cache::storage::StorageBackend::Flat,
         },
     )
     .expect("library dry-run should inspect without completing recovery");

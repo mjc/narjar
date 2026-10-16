@@ -30,7 +30,7 @@ pub enum RecoveryStatus {
     /// The storage did not require recovery.
     NotRequired,
     /// Recovery completed after validating this many published narinfos.
-    Completed(crate::inventory::NarInfoCount),
+    Completed(crate::cache::inventory::NarInfoCount),
 }
 
 #[derive(Debug)]
@@ -348,7 +348,7 @@ impl RecoveryState {
 
     fn recover_named_transaction(&self, name: &OsStr) -> Result<(), StorageError> {
         let record = open_regular_at(&self.transactions, name)?;
-        let contents = crate::records::read_bounded_bytes(record, MAX_TRANSACTION_BYTES)
+        let contents = crate::cache::records::read_bounded_bytes(record, MAX_TRANSACTION_BYTES)
             .map_err(io::Error::from)?;
         self.recover_transaction(parse_transaction(&contents)?)?;
         unlink_at(&self.transactions, name)?;
@@ -571,7 +571,7 @@ pub(super) fn parse_transaction(contents: &[u8]) -> Result<TransactionRecord, St
     if contents.len() as u64 > MAX_TRANSACTION_BYTES {
         return Err(io::Error::from(io::ErrorKind::InvalidData).into());
     }
-    crate::records::decode_complete(contents)
+    crate::cache::records::decode_complete(contents)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
 }
 

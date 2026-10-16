@@ -22,9 +22,9 @@ use rustix::fs::{
 
 use super::publication::{StagingBudget, TemporaryFile};
 use super::{StagingReservation, StorageError};
-use crate::filesystem::{directory_names, exclude_dot_directory_entries};
-pub(super) use crate::filesystem::{ensure_directory_at, validate_directory};
-pub(crate) use crate::filesystem::{
+use crate::cache::filesystem::{directory_names, exclude_dot_directory_entries};
+pub(super) use crate::cache::filesystem::{ensure_directory_at, validate_directory};
+pub(crate) use crate::cache::filesystem::{
     open_directory, open_directory_at, open_regular_at, read_dir_names,
 };
 #[cfg(test)]

@@ -1,3 +1,8 @@
+// Benchmark the binary's private implementation, not a public library facade.
+#[allow(dead_code, unused_imports)]
+#[path = "../src/cache.rs"]
+mod cache;
+
 use std::{
     fs,
     hint::black_box,
@@ -8,13 +13,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use narjar::__private::{
+use crate::cache::{
     http_server::Request,
     inventory::{Inventory, InventoryClass, VerificationMode},
-    nar::{Decoder, Event},
-    nar_encode::{self, Encoder},
     narinfo::TrustedPublicKeys,
     storage::{CacheCreation, Directory, NarFileName, NarHash, Storage, SupportedStorageBackend},
+};
+use narjar::{
+    nar::{Decoder, Event},
+    nar_encode::{self, Encoder},
 };
 use sha2::{Digest, Sha256};
 

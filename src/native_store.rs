@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use narjar::__private::narinfo::TrustedPublicKeys;
+use crate::cache::narinfo::TrustedPublicKeys;
 use rustix::fs::{Access, AtFlags, CWD, StatVfsMountFlags};
 use sqlite::{Connection, ConnectionThreadSafe, OpenFlags, State};
 
@@ -450,7 +450,7 @@ fn require_writable_roots_filesystem(writeability: FilesystemWriteability) -> Re
 }
 
 fn open_read_only_regular_file(path: &Path, description: &str) -> Result<File, String> {
-    narjar::__private::filesystem::open_regular_at(rustix::fs::CWD, path).map_err(|error| {
+    crate::cache::filesystem::open_regular_at(rustix::fs::CWD, path).map_err(|error| {
         match error.raw_os_error() {
             Some(raw) if raw == rustix::io::Errno::LOOP.raw_os_error() => {
                 format!("{description} must not be a symlink")
@@ -508,7 +508,7 @@ fn filesystem_writeability_from_flags(flags: StatVfsMountFlags) -> FilesystemWri
 }
 
 fn open_directory_without_following_final_symlink(path: &Path) -> std::io::Result<File> {
-    narjar::__private::filesystem::open_directory(path)
+    crate::cache::filesystem::open_directory(path)
 }
 
 fn require_absolute_path(path: &Path, description: &str) -> Result<(), String> {
@@ -691,9 +691,9 @@ mod tests {
         path::PathBuf,
     };
 
+    use crate::cache::{narinfo::TrustedPublicKeys, storage::StoreHash};
     use data_encoding::BASE64;
     use ed25519_dalek::SigningKey;
-    use narjar::__private::{narinfo::TrustedPublicKeys, storage::StoreHash};
     use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
     use sqlite::Connection;
     use tempfile::TempDir;
@@ -1062,7 +1062,7 @@ mod tests {
     }
 
     fn verify_nix_raw_projection(
-        metadata: narjar::__private::narinfo::NarInfoMetadata,
+        metadata: crate::cache::narinfo::NarInfoMetadata,
         trusted_keys: &TrustedPublicKeys,
         route_and_store_path: &str,
         nar_hash: &str,

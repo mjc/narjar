@@ -4,7 +4,7 @@ use data_encoding::{BitOrder, Encoding, Specification};
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const MAX_STORE_NAME_BYTES: usize = 211;
 
-pub use crate::object::InvalidObjectId;
+pub use crate::cache::object::InvalidObjectId;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StoreHash([u8; 32]);

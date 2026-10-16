@@ -5,7 +5,7 @@ use std::{ffi::OsString, io};
 use super::super::{
     compression::IngestionReceipt, egress::EgressReceipt, ids::StoreHash, location::StorePath,
 };
-use crate::object::{EncodedIdentity, NarFileName};
+use crate::cache::object::{EncodedIdentity, NarFileName};
 
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
@@ -23,7 +23,7 @@ impl Layout {
         self.root.join("nar")
     }
 
-    pub(crate) fn nar_path(&self, hash: crate::object::NarHash) -> PathBuf {
+    pub(crate) fn nar_path(&self, hash: crate::cache::object::NarHash) -> PathBuf {
         self.nar_dir().join(NarFileName::raw(hash).to_string())
     }
 
@@ -108,7 +108,7 @@ impl PublishTarget<'_> {
                 temp_prefix: "cache-info",
             },
             Self::Nar(name) => PublicationDestination {
-                path: StorePath::Nar(name.os_string()),
+                path: StorePath::Nar(name.to_string().into()),
                 temporary_directory: TemporaryDirectory::Nar,
                 publication: DestinationPublication::Link,
                 temp_prefix: "nar",
@@ -132,7 +132,7 @@ impl PublishTarget<'_> {
                 temp_prefix: "egress-receipt",
             },
             Self::RepairEgressNar(output) => PublicationDestination {
-                path: StorePath::Nar(output.file_name().os_string()),
+                path: StorePath::Nar(output.file_name().to_string().into()),
                 temporary_directory: TemporaryDirectory::Nar,
                 publication: DestinationPublication::Repair(*output),
                 temp_prefix: "nar",

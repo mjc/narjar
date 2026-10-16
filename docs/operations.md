@@ -3,7 +3,7 @@
 ## CLI
 
 Run `narjar <command> --help` for flags and defaults. Non-secret options use
-command-line flags first, then their documented `NARJAR_*` environment
+command-line flags first, then the documented `NARJAR_*` environment
 variables, then compiled defaults. There is no configuration file.
 
 `narjar setup` creates a cache and producer credentials; see the
@@ -31,7 +31,7 @@ Redirect stdout to a private file. `token revoke` removes a label. These are
 offline commands: stop the server before changing its token files. Use a
 mode-`0600` netrc file for HTTP credentials, not command-line secrets.
 
-A write token permits uploading; it does not authorize signing. Narinfo must
+A write token permits uploading, not signing. Narinfo must
 carry a signature from a key in `trusted-public-keys`. To rotate signing keys,
 trust both public keys while producers switch, then remove the old key once
 clients no longer need its cached signatures.
@@ -58,11 +58,11 @@ transfers. Netrc credentials require HTTPS unless `--insecure-http` is
 explicitly supplied. An unauthenticated HTTP request remains unauthenticated
 after a redirect to HTTPS.
 
-A valid destination publication for the same full store path is skipped,
+Push skips a valid destination publication for the same full store path,
 even if local NAR contents differ. `--refresh` bypasses that check but cannot
-replace immutable metadata. A concurrent publication of the same path is
-also destination-present. Other destination narinfo conflicts fail unless
-`--ignore-conflicts` is set. Payload upload failures still abort.
+replace immutable metadata. If another uploader publishes that path first,
+push counts it as already present. Other destination narinfo conflicts fail
+unless `--ignore-conflicts` is set. Payload upload failures still abort.
 
 `--trusted-upstream` and `--trusted-upstream-key` check signed metadata
 before uploading. They do not fetch upstream payloads; consumers must have
@@ -77,8 +77,8 @@ store, but serving an initialized Narjar cache does not require Nix.
 Choose `flat` or `chunked` at initialization and pass the same
 `--storage-backend` to serving and maintenance commands. Flat is the
 default and works on Linux and macOS; chunked is Linux-only. The layout
-descriptor fixes the backend for that data directory. There is no migration
-or automatic conversion.
+descriptor records the backend for that data directory; Narjar cannot convert
+it to another backend.
 
 Keep DATA private to the cache owner: directories `0700`, published files,
 token hashes, trusted keys, and the lock `0600`. Producer secrets belong
@@ -95,17 +95,17 @@ Preserve these along with `.narjar-layout` and the recovery records.
 The daemon creates a private `.narjar-control/gc.sock` for local online GC.
 It is not an HTTP endpoint and does not need proxy configuration.
 
-See the [filesystem requirements](https://github.com/mjc/narjar/blob/main/docs/filesystem-capability-adr.md) for
-publication and synchronization requirements. Narjar does not manage
+See the [filesystem requirements](https://github.com/mjc/narjar/blob/main/docs/filesystem-capability-adr.md)
+for publication and synchronization requirements. Narjar does not manage
 filesystems or ZFS properties. Logical byte totals do not measure physical
 space used under compression or snapshots.
 
 ## Capacity and timeouts
 
 The server uses bounded request and publication queues. `--max-in-flight`
-includes queued requests and idle keep-alive connections; excess admission
-receives 429 when a response can be sent. Idle connections do not occupy a
-request worker.
+includes queued requests and idle keep-alive connections. When the limit is
+reached, new requests receive 429 if a response can be sent. Idle connections
+do not occupy a request worker.
 
 Uploads have separate encoded-size, decoded-size, and decoder-memory limits.
 A small I/O buffer does not bound decoder memory. At most `--workers`
@@ -125,8 +125,9 @@ for read-only storage. Unexpected I/O and synchronization failures return 500.
 A failure after response headers are sent closes the connection instead of
 changing its status.
 
-SIGINT and SIGTERM stop admission and drain active collection and request/publication workers up to
-`--shutdown-grace-seconds` (default 30). A second signal exits immediately.
+SIGINT and SIGTERM stop accepting work and wait up to `--shutdown-grace-seconds`
+(default 30) for active GC, requests, and publications to finish. A second signal
+exits immediately.
 The NixOS module's default stop timeout is the grace period plus 10 seconds.
 Systemd waits for the daemon's readiness notification before starting dependent
 units, including online GC. Startup recovery has a one-hour service timeout.
@@ -145,8 +146,9 @@ narjar cleanup --data-dir /var/lib/narjar --min-age-seconds 86400
 
 `reconcile` reports metadata, signatures, payload availability, and orphans.
 `--verify-hashes` reads payload content as well. `--structural` instead inspects
-directory entries and temporary files. `--limit` caps retained findings and
-causes failure if exceeded; it does not bound traversal work.
+directory entries and temporary files. `--limit` caps the number of findings
+kept in the report and causes failure if exceeded; it does not limit how much
+of the cache is scanned.
 `--min-age-seconds` classifies temporary files as young or stale.
 `verify` performs content verification and exits unsuccessfully for invalid
 published pairs. `cleanup` removes eligible stale temporary files; it does
@@ -155,8 +157,8 @@ repair cache objects, but do write maintenance start/completion summaries.
 
 A successful NAR PUT makes canonical content durable. A successful narinfo
 PUT publishes the store path only after its payload and metadata are durable.
-An interrupted upload can leave an orphan payload or temporary files, but
-must not leave metadata pointing to an uncommitted payload.
+Interrupted uploads can leave orphan payloads or temporary files, but not
+published metadata pointing to an uncommitted payload.
 
 Startup checks the fixed layout. If recovery is marked, it validates trusted
 published references using file types and sizes, manifests, and chunk
@@ -164,7 +166,7 @@ availability; it does not hash every payload. Invalid references stop startup.
 Recorded temporary resources are cleaned before the clean marker is restored.
 Use offline verification to detect same-size corruption.
 
-Compressed ingress metadata requires its matching receipt. If that evidence
+Compressed ingress metadata requires its matching receipt. If the receipt
 is missing, upload the payload again. For server-generated compressed output,
 a valid receipt survives a missing or corrupt derivative while the canonical
 source exists. Repair must reproduce its recorded encoded identity. Ordinary
@@ -206,28 +208,28 @@ work. On macOS, the control socket pathname must fit the platform's Unix socket
 limit. If it does not, the daemon reports that online GC is unavailable and
 continues serving; offline maintenance still works with the server stopped.
 
-Online GC supports flat and chunked storage. Inventory and chunk marking run
-without excluding publication. Mutations invalidate the scan before deletion.
-New advertisements defer deletion only when they protect a selected object or
-its dependent publication. Active uploads and binding can return busy; a
-chunked read defers only retirement of its own canonical object. Unrelated
-metadata and payload reads do not block collection. Retry a deferred command later.
-During deletion, reads of retained objects continue. Retiring metadata returns
-a miss; already-open flat transfers finish through their descriptors.
+Online GC supports flat and chunked storage. Uploads can continue while GC
+scans inventory and marks chunks. Changes to the cache invalidate the scan
+before deletion. Serving narinfo defers deletion if it protects a selected
+object or a publication that depends on it. Active uploads and narinfo binding
+can make GC report busy. A chunked read defers deletion only for its own
+canonical object; unrelated reads do not block collection. Retry deferred
+collection later. Reads of retained objects continue during deletion. Metadata
+being deleted returns a miss; already-open flat transfers finish through their
+file descriptors.
 
-Online collection enforces at least ten minutes of age protection. Accepted
-canonical uploads and successfully advertised narinfos get a ten-minute grace,
-including the advertised publication's transitive dependencies. Protection is
-renewed after metadata delivery. The daemon retains at most 4096 recent object
-keys; overflow protects all objects for the grace instead of dropping live
-protection. Startup also protects all objects for ten minutes because previous
-advertisements are not retained in memory. A size target does not override
-these protections. Cached metadata does not guarantee payload availability
-after the grace expires.
+Online GC never deletes objects younger than ten minutes. It also protects
+accepted canonical uploads, successfully served narinfos, and their transitive
+dependencies for ten minutes. Serving the metadata again renews that protection.
+The daemon tracks at most 4096 recent object keys; if that limit is exceeded,
+it protects all objects for the grace period. Startup protects all objects for
+ten minutes because the daemon no longer has the previous process's record of
+served metadata. A size target does not override these protections. Clients
+with cached metadata may lose access to its payload after the grace expires.
 
 Online GC does not perform offline recovery or clear publication journals.
 Unresolved publication records defer collection. Failed or interrupted deletion
-leaves recovery evidence for restart or offline maintenance.
+leaves recovery records for restart or offline maintenance.
 
 GC validates published inventory before deleting anything and selects
 publications by narinfo modification time. `--min-age-seconds` protects recent
@@ -257,10 +259,10 @@ Filesystem snapshots and replication are managed outside Narjar.
 
 ## Observability
 
-`GET /healthz` is public liveness. `GET /readyz` probes the staging filesystem's
-free bytes, inodes, and read-only status against the configured reserve; it
-returns 503 when that probe fails. Layout and trust checks happen at startup,
-not on each readiness request.
+`GET /healthz` is a public liveness check. `GET /readyz` checks the staging
+filesystem's free bytes, inodes, and read-only status against the configured
+reserve; it returns 503 when that check fails. Layout and trust checks happen
+at startup, not on each readiness request.
 `GET /metrics` returns Prometheus text; `narjar stats --url URL` prints the
 same response. Readiness and metrics require read credentials in private-read
 mode. There is no separate JSON statistics route.
@@ -271,14 +273,14 @@ process memory and CPU; storage capacity; queue depth; and maintenance results.
 `narjar_online_gc_requests_total` distinguishes successful passes, unmet targets,
 contention, invalidated inventory, and failures. Existing maintenance series
 report the last pass's duration and logically reclaimed objects and bytes.
-The exposition's HELP text describes each series. Labels do not contain
+Each series has HELP text describing it. Labels do not contain
 paths, hashes, token names, or request IDs.
 
 Hit ratio is hits divided by hits plus misses; failures are separate. A narinfo
 hit means committed metadata was read successfully. Reads trust immutable disk
-contents: they do not recheck signatures or backing payloads. Payload lookup
-and transfer failures are counted when those operations observe them. This is
-a server lookup ratio, not a build-success or end-to-end integrity measure.
+contents: they do not recheck signatures or backing payloads. Payload lookups
+and transfers count their own failures. The ratio measures cache lookups, not
+successful builds or payload integrity.
 
 Counters reset on restart. Outgoing bytes count successful socket writes,
 including partial responses; they do not prove receipt by the client.
@@ -286,23 +288,25 @@ Logical-byte counters do not measure filesystem compression or physical disk
 use.
 
 `narjar_build_info` identifies the version, storage backend and egress codec;
-`narjar_stats_schema_version` identifies the exposition contract. Recent
-artifact request and byte rates report their actual one-/five-minute sample
-coverage. Reporting traffic is excluded. Full and range GET delivery durations
-have separate histograms; HEAD and error responses do not enter those two
-distributions. Interrupted transfers retain their measured bytes and duration.
+`narjar_stats_schema_version` identifies the metrics schema. Recent artifact
+request and byte rates cover one- and five-minute windows and report how much
+of each window was sampled. Requests to health, readiness, and metrics endpoints
+are excluded. Full and range GET delivery durations have separate histograms;
+HEAD and error responses are excluded. Interrupted transfers still count their
+measured bytes and duration.
 
 Process resources and filesystem capacity are sampled every five seconds.
 `/metrics` reads the cached capacity sample, including its timestamp and state,
 without probing the filesystem. Failed refreshes retain the last values as
-stale and report readiness as unknown, not healthy. `/readyz` still performs a
-current readiness check. Sampled headroom is an observation, not an admission
-guarantee; connection, worker and queue gauges come from their live owners.
+stale and report readiness as unknown, not healthy. `/readyz` still checks the
+filesystem on each request. Reported headroom can change before the next upload;
+admission checks capacity separately. Connection, worker and queue gauges read
+the current counts rather than periodic samples.
 
 Population sampling is disabled by default. Enable it with
 `--stats-inventory-interval-seconds 900`; metrics requests use the last sample
-rather than scanning the cache. Sample timestamps, quality, and stale state
-distinguish a complete sample from a failed refresh. ZFS samples come from an
+rather than scanning the cache. Use sample timestamps, quality, and stale state
+to check for incomplete scans and failed refreshes. ZFS samples come from an
 external file or the NixOS module's optional sampler, not a subprocess launched
 by the server.
 
@@ -311,9 +315,10 @@ identifier. Configure proxy logs to redact credentials.
 
 ## Deployment
 
-The [NixOS module](https://github.com/mjc/narjar/blob/main/nix/module.nix) initializes the cache and runs it under an
-unprivileged user. Its `auth.*` options take host file paths loaded through
-systemd credentials; do not put secret contents in Nix expressions.
+The [NixOS module](https://github.com/mjc/narjar/blob/main/nix/module.nix)
+initializes the cache and runs it under an unprivileged user. Its `auth.*`
+options take host file paths loaded through systemd credentials; do not put
+secret contents in Nix expressions.
 `auth.writeTokens` must contain Narjar's hashed token records, not a plaintext
 token. See the [README example](../README.md#nixos-service).
 
@@ -331,7 +336,7 @@ services.narjar.gc = {
 ~~~
 
 The GC unit requests collection through the running daemon; it does not stop
-or restart the service. `maxBytes` starts collection above that limit and supplies the
+or restart the service. Collection starts above `maxBytes`, which is also the
 target if `targetBytes` is unset. When both are set, the target must not exceed
 the maximum.
 
