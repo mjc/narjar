@@ -52,9 +52,10 @@ roots and reading metadata, not throughout the transfer. Otherwise it uses
 `AddTempRoot` over the Nix daemon socket and keeps the connection alive.
 Rooting failures abort the push.
 
-`--compression` controls upload transport only. HTTP requests have a
-30-second total timeout by default; set `--timeout-seconds` for longer
-transfers. Netrc credentials require HTTPS unless `--insecure-http` is
+`--compression` controls upload transport only. Native HTTP requests have a
+30-second DNS/connect and network inactivity timeout by default; set
+`--timeout-seconds` to change it. Transfers can take longer while making
+progress. Netrc credentials require HTTPS unless `--insecure-http` is
 explicitly supplied. An unauthenticated HTTP request remains unauthenticated
 after a redirect to HTTPS.
 

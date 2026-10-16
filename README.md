@@ -94,8 +94,9 @@ duration of the upload. See [push details](https://github.com/mjc/narjar/blob/ma
 for native-store access and rooting.
 
 Netrc credentials are sent over HTTPS unless `--insecure-http` is supplied.
-That flag is needed for the local HTTP example above. Upload requests have a
-30-second timeout by default; change it with `--timeout-seconds`.
+That flag is needed for the local HTTP example above. Native HTTP requests have
+a 30-second DNS/connect and network inactivity timeout by default; change it
+with `--timeout-seconds`. Transfers can take longer while making progress.
 
 Valid publications for the same full store path are skipped, even when a local
 build has a different NAR hash, size, or references. The first valid publication
