@@ -70,15 +70,11 @@ pub(crate) use fs::{
     open_directory_at, open_regular_at, read_dir_names,
 };
 
-pub use crate::object::{
-    EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarSize, WireEncoding,
-};
-pub use backend::{
-    InvalidStorageBackend, StorageBackend, SupportedStorageBackend, UnsupportedStorageBackend,
-};
+pub use crate::cache::object::{FileHash, NarFileName, NarHash};
+pub use backend::{StorageBackend, SupportedStorageBackend, UnsupportedStorageBackend};
 pub use directory::Directory;
 pub(crate) use egress::{NarReadBody, VerifiedCanonicalNar};
-pub use ids::{InvalidObjectId, StoreHash, validate_store_basename};
+pub use ids::{StoreHash, validate_store_basename};
 pub use initialization::{
     CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, CACHE_RECOVERY_MARKERS, CacheCreation,
     CachePolicies, storage_directories, storage_root_entries,
@@ -89,13 +85,12 @@ pub use state::Storage;
 pub(crate) use state::StorageActivitySnapshot;
 
 pub(crate) use operations::AdvertisedNarInfo;
-pub use operations::{NarInfoDeletion, NarMatch, RecoveredStorage, StorageReadiness};
+pub use operations::{RecoveredStorage, StorageReadiness};
 pub use population::PopulationCounts;
-pub use reconcile::{CleanupOutcome, ReconcileClass, ReconcileEntry, ReconcileReport};
+pub use reconcile::{CleanupOutcome, ReconcileClass, ReconcileEntry};
 
 pub const NAR_DIRECTORY: &str = "nar";
 pub const TEMPORARY_DIRECTORY: &str = ".tmp";
-pub const REALISATIONS_DIRECTORY: &str = "realisations";
 pub const VALIDATION_DIRECTORY: &str = ".narjar-validation";
 pub const INGESTION_RECEIPT_DIRECTORY: &str = ".narjar-ingress";
 pub const EGRESS_RECEIPT_DIRECTORY: &str = ".narjar-egress";

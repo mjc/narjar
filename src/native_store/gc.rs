@@ -1,6 +1,6 @@
 use std::{fs::File, io, path::Path};
 
-use narjar::__private::filesystem::open_regular_at;
+use crate::cache::filesystem::open_regular_at;
 use rustix::fs::{CWD, FlockOperation, Mode, OFlags};
 
 /// Excludes Nix GC while live store paths are checked and roots are installed.

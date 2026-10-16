@@ -1,10 +1,10 @@
 use std::io::{self, Read, Write};
 
-use crate::object::{
+use crate::cache::object::{
     EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash, NarIdentity, NarRepresentation,
     NarSize, WireEncoding,
 };
-use crate::storage::{StoreHash, VerifiedCanonicalNar};
+use crate::cache::storage::{StoreHash, VerifiedCanonicalNar};
 use data_encoding::BASE64;
 use ed25519_dalek::Signature;
 use fluent_uri::UriRef;
@@ -12,7 +12,7 @@ use fluent_uri::UriRef;
 #[path = "narinfo/trust.rs"]
 mod trust;
 
-pub use trust::{TrustError, TrustedPublicKeys};
+pub use trust::TrustedPublicKeys;
 
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
@@ -148,10 +148,6 @@ impl NarInfoClaims {
 
     pub fn reference_basenames(&self) -> impl ExactSizeIterator<Item = &str> {
         self.references.iter().map(NixStorePath::basename)
-    }
-
-    pub fn reference_stores(&self) -> impl ExactSizeIterator<Item = &StoreHash> {
-        self.references.iter().map(NixStorePath::store)
     }
 
     pub fn reference_store_paths(&self) -> impl ExactSizeIterator<Item = (&StoreHash, &str)> {
@@ -529,7 +525,7 @@ impl<'text> NarInfoDocument<'text> {
             .parse::<u64>()
             .map(EncodedSize::new)
             .map_err(|_| NarInfoError)?;
-        NarRepresentation::from_narinfo(file_name, file_hash, file_size, identity)
+        representation_from_narinfo_fields(file_name, file_hash, file_size, identity)
     }
 
     fn validate_external_transport(&self) -> Result<(), NarInfoError> {
@@ -679,35 +675,34 @@ impl TrustedNarInfoClaims {
     }
 }
 
-impl NarRepresentation {
-    fn from_narinfo(
-        file_name: NarFileName,
-        file_hash: FileHash,
-        file_size: EncodedSize,
-        identity: NarIdentity,
-    ) -> Result<Self, NarInfoError> {
-        if file_name.file_hash() != file_hash || identity.size().get() == 0 {
-            return Err(NarInfoError);
-        }
-
-        match file_name.encoding() {
-            WireEncoding::Raw => Self::validate_raw_payload(file_hash, file_size, identity),
-            WireEncoding::Compressed(codec) => Ok(Self::compressed(
-                EncodedIdentity::new(codec, file_hash, file_size),
-                identity,
-            )),
-        }
+fn representation_from_narinfo_fields(
+    file_name: NarFileName,
+    file_hash: FileHash,
+    file_size: EncodedSize,
+    identity: NarIdentity,
+) -> Result<NarRepresentation, NarInfoError> {
+    if file_name.file_hash() != file_hash || identity.size().get() == 0 {
+        return Err(NarInfoError);
     }
 
-    fn validate_raw_payload(
-        file_hash: FileHash,
-        file_size: EncodedSize,
-        identity: NarIdentity,
-    ) -> Result<Self, NarInfoError> {
-        (file_hash.matches_nar_hash(identity.hash()) && file_size.get() == identity.size().get())
-            .then_some(Self::Raw(identity))
-            .ok_or(NarInfoError)
+    match file_name.encoding() {
+        WireEncoding::Raw => validate_raw_narinfo_identity(file_hash, file_size, identity),
+        WireEncoding::Compressed(codec) => Ok(NarRepresentation::compressed(
+            EncodedIdentity::new(codec, file_hash, file_size),
+            identity,
+        )),
     }
+}
+
+fn validate_raw_narinfo_identity(
+    file_hash: FileHash,
+    file_size: EncodedSize,
+    identity: NarIdentity,
+) -> Result<NarRepresentation, NarInfoError> {
+    (file_hash == FileHash::from_nar_hash(identity.hash())
+        && file_size.get() == identity.size().get())
+    .then_some(NarRepresentation::Raw(identity))
+    .ok_or(NarInfoError)
 }
 
 impl ValidatedNarInfo {
@@ -855,7 +850,7 @@ fn parse_content_address(value: &str) -> Result<(), NarInfoError> {
 }
 
 fn validate_store_basename(value: &str) -> Result<(StoreHash, &str), NarInfoError> {
-    crate::storage::validate_store_basename(value).map_err(|_| NarInfoError)
+    crate::cache::storage::validate_store_basename(value).map_err(|_| NarInfoError)
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]

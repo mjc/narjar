@@ -13,7 +13,7 @@ use super::collection::CollectionCoordinator;
 use super::publication::Layout;
 use super::publication::{ProcessLock, StagingBudget};
 use super::recovery::RecoveryState;
-use crate::object::{NarFileName, NarIdentity};
+use crate::cache::object::{NarFileName, NarIdentity};
 
 #[derive(Debug)]
 pub(super) enum PayloadStorage {
@@ -321,7 +321,7 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::{DELIVERY_VALIDATION_CACHE_CAPACITY, DeliveryProof, DeliveryProofs, FileStamp};
-    use crate::object::{NarFileName, NarHash, NarIdentity, NarSize};
+    use crate::cache::object::{NarFileName, NarHash, NarIdentity, NarSize};
 
     fn delivery_test_name(index: usize) -> NarFileName {
         let mut digest = [0; 32];

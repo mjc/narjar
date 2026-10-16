@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use narjar::__private::filesystem::{open_directory, open_directory_at};
+use crate::cache::filesystem::{open_directory, open_directory_at};
 
 pub(super) const CONTROL_DIRECTORY: &str = ".narjar-control";
 const SOCKET_NAME: &str = "gc.sock";

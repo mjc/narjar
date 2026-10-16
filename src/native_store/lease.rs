@@ -10,8 +10,8 @@ use std::{
 };
 
 use super::gc::{GcReadLock, lock_file};
+use crate::cache::records::{BoundedRegularFile, decode_complete, read_bounded_regular_file};
 use data_encoding::HEXLOWER;
-use narjar::__private::records::{BoundedRegularFile, decode_complete, read_bounded_regular_file};
 use rustix::fs::FlockOperation;
 #[cfg(test)]
 use rustix::io::Errno;
@@ -61,7 +61,7 @@ impl NativeStorePath {
             .and_then(|name| name.to_str())
             .filter(|_| absolute_path.parent() == Some(store_dir))
             .ok_or(NativeStoreLeaseError::InvalidStorePath)?;
-        narjar::__private::storage::validate_store_basename(basename)
+        crate::cache::storage::validate_store_basename(basename)
             .map_err(|_| NativeStoreLeaseError::InvalidStorePath)?;
         let absolute_path = absolute_path
             .to_str()
@@ -1256,7 +1256,7 @@ fn open_lease_directory(record_path: &Path) -> Result<File, NativeStoreLeaseErro
     let directory = record_path
         .parent()
         .ok_or(NativeStoreLeaseError::InvalidRecord)?;
-    narjar::__private::filesystem::open_directory(directory).map_err(NativeStoreLeaseError::Io)
+    crate::cache::filesystem::open_directory(directory).map_err(NativeStoreLeaseError::Io)
 }
 
 fn set_flock_lock(file: &File) -> Result<(), NativeStoreLeaseError> {

@@ -23,6 +23,7 @@ include = [
     "tests/nar_benchmark_options.rs",
     "src/**",
     "tests/cli.rs",
+    "tests/application.rs",
     "tests/fixtures/nix-2.31.5-http-v0.1.tsv",
     "tests/gc_scale.rs",
     "tests/nar_decoder.rs",
@@ -49,9 +50,12 @@ application = [
 name = "narjar"
 path = "src/main.rs"
 required-features = ["application"]
+test = false
 
 [[test]]
 name = "cli"
+# Compile application unit tests and CLI tests in the binary's private module tree.
+path = "tests/application.rs"
 required-features = ["application"]
 
 [[test]]

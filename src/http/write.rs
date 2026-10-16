@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{
+use crate::cache::{
     auth::{Authorizer, Permission},
     http_server::{BodyReader, BodyReaderError, Request, RequestExpectation, Response, StatusCode},
     metrics::{ConnectionOutcome, Metrics, RequestGuard, RequestMethod, ValidationClass},

@@ -15,7 +15,7 @@ use super::{
     Storage, StorageError, StoreHash, entry_identity_at, entry_is_directory_at,
     entry_is_regular_at, open_regular_at, read_dir_names,
 };
-use crate::maintenance::FILE_NAMES as MAINTENANCE_FILES;
+use crate::cache::maintenance::FILE_NAMES as MAINTENANCE_FILES;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ReconcileClass {
@@ -339,7 +339,7 @@ fn valid_store_hash_filename(name: &str) -> bool {
 
 fn valid_nar_filename(name: &OsStr) -> bool {
     name.to_str()
-        .is_some_and(|name| crate::object::NarFileName::parse(name).is_ok())
+        .is_some_and(|name| crate::cache::object::NarFileName::parse(name).is_ok())
 }
 
 fn valid_temp_filename(name: &OsStr) -> bool {

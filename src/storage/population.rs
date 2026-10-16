@@ -6,8 +6,8 @@ use std::{
     thread,
 };
 
-use crate::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims};
-use crate::object::{NarFileName, WireEncoding};
+use crate::cache::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims};
+use crate::cache::object::{NarFileName, WireEncoding};
 
 use super::{
     Storage, StorageError, StoreHash, for_each_dir_name,
@@ -126,8 +126,10 @@ impl Storage {
             let kind = match NarFileName::parse(text) {
                 Ok(name) => match name.encoding() {
                     WireEncoding::Raw => FileKind::Raw,
-                    WireEncoding::Compressed(crate::object::CompressionCodec::Xz) => FileKind::Xz,
-                    WireEncoding::Compressed(crate::object::CompressionCodec::Zstd) => {
+                    WireEncoding::Compressed(crate::cache::object::CompressionCodec::Xz) => {
+                        FileKind::Xz
+                    }
+                    WireEncoding::Compressed(crate::cache::object::CompressionCodec::Zstd) => {
                         FileKind::Zstd
                     }
                 },

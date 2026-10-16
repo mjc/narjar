@@ -2,12 +2,14 @@ use std::{collections::HashSet, ffi::OsStr, fs::File, io};
 
 use sha2::{Digest, Sha256};
 
-use crate::{
+#[cfg(test)]
+use crate::cache::storage::Directory;
+use crate::cache::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file},
     object::NarRepresentation,
     storage::{
-        Directory, DirectoryEntryAction, DirectoryScanOutcome, FileHash, NarFileName, NarHash,
-        Storage, StoreHash, for_each_dir_name,
+        DirectoryEntryAction, DirectoryScanOutcome, FileHash, NarFileName, NarHash, Storage,
+        StoreHash, for_each_dir_name,
         inspection::{NarinfoCandidate, NarinfoName, PayloadEntry, ReferencedPayload},
         open_directory_at, read_dir_names,
     },
@@ -66,17 +68,6 @@ impl InventoryClass {
             | Self::HashOrSizeMismatch
             | Self::UntrustedSignature => true,
             Self::ValidPair | Self::OrphanNar | Self::InvalidFilename => false,
-        }
-    }
-
-    pub const fn blocks_serve(self) -> bool {
-        match self {
-            Self::MalformedNarInfo | Self::UntrustedSignature => true,
-            Self::ValidPair
-            | Self::OrphanNar
-            | Self::MissingNar
-            | Self::HashOrSizeMismatch
-            | Self::InvalidFilename => false,
         }
     }
 }
@@ -170,6 +161,8 @@ enum MetadataAssessment {
 
 #[derive(Clone, Copy)]
 enum PayloadSource<'a> {
+    #[cfg(test)]
+    #[allow(dead_code, reason = "Used by the CLI and benchmark harnesses")]
     Directory(&'a File),
     Storage(&'a Storage),
 }
@@ -219,6 +212,7 @@ fn inspect_payload(
     verification: VerificationMode,
 ) -> io::Result<InventoryClass> {
     match source {
+        #[cfg(test)]
         PayloadSource::Directory(payloads) => {
             inspect_directory_payload(payloads, payload, verification)
         }
@@ -228,7 +222,7 @@ fn inspect_payload(
 
 fn inspect_storage_canonical_nar(
     storage: &Storage,
-    identity: crate::object::NarIdentity,
+    identity: crate::cache::object::NarIdentity,
     verification: VerificationMode,
 ) -> io::Result<InventoryClass> {
     match verification {
@@ -242,7 +236,7 @@ fn inspect_storage_canonical_nar(
 
 fn verify_storage_canonical_nar_content(
     storage: &Storage,
-    identity: crate::object::NarIdentity,
+    identity: crate::cache::object::NarIdentity,
 ) -> io::Result<InventoryClass> {
     let name = NarFileName::raw(identity.hash());
     let size = match storage.nar_size(name) {
@@ -273,7 +267,9 @@ fn verify_storage_canonical_nar_content(
     Ok(InventoryClass::ValidPair)
 }
 
-fn classify_storage_error(error: crate::storage::StorageError) -> io::Result<InventoryClass> {
+fn classify_storage_error(
+    error: crate::cache::storage::StorageError,
+) -> io::Result<InventoryClass> {
     match classify_storage_failure(&error) {
         Some(class) => Ok(class),
         None => Err(storage_error_to_io(error)),
@@ -287,28 +283,30 @@ fn classify_io_error(error: io::Error) -> io::Result<InventoryClass> {
     }
 }
 
-fn storage_error_to_io(error: crate::storage::StorageError) -> io::Error {
+fn storage_error_to_io(error: crate::cache::storage::StorageError) -> io::Error {
     match error {
-        crate::storage::StorageError::Io(error) => error,
-        crate::storage::StorageError::MissingNar => io::Error::from(io::ErrorKind::NotFound),
+        crate::cache::storage::StorageError::Io(error) => error,
+        crate::cache::storage::StorageError::MissingNar => io::Error::from(io::ErrorKind::NotFound),
         error => io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
     }
 }
 
-fn classify_storage_failure(error: &crate::storage::StorageError) -> Option<InventoryClass> {
+fn classify_storage_failure(error: &crate::cache::storage::StorageError) -> Option<InventoryClass> {
     match error {
-        crate::storage::StorageError::MissingNar => Some(InventoryClass::MissingNar),
-        crate::storage::StorageError::NarMismatch => Some(InventoryClass::HashOrSizeMismatch),
-        crate::storage::StorageError::Io(error) => classify_io_failure(error),
-        crate::storage::StorageError::Conflict
-        | crate::storage::StorageError::CollectionBusy
-        | crate::storage::StorageError::CollectionChanged
-        | crate::storage::StorageError::DecodedSizeLimitExceeded
-        | crate::storage::StorageError::DecoderMemoryLimitExceeded
-        | crate::storage::StorageError::InsufficientSpace
-        | crate::storage::StorageError::InsufficientInodes
-        | crate::storage::StorageError::Locked
-        | crate::storage::StorageError::UploadTooLarge => None,
+        crate::cache::storage::StorageError::MissingNar => Some(InventoryClass::MissingNar),
+        crate::cache::storage::StorageError::NarMismatch => {
+            Some(InventoryClass::HashOrSizeMismatch)
+        }
+        crate::cache::storage::StorageError::Io(error) => classify_io_failure(error),
+        crate::cache::storage::StorageError::Conflict
+        | crate::cache::storage::StorageError::CollectionBusy
+        | crate::cache::storage::StorageError::CollectionChanged
+        | crate::cache::storage::StorageError::DecodedSizeLimitExceeded
+        | crate::cache::storage::StorageError::DecoderMemoryLimitExceeded
+        | crate::cache::storage::StorageError::InsufficientSpace
+        | crate::cache::storage::StorageError::InsufficientInodes
+        | crate::cache::storage::StorageError::Locked
+        | crate::cache::storage::StorageError::UploadTooLarge => None,
     }
 }
 
@@ -453,7 +451,8 @@ fn inspect_unreferenced_manifests(
     references: &HashSet<FileHash>,
 ) -> io::Result<Vec<InventoryEntry>> {
     let root = storage.root_directory().map_err(storage_error_to_io)?;
-    let manifests = open_directory_at(&root, OsStr::new(crate::storage::MANIFEST_DIRECTORY))?;
+    let manifests =
+        open_directory_at(&root, OsStr::new(crate::cache::storage::MANIFEST_DIRECTORY))?;
     let mut entries = Vec::new();
     read_dir_names(&manifests)?.iter().try_for_each(|name| {
         let Some(text) = name.to_str() else {
@@ -468,7 +467,7 @@ fn inspect_unreferenced_manifests(
         if references.contains(&FileHash::from_nar_hash(hash)) {
             return Ok(());
         }
-        if !crate::storage::entry_is_regular_at(&manifests, name)? {
+        if !crate::cache::storage::entry_is_regular_at(&manifests, name)? {
             return Ok(());
         }
         entries.push(InventoryEntry::new(
@@ -514,6 +513,8 @@ fn inspect_unreferenced_payloads(
 }
 
 impl Inventory {
+    #[cfg(test)]
+    #[allow(dead_code, reason = "Used by the CLI harness")]
     pub fn can_serve_streaming(root: &Directory, trusted: &TrustedPublicKeys) -> io::Result<bool> {
         let root = root.file();
         let outcome = for_each_dir_name(root, |name| {
@@ -571,6 +572,8 @@ impl Inventory {
         })
     }
 
+    #[cfg(test)]
+    #[allow(dead_code, reason = "Used by the CLI and benchmark harnesses")]
     pub fn scan(
         root: &Directory,
         trusted: &TrustedPublicKeys,
@@ -610,8 +613,8 @@ impl Inventory {
         )?;
         entries.extend(inspect_unreferenced_payloads(&nar_directory, &references)?);
         match storage.backend() {
-            crate::storage::StorageBackend::Flat => {}
-            crate::storage::StorageBackend::Chunked => {
+            crate::cache::storage::StorageBackend::Flat => {}
+            crate::cache::storage::StorageBackend::Chunked => {
                 entries.extend(inspect_unreferenced_manifests(storage, &references)?);
             }
         }
@@ -622,18 +625,14 @@ impl Inventory {
     pub fn entries(&self) -> &[InventoryEntry] {
         &self.entries
     }
-
-    pub fn can_serve(&self) -> bool {
-        !self.entries.iter().any(|entry| entry.class.blocks_serve())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{CacheCreation, NarUploadPolicy, SupportedStorageBackend};
+    use crate::cache::storage::{CacheCreation, NarUploadPolicy, SupportedStorageBackend};
     #[cfg(not(target_os = "macos"))]
-    use crate::storage::{PublishOutcome, StorageBackend};
+    use crate::cache::storage::{PublishOutcome, StorageBackend};
     use sha2::{Digest, Sha256};
     use std::io::Cursor;
     #[cfg(not(target_os = "macos"))]
@@ -642,7 +641,7 @@ mod tests {
 
     fn assert_canonical_nar_class(
         storage: &Storage,
-        identity: crate::object::NarIdentity,
+        identity: crate::cache::object::NarIdentity,
         verification: VerificationMode,
         expected: InventoryClass,
     ) {
@@ -661,7 +660,7 @@ mod tests {
             .unwrap();
         let raw = b"canonical raw nar";
         let hash = NarHash::from_digest(Sha256::digest(raw).into());
-        let identity = crate::object::NarIdentity::new(hash, (raw.len() as u64).into());
+        let identity = crate::cache::object::NarIdentity::new(hash, (raw.len() as u64).into());
         storage
             .publish_nar(
                 NarFileName::raw(hash),
@@ -725,7 +724,7 @@ mod tests {
             PublishOutcome::Created
         );
 
-        let identity = crate::object::NarIdentity::new(hash, (raw.len() as u64).into());
+        let identity = crate::cache::object::NarIdentity::new(hash, (raw.len() as u64).into());
         assert_canonical_nar_class(
             &storage,
             identity,
@@ -739,7 +738,9 @@ mod tests {
             InventoryClass::ValidPair,
         );
 
-        let chunk_root = directory.path().join(crate::storage::CHUNK_DIRECTORY);
+        let chunk_root = directory
+            .path()
+            .join(crate::cache::storage::CHUNK_DIRECTORY);
         let shard = std::fs::read_dir(chunk_root)
             .unwrap()
             .map(|entry| entry.unwrap())
@@ -791,13 +792,13 @@ mod tests {
         }));
 
         let manifest = Path::new(directory.path())
-            .join(crate::storage::MANIFEST_DIRECTORY)
+            .join(crate::cache::storage::MANIFEST_DIRECTORY)
             .join(format!("{hash}.manifest"));
         std::fs::remove_file(manifest).unwrap();
         assert_eq!(
             inspect_storage_canonical_nar(
                 &storage,
-                crate::object::NarIdentity::new(hash, (raw.len() as u64).into()),
+                crate::cache::object::NarIdentity::new(hash, (raw.len() as u64).into()),
                 VerificationMode::Availability,
             )
             .unwrap(),

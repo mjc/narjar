@@ -8,7 +8,7 @@ use std::{
 };
 
 const MAX_RECORD_BYTES: u64 = 2 * 1024;
-const INVENTORY_CLASS_COUNT: usize = crate::inventory::InventoryClass::ALL.len();
+const INVENTORY_CLASS_COUNT: usize = crate::cache::inventory::InventoryClass::ALL.len();
 pub const FILE_NAMES: [&str; 6] = [
     ".narjar-maintenance-gc.started",
     ".narjar-maintenance-gc.last",
@@ -215,7 +215,7 @@ fn decode_record<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
     if bytes.len() as u64 > MAX_RECORD_BYTES {
         return None;
     }
-    let Record::V1(value) = crate::records::decode_complete(bytes).ok()?;
+    let Record::V1(value) = crate::cache::records::decode_complete(bytes).ok()?;
     Some(value)
 }
 
@@ -233,8 +233,8 @@ fn parse_started(operation: Operation, bytes: &[u8]) -> Option<Started> {
 }
 
 fn read_bounded_file(path: &Path) -> io::Result<Vec<u8>> {
-    let file = crate::filesystem::open_regular_at(rustix::fs::CWD, path)?;
-    crate::records::read_bounded_bytes(file, MAX_RECORD_BYTES).map_err(Into::into)
+    let file = crate::cache::filesystem::open_regular_at(rustix::fs::CWD, path)?;
+    crate::cache::records::read_bounded_bytes(file, MAX_RECORD_BYTES).map_err(Into::into)
 }
 
 fn write_atomic(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {

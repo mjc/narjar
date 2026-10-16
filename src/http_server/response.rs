@@ -39,6 +39,7 @@ impl StatusCode {
     pub const SERVICE_UNAVAILABLE: Self = Self(503);
     pub const INSUFFICIENT_STORAGE: Self = Self(507);
 
+    #[cfg(test)]
     pub const fn new(code: u16) -> Option<Self> {
         if code >= 100 && code <= 599 {
             Some(Self(code))

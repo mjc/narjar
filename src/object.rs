@@ -4,8 +4,6 @@
 //! their byte counts. This prevents accidentally comparing or substituting
 //! identities for different byte streams.
 
-#[cfg(feature = "application")]
-use std::ffi::OsString;
 use std::{fmt, marker::PhantomData, str::FromStr, sync::OnceLock};
 
 use data_encoding::{BitOrder, Encoding, Specification};
@@ -52,8 +50,9 @@ impl<Purpose> Sha256Digest<Purpose> {
         Self(digest, PhantomData)
     }
 
-    pub(crate) const fn bytes(self) -> [u8; 32] {
-        self.0
+    /// Borrows the 32 raw SHA-256 bytes without formatting or allocation.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -65,14 +64,9 @@ impl<Purpose> fmt::Display for Sha256Digest<Purpose> {
 }
 
 impl Sha256Digest<EncodedFile> {
-    #[cfg(feature = "application")]
-    pub(crate) fn matches_nar_hash(self, hash: NarHash) -> bool {
-        self.bytes() == hash.bytes()
-    }
-
     /// Re-tags a digest after establishing that raw file bytes match a NAR hash.
     pub const fn from_nar_hash(hash: NarHash) -> Self {
-        Self::from_digest(hash.bytes())
+        Self::from_digest(*hash.as_bytes())
     }
 
     /// Re-tags this digest as a NAR hash without decoding or verifying bytes.
@@ -81,7 +75,7 @@ impl Sha256Digest<EncodedFile> {
     /// itself. For an XZ- or Zstandard-compressed file, this returns the hash
     /// of the compressed bytes, not the decoded NAR hash.
     pub const fn as_nar_hash(self) -> NarHash {
-        NarHash::from_digest(self.bytes())
+        NarHash::from_digest(*self.as_bytes())
     }
 }
 
@@ -262,17 +256,12 @@ impl NarFileName {
         self.encoding
     }
 
-    #[cfg(feature = "application")]
-    pub(crate) const fn raw_hash(self) -> Option<NarHash> {
+    /// Returns the logical NAR hash for a raw filename, or `None` for compressed bytes.
+    pub const fn raw_hash(self) -> Option<NarHash> {
         match self.encoding {
             WireEncoding::Raw => Some(self.file_hash.as_nar_hash()),
             WireEncoding::Compressed(_) => None,
         }
-    }
-
-    #[cfg(feature = "application")]
-    pub(crate) fn os_string(self) -> OsString {
-        OsString::from(self.to_string())
     }
 }
 
@@ -433,9 +422,31 @@ fn nix32_encoding() -> &'static Encoding {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileHash, NarHash};
+    use super::{CompressionCodec, FileHash, NarFileName, NarHash, WireEncoding};
 
     const SHA256_NIX32_WIDTH: usize = 52;
+
+    #[test]
+    fn digest_bytes_can_be_borrowed_without_consuming_the_typed_hash() {
+        let digest = [0xa5; 32];
+        let hash = NarHash::from_digest(digest);
+        let bytes = hash.as_bytes();
+        assert_eq!(bytes, &digest);
+        assert_eq!(FileHash::from_nar_hash(hash).as_bytes(), bytes);
+    }
+
+    #[test]
+    fn only_raw_filenames_identify_the_logical_nar_hash() {
+        let hash = NarHash::from_digest([0x5a; 32]);
+        assert_eq!(NarFileName::raw(hash).raw_hash(), Some(hash));
+        for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
+            let name = NarFileName::new(
+                FileHash::from_nar_hash(hash),
+                WireEncoding::Compressed(codec),
+            );
+            assert_eq!(name.raw_hash(), None, "{codec:?} hashes encoded bytes");
+        }
+    }
 
     #[test]
     fn sha256_nix32_round_trips_zero_and_high_bit_boundary_hashes() {
@@ -468,8 +479,8 @@ mod tests {
         let nar_hash = NarHash::parse(encoded).expect("canonical NAR hash");
         let file_hash = FileHash::parse(encoded).expect("canonical file hash");
 
-        assert_eq!(nar_hash.bytes(), expected);
-        assert_eq!(file_hash.bytes(), expected);
+        assert_eq!(*nar_hash.as_bytes(), expected);
+        assert_eq!(*file_hash.as_bytes(), expected);
         assert_eq!(nar_hash.to_string(), encoded);
         assert_eq!(file_hash.to_string(), encoded);
     }

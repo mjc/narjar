@@ -6,7 +6,7 @@ use std::{
 use rustix::fd::AsFd;
 use serde::Deserialize;
 
-use crate::filesystem::open_regular_at;
+use crate::cache::filesystem::open_regular_at;
 
 #[derive(Debug)]
 pub enum BoundedRegularFile<T> {
@@ -101,7 +101,7 @@ mod tests {
         let original = root.path().join("original");
         std::fs::create_dir(&original).unwrap();
         std::fs::write(original.join("record"), b"abc").unwrap();
-        let directory = crate::filesystem::open_directory(&original).unwrap();
+        let directory = crate::cache::filesystem::open_directory(&original).unwrap();
         std::fs::rename(&original, root.path().join("moved")).unwrap();
         std::fs::create_dir(&original).unwrap();
         std::fs::write(original.join("record"), b"replacement").unwrap();

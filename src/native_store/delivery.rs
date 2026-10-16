@@ -6,10 +6,10 @@ use std::{
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
 };
 
-use crate::verified_stream::{VerifiedStream, read_uninterrupted_chunk};
-use narjar::__private::filesystem::{
+use crate::cache::filesystem::{
     open_directory, open_directory_at, open_regular_at, read_dir_names,
 };
+use crate::verified_stream::{VerifiedStream, read_uninterrupted_chunk};
 use narjar::{
     nar_encode::{EncodeSummary, Encoder, Event},
     object::{LogicalNar, NarIdentity},

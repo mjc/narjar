@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{
+use crate::cache::{
     auth::{Authorizer, Permission, ReadVisibility},
     http_server::{Method, Request, Response, ResponseHeader as Header, StatusCode, static_header},
     metrics::{
@@ -126,7 +126,7 @@ fn respond_narinfo(
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
     let lookup_started = Instant::now();
-    let crate::storage::AdvertisedNarInfo { bytes, _activity } =
+    let crate::cache::storage::AdvertisedNarInfo { bytes, _activity } =
         match load_published_narinfo(storage, store) {
             Ok(advertisement) => advertisement,
             Err(NarInfoReadFailure::Missing) => {
@@ -156,7 +156,7 @@ enum NarInfoReadFailure {
 fn load_published_narinfo<'storage>(
     storage: &'storage Storage,
     store: &StoreHash,
-) -> Result<crate::storage::AdvertisedNarInfo<'storage>, NarInfoReadFailure> {
+) -> Result<crate::cache::storage::AdvertisedNarInfo<'storage>, NarInfoReadFailure> {
     let narinfo = storage
         .read_advertised_narinfo(store)
         .map_err(|_| NarInfoReadFailure::InvalidOrUnreadable)?
@@ -808,7 +808,7 @@ mod tests {
         CacheRoute, RequestedRange, RouteMatch, invalid_route_status, parse_range_value,
         readiness_response, record_nar_open_outcome, request_route,
     };
-    use crate::{
+    use crate::cache::{
         http_server::{Method, StatusCode},
         metrics::{Metrics, RequestMethod, RequestRoute as MetricsRoute},
         object::{CompressionCodec, WireEncoding},

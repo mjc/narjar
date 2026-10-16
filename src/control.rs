@@ -12,8 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Sender, bounded};
-use narjar::__private::{
+use crate::cache::{
     metrics::{Metrics, OnlineGcOutcome},
     narinfo::TrustedPublicKeys,
     storage::{
@@ -21,6 +20,7 @@ use narjar::__private::{
         gc::{GcOptions, GcReport},
     },
 };
+use crossbeam_channel::{Sender, bounded};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
@@ -370,7 +370,7 @@ impl Read for DeadlineReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use narjar::__private::{
+    use crate::cache::{
         maintenance::{self, Operation, Outcome},
         storage::{CachePolicies, Directory, StorageBackend, SupportedStorageBackend, gc::GcMode},
     };
@@ -486,7 +486,7 @@ mod tests {
         std::fs::write(&source, "00000000000000000000000000000000\n").unwrap();
         let mut request = options();
         request.protected_roots =
-            narjar::__private::storage::gc::ProtectedRoots::load(Some(&source)).unwrap();
+            crate::cache::storage::gc::ProtectedRoots::load(Some(&source)).unwrap();
         std::fs::remove_file(&source).unwrap();
         let service = ControlService::start(
             root.path(),
@@ -523,7 +523,7 @@ mod tests {
             .map(|index| format!("{index:032}\n"))
             .collect::<String>();
         request.protected_roots =
-            narjar::__private::storage::gc::ProtectedRoots::parse(&oversized).unwrap();
+            crate::cache::storage::gc::ProtectedRoots::parse(&oversized).unwrap();
         let result = collect(root.path(), request);
         service
             .finish(Instant::now() + Duration::from_secs(2))

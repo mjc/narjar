@@ -48,7 +48,7 @@ fn concrete_store_path(value: &str) -> Result<String, PushError> {
         .strip_prefix("/nix/store/")
         .filter(|relative| !relative.is_empty() && !relative.contains('/'))
         .ok_or_else(|| format!("native push requires a concrete store path: {value}"))?;
-    narjar::__private::storage::validate_store_basename(relative)
+    crate::cache::storage::validate_store_basename(relative)
         .map_err(|_| PushError::new(format!("invalid concrete store path: {value}")))?;
     Ok(format!("/nix/store/{relative}"))
 }

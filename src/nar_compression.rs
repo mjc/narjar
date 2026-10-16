@@ -6,7 +6,7 @@ use lzma_rust2::{XzOptions, XzWriter};
 use sha2::Sha256;
 use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 
-use crate::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
+use crate::cache::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash};
 
 /// Invoke the raw-byte producer once and finish the selected encoding before returning.
 /// The producer remains responsible for validating the raw NAR it supplies.

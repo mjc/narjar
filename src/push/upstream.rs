@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use narjar::__private::narinfo::{LogicalClaimsMismatch, MAX_NARINFO_BYTES, TrustedPublicKeys};
+use crate::cache::narinfo::{LogicalClaimsMismatch, MAX_NARINFO_BYTES, TrustedPublicKeys};
 use ureq::http::StatusCode;
 
 use super::{

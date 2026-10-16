@@ -3,9 +3,8 @@
 //! The supported library modules are [`nar`], [`nar_encode`], and [`object`]. Set
 //! `default-features = false` to use these without the application's HTTP,
 //! compression, or SQLite dependencies. The default `application` feature builds
-//! the command-line program. The binary and repository integration tests share
-//! application code through the hidden `__private` module. Its paths are not
-//! supported for downstream use and may change without notice.
+//! the command-line program. Application internals belong to the binary and are
+//! not part of this library.
 //!
 //! ```
 //! use narjar::object::{NarHash, NarIdentity, NarSize};
@@ -42,24 +41,6 @@
 
 #![warn(missing_docs)]
 
-#[cfg(feature = "application")]
-mod implementation;
-
 pub mod nar;
 pub mod nar_encode;
 pub mod object;
-
-#[doc(hidden)]
-#[cfg(feature = "application")]
-pub mod __private {
-    pub use crate::implementation::{
-        auth, filesystem, http, http_server, inventory, maintenance, metrics, nar, nar_compression,
-        nar_encode, narinfo, object, records, storage, token_file,
-    };
-}
-
-#[cfg(feature = "application")]
-pub(crate) use implementation::{
-    auth, filesystem, http_server, inventory, maintenance, metrics, nar_compression, narinfo,
-    records, storage, token_file,
-};

@@ -2,7 +2,7 @@ use std::{io, io::Read, io::Seek, io::SeekFrom, io::Write};
 
 use sha2::{Digest, Sha256};
 
-use crate::object::{NarHash, NarIdentity, NarSize, Sha256Digest};
+use crate::cache::object::{NarHash, NarIdentity, NarSize, Sha256Digest};
 
 pub(crate) const MANIFEST_MAGIC: &[u8; 8] = b"NARJCHNK";
 pub(crate) const MANIFEST_VERSION: u8 = 1;
@@ -256,7 +256,7 @@ pub(crate) fn write_manifest_header<W: Write>(
 ) -> Result<(), ManifestError> {
     writer.write_all(MANIFEST_MAGIC)?;
     writer.write_all(&[MANIFEST_VERSION, manifest.profile.id(), 0, 0])?;
-    writer.write_all(&manifest.identity.hash().bytes())?;
+    writer.write_all(manifest.identity.hash().as_bytes())?;
     writer.write_all(&manifest.identity.size().get().to_le_bytes())?;
     writer.write_all(&manifest.chunk_count.to_le_bytes())?;
     Ok(())
@@ -328,7 +328,7 @@ mod tests {
         MANIFEST_HEADER_BYTES, MANIFEST_RECORD_BYTES, ManifestError, ManifestReader,
         write_manifest_header,
     };
-    use crate::object::{NarHash, NarIdentity, NarSize};
+    use crate::cache::object::{NarHash, NarIdentity, NarSize};
     use sha2::{Digest, Sha256};
     use std::io::Cursor;
 
@@ -348,7 +348,7 @@ mod tests {
                 manifest.profile().min_size()
             };
             content.extend_from_slice(&end.to_le_bytes());
-            content.extend_from_slice(&hash.bytes());
+            content.extend_from_slice(hash.as_bytes());
         });
         let checksum = Sha256::digest(&content);
         content.extend_from_slice(&checksum);

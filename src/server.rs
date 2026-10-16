@@ -11,7 +11,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
-use narjar::__private::{
+use crate::cache::{
     auth::Authorizer,
     http::{PublicationRequest, prepare_publication, respond},
     http_server::{Method, Request, StatusCode, write_status},
@@ -27,11 +27,11 @@ use signal_hook::{
     low_level,
 };
 
+use crate::cache::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure, WorkerKind};
 use crate::{
     config::{ServeConfig, ServeSource},
     error::Error,
 };
-use narjar::__private::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure, WorkerKind};
 
 mod idle;
 
@@ -847,10 +847,10 @@ mod tests {
         time::Duration,
     };
 
-    use narjar::__private::{http_server::Request, metrics::Metrics};
+    use crate::cache::{http_server::Request, metrics::Metrics};
 
     use super::{Admissions, configure_accepted_socket, request_read_failure_outcome};
-    use narjar::__private::metrics::ConnectionOutcome;
+    use crate::cache::metrics::ConnectionOutcome;
 
     #[test]
     fn standalone_serving_needs_no_notification_socket() {
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn unavailable_publication_queue_rejects_without_continue_and_releases_admission() {
-        use narjar::__private::{
+        use crate::cache::{
             auth::Authorizer,
             storage::{CacheCreation, Directory, SupportedStorageBackend},
             token_file::TokenFile,

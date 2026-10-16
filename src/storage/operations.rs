@@ -15,12 +15,12 @@ use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
-use crate::object::NarHash;
-use crate::object::{
+use crate::cache::object::NarHash;
+use crate::cache::object::{
     CompressedNarIdentity, EncodedIdentity, NarFileName, NarIdentity, NarRepresentation,
     WireEncoding,
 };
-use crate::{
+use crate::cache::{
     inventory::{Inventory, RecoveryOutcome},
     narinfo::{
         BoundNarInfo, NarInfoClaims, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file,
@@ -174,7 +174,7 @@ impl CompressedValidationName {
     }
 
     fn nar_name(&self) -> OsString {
-        self.0.os_string()
+        self.0.to_string().into()
     }
 }
 
@@ -363,6 +363,7 @@ impl Storage {
         Ok(expected.matches_external_narinfo(bytes))
     }
 
+    #[cfg(test)]
     pub fn recovery_required(&self) -> Result<bool, StorageError> {
         self.recovery.required()
     }
@@ -375,7 +376,7 @@ impl Storage {
     pub fn recover_if_required(
         &self,
         trusted_keys: &TrustedPublicKeys,
-        mut report_progress: impl FnMut(crate::inventory::NarInfoCount),
+        mut report_progress: impl FnMut(crate::cache::inventory::NarInfoCount),
     ) -> Result<RecoveryStatus, StorageError> {
         let snapshot = self.collection.snapshot()?;
         let status = match self.recovery_required_for()? {
@@ -452,6 +453,7 @@ impl Storage {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub fn publish_nar(
         &self,
         name: NarFileName,
@@ -597,7 +599,7 @@ impl Storage {
             PayloadStorage::Flat => {
                 let nar_directory = self.nar_directory()?;
                 let nar_name = NarFileName::raw(*nar);
-                match open_regular_at(&nar_directory, nar_name.os_string()) {
+                match open_regular_at(&nar_directory, nar_name.to_string()) {
                     Ok(_) => Ok(()),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         Err(StorageError::MissingNar)
@@ -610,7 +612,7 @@ impl Storage {
 
     pub fn open_nar(&self, name: NarFileName) -> Result<Option<File>, StorageError> {
         let directory = self.nar_directory()?;
-        open_optional_at(&directory, &name.os_string())
+        open_optional_at(&directory, name.to_string().as_ref())
     }
 
     pub(super) fn open_durable_nar(&self, name: NarFileName) -> Result<File, StorageError> {
@@ -766,9 +768,11 @@ impl Storage {
         };
         self.open_narinfo(store)?
             .map(|file| {
-                let bytes =
-                    crate::records::read_bounded_bytes(file, crate::narinfo::MAX_NARINFO_BYTES)
-                        .map_err(io::Error::from)?;
+                let bytes = crate::cache::records::read_bounded_bytes(
+                    file,
+                    crate::cache::narinfo::MAX_NARINFO_BYTES,
+                )
+                .map_err(io::Error::from)?;
                 Ok(AdvertisedNarInfo {
                     bytes,
                     _activity: activity.advertise(*store)?,
@@ -1423,7 +1427,7 @@ impl RecoveredStorage<'_> {
 #[cfg(test)]
 mod durability_tests {
     use super::*;
-    use crate::storage::{CacheCreation, Directory, SupportedStorageBackend};
+    use crate::cache::storage::{CacheCreation, Directory, SupportedStorageBackend};
 
     #[test]
     fn existing_object_acquisition_requires_directory_sync_under_its_publication_lock() {

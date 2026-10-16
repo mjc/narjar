@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use narjar::__private::{
+use crate::cache::{
     maintenance::{
         Mode as MaintenanceMode, Operation as MaintenanceOperation, Outcome as MaintenanceOutcome,
         Recorder as MaintenanceRecorder, RunValues as MaintenanceValues,

@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 
-use narjar::__private::records::decode_complete;
+use crate::cache::records::decode_complete;
 use serde::{Serialize, de::DeserializeOwned};
 
 pub(super) const MAX_FRAME_BYTES: usize = 16 * 1024;

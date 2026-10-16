@@ -3,7 +3,6 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io,
-    path::Path,
     time::{Duration, SystemTime},
 };
 
@@ -16,14 +15,18 @@ use super::{
     inspection::NarinfoName,
     state::PayloadStorage,
 };
-use crate::{
+#[cfg(test)]
+use crate::cache::storage::{Directory, SupportedStorageBackend};
+use crate::cache::{
     narinfo::{PublishedNarInfoError, TrustedPublicKeys, read_narinfo_file},
     object::{NarHash, NarRepresentation},
     storage::{
-        Directory, NarFileName, RecoveredStorage, Storage, StorageBackend, StorageError, StoreHash,
-        SupportedStorageBackend, open_regular_at, read_dir_names,
+        NarFileName, RecoveredStorage, Storage, StorageBackend, StorageError, StoreHash,
+        open_regular_at, read_dir_names,
     },
 };
+#[cfg(test)]
+use std::path::Path;
 
 #[path = "gc/roots.rs"]
 mod roots;
@@ -385,6 +388,7 @@ impl RetentionPolicy {
     }
 }
 
+#[cfg(test)]
 pub fn run(data_dir: &Path, options: GcOptions) -> Result<GcReport, StorageError> {
     let backend = SupportedStorageBackend::try_from(options.backend)
         .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
@@ -1020,7 +1024,7 @@ fn scan_chunked(
         let (output_name, output_bytes) = match representation {
             NarRepresentation::Raw(_) => (None, 0),
             NarRepresentation::Compressed(_) => {
-                let output_name = representation.file_name().os_string();
+                let output_name = OsString::from(representation.file_name().to_string());
                 let output = open_regular_at(&nar_directory, &output_name).map_err(|error| {
                     match error.kind() {
                         io::ErrorKind::NotFound => {
@@ -2036,7 +2040,7 @@ fn invalid(message: impl Into<String>) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{CacheCreation, Directory, NarUploadPolicy};
+    use crate::cache::storage::{CacheCreation, Directory, NarUploadPolicy};
     use sha2::Digest;
     use std::{
         fs,
@@ -2218,7 +2222,7 @@ mod tests {
         .unwrap();
         let projections = std::cell::Cell::new(0);
         let roots = ProtectedRoots::load(Some(&path)).unwrap();
-        let roots = crate::records::decode_complete::<ProtectedRoots>(
+        let roots = crate::cache::records::decode_complete::<ProtectedRoots>(
             &postcard::to_allocvec(&roots).unwrap(),
         )
         .unwrap();
@@ -2595,7 +2599,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
         let storage = initialize_storage(directory.path()).expect("storage should initialize");
         let store = StoreHash::parse(TEST_STORE_HASH).expect("store hash should parse");
-        let nar = crate::object::NarHash::parse(TEST_NAR_ID).expect("NAR hash should parse");
+        let nar = crate::cache::object::NarHash::parse(TEST_NAR_ID).expect("NAR hash should parse");
         let narinfo_name = OsString::from(format!("{TEST_STORE_HASH}.narinfo"));
         let nar_path = storage.layout.nar_path(nar);
         let narinfo_path = directory.path().join(&narinfo_name);
@@ -2744,7 +2748,7 @@ mod tests {
 
     #[test]
     fn collection_preserves_an_unrelated_live_publication_journal() {
-        use crate::storage::publication::PublishTarget;
+        use crate::cache::storage::publication::PublishTarget;
 
         let directory = tempfile::tempdir().unwrap();
         let storage = initialize_storage(directory.path()).unwrap();
@@ -2858,13 +2862,13 @@ mod tests {
     fn write_signed_raw_metadata(
         root: &Path,
         store: &str,
-        identity: crate::object::NarIdentity,
+        identity: crate::cache::object::NarIdentity,
         references: Vec<String>,
     ) {
         use data_encoding::BASE64;
         use ed25519_dalek::{Signer, SigningKey};
         let key = SigningKey::from_bytes(&[7; 32]);
-        let mut metadata = crate::narinfo::NarInfoMetadata::from_store_metadata(
+        let mut metadata = crate::cache::narinfo::NarInfoMetadata::from_store_metadata(
             format!("/nix/store/{store}-narjar"),
             None,
             None,
@@ -2901,7 +2905,7 @@ mod tests {
         write_signed_raw_metadata(
             directory.path(),
             TEST_SECOND_STORE_HASH,
-            crate::object::NarIdentity::new(hash, crate::object::NarSize::new(3)),
+            crate::cache::object::NarIdentity::new(hash, crate::cache::object::NarSize::new(3)),
             Vec::new(),
         );
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
@@ -2919,8 +2923,9 @@ mod tests {
             .unwrap();
         fs::create_dir_all(directory.path().join("auth")).unwrap();
         let authorizer =
-            crate::auth::Authorizer::load(&Directory::open(directory.path()).unwrap()).unwrap();
-        let metrics = crate::metrics::Metrics::default();
+            crate::cache::auth::Authorizer::load(&Directory::open(directory.path()).unwrap())
+                .unwrap();
+        let metrics = crate::cache::metrics::Metrics::default();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let nar = format!("/nar/{}", original.nar_name.to_str().unwrap());
@@ -2958,8 +2963,8 @@ mod tests {
             let http = scope.spawn(|| {
                 for _ in &requests {
                     let (stream, _) = listener.accept().unwrap();
-                    let request = crate::http_server::Request::read(stream).unwrap();
-                    drop(crate::__private::http::respond(
+                    let request = crate::cache::http_server::Request::read(stream).unwrap();
+                    drop(crate::cache::http::respond(
                         request,
                         storage,
                         &authorizer,
@@ -3081,7 +3086,7 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn advertising_a_signed_root_retains_its_whole_closure_for_both_storage_backends() {
-        use crate::{
+        use crate::cache::{
             narinfo::NarInfoMetadata,
             object::{NarIdentity, NarSize},
         };
@@ -3260,7 +3265,7 @@ mod tests {
             write_signed_raw_metadata(
                 directory.path(),
                 TEST_SECOND_STORE_HASH,
-                crate::object::NarIdentity::new(hash, crate::object::NarSize::new(3)),
+                crate::cache::object::NarIdentity::new(hash, crate::cache::object::NarSize::new(3)),
                 depends_on_victim
                     .then(|| victim.store_path.clone())
                     .into_iter()
@@ -4039,9 +4044,10 @@ mod tests {
     fn orphan_cleanup_failure_preserves_orphan() {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
         let storage = initialize_storage(directory.path()).expect("storage should initialize");
-        let nar =
-            crate::object::NarHash::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl")
-                .expect("NAR hash should parse");
+        let nar = crate::cache::object::NarHash::parse(
+            "0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl",
+        )
+        .expect("NAR hash should parse");
         let path = storage.layout.nar_path(nar);
         fs::write(&path, b"orphan").expect("orphan should be written");
         let orphan = Orphan {

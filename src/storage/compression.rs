@@ -14,7 +14,7 @@ use structured_zstd::decoding::{
 };
 use xz4rust::{XzDecoder, XzNextBlockResult};
 
-use crate::object::{
+use crate::cache::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
     NarHash, NarIdentity, NarRepresentation, NarSize, WireEncoding,
 };
@@ -535,10 +535,7 @@ fn validate_raw_upload_identity(
     expectation: UploadExpectation,
 ) -> io::Result<NarIdentity> {
     if decoded.size().get() == expectation.size.get()
-        && expectation
-            .name
-            .file_hash()
-            .matches_nar_hash(decoded.hash())
+        && expectation.name.file_hash() == FileHash::from_nar_hash(decoded.hash())
     {
         return Ok(decoded);
     }
@@ -742,7 +739,7 @@ pub(super) fn encoded_file_matches(file: &File, identity: EncodedIdentity) -> io
     if file.metadata()?.len() != identity.size().get() {
         return Ok(false);
     }
-    Ok(identity.hash().matches_nar_hash(sha256_file(file)?))
+    Ok(identity.hash() == FileHash::from_nar_hash(sha256_file(file)?))
 }
 
 pub(super) struct VerifiedCompressedNar<'file> {
@@ -885,8 +882,8 @@ mod tests {
         EncodedIdentity, EncodedSize, FileHash, IngestionReceipt, NarHash, NarIdentity, NarSize,
         reserve_preferred_or_exact_staging_growth,
     };
-    use crate::object::CompressionCodec;
-    use crate::storage::{StorageCapacity, publication::StagingBudget};
+    use crate::cache::object::CompressionCodec;
+    use crate::cache::storage::{StorageCapacity, publication::StagingBudget};
 
     struct EnospcWriter;
 
@@ -906,7 +903,7 @@ mod tests {
     fn encoding_propagates_physical_enospc() {
         for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
             let mut source = io::Cursor::new(b"raw NAR bytes");
-            let error = crate::nar_compression::encode_and_measure_nar(
+            let error = crate::cache::nar_compression::encode_and_measure_nar(
                 codec,
                 &mut EnospcWriter,
                 |output| io::copy(&mut source, output).map(|_| ()),

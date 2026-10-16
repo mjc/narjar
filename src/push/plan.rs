@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::cache::{narinfo::NarInfoMetadata, storage::StoreHash};
 use crate::error::Error;
-use narjar::__private::{narinfo::NarInfoMetadata, storage::StoreHash};
 
 pub(super) fn dependency_waves(
     metadata: Vec<NarInfoMetadata>,
