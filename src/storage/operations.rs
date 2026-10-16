@@ -47,9 +47,9 @@ use super::{
     ids::StoreHash,
     location::{StorePath, TemporaryPath},
     publication::{
-        DestinationPublication, NEXT_TEMP, NarUploadPolicy, PublicationDestination,
-        PublishBoundary, PublishOutcome, PublishTarget, StagedPublication, StagingReservation,
-        StorageError, TemporaryDirectory, TemporaryFile,
+        DestinationPublication, NEXT_TEMP, NarUploadPolicy, OwnedPublication,
+        PublicationDestination, PublishBoundary, PublishOutcome, PublishTarget, StagedPublication,
+        StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction, RecoveryStatus},
@@ -105,10 +105,13 @@ impl TemporaryLocation {
         self,
         destination_directory: &File,
         destination_name: &OsStr,
-    ) -> Result<(), StorageError> {
+    ) -> Result<PublicationProgress, StorageError> {
         match self {
-            Self::Staging => Ok(rollback_link_at(destination_directory, destination_name)?),
-            Self::Destination => Ok(()),
+            Self::Staging => {
+                rollback_link_at(destination_directory, destination_name)?;
+                Ok(PublicationProgress::Unpublished)
+            }
+            Self::Destination => Ok(PublicationProgress::Uncertain(self)),
         }
     }
 
@@ -131,6 +134,15 @@ enum DestinationPublicationAttempt {
 }
 
 impl DestinationPublicationAttempt {
+    fn progress(self) -> PublicationProgress {
+        match self {
+            Self::Existing => PublicationProgress::Unpublished,
+            Self::Created(location) | Self::Repaired(location) => {
+                PublicationProgress::Uncertain(location)
+            }
+        }
+    }
+
     fn temporary_location(self) -> TemporaryLocation {
         match self {
             Self::Existing => TemporaryLocation::Staging,
@@ -151,9 +163,13 @@ impl DestinationPublicationAttempt {
         }
     }
 
-    fn rollback_new_link(self, directory: &File, name: &OsStr) -> Result<(), StorageError> {
+    fn rollback_new_link(
+        self,
+        directory: &File,
+        name: &OsStr,
+    ) -> Result<PublicationProgress, StorageError> {
         match self {
-            Self::Existing => Ok(()),
+            Self::Existing => Ok(PublicationProgress::Unpublished),
             Self::Created(location) | Self::Repaired(location) => {
                 location.rollback_destination_before_durability(directory, name)
             }
@@ -288,18 +304,23 @@ impl Drop for OwnedTemporary<'_> {
 
 #[derive(Clone, Copy)]
 enum PublicationProgress {
-    Pending(TemporaryLocation),
+    Unpublished,
+    Uncertain(TemporaryLocation),
     Durable(TemporaryLocation),
 }
 
 impl PublicationProgress {
-    fn pending(location: TemporaryLocation) -> Self {
-        Self::Pending(location)
+    fn temporary_location(self) -> TemporaryLocation {
+        match self {
+            Self::Unpublished => TemporaryLocation::Staging,
+            Self::Uncertain(location) | Self::Durable(location) => location,
+        }
     }
 
     fn mark_durable(&mut self) {
         *self = match *self {
-            Self::Pending(location) => Self::Durable(location),
+            Self::Unpublished => Self::Durable(TemporaryLocation::Staging),
+            Self::Uncertain(location) => Self::Durable(location),
             Self::Durable(location) => Self::Durable(location),
         };
     }
@@ -311,18 +332,16 @@ impl PublicationProgress {
         temp: &TemporaryFile,
         transaction: PublicationTransaction,
     ) -> Result<PublishOutcome, StorageError> {
-        match (result, self) {
-            (Ok(outcome), Self::Pending(location) | Self::Durable(location)) => {
-                location.remove_temporary(storage, temp)?;
-                transaction.complete()?;
-                Ok(outcome)
+        match (self, result) {
+            (progress @ (Self::Unpublished | Self::Durable(_)), result)
+            | (progress @ Self::Uncertain(_), result @ Ok(_)) => {
+                let completion = progress
+                    .temporary_location()
+                    .remove_temporary(storage, temp)
+                    .and_then(|()| transaction.complete());
+                result.and_then(|outcome| completion.map(|()| outcome))
             }
-            (Err(error), Self::Durable(location)) => {
-                location.remove_temporary(storage, temp)?;
-                transaction.complete()?;
-                Err(error)
-            }
-            (Err(error), Self::Pending(location)) => {
+            (Self::Uncertain(location), Err(error)) => {
                 let _ = location.remove_temporary(storage, temp);
                 Err(error)
             }
@@ -860,22 +879,45 @@ impl Storage {
     {
         let activity = self.collection.mutation()?;
         let destination = target.destination();
-        destination.validate_path()?;
-        let temp_name = self.next_temp_name(&target);
-        let temporary_path = self.temporary_path(&target, temp_name.clone());
-        let mut transaction = self.recovery.begin(&temporary_path.relative_path())?;
-        checkpoint(PublishBoundary::BeforeTempCreate)?;
-        let temporary = OwnedTemporary::new(self, self.create_temp_named(&target, temp_name)?);
-        transaction.transition(PublicationState::Streaming)?;
+        let mut publication = self
+            .begin_journaled_temporary(&target, || checkpoint(PublishBoundary::BeforeTempCreate))?;
+        publication
+            .transaction_mut()
+            .transition(PublicationState::Streaming)?;
 
         Ok(StagedPublication::from_parts(
             self,
             destination,
-            temporary,
-            transaction,
+            publication,
             checkpoint,
             activity,
         ))
+    }
+
+    pub(super) fn begin_journaled_temporary(
+        &self,
+        target: &PublishTarget<'_>,
+        before_temp: impl FnOnce() -> Result<(), StorageError>,
+    ) -> Result<OwnedPublication<'_>, StorageError> {
+        target.destination().validate_path()?;
+        let name = self.next_temp_name(target);
+        let path = self.temporary_path(target, name.clone());
+        let transaction = self.recovery.begin(&path.relative_path())?;
+        match before_temp().and_then(|()| self.create_temp_named_owned(target, name)) {
+            Ok(temporary) => {
+                let publication = OwnedPublication::new(temporary, transaction);
+                publication
+                    .temporary()
+                    .file()
+                    .file
+                    .set_permissions(Permissions::from_mode(0o600))?;
+                Ok(publication)
+            }
+            Err(error) => {
+                transaction.cancel();
+                Err(error)
+            }
+        }
     }
 
     pub(super) fn publish_with(
@@ -896,7 +938,7 @@ impl Storage {
         mut transaction: PublicationTransaction,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
-        let mut progress = PublicationProgress::Pending(TemporaryLocation::Staging);
+        let mut progress = PublicationProgress::Unpublished;
         let _activity = self.collection.mutation()?;
         let result = (|| {
             let root = self.root_directory()?;
@@ -972,7 +1014,7 @@ impl Storage {
             destination_directory,
             temp,
         )?;
-        *progress = PublicationProgress::pending(attempt.temporary_location());
+        *progress = attempt.progress();
         let barrier = (|| {
             attempt
                 .temporary_location()
@@ -983,7 +1025,9 @@ impl Storage {
             Ok::<_, StorageError>(())
         })();
         if let Err(error) = barrier {
-            attempt.rollback_new_link(destination_directory, destination.path.name())?;
+            *progress = attempt
+                .rollback_new_link(destination_directory, destination.path.name())
+                .unwrap_or(*progress);
             return Err(error);
         }
         // The destination is durable even if recording that fact fails. Never
@@ -1120,7 +1164,12 @@ impl Storage {
         target: &PublishTarget<'_>,
     ) -> Result<TemporaryFile, StorageError> {
         let name = self.next_temp_name(target);
-        self.create_temp_named(target, name)
+        let temporary = self.create_temp_named_owned(target, name)?;
+        temporary
+            .file()
+            .file
+            .set_permissions(Permissions::from_mode(0o600))?;
+        Ok(temporary.into_file())
     }
 
     pub(super) fn next_temp_name(&self, target: &PublishTarget<'_>) -> OsString {
@@ -1139,19 +1188,6 @@ impl Storage {
     ) -> TemporaryPath {
         let destination = target.destination();
         Self::temporary_path_for(destination.temporary_directory, name)
-    }
-
-    pub(super) fn create_temp_named(
-        &self,
-        target: &PublishTarget<'_>,
-        name: OsString,
-    ) -> Result<TemporaryFile, StorageError> {
-        let temporary = self.create_temp_named_owned(target, name)?;
-        temporary
-            .file()
-            .file
-            .set_permissions(Permissions::from_mode(0o600))?;
-        Ok(temporary.into_file())
     }
 
     pub(super) fn create_temp_named_owned(

@@ -1,9 +1,6 @@
 //! Own the upload resources through receiving, verification, and durable publication.
 
-use std::{
-    io::{self, Read},
-    os::unix::fs::PermissionsExt,
-};
+use std::io::{self, Read};
 
 use crate::cache::object::NarFileName;
 
@@ -39,11 +36,7 @@ impl Storage {
         policy: NarUploadPolicy,
         reservation: StagingReservation,
     ) -> Result<Staged<'_, Streaming<UploadRequest>>, StorageError> {
-        self.begin_upload_with_temp_setup(name, length, policy, reservation, |temporary| {
-            temporary
-                .file
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-        })
+        self.begin_upload_with_temp_setup(name, length, policy, reservation, |_| Ok(()))
     }
 
     pub(super) fn begin_upload_with_temp_setup(
@@ -56,19 +49,7 @@ impl Storage {
     ) -> Result<Staged<'_, Streaming<UploadRequest>>, StorageError> {
         let activity = self.collection.mutation()?;
         let target = PublishTarget::Nar(name);
-        let destination = target.destination();
-        destination.validate_path()?;
-        let temp_name = self.next_temp_name(&target);
-        let temporary_path = self.temporary_path(&target, temp_name.clone());
-        let transaction = self.recovery.begin(&temporary_path.relative_path())?;
-        let temporary = match self.create_temp_named_owned(&target, temp_name) {
-            Ok(temporary) => temporary,
-            Err(error) => {
-                transaction.cancel();
-                return Err(error);
-            }
-        };
-        let publication = OwnedPublication::new(temporary, transaction);
+        let publication = self.begin_journaled_temporary(&target, || Ok(()))?;
         setup(publication.temporary().file())?;
         Ok(Staged {
             publication,

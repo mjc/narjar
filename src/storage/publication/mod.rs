@@ -65,10 +65,6 @@ impl<'storage> OwnedPublication<'storage> {
             .expect("owned publication transaction is present")
     }
 
-    fn preserve_recovery_record(&mut self) {
-        let _ = self.transaction.take();
-    }
-
     pub(super) fn into_parts(mut self) -> (OwnedTemporary<'storage>, PublicationTransaction) {
         (
             self.temporary
@@ -111,15 +107,14 @@ impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
     pub(super) fn from_parts(
         storage: &'storage Storage,
         destination: PublicationDestination,
-        temporary: OwnedTemporary<'storage>,
-        transaction: PublicationTransaction,
+        publication: OwnedPublication<'storage>,
         checkpoint: Checkpoint,
         activity: ActivityLease<'storage>,
     ) -> Self {
         Self {
             storage,
             destination,
-            publication: OwnedPublication::new(temporary, transaction),
+            publication,
             checkpoint,
             _state: Streaming::new(()),
             _activity: activity,
@@ -135,21 +130,14 @@ where
         mut self,
         mut source: impl Read,
     ) -> Result<StagedPublication<'storage, Checkpoint, Validated>, StorageError> {
-        let result = (|| {
-            (self.checkpoint)(PublishBoundary::AfterTempCreate)?;
-            io::copy(&mut source, self.publication.temporary_mut().file_mut())?;
-            (self.checkpoint)(PublishBoundary::AfterStream)?;
-            self.publication.temporary().file().file.sync_all()?;
-            (self.checkpoint)(PublishBoundary::AfterTempSync)?;
-            self.publication
-                .transaction_mut()
-                .transition(PublicationState::Validated)?;
-            Ok::<_, StorageError>(())
-        })();
-        if let Err(error) = result {
-            self.publication.preserve_recovery_record();
-            return Err(error);
-        }
+        (self.checkpoint)(PublishBoundary::AfterTempCreate)?;
+        io::copy(&mut source, self.publication.temporary_mut().file_mut())?;
+        (self.checkpoint)(PublishBoundary::AfterStream)?;
+        self.publication.temporary().file().file.sync_all()?;
+        (self.checkpoint)(PublishBoundary::AfterTempSync)?;
+        self.publication
+            .transaction_mut()
+            .transition(PublicationState::Validated)?;
 
         let Self {
             storage,

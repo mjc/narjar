@@ -23,6 +23,7 @@ mod plan;
 mod root;
 mod signing;
 mod store;
+mod timeout;
 mod transfer;
 mod upstream;
 use nar_stream::open_upload_reader;
@@ -93,7 +94,7 @@ pub(crate) struct Push {
     #[arg(long, default_value = "none")]
     compression: WireEncoding,
 
-    /// Maximum time allowed for each native HTTP request.
+    /// Timeout for native HTTP DNS/connect and inactive network I/O, in seconds.
     #[arg(long, env = "NARJAR_PUSH_TIMEOUT_SECONDS", default_value_t = NonZeroU64::new(30).unwrap())]
     timeout_seconds: NonZeroU64,
 
@@ -358,10 +359,7 @@ struct DestinationClient {
 impl DestinationClient {
     fn new(options: &NativeCopyOptions) -> Result<Self, PushError> {
         let authorization = authorization_for_destination(options)?;
-        let agent = Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(options.timeout_seconds.get())))
-            .build()
-            .into();
+        let agent = timeout::native_agent(Duration::from_secs(options.timeout_seconds.get()));
         Ok(Self {
             base_url: options.target.clone(),
             agent,

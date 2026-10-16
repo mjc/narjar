@@ -1041,6 +1041,32 @@ fn failed_generic_publication_stream_cleans_up_staging() {
     assert_eq!(storage.temporary_objects(), 0);
     assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
     assert!(directory_entry_count(storage.layout().nar_temp_dir()) == 0);
+    assert_eq!(transaction_record_count(&storage), 0);
+    assert!(!storage.recovery_required().unwrap());
+}
+
+#[test]
+fn conflicting_immutable_publications_do_not_accumulate_recovery_records() {
+    let (_directory, storage) = flat_storage_fixture();
+    let hash = NarHash::parse(NAR_ID).unwrap();
+    let name = NarFileName::raw(hash);
+    storage
+        .publish(PublishTarget::Nar(name), Cursor::new(b"original"))
+        .unwrap();
+
+    for _ in 0..4 {
+        assert!(matches!(
+            storage.publish(PublishTarget::Nar(name), Cursor::new(b"different")),
+            Err(StorageError::Conflict)
+        ));
+        assert_eq!(transaction_record_count(&storage), 0);
+        assert_eq!(storage.temporary_objects(), 0);
+        assert!(!storage.recovery_required().unwrap());
+    }
+    assert_eq!(
+        fs::read(storage.layout().nar_path(hash)).unwrap(),
+        b"original"
+    );
 }
 
 #[test]
@@ -1119,7 +1145,7 @@ fn rejected_and_disconnected_uploads_do_not_accumulate_transactions() {
 }
 
 #[test]
-fn uncertain_upload_publication_retains_its_recovery_record() {
+fn failure_before_publication_cancels_its_recovery_record() {
     let (_directory, storage) = flat_storage_fixture();
     let raw = b"raw NAR";
     let complete = begin_raw_upload(&storage, raw)
@@ -1131,13 +1157,113 @@ fn uncertain_upload_publication_retains_its_recovery_record() {
             .commit_fault(PublishBoundary::BeforeFinalLink)
             .is_err()
     );
-    assert_eq!(transaction_record_count(&storage), 1);
+    assert_eq!(transaction_record_count(&storage), 0);
     assert!(
         directory_entry_count(storage.layout().nar_temp_dir()) == 0,
-        "a conclusively removable staging file is cleaned even when publication is uncertain"
+        "failure before linking cannot leave a published destination"
     );
     assert_upload_resources_released(&storage);
 
+    assert!(!storage.recovery_required().unwrap());
+}
+
+#[test]
+fn failed_destination_rollback_retains_recovery_evidence() {
+    let (_directory, storage) = flat_storage_fixture();
+    let hash = NarHash::parse(NAR_ID).unwrap();
+    let nar_directory = storage.layout().nar_dir();
+    let result = storage.publish_with(
+        PublishTarget::Nar(NarFileName::raw(hash)),
+        Cursor::new(b"NAR bytes"),
+        |boundary| {
+            if boundary == PublishBoundary::BeforeParentSync {
+                fs::set_permissions(&nar_directory, fs::Permissions::from_mode(0o500))?;
+                return Err(io::Error::other("injected destination sync failure").into());
+            }
+            Ok(())
+        },
+    );
+    fs::set_permissions(&nar_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(
+        result,
+        Err(StorageError::Io(error)) if error.to_string() == "injected destination sync failure"
+    ));
+    assert!(storage.layout().nar_path(hash).exists());
+    assert_eq!(transaction_record_count(&storage), 1);
+    assert!(storage.recovery_required().unwrap());
+    storage.finish_recovery().unwrap();
+    assert_eq!(transaction_record_count(&storage), 0);
+    assert_eq!(storage.temporary_objects(), 0);
+}
+
+#[test]
+fn a_failed_temporary_cleanup_preserves_the_original_publication_error() {
+    let (_directory, storage) = flat_storage_fixture();
+    let temporary_directory = storage.layout().nar_temp_dir();
+    let result = storage.publish_with(
+        PublishTarget::Nar(NarFileName::raw(NarHash::parse(NAR_ID).unwrap())),
+        Cursor::new(b"NAR bytes"),
+        |boundary| {
+            if boundary == PublishBoundary::BeforeFinalLink {
+                let temporary_path = fs::read_dir(&temporary_directory)?
+                    .next()
+                    .expect("one staging file")?
+                    .path();
+                fs::remove_file(&temporary_path)?;
+                fs::create_dir(&temporary_path)?;
+                return Err(
+                    io::Error::new(io::ErrorKind::ConnectionReset, "publication failed").into(),
+                );
+            }
+            Ok(())
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset
+    ));
+    assert_eq!(transaction_record_count(&storage), 1);
+    assert!(storage.recovery_required().unwrap());
+    let temporary_path = fs::read_dir(&temporary_directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_dir(temporary_path).unwrap();
+    storage.finish_recovery().unwrap();
+    assert_eq!(transaction_record_count(&storage), 0);
+}
+
+#[test]
+fn a_failed_journal_completion_preserves_the_original_publication_error() {
+    let (directory, storage) = flat_storage_fixture();
+    let transactions = directory.path().join(".narjar-transactions");
+    let hash = NarHash::parse(NAR_ID).unwrap();
+    let result = storage.publish_with(
+        PublishTarget::Nar(NarFileName::raw(hash)),
+        Cursor::new(b"NAR bytes"),
+        |boundary| {
+            if boundary == PublishBoundary::AfterParentSync {
+                fs::set_permissions(&transactions, fs::Permissions::from_mode(0o500))?;
+                return Err(
+                    io::Error::new(io::ErrorKind::ConnectionAborted, "publication failed").into(),
+                );
+            }
+            Ok(())
+        },
+    );
+    fs::set_permissions(&transactions, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(
+        result,
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+    ));
+    assert!(storage.layout().nar_path(hash).exists());
+    assert_eq!(storage.temporary_objects(), 0);
+    assert_eq!(transaction_record_count(&storage), 1);
+    assert!(storage.recovery_required().unwrap());
     storage.finish_recovery().unwrap();
     assert_eq!(transaction_record_count(&storage), 0);
 }
@@ -2845,9 +2971,20 @@ fn recovery_marker_distinguishes_clean_and_interrupted_publication() {
             .is_err()
     );
     assert!(
+        !storage
+            .recovery_required()
+            .expect("a handled stream failure is completely cleaned up")
+    );
+    drop(
+        storage
+            .recovery
+            .begin(Path::new("nar/.tmp/nar-interrupted.part"))
+            .unwrap(),
+    );
+    assert!(
         storage
             .recovery_required()
-            .expect("inspect interrupted recovery marker")
+            .expect("an interrupted operation retains its journal")
     );
 }
 
@@ -3139,28 +3276,38 @@ fn recovery_records_publish_state_before_each_fault_boundary() {
         let (directory, storage) = flat_storage_fixture();
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
-        assert!(
-            storage
-                .publish_nar_fault(&nar, Cursor::new(b"nar bytes"), boundary)
-                .is_err(),
-            "{boundary:?} unexpectedly succeeded"
+        let mut observed = None;
+        let result = storage.publish_with(
+            PublishTarget::Nar(NarFileName::raw(nar)),
+            Cursor::new(b"nar bytes"),
+            |current| {
+                if current == boundary {
+                    let mut records = fs::read_dir(directory.path().join(".narjar-transactions"))?;
+                    let record = records
+                        .next()
+                        .expect("publication is journaled before the fault")?;
+                    assert!(
+                        records.next().is_none(),
+                        "one authoritative transaction record"
+                    );
+                    let TransactionRecord::V1 { state, .. } =
+                        parse_transaction(&fs::read(record.path())?)?;
+                    observed = Some(state);
+                    return Err(io::Error::other("injected publication failure").into());
+                }
+                Ok(())
+            },
         );
-        let mut records = fs::read_dir(directory.path().join(".narjar-transactions"))
-            .expect("read transaction directory");
-        let record = records
-            .next()
-            .expect("faulted publication should retain a transaction")
-            .expect("read transaction entry");
-        assert!(
-            records.next().is_none(),
-            "state replacement must not leave an extra transaction record"
-        );
-        let contents = fs::read(record.path()).expect("read transaction record");
-        let TransactionRecord::V1 { state, .. } =
-            parse_transaction(&contents).expect("complete typed transaction");
+        assert!(result.is_err(), "{boundary:?} unexpectedly succeeded");
         assert_eq!(
-            state, expected_state,
-            "{boundary:?} recorded unexpected state"
+            observed,
+            Some(expected_state),
+            "journal state at {boundary:?}"
+        );
+        assert_eq!(
+            transaction_record_count(&storage),
+            0,
+            "handled failure at {boundary:?} is cleaned up"
         );
     }
 }
@@ -3343,6 +3490,8 @@ fn narinfo_publication_is_idempotent_for_matching_logical_claims() {
             .expect("matching claims should make publication idempotent"),
         PublishOutcome::Identical
     );
+    assert_eq!(transaction_record_count(&storage), 0);
+    assert!(!storage.recovery_required().unwrap());
 }
 
 #[test]
@@ -3579,7 +3728,7 @@ fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
         PublishBoundary::BeforeFinalLink,
         PublishBoundary::BeforeParentSync,
     ] {
-        let (directory, storage) = flat_storage_fixture();
+        let (_directory, storage) = flat_storage_fixture();
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
 
         assert!(
@@ -3597,18 +3746,16 @@ fn each_failed_pre_durable_boundary_leaves_no_final_or_temp() {
             "{boundary:?} left a temporary file"
         );
         assert_eq!(
-            directory_entry_count(directory.path().join(".narjar-transactions")),
-            1,
-            "{boundary:?} lost its durable recovery record"
-        );
-        storage
-            .finish_recovery()
-            .expect("recover failed publication");
-        assert_eq!(
-            directory_entry_count(directory.path().join(".narjar-transactions")),
+            directory_entry_count(storage.layout().nar_temp_dir()),
             0,
-            "{boundary:?} left its recovery record"
+            "{boundary:?} left a temporary NAR"
         );
+        assert_eq!(
+            transaction_record_count(&storage),
+            0,
+            "{boundary:?} retained a record after completing cleanup"
+        );
+        assert!(!storage.recovery_required().unwrap());
     }
 }
 
