@@ -393,9 +393,7 @@ impl NativeStoreLeaseManager {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
         self.recover_pending_capacity_mutation(&mut state)?;
-        let now = clock()?;
         self.refresh_record_paths_if_stale(&mut state)?;
-        self.cleanup_expired_records(now, MAX_EXPIRY_CLEANUP_PER_CALL, &mut state)?;
         let path = self.validate_store_path(path.as_path())?;
         let paths = LeasePaths {
             directory: self.lease_directory(&path),
@@ -440,13 +438,25 @@ impl NativeStoreLeaseManager {
         match record.state {
             PersistedLeaseState::Live => {
                 let requested_expiry = lease_expiry(clock()?, self.minimum_lease_seconds)?;
-                let renewed_expiry = record.expires_at.max(requested_expiry);
                 self.verify_root(&paths.root, path)?;
-                write_record_atomically(
-                    &self.roots_dir,
-                    &paths.record,
-                    &LeaseRecord::live(path, renewed_expiry),
-                )?;
+                let renewed_expiry = if record.expires_at >= requested_expiry {
+                    // Complete synchronization if a preceding post-rename attempt failed.
+                    sync_directory(&paths.directory)?;
+                    sync_directory(&self.roots_dir)?;
+                    record.expires_at
+                } else {
+                    // Preserve the full promised lifetime while coalescing later renewals.
+                    let headroom = (self.minimum_lease_seconds.get() / 10).clamp(1, 3600);
+                    let expiry = requested_expiry
+                        .checked_add(headroom)
+                        .ok_or(NativeStoreLeaseError::InvalidRecord)?;
+                    write_record_atomically(
+                        &self.roots_dir,
+                        &paths.record,
+                        &LeaseRecord::live(path, expiry),
+                    )?;
+                    expiry
+                };
                 state.record_added(paths.record.clone());
                 Ok(renewed_expiry)
             }
@@ -1190,7 +1200,7 @@ impl NativeStoreLeaseManager {
     }
 
     fn acquire_gc_read_lock(&self) -> Result<GcReadLock, NativeStoreLeaseError> {
-        GcReadLock::acquire(&self.state_dir).map_err(NativeStoreLeaseError::Io)
+        GcReadLock::try_acquire(&self.state_dir).map_err(NativeStoreLeaseError::Io)
     }
 
     fn is_registered_store_path(
@@ -1944,6 +1954,62 @@ mod tests {
     }
 
     #[test]
+    fn repeated_acquisition_preserves_the_full_promise_without_rewriting_renewed_records() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = LeaseFixture::new(1);
+        fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 100)
+            .unwrap();
+        let renewed = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 110)
+            .unwrap();
+        let record = fixture.manager.record_path(&fixture.store_path);
+        let before = fs::metadata(&record).unwrap().ino();
+        let repeated = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 111)
+            .unwrap();
+        assert_eq!(
+            repeated.expires_at_unix_seconds(),
+            renewed.expires_at_unix_seconds()
+        );
+        assert!(repeated.expires_at_unix_seconds() >= 111 + 3600);
+        assert_eq!(fs::metadata(&record).unwrap().ino(), before);
+    }
+
+    #[test]
+    fn native_requests_and_maintenance_fail_fast_while_nix_gc_holds_its_lock() {
+        let fixture = LeaseFixture::new(1);
+        let collector = File::open(fixture.state_dir.join("gc.lock")).unwrap();
+        set_flock_lock(&collector).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let early = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = fixture.manager.acquire(fixture.store_path.clone(), 100);
+                sent.send(result).unwrap();
+            });
+            let early = received.recv_timeout(std::time::Duration::from_secs(1));
+            // Always unlock, including when testing the old blocking implementation.
+            rustix::fs::flock(&collector, FlockOperation::Unlock).unwrap();
+            early
+        })
+        .expect("request must finish before GC releases its lock");
+        assert!(
+            matches!(early, Err(NativeStoreLeaseError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(fixture.manager.snapshot().unwrap().active, 0);
+        set_flock_lock(&collector).unwrap();
+        let cleanup = fixture.manager.cleanup_expired_at(100);
+        rustix::fs::flock(&collector, FlockOperation::Unlock).unwrap();
+        assert!(
+            matches!(cleanup, Err(NativeStoreLeaseError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(fixture.manager.snapshot().unwrap().active, 0);
+    }
+
+    #[test]
     fn restart_recovers_live_root_and_rejects_release_before_expiry() {
         let fixture = LeaseFixture::new(2);
         let now = now_unix_seconds().expect("clock should be available");
@@ -2557,7 +2623,7 @@ mod tests {
     #[test]
     fn lease_expiry_uses_the_clock_after_waiting_for_the_nix_gc_lock() {
         let fixture = LeaseFixture::new(1);
-        let mut times = [5, 10, 100].into_iter();
+        let mut times = [10, 100].into_iter();
         let mut clock = || Ok(times.next().expect("each lease phase reads the clock"));
 
         let lease = fixture
@@ -2900,8 +2966,14 @@ mod tests {
             Err(NativeStoreLeaseError::CapacityExceeded)
         ));
         manager
+            .cleanup_expired_at(3)
+            .expect("background maintenance removes the next expired batch");
+        manager
+            .cleanup_expired_at(3)
+            .expect("background maintenance frees the last expired slot");
+        manager
             .acquire(new_path.clone(), 3)
-            .expect("bounded cleanup frees the remaining expired batch before admission");
+            .expect("maintenance frees expired capacity without request-path cleanup");
         let second_path = fixture.store_dir.join(format!("{}-second", "4".repeat(32)));
         fs::create_dir(&second_path).expect("second store object should be created");
         fixture.register_path(&second_path);

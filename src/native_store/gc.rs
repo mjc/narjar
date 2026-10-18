@@ -18,6 +18,12 @@ impl GcReadLock {
         lock_file(&file, FlockOperation::LockShared)?;
         Ok(Self { _file: file })
     }
+
+    pub(crate) fn try_acquire(state_dir: &Path) -> io::Result<Self> {
+        let file = open_or_create_gc_lock(&state_dir.join("gc.lock"))?;
+        lock_file(&file, FlockOperation::NonBlockingLockShared)?;
+        Ok(Self { _file: file })
+    }
 }
 
 fn open_or_create_gc_lock(path: &Path) -> io::Result<File> {
