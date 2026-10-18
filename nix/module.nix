@@ -342,6 +342,8 @@
       (toString cfg.edge.maxFills)
       "--edge-timeout-seconds"
       (toString cfg.edge.timeoutSeconds)
+      "--edge-fill-timeout-seconds"
+      (toString cfg.edge.fillTimeoutSeconds)
       "--edge-negative-ttl-seconds"
       (toString cfg.edge.negativeTtlSeconds)
     ]
@@ -592,7 +594,12 @@ in {
       timeoutSeconds = lib.mkOption {
         type = lib.types.ints.positive;
         default = 30;
-        description = "Upstream request and inactive-I/O timeout in seconds.";
+        description = "Upstream connection, inactive-I/O and follower-wait timeout in seconds; progressing fills may outlive it.";
+      };
+      fillTimeoutSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 3600;
+        description = "Total fill deadline in seconds, separate from the inactive-I/O timeout. Increase for large objects on slow links.";
       };
       negativeTtlSeconds = lib.mkOption {
         type = lib.types.ints.positive;
@@ -817,8 +824,8 @@ in {
     };
     assertions = [
       {
-        assertion = !cfg.edge.enable || (!cfg.nativeStore.enable && cfg.egressCompression == "none");
-        message = "services.narjar.edge requires raw output and cannot be combined with nativeStore";
+        assertion = !cfg.edge.enable || (!cfg.nativeStore.enable && cfg.egressCompression == "none" && cfg.workers >= 2);
+        message = "services.narjar.edge requires raw output, at least two workers, and cannot be combined with nativeStore";
       }
       {
         assertion = !cfg.edge.enable || (lib.hasPrefix "https://" cfg.edge.upstream || lib.hasPrefix "http://" cfg.edge.upstream);

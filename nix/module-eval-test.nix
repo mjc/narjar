@@ -34,6 +34,7 @@
     collectorPackages ? null,
     gc ? {},
     edge ? {},
+    workers ? 8,
   }:
     (import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = pkgs.system;
@@ -69,6 +70,7 @@
               shutdownGraceSeconds
               egressCompression
               storageBackend
+              workers
               ;
             auth.readTokens = readTokens;
             nativeStore.enable = nativeStoreEnable;
@@ -144,6 +146,11 @@
     dataDir = "/var/lib/narjar";
     egressCompression = "zstd";
     edge = edgeOptions;
+  };
+  singleWorkerEdgeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge = edgeOptions;
+    workers = 1;
   };
   unattendedConfig = configuration {
     dataDir = "/var/lib/narjar";
@@ -531,6 +538,8 @@ in
   assert lib.hasInfix "--serve-source read-through" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
   assert lib.hasInfix "--edge-upstream https://cache.example" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
   assert lib.hasInfix "--edge-lease-seconds 3600" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert lib.hasInfix "--edge-fill-timeout-seconds 3600" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert !(evaluatesConfig singleWorkerEdgeConfig);
   assert edgeConfig.nix.settings.substituters == ["http://127.0.0.1:5000"];
   assert edgeConfig.nix.settings.fallback == false;
   assert edgeConfig.nix.settings.narinfo-cache-positive-ttl == 300;

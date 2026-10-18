@@ -80,6 +80,25 @@ fn assert_edge_waits_for_the_exact_payload(end: PayloadEnd) {
     ));
     assert!(!edge.data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
 
+    // With two workers the leader owns the sole blocking-fill slot. A duplicate
+    // miss must return immediately, leaving health and cached delivery runnable.
+    let rejected_follower = edge.request("GET", &route);
+    assert!(
+        response_parts(&rejected_follower)
+            .0
+            .starts_with("HTTP/1.1 404")
+    );
+    assert!(
+        response_parts(&edge.request("GET", "/healthz"))
+            .0
+            .starts_with("HTTP/1.1 200")
+    );
+    assert!(
+        response_parts(&edge.request("GET", "/metrics"))
+            .0
+            .starts_with("HTTP/1.1 200")
+    );
+
     release.send(()).unwrap();
     request
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -123,6 +142,21 @@ fn read_through_http_turns_mid_payload_disconnect_into_a_clean_miss() {
 }
 
 #[test]
+fn doctor_accepts_the_edge_source_environment_for_local_checks() {
+    let data_dir = init_data_dir("edge-doctor-environment");
+    let output = run_with_env(
+        &["doctor", "--data-dir", data_dir.to_str().unwrap(), "--json"],
+        &[("NARJAR_SERVE_SOURCE", "read-through")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("flat-cache"));
+}
+
+#[test]
 fn read_through_http_failed_renewal_is_a_miss_without_revoking_the_payload() {
     use crate::cache::storage::{Directory, Storage, StoreHash, SupportedStorageBackend};
     let central = RunningServer::start("edge-renewal-central");
@@ -157,7 +191,7 @@ fn read_through_http_failed_renewal_is_a_miss_without_revoking_the_payload() {
         "--min-free-bytes",
         "0",
     ];
-    let edge = RunningServer::start_with_args("edge-renewal-capacity", &args);
+    let edge = RunningServer::start_with_workers("edge-renewal-capacity", 2, &args);
     let route = format!("/{STORE_HASH}.narinfo");
     assert!(
         response_parts(&edge.request("GET", &route))
@@ -190,7 +224,7 @@ fn read_through_http_failed_renewal_is_a_miss_without_revoking_the_payload() {
         "--min-free-bytes",
         &reserve,
     ];
-    let edge = RunningServer::start_in(directory, &args);
+    let edge = RunningServer::start_in_with_workers(directory, 2, &args);
     for method in ["GET", "HEAD"] {
         let response = edge.request(method, &route);
         assert!(

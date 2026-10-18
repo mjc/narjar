@@ -89,7 +89,7 @@ mod tests {
     use super::{Cli, Command};
 
     #[test]
-    fn doctor_does_not_advertise_an_unconfigurable_read_through_source() {
+    fn doctor_accepts_read_through_for_local_storage_diagnostics() {
         let result = Cli::try_parse_from([
             "narjar",
             "doctor",
@@ -99,8 +99,8 @@ mod tests {
             "read-through",
         ]);
         assert!(
-            result.is_err(),
-            "doctor has no upstream input; inspect edge storage through its default cache diagnostics"
+            result.is_ok(),
+            "doctor must accept the source selected by the shared environment variable"
         );
         assert!(
             Cli::try_parse_from([

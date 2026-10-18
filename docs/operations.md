@@ -90,6 +90,8 @@ the central cache. The edge is read-only and rejects PUT without accepting a
 body. It needs neither Nix executables nor a Nix database. Use
 `narjar doctor --data-dir ./edge` for local storage diagnostics; it does not
 probe the upstream.
+It also accepts `--serve-source read-through` or `NARJAR_SERVE_SOURCE=read-through`
+for those local storage checks.
 
 A local miss fetches bounded, signature-verified metadata and its exact payload.
 The edge validates and commits the payload, projects raw narinfo, then commits
@@ -109,7 +111,13 @@ no recipe cannot be built just because a cache misses.
 
 The existing size, decoder-memory, staging-space and minimum-free controls
 apply to fills. `--edge-max-fills` bounds concurrent fills; excess unrelated
-misses return 404. `--edge-negative-ttl-seconds` defaults to one second. Negative
+misses return 404. Leaders and waiting followers together can occupy at most
+`--workers - 1` request workers, leaving one for local hits, payloads and health
+requests. Edge mode requires at least two workers. A follower waits at most
+`--edge-timeout-seconds`, which also bounds connection and inactive network I/O.
+Progressing fills can exceed that idle timeout. Their separate total deadline,
+`--edge-fill-timeout-seconds`, defaults to 3600 seconds; increase it for large
+objects on slow links. `--edge-negative-ttl-seconds` defaults to one second. Negative
 entries are bounded and expire after at most 60 seconds. Nix separately caches
 negative narinfo, so a long client negative TTL delays recovery too.
 

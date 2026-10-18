@@ -42,7 +42,9 @@ pub(crate) struct EdgeSettings {
     pub(crate) upstream: HttpUrl,
     pub(crate) lease_seconds: NonZeroU64,
     pub(crate) max_fills: NonZeroUsize,
+    pub(crate) request_workers: NonZeroUsize,
     pub(crate) timeout: Duration,
+    pub(crate) fill_timeout: Duration,
     pub(crate) negative_ttl: Duration,
 }
 
@@ -125,9 +127,12 @@ pub(crate) struct ReadThroughSource {
     policy: NarUploadPolicy,
     agent: Agent,
     timeout: Duration,
+    fill_timeout: Duration,
     negative_ttl: Duration,
     max_fills: usize,
     active: AtomicUsize,
+    blocked_requests: AtomicUsize,
+    max_blocked_requests: usize,
     state: Mutex<State>,
     counters: Counters,
 }
@@ -170,10 +175,15 @@ impl ReadThroughSource {
                 "edge requires trusted public keys",
             ));
         }
-        if settings.timeout.is_zero() || Instant::now().checked_add(settings.timeout).is_none() {
+        if settings.timeout.is_zero()
+            || settings.fill_timeout.is_zero()
+            || Instant::now().checked_add(settings.timeout).is_none()
+            || Instant::now().checked_add(settings.fill_timeout).is_none()
+            || settings.request_workers.get() < 2
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid edge fill timeout",
+                "edge requires bounded timeouts and at least two HTTP workers",
             ));
         }
         Ok(Self {
@@ -182,9 +192,12 @@ impl ReadThroughSource {
             policy,
             agent: idle_agent(settings.timeout),
             timeout: settings.timeout,
+            fill_timeout: settings.fill_timeout,
             negative_ttl: settings.negative_ttl.min(MAX_NEGATIVE_TTL),
             max_fills: settings.max_fills.get(),
             active: AtomicUsize::new(0),
+            blocked_requests: AtomicUsize::new(0),
+            max_blocked_requests: settings.request_workers.get() - 1,
             state: Mutex::new(State::new(settings.max_fills.get())),
             counters: Counters::default(),
         })
@@ -210,7 +223,10 @@ impl ReadThroughSource {
             }
             LocalLookup::Repair | LocalLookup::Missing => {}
         }
-        let deadline = Deadline::new(self.timeout)?;
+        // Both leaders and followers consume this budget. Leave a worker for local hits,
+        // payload delivery and health requests even while every admitted fill is stalled.
+        let _request = reserve_activity_slot(&self.blocked_requests, self.max_blocked_requests)?;
+        let deadline = Deadline::new(self.fill_timeout)?;
         self.coalesce(Key::Store(*store), deadline, || {
             // Another completed flight may have published between the first lookup and admission.
             match Self::local_lookup(storage, store)? {
@@ -425,7 +441,7 @@ impl ReadThroughSource {
             }
             Join::Follower(flight) => {
                 increment(&self.counters.followers);
-                flight.wait(deadline)
+                flight.wait(Deadline::new(self.timeout)?.earlier(deadline))
             }
             Join::Leader(flight) => {
                 let completion = Completion::new(&flight);
@@ -442,13 +458,8 @@ impl ReadThroughSource {
         }
     }
 
-    fn admit(&self) -> Result<ActiveFill<'_>, EdgeFailure> {
-        self.active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
-                (active < self.max_fills).then(|| active + 1)
-            })
-            .map_err(|_| EdgeFailure::Capacity)?;
-        Ok(ActiveFill(&self.active))
+    fn admit(&self) -> Result<ActiveSlot<'_>, EdgeFailure> {
+        reserve_activity_slot(&self.active, self.max_fills)
     }
 
     pub(crate) fn maintain(&self) {
@@ -485,6 +496,11 @@ impl ReadThroughSource {
             "# TYPE narjar_edge_active_fills gauge\nnarjar_edge_active_fills {}",
             self.active.load(Ordering::Relaxed)
         );
+        let _ = writeln!(
+            output,
+            "# TYPE narjar_edge_blocked_requests gauge\nnarjar_edge_blocked_requests {}",
+            self.blocked_requests.load(Ordering::Relaxed)
+        );
         if let Ok(state) = self.state.lock() {
             let _ = writeln!(
                 output,
@@ -501,9 +517,21 @@ fn increment(counter: &AtomicU64) {
     });
 }
 
-struct ActiveFill<'a>(&'a AtomicUsize);
+struct ActiveSlot<'a>(&'a AtomicUsize);
 
-impl Drop for ActiveFill<'_> {
+fn reserve_activity_slot(
+    counter: &AtomicUsize,
+    limit: usize,
+) -> Result<ActiveSlot<'_>, EdgeFailure> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+            (active < limit).then(|| active + 1)
+        })
+        .map_err(|_| EdgeFailure::Capacity)?;
+    Ok(ActiveSlot(counter))
+}
+
+impl Drop for ActiveSlot<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
@@ -538,6 +566,10 @@ impl Drop for Completion<'_> {
 struct Deadline(Instant);
 
 impl Deadline {
+    fn earlier(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
     fn new(timeout: Duration) -> Result<Self, EdgeFailure> {
         Instant::now()
             .checked_add(timeout)

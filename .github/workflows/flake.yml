@@ -45,7 +45,9 @@ jobs:
       - name: Real Nix end-to-end gate (chunked)
         run: nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend chunked
       - name: Read-through edge outage and retained-metadata acceptance
-        run: nix run -L --no-update-lock-file .#edge-e2e
+        run: |
+          edge_runner=$(nix build -L --no-update-lock-file --no-link --print-out-paths .#edge-e2e)
+          sudo -- "$edge_runner/bin/narjar-edge-e2e"
       - run: nix run -L --no-update-lock-file .#provenance
 
   darwin:

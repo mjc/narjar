@@ -804,7 +804,7 @@ pub(crate) struct Doctor {
         value_enum,
         default_value = "flat-cache"
     )]
-    serve_source: DoctorSourceChoice,
+    serve_source: ServeSourceChoice,
     #[arg(long, env = "NARJAR_NATIVE_STORE_DIR")]
     native_store_dir: Option<PathBuf>,
     #[arg(long, env = "NARJAR_NATIVE_STATE_DIR")]
@@ -821,26 +821,16 @@ pub(crate) struct Doctor {
     storage_backend: StorageBackend,
 }
 
-#[derive(Clone, Copy, Default, clap::ValueEnum)]
-enum DoctorSourceChoice {
-    #[default]
-    FlatCache,
-    NativeStore,
-}
-
-impl From<DoctorSourceChoice> for ServeSourceChoice {
-    fn from(choice: DoctorSourceChoice) -> Self {
-        match choice {
-            DoctorSourceChoice::FlatCache => Self::FlatCache,
-            DoctorSourceChoice::NativeStore => Self::NativeStore,
-        }
-    }
-}
-
 impl Doctor {
     fn prepare_source(&self) -> Result<ServeSource, SourcePreparationError> {
+        let choice = match self.serve_source {
+            ServeSourceChoice::FlatCache | ServeSourceChoice::ReadThrough => {
+                ServeSourceChoice::FlatCache
+            }
+            ServeSourceChoice::NativeStore => ServeSourceChoice::NativeStore,
+        };
         ServeSource::prepare(
-            self.serve_source.into(),
+            choice,
             self.storage_backend,
             self.egress_compression,
             NativeStoreOptions {
@@ -939,6 +929,7 @@ pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
             | SourcePreparationError::MissingEdgeUpstream
             | SourcePreparationError::EdgeOptionsForOtherSource
             | SourcePreparationError::EdgeCompressedOutput
+            | SourcePreparationError::EdgeWorkersTooFew
             | SourcePreparationError::NativeStoreDirectory
             | SourcePreparationError::MissingNativeOptions
             | SourcePreparationError::NativeCompressedOutput
@@ -1042,10 +1033,7 @@ fn inspect_doctor_source(
     let (name, validation) = match source {
         Ok(ServeSource::FlatCache { .. }) => ("flat-cache", Ok("selected")),
         Ok(ServeSource::ReadThrough { .. }) => ("read-through", Ok("selected")),
-        Err(error) => (
-            ServeSourceChoice::from(options.serve_source).name(),
-            Err(error.doctor_detail()),
-        ),
+        Err(error) => (options.serve_source.name(), Err(error.doctor_detail())),
         Ok(ServeSource::NativeStore(settings)) => (
             "native-store",
             validate_doctor_native_store(&options.data_dir, &settings)
@@ -2158,7 +2146,7 @@ machine other.example password other-secret
         };
         for (choice, native, encoding, backend, expected_error, detail) in [
             (
-                DoctorSourceChoice::FlatCache,
+                ServeSourceChoice::FlatCache,
                 complete,
                 WireEncoding::Raw,
                 StorageBackend::Flat,
@@ -2166,7 +2154,7 @@ machine other.example password other-secret
                 "native source options require native-store selection",
             ),
             (
-                DoctorSourceChoice::NativeStore,
+                ServeSourceChoice::NativeStore,
                 NativeStoreOptions {
                     state_dir: None,
                     ..complete
@@ -2177,7 +2165,7 @@ machine other.example password other-secret
                 "required native source options are missing",
             ),
             (
-                DoctorSourceChoice::NativeStore,
+                ServeSourceChoice::NativeStore,
                 complete,
                 WireEncoding::Compressed(CompressionCodec::Xz),
                 StorageBackend::Flat,
@@ -2185,7 +2173,7 @@ machine other.example password other-secret
                 "native source requires raw output and flat storage",
             ),
             (
-                DoctorSourceChoice::NativeStore,
+                ServeSourceChoice::NativeStore,
                 complete,
                 WireEncoding::Compressed(CompressionCodec::Zstd),
                 StorageBackend::Flat,
@@ -2193,7 +2181,7 @@ machine other.example password other-secret
                 "native source requires raw output and flat storage",
             ),
             (
-                DoctorSourceChoice::NativeStore,
+                ServeSourceChoice::NativeStore,
                 complete,
                 WireEncoding::Raw,
                 StorageBackend::Chunked,
@@ -2220,7 +2208,7 @@ machine other.example password other-secret
                 "doctor must use the same source policy as serve"
             );
             let diagnostic = inspect_doctor_source(&options, source);
-            assert_eq!(diagnostic.name, ServeSourceChoice::from(choice).name());
+            assert_eq!(diagnostic.name, choice.name());
             assert!(matches!(diagnostic.severity, DoctorSeverity::Error));
             assert_eq!(
                 diagnostic.detail, detail,
@@ -2236,16 +2224,16 @@ machine other.example password other-secret
 
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         for (choice, complete, encoding) in [
-            (DoctorSourceChoice::FlatCache, true, WireEncoding::Raw),
-            (DoctorSourceChoice::NativeStore, false, WireEncoding::Raw),
-            (DoctorSourceChoice::NativeStore, true, WireEncoding::Raw),
+            (ServeSourceChoice::FlatCache, true, WireEncoding::Raw),
+            (ServeSourceChoice::NativeStore, false, WireEncoding::Raw),
+            (ServeSourceChoice::NativeStore, true, WireEncoding::Raw),
             (
-                DoctorSourceChoice::NativeStore,
+                ServeSourceChoice::NativeStore,
                 true,
                 WireEncoding::Compressed(CompressionCodec::Xz),
             ),
             (
-                DoctorSourceChoice::NativeStore,
+                ServeSourceChoice::NativeStore,
                 true,
                 WireEncoding::Compressed(CompressionCodec::Zstd),
             ),
@@ -2284,7 +2272,7 @@ machine other.example password other-secret
         let options = Doctor {
             data_dir: directory.path().to_owned(),
             json: true,
-            serve_source: DoctorSourceChoice::NativeStore,
+            serve_source: ServeSourceChoice::NativeStore,
             native_store_dir: Some(PathBuf::from("/private/store-path")),
             native_state_dir: Some(PathBuf::from("/private/state-path")),
             native_roots_dir: Some(PathBuf::from("/private/roots-path")),

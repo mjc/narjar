@@ -89,7 +89,9 @@ fn settings(upstream: HttpUrl) -> EdgeSettings {
         upstream,
         lease_seconds: NonZeroU64::new(60).unwrap(),
         max_fills: NonZeroUsize::new(8).unwrap(),
+        request_workers: NonZeroUsize::new(16).unwrap(),
         timeout: TEST_TIMEOUT,
+        fill_timeout: TEST_TIMEOUT,
         negative_ttl: Duration::from_secs(1),
     }
 }
@@ -241,7 +243,9 @@ fn empty_trust_is_rejected_before_any_fill() {
             upstream: "http://127.0.0.1:1".parse().unwrap(),
             lease_seconds: NonZeroU64::new(60).unwrap(),
             max_fills: NonZeroUsize::new(1).unwrap(),
+            request_workers: NonZeroUsize::new(2).unwrap(),
             timeout: Duration::from_secs(1),
+            fill_timeout: TEST_TIMEOUT,
             negative_ttl: Duration::from_secs(1),
         },
         Arc::new(TrustedPublicKeys::default()),
@@ -513,6 +517,7 @@ fn active_limit_rejects_unrelated_keys_while_same_store_followers_wait() {
     };
     let mut settings = settings(upstream.url());
     settings.max_fills = NonZeroUsize::new(1).unwrap();
+    settings.request_workers = NonZeroUsize::new(3).unwrap();
     let source = ReadThroughSource::new(
         settings,
         trusted_keys(),
@@ -528,6 +533,12 @@ fn active_limit_rejects_unrelated_keys_while_same_store_followers_wait() {
         wait_for(|| upstream.count(".narinfo") == 1);
         let follower = scope.spawn(move || source.ensure_local(storage, &store));
         wait_for(|| source.counters.followers.load(Ordering::Relaxed) == 1);
+        assert_eq!(source.blocked_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            source.ensure_local(storage, &store),
+            EdgeLookup::Miss(EdgeFailure::Capacity),
+            "a third blocked request must leave the last HTTP worker available"
+        );
         assert_eq!(
             source.ensure_local(storage, &StoreHash::parse(ALIAS).unwrap()),
             EdgeLookup::Miss(EdgeFailure::Capacity)
@@ -537,6 +548,51 @@ fn active_limit_rejects_unrelated_keys_while_same_store_followers_wait() {
         assert_eq!(leader.join().unwrap(), EdgeLookup::Ready);
         assert_eq!(follower.join().unwrap(), EdgeLookup::Ready);
     });
+    assert_eq!(source.blocked_requests.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn progressing_payload_can_outlive_the_network_idle_timeout() {
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata(
+        STORE,
+        NarRepresentation::Raw(fixture.identity),
+        &signing_key(),
+    );
+    let upstream = Upstream::new(move |route, stream| {
+        if route.ends_with(".narinfo") {
+            reply(stream, 200, &metadata);
+        } else {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                fixture.raw.len()
+            )
+            .unwrap();
+            for chunk in fixture.raw.chunks(fixture.raw.len().div_ceil(8)) {
+                if stream.write_all(chunk).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(400));
+            }
+        }
+    });
+    let mut options = settings(upstream.url());
+    options.timeout = Duration::from_secs(2);
+    options.fill_timeout = Duration::from_secs(20);
+    let source = ReadThroughSource::new(
+        options,
+        trusted_keys(),
+        NarUploadPolicy::new(1024 * 1024, 0),
+    )
+    .unwrap();
+    let (_directory, storage) = storage();
+    let started = Instant::now();
+    assert_eq!(
+        source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap()),
+        EdgeLookup::Ready
+    );
+    assert!(started.elapsed() > Duration::from_secs(2));
 }
 
 #[test]

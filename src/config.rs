@@ -145,6 +145,8 @@ pub(crate) enum SourcePreparationError {
     EdgeOptionsForOtherSource,
     #[error("read-through source requires uncompressed output (--egress-compression none)")]
     EdgeCompressedOutput,
+    #[error("read-through source requires at least two HTTP workers")]
+    EdgeWorkersTooFew,
     #[error("native-store HTTP serving requires --native-store-dir /nix/store")]
     NativeStoreDirectory,
     #[error("native-store options require --serve-source native-store")]
@@ -169,6 +171,7 @@ impl SourcePreparationError {
             Self::MissingEdgeUpstream => "required edge upstream is missing",
             Self::EdgeOptionsForOtherSource => "edge options require read-through selection",
             Self::EdgeCompressedOutput => "read-through source requires raw output",
+            Self::EdgeWorkersTooFew => "read-through source requires at least two HTTP workers",
             Self::NativeStoreDirectory => {
                 "native serving requires the standard /nix/store directory"
             }
@@ -252,9 +255,12 @@ pub(crate) struct ServeArgs {
     /// Maximum concurrently active upstream fills.
     #[arg(long, env = "NARJAR_EDGE_MAX_FILLS", default_value = "4")]
     edge_max_fills: NonZeroUsize,
-    /// Timeout for an upstream request and inactive network I/O, in seconds.
+    /// Connection, inactive network I/O and follower-wait timeout, in seconds.
     #[arg(long, env = "NARJAR_EDGE_TIMEOUT_SECONDS", default_value = "30")]
     edge_timeout_seconds: NonZeroU64,
+    /// Total fill deadline, separate from inactive network I/O, in seconds.
+    #[arg(long, env = "NARJAR_EDGE_FILL_TIMEOUT_SECONDS", default_value = "3600")]
+    edge_fill_timeout_seconds: NonZeroU64,
     /// Short negative-cache lifetime for upstream misses and failures.
     #[arg(long, env = "NARJAR_EDGE_NEGATIVE_TTL_SECONDS", default_value = "1")]
     edge_negative_ttl_seconds: NonZeroU64,
@@ -313,6 +319,9 @@ impl ServeArgs {
         &self,
         upstream: &HttpUrl,
     ) -> Result<ServeSource, SourcePreparationError> {
+        if self.workers.get() < 2 {
+            return Err(SourcePreparationError::EdgeWorkersTooFew);
+        }
         let cache = ServeSource::prepare(
             ServeSourceChoice::FlatCache,
             self.storage_backend,
@@ -326,7 +335,11 @@ impl ServeArgs {
                     upstream: upstream.clone(),
                     lease_seconds: self.edge_lease_seconds,
                     max_fills: self.edge_max_fills,
+                    request_workers: self.workers,
                     timeout: std::time::Duration::from_secs(self.edge_timeout_seconds.get()),
+                    fill_timeout: std::time::Duration::from_secs(
+                        self.edge_fill_timeout_seconds.get(),
+                    ),
                     negative_ttl: std::time::Duration::from_secs(
                         self.edge_negative_ttl_seconds.get(),
                     ),
@@ -637,6 +650,8 @@ mod tests {
         assert_eq!(settings.upstream.as_str(), "https://cache.example/base");
         assert_eq!(settings.lease_seconds.get(), 2 * 2_592_000 + 3600);
         assert_eq!(settings.max_fills.get(), 4);
+        assert_eq!(settings.request_workers.get(), 8);
+        assert_eq!(settings.fill_timeout, std::time::Duration::from_secs(3600));
         assert_eq!(settings.negative_ttl, std::time::Duration::from_secs(1));
     }
 
@@ -669,6 +684,22 @@ mod tests {
             ])
             .unwrap_err(),
             SourcePreparationError::NativeOptionsForCache.to_string()
+        );
+    }
+
+    #[test]
+    fn edge_source_reserves_a_worker_for_non_fill_requests() {
+        assert_eq!(
+            parse_serve_config(&[
+                "--serve-source",
+                "read-through",
+                "--edge-upstream",
+                "https://cache.example",
+                "--workers",
+                "1"
+            ])
+            .unwrap_err(),
+            SourcePreparationError::EdgeWorkersTooFew.to_string()
         );
     }
 
