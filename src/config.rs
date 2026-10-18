@@ -145,8 +145,8 @@ pub(crate) enum SourcePreparationError {
     EdgeOptionsForOtherSource,
     #[error("read-through source requires uncompressed output (--egress-compression none)")]
     EdgeCompressedOutput,
-    #[error("read-through source requires at least two HTTP workers")]
-    EdgeWorkersTooFew,
+    #[error("read-through source requires at least two HTTP workers and connection admissions")]
+    EdgeRequestCapacityTooSmall,
     #[error("native-store HTTP serving requires --native-store-dir /nix/store")]
     NativeStoreDirectory,
     #[error("native-store options require --serve-source native-store")]
@@ -171,7 +171,9 @@ impl SourcePreparationError {
             Self::MissingEdgeUpstream => "required edge upstream is missing",
             Self::EdgeOptionsForOtherSource => "edge options require read-through selection",
             Self::EdgeCompressedOutput => "read-through source requires raw output",
-            Self::EdgeWorkersTooFew => "read-through source requires at least two HTTP workers",
+            Self::EdgeRequestCapacityTooSmall => {
+                "read-through source requires two workers and connection admissions"
+            }
             Self::NativeStoreDirectory => {
                 "native serving requires the standard /nix/store directory"
             }
@@ -319,8 +321,8 @@ impl ServeArgs {
         &self,
         upstream: &HttpUrl,
     ) -> Result<ServeSource, SourcePreparationError> {
-        if self.workers.get() < 2 {
-            return Err(SourcePreparationError::EdgeWorkersTooFew);
+        if self.workers.get() < 2 || self.max_in_flight.get() < 2 {
+            return Err(SourcePreparationError::EdgeRequestCapacityTooSmall);
         }
         let cache = ServeSource::prepare(
             ServeSourceChoice::FlatCache,
@@ -336,6 +338,7 @@ impl ServeArgs {
                     lease_seconds: self.edge_lease_seconds,
                     max_fills: self.edge_max_fills,
                     request_workers: self.workers,
+                    max_in_flight: self.max_in_flight,
                     timeout: std::time::Duration::from_secs(self.edge_timeout_seconds.get()),
                     fill_timeout: std::time::Duration::from_secs(
                         self.edge_fill_timeout_seconds.get(),
@@ -689,18 +692,20 @@ mod tests {
 
     #[test]
     fn edge_source_reserves_a_worker_for_non_fill_requests() {
-        assert_eq!(
-            parse_serve_config(&[
-                "--serve-source",
-                "read-through",
-                "--edge-upstream",
-                "https://cache.example",
-                "--workers",
-                "1"
-            ])
-            .unwrap_err(),
-            SourcePreparationError::EdgeWorkersTooFew.to_string()
-        );
+        for limit in ["--workers", "--max-in-flight"] {
+            assert_eq!(
+                parse_serve_config(&[
+                    "--serve-source",
+                    "read-through",
+                    "--edge-upstream",
+                    "https://cache.example",
+                    limit,
+                    "1"
+                ])
+                .unwrap_err(),
+                SourcePreparationError::EdgeRequestCapacityTooSmall.to_string()
+            );
+        }
     }
 
     #[test]

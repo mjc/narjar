@@ -43,6 +43,7 @@ pub(crate) struct EdgeSettings {
     pub(crate) lease_seconds: NonZeroU64,
     pub(crate) max_fills: NonZeroUsize,
     pub(crate) request_workers: NonZeroUsize,
+    pub(crate) max_in_flight: NonZeroUsize,
     pub(crate) timeout: Duration,
     pub(crate) fill_timeout: Duration,
     pub(crate) negative_ttl: Duration,
@@ -180,10 +181,11 @@ impl ReadThroughSource {
             || Instant::now().checked_add(settings.timeout).is_none()
             || Instant::now().checked_add(settings.fill_timeout).is_none()
             || settings.request_workers.get() < 2
+            || settings.max_in_flight.get() < 2
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "edge requires bounded timeouts and at least two HTTP workers",
+                "edge requires bounded timeouts, two HTTP workers and two connection admissions",
             ));
         }
         Ok(Self {
@@ -197,7 +199,11 @@ impl ReadThroughSource {
             max_fills: settings.max_fills.get(),
             active: AtomicUsize::new(0),
             blocked_requests: AtomicUsize::new(0),
-            max_blocked_requests: settings.request_workers.get() - 1,
+            max_blocked_requests: settings
+                .request_workers
+                .get()
+                .min(settings.max_in_flight.get())
+                - 1,
             state: Mutex::new(State::new(settings.max_fills.get())),
             counters: Counters::default(),
         })
@@ -307,7 +313,11 @@ impl ReadThroughSource {
             deadline,
             || match storage.ensure_canonical_nar_available(payload.identity()) {
                 Ok(()) => Ok(()),
-                Err(StorageError::MissingNar) => self.receive_payload(storage, payload, deadline),
+                Err(StorageError::MissingNar) => {
+                    self.coalesce(Key::Representation(payload.file_name()), deadline, || {
+                        self.receive_payload(storage, payload, deadline)
+                    })
+                }
                 Err(error) => Err(EdgeFailure::ingestion(error)),
             },
         )?;
@@ -441,7 +451,9 @@ impl ReadThroughSource {
             }
             Join::Follower(flight) => {
                 increment(&self.counters.followers);
-                flight.wait(Deadline::new(self.timeout)?.earlier(deadline))
+                flight.wait(Deadline::new(self.timeout)?.earlier(deadline), |result| {
+                    finish_shared_fill_or_retry_representation(key, result, fill)
+                })
             }
             Join::Leader(flight) => {
                 let completion = Completion::new(&flight);
@@ -515,6 +527,22 @@ fn increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))
     });
+}
+
+fn finish_shared_fill_or_retry_representation(
+    key: Key,
+    result: Result<(), EdgeFailure>,
+    retry: impl FnOnce() -> Result<(), EdgeFailure>,
+) -> Result<(), EdgeFailure> {
+    match key {
+        Key::Store(_) | Key::Representation(_) => result,
+        Key::Nar(_) => result.or_else(|failure| match failure {
+            EdgeFailure::Authoritative404 | EdgeFailure::Transient | EdgeFailure::Invalid => {
+                retry()
+            }
+            EdgeFailure::Capacity | EdgeFailure::Storage => Err(failure),
+        }),
+    }
 }
 
 struct ActiveSlot<'a>(&'a AtomicUsize);

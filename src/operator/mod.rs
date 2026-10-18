@@ -929,7 +929,7 @@ pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
             | SourcePreparationError::MissingEdgeUpstream
             | SourcePreparationError::EdgeOptionsForOtherSource
             | SourcePreparationError::EdgeCompressedOutput
-            | SourcePreparationError::EdgeWorkersTooFew
+            | SourcePreparationError::EdgeRequestCapacityTooSmall
             | SourcePreparationError::NativeStoreDirectory
             | SourcePreparationError::MissingNativeOptions
             | SourcePreparationError::NativeCompressedOutput

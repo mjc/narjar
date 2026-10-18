@@ -90,6 +90,7 @@ fn settings(upstream: HttpUrl) -> EdgeSettings {
         lease_seconds: NonZeroU64::new(60).unwrap(),
         max_fills: NonZeroUsize::new(8).unwrap(),
         request_workers: NonZeroUsize::new(16).unwrap(),
+        max_in_flight: NonZeroUsize::new(64).unwrap(),
         timeout: TEST_TIMEOUT,
         fill_timeout: TEST_TIMEOUT,
         negative_ttl: Duration::from_secs(1),
@@ -244,6 +245,7 @@ fn empty_trust_is_rejected_before_any_fill() {
             lease_seconds: NonZeroU64::new(60).unwrap(),
             max_fills: NonZeroUsize::new(1).unwrap(),
             request_workers: NonZeroUsize::new(2).unwrap(),
+            max_in_flight: NonZeroUsize::new(64).unwrap(),
             timeout: Duration::from_secs(1),
             fill_timeout: TEST_TIMEOUT,
             negative_ttl: Duration::from_secs(1),
@@ -549,6 +551,73 @@ fn active_limit_rejects_unrelated_keys_while_same_store_followers_wait() {
         assert_eq!(follower.join().unwrap(), EdgeLookup::Ready);
     });
     assert_eq!(source.blocked_requests.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn blocked_requests_leave_both_worker_and_connection_admission_capacity() {
+    let mut settings = settings("http://127.0.0.1:1".parse().unwrap());
+    settings.request_workers = NonZeroUsize::new(8).unwrap();
+    settings.max_in_flight = NonZeroUsize::new(2).unwrap();
+    let source =
+        ReadThroughSource::new(settings, trusted_keys(), NarUploadPolicy::new(1024, 0)).unwrap();
+    assert_eq!(source.max_blocked_requests, 1);
+}
+
+#[test]
+fn a_failed_compressed_alias_does_not_poison_a_valid_raw_alias() {
+    let fixture = Fixture::new();
+    let compressed_metadata = fixture.metadata(
+        STORE,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+    );
+    let raw_metadata = fixture.metadata(
+        ALIAS,
+        NarRepresentation::Raw(fixture.identity),
+        &signing_key(),
+    );
+    let gate = Arc::new(Gate::default());
+    let upstream = {
+        let gate = gate.clone();
+        Upstream::new(move |route, stream| {
+            if route.ends_with(".narinfo") {
+                reply(
+                    stream,
+                    200,
+                    if route.contains(STORE) {
+                        &compressed_metadata
+                    } else {
+                        &raw_metadata
+                    },
+                );
+            } else if route.ends_with(".zst") {
+                gate.wait();
+                let mut corrupt = fixture.compressed.clone();
+                corrupt[0] ^= 1;
+                reply(stream, 200, &corrupt);
+            } else {
+                reply(stream, 200, &fixture.raw);
+            }
+        })
+    };
+    let source = source(&upstream);
+    let (_directory, storage) = storage();
+    thread::scope(|scope| {
+        let leader =
+            scope.spawn(|| source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap()));
+        wait_for(|| upstream.count(".zst") == 1);
+        let follower =
+            scope.spawn(|| source.ensure_local(&storage, &StoreHash::parse(ALIAS).unwrap()));
+        wait_for(|| source.counters.followers.load(Ordering::Relaxed) == 1);
+        gate.release();
+        assert_eq!(
+            leader.join().unwrap(),
+            EdgeLookup::Miss(EdgeFailure::Invalid)
+        );
+        assert_eq!(follower.join().unwrap(), EdgeLookup::Ready);
+    });
+    assert_eq!(upstream.count(".zst"), 1);
+    assert_eq!(upstream.count(".nar"), 1);
 }
 
 #[test]

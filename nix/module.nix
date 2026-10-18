@@ -824,8 +824,8 @@ in {
     };
     assertions = [
       {
-        assertion = !cfg.edge.enable || (!cfg.nativeStore.enable && cfg.egressCompression == "none" && cfg.workers >= 2);
-        message = "services.narjar.edge requires raw output, at least two workers, and cannot be combined with nativeStore";
+        assertion = !cfg.edge.enable || (!cfg.nativeStore.enable && cfg.egressCompression == "none" && cfg.workers >= 2 && cfg.maxInFlight >= 2);
+        message = "services.narjar.edge requires raw output, two workers and connection admissions, and cannot be combined with nativeStore";
       }
       {
         assertion = !cfg.edge.enable || (lib.hasPrefix "https://" cfg.edge.upstream || lib.hasPrefix "http://" cfg.edge.upstream);

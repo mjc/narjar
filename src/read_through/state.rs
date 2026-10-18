@@ -4,7 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::cache::{object::NarHash, storage::StoreHash};
+use crate::cache::{
+    object::{NarFileName, NarHash},
+    storage::StoreHash,
+};
 
 use super::{Deadline, EdgeFailure};
 
@@ -15,6 +18,7 @@ const MAX_WAITERS: usize = 64;
 pub(super) enum Key {
     Store(StoreHash),
     Nar(NarHash),
+    Representation(NarFileName),
 }
 
 pub(super) enum Join {
@@ -69,6 +73,11 @@ impl State {
     }
 
     pub(super) fn remember(&mut self, key: Key, failure: EdgeFailure, now: Instant, ttl: Duration) {
+        match key {
+            // A failed transport says nothing about another representation of this NAR.
+            Key::Nar(_) => return,
+            Key::Store(_) | Key::Representation(_) => {}
+        }
         if !failure.cacheable() || ttl.is_zero() {
             return;
         }
@@ -112,13 +121,19 @@ pub(super) struct Flight {
 }
 
 impl Flight {
-    pub(super) fn wait(&self, deadline: Deadline) -> Result<(), EdgeFailure> {
+    pub(super) fn wait(
+        &self,
+        deadline: Deadline,
+        completed: impl FnOnce(Result<(), EdgeFailure>) -> Result<(), EdgeFailure>,
+    ) -> Result<(), EdgeFailure> {
         let mut progress = self.progress.lock().map_err(|_| EdgeFailure::Storage)?;
         let remaining = deadline.remaining()?;
         match &mut *progress {
             Progress::Complete(result) => {
                 deadline.remaining()?;
-                return *result;
+                let result = *result;
+                drop(progress);
+                return completed(result);
             }
             Progress::Running { waiters } if *waiters >= MAX_WAITERS => {
                 return Err(EdgeFailure::Capacity);
@@ -135,7 +150,9 @@ impl Flight {
         match &mut *progress {
             Progress::Complete(result) => {
                 deadline.remaining()?;
-                *result
+                let result = *result;
+                drop(progress);
+                completed(result)
             }
             Progress::Running { waiters } => {
                 *waiters -= 1;
@@ -159,7 +176,7 @@ mod tests {
     fn key(index: u64) -> Key {
         let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&index.to_le_bytes());
-        Key::Nar(NarHash::from_digest(bytes))
+        Key::Representation(NarFileName::raw(NarHash::from_digest(bytes)))
     }
 
     #[test]
@@ -211,7 +228,10 @@ mod tests {
         let flight = Flight::default();
         flight.finish(Err(EdgeFailure::Invalid));
         assert_eq!(
-            flight.wait(Deadline::new(Duration::from_secs(1)).unwrap()),
+            flight.wait(
+                Deadline::new(Duration::from_secs(1)).unwrap(),
+                std::convert::identity
+            ),
             Err(EdgeFailure::Invalid)
         );
     }
@@ -220,16 +240,41 @@ mod tests {
     fn expired_follower_releases_its_waiter_slot_without_canceling_the_fill() {
         let flight = Flight::default();
         let expired = Deadline(Instant::now() - Duration::from_secs(1));
-        assert_eq!(flight.wait(expired), Err(EdgeFailure::Transient));
+        assert_eq!(
+            flight.wait(expired, |_| panic!(
+                "an expired wait must not retry a running fill"
+            )),
+            Err(EdgeFailure::Transient)
+        );
         assert!(matches!(
             *flight.progress.lock().unwrap(),
             Progress::Running { waiters: 0 }
         ));
         flight.finish(Ok(()));
         assert_eq!(
-            flight.wait(Deadline::new(Duration::from_secs(1)).unwrap()),
+            flight.wait(
+                Deadline::new(Duration::from_secs(1)).unwrap(),
+                std::convert::identity
+            ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_representation_failure_never_negative_caches_the_logical_nar() {
+        let mut state = State::new(1);
+        let key = Key::Nar(NarHash::from_digest([42; 32]));
+        state.remember(
+            key,
+            EdgeFailure::Invalid,
+            Instant::now(),
+            Duration::from_secs(60),
+        );
+        assert_eq!(state.negative_entries(), 0);
+        assert!(matches!(
+            state.join(key, Instant::now()).unwrap(),
+            Join::Leader(_)
+        ));
     }
 
     #[test]
@@ -239,7 +284,10 @@ mod tests {
             waiters: MAX_WAITERS,
         };
         assert_eq!(
-            flight.wait(Deadline::new(Duration::from_secs(1)).unwrap()),
+            flight.wait(
+                Deadline::new(Duration::from_secs(1)).unwrap(),
+                std::convert::identity
+            ),
             Err(EdgeFailure::Capacity)
         );
     }

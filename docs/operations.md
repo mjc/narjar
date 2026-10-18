@@ -112,8 +112,9 @@ no recipe cannot be built just because a cache misses.
 The existing size, decoder-memory, staging-space and minimum-free controls
 apply to fills. `--edge-max-fills` bounds concurrent fills; excess unrelated
 misses return 404. Leaders and waiting followers together can occupy at most
-`--workers - 1` request workers, leaving one for local hits, payloads and health
-requests. Edge mode requires at least two workers. A follower waits at most
+`min(--workers, --max-in-flight) - 1` request slots, leaving both a worker and
+connection admission for local hits, payloads and health requests. Edge mode
+requires at least two workers and two connection admissions. A follower waits at most
 `--edge-timeout-seconds`, which also bounds connection and inactive network I/O.
 Progressing fills can exceed that idle timeout. Their separate total deadline,
 `--edge-fill-timeout-seconds`, defaults to 3600 seconds; increase it for large

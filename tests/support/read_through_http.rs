@@ -50,7 +50,7 @@ fn assert_edge_waits_for_the_exact_payload(end: PayloadEnd) {
     });
     let edge = RunningServer::start_with_workers(
         "edge-publication-barrier",
-        2,
+        8,
         &[
             "--serve-source",
             "read-through",
@@ -58,6 +58,8 @@ fn assert_edge_waits_for_the_exact_payload(end: PayloadEnd) {
             &upstream_url,
             "--edge-max-fills",
             "1",
+            "--max-in-flight",
+            "2",
             "--min-free-bytes",
             "0",
         ],
@@ -80,8 +82,8 @@ fn assert_edge_waits_for_the_exact_payload(end: PayloadEnd) {
     ));
     assert!(!edge.data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
 
-    // With two workers the leader owns the sole blocking-fill slot. A duplicate
-    // miss must return immediately, leaving health and cached delivery runnable.
+    // Admission is smaller than the worker pool. The leader must still own the
+    // sole blocking slot, leaving health and cached delivery runnable.
     let rejected_follower = edge.request("GET", &route);
     assert!(
         response_parts(&rejected_follower)
