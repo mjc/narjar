@@ -363,11 +363,28 @@ impl Storage {
     }
 
     pub(super) fn forget_advertisement(&self, store: StoreHash) {
-        if let AdvertisementLeases::Active { directory, .. } = &self.advertisements {
-            let removed =
-                unlink_at(directory, &lease_name(store)).and_then(|()| directory.sync_all());
-            if let Err(error) = removed {
-                eprintln!("narjar: remove expired advertisement record: {error}");
+        if let Err(error) = self.remove_advertisement_record(store) {
+            eprintln!("narjar: remove advertisement record: {error}");
+        }
+    }
+
+    pub(super) fn remove_advertisement_record(&self, store: StoreHash) -> Result<(), StorageError> {
+        match &self.advertisements {
+            AdvertisementLeases::Absent => Ok(()),
+            AdvertisementLeases::Incomplete => Err(invalid("advertisement policy is missing")),
+            AdvertisementLeases::Active { directory, .. } => {
+                let lock = self.destination_lock(
+                    PathBuf::from(DIRECTORY).join(format!("{}.renew", store.as_str())),
+                );
+                let _guard = lock
+                    .lock()
+                    .map_err(|_| invalid("advertisement renewal lock poisoned"))?;
+                match unlink_at(directory, &lease_name(store)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                directory.sync_all().map_err(Into::into)
             }
         }
     }
@@ -425,6 +442,25 @@ mod tests {
         let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
         storage.record_publication_lease(store, identity).unwrap();
         (directory, storage, store, identity)
+    }
+
+    #[test]
+    fn explicit_metadata_deletion_removes_its_lease_before_identity_replacement() {
+        let (directory, storage, store, _) = advertised_fixture();
+        std::fs::write(
+            directory.path().join(format!("{}.narinfo", store.as_str())),
+            b"metadata",
+        )
+        .unwrap();
+        storage.delete_narinfo(&store).unwrap();
+        assert!(matches!(
+            storage.advertisement_evidence(store).unwrap(),
+            AdvertisementEvidence::Missing
+        ));
+        let replacement = NarIdentity::new(NarHash::from_digest([99; 32]), 4.into());
+        storage
+            .record_publication_lease(store, replacement)
+            .unwrap();
     }
 
     #[test]

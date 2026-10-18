@@ -885,6 +885,8 @@ impl Storage {
         let name = OsString::from(format!("{}.narinfo", store.as_str()));
         match entry_is_regular_at(&root, &name) {
             Ok(true) => {
+                // Cleanup first keeps metadata retryable if removing its lease fails.
+                self.remove_advertisement_record(*store)?;
                 unlink_at(&root, &name)?;
                 root.sync_all()?;
                 Ok(NarInfoDeletion::Deleted)
@@ -894,7 +896,10 @@ impl Storage {
                 "narinfo is not a regular file",
             )
             .into()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(NarInfoDeletion::Absent),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.remove_advertisement_record(*store)?;
+                Ok(NarInfoDeletion::Absent)
+            }
             Err(error) => Err(error.into()),
         }
     }
