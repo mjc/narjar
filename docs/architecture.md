@@ -1,9 +1,28 @@
 # Architecture
 
 Narjar stores cache state in a private filesystem directory. The server needs
-neither Nix nor an external database. The push client reads its local Nix
-store and SQLite metadata database; native-store HTTP serving is not
-implemented.
+neither Nix nor an external database in its default cache mode. The push client
+and optional native-store server source read the existing Nix store and its
+SQLite metadata database.
+
+## Native-store source
+
+Source selection happens at startup. Native mode uses the same binary-cache
+routes and authorization as cache mode, but rejects uploads. It produces raw
+NARs directly from leased store paths rather than staging a second payload.
+
+A narinfo lookup verifies a reusable signature or signs with a configured key,
+acquires the exact path's durable GC-root lease, then re-reads its logical claims
+from a fresh database snapshot. The response is emitted only if those claims
+still match. Startup does not retain a read transaction that hides later Nix
+registrations or blocks database writers.
+
+Raw NAR delivery retains the lease and active-delivery guard through canonical
+serialization and EOF identity checking. Range delivery verifies the remainder
+before completing the response. HEAD uses the declared length without starting
+serialization. Lease recovery runs before readiness; bounded expiry cleanup
+continues while serving. Shutdown leaves unexpired roots in place for clients
+with cached metadata.
 
 ## Identities and representations
 

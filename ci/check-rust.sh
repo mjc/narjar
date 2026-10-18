@@ -32,6 +32,10 @@ case "$check" in
       export NEXTEST_TEST_THREADS=$NIX_BUILD_CORES
     fi
     cargo nextest run "${nextest_profile_args[@]}" --locked --workspace --all-features
+    if [[ -n ${NARJAR_NATIVE_TEST_FILE:-} ]]; then
+      cargo nextest run "${nextest_profile_args[@]}" --locked --workspace --all-features \
+        --run-ignored=only -E 'test(cli_tests::native_http)'
+    fi
     ;;
   doc)
     RUSTDOCFLAGS="-D warnings" cargo test --doc "${cargo_profile_args[@]}" --locked --workspace --all-features

@@ -70,8 +70,61 @@ before uploading. They do not fetch upstream payloads; consumers must have
 that upstream configured as a substituter. Failed checks fall back to local
 upload. `--refresh` bypasses upstream checks.
 
-The server does not serve the native Nix store. Push requires a local Nix
-store, but serving an initialized Narjar cache does not require Nix.
+Push and native-store serving require a local Nix store. Serving an initialized
+standalone Narjar cache does not require Nix.
+
+## Native-store serving
+
+Select `serve --serve-source native-store` with explicit `--native-store-dir`,
+`--native-state-dir`, `--native-roots-dir`, and `--native-min-lease-seconds`.
+The source is read-only: GET, HEAD, and single ranges are supported; PUT returns
+405 without accepting or queuing a body. Output must be raw and the Narjar
+data directory must use the flat backend.
+
+The service reads the existing SQLite database without writing to it. It needs
+read access to the store and GC lock, plus write access to its private roots
+directory at `STATE/gcroots/auto/narjar`. Keep that directory outside the store
+and Narjar data directory. Do not remove it during restart: its leases protect
+previously advertised paths. Expired leases are cleaned in bounded batches;
+active deliveries retain their roots until delivery ends.
+
+`--native-signing-key-file` supplies a Nix-format secret key for unsigned paths.
+Its public key must be trusted by the cache. Without a signer, only existing
+trusted signatures are reused; unsigned or untrusted paths return 404. Metadata
+or lease failures return 503 before a response body starts. Integrity failures
+during delivery terminate the transfer and are recorded as failed responses.
+
+NixOS example:
+
+~~~nix
+services.narjar = {
+  enable = true;
+  dynamicUser = false;
+  auth.trustedPublicKeys = "/run/secrets/narjar-public-keys";
+  nativeStore = {
+    enable = true;
+    signingKeyFile = "/run/secrets/narjar-secret-key";
+    minLeaseSeconds = 3600;
+  };
+};
+~~~
+
+The module prepares the roots with stable ownership, grants access to the GC
+lock, and loads the signer through systemd credentials. It does not make the
+store or metadata database writable. `doctor` accepts the same native source
+and signing options as `serve`.
+
+Nix caches positive narinfo independently of HTTP cache headers. Set the lease
+to cover that configured lifetime, a second in-memory cache window, and delayed
+requests. For a short-lived local profile, a 300-second positive narinfo TTL
+fits within a 3,600-second lease; the default 30-day Nix TTL does not. Arbitrarily
+suspended clients cannot be covered by a finite lease. Native responses require
+HTTP metadata revalidation rather than advertising a year-long intermediary TTL.
+
+`/readyz` checks the selected source's database and lease state. `/metrics`
+reports `narjar_source_info`, registered native leases, expired leases released,
+lease-capacity rejections, and failures by metadata/signature/lease/delivery/
+cleanup phase. Existing request and transfer metrics include native reads.
 
 ## Storage and permissions
 

@@ -29,7 +29,8 @@
     readTokens ? null,
     nativeStoreEnable ? false,
     nativeStateDir ? "/nix/var/nix",
-    nativeRootsDir ? "/nix/var/nix/gcroots/auto/narjar",
+    nativeRootsDir ? "${nativeStateDir}/gcroots/auto/narjar",
+    nativeSigningKeyFile ? null,
     collectorPackages ? null,
     gc ? {},
   }:
@@ -72,6 +73,7 @@
             nativeStore.enable = nativeStoreEnable;
             nativeStore.stateDir = nativeStateDir;
             nativeStore.rootsDir = nativeRootsDir;
+            nativeStore.signingKeyFile = nativeSigningKeyFile;
             inherit gc;
             minFreeBytes = 0;
             package = package;
@@ -122,14 +124,45 @@
       randomizedDelaySeconds = 42;
     };
   };
-  invalidUnattendedConfigs = map (gc: configuration {dataDir = "/var/lib/narjar"; inherit gc;}) [
-    {enable = true; minFreeBytes = 1000;}
-    {enable = true; targetFreeBytes = 2000;}
-    {enable = true; minFreeBytes = 2000; targetFreeBytes = 1000;}
-    {enable = true; minFreeBytes = 1000; targetFreeBytes = 2000; maxDeletions = null;}
-    {enable = true; maxBytes = 1000; maxDeletions = 0;}
-    {enable = true; maxBytes = 1000; retryAttempts = 17;}
-    {enable = true; maxBytes = 1000; retryDelayMillis = 30001;}
+  invalidUnattendedConfigs = map (gc:
+    configuration {
+      dataDir = "/var/lib/narjar";
+      inherit gc;
+    }) [
+    {
+      enable = true;
+      minFreeBytes = 1000;
+    }
+    {
+      enable = true;
+      targetFreeBytes = 2000;
+    }
+    {
+      enable = true;
+      minFreeBytes = 2000;
+      targetFreeBytes = 1000;
+    }
+    {
+      enable = true;
+      minFreeBytes = 1000;
+      targetFreeBytes = 2000;
+      maxDeletions = null;
+    }
+    {
+      enable = true;
+      maxBytes = 1000;
+      maxDeletions = 0;
+    }
+    {
+      enable = true;
+      maxBytes = 1000;
+      retryAttempts = 17;
+    }
+    {
+      enable = true;
+      maxBytes = 1000;
+      retryDelayMillis = 30001;
+    }
   ];
   longShutdownConfig = configuration {
     dataDir = "/var/lib/narjar";
@@ -256,6 +289,7 @@
     dataDir = "/var/lib/narjar";
     dynamicUser = false;
     nativeStoreEnable = true;
+    nativeSigningKeyFile = "/run/secrets/narjar-native-signing-key";
   };
   customNativeStateDirConfig = configuration {
     dataDir = "/var/lib/narjar";
@@ -470,7 +504,12 @@ in
   assert lib.hasInfix "--track-access" unattendedConfig.systemd.services.narjar.serviceConfig.ExecStart;
   assert !(lib.hasInfix "--track-access" defaultConfig.systemd.services.narjar.serviceConfig.ExecStart);
   assert lib.all (flag: lib.hasInfix flag unattendedConfig.systemd.services.narjar-gc.serviceConfig.ExecStart) [
-    "--eviction-order last-use" "--max-deletions 20" "--min-free-bytes 1000" "--target-free-bytes 2000" "--retry-attempts 4" "--retry-delay-millis 250"
+    "--eviction-order last-use"
+    "--max-deletions 20"
+    "--min-free-bytes 1000"
+    "--target-free-bytes 2000"
+    "--retry-attempts 4"
+    "--retry-delay-millis 250"
   ];
   assert unattendedConfig.systemd.timers.narjar-gc.timerConfig.RandomizedDelaySec == 42;
   assert lib.hasInfix "--delete-older-than 7d" ageDaysGcConfig.systemd.services.narjar-gc.serviceConfig.ExecStart;
@@ -528,9 +567,13 @@ in
   assert (!(builtins.tryEval conflictingFilesystemSamplesConfig.system.build.toplevel.drvPath).success);
   assert (!(builtins.tryEval unsafeNativeRootsConfig.system.build.toplevel.drvPath).success);
   assert (!(builtins.tryEval nestedNativeRootsConfig.system.build.toplevel.drvPath).success);
-  assert (!(builtins.tryEval nativeStoreConfig.system.build.toplevel.drvPath).success);
-  assert (!(builtins.tryEval customNativeStateDirConfig.system.build.toplevel.drvPath).success);
-  assert (lib.any (assertion: assertion.message == "services.narjar.nativeStore cannot be enabled until native-store HTTP serving is implemented" && !assertion.assertion) nativeStoreConfig.assertions);
+  assert (builtins.tryEval nativeStoreConfig.system.build.toplevel.drvPath).success;
+  assert (builtins.tryEval customNativeStateDirConfig.system.build.toplevel.drvPath).success;
+  assert lib.hasInfix "--native-signing-key-file" nativeStoreConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert lib.hasInfix "%d/native-signing-key" nativeStoreConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert builtins.elem "native-signing-key:/run/secrets/narjar-native-signing-key" nativeStoreConfig.systemd.services.narjar.serviceConfig.LoadCredential;
+  assert !(builtins.elem "/nix/store" nativeStoreConfig.systemd.services.narjar.serviceConfig.ReadWritePaths);
+  assert !(builtins.elem "/nix/var/nix/db" nativeStoreConfig.systemd.services.narjar.serviceConfig.ReadWritePaths);
   assert lib.hasPrefix "+" nativeStorePreStartCommand;
   assert lib.hasPrefix "+" customNativeStorePreStartCommand;
   assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules)); "narjar module assertions passed; generated preStart check: ${preStartCheck}; generated collector check: ${collectorCheck}"

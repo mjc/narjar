@@ -312,27 +312,31 @@
       "--storage-backend"
       cfg.storageBackend
     ]
-      ++ lib.optionals (cfg.gc.enable && cfg.gc.evictionOrder == "last-use") ["--track-access"]
-      ++ lib.optionals cfg.nativeStore.enable [
-        "--serve-source"
-        "native-store"
-        "--native-store-dir"
-        cfg.nativeStore.storeDir
-        "--native-state-dir"
-        cfg.nativeStore.stateDir
-        "--native-roots-dir"
-        cfg.nativeStore.rootsDir
-        "--native-min-lease-seconds"
-        (toString cfg.nativeStore.minLeaseSeconds)
-      ]
-      ++ lib.optionals cfg.statsInventory [
-        "--stats-inventory-interval-seconds"
-        (toString cfg.statsInventoryIntervalSeconds)
-      ]
-      ++ lib.optionals (filesystemSampleFile != null) [
-        "--stats-filesystem-sample"
-        filesystemSampleFile
-      ]
+    ++ lib.optionals (cfg.gc.enable && cfg.gc.evictionOrder == "last-use") ["--track-access"]
+    ++ lib.optionals cfg.nativeStore.enable [
+      "--serve-source"
+      "native-store"
+      "--native-store-dir"
+      cfg.nativeStore.storeDir
+      "--native-state-dir"
+      cfg.nativeStore.stateDir
+      "--native-roots-dir"
+      cfg.nativeStore.rootsDir
+      "--native-min-lease-seconds"
+      (toString cfg.nativeStore.minLeaseSeconds)
+    ]
+    ++ lib.optionals (cfg.nativeStore.signingKeyFile != null) [
+      "--native-signing-key-file"
+      "%d/native-signing-key"
+    ]
+    ++ lib.optionals cfg.statsInventory [
+      "--stats-inventory-interval-seconds"
+      (toString cfg.statsInventoryIntervalSeconds)
+    ]
+    ++ lib.optionals (filesystemSampleFile != null) [
+      "--stats-filesystem-sample"
+      filesystemSampleFile
+    ]
   );
   zfsProperties = [
     "mountpoint"
@@ -352,7 +356,11 @@
   ];
   zfsSampleCollector = lib.optionalString (cfg.statsZfsDataset != null) (pkgs.writeShellScript "narjar-zfs-stats-sample" ''
     set -eu
-    dataset=${lib.escapeShellArg (if cfg.statsZfsDataset == null then "" else cfg.statsZfsDataset)}
+    dataset=${lib.escapeShellArg (
+      if cfg.statsZfsDataset == null
+      then ""
+      else cfg.statsZfsDataset
+    )}
     expected_mountpoint=${lib.escapeShellArg cfg.dataDir}
     storage_root=${lib.escapeShellArg runtimeDataDir}
     sample_directory=${lib.escapeShellArg zfsSampleDirectory}
@@ -408,7 +416,8 @@
   commonServiceConfig = {
     PrivateTmp = true;
     ProtectSystem = "strict";
-    ReadWritePaths = [runtimeDataDir]
+    ReadWritePaths =
+      [runtimeDataDir]
       ++ lib.optionals cfg.nativeStore.enable [nativeRootsParent nativeGcLock];
     UMask = "0077";
   };
@@ -529,6 +538,12 @@ in {
         type = lib.types.ints.positive;
         default = 3600;
         description = "Minimum lifetime for each Narjar-owned Nix GC root.";
+      };
+
+      signingKeyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Nix secret signing key for unsigned native paths, loaded through systemd credentials. Its public key must be trusted by this cache.";
       };
     };
 
@@ -781,8 +796,8 @@ in {
         message = "services.narjar.nativeStore requires dynamicUser = false so its GC-root directory has stable ownership";
       }
       {
-        assertion = !cfg.nativeStore.enable;
-        message = "services.narjar.nativeStore cannot be enabled until native-store HTTP serving is implemented";
+        assertion = cfg.nativeStore.signingKeyFile == null || cfg.nativeStore.enable;
+        message = "services.narjar.nativeStore.signingKeyFile requires nativeStore.enable";
       }
       {
         assertion = !cfg.nativeStore.enable || cfg.storageBackend == "flat";
@@ -811,7 +826,8 @@ in {
       description = "Narjar binary cache";
       wantedBy = ["multi-user.target"];
       after = ["network.target"];
-      unitConfig.RequiresMountsFor = [cfg.dataDir]
+      unitConfig.RequiresMountsFor =
+        [cfg.dataDir]
         ++ lib.optionals cfg.nativeStore.enable [cfg.nativeStore.storeDir cfg.nativeStore.stateDir nativeRootsParent];
 
       preStart = lib.mkIf cfg.dynamicUser preStartScript;
@@ -823,7 +839,9 @@ in {
           Environment = "NARJAR_CREDENTIALS_DIRECTORY=%d";
           SupplementaryGroups = lib.optional cfg.nativeStore.enable "narjar-nix-gc";
           ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";
-          LoadCredential = map (credential: "${credential.name}:${credential.source}") credentials;
+          LoadCredential =
+            map (credential: "${credential.name}:${credential.source}") credentials
+            ++ lib.optional (cfg.nativeStore.signingKeyFile != null) "native-signing-key:${cfg.nativeStore.signingKeyFile}";
           ExecStart = "${executable} ${serveArgs}";
           Type = "notify";
           NotifyAccess = "main";
@@ -880,7 +898,7 @@ in {
         DevicePolicy = "closed";
         DeviceAllow = ["/dev/zfs rw"];
         ReadWritePaths = [zfsSampleDirectory];
-        RestrictAddressFamilies = [ ];
+        RestrictAddressFamilies = [];
         RestrictNamespaces = true;
         RestrictRealtime = true;
       };

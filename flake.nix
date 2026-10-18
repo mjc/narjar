@@ -337,6 +337,7 @@
                 doCheck = false;
                 doInstallCargoArtifacts = false;
                 nativeBuildInputs = env.commonArgs.nativeBuildInputs ++ [ env.pkgs.cargo-nextest ];
+                NARJAR_NATIVE_TEST_FILE = env.pkgs.writeText "narjar-native-http-fixture" "native source fixture\n";
                 buildPhaseCargoCommand = ''
                   export CARGO_PROFILE
                   ${env.pkgs.bash}/bin/bash ${repositorySrc}/ci/check-rust.sh ${command}
