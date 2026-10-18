@@ -18,7 +18,10 @@ use super::{
     lease::{NativeStoreActiveDelivery, NativeStoreLease, NativeStoreLeaseError},
     metadata::{NativeMetadataError, ValidatedNativeClaims},
 };
-use crate::cache::{narinfo::TrustedPublicKeys, storage::StoreHash};
+use crate::cache::{
+    narinfo::TrustedPublicKeys,
+    storage::{StorageReadiness, StoreHash, capacity_from_statvfs},
+};
 
 pub(crate) struct NativeStoreSource {
     store: ValidatedNativeStore,
@@ -143,32 +146,41 @@ impl NativeStoreSource {
                 .sign_for_trusted_cache(&self.trusted, self.store.signing_key.as_ref())
                 .map_err(|_| NativeReadError::Signature)?;
             drop(snapshot);
-            let LeasedNativeNar {
-                claims, _activity, ..
-            } = self.lease_and_read_current_claims(&path)?;
+            let object = self.lease_and_read_current_claims(&path)?;
             signed
                 .claims()
-                .compare_logical_claims(claims.claims())
+                .compare_logical_claims(object.claims.claims())
                 .map_err(|_| NativeReadError::Missing)?;
             let bytes = signed.serialize_raw().map_err(|_| {
                 NativeReadError::Metadata(NativeMetadataError::InvalidMetadata(
                     "native narinfo exceeds the protocol limit or has invalid fields".into(),
                 ))
             })?;
-            Ok(NativeAdvertisement { bytes, _activity })
+            self.store
+                .leases()
+                .record_advertisement(&object.lease, &signed)?;
+            Ok(NativeAdvertisement {
+                bytes,
+                _activity: object._activity,
+            })
         })())
     }
 
     pub(crate) fn resolve_nar(&self, hash: NarHash) -> Result<LeasedNativeNar, NativeReadError> {
         self.observe_read((|| {
-            let path = self
+            let advertised: super::lease::AdvertisedNativeNar = self
                 .store
-                .metadata_snapshot()?
-                .path_for_nar(hash)?
+                .leases()
+                .lookup_advertisement(hash)?
                 .ok_or(NativeReadError::Missing)?;
-            let object = self.lease_and_read_current_claims(&path)?;
-            match object.identity().hash() == hash {
-                true => Ok(object),
+            let object = self.lease_and_read_current_claims(advertised.store_path())?;
+            match object.identity() == advertised.identity() {
+                true => {
+                    self.store
+                        .leases()
+                        .renew_advertisement(&object.lease, &advertised)?;
+                    Ok(object)
+                }
                 false => Err(NativeReadError::Missing),
             }
         })())
@@ -230,10 +242,17 @@ impl NativeStoreSource {
             });
     }
 
-    pub(crate) fn probe(&self) -> Result<(), NativeReadError> {
+    pub(crate) fn readiness(
+        &self,
+        min_free_bytes: u64,
+    ) -> Result<StorageReadiness, NativeReadError> {
         self.store.metadata_snapshot()?;
         self.store.leases().probe()?;
-        Ok(())
+        let space = rustix::fs::fstatvfs(&self.store._roots_directory).map_err(io::Error::from)?;
+        Ok(StorageReadiness::from_capacity(
+            capacity_from_statvfs(&space),
+            min_free_bytes,
+        ))
     }
 
     pub(crate) fn maintain(&self) {
@@ -244,6 +263,14 @@ impl NativeStoreSource {
     }
 
     pub(crate) fn append_metrics(&self, output: &mut String) {
+        if let Ok(space) = rustix::fs::fstatvfs(&self.store._roots_directory) {
+            let space = capacity_from_statvfs(&space);
+            let _ = writeln!(
+                output,
+                "# TYPE narjar_native_roots_available_bytes gauge\nnarjar_native_roots_available_bytes {}",
+                space.available_bytes
+            );
+        }
         if let Ok(leases) = self.store.leases().snapshot() {
             let _ = writeln!(
                 output,

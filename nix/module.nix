@@ -536,7 +536,7 @@ in {
 
       minLeaseSeconds = lib.mkOption {
         type = lib.types.ints.positive;
-        default = 3600;
+        default = 5187600;
         description = "Minimum lifetime for each Narjar-owned Nix GC root.";
       };
 
@@ -798,6 +798,10 @@ in {
       {
         assertion = cfg.nativeStore.signingKeyFile == null || cfg.nativeStore.enable;
         message = "services.narjar.nativeStore.signingKeyFile requires nativeStore.enable";
+      }
+      {
+        assertion = !cfg.nativeStore.enable || cfg.nativeStore.storeDir == "/nix/store";
+        message = "services.narjar.nativeStore HTTP serving currently requires storeDir = /nix/store";
       }
       {
         assertion = !cfg.nativeStore.enable || cfg.storageBackend == "flat";

@@ -572,6 +572,7 @@ in
   assert lib.hasInfix "--native-signing-key-file" nativeStoreConfig.systemd.services.narjar.serviceConfig.ExecStart;
   assert lib.hasInfix "%d/native-signing-key" nativeStoreConfig.systemd.services.narjar.serviceConfig.ExecStart;
   assert builtins.elem "native-signing-key:/run/secrets/narjar-native-signing-key" nativeStoreConfig.systemd.services.narjar.serviceConfig.LoadCredential;
+  assert nativeStoreConfig.services.narjar.nativeStore.minLeaseSeconds >= 2 * 2592000 + 3600;
   assert !(builtins.elem "/nix/store" nativeStoreConfig.systemd.services.narjar.serviceConfig.ReadWritePaths);
   assert !(builtins.elem "/nix/var/nix/db" nativeStoreConfig.systemd.services.narjar.serviceConfig.ReadWritePaths);
   assert lib.hasPrefix "+" nativeStorePreStartCommand;

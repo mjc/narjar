@@ -212,8 +212,8 @@ fn native_store_http_serves_signed_raw_get_head_ranges_and_rejects_writes_after_
         owner,
         &args.iter().map(String::as_str).collect::<Vec<_>>(),
     );
-    assert_status(&server.request("GET", &metadata_path), 200);
     assert_eq!(body(&server.request("GET", &payload_path)), nar);
+    assert_status(&server.request("GET", &metadata_path), 200);
 }
 
 #[test]
@@ -226,6 +226,7 @@ fn native_store_http_requires_trust_and_can_sign_unsigned_paths_with_a_configure
             .execute("UPDATE ValidPaths SET sigs = ''")
             .unwrap();
         let path = format!("/{}.narinfo", fixture.store_hash);
+        let payload = format!("/nar/{}.nar", fixture.hash);
         let key = fixture.key.clone();
         let extra = if sign {
             vec!["--native-signing-key-file", key.to_str().unwrap()]
@@ -233,7 +234,12 @@ fn native_store_http_requires_trust_and_can_sign_unsigned_paths_with_a_configure
             vec![]
         };
         let server = fixture.start(&extra);
+        assert_status(&server.request("GET", &payload), 404);
         assert_status(&server.request("GET", &path), if sign { 200 } else { 404 });
+        assert_status(
+            &server.request("GET", &payload),
+            if sign { 200 } else { 404 },
+        );
         if !sign {
             assert!(
                 fs::read_dir(
@@ -313,6 +319,33 @@ fn native_store_http_readiness_requires_the_gc_lock_to_remain_readable() {
 
 #[test]
 #[ignore = "requires the pinned Nix store fixture; run by the Nix test gate"]
+fn native_store_http_unadvertised_payload_misses_do_not_query_the_database() {
+    let fixture = NativeHttpFixture::new();
+    let database = fixture.state.join("db/db.sqlite");
+    let path = format!("/nar/{}.nar", fixture.hash);
+    let server = fixture.start(&[]);
+    sqlite::Connection::open(database)
+        .unwrap()
+        .execute("DROP TABLE ValidPaths")
+        .unwrap();
+    assert_status(&server.request("GET", &path), 404);
+    assert_status(&server.request("HEAD", &path), 404);
+}
+
+#[test]
+#[ignore = "requires the pinned Nix store fixture; run by the Nix test gate"]
+fn native_store_http_readiness_does_not_depend_on_upload_staging() {
+    let fixture = NativeHttpFixture::new();
+    let cache = fixture.cache.clone();
+    let path = format!("/{}.narinfo", fixture.store_hash);
+    let server = fixture.start(&[]);
+    fs::rename(cache.join("nar/.tmp"), cache.join("unused-upload-staging")).unwrap();
+    assert_status(&server.request("GET", "/readyz"), 200);
+    assert_status(&server.request("GET", &path), 200);
+}
+
+#[test]
+#[ignore = "requires the pinned Nix store fixture; run by the Nix test gate"]
 fn native_store_http_counts_full_and_range_streaming_hash_failures_once_per_response() {
     let fixture = NativeHttpFixture::new();
     let hash = NarHash::from_digest([42; 32]);
@@ -324,7 +357,10 @@ fn native_store_http_counts_full_and_range_streaming_hash_failures_once_per_resp
     .unwrap();
     drop(db);
     let full_length = fixture.nar.len();
-    let server = fixture.start(&[]);
+    let metadata = format!("/{}.narinfo", fixture.store_hash);
+    let key = fixture.key.clone();
+    let server = fixture.start(&["--native-signing-key-file", key.to_str().unwrap()]);
+    assert_status(&server.request("GET", &metadata), 200);
     let path = format!("/nar/{hash}.nar");
     for (index, (headers, expected_status, expected_length)) in [
         (vec![], 200, full_length),

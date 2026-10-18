@@ -80,6 +80,8 @@ Select `serve --serve-source native-store` with explicit `--native-store-dir`,
 The source is read-only: GET, HEAD, and single ranges are supported; PUT returns
 405 without accepting or queuing a body. Output must be raw and the Narjar
 data directory must use the flat backend.
+The HTTP source currently supports only `/nix/store`; other store roots are
+rejected during configuration.
 
 The service reads the existing SQLite database without writing to it. It needs
 read access to the store and GC lock, plus write access to its private roots
@@ -87,6 +89,10 @@ directory at `STATE/gcroots/auto/narjar`. Keep that directory outside the store
 and Narjar data directory. Do not remove it during restart: its leases protect
 previously advertised paths. Expired leases are cleaned in bounded batches;
 active deliveries retain their roots until delivery ends.
+Payload hashes resolve through private advertisement records, not a scan of the
+Nix database. Only a trusted narinfo advertisement creates that association.
+The lease manager preserves it across restart and removes it with the expired
+root; unknown payload hashes do not acquire leases.
 
 `--native-signing-key-file` supplies a Nix-format secret key for unsigned paths.
 Its public key must be trusted by the cache. Without a signer, only existing
@@ -104,7 +110,7 @@ services.narjar = {
   nativeStore = {
     enable = true;
     signingKeyFile = "/run/secrets/narjar-secret-key";
-    minLeaseSeconds = 3600;
+    minLeaseSeconds = 5187600;
   };
 };
 ~~~
@@ -114,14 +120,15 @@ lock, and loads the signer through systemd credentials. It does not make the
 store or metadata database writable. `doctor` accepts the same native source
 and signing options as `serve`.
 
-Nix caches positive narinfo independently of HTTP cache headers. Set the lease
-to cover that configured lifetime, a second in-memory cache window, and delayed
-requests. For a short-lived local profile, a 300-second positive narinfo TTL
-fits within a 3,600-second lease; the default 30-day Nix TTL does not. Arbitrarily
+Nix caches positive narinfo independently of HTTP cache headers. The module's
+5,187,600-second default covers two 30-day positive-cache windows plus an hour
+for delayed requests. Match shorter leases to the client's configured TTL:
+a 300-second positive narinfo TTL fits within a 3,600-second lease. Arbitrarily
 suspended clients cannot be covered by a finite lease. Native responses require
 HTTP metadata revalidation rather than advertising a year-long intermediary TTL.
 
-`/readyz` checks the selected source's database and lease state. `/metrics`
+`/readyz` checks the selected source's database, GC-lock access, lease state,
+and free space on the roots filesystem, not unused upload staging. `/metrics`
 reports `narjar_source_info`, registered native leases, expired leases released,
 lease-capacity rejections, and failures by metadata/signature/lease/delivery/
 cleanup phase. Existing request and transfer metrics include native reads.

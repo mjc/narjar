@@ -18,6 +18,12 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlite::{ConnectionThreadSafe, State};
+#[cfg(test)]
+use std::collections::BTreeMap;
+
+#[path = "lease/advertisement.rs"]
+mod advertisement;
+pub(crate) use advertisement::AdvertisedNativeNar;
 
 const LEASE_PREFIX: &str = ".narjar-lease-";
 const LEASE_TEMP_PREFIX: &str = ".narjar-lease-temp-";
@@ -32,7 +38,7 @@ const MAX_EXPIRY_CLEANUP_PER_CALL: usize = 64;
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 
 #[cfg(test)]
-static FAIL_DIRECTORY_SYNC: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
+static FAIL_DIRECTORY_SYNC: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeStorePath {
@@ -946,6 +952,7 @@ impl NativeStoreLeaseManager {
         record: &LeaseRecord,
         inactive: &InactiveLeaseDirectory,
     ) -> Result<(), NativeStoreLeaseError> {
+        self.remove_advertisement_for_lease(store_path)?;
         self.remove_recorded_root(&self.root_path(store_path), record, inactive)?;
         remove_record(&self.roots_dir, record_path)?;
         fs::remove_dir(self.lease_directory(store_path)).map_err(NativeStoreLeaseError::Io)?;
@@ -1513,13 +1520,12 @@ fn sync_root_parent_directory(root_path: &Path) -> Result<(), NativeStoreLeaseEr
 
 fn sync_directory(path: &Path) -> Result<(), NativeStoreLeaseError> {
     #[cfg(test)]
-    if let Ok(mut failure) = FAIL_DIRECTORY_SYNC.lock()
-        && let Some((directory, remaining_syncs)) = failure.as_mut()
-        && directory == path
+    if let Ok(mut failures) = FAIL_DIRECTORY_SYNC.lock()
+        && let Some(remaining_syncs) = failures.get_mut(path)
     {
         *remaining_syncs -= 1;
         if *remaining_syncs == 0 {
-            failure.take();
+            failures.remove(path);
             return Err(NativeStoreLeaseError::Io(io::Error::other(
                 "injected directory synchronization failure",
             )));
@@ -1532,10 +1538,10 @@ fn sync_directory(path: &Path) -> Result<(), NativeStoreLeaseError> {
 
 #[cfg(test)]
 fn fail_nth_directory_sync(path: &Path, nth_sync: usize) {
-    *FAIL_DIRECTORY_SYNC
+    FAIL_DIRECTORY_SYNC
         .lock()
-        .expect("directory-sync failpoint lock should be available") =
-        Some((path.to_owned(), nth_sync));
+        .expect("directory-sync failpoint lock should be available")
+        .insert(path.to_owned(), nth_sync);
 }
 
 fn remove_stale_temporary_records(roots_dir: &Path) -> Result<(), NativeStoreLeaseError> {
@@ -3015,6 +3021,152 @@ mod tests {
         assert!(!fixture.manager.root_path(&fixture.store_path).exists());
         assert!(fixture.owned_records().is_empty());
         assert_eq!(fixture.manager.snapshot().unwrap().active, 0);
+    }
+
+    #[test]
+    fn reusing_an_advertisement_completes_a_previously_failed_index_directory_sync() {
+        use narjar::object::{NarHash, NarIdentity};
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        fail_nth_directory_sync(&fixture.roots_dir, 2);
+        assert!(
+            fixture
+                .manager
+                .publish_advertisement(&lease, identity)
+                .is_err()
+        );
+        fail_nth_directory_sync(&fixture.roots_dir, 1);
+        assert!(
+            fixture
+                .manager
+                .publish_advertisement(&lease, identity)
+                .is_err(),
+            "reusing the visible index must still synchronize its directory"
+        );
+        fixture
+            .manager
+            .publish_advertisement(&lease, identity)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .reopen_at(1, 2)
+                .lookup_advertisement_at(identity.hash(), 2)
+                .unwrap()
+                .unwrap()
+                .identity(),
+            identity
+        );
+    }
+
+    #[test]
+    fn advertised_hash_lookup_survives_restart_expires_and_is_removed_with_its_root() {
+        use narjar::object::{NarHash, NarIdentity};
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        fixture
+            .manager
+            .publish_advertisement(&lease, identity)
+            .unwrap();
+        let manager = fixture.reopen_at(1, 2);
+        let advertised = manager
+            .lookup_advertisement_at(identity.hash(), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(advertised.identity(), identity);
+        assert_eq!(
+            Path::new(advertised.store_path()),
+            fixture.store_path.as_path()
+        );
+        assert!(
+            manager
+                .lookup_advertisement_at(NarHash::from_digest([99; 32]), 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .lookup_advertisement_at(identity.hash(), lease.expires_at_unix_seconds())
+                .unwrap()
+                .is_none(),
+            "expired evidence cannot admit a new lease"
+        );
+        manager
+            .release(&lease, lease.expires_at_unix_seconds())
+            .unwrap();
+        assert!(
+            manager
+                .lookup_advertisement_at(identity.hash(), 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(fixture.owned_records().is_empty());
+    }
+
+    #[test]
+    fn collecting_an_older_shared_advertisement_preserves_the_later_paths_index() {
+        use narjar::object::{NarHash, NarIdentity};
+        let fixture = LeaseFixture::new(2);
+        let other_path = fixture.store_dir.join(format!("{}-other", "1".repeat(32)));
+        fs::create_dir(&other_path).unwrap();
+        let database = Connection::open(&fixture.database_path).unwrap();
+        let mut row = database
+            .prepare("INSERT INTO ValidPaths(path) VALUES(?)")
+            .unwrap();
+        row.bind((1, other_path.to_str().unwrap())).unwrap();
+        row.next().unwrap();
+        drop(row);
+        drop(database);
+        let first = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .unwrap();
+        let second = fixture
+            .manager
+            .acquire(fixture.manager.validate_store_path(&other_path).unwrap(), 2)
+            .unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        fixture
+            .manager
+            .publish_advertisement(&first, identity)
+            .unwrap();
+        fixture
+            .manager
+            .publish_advertisement(&second, identity)
+            .unwrap();
+        fixture
+            .manager
+            .release(&first, first.expires_at_unix_seconds())
+            .unwrap();
+        assert_eq!(
+            Path::new(
+                fixture
+                    .manager
+                    .lookup_advertisement_at(identity.hash(), 2)
+                    .unwrap()
+                    .unwrap()
+                    .store_path()
+            ),
+            other_path
+        );
+        fixture
+            .manager
+            .release(&second, second.expires_at_unix_seconds())
+            .unwrap();
+        assert!(
+            fixture
+                .manager
+                .lookup_advertisement_at(identity.hash(), 2)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

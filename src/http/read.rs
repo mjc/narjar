@@ -47,16 +47,14 @@ impl ReadSource {
 
 impl ReadContext<'_> {
     fn readiness(self, min_free_bytes: u64) -> StorageReadiness {
-        let storage = self
-            .storage
-            .is_ready(min_free_bytes)
-            .unwrap_or(StorageReadiness::ProbeFailed);
         match self.source {
-            ReadSource::FlatCache => storage,
-            ReadSource::NativeStore(source) => match source.probe() {
-                Ok(()) => storage,
-                Err(_) => StorageReadiness::ProbeFailed,
-            },
+            ReadSource::FlatCache => self
+                .storage
+                .is_ready(min_free_bytes)
+                .unwrap_or(StorageReadiness::ProbeFailed),
+            ReadSource::NativeStore(source) => source
+                .readiness(min_free_bytes)
+                .unwrap_or(StorageReadiness::ProbeFailed),
         }
     }
 }

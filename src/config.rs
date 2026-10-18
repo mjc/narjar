@@ -82,6 +82,11 @@ impl ServeSource {
                     signing_key_file,
                 },
             ) => match (egress_compression, storage_backend) {
+                (WireEncoding::Raw, StorageBackend::Flat)
+                    if store_dir != std::path::Path::new("/nix/store") =>
+                {
+                    Err(SourcePreparationError::NativeStoreDirectory)
+                }
                 (WireEncoding::Raw, StorageBackend::Flat) => Ok(Self::NativeStore(
                     NativeStoreSettings::new(
                         store_dir.to_owned(),
@@ -125,6 +130,8 @@ impl ServeSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum SourcePreparationError {
+    #[error("native-store HTTP serving requires --native-store-dir /nix/store")]
+    NativeStoreDirectory,
     #[error("native-store options require --serve-source native-store")]
     NativeOptionsForCache,
     #[error(
@@ -144,6 +151,9 @@ pub(crate) enum SourcePreparationError {
 impl SourcePreparationError {
     pub(crate) const fn doctor_detail(self) -> &'static str {
         match self {
+            Self::NativeStoreDirectory => {
+                "native serving requires the standard /nix/store directory"
+            }
             Self::NativeOptionsForCache => "native source options require native-store selection",
             Self::MissingNativeOptions => "required native source options are missing",
             Self::NativeCompressedOutput | Self::NativeChunkedBackend => {
@@ -297,6 +307,24 @@ mod tests {
             min_lease_seconds: NonZeroU64::new(60),
             signing_key_file: None,
         }
+    }
+
+    #[test]
+    fn native_http_rejects_nonstandard_store_roots_before_opening_source_files() {
+        let native = NativeStoreOptions {
+            store_dir: Some(Path::new("/other/store")),
+            ..native_options()
+        };
+        assert_eq!(
+            ServeSource::prepare(
+                ServeSourceChoice::NativeStore,
+                StorageBackend::Flat,
+                WireEncoding::Raw,
+                native
+            )
+            .unwrap_err(),
+            SourcePreparationError::NativeStoreDirectory
+        );
     }
 
     #[test]

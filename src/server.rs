@@ -13,7 +13,6 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use crate::cache::{
     auth::Authorizer,
-    http::{PublicationRequest, ReadContext, ReadSource, prepare_publication, respond},
     http_server::{Method, Request, StatusCode, write_status},
     narinfo::TrustedPublicKeys,
     object::WireEncoding,
@@ -31,6 +30,7 @@ use crate::cache::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure, W
 use crate::{
     config::{ServeConfig, ServeSource},
     error::Error,
+    http::{PublicationRequest, ReadContext, ReadSource, prepare_publication, respond},
 };
 
 mod idle;

@@ -24,6 +24,13 @@ serialization. Lease recovery runs before readiness; bounded expiry cleanup
 continues while serving. Shutdown leaves unexpired roots in place for clients
 with cached metadata.
 
+Trusted advertisements durably associate a NAR hash with its rooted store path.
+Payload requests use that bounded record lookup rather than an unindexed
+database hash query. Unknown or expired associations return a miss without
+leasing an unsigned path. Per-lease association records and the raw-hash index
+are serialized with lease mutation; cleanup retains an index owned by another
+still-live path with identical NAR contents.
+
 ## Identities and representations
 
 A logical NAR has an uncompressed SHA-256 hash and byte count. Its raw, XZ,

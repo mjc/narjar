@@ -38,21 +38,6 @@ impl NativeMetadataSnapshot {
         }
     }
 
-    pub(crate) fn path_for_nar(
-        &self,
-        hash: NarHash,
-    ) -> Result<Option<String>, NativeMetadataError> {
-        let mut query = self
-            .database
-            .prepare("SELECT path FROM ValidPaths WHERE hash = ? ORDER BY path LIMIT 1")
-            .map_err(database_error("preparing Nix NAR-hash lookup"))?;
-        let hash = format!("sha256:{}", data_encoding::HEXLOWER.encode(hash.as_bytes()));
-        query
-            .bind((1, hash.as_str()))
-            .map_err(database_error("binding Nix NAR-hash lookup"))?;
-        read_optional_path(&mut query)
-    }
-
     pub(crate) fn open(state_dir: &Path) -> Result<Self, NativeMetadataError> {
         let database = open_supported_metadata_database(state_dir)
             .map_err(|error| NativeMetadataError::Database(error.to_string()))?;
@@ -153,7 +138,7 @@ impl SignedNativeNarInfo {
         self.metadata.claims()
     }
 
-    pub(crate) fn serialize_raw(self) -> Result<Vec<u8>, crate::cache::narinfo::NarInfoError> {
+    pub(crate) fn serialize_raw(&self) -> Result<Vec<u8>, crate::cache::narinfo::NarInfoError> {
         self.metadata
             .serialize(NarRepresentation::Raw(self.metadata.claims().identity()))
     }
@@ -326,7 +311,7 @@ mod tests {
     const NAR_HASH: &str = "01nvfd133isi40l4id6if932mbwc7mxgwxd8x625xqhjdz6mpzai";
 
     #[test]
-    fn route_lookup_uses_exact_store_hash_and_decoded_identity_without_opening_store_files() {
+    fn route_lookup_rejects_ambiguous_store_hashes_without_opening_store_files() {
         use super::NativeMetadataSnapshot;
         use crate::cache::storage::StoreHash;
         let database = sqlite::Connection::open_thread_safe(":memory:").unwrap();
@@ -346,20 +331,6 @@ mod tests {
         assert_eq!(
             snapshot
                 .path_for_store(StoreHash::parse("11111111111111111111111111111111").unwrap())
-                .unwrap(),
-            None
-        );
-        let nar = super::parse_nix_base16_nar_hash(
-            "sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        )
-        .unwrap();
-        assert_eq!(
-            snapshot.path_for_nar(nar).unwrap().as_deref(),
-            Some(STORE_PATH)
-        );
-        assert_eq!(
-            snapshot
-                .path_for_nar(NarHash::from_digest([42; 32]))
                 .unwrap(),
             None
         );

@@ -78,7 +78,7 @@ narjar serve --data-dir ./cache \
   --native-store-dir /nix/store \
   --native-state-dir /nix/var/nix \
   --native-roots-dir /nix/var/nix/gcroots/auto/narjar \
-  --native-min-lease-seconds 3600 \
+  --native-min-lease-seconds 5187600 \
   --native-signing-key-file ./credentials/producer.sec
 ```
 

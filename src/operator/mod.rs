@@ -920,6 +920,7 @@ pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
         }
         Err(
             SourcePreparationError::NativeOptionsForCache
+            | SourcePreparationError::NativeStoreDirectory
             | SourcePreparationError::MissingNativeOptions
             | SourcePreparationError::NativeCompressedOutput
             | SourcePreparationError::NativeChunkedBackend,
@@ -2275,7 +2276,11 @@ machine other.example password other-secret
         let json = serde_json::to_string(&doctor_json(&report)).unwrap();
 
         assert!(json.contains("\"name\":\"native-store\""));
-        assert!(json.contains("\"detail\":\"Nix store path is unavailable or unsafe\""));
+        assert!(
+            json.contains(
+                "\"detail\":\"native serving requires the standard /nix/store directory\""
+            )
+        );
         assert!(!json.contains("/private/store-path"));
         assert!(!json.contains("/private/state-path"));
         assert!(!json.contains("/private/roots-path"));

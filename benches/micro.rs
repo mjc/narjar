@@ -2,12 +2,19 @@
 #[allow(dead_code, unused_imports)]
 #[path = "../src/cache.rs"]
 mod cache;
+#[cfg(test)]
+#[allow(dead_code, unused_imports)]
+#[path = "../src/http/mod.rs"]
+mod http;
+#[cfg(test)]
 #[allow(dead_code, unused_imports)]
 #[path = "../src/narinfo_signing.rs"]
 mod narinfo_signing;
+#[cfg(test)]
 #[allow(dead_code, unused_imports)]
 #[path = "../src/native_store.rs"]
 mod native_store;
+#[cfg(test)]
 #[allow(dead_code, unused_imports)]
 #[path = "../src/verified_stream.rs"]
 mod verified_stream;
