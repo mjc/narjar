@@ -19,9 +19,15 @@ use ureq::{Agent, http::StatusCode};
 
 use crate::{
     cache::{
-        narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file},
+        narinfo::{
+            MAX_NARINFO_BYTES, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file,
+            require_raw_narinfo_transport,
+        },
         object::NarRepresentation,
-        storage::{AdvertisementEvidence, NarUploadPolicy, Storage, StorageError, StoreHash},
+        storage::{
+            AdvertisedNarInfo, AdvertisementEvidence, NarUploadPolicy, Storage, StorageError,
+            StoreHash,
+        },
     },
     http_client::idle_agent,
     http_url::HttpUrl,
@@ -127,6 +133,32 @@ pub(crate) struct ReadThroughSource {
 }
 
 impl ReadThroughSource {
+    pub(crate) fn advertise<'storage>(
+        &self,
+        storage: &'storage Storage,
+        store: &StoreHash,
+    ) -> Result<AdvertisedNarInfo<'storage>, EdgeFailure> {
+        match self.ensure_local(storage, store) {
+            EdgeLookup::Miss(failure) => Err(failure),
+            EdgeLookup::Ready => self
+                .open_raw_advertisement_after_lease_renewal(storage, store)
+                .inspect_err(|failure| increment(&self.counters.failures[*failure])),
+        }
+    }
+
+    fn open_raw_advertisement_after_lease_renewal<'storage>(
+        &self,
+        storage: &'storage Storage,
+        store: &StoreHash,
+    ) -> Result<AdvertisedNarInfo<'storage>, EdgeFailure> {
+        let advertisement = storage
+            .read_advertised_narinfo(store)
+            .map_err(EdgeFailure::ingestion)?
+            .ok_or(EdgeFailure::Storage)?;
+        require_raw_narinfo_transport(&advertisement.bytes).map_err(|_| EdgeFailure::Invalid)?;
+        Ok(advertisement)
+    }
+
     pub(crate) fn new(
         settings: EdgeSettings,
         keys: Arc<TrustedPublicKeys>,
@@ -230,6 +262,10 @@ impl ReadThroughSource {
             .keys
             .validate(store, bytes)
             .map_err(|_| EdgeFailure::Invalid)?;
+        match metadata.payload() {
+            NarRepresentation::Raw(_) => {}
+            NarRepresentation::Compressed(_) => return Err(EdgeFailure::Invalid),
+        }
         let bound = storage
             .bind_canonical_narinfo(metadata)
             .map_err(EdgeFailure::ingestion)?;
@@ -449,6 +485,13 @@ impl ReadThroughSource {
             "# TYPE narjar_edge_active_fills gauge\nnarjar_edge_active_fills {}",
             self.active.load(Ordering::Relaxed)
         );
+        if let Ok(state) = self.state.lock() {
+            let _ = writeln!(
+                output,
+                "# TYPE narjar_edge_negative_entries gauge\nnarjar_edge_negative_entries {}",
+                state.negative_entries()
+            );
+        }
     }
 }
 

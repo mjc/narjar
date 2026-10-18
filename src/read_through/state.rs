@@ -36,6 +36,10 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn negative_entries(&self) -> usize {
+        self.negatives.len()
+    }
+
     pub(super) fn new(max_fills: usize) -> Self {
         Self {
             flights: HashMap::new(),
@@ -110,6 +114,7 @@ pub(super) struct Flight {
 impl Flight {
     pub(super) fn wait(&self, deadline: Deadline) -> Result<(), EdgeFailure> {
         let mut progress = self.progress.lock().map_err(|_| EdgeFailure::Storage)?;
+        let remaining = deadline.remaining()?;
         match &mut *progress {
             Progress::Complete(result) => {
                 deadline.remaining()?;
@@ -120,27 +125,21 @@ impl Flight {
             }
             Progress::Running { waiters } => *waiters += 1,
         }
-        loop {
-            let remaining = match deadline.remaining() {
-                Ok(remaining) => remaining,
-                Err(failure) => {
-                    if let Progress::Running { waiters } = &mut *progress {
-                        *waiters -= 1;
-                    }
-                    return Err(failure);
-                }
-            };
-            let (next, _) = self
-                .completed
-                .wait_timeout(progress, remaining)
-                .map_err(|_| EdgeFailure::Storage)?;
-            progress = next;
-            match *progress {
-                Progress::Complete(result) => {
-                    deadline.remaining()?;
-                    return result;
-                }
-                Progress::Running { .. } => {}
+        let (mut progress, _) = self
+            .completed
+            .wait_timeout_while(progress, remaining, |progress| match progress {
+                Progress::Running { .. } => true,
+                Progress::Complete(_) => false,
+            })
+            .map_err(|_| EdgeFailure::Storage)?;
+        match &mut *progress {
+            Progress::Complete(result) => {
+                deadline.remaining()?;
+                *result
+            }
+            Progress::Running { waiters } => {
+                *waiters -= 1;
+                Err(EdgeFailure::Transient)
             }
         }
     }

@@ -251,6 +251,100 @@ fn empty_trust_is_rejected_before_any_fill() {
 }
 
 #[test]
+fn offline_repair_rejects_compressed_publications_in_a_raw_only_edge() {
+    let fixture = Fixture::new();
+    let (directory, storage) = storage();
+    storage
+        .publish_nar(
+            crate::cache::object::NarFileName::raw(fixture.identity.hash()),
+            fixture.raw.as_slice(),
+            fixture.raw.len() as u64,
+            NarUploadPolicy::new(1024 * 1024, 0),
+        )
+        .unwrap();
+    let compressed = fixture.metadata(
+        STORE,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+    );
+    let store = StoreHash::parse(STORE).unwrap();
+    fs::write(
+        directory.path().join(format!("{STORE}.narinfo")),
+        &compressed,
+    )
+    .unwrap();
+    let source = ReadThroughSource::new(
+        settings("http://127.0.0.1:1".parse().unwrap()),
+        trusted_keys(),
+        NarUploadPolicy::new(1024 * 1024, 0),
+    )
+    .unwrap();
+    assert_eq!(
+        source.ensure_local(&storage, &store),
+        EdgeLookup::Miss(EdgeFailure::Invalid)
+    );
+    assert!(matches!(
+        storage.advertisement_evidence(store).unwrap(),
+        AdvertisementEvidence::Missing
+    ));
+    assert_eq!(
+        fs::read(directory.path().join(format!("{STORE}.narinfo"))).unwrap(),
+        compressed,
+        "raw-only mode must not overwrite immutable metadata"
+    );
+}
+
+#[test]
+fn recorded_leases_do_not_make_compressed_metadata_a_raw_edge_advertisement() {
+    use crate::cache::object::{NarFileName, WireEncoding};
+    let fixture = Fixture::new();
+    let (_directory, storage) = storage();
+    let policy = NarUploadPolicy::new(1024 * 1024, 0);
+    storage
+        .publish_nar(
+            NarFileName::raw(fixture.identity.hash()),
+            fixture.raw.as_slice(),
+            fixture.raw.len() as u64,
+            policy,
+        )
+        .unwrap();
+    let store = StoreHash::parse(STORE).unwrap();
+    let metadata = trusted_keys()
+        .validate(
+            &store,
+            fixture.metadata(
+                STORE,
+                NarRepresentation::Raw(fixture.identity),
+                &signing_key(),
+            ),
+        )
+        .unwrap();
+    storage
+        .bind_narinfo(
+            metadata,
+            WireEncoding::Compressed(CompressionCodec::Zstd),
+            policy,
+        )
+        .unwrap()
+        .publish()
+        .unwrap();
+    let source = ReadThroughSource::new(
+        settings("http://127.0.0.1:1".parse().unwrap()),
+        trusted_keys(),
+        policy,
+    )
+    .unwrap();
+    assert!(matches!(
+        storage.advertisement_evidence(store).unwrap(),
+        AdvertisementEvidence::Recorded
+    ));
+    assert_eq!(
+        source.advertise(&storage, &store).err(),
+        Some(EdgeFailure::Invalid)
+    );
+}
+
+#[test]
 fn overlapping_store_requests_make_one_upstream_generation_and_local_hits_stay_offline() {
     let fixture = Fixture::new();
     let metadata = fixture.metadata(

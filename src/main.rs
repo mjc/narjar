@@ -89,6 +89,35 @@ mod tests {
     use super::{Cli, Command};
 
     #[test]
+    fn doctor_does_not_advertise_an_unconfigurable_read_through_source() {
+        let result = Cli::try_parse_from([
+            "narjar",
+            "doctor",
+            "--data-dir",
+            "/cache",
+            "--serve-source",
+            "read-through",
+        ]);
+        assert!(
+            result.is_err(),
+            "doctor has no upstream input; inspect edge storage through its default cache diagnostics"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "narjar",
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--serve-source",
+                "read-through",
+                "--edge-upstream",
+                "https://cache.example"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn command_schema_rejects_invalid_input() {
         for args in [
             ["serve", "--unknown"].as_slice(),

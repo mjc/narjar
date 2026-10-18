@@ -272,6 +272,8 @@ start_server() {
   esac
   # Empty PATH proves the servers need no runtime Nix executable. In particular
   # the edge's native-store paths are absent sentinels, checked after shutdown.
+  # Clear the previous run before forking, not in the background child's redirect.
+  : > "$temp_root/$role.stdout"
   "${isolated_env[@]}" PATH="$temp_root/empty-path" \
     NIX_REMOTE="$(store_uri "$temp_root/$role-native")" \
     NIX_STORE_DIR="$temp_root/$role-native/store" \
@@ -325,7 +327,7 @@ cached_row() {
 }
 metric_count() {
   local route=$1 total=0 value
-  get "$edge_url/metrics" > "$temp_root/metrics"
+  get "$edge_url/metrics" > "$temp_root/metrics" || fail 'edge metrics request failed'
   while IFS= read -r value; do
     total=$((total + value))
   done < <(sed -n "s/^narjar_http_requests_total{method=\"GET\",route=\"$route\",status=\"[^\"]*\"} \([0-9][0-9]*\)$/\1/p" "$temp_root/metrics")

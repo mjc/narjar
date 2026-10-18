@@ -87,7 +87,9 @@ narjar serve --data-dir ./edge --listen 127.0.0.1:5000 \
 
 Configure Nix to use the local endpoint, not the central URL. Push directly to
 the central cache. The edge is read-only and rejects PUT without accepting a
-body. It needs neither Nix executables nor a Nix database.
+body. It needs neither Nix executables nor a Nix database. Use
+`narjar doctor --data-dir ./edge` for local storage diagnostics; it does not
+probe the upstream.
 
 A local miss fetches bounded, signature-verified metadata and its exact payload.
 The edge validates and commits the payload, projects raw narinfo, then commits
@@ -95,6 +97,8 @@ metadata and its retention lease before returning success. It accepts raw, XZ,
 and Zstd input and serves raw output. Concurrent requests for the same object
 share the fill. Redirects are rejected; payload routes stay under the configured
 upstream base URL.
+Existing compressed publications are not advertised by raw-only edge mode; it
+does not overwrite or migrate them. Initialize a separate edge data directory.
 
 An upstream 404, timeout, refused connection, 429/503, invalid signature or
 incomplete/corrupt payload produces a local narinfo 404. Nix can then build a

@@ -148,10 +148,9 @@ impl Storage {
         if let AdvertisementLeases::Active {
             policy: existing, ..
         } = self.advertisements
+            && existing == policy
         {
-            if existing == policy {
-                return Ok(());
-            }
+            return Ok(());
         }
         let directory =
             ensure_directory_at(&self.root, DIRECTORY.as_ref(), "advertisement directory")?;
@@ -167,11 +166,21 @@ impl Storage {
         store: StoreHash,
         identity: NarIdentity,
     ) -> Result<(), StorageError> {
-        self.update_advertisement_lease(store, LeasePurpose::Publication(identity), unix_seconds()?)
+        self.update_advertisement_lease(
+            store,
+            LeasePurpose::Publication(identity),
+            unix_seconds()?,
+            File::sync_all,
+        )
     }
 
     pub(super) fn renew_advertisement_lease(&self, store: StoreHash) -> Result<(), StorageError> {
-        self.update_advertisement_lease(store, LeasePurpose::Advertisement, unix_seconds()?)
+        self.update_advertisement_lease(
+            store,
+            LeasePurpose::Advertisement,
+            unix_seconds()?,
+            File::sync_all,
+        )
     }
 
     fn update_advertisement_lease(
@@ -179,6 +188,7 @@ impl Storage {
         store: StoreHash,
         purpose: LeasePurpose,
         now: u64,
+        synchronize_reused: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<(), StorageError> {
         match &self.advertisements {
             AdvertisementLeases::Absent => Ok(()),
@@ -213,7 +223,9 @@ impl Storage {
                     .checked_add(policy.lifetime_seconds.get())
                     .ok_or_else(|| invalid("advertisement expiry overflow"))?;
                 match existing {
-                    Some(record) if record.expires_at >= required_expiry => Ok(()),
+                    Some(record) if record.expires_at >= required_expiry => {
+                        synchronize_reused(directory).map_err(Into::into)
+                    }
                     Some(_) | None => {
                         let headroom = policy.lifetime_seconds.get().div_ceil(10).min(3600);
                         let lease = AdvertisementLease {
@@ -243,6 +255,28 @@ impl Storage {
             Cursor::new(bytes),
         )
         .map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_advertisement_renewal_with_unavailable_reserve_for_test(
+        &mut self,
+        store: StoreHash,
+    ) -> Result<(), StorageError> {
+        let AdvertisementLeases::Active { directory, policy } = &self.advertisements else {
+            return Err(invalid("test requires configured advertisement retention"));
+        };
+        let directory = directory.try_clone()?;
+        let mut policy = *policy;
+        policy.min_free_bytes = u64::MAX;
+        let name = lease_name(store);
+        let mut record: AdvertisementLease = read_record(&directory, &name)?
+            .ok_or_else(|| invalid("test requires an existing advertisement"))?;
+        record.expires_at = unix_seconds()? + (policy.lifetime_seconds.get() / 2).max(1);
+        // Set controlled admission policy without consuming real filesystem capacity.
+        self.publish_advertisement_record(POLICY.into(), &policy, 0)?;
+        self.publish_advertisement_record(name, &record, 0)?;
+        self.advertisements = AdvertisementLeases::Active { directory, policy };
+        Ok(())
     }
 
     pub(super) fn advertisement_protection(
@@ -330,8 +364,100 @@ fn invalid(message: impl Into<String>) -> StorageError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        CacheCreation, Directory, SupportedStorageBackend, publication::PublishBoundary,
+    };
     use super::*;
     use crate::cache::object::NarHash;
+
+    fn advertised_fixture() -> (tempfile::TempDir, Storage, StoreHash, NarIdentity) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = CacheCreation::prepare(
+            &Directory::open(directory.path()).unwrap(),
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap()
+        .create_or_complete()
+        .unwrap();
+        storage
+            .configure_advertisement_leases(NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let store = StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        storage.record_publication_lease(store, identity).unwrap();
+        (directory, storage, store, identity)
+    }
+
+    #[test]
+    fn failed_renewal_keeps_the_previous_durable_promise_intact() {
+        let (_directory, mut storage, store, identity) = advertised_fixture();
+        storage
+            .force_advertisement_renewal_with_unavailable_reserve_for_test(store)
+            .unwrap();
+        let AdvertisementLeases::Active { directory, .. } = &storage.advertisements else {
+            panic!("configured policy")
+        };
+        let before: AdvertisementLease =
+            read_record(directory, &lease_name(store)).unwrap().unwrap();
+        assert!(matches!(
+            storage.renew_advertisement_lease(store),
+            Err(StorageError::InsufficientSpace)
+        ));
+        let after: AdvertisementLease =
+            read_record(directory, &lease_name(store)).unwrap().unwrap();
+        assert_eq!(after.expires_at, before.expires_at);
+        assert_eq!(after.identity, identity);
+        let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
+        assert!(protection.protects(ProtectedObject::Publication(store)));
+        assert!(protection.protects(ProtectedObject::CanonicalNar(identity.hash())));
+    }
+
+    #[test]
+    fn retry_of_an_unacknowledged_lease_replacement_must_complete_directory_sync() {
+        let (directory, storage, store, identity) = advertised_fixture();
+        let now = unix_seconds().unwrap();
+        let record = AdvertisementLease {
+            version: 1,
+            identity,
+            expires_at: now + 7200,
+        };
+        let name = lease_name(store);
+        let bytes = postcard::to_allocvec(&record).unwrap();
+        let failure = storage.publish_with(
+            PublishTarget::AdvertisementRecord(&name),
+            Cursor::new(bytes),
+            |boundary| match boundary {
+                PublishBoundary::BeforeParentSync => {
+                    Err(io::Error::other("injected lease directory sync failure").into())
+                }
+                _ => Ok(()),
+            },
+        );
+        assert!(
+            failure.is_err(),
+            "rename is visible but not acknowledged as durable"
+        );
+        let failure =
+            storage.update_advertisement_lease(store, LeasePurpose::Advertisement, now, |_| {
+                Err(io::Error::other("directory synchronization still fails"))
+            });
+        assert!(
+            failure.is_err(),
+            "a visible future expiry cannot bypass the missing durability barrier"
+        );
+        storage
+            .update_advertisement_lease(store, LeasePurpose::Advertisement, now, File::sync_all)
+            .unwrap();
+        drop(storage);
+        let storage = Storage::open(
+            &Directory::open(directory.path()).unwrap(),
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap();
+        let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
+        assert!(protection.protects(ProtectedObject::Publication(store)));
+        assert!(protection.protects(ProtectedObject::CanonicalNar(identity.hash())));
+    }
 
     #[test]
     fn missing_publication_evidence_is_conservative_but_expired_leases_release_both_identities() {

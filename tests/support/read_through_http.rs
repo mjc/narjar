@@ -121,3 +121,87 @@ fn read_through_http_advertises_only_after_complete_durable_payload() {
 fn read_through_http_turns_mid_payload_disconnect_into_a_clean_miss() {
     assert_edge_waits_for_the_exact_payload(PayloadEnd::Disconnect);
 }
+
+#[test]
+fn read_through_http_failed_renewal_is_a_miss_without_revoking_the_payload() {
+    use crate::cache::storage::{Directory, Storage, StoreHash, SupportedStorageBackend};
+    let central = RunningServer::start("edge-renewal-central");
+    assert!(
+        response_parts(&central.request_with_body(
+            "PUT",
+            &format!("/nar/{NARJAR_HASH}.nar"),
+            &[],
+            NAR_BYTES
+        ))
+        .0
+        .starts_with("HTTP/1.1 201")
+    );
+    assert!(
+        response_parts(&central.request_with_body(
+            "PUT",
+            &format!("/{STORE_HASH}.narinfo"),
+            &[],
+            signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64).as_bytes()
+        ))
+        .0
+        .starts_with("HTTP/1.1 201")
+    );
+    let upstream = format!("http://{}", central.address);
+    let args = [
+        "--serve-source",
+        "read-through",
+        "--edge-upstream",
+        &upstream,
+        "--edge-lease-seconds",
+        "60",
+        "--min-free-bytes",
+        "0",
+    ];
+    let edge = RunningServer::start_with_args("edge-renewal-capacity", &args);
+    let route = format!("/{STORE_HASH}.narinfo");
+    assert!(
+        response_parts(&edge.request("GET", &route))
+            .0
+            .starts_with("HTTP/1.1 200")
+    );
+    let (directory, signal, status) = edge.stop_preserving();
+    assert_clean_shutdown(signal, status);
+    let (signal, status) = central.stop();
+    assert_clean_shutdown(signal, status);
+    let mut storage = Storage::open(
+        &Directory::open(directory.path()).unwrap(),
+        SupportedStorageBackend::FLAT,
+    )
+    .unwrap();
+    storage
+        .force_advertisement_renewal_with_unavailable_reserve_for_test(
+            StoreHash::parse(STORE_HASH).unwrap(),
+        )
+        .unwrap();
+    drop(storage);
+    let reserve = u64::MAX.to_string();
+    let args = [
+        "--serve-source",
+        "read-through",
+        "--edge-upstream",
+        &upstream,
+        "--edge-lease-seconds",
+        "60",
+        "--min-free-bytes",
+        &reserve,
+    ];
+    let edge = RunningServer::start_in(directory, &args);
+    for method in ["GET", "HEAD"] {
+        let response = edge.request(method, &route);
+        assert!(
+            response_parts(&response).0.starts_with("HTTP/1.1 404"),
+            "{method} must fail open when a new durable promise cannot be made: {}",
+            response_parts(&response).0
+        );
+    }
+    let response = edge.request("GET", &format!("/nar/{NARJAR_HASH}.nar"));
+    assert!(response_parts(&response).0.starts_with("HTTP/1.1 200"));
+    assert_eq!(response_parts(&response).1, NAR_BYTES);
+    let (signal, status) = edge.stop();
+    assert_clean_shutdown(signal, status);
+}

@@ -44,6 +44,8 @@ jobs:
         run: nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend flat
       - name: Real Nix end-to-end gate (chunked)
         run: nix run -L --no-update-lock-file .#nix-e2e -- --storage-backend chunked
+      - name: Read-through edge outage and retained-metadata acceptance
+        run: nix run -L --no-update-lock-file .#edge-e2e
       - run: nix run -L --no-update-lock-file .#provenance
 
   darwin:

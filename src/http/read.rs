@@ -17,7 +17,7 @@ use crate::cache::{
 
 use super::write::unauthorized;
 use crate::native_store::serving::{NativeReadError, NativeStoreSource};
-use crate::read_through::{EdgeLookup, ReadThroughSource};
+use crate::read_through::ReadThroughSource;
 
 pub(crate) enum ReadSource {
     FlatCache,
@@ -172,19 +172,29 @@ fn respond_narinfo(
     public_control: &'static str,
 ) -> Option<TcpStream> {
     let lookup_started = Instant::now();
-    let crate::cache::storage::AdvertisedNarInfo { bytes, _activity } =
-        match load_published_narinfo(storage, store) {
-            Ok(advertisement) => advertisement,
-            Err(NarInfoReadFailure::Missing) => {
-                record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
-                return not_found(guard, request);
-            }
-            Err(NarInfoReadFailure::InvalidOrUnreadable) => {
-                record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
-                return internal_error(guard, request);
-            }
-        };
+    let advertisement = match load_published_narinfo(storage, store) {
+        Ok(advertisement) => advertisement,
+        Err(NarInfoReadFailure::Missing) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
+            return not_found(guard, request);
+        }
+        Err(NarInfoReadFailure::InvalidOrUnreadable) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+            return internal_error(guard, request);
+        }
+    };
     record_narinfo_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
+    send_advertised_narinfo(request, advertisement, guard, visibility, public_control)
+}
+
+fn send_advertised_narinfo(
+    request: Request,
+    advertisement: crate::cache::storage::AdvertisedNarInfo<'_>,
+    guard: &RequestGuard<'_>,
+    visibility: ReadVisibility,
+    public_control: &'static str,
+) -> Option<TcpStream> {
+    let crate::cache::storage::AdvertisedNarInfo { bytes, _activity } = advertisement;
     let response = cache_policy(
         Response::from_data(bytes).with_header(header("Content-Type", "text/x-nix-narinfo")),
         visibility,
@@ -201,16 +211,14 @@ fn respond_edge_narinfo(
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
-    match source.ensure_local(storage, store) {
-        EdgeLookup::Ready => {
-            respond_narinfo(request, storage, store, guard, visibility, "no-store")
+    let lookup_started = Instant::now();
+    match source.advertise(storage, store) {
+        Ok(advertisement) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
+            send_advertised_narinfo(request, advertisement, guard, visibility, "no-store")
         }
-        EdgeLookup::Miss(_) => {
-            guard.record_cache_lookup(
-                CacheObject::NarInfo,
-                CacheLookupOutcome::Miss,
-                std::time::Duration::ZERO,
-            );
+        Err(_) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
             send_response(
                 guard,
                 request,
