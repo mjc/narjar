@@ -384,12 +384,15 @@ impl Storage {
         claims: &NarInfoClaims,
         bytes: Vec<u8>,
     ) -> Result<PublishOutcome, StorageError> {
-        match self.publish(PublishTarget::NarInfo(claims.store()), Cursor::new(bytes)) {
+        let outcome = match self.publish(PublishTarget::NarInfo(claims.store()), Cursor::new(bytes))
+        {
             Err(StorageError::Conflict) if self.existing_narinfo_matches(claims)? => {
                 Ok(PublishOutcome::Identical)
             }
             result => result,
-        }
+        }?;
+        self.record_publication_lease(*claims.store(), claims.identity())?;
+        Ok(outcome)
     }
 
     fn existing_narinfo_matches(&self, expected: &NarInfoClaims) -> Result<bool, StorageError> {
@@ -812,6 +815,7 @@ impl Storage {
                     crate::cache::narinfo::MAX_NARINFO_BYTES,
                 )
                 .map_err(io::Error::from)?;
+                self.renew_advertisement_lease(*store)?;
                 self.access
                     .record(super::access::AccessKey::Publication(*store));
                 Ok(AdvertisedNarInfo {

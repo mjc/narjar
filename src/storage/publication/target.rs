@@ -63,6 +63,7 @@ pub(crate) enum PublishTarget<'a> {
     IngestionReceipt(&'a IngestionReceipt),
     EgressReceipt(&'a EgressReceipt),
     RepairEgressNar(EncodedIdentity),
+    AdvertisementRecord(&'a std::ffi::OsStr),
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +102,12 @@ pub(crate) enum DestinationPublication {
 impl PublishTarget<'_> {
     pub(crate) fn destination(&self) -> PublicationDestination {
         match self {
+            Self::AdvertisementRecord(name) => PublicationDestination {
+                path: StorePath::Advertisement(name.to_os_string()),
+                temporary_directory: TemporaryDirectory::Root,
+                publication: DestinationPublication::Replace,
+                temp_prefix: "advertisement",
+            },
             Self::CacheInfo => PublicationDestination {
                 path: StorePath::Root(OsString::from("nix-cache-info")),
                 temporary_directory: TemporaryDirectory::Root,

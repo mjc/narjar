@@ -40,6 +40,7 @@ impl PayloadStorage {
 #[derive(Debug)]
 pub struct Storage {
     pub(super) access: super::access::AccessRecorder,
+    pub(super) advertisements: super::advertisement::AdvertisementLeases,
     #[cfg(test)]
     pub(super) layout: Layout,
     pub(super) root: File,

@@ -194,6 +194,7 @@ impl CollectionCoordinator {
             generation: activity.generation,
             protect_all_until: activity.protect_all_until,
             protection,
+            durable: super::advertisement::AdvertisementProtection::Absent,
         })
     }
 }
@@ -261,6 +262,7 @@ pub(super) struct CollectionSnapshot<'coordinator> {
     generation: u64,
     protect_all_until: Instant,
     pub(super) protection: ObjectSelection,
+    pub(super) durable: super::advertisement::AdvertisementProtection,
 }
 
 impl<'coordinator> CollectionSnapshot<'coordinator> {

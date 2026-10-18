@@ -353,6 +353,7 @@ fn valid_temp_filename(name: &OsStr) -> bool {
         "realisation-",
         "validation-",
         "egress-receipt-",
+        "advertisement-",
     ]
     .into_iter()
     .find_map(|prefix| stem.strip_prefix(prefix)) else {

@@ -127,16 +127,31 @@ enum ChunkedCollectionAction<'storage> {
 impl<'storage> CollectionAccess<'storage> {
     fn protects(&self, object: ProtectedObject) -> bool {
         match self {
-            Self::Offline(_) => false,
-            Self::Online(snapshot) => snapshot.protection.contains(object),
+            Self::Offline(snapshot) => snapshot.durable.protects(object),
+            Self::Online(snapshot) => {
+                snapshot.durable.protects(object) || snapshot.protection.contains(object)
+            }
         }
     }
 
     fn protects_nar_name(&self, name: &OsStr) -> bool {
         match self {
-            Self::Offline(_) => false,
-            Self::Online(snapshot) => snapshot.protection.contains_nar_name(name),
+            Self::Offline(snapshot) => snapshot.durable.protects_nar_name(name),
+            Self::Online(snapshot) => {
+                snapshot.durable.protects_nar_name(name)
+                    || snapshot.protection.contains_nar_name(name)
+            }
         }
+    }
+
+    fn with_durable_protection(
+        mut self,
+        protection: super::advertisement::AdvertisementProtection,
+    ) -> Self {
+        match &mut self {
+            Self::Offline(snapshot) | Self::Online(snapshot) => snapshot.durable = protection,
+        }
+        self
     }
 
     fn authorize(
@@ -513,6 +528,8 @@ fn run_with_capacity_measurement(
     access: CollectionAccess<'_>,
     mut measure: impl FnMut(&Storage) -> Result<super::StorageCapacity, StorageError>,
 ) -> Result<GcReport, StorageError> {
+    let access =
+        access.with_durable_protection(storage.advertisement_protection(SystemTime::now())?);
     let target_bytes = gc_target_bytes(&options)?;
     let mode = options.mode;
     let thresholds = options.retention.free_space;
@@ -1664,6 +1681,7 @@ fn apply_marked_chunked(
             &root,
             super::access::AccessKey::Publication(entries[index].store),
         );
+        storage.forget_advertisement(entries[index].store);
     });
     let selected_outputs = selected
         .entries
@@ -2315,6 +2333,7 @@ fn apply_with_checkpoint(
         checkpoint(FailurePoint::AfterNarinfoDeleteBeforeSync)?;
         root.sync_all()?;
         super::access::forget(&root, super::access::AccessKey::Publication(entry.store));
+        storage.forget_advertisement(entry.store);
         checkpoint(FailurePoint::AfterNarinfoSyncBeforeNarDelete)?;
         let mut deleted_payload = false;
         let mut deleted_raw_nar = false;
@@ -2417,6 +2436,40 @@ mod tests {
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
         CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
             .and_then(|creation| creation.create_or_complete())
+    }
+
+    #[test]
+    fn durable_advertisement_leases_survive_restart_and_protect_offline_collection() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        storage
+            .record_publication_lease(
+                entry.store,
+                crate::cache::object::NarIdentity::new(
+                    NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+                    3.into(),
+                ),
+            )
+            .unwrap();
+        drop(storage);
+        let root = Directory::open(directory.path()).unwrap();
+        let storage = Storage::open(&root, SupportedStorageBackend::FLAT).unwrap();
+        let trusted = TrustedPublicKeys::load(&root).unwrap();
+        let report = run_with_access(
+            online_options(),
+            &storage,
+            &trusted,
+            CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            report.deleted_narinfos, 0,
+            "restarting must not erase the promise to a client's cached narinfo"
+        );
+        assert!(directory.path().join(entry.narinfo_name).is_file());
+        assert!(directory.path().join("nar").join(entry.nar_name).is_file());
     }
 
     #[test]
