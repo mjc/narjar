@@ -64,6 +64,7 @@ impl ServeSource {
                     state_dir: None,
                     roots_dir: None,
                     min_lease_seconds: None,
+                    signing_key_file: None,
                 },
             ) => Ok(Self::FlatCache {
                 storage_backend: SupportedStorageBackend::try_from(storage_backend)
@@ -78,16 +79,23 @@ impl ServeSource {
                     state_dir: Some(state_dir),
                     roots_dir: Some(roots_dir),
                     min_lease_seconds: Some(min_lease_seconds),
+                    signing_key_file,
                 },
             ) => match (egress_compression, storage_backend) {
-                (WireEncoding::Raw, StorageBackend::Flat) => {
-                    Ok(Self::NativeStore(NativeStoreSettings::new(
+                (WireEncoding::Raw, StorageBackend::Flat)
+                    if store_dir != std::path::Path::new("/nix/store") =>
+                {
+                    Err(SourcePreparationError::NativeStoreDirectory)
+                }
+                (WireEncoding::Raw, StorageBackend::Flat) => Ok(Self::NativeStore(
+                    NativeStoreSettings::new(
                         store_dir.to_owned(),
                         state_dir.to_owned(),
                         roots_dir.to_owned(),
                         min_lease_seconds,
-                    )))
-                }
+                    )
+                    .with_signing_key_file(signing_key_file),
+                )),
                 (WireEncoding::Raw, StorageBackend::Chunked) => {
                     Err(SourcePreparationError::NativeChunkedBackend)
                 }
@@ -122,6 +130,8 @@ impl ServeSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum SourcePreparationError {
+    #[error("native-store HTTP serving requires --native-store-dir /nix/store")]
+    NativeStoreDirectory,
     #[error("native-store options require --serve-source native-store")]
     NativeOptionsForCache,
     #[error(
@@ -141,6 +151,9 @@ pub(crate) enum SourcePreparationError {
 impl SourcePreparationError {
     pub(crate) const fn doctor_detail(self) -> &'static str {
         match self {
+            Self::NativeStoreDirectory => {
+                "native serving requires the standard /nix/store directory"
+            }
             Self::NativeOptionsForCache => "native source options require native-store selection",
             Self::MissingNativeOptions => "required native source options are missing",
             Self::NativeCompressedOutput | Self::NativeChunkedBackend => {
@@ -155,7 +168,6 @@ impl SourcePreparationError {
 pub(crate) enum ServeSourceChoice {
     #[default]
     FlatCache,
-    #[value(hide = true)]
     NativeStore,
 }
 
@@ -211,14 +223,17 @@ pub(crate) struct ServeArgs {
         default_value = "flat-cache"
     )]
     source: ServeSourceChoice,
-    #[arg(long, hide = true, env = "NARJAR_NATIVE_STORE_DIR", value_parser = non_empty_path)]
+    #[arg(long, env = "NARJAR_NATIVE_STORE_DIR", value_parser = non_empty_path)]
     native_store_dir: Option<PathBuf>,
-    #[arg(long, hide = true, env = "NARJAR_NATIVE_STATE_DIR", value_parser = non_empty_path)]
+    #[arg(long, env = "NARJAR_NATIVE_STATE_DIR", value_parser = non_empty_path)]
     native_state_dir: Option<PathBuf>,
-    #[arg(long, hide = true, env = "NARJAR_NATIVE_ROOTS_DIR", value_parser = non_empty_path)]
+    #[arg(long, env = "NARJAR_NATIVE_ROOTS_DIR", value_parser = non_empty_path)]
     native_roots_dir: Option<PathBuf>,
-    #[arg(long, hide = true, env = "NARJAR_NATIVE_MIN_LEASE_SECONDS")]
+    #[arg(long, env = "NARJAR_NATIVE_MIN_LEASE_SECONDS")]
     native_min_lease_seconds: Option<NonZeroU64>,
+    /// Nix secret key used to sign native paths without a reusable trusted signature.
+    #[arg(long, env = "NARJAR_NATIVE_SIGNING_KEY_FILE", value_parser = non_empty_path)]
+    native_signing_key_file: Option<PathBuf>,
     #[arg(
         long,
         env = "NARJAR_STATS_INVENTORY_INTERVAL_SECONDS",
@@ -243,6 +258,7 @@ impl TryFrom<ServeArgs> for ServeConfig {
                 state_dir: args.native_state_dir.as_deref(),
                 roots_dir: args.native_roots_dir.as_deref(),
                 min_lease_seconds: args.native_min_lease_seconds,
+                signing_key_file: args.native_signing_key_file.as_deref(),
             },
         )
         .map_err(|error| error.to_string())?;
@@ -289,7 +305,26 @@ mod tests {
             state_dir: Some(Path::new("/nix/var/nix")),
             roots_dir: Some(Path::new("/var/lib/narjar-roots")),
             min_lease_seconds: NonZeroU64::new(60),
+            signing_key_file: None,
         }
+    }
+
+    #[test]
+    fn native_http_rejects_nonstandard_store_roots_before_opening_source_files() {
+        let native = NativeStoreOptions {
+            store_dir: Some(Path::new("/other/store")),
+            ..native_options()
+        };
+        assert_eq!(
+            ServeSource::prepare(
+                ServeSourceChoice::NativeStore,
+                StorageBackend::Flat,
+                WireEncoding::Raw,
+                native
+            )
+            .unwrap_err(),
+            SourcePreparationError::NativeStoreDirectory
+        );
     }
 
     #[test]
@@ -303,6 +338,7 @@ mod tests {
                 min_lease_seconds: (present & 8 != 0)
                     .then_some(complete.min_lease_seconds)
                     .flatten(),
+                signing_key_file: None,
             };
             let native = ServeSource::prepare(
                 ServeSourceChoice::NativeStore,

@@ -16,6 +16,48 @@ use crate::cache::{
 };
 
 use super::write::unauthorized;
+use crate::native_store::serving::{NativeReadError, NativeStoreSource};
+
+pub(crate) enum ReadSource {
+    FlatCache,
+    NativeStore(Box<NativeStoreSource>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReadContext<'a> {
+    pub(crate) storage: &'a Storage,
+    pub(crate) source: &'a ReadSource,
+}
+
+impl ReadSource {
+    pub(crate) fn maintain(&self) {
+        match self {
+            Self::FlatCache => {}
+            Self::NativeStore(source) => source.maintain(),
+        }
+    }
+
+    fn allowed_methods(&self) -> &'static str {
+        match self {
+            Self::FlatCache => "GET, HEAD, PUT",
+            Self::NativeStore(_) => "GET, HEAD",
+        }
+    }
+}
+
+impl ReadContext<'_> {
+    fn readiness(self, min_free_bytes: u64) -> StorageReadiness {
+        match self.source {
+            ReadSource::FlatCache => self
+                .storage
+                .is_ready(min_free_bytes)
+                .unwrap_or(StorageReadiness::ProbeFailed),
+            ReadSource::NativeStore(source) => source
+                .readiness(min_free_bytes)
+                .unwrap_or(StorageReadiness::ProbeFailed),
+        }
+    }
+}
 
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
@@ -170,6 +212,135 @@ fn record_narinfo_lookup(
     lookup_started: Instant,
 ) {
     guard.record_cache_lookup(CacheObject::NarInfo, outcome, lookup_started.elapsed());
+}
+
+fn native_read_failure(
+    request: Request,
+    guard: &RequestGuard<'_>,
+    error: NativeReadError,
+) -> Option<TcpStream> {
+    match error {
+        NativeReadError::Missing | NativeReadError::Signature => not_found(guard, request),
+        NativeReadError::Metadata(_) | NativeReadError::Lease(_) | NativeReadError::Delivery(_) => {
+            eprintln!("narjar: {error}");
+            send_response(
+                guard,
+                request,
+                Response::empty(StatusCode::SERVICE_UNAVAILABLE),
+            )
+        }
+    }
+}
+
+fn native_lookup_outcome(error: &NativeReadError) -> CacheLookupOutcome {
+    match error {
+        NativeReadError::Missing | NativeReadError::Signature => CacheLookupOutcome::Miss,
+        NativeReadError::Metadata(_) | NativeReadError::Lease(_) | NativeReadError::Delivery(_) => {
+            CacheLookupOutcome::Failure
+        }
+    }
+}
+
+fn respond_native_narinfo(
+    request: Request,
+    source: &NativeStoreSource,
+    store: StoreHash,
+    guard: &RequestGuard<'_>,
+    visibility: ReadVisibility,
+) -> Option<TcpStream> {
+    let started = Instant::now();
+    match source.advertise(store) {
+        Ok(advertisement) => {
+            record_narinfo_lookup(guard, CacheLookupOutcome::Hit, started);
+            let response = cache_policy(
+                Response::from_data(advertisement.bytes)
+                    .with_header(header("Content-Type", "text/x-nix-narinfo")),
+                visibility,
+                "public, max-age=0, must-revalidate",
+            );
+            send_response(guard, request, response)
+        }
+        Err(error) => {
+            record_narinfo_lookup(guard, native_lookup_outcome(&error), started);
+            native_read_failure(request, guard, error)
+        }
+    }
+}
+
+fn respond_native_nar(
+    request: Request,
+    source: &NativeStoreSource,
+    name: NarFileName,
+    guard: &RequestGuard<'_>,
+    visibility: ReadVisibility,
+) -> Option<TcpStream> {
+    let started = Instant::now();
+    let opened = name
+        .raw_hash()
+        .ok_or(NativeReadError::Missing)
+        .and_then(|hash| source.resolve_nar(hash));
+    let object = match opened {
+        Ok(object) => object,
+        Err(error) => {
+            record_nar_lookup(guard, native_lookup_outcome(&error), started);
+            return native_read_failure(request, guard, error);
+        }
+    };
+    let length = object.identity().size().get();
+    let requested = requested_range(&request, length);
+    guard.record_nar_range_request(requested.metric_outcome());
+    let range = match requested {
+        RequestedRange::Full => NarResponseRange::Full { length },
+        RequestedRange::Partial { start, end } => NarResponseRange::Partial {
+            start,
+            end,
+            nar_length: length,
+        },
+        RequestedRange::Unsatisfiable => {
+            return respond_unsatisfiable_nar_range(request, length, guard, started);
+        }
+        RequestedRange::Invalid => return respond_invalid_nar_range(request, guard, started),
+    };
+    let content_length = match usize::try_from(range.content_length()) {
+        Ok(length) => length,
+        Err(_) => return internal_error(guard, request),
+    };
+    match request.method() {
+        Method::Head => {
+            record_nar_lookup(guard, CacheLookupOutcome::Hit, started);
+            send_response(
+                guard,
+                request,
+                nar_range_response(range, content_length, visibility, io::empty()),
+            )
+        }
+        Method::Get | Method::Put | Method::Other => {
+            let reader = source.open_delivery(object).and_then(|delivery| {
+                delivery
+                    .into_range_reader(range.byte_range())
+                    .map_err(Into::into)
+            });
+            match reader {
+                Ok(reader) => {
+                    record_nar_lookup(guard, CacheLookupOutcome::Hit, started);
+                    send_response(
+                        guard,
+                        request,
+                        nar_range_response(
+                            range,
+                            content_length,
+                            visibility,
+                            source.observe_delivery_reader(reader),
+                        ),
+                    )
+                }
+                Err(error) => {
+                    record_nar_lookup(guard, CacheLookupOutcome::Failure, started);
+                    native_read_failure(request, guard, error)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -616,7 +787,7 @@ fn invalid_route_status(method: Method, route: &RouteMatch) -> StatusCode {
 
 pub fn respond(
     request: Request,
-    storage: &Storage,
+    context: ReadContext<'_>,
     authorizer: &Authorizer,
     metrics: &Metrics,
     min_free_bytes: u64,
@@ -627,14 +798,14 @@ pub fn respond(
         ReadRoute::Operator(operator) => respond_operator_route(
             operator,
             request,
-            storage,
+            context,
             authorizer,
             metrics,
             min_free_bytes,
             &guard,
         ),
         ReadRoute::Cache(route) => {
-            respond_cache_route(route, request, storage, authorizer, metrics, &guard)
+            respond_cache_route(route, request, context, authorizer, metrics, &guard)
         }
     }
 }
@@ -642,7 +813,7 @@ pub fn respond(
 fn respond_operator_route(
     operator: OperatorRoute,
     request: Request,
-    storage: &Storage,
+    context: ReadContext<'_>,
     authorizer: &Authorizer,
     metrics: &Metrics,
     min_free_bytes: u64,
@@ -653,7 +824,7 @@ fn respond_operator_route(
         OperatorRoute::Protected(operator) => respond_protected_operator(
             operator,
             request,
-            storage,
+            context,
             authorizer,
             metrics,
             min_free_bytes,
@@ -680,7 +851,7 @@ fn respond_health_request(request: Request, guard: &RequestGuard<'_>) -> Option<
 fn respond_protected_operator(
     operator: ProtectedOperatorRoute,
     request: Request,
-    storage: &Storage,
+    context: ReadContext<'_>,
     authorizer: &Authorizer,
     metrics: &Metrics,
     min_free_bytes: u64,
@@ -695,14 +866,10 @@ fn respond_protected_operator(
         return unauthorized(guard, request);
     }
     match operator {
-        ProtectedOperatorRoute::Readiness => respond_readiness(
-            request,
-            storage
-                .is_ready(min_free_bytes)
-                .unwrap_or(StorageReadiness::ProbeFailed),
-            guard,
-        ),
-        ProtectedOperatorRoute::Metrics => respond_metrics(request, storage, metrics, guard),
+        ProtectedOperatorRoute::Readiness => {
+            respond_readiness(request, context.readiness(min_free_bytes), guard)
+        }
+        ProtectedOperatorRoute::Metrics => respond_metrics(request, context, metrics, guard),
     }
 }
 
@@ -735,16 +902,29 @@ fn readiness_response(readiness: StorageReadiness) -> (StatusCode, &'static str)
 
 fn respond_metrics(
     request: Request,
-    storage: &Storage,
+    context: ReadContext<'_>,
     metrics: &Metrics,
     guard: &RequestGuard<'_>,
 ) -> Option<TcpStream> {
+    let storage = context.storage;
     let temporary_objects = storage.temporary_objects();
     metrics.set_temp_objects(temporary_objects);
     let mut snapshot = metrics.snapshot();
     snapshot.storage_activity = storage.activity_snapshot();
+    let mut output = render_prometheus(&snapshot);
+    match context.source {
+        ReadSource::FlatCache => output.push_str(
+            "# TYPE narjar_source_info gauge\nnarjar_source_info{source=\"flat-cache\"} 1\n",
+        ),
+        ReadSource::NativeStore(source) => {
+            output.push_str(
+                "# TYPE narjar_source_info gauge\nnarjar_source_info{source=\"native-store\"} 1\n",
+            );
+            source.append_metrics(&mut output);
+        }
+    }
     let response = prevent_operator_and_auth_response_caching(
-        Response::from_string(render_prometheus(&snapshot))
+        Response::from_string(output)
             .with_status_code(StatusCode::OK)
             .with_header(header(
                 "Content-Type",
@@ -757,7 +937,7 @@ fn respond_metrics(
 fn respond_cache_route(
     route: RouteMatch,
     request: Request,
-    storage: &Storage,
+    context: ReadContext<'_>,
     authorizer: &Authorizer,
     metrics: &Metrics,
     guard: &RequestGuard<'_>,
@@ -775,12 +955,12 @@ fn respond_cache_route(
         RouteMatch::Found(route) => {
             match request.method() {
                 Method::Get | Method::Head => {}
-                _ => return method_not_allowed(guard, request, "GET, HEAD, PUT"),
+                _ => return method_not_allowed(guard, request, context.source.allowed_methods()),
             }
             let visibility = authorizer.read_visibility();
             match route {
                 CacheRoute::CacheInfo => {
-                    let cache_info = match storage.cache_info() {
+                    let cache_info = match context.storage.cache_info() {
                         Ok(cache_info) => cache_info,
                         Err(_) => return internal_error(guard, request),
                     };
@@ -792,10 +972,22 @@ fn respond_cache_route(
                     );
                     send_response(guard, request, response)
                 }
-                CacheRoute::Nar(name) => respond_nar(request, storage, name, guard, visibility),
-                CacheRoute::NarInfo(store) => {
-                    respond_narinfo(request, storage, &store, guard, visibility)
-                }
+                CacheRoute::Nar(name) => match context.source {
+                    ReadSource::FlatCache => {
+                        respond_nar(request, context.storage, name, guard, visibility)
+                    }
+                    ReadSource::NativeStore(source) => {
+                        respond_native_nar(request, source, name, guard, visibility)
+                    }
+                },
+                CacheRoute::NarInfo(store) => match context.source {
+                    ReadSource::FlatCache => {
+                        respond_narinfo(request, context.storage, &store, guard, visibility)
+                    }
+                    ReadSource::NativeStore(source) => {
+                        respond_native_narinfo(request, source, store, guard, visibility)
+                    }
+                },
             }
         }
     }

@@ -155,6 +155,19 @@
             ];
             text = builtins.readFile ./tests/nix-e2e.sh;
           };
+          nativeHttpTests = pkgs.writeShellApplication {
+            name = "narjar-native-http-tests";
+            runtimeInputs = [ toolchain pkgs.cargo-nextest pkgs.pkg-config pkgs.stdenv.cc ];
+            text = ''
+              export NARJAR_NATIVE_TEST_FILE=${pkgs.writeText "narjar-native-http-fixture" "native source fixture\n"}
+              export PKG_CONFIG_PATH=${lib.getDev pkgs.sqlite}/lib/pkgconfig
+              ${lib.optionalString pkgs.stdenv.isDarwin ''
+                export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=${lib.getExe pkgs.stdenv.cc}
+                export RUSTFLAGS="''${RUSTFLAGS:-} -L native=${lib.getLib pkgs.libiconv}/lib"
+              ''}
+              exec ${pkgs.bash}/bin/bash ci/check-rust.sh native-http
+            '';
+          };
           ociE2E = pkgs.writeShellApplication {
             name = "narjar-oci-e2e";
             runtimeInputs = [
@@ -208,6 +221,7 @@
             provenance
             advisoryCheck
             nixE2E
+            nativeHttpTests
             continuationBenchmark
             ociE2E
             ;
@@ -312,6 +326,11 @@
           type = "app";
           program = lib.getExe env.nixE2E;
           meta.description = "Run the real-Nix end-to-end verification";
+        };
+        native-http-tests = {
+          type = "app";
+          program = lib.getExe env.nativeHttpTests;
+          meta.description = "Run native HTTP tests outside the build user namespace";
         };
         oci-e2e = {
           type = "app";

@@ -314,10 +314,10 @@ impl NarInfoMetadata {
         if representation.identity() != self.claims.identity() {
             return Err(NarInfoError);
         }
-        let mut output = Vec::new();
+        let mut output = BoundedNarInfoWriter::new();
         self.write(representation, &mut output)
             .map_err(|_| NarInfoError)?;
-        Ok(output)
+        Ok(output.into_bytes())
     }
 
     fn from_document(
@@ -941,6 +941,18 @@ mod tests {
                 .serialize(NarRepresentation::Raw(different_size))
                 .is_err(),
             "metadata must not advertise a representation of another logical NAR"
+        );
+    }
+
+    #[test]
+    fn local_metadata_serialization_obeys_the_same_size_limit_as_uploaded_metadata() {
+        let identity = NarIdentity::new(NarHash::parse(NAR_HASH).unwrap(), NarSize::new(1));
+        let mut metadata = local_metadata(identity);
+        metadata.add_signature("s".repeat(MAX_NARINFO_BYTES as usize));
+        assert!(
+            metadata
+                .serialize(NarRepresentation::Raw(identity))
+                .is_err()
         );
     }
 

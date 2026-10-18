@@ -3977,9 +3977,12 @@ mod tests {
                 for _ in &requests {
                     let (stream, _) = listener.accept().unwrap();
                     let request = crate::cache::http_server::Request::read(stream).unwrap();
-                    drop(crate::cache::http::respond(
+                    drop(crate::http::respond(
                         request,
-                        storage,
+                        crate::http::ReadContext {
+                            storage,
+                            source: &crate::http::ReadSource::FlatCache,
+                        },
                         &authorizer,
                         &metrics,
                         0,

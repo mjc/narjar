@@ -13,7 +13,6 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use crate::cache::{
     auth::Authorizer,
-    http::{PublicationRequest, prepare_publication, respond},
     http_server::{Method, Request, StatusCode, write_status},
     narinfo::TrustedPublicKeys,
     object::WireEncoding,
@@ -31,6 +30,7 @@ use crate::cache::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure, W
 use crate::{
     config::{ServeConfig, ServeSource},
     error::Error,
+    http::{PublicationRequest, ReadContext, ReadSource, prepare_publication, respond},
 };
 
 mod idle;
@@ -172,6 +172,7 @@ impl PublicationQueue {
 #[derive(Clone)]
 struct RequestWorkerContext {
     storage: Arc<Storage>,
+    source: Arc<ReadSource>,
     authorizer: Arc<Authorizer>,
     metrics: Arc<Metrics>,
     publications: Arc<PublicationQueue>,
@@ -286,13 +287,16 @@ fn process_next_request(
     match Request::read(stream) {
         Ok(_) if context.stopping.load(Ordering::Acquire) => None,
         Ok(request) => match request.method() {
-            Method::Put => {
+            Method::Put if let ReadSource::FlatCache = &*context.source => {
                 queue_publication(request, admission, context);
                 None
             }
-            Method::Get | Method::Head | Method::Other => respond(
+            Method::Get | Method::Head | Method::Other | Method::Put => respond(
                 request,
-                &context.storage,
+                ReadContext {
+                    storage: &context.storage,
+                    source: &context.source,
+                },
                 &context.authorizer,
                 &context.metrics,
                 context.min_free_bytes,
@@ -410,6 +414,7 @@ fn staging_reservation_status(error: &StorageError) -> StatusCode {
 
 struct ServerResources {
     storage: Arc<Storage>,
+    source: Arc<ReadSource>,
     authorizer: Arc<Authorizer>,
     trusted_keys: Arc<TrustedPublicKeys>,
 }
@@ -428,31 +433,27 @@ fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, 
             Error::runtime(format!("cannot load initialized cache policies: {error}"))
         })?
         .into_parts();
-    match &config.source {
-        ServeSource::FlatCache { .. } => {
-            initialize_flat_cache_resources(storage, authorizer, trusted_keys)
-        }
+    let trusted_keys = Arc::new(trusted_keys);
+    let source = match &config.source {
+        ServeSource::FlatCache { .. } => ReadSource::FlatCache,
         ServeSource::NativeStore(settings) => {
-            settings
+            let source = settings
                 .validate(&config.data_dir, &trusted_keys)
                 .map_err(|error| Error::runtime(error.to_string()))?;
-            Err(Error::runtime(
-                "native-store source passed startup validation, but native-store request serving is not implemented yet",
+            ReadSource::NativeStore(Box::new(
+                crate::native_store::serving::NativeStoreSource::new(
+                    source,
+                    Arc::clone(&trusted_keys),
+                ),
             ))
         }
-    }
-}
-
-fn initialize_flat_cache_resources(
-    storage: Storage,
-    authorizer: Authorizer,
-    trusted_keys: TrustedPublicKeys,
-) -> Result<ServerResources, Error> {
+    };
     recover_server_storage(&storage, &trusted_keys)?;
     Ok(ServerResources {
         storage: Arc::new(storage),
+        source: Arc::new(source),
         authorizer: Arc::new(authorizer),
-        trusted_keys: Arc::new(trusted_keys),
+        trusted_keys,
     })
 }
 
@@ -492,6 +493,7 @@ fn spawn_metrics_sampler(
     config: &ServeConfig,
     metrics: Arc<Metrics>,
     storage: Arc<Storage>,
+    source: Arc<ReadSource>,
     stopping: Arc<AtomicBool>,
 ) -> io::Result<thread::JoinHandle<()>> {
     let filesystem_sample = config
@@ -506,6 +508,7 @@ fn spawn_metrics_sampler(
         .spawn(move || {
             while !stopping.load(Ordering::Acquire) {
                 metrics.sample_periodic();
+                source.maintain();
                 metrics.sample_storage_capacity(&storage, min_free_bytes);
                 metrics.sample_maintenance_sidecar(&maintenance_root);
                 if let Some((path, root)) = &filesystem_sample {
@@ -617,9 +620,14 @@ fn continue_after_accept_error(error: io::Error) -> Result<(), Error> {
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let ServerResources {
         storage,
+        source,
         authorizer,
         trusted_keys,
     } = initialize_server_resources(&config)?;
+    let publication_workers = match source.as_ref() {
+        ReadSource::FlatCache => config.workers.get(),
+        ReadSource::NativeStore(_) => 0,
+    };
     if config.track_access {
         storage
             .enable_access_tracking()
@@ -637,6 +645,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         &config,
         Arc::clone(&metrics),
         Arc::clone(&storage),
+        Arc::clone(&source),
         Arc::clone(&stopping),
     )
     .map_err(|error| Error::runtime(format!("cannot start metrics sampler: {error}")))?;
@@ -683,7 +692,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         config.max_nar_bytes,
         config.max_encoded_nar_bytes,
         config.max_decoder_memory_bytes,
-        config.workers,
+        publication_workers,
         config.min_free_bytes,
         config.shutdown_grace_seconds,
         config.io_timeout_seconds
@@ -702,7 +711,13 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     );
     let max_encoded_nar_bytes = config.max_encoded_nar_bytes.get();
     let max_in_flight = config.max_in_flight.get();
-    metrics.configure_pressure_limits(max_in_flight as u64, config.workers.get() as u64);
+    metrics.configure_pressure_limits(
+        max_in_flight as u64,
+        enum_map::enum_map! {
+            WorkerKind::Request => config.workers.get() as u64,
+            WorkerKind::Publication => publication_workers as u64,
+        },
+    );
     let admissions = Arc::new(Admissions::new(max_in_flight, Arc::clone(&metrics)));
     let (sender, receiver) = bounded::<AcceptedRequest>(max_in_flight);
     let (publication_sender, publication_receiver) = bounded::<QueuedPublication>(max_in_flight);
@@ -711,7 +726,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         Arc::clone(&metrics),
     ));
     let publication_handles = spawn_publication_workers(
-        config.workers.get(),
+        publication_workers,
         publication_receiver.clone(),
         PublicationWorkerContext {
             storage: Arc::clone(&storage),
@@ -732,6 +747,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     .map_err(|error| Error::runtime(format!("cannot start idle connection monitor: {error}")))?;
     let request_context = RequestWorkerContext {
         storage: Arc::clone(&storage),
+        source: Arc::clone(&source),
         authorizer: Arc::clone(&authorizer),
         metrics: Arc::clone(&metrics),
         publications: Arc::clone(&publications),
@@ -1007,6 +1023,7 @@ mod tests {
         .unwrap();
         let context = super::RequestWorkerContext {
             storage: Arc::new(storage),
+            source: Arc::new(super::ReadSource::FlatCache),
             authorizer: Arc::new(Authorizer::load(&root).unwrap()),
             metrics: Arc::clone(&metrics),
             publications: Arc::new(super::PublicationQueue::new(

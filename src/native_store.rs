@@ -11,27 +11,21 @@ use crate::cache::narinfo::TrustedPublicKeys;
 use rustix::fs::{Access, AtFlags, CWD, StatVfsMountFlags};
 use sqlite::{Connection, ConnectionThreadSafe, OpenFlags, State};
 
+#[path = "native_store/daemon_roots.rs"]
 pub(crate) mod daemon_roots;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "NARJ-141 connects native NAR delivery to HTTP")
-)]
+#[path = "native_store/delivery.rs"]
 pub(crate) mod delivery;
+#[path = "native_store/directory_entry.rs"]
 pub(crate) mod directory_entry;
+#[path = "native_store/gc.rs"]
 pub(crate) mod gc;
-#[expect(
-    dead_code,
-    reason = "NARJ-142 connects lease capabilities to native-store serving"
-)]
+#[path = "native_store/lease.rs"]
 pub(crate) mod lease;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "NARJ-141 connects native metadata projection to HTTP"
-    )
-)]
+#[path = "native_store/metadata.rs"]
 pub(crate) mod metadata;
+#[path = "native_store/serving.rs"]
+pub(crate) mod serving;
+#[path = "native_store/temp_roots.rs"]
 pub(crate) mod temp_roots;
 
 const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
@@ -123,6 +117,7 @@ pub(crate) struct NativeStoreSettings {
     state_dir: PathBuf,
     roots_dir: PathBuf,
     min_lease_seconds: NonZeroU64,
+    signing_key_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,12 +126,18 @@ pub(crate) struct NativeStoreOptions<'a> {
     pub(crate) state_dir: Option<&'a Path>,
     pub(crate) roots_dir: Option<&'a Path>,
     pub(crate) min_lease_seconds: Option<NonZeroU64>,
+    pub(crate) signing_key_file: Option<&'a Path>,
 }
 
 const MAX_ACTIVE_NATIVE_LEASES: NonZeroUsize =
     NonZeroUsize::new(100_000).expect("native lease capacity is nonzero");
 
 impl NativeStoreSettings {
+    pub(crate) fn with_signing_key_file(mut self, path: Option<&Path>) -> Self {
+        self.signing_key_file = path.map(Path::to_owned);
+        self
+    }
+
     pub(crate) fn new(
         store_dir: PathBuf,
         state_dir: PathBuf,
@@ -148,6 +149,7 @@ impl NativeStoreSettings {
             state_dir,
             roots_dir,
             min_lease_seconds,
+            signing_key_file: None,
         }
     }
 
@@ -187,15 +189,34 @@ impl NativeStoreSettings {
             validate_nix_database_path(&state_path),
             NativeStoreIssue::Database,
         )?;
-        let metadata_database = open_supported_metadata_database(&state_path)?;
+        drop(open_supported_metadata_database(&state_path)?);
         let path_lookup_database = Arc::new(open_native_path_lookup_database(&state_path)?);
         classify_validation(
             require_trusted_signature_key(trusted_keys),
             NativeStoreIssue::SignatureTrust,
         )?;
+        let signing_key = self
+            .signing_key_file
+            .as_deref()
+            .map(crate::narinfo_signing::NixSigningKey::read)
+            .transpose()
+            .map_err(|error| {
+                NativeStoreValidationError::new(NativeStoreIssue::SignatureTrust, error)
+            })?;
+        if let Some(key) = &signing_key {
+            let fingerprint = "narjar signing-key startup check";
+            if !trusted_keys
+                .verifies_signature(fingerprint.as_bytes(), &key.sign_fingerprint(fingerprint))
+            {
+                return Err(NativeStoreValidationError::new(
+                    NativeStoreIssue::SignatureTrust,
+                    "native signing key is not in the cache trust policy",
+                ));
+            }
+        }
         let lease_manager = lease::NativeStoreLeaseManager::open(
             store_path,
-            state_path,
+            state_path.clone(),
             roots_path,
             self.min_lease_seconds,
             MAX_ACTIVE_NATIVE_LEASES,
@@ -209,8 +230,9 @@ impl NativeStoreSettings {
             _store_directory: store_directory,
             _state_directory: state_directory,
             _roots_directory: roots_directory,
-            _metadata_database: metadata_database,
             lease_manager,
+            state_dir: state_path,
+            signing_key,
         })
     }
 }
@@ -277,21 +299,20 @@ pub(crate) struct ValidatedNativeStore {
     _store_directory: File,
     _state_directory: File,
     _roots_directory: File,
-    _metadata_database: ConnectionThreadSafe,
-    #[expect(
-        dead_code,
-        reason = "NARJ-142 consumes this manager before returning native narinfo"
-    )]
     lease_manager: lease::NativeStoreLeaseManager,
+    state_dir: PathBuf,
+    signing_key: Option<crate::narinfo_signing::NixSigningKey>,
 }
 
 impl ValidatedNativeStore {
-    #[expect(
-        dead_code,
-        reason = "NARJ-142 acquires leases before advertising native paths"
-    )]
     pub(crate) fn leases(&self) -> &lease::NativeStoreLeaseManager {
         &self.lease_manager
+    }
+
+    fn metadata_snapshot(
+        &self,
+    ) -> Result<metadata::NativeMetadataSnapshot, metadata::NativeMetadataError> {
+        metadata::NativeMetadataSnapshot::open(&self.state_dir)
     }
 }
 
@@ -790,11 +811,26 @@ mod tests {
             .validate(&fixture.narjar_data_dir, &trusted_keys())
             .expect("complete native-store config should validate");
 
+        let database = open_supported_metadata_database(&fixture.settings.state_dir).unwrap();
         assert!(
-            validated
-                ._metadata_database
+            database
                 .execute("CREATE TABLE must_not_be_written (id INTEGER)")
                 .is_err()
+        );
+        drop(database);
+        Connection::open(fixture.settings.state_dir.join("db/db.sqlite")).unwrap()
+            .execute("INSERT INTO ValidPaths(id, path) VALUES(1, '/nix/store/0123456789abcdfghijklmnpqrsvwxyz-fresh')").unwrap();
+        assert_eq!(
+            validated
+                .metadata_snapshot()
+                .unwrap()
+                .path_for_store(
+                    crate::cache::storage::StoreHash::parse("0123456789abcdfghijklmnpqrsvwxyz")
+                        .unwrap()
+                )
+                .unwrap()
+                .as_deref(),
+            Some("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-fresh")
         );
     }
 

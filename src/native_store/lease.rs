@@ -18,6 +18,12 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlite::{ConnectionThreadSafe, State};
+#[cfg(test)]
+use std::collections::BTreeMap;
+
+#[path = "lease/advertisement.rs"]
+mod advertisement;
+pub(crate) use advertisement::AdvertisedNativeNar;
 
 const LEASE_PREFIX: &str = ".narjar-lease-";
 const LEASE_TEMP_PREFIX: &str = ".narjar-lease-temp-";
@@ -32,7 +38,7 @@ const MAX_EXPIRY_CLEANUP_PER_CALL: usize = 64;
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 
 #[cfg(test)]
-static FAIL_DIRECTORY_SYNC: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
+static FAIL_DIRECTORY_SYNC: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeStorePath {
@@ -147,6 +153,7 @@ impl NativeStoreLease {
         &self.path
     }
 
+    #[cfg(test)]
     pub(crate) const fn expires_at_unix_seconds(&self) -> u64 {
         self.expires_at
     }
@@ -185,6 +192,7 @@ pub(crate) struct NativeLeaseSnapshot {
     pub(crate) active: usize,
     pub(crate) maximum: NonZeroUsize,
     pub(crate) capacity_rejections: u64,
+    pub(crate) expired_released: u64,
 }
 
 pub(crate) struct NativeStoreLeaseManager {
@@ -202,6 +210,7 @@ struct LeaseManagerState {
     record_index: RecordPathIndex,
     record_scan: Option<RecordPathScan>,
     capacity_rejections: u64,
+    expired_released: u64,
     record_paths: BTreeSet<PathBuf>,
     cleanup_cursor: Option<PathBuf>,
 }
@@ -348,6 +357,7 @@ impl NativeStoreLeaseManager {
                 record_index: RecordPathIndex::Current(0),
                 record_scan: None,
                 capacity_rejections: 0,
+                expired_released: 0,
                 record_paths: BTreeSet::new(),
                 cleanup_cursor: None,
             })),
@@ -383,9 +393,7 @@ impl NativeStoreLeaseManager {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
         self.recover_pending_capacity_mutation(&mut state)?;
-        let now = clock()?;
         self.refresh_record_paths_if_stale(&mut state)?;
-        self.cleanup_expired_records(now, MAX_EXPIRY_CLEANUP_PER_CALL, &mut state)?;
         let path = self.validate_store_path(path.as_path())?;
         let paths = LeasePaths {
             directory: self.lease_directory(&path),
@@ -430,13 +438,25 @@ impl NativeStoreLeaseManager {
         match record.state {
             PersistedLeaseState::Live => {
                 let requested_expiry = lease_expiry(clock()?, self.minimum_lease_seconds)?;
-                let renewed_expiry = record.expires_at.max(requested_expiry);
                 self.verify_root(&paths.root, path)?;
-                write_record_atomically(
-                    &self.roots_dir,
-                    &paths.record,
-                    &LeaseRecord::live(path, renewed_expiry),
-                )?;
+                let renewed_expiry = if record.expires_at >= requested_expiry {
+                    // Complete synchronization if a preceding post-rename attempt failed.
+                    sync_directory(&paths.directory)?;
+                    sync_directory(&self.roots_dir)?;
+                    record.expires_at
+                } else {
+                    // Preserve the full promised lifetime while coalescing later renewals.
+                    let headroom = (self.minimum_lease_seconds.get() / 10).clamp(1, 3600);
+                    let expiry = requested_expiry
+                        .checked_add(headroom)
+                        .ok_or(NativeStoreLeaseError::InvalidRecord)?;
+                    write_record_atomically(
+                        &self.roots_dir,
+                        &paths.record,
+                        &LeaseRecord::live(path, expiry),
+                    )?;
+                    expiry
+                };
                 state.record_added(paths.record.clone());
                 Ok(renewed_expiry)
             }
@@ -662,6 +682,7 @@ impl NativeStoreLeaseManager {
         self.ensure_root(&self.root_path(path), path)
     }
 
+    #[cfg(test)]
     pub(crate) fn release(
         &self,
         lease: &NativeStoreLease,
@@ -696,6 +717,11 @@ impl NativeStoreLeaseManager {
         })()
     }
 
+    pub(crate) fn probe(&self) -> Result<(), NativeStoreLeaseError> {
+        GcReadLock::check_access(&self.state_dir).map_err(NativeStoreLeaseError::Io)?;
+        self.snapshot().map(drop)
+    }
+
     pub(crate) fn snapshot(&self) -> Result<NativeLeaseSnapshot, NativeStoreLeaseError> {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
@@ -707,6 +733,7 @@ impl NativeStoreLeaseManager {
             active: state.active,
             maximum: self.maximum_active,
             capacity_rejections: state.capacity_rejections,
+            expired_released: state.expired_released,
         })
     }
 
@@ -719,6 +746,7 @@ impl NativeStoreLeaseManager {
         self.cleanup_expired_records(now, MAX_EXPIRY_CLEANUP_PER_CALL, &mut state)
     }
 
+    #[cfg(test)]
     fn cleanup_expired_at(&self, now: u64) -> Result<(), NativeStoreLeaseError> {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
@@ -934,6 +962,7 @@ impl NativeStoreLeaseManager {
         record: &LeaseRecord,
         inactive: &InactiveLeaseDirectory,
     ) -> Result<(), NativeStoreLeaseError> {
+        self.remove_advertisement_for_lease(store_path)?;
         self.remove_recorded_root(&self.root_path(store_path), record, inactive)?;
         remove_record(&self.roots_dir, record_path)?;
         fs::remove_dir(self.lease_directory(store_path)).map_err(NativeStoreLeaseError::Io)?;
@@ -1143,6 +1172,12 @@ impl NativeStoreLeaseManager {
                     )?;
                     state.record_removed(&record_path);
                     self.complete_capacity_mutation(state)?;
+                    match record.state {
+                        PersistedLeaseState::Pending => {}
+                        PersistedLeaseState::Live => {
+                            state.expired_released = state.expired_released.saturating_add(1)
+                        }
+                    }
                     Ok(())
                 })
         })()
@@ -1165,7 +1200,7 @@ impl NativeStoreLeaseManager {
     }
 
     fn acquire_gc_read_lock(&self) -> Result<GcReadLock, NativeStoreLeaseError> {
-        GcReadLock::acquire(&self.state_dir).map_err(NativeStoreLeaseError::Io)
+        GcReadLock::try_acquire(&self.state_dir).map_err(NativeStoreLeaseError::Io)
     }
 
     fn is_registered_store_path(
@@ -1495,13 +1530,12 @@ fn sync_root_parent_directory(root_path: &Path) -> Result<(), NativeStoreLeaseEr
 
 fn sync_directory(path: &Path) -> Result<(), NativeStoreLeaseError> {
     #[cfg(test)]
-    if let Ok(mut failure) = FAIL_DIRECTORY_SYNC.lock()
-        && let Some((directory, remaining_syncs)) = failure.as_mut()
-        && directory == path
+    if let Ok(mut failures) = FAIL_DIRECTORY_SYNC.lock()
+        && let Some(remaining_syncs) = failures.get_mut(path)
     {
         *remaining_syncs -= 1;
         if *remaining_syncs == 0 {
-            failure.take();
+            failures.remove(path);
             return Err(NativeStoreLeaseError::Io(io::Error::other(
                 "injected directory synchronization failure",
             )));
@@ -1514,10 +1548,10 @@ fn sync_directory(path: &Path) -> Result<(), NativeStoreLeaseError> {
 
 #[cfg(test)]
 fn fail_nth_directory_sync(path: &Path, nth_sync: usize) {
-    *FAIL_DIRECTORY_SYNC
+    FAIL_DIRECTORY_SYNC
         .lock()
-        .expect("directory-sync failpoint lock should be available") =
-        Some((path.to_owned(), nth_sync));
+        .expect("directory-sync failpoint lock should be available")
+        .insert(path.to_owned(), nth_sync);
 }
 
 fn remove_stale_temporary_records(roots_dir: &Path) -> Result<(), NativeStoreLeaseError> {
@@ -1920,6 +1954,62 @@ mod tests {
     }
 
     #[test]
+    fn repeated_acquisition_preserves_the_full_promise_without_rewriting_renewed_records() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = LeaseFixture::new(1);
+        fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 100)
+            .unwrap();
+        let renewed = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 110)
+            .unwrap();
+        let record = fixture.manager.record_path(&fixture.store_path);
+        let before = fs::metadata(&record).unwrap().ino();
+        let repeated = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 111)
+            .unwrap();
+        assert_eq!(
+            repeated.expires_at_unix_seconds(),
+            renewed.expires_at_unix_seconds()
+        );
+        assert!(repeated.expires_at_unix_seconds() >= 111 + 3600);
+        assert_eq!(fs::metadata(&record).unwrap().ino(), before);
+    }
+
+    #[test]
+    fn native_requests_and_maintenance_fail_fast_while_nix_gc_holds_its_lock() {
+        let fixture = LeaseFixture::new(1);
+        let collector = File::open(fixture.state_dir.join("gc.lock")).unwrap();
+        set_flock_lock(&collector).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let early = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = fixture.manager.acquire(fixture.store_path.clone(), 100);
+                sent.send(result).unwrap();
+            });
+            let early = received.recv_timeout(std::time::Duration::from_secs(1));
+            // Always unlock, including when testing the old blocking implementation.
+            rustix::fs::flock(&collector, FlockOperation::Unlock).unwrap();
+            early
+        })
+        .expect("request must finish before GC releases its lock");
+        assert!(
+            matches!(early, Err(NativeStoreLeaseError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(fixture.manager.snapshot().unwrap().active, 0);
+        set_flock_lock(&collector).unwrap();
+        let cleanup = fixture.manager.cleanup_expired_at(100);
+        rustix::fs::flock(&collector, FlockOperation::Unlock).unwrap();
+        assert!(
+            matches!(cleanup, Err(NativeStoreLeaseError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(fixture.manager.snapshot().unwrap().active, 0);
+    }
+
+    #[test]
     fn restart_recovers_live_root_and_rejects_release_before_expiry() {
         let fixture = LeaseFixture::new(2);
         let now = now_unix_seconds().expect("clock should be available");
@@ -2312,7 +2402,7 @@ mod tests {
         let mut clock = || {
             clock_calls += 1;
             match clock_calls {
-                1 | 2 => Ok(10),
+                1 => Ok(10),
                 _ => Err(NativeStoreLeaseError::ClockBeforeEpoch),
             }
         };
@@ -2334,7 +2424,7 @@ mod tests {
     }
 
     #[test]
-    fn acquire_reclaims_an_expired_lease_created_by_another_manager() {
+    fn maintenance_reclaims_an_expired_lease_created_by_another_manager() {
         let fixture = LeaseFixture::new(1);
         let next_path = fixture.store_dir.join(format!("{}-next", "1".repeat(32)));
         fs::create_dir(&next_path).expect("next store object should exist");
@@ -2349,9 +2439,20 @@ mod tests {
             .manager
             .acquire(fixture.store_path.clone(), 1)
             .expect("first manager should create the expiring lease");
+        assert!(matches!(
+            stale_manager.acquire(next_path.clone(), 4_000),
+            Err(NativeStoreLeaseError::CapacityExceeded)
+        ));
+        assert!(
+            fixture.manager.root_path(&fixture.store_path).is_symlink(),
+            "a request must not run expiry cleanup"
+        );
+        stale_manager
+            .cleanup_expired_at(4_000)
+            .expect("maintenance reclaims the expired lease");
         stale_manager
             .acquire(next_path, 4_000)
-            .expect("acquisition should scan stale paths and reclaim the expired lease");
+            .expect("admission succeeds after maintenance frees capacity");
 
         assert!(!fixture.manager.root_path(&fixture.store_path).exists());
         assert_eq!(
@@ -2533,7 +2634,7 @@ mod tests {
     #[test]
     fn lease_expiry_uses_the_clock_after_waiting_for_the_nix_gc_lock() {
         let fixture = LeaseFixture::new(1);
-        let mut times = [5, 10, 100].into_iter();
+        let mut times = [10, 100].into_iter();
         let mut clock = || Ok(times.next().expect("each lease phase reads the clock"));
 
         let lease = fixture
@@ -2876,8 +2977,14 @@ mod tests {
             Err(NativeStoreLeaseError::CapacityExceeded)
         ));
         manager
+            .cleanup_expired_at(3)
+            .expect("background maintenance removes the next expired batch");
+        manager
+            .cleanup_expired_at(3)
+            .expect("background maintenance frees the last expired slot");
+        manager
             .acquire(new_path.clone(), 3)
-            .expect("bounded cleanup frees the remaining expired batch before admission");
+            .expect("maintenance frees expired capacity without request-path cleanup");
         let second_path = fixture.store_dir.join(format!("{}-second", "4".repeat(32)));
         fs::create_dir(&second_path).expect("second store object should be created");
         fixture.register_path(&second_path);
@@ -2997,6 +3104,152 @@ mod tests {
         assert!(!fixture.manager.root_path(&fixture.store_path).exists());
         assert!(fixture.owned_records().is_empty());
         assert_eq!(fixture.manager.snapshot().unwrap().active, 0);
+    }
+
+    #[test]
+    fn reusing_an_advertisement_completes_a_previously_failed_index_directory_sync() {
+        use narjar::object::{NarHash, NarIdentity};
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        fail_nth_directory_sync(&fixture.roots_dir, 2);
+        assert!(
+            fixture
+                .manager
+                .publish_advertisement(&lease, identity)
+                .is_err()
+        );
+        fail_nth_directory_sync(&fixture.roots_dir, 1);
+        assert!(
+            fixture
+                .manager
+                .publish_advertisement(&lease, identity)
+                .is_err(),
+            "reusing the visible index must still synchronize its directory"
+        );
+        fixture
+            .manager
+            .publish_advertisement(&lease, identity)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .reopen_at(1, 2)
+                .lookup_advertisement_at(identity.hash(), 2)
+                .unwrap()
+                .unwrap()
+                .identity(),
+            identity
+        );
+    }
+
+    #[test]
+    fn advertised_hash_lookup_survives_restart_expires_and_is_removed_with_its_root() {
+        use narjar::object::{NarHash, NarIdentity};
+        let fixture = LeaseFixture::new(1);
+        let lease = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        fixture
+            .manager
+            .publish_advertisement(&lease, identity)
+            .unwrap();
+        let manager = fixture.reopen_at(1, 2);
+        let advertised = manager
+            .lookup_advertisement_at(identity.hash(), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(advertised.identity(), identity);
+        assert_eq!(
+            Path::new(advertised.store_path()),
+            fixture.store_path.as_path()
+        );
+        assert!(
+            manager
+                .lookup_advertisement_at(NarHash::from_digest([99; 32]), 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .lookup_advertisement_at(identity.hash(), lease.expires_at_unix_seconds())
+                .unwrap()
+                .is_none(),
+            "expired evidence cannot admit a new lease"
+        );
+        manager
+            .release(&lease, lease.expires_at_unix_seconds())
+            .unwrap();
+        assert!(
+            manager
+                .lookup_advertisement_at(identity.hash(), 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(fixture.owned_records().is_empty());
+    }
+
+    #[test]
+    fn collecting_an_older_shared_advertisement_preserves_the_later_paths_index() {
+        use narjar::object::{NarHash, NarIdentity};
+        let fixture = LeaseFixture::new(2);
+        let other_path = fixture.store_dir.join(format!("{}-other", "1".repeat(32)));
+        fs::create_dir(&other_path).unwrap();
+        let database = Connection::open(&fixture.database_path).unwrap();
+        let mut row = database
+            .prepare("INSERT INTO ValidPaths(path) VALUES(?)")
+            .unwrap();
+        row.bind((1, other_path.to_str().unwrap())).unwrap();
+        row.next().unwrap();
+        drop(row);
+        drop(database);
+        let first = fixture
+            .manager
+            .acquire(fixture.store_path.clone(), 1)
+            .unwrap();
+        let second = fixture
+            .manager
+            .acquire(fixture.manager.validate_store_path(&other_path).unwrap(), 2)
+            .unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        fixture
+            .manager
+            .publish_advertisement(&first, identity)
+            .unwrap();
+        fixture
+            .manager
+            .publish_advertisement(&second, identity)
+            .unwrap();
+        fixture
+            .manager
+            .release(&first, first.expires_at_unix_seconds())
+            .unwrap();
+        assert_eq!(
+            Path::new(
+                fixture
+                    .manager
+                    .lookup_advertisement_at(identity.hash(), 2)
+                    .unwrap()
+                    .unwrap()
+                    .store_path()
+            ),
+            other_path
+        );
+        fixture
+            .manager
+            .release(&second, second.expires_at_unix_seconds())
+            .unwrap();
+        assert!(
+            fixture
+                .manager
+                .lookup_advertisement_at(identity.hash(), 2)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

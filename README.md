@@ -3,9 +3,11 @@
 A filesystem-backed HTTP binary cache for Nix, written in Rust with low memory usage.
 
 `narjar push` reads directly from your local Nix store and uploads paths with
-their dependencies in parallel. The cache server runs without a Nix installation
+their dependencies in parallel. The standalone cache server runs without a Nix installation
 or an external database, with commands to verify and garbage-collect cached data.
 Uploads and downloads support uncompressed NARs, Zstd, and XZ.
+It can also serve raw NARs directly from an existing local Nix store without
+keeping another copy of each payload.
 
 ## Installation
 
@@ -64,6 +66,32 @@ Setup never prints a secret.
 
 Narjar speaks HTTP. For remote access, run it behind a TLS reverse proxy and
 use an HTTPS cache URL.
+
+## Serve the local Nix store
+
+Instead of accepting uploads, a server can read the existing Nix store and its
+metadata database. Initialize a cache directory and trust policy first, then run:
+
+```sh
+narjar serve --data-dir ./cache \
+  --serve-source native-store \
+  --native-store-dir /nix/store \
+  --native-state-dir /nix/var/nix \
+  --native-roots-dir /nix/var/nix/gcroots/auto/narjar \
+  --native-min-lease-seconds 5187600 \
+  --native-signing-key-file ./credentials/producer.sec
+```
+
+The roots directory must already be private and owned by the service user.
+The service needs read access to the store, metadata database, and GC lock.
+The signing key's public key must be in the cache trust policy. Omit the signing
+key to serve only paths that already have a trusted signature.
+
+Native mode rejects uploads and serves raw NARs, including HEAD and byte ranges.
+Each advertisement installs a durable Nix GC root before returning metadata.
+Choose a lease that covers clients' narinfo-cache lifetimes and delayed payload
+requests. See [native serving configuration](https://github.com/mjc/narjar/blob/main/docs/operations.md#native-store-serving)
+for permissions and NixOS options.
 
 ## Push a closure
 

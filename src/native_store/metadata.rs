@@ -5,6 +5,7 @@ use sqlite::{ConnectionThreadSafe, State};
 
 use super::open_supported_metadata_database;
 use crate::cache::narinfo::{NarInfoMetadata, TrustedPublicKeys};
+use crate::cache::storage::StoreHash;
 use crate::narinfo_signing::NixSigningKey;
 
 pub(crate) struct NativeMetadataSnapshot {
@@ -12,6 +13,31 @@ pub(crate) struct NativeMetadataSnapshot {
 }
 
 impl NativeMetadataSnapshot {
+    pub(crate) fn path_for_store(
+        &self,
+        store: StoreHash,
+    ) -> Result<Option<String>, NativeMetadataError> {
+        let mut query = self
+            .database
+            .prepare(
+                "SELECT path FROM ValidPaths WHERE path >= ? AND path < ? ORDER BY path LIMIT 2",
+            )
+            .map_err(database_error("preparing Nix store-hash lookup"))?;
+        query
+            .bind((1, format!("/nix/store/{}-", store.as_str()).as_str()))
+            .map_err(database_error("binding Nix store-hash lower bound"))?;
+        query
+            .bind((2, format!("/nix/store/{}.", store.as_str()).as_str()))
+            .map_err(database_error("binding Nix store-hash upper bound"))?;
+        let first = read_optional_path(&mut query)?;
+        match read_optional_path(&mut query)? {
+            None => Ok(first),
+            Some(_) => Err(NativeMetadataError::InvalidMetadata(
+                "multiple store basenames have the requested hash".into(),
+            )),
+        }
+    }
+
     pub(crate) fn open(state_dir: &Path) -> Result<Self, NativeMetadataError> {
         let database = open_supported_metadata_database(state_dir)
             .map_err(|error| NativeMetadataError::Database(error.to_string()))?;
@@ -35,6 +61,21 @@ impl NativeMetadataSnapshot {
         )
         .map_err(|error| NativeMetadataError::InvalidMetadata(error.to_string()))?;
         Ok(ValidatedNativeClaims { metadata })
+    }
+}
+
+fn read_optional_path(
+    query: &mut sqlite::Statement<'_>,
+) -> Result<Option<String>, NativeMetadataError> {
+    match query
+        .next()
+        .map_err(database_error("reading native path lookup"))?
+    {
+        State::Row => query
+            .read::<String, _>(0)
+            .map(Some)
+            .map_err(database_error("reading native store path")),
+        State::Done => Ok(None),
     }
 }
 
@@ -93,7 +134,11 @@ pub(crate) struct SignedNativeNarInfo {
 }
 
 impl SignedNativeNarInfo {
-    pub(crate) fn serialize_raw(self) -> Result<Vec<u8>, crate::cache::narinfo::NarInfoError> {
+    pub(crate) fn claims(&self) -> &crate::cache::narinfo::NarInfoClaims {
+        self.metadata.claims()
+    }
+
+    pub(crate) fn serialize_raw(&self) -> Result<Vec<u8>, crate::cache::narinfo::NarInfoError> {
         self.metadata
             .serialize(NarRepresentation::Raw(self.metadata.claims().identity()))
     }
@@ -264,6 +309,41 @@ mod tests {
 
     const STORE_PATH: &str = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package";
     const NAR_HASH: &str = "01nvfd133isi40l4id6if932mbwc7mxgwxd8x625xqhjdz6mpzai";
+
+    #[test]
+    fn route_lookup_rejects_ambiguous_store_hashes_without_opening_store_files() {
+        use super::NativeMetadataSnapshot;
+        use crate::cache::storage::StoreHash;
+        let database = sqlite::Connection::open_thread_safe(":memory:").unwrap();
+        database
+            .execute(
+                "CREATE TABLE ValidPaths(path TEXT, hash TEXT);
+            INSERT INTO ValidPaths VALUES('/nix/store/0123456789abcdfghijklmnpqrsvwxyz-package',
+            'sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f');",
+            )
+            .unwrap();
+        let snapshot = NativeMetadataSnapshot { database };
+        let store = StoreHash::parse("0123456789abcdfghijklmnpqrsvwxyz").unwrap();
+        assert_eq!(
+            snapshot.path_for_store(store).unwrap().as_deref(),
+            Some(STORE_PATH)
+        );
+        assert_eq!(
+            snapshot
+                .path_for_store(StoreHash::parse("11111111111111111111111111111111").unwrap())
+                .unwrap(),
+            None
+        );
+        database_insert_ambiguous_store_path(&snapshot);
+        assert!(
+            snapshot.path_for_store(store).is_err(),
+            "a hash route must not pick an arbitrary store basename"
+        );
+    }
+
+    fn database_insert_ambiguous_store_path(snapshot: &super::NativeMetadataSnapshot) {
+        snapshot.database.execute("INSERT INTO ValidPaths VALUES('/nix/store/0123456789abcdfghijklmnpqrsvwxyz-other', 'different')").unwrap();
+    }
 
     fn fixture_signing_key() -> SigningKey {
         SigningKey::from_bytes(&[7; 32])

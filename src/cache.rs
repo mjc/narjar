@@ -2,8 +2,6 @@
 pub(crate) mod auth;
 #[path = "filesystem.rs"]
 pub(crate) mod filesystem;
-#[path = "http/mod.rs"]
-pub(crate) mod http;
 #[path = "http_server/mod.rs"]
 pub(crate) mod http_server;
 #[path = "inventory.rs"]

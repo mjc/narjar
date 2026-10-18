@@ -2,6 +2,7 @@ mod cache;
 mod config;
 mod control;
 mod error;
+mod http;
 mod http_url;
 mod narinfo_signing;
 mod native_store;
