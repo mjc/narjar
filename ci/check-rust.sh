@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 usage() {
-  printf 'Usage: %s {fmt|clippy|test|doc}\n' "${0##*/}" >&2
+  printf 'Usage: %s {fmt|clippy|test|native-http|doc}\n' "${0##*/}" >&2
 }
 
 check=${1:-}
@@ -32,10 +32,11 @@ case "$check" in
       export NEXTEST_TEST_THREADS=$NIX_BUILD_CORES
     fi
     cargo nextest run "${nextest_profile_args[@]}" --locked --workspace --all-features
-    if [[ -n ${NARJAR_NATIVE_TEST_FILE:-} ]]; then
-      cargo nextest run "${nextest_profile_args[@]}" --locked --workspace --all-features \
-        --run-ignored=only -E 'test(cli_tests::native_http)'
-    fi
+    ;;
+  native-http)
+    : "${NARJAR_NATIVE_TEST_FILE:?native HTTP tests require an immutable store fixture}"
+    cargo nextest run "${nextest_profile_args[@]}" --locked --all-features --test cli \
+      --run-ignored=only -E 'test(cli_tests::native_http)'
     ;;
   doc)
     RUSTDOCFLAGS="-D warnings" cargo test --doc "${cargo_profile_args[@]}" --locked --workspace --all-features

@@ -2402,7 +2402,7 @@ mod tests {
         let mut clock = || {
             clock_calls += 1;
             match clock_calls {
-                1 | 2 => Ok(10),
+                1 => Ok(10),
                 _ => Err(NativeStoreLeaseError::ClockBeforeEpoch),
             }
         };
@@ -2424,7 +2424,7 @@ mod tests {
     }
 
     #[test]
-    fn acquire_reclaims_an_expired_lease_created_by_another_manager() {
+    fn maintenance_reclaims_an_expired_lease_created_by_another_manager() {
         let fixture = LeaseFixture::new(1);
         let next_path = fixture.store_dir.join(format!("{}-next", "1".repeat(32)));
         fs::create_dir(&next_path).expect("next store object should exist");
@@ -2439,9 +2439,20 @@ mod tests {
             .manager
             .acquire(fixture.store_path.clone(), 1)
             .expect("first manager should create the expiring lease");
+        assert!(matches!(
+            stale_manager.acquire(next_path.clone(), 4_000),
+            Err(NativeStoreLeaseError::CapacityExceeded)
+        ));
+        assert!(
+            fixture.manager.root_path(&fixture.store_path).is_symlink(),
+            "a request must not run expiry cleanup"
+        );
+        stale_manager
+            .cleanup_expired_at(4_000)
+            .expect("maintenance reclaims the expired lease");
         stale_manager
             .acquire(next_path, 4_000)
-            .expect("acquisition should scan stale paths and reclaim the expired lease");
+            .expect("admission succeeds after maintenance frees capacity");
 
         assert!(!fixture.manager.root_path(&fixture.store_path).exists());
         assert_eq!(

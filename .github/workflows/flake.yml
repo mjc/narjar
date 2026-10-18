@@ -30,6 +30,8 @@ jobs:
         run: nix run -L --no-update-lock-file .#advisory-check
       - name: Check the flake contract
         run: ./ci/check-flake-contract.sh
+      - name: Native-store HTTP acceptance on the host store
+        run: nix run -L --no-update-lock-file .#native-http-tests
       - run: nix build -L --no-update-lock-file .#packages.x86_64-linux.default
       - run: |
           data_dir="$(mktemp -d)"
@@ -60,6 +62,8 @@ jobs:
         run: nix build -L --no-update-lock-file .#checks.aarch64-darwin.clippy
       - name: Run the Darwin Narjar package tests
         run: nix build -L --no-update-lock-file .#checks.aarch64-darwin.tests
+      - name: Native-store HTTP acceptance on the host store
+        run: nix run -L --no-update-lock-file .#native-http-tests
 
   cargo-install:
     uses: ./.github/workflows/cargo-install.yml

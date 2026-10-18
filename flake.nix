@@ -155,6 +155,15 @@
             ];
             text = builtins.readFile ./tests/nix-e2e.sh;
           };
+          nativeHttpTests = pkgs.writeShellApplication {
+            name = "narjar-native-http-tests";
+            runtimeInputs = [ toolchain pkgs.cargo-nextest pkgs.pkg-config pkgs.stdenv.cc ];
+            text = ''
+              export NARJAR_NATIVE_TEST_FILE=${pkgs.writeText "narjar-native-http-fixture" "native source fixture\n"}
+              export PKG_CONFIG_PATH=${lib.getDev pkgs.sqlite}/lib/pkgconfig
+              exec ${pkgs.bash}/bin/bash ci/check-rust.sh native-http
+            '';
+          };
           ociE2E = pkgs.writeShellApplication {
             name = "narjar-oci-e2e";
             runtimeInputs = [
@@ -208,6 +217,7 @@
             provenance
             advisoryCheck
             nixE2E
+            nativeHttpTests
             continuationBenchmark
             ociE2E
             ;
@@ -313,6 +323,11 @@
           program = lib.getExe env.nixE2E;
           meta.description = "Run the real-Nix end-to-end verification";
         };
+        native-http-tests = {
+          type = "app";
+          program = lib.getExe env.nativeHttpTests;
+          meta.description = "Run native HTTP tests outside the build user namespace";
+        };
         oci-e2e = {
           type = "app";
           program = lib.getExe env.ociE2E;
@@ -337,7 +352,6 @@
                 doCheck = false;
                 doInstallCargoArtifacts = false;
                 nativeBuildInputs = env.commonArgs.nativeBuildInputs ++ [ env.pkgs.cargo-nextest ];
-                NARJAR_NATIVE_TEST_FILE = env.pkgs.writeText "narjar-native-http-fixture" "native source fixture\n";
                 buildPhaseCargoCommand = ''
                   export CARGO_PROFILE
                   ${env.pkgs.bash}/bin/bash ${repositorySrc}/ci/check-rust.sh ${command}
