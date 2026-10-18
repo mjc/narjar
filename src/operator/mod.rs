@@ -920,6 +920,9 @@ pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
         }
         Err(
             SourcePreparationError::NativeOptionsForCache
+            | SourcePreparationError::MissingEdgeUpstream
+            | SourcePreparationError::EdgeOptionsForOtherSource
+            | SourcePreparationError::EdgeCompressedOutput
             | SourcePreparationError::NativeStoreDirectory
             | SourcePreparationError::MissingNativeOptions
             | SourcePreparationError::NativeCompressedOutput
@@ -1022,6 +1025,7 @@ fn inspect_doctor_source(
 ) -> DoctorSource {
     let (name, validation) = match source {
         Ok(ServeSource::FlatCache { .. }) => ("flat-cache", Ok("selected")),
+        Ok(ServeSource::ReadThrough { .. }) => ("read-through", Ok("selected")),
         Err(error) => (options.serve_source.name(), Err(error.doctor_detail())),
         Ok(ServeSource::NativeStore(settings)) => (
             "native-store",

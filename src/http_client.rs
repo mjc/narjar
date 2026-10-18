@@ -12,7 +12,7 @@ use ureq::{
     },
 };
 
-pub(super) fn native_agent(timeout: Duration) -> Agent {
+pub(crate) fn idle_agent(timeout: Duration) -> Agent {
     Agent::with_parts(
         connection_config(timeout),
         DefaultConnector::default().chain(IdleConnector { timeout }),
@@ -90,4 +90,5 @@ fn idle_timeout(supplied: NextTimeout, idle: Duration, reason: Timeout) -> NextT
 }
 
 #[cfg(test)]
-mod tests;
+#[path = "push/timeout/tests.rs"]
+pub(crate) mod tests;

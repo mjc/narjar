@@ -31,6 +31,25 @@ leasing an unsigned path. Per-lease association records and the raw-hash index
 are serialized with lease mutation; cleanup retains an index owned by another
 still-live path with identical NAR contents.
 
+## Read-through source
+
+The edge uses normal cache storage and publication with a fixed trusted HTTP
+upstream. A metadata miss obtains trusted claims, secures the exact payload
+through existing bounded ingestion, then publishes raw metadata. It returns no
+positive narinfo before both objects and an advertisement lease are durable.
+It never streams upstream metadata ahead of payload completion.
+
+Per-store and logical-NAR fill ownership coalesces duplicate work. Active fills,
+waiting requests and negative entries are bounded. Failures become local misses;
+committed hits do not contact the upstream. There is no native Nix store,
+build daemon or write-behind queue.
+
+Storage owns durable advertisement leases, independent of HTTP source selection.
+Reads renew them before returning metadata. GC loads them under the existing
+collection coordination, including offline collection after restart. Missing
+lease evidence protects publications conservatively; malformed evidence cannot
+silently disable retention.
+
 ## Identities and representations
 
 A logical NAR has an uncompressed SHA-256 hash and byte count. Its raw, XZ,
@@ -67,6 +86,7 @@ DATA/
   .narjar-chunks/                shared raw chunks, sharded by hash
   .narjar-ingress/               compressed upload-to-raw receipts
   .narjar-egress/                raw-to-compressed download receipts
+  .narjar-advertisements/        optional durable metadata/payload retention leases
   .narjar-control/gc.sock        private daemon maintenance socket
   .tmp/                         metadata and receipt staging
   <store-hash>.narinfo

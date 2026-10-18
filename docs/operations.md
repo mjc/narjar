@@ -73,6 +73,85 @@ upload. `--refresh` bypasses upstream checks.
 Push and native-store serving require a local Nix store. Serving an initialized
 standalone Narjar cache does not require Nix.
 
+## Read-through edge
+
+Run a local edge when clients need to keep building while a central cache is
+unreachable. Initialize a normal Narjar data directory and install the central
+cache's public signing keys in `trusted-public-keys`, then run:
+
+~~~sh
+narjar serve --data-dir ./edge --listen 127.0.0.1:5000 \
+  --serve-source read-through --edge-upstream https://cache.example \
+  --edge-max-fills 4 --edge-timeout-seconds 30
+~~~
+
+Configure Nix to use the local endpoint, not the central URL. Push directly to
+the central cache. The edge is read-only and rejects PUT without accepting a
+body. It needs neither Nix executables nor a Nix database.
+
+A local miss fetches bounded, signature-verified metadata and its exact payload.
+The edge validates and commits the payload, projects raw narinfo, then commits
+metadata and its retention lease before returning success. It accepts raw, XZ,
+and Zstd input and serves raw output. Concurrent requests for the same object
+share the fill. Redirects are rejected; payload routes stay under the configured
+upstream base URL.
+
+An upstream 404, timeout, refused connection, 429/503, invalid signature or
+incomplete/corrupt payload produces a local narinfo 404. Nix can then build a
+path for which it has a recipe with `fallback = false`. A hit needs no upstream
+connection. The edge secures individual pairs, not whole reference closures;
+Nix can build a missing reference and its dependent locally. Opaque paths with
+no recipe cannot be built just because a cache misses.
+
+The existing size, decoder-memory, staging-space and minimum-free controls
+apply to fills. `--edge-max-fills` bounds concurrent fills; excess unrelated
+misses return 404. `--edge-negative-ttl-seconds` defaults to one second. Negative
+entries are bounded and expire after at most 60 seconds. Nix separately caches
+negative narinfo, so a long client negative TTL delays recovery too.
+
+Successful advertisements have durable leases under `.narjar-advertisements`.
+Online and offline GC retain live promises across restart. Capacity exhaustion
+rejects new fills rather than revoking those promises. The default lease is
+5,187,600 seconds: two stock 30-day positive-cache windows plus one hour. Nix can
+load a disk-cache entry into another in-memory TTL window; HTTP `no-store` does
+not change those caches. Pair shorter leases with shorter client TTLs and leave
+time for queued payload requests. Arbitrarily suspended clients have no finite
+retention guarantee. Do not delete edge data while clients retain its positive
+metadata.
+
+NixOS can configure the loopback service and sole substituter together:
+
+~~~nix
+services.narjar = {
+  enable = true;
+  edge = {
+    enable = true;
+    upstream = "https://cache.example";
+    trustedPublicKeys = [ "cache.example:BASE64_PUBLIC_KEY" ];
+    configureClient = true;
+    clientPositiveTtlSeconds = 300;
+    clientNegativeTtlSeconds = 1;
+    leaseSeconds = 3600;
+  };
+  gc = {
+    enable = true;
+    maxBytes = 20 * 1024 * 1024 * 1024;
+    targetBytes = 15 * 1024 * 1024 * 1024;
+  };
+};
+~~~
+
+`configureClient` replaces Nix's substituter list with this loopback endpoint,
+installs the same public keys for Nix, sets the TTLs, and keeps fallback disabled.
+The module requires a lease covering two positive TTL windows plus 300 seconds
+of delay. Public keys may be in the Nix store; no signing secret is needed.
+GC size targets are best-effort while leases are live. Use `/metrics` to inspect
+local hits, upstream outcomes, active fills and negative-cache occupancy.
+
+Run `nix run .#edge-e2e` on Linux to exercise real private-store builds with
+fallback disabled, cached positives across restart/offline GC, and recovery
+after an outage. The test does not change the host store or boot a VM.
+
 ## Native-store serving
 
 Select `serve --serve-source native-store` with explicit `--native-store-dir`,

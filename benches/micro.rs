@@ -8,12 +8,24 @@ mod cache;
 mod http;
 #[cfg(test)]
 #[allow(dead_code, unused_imports)]
+#[path = "../src/http_client.rs"]
+mod http_client;
+#[cfg(test)]
+#[allow(dead_code, unused_imports)]
+#[path = "../src/http_url.rs"]
+mod http_url;
+#[cfg(test)]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/narinfo_signing.rs"]
 mod narinfo_signing;
 #[cfg(test)]
 #[allow(dead_code, unused_imports)]
 #[path = "../src/native_store.rs"]
 mod native_store;
+#[cfg(test)]
+#[allow(dead_code, unused_imports)]
+#[path = "../src/read_through.rs"]
+mod read_through;
 #[cfg(test)]
 #[allow(dead_code, unused_imports)]
 #[path = "../src/verified_stream.rs"]

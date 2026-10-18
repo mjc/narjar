@@ -422,18 +422,20 @@ struct ServerResources {
 fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, Error> {
     let root_directory =
         Directory::open(&config.data_dir).map_err(|error| Error::runtime(error.to_string()))?;
-    let storage = Storage::open(&root_directory, config.storage_backend()).map_err(|error| {
-        Error::runtime(format!(
-            "data directory is not initialized at {}: {error}",
-            config.data_dir.display()
-        ))
-    })?;
+    let mut storage =
+        Storage::open(&root_directory, config.storage_backend()).map_err(|error| {
+            Error::runtime(format!(
+                "data directory is not initialized at {}: {error}",
+                config.data_dir.display()
+            ))
+        })?;
     let (authorizer, trusted_keys) = CachePolicies::load(&root_directory)
         .map_err(|error| {
             Error::runtime(format!("cannot load initialized cache policies: {error}"))
         })?
         .into_parts();
     let trusted_keys = Arc::new(trusted_keys);
+    recover_server_storage(&storage, &trusted_keys)?;
     let source = match &config.source {
         ServeSource::FlatCache { .. } => ReadSource::FlatCache,
         ServeSource::NativeStore(settings) => {
@@ -447,8 +449,26 @@ fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, 
                 ),
             ))
         }
+        ServeSource::ReadThrough { settings, .. } => {
+            let source = crate::read_through::ReadThroughSource::new(
+                settings.clone(),
+                Arc::clone(&trusted_keys),
+                NarUploadPolicy::with_limits(
+                    config.max_encoded_nar_bytes.get(),
+                    config.max_nar_bytes.get(),
+                    config.max_decoder_memory_bytes.get(),
+                    config.min_free_bytes,
+                ),
+            )
+            .map_err(|error| Error::usage(error.to_string()))?;
+            storage
+                .configure_advertisement_leases(settings.lease_seconds, config.min_free_bytes)
+                .map_err(|error| {
+                    Error::runtime(format!("cannot configure advertisement retention: {error}"))
+                })?;
+            ReadSource::ReadThrough(Box::new(source))
+        }
     };
-    recover_server_storage(&storage, &trusted_keys)?;
     Ok(ServerResources {
         storage: Arc::new(storage),
         source: Arc::new(source),
@@ -626,7 +646,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     } = initialize_server_resources(&config)?;
     let publication_workers = match source.as_ref() {
         ReadSource::FlatCache => config.workers.get(),
-        ReadSource::NativeStore(_) => 0,
+        ReadSource::NativeStore(_) | ReadSource::ReadThrough(_) => 0,
     };
     if config.track_access {
         storage

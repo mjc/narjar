@@ -66,6 +66,7 @@ impl CleanupAction {
     }
 }
 
+pub(crate) use advertisement::AdvertisementEvidence;
 pub use fs::{StorageCapacity, capacity_from_statvfs, private_file_mode_is_valid};
 
 pub(crate) use fs::{

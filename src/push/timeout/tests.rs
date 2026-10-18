@@ -95,7 +95,7 @@ impl Transport for RecordedTransport {
 
 #[test]
 fn connection_deadlines_do_not_limit_transfer_phases() {
-    let agent = native_agent(IDLE);
+    let agent = idle_agent(IDLE);
     let timeouts = agent.config().timeouts();
     assert_eq!(timeouts.resolve, Some(IDLE));
     assert_eq!(timeouts.connect, Some(IDLE));
@@ -244,8 +244,9 @@ impl Resolver for FixedResolver {
     }
 }
 
-#[test]
-fn redirect_retry_and_new_connections_keep_idle_timeouts() {
+pub(crate) fn assert_redirect_retry_and_new_connections_keep_idle_timeouts(
+    put: impl FnOnce(&Agent) -> StatusCode,
+) {
     let responses = Arc::new(Mutex::new(VecDeque::from([
         b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
         b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
@@ -261,12 +262,7 @@ fn redirect_retry_and_new_connections_keep_idle_timeouts() {
         .chain(IdleConnector { timeout: IDLE }),
         FixedResolver,
     );
-    let url = "https://cache.example/nar".parse().unwrap();
-    let status =
-        super::super::transfer::put(&agent, &url, 3, "application/x-nix-nar", None, || {
-            Ok(b"nar".as_slice())
-        })
-        .unwrap();
+    let status = put(&agent);
     assert_eq!(status, StatusCode::CREATED);
     assert!(responses.lock().unwrap().is_empty());
     let calls = calls.lock().unwrap();
@@ -336,7 +332,7 @@ fn progressing_upload_outlives_the_configured_timeout() {
             .unwrap();
     });
     let started = Instant::now();
-    let response = native_agent(IDLE)
+    let response = idle_agent(IDLE)
         .put(&url)
         .config()
         .proxy(None)
@@ -366,7 +362,7 @@ fn stalled_response_headers_and_body_time_out_on_loopback() {
             // Also bounds a broken implementation that forgets the idle timeout.
             let _ = wait.recv_timeout(Duration::from_secs(30));
         });
-        let result = native_agent(IDLE)
+        let result = idle_agent(IDLE)
             .get(&url)
             .config()
             .proxy(None)

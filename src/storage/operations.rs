@@ -601,6 +601,18 @@ impl Storage {
             .map_err(|_| StorageError::NarMismatch)
     }
 
+    /// Bind signed logical claims to canonical bytes independently of upload encoding.
+    pub(crate) fn bind_canonical_narinfo(
+        &self,
+        narinfo: ValidatedNarInfo,
+    ) -> Result<BoundNarInfo<'_>, StorageError> {
+        let output = NarRepresentation::Raw(narinfo.claims().identity());
+        let stored = self.open_verified_canonical_nar(output)?;
+        narinfo
+            .bind_to_stored_nar(stored, output)
+            .map_err(|_| StorageError::NarMismatch)
+    }
+
     #[cfg(test)]
     pub(super) fn publish_narinfo_unchecked(
         &self,

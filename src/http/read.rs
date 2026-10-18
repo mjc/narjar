@@ -17,10 +17,12 @@ use crate::cache::{
 
 use super::write::unauthorized;
 use crate::native_store::serving::{NativeReadError, NativeStoreSource};
+use crate::read_through::{EdgeLookup, ReadThroughSource};
 
 pub(crate) enum ReadSource {
     FlatCache,
     NativeStore(Box<NativeStoreSource>),
+    ReadThrough(Box<ReadThroughSource>),
 }
 
 #[derive(Clone, Copy)]
@@ -34,13 +36,14 @@ impl ReadSource {
         match self {
             Self::FlatCache => {}
             Self::NativeStore(source) => source.maintain(),
+            Self::ReadThrough(source) => source.maintain(),
         }
     }
 
     fn allowed_methods(&self) -> &'static str {
         match self {
             Self::FlatCache => "GET, HEAD, PUT",
-            Self::NativeStore(_) => "GET, HEAD",
+            Self::NativeStore(_) | Self::ReadThrough(_) => "GET, HEAD",
         }
     }
 }
@@ -48,7 +51,7 @@ impl ReadSource {
 impl ReadContext<'_> {
     fn readiness(self, min_free_bytes: u64) -> StorageReadiness {
         match self.source {
-            ReadSource::FlatCache => self
+            ReadSource::FlatCache | ReadSource::ReadThrough(_) => self
                 .storage
                 .is_ready(min_free_bytes)
                 .unwrap_or(StorageReadiness::ProbeFailed),
@@ -166,6 +169,7 @@ fn respond_narinfo(
     store: &StoreHash,
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
+    public_control: &'static str,
 ) -> Option<TcpStream> {
     let lookup_started = Instant::now();
     let crate::cache::storage::AdvertisedNarInfo { bytes, _activity } =
@@ -184,9 +188,40 @@ fn respond_narinfo(
     let response = cache_policy(
         Response::from_data(bytes).with_header(header("Content-Type", "text/x-nix-narinfo")),
         visibility,
-        IMMUTABLE_CACHE_CONTROL,
+        public_control,
     );
     send_response(guard, request, response)
+}
+
+fn respond_edge_narinfo(
+    request: Request,
+    storage: &Storage,
+    source: &ReadThroughSource,
+    store: &StoreHash,
+    guard: &RequestGuard<'_>,
+    visibility: ReadVisibility,
+) -> Option<TcpStream> {
+    match source.ensure_local(storage, store) {
+        EdgeLookup::Ready => {
+            respond_narinfo(request, storage, store, guard, visibility, "no-store")
+        }
+        EdgeLookup::Miss(_) => {
+            guard.record_cache_lookup(
+                CacheObject::NarInfo,
+                CacheLookupOutcome::Miss,
+                std::time::Duration::ZERO,
+            );
+            send_response(
+                guard,
+                request,
+                cache_policy(
+                    Response::empty(StatusCode::NOT_FOUND),
+                    visibility,
+                    "no-store",
+                ),
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -922,6 +957,12 @@ fn respond_metrics(
             );
             source.append_metrics(&mut output);
         }
+        ReadSource::ReadThrough(source) => {
+            output.push_str(
+                "# TYPE narjar_source_info gauge\nnarjar_source_info{source=\"read-through\"} 1\n",
+            );
+            source.append_metrics(&mut output);
+        }
     }
     let response = prevent_operator_and_auth_response_caching(
         Response::from_string(output)
@@ -973,7 +1014,7 @@ fn respond_cache_route(
                     send_response(guard, request, response)
                 }
                 CacheRoute::Nar(name) => match context.source {
-                    ReadSource::FlatCache => {
+                    ReadSource::FlatCache | ReadSource::ReadThrough(_) => {
                         respond_nar(request, context.storage, name, guard, visibility)
                     }
                     ReadSource::NativeStore(source) => {
@@ -981,12 +1022,25 @@ fn respond_cache_route(
                     }
                 },
                 CacheRoute::NarInfo(store) => match context.source {
-                    ReadSource::FlatCache => {
-                        respond_narinfo(request, context.storage, &store, guard, visibility)
-                    }
+                    ReadSource::FlatCache => respond_narinfo(
+                        request,
+                        context.storage,
+                        &store,
+                        guard,
+                        visibility,
+                        IMMUTABLE_CACHE_CONTROL,
+                    ),
                     ReadSource::NativeStore(source) => {
                         respond_native_narinfo(request, source, store, guard, visibility)
                     }
+                    ReadSource::ReadThrough(source) => respond_edge_narinfo(
+                        request,
+                        context.storage,
+                        source,
+                        &store,
+                        guard,
+                        visibility,
+                    ),
                 },
             }
         }

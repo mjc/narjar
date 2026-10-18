@@ -27,6 +27,11 @@ use tempfile::TempDir;
 use std::sync::{Barrier, atomic::AtomicU64};
 
 const CONFIG_ENV: &[&str] = &[
+    "NARJAR_EDGE_UPSTREAM",
+    "NARJAR_EDGE_LEASE_SECONDS",
+    "NARJAR_EDGE_MAX_FILLS",
+    "NARJAR_EDGE_TIMEOUT_SECONDS",
+    "NARJAR_EDGE_NEGATIVE_TTL_SECONDS",
     "NARJAR_SERVE_SOURCE",
     "NARJAR_NATIVE_STORE_DIR",
     "NARJAR_NATIVE_STATE_DIR",
@@ -49,6 +54,8 @@ const CONFIG_ENV: &[&str] = &[
 
 #[path = "support/native_http.rs"]
 mod native_http;
+#[path = "support/read_through_http.rs"]
+mod read_through_http;
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const NAR_BYTES: &[u8] = b"narjar";

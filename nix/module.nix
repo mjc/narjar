@@ -37,6 +37,12 @@
   zfsSampleDirectory = "/run/narjar-zfs-stats";
   zfsSampleFile = "${zfsSampleDirectory}/sample.json";
   nativeGcLock = "${cfg.nativeStore.stateDir}/gc.lock";
+  trustedPublicKeysFile =
+    if cfg.auth.trustedPublicKeys != null
+    then cfg.auth.trustedPublicKeys
+    else if cfg.edge.trustedPublicKeys != []
+    then pkgs.writeText "narjar-edge-trusted-keys" (lib.concatStringsSep "\n" cfg.edge.trustedPublicKeys + "\n")
+    else null;
   filesystemSampleFile =
     if cfg.statsFilesystemSample != null
     then cfg.statsFilesystemSample
@@ -87,7 +93,7 @@
     }
     {
       name = "trusted-public-keys";
-      source = cfg.auth.trustedPublicKeys;
+      source = trustedPublicKeysFile;
       target = "trusted-public-keys";
       mode = "0600";
     }
@@ -325,6 +331,20 @@
       "--native-min-lease-seconds"
       (toString cfg.nativeStore.minLeaseSeconds)
     ]
+    ++ lib.optionals cfg.edge.enable [
+      "--serve-source"
+      "read-through"
+      "--edge-upstream"
+      cfg.edge.upstream
+      "--edge-lease-seconds"
+      (toString cfg.edge.leaseSeconds)
+      "--edge-max-fills"
+      (toString cfg.edge.maxFills)
+      "--edge-timeout-seconds"
+      (toString cfg.edge.timeoutSeconds)
+      "--edge-negative-ttl-seconds"
+      (toString cfg.edge.negativeTtlSeconds)
+    ]
     ++ lib.optionals (cfg.nativeStore.signingKeyFile != null) [
       "--native-signing-key-file"
       "%d/native-signing-key"
@@ -547,6 +567,51 @@ in {
       };
     };
 
+    edge = {
+      enable = lib.mkEnableOption "a read-only, fail-open local cache for a fixed upstream";
+      upstream = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Fixed HTTP(S) binary cache used for read-through fills. Redirects are rejected.";
+      };
+      trustedPublicKeys = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [];
+        description = "Nix signing keys trusted for fills, also used by the optional local Nix client profile. Public keys are stored in the Nix store.";
+      };
+      leaseSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 5187600;
+        description = "Durable protection after advertisement. Default covers two 30-day positive TTL windows plus one hour; GC cannot revoke a live promise.";
+      };
+      maxFills = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 4;
+        description = "Maximum simultaneous upstream fills; additional unrelated misses return 404.";
+      };
+      timeoutSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 30;
+        description = "Upstream request and inactive-I/O timeout in seconds.";
+      };
+      negativeTtlSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 1;
+        description = "Bounded edge negative-cache lifetime for misses and failed fills.";
+      };
+      configureClient = lib.mkEnableOption "using this loopback edge as the sole Nix substituter, with fallback disabled";
+      clientPositiveTtlSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 300;
+        description = "Nix positive narinfo TTL for the local client profile. Lease must cover two TTL windows plus 300 seconds of delay.";
+      };
+      clientNegativeTtlSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 1;
+        description = "Nix negative narinfo TTL for the local client profile.";
+      };
+    };
+
     listen = lib.mkOption {
       type = lib.types.str;
       default = "127.0.0.1:5000";
@@ -743,7 +808,38 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    nix.settings = lib.mkIf cfg.edge.configureClient {
+      substituters = lib.mkForce ["http://${cfg.listen}"];
+      trusted-public-keys = lib.mkAfter cfg.edge.trustedPublicKeys;
+      fallback = false;
+      narinfo-cache-positive-ttl = cfg.edge.clientPositiveTtlSeconds;
+      narinfo-cache-negative-ttl = cfg.edge.clientNegativeTtlSeconds;
+    };
     assertions = [
+      {
+        assertion = !cfg.edge.enable || (!cfg.nativeStore.enable && cfg.egressCompression == "none");
+        message = "services.narjar.edge requires raw output and cannot be combined with nativeStore";
+      }
+      {
+        assertion = !cfg.edge.enable || (lib.hasPrefix "https://" cfg.edge.upstream || lib.hasPrefix "http://" cfg.edge.upstream);
+        message = "services.narjar.edge.upstream must be an HTTP(S) cache URL";
+      }
+      {
+        assertion = !cfg.edge.enable || trustedPublicKeysFile != null;
+        message = "services.narjar.edge requires trustedPublicKeys or auth.trustedPublicKeys";
+      }
+      {
+        assertion = cfg.edge.trustedPublicKeys == [] || cfg.auth.trustedPublicKeys == null;
+        message = "services.narjar.edge.trustedPublicKeys and auth.trustedPublicKeys are mutually exclusive";
+      }
+      {
+        assertion = !cfg.edge.configureClient || (cfg.edge.enable && !cfg.privateRead && cfg.edge.trustedPublicKeys != [] && (lib.hasPrefix "127.0.0.1:" cfg.listen || lib.hasPrefix "[::1]:" cfg.listen));
+        message = "services.narjar.edge.configureClient requires an enabled loopback edge and edge.trustedPublicKeys";
+      }
+      {
+        assertion = !cfg.edge.configureClient || cfg.edge.leaseSeconds >= 2 * cfg.edge.clientPositiveTtlSeconds + 300;
+        message = "services.narjar.edge.leaseSeconds must cover two client positive TTL windows plus 300 seconds";
+      }
       {
         assertion =
           canonicalDataDir;

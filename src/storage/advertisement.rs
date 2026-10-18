@@ -109,7 +109,31 @@ enum LeasePurpose {
     Advertisement,
 }
 
+pub(crate) enum AdvertisementEvidence {
+    Recorded,
+    Missing,
+}
+
 impl Storage {
+    pub(crate) fn advertisement_evidence(
+        &self,
+        store: StoreHash,
+    ) -> Result<AdvertisementEvidence, StorageError> {
+        match &self.advertisements {
+            AdvertisementLeases::Absent => {
+                Err(invalid("advertisement retention is not configured"))
+            }
+            AdvertisementLeases::Incomplete => Err(invalid("advertisement policy is missing")),
+            AdvertisementLeases::Active { directory, .. } => {
+                match read_record::<AdvertisementLease>(directory, &lease_name(store))? {
+                    Some(record) if record.version == 1 => Ok(AdvertisementEvidence::Recorded),
+                    Some(_) => Err(invalid("unsupported advertisement lease")),
+                    None => Ok(AdvertisementEvidence::Missing),
+                }
+            }
+        }
+    }
+
     /// Configure durable advertisement retention before sharing storage with workers.
     pub(crate) fn configure_advertisement_leases(
         &mut self,

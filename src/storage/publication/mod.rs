@@ -312,6 +312,17 @@ impl NarUploadPolicy {
     pub const fn min_free_bytes(self) -> u64 {
         self.min_free_bytes
     }
+
+    pub(crate) fn ensure_representation_within_limits(
+        self,
+        representation: crate::cache::object::NarRepresentation,
+    ) -> Result<(), StorageError> {
+        self.ensure_encoded_size_within_limit(representation.encoded_size().get())?;
+        if representation.identity().size().get() > self.max_decoded_bytes {
+            return Err(StorageError::UploadTooLarge);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
