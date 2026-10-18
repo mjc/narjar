@@ -109,43 +109,61 @@ impl Tracking {
         clock: Instant,
         time: SystemTime,
     ) -> io::Result<AccessOutcome> {
-        let mut recent = self
+        self.record_after_coalescing(key, clock, || self.write_access_time(key, time))
+    }
+
+    fn record_after_coalescing(
+        &self,
+        key: AccessKey,
+        clock: Instant,
+        write: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<AccessOutcome> {
+        let recorded = self
             .recent
             .lock()
-            .map_err(|_| io::Error::other("access recorder lock poisoned"))?;
-        match recent.get(&key) {
-            Some(recorded) if clock.saturating_duration_since(*recorded) < TOUCH_INTERVAL => {
+            .map_err(|_| io::Error::other("access recorder lock poisoned"))?
+            .get(&key)
+            .copied();
+        match recorded {
+            Some(recorded) if clock.saturating_duration_since(recorded) < TOUCH_INTERVAL => {
                 Ok(AccessOutcome::Coalesced)
             }
             Some(_) | None => {
-                let file = open_at(
-                    &self.directory,
-                    &key.name(),
-                    OFlags::CREATE
-                        | OFlags::WRONLY
-                        | OFlags::NOFOLLOW
-                        | OFlags::CLOEXEC
-                        | OFlags::NONBLOCK,
-                    (Mode::RUSR | Mode::WUSR).bits(),
-                )?;
-                let metadata = file.metadata()?;
-                if !metadata.is_file() || metadata.len() != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "access record must be an empty regular file",
-                    ));
-                }
-                file.set_times(FileTimes::new().set_modified(time))?;
+                write()?;
+                let mut recent = self
+                    .recent
+                    .lock()
+                    .map_err(|_| io::Error::other("access recorder lock poisoned"))?;
                 let discarded = (recent.len() >= RECENT_LIMIT && !recent.contains_key(&key))
                     .then(|| recent.keys().next().copied())
                     .flatten();
                 if let Some(discarded) = discarded {
                     recent.remove(&discarded);
                 }
-                recent.insert(key, clock);
+                recent
+                    .entry(key)
+                    .and_modify(|previous| *previous = (*previous).max(clock))
+                    .or_insert(clock);
                 Ok(AccessOutcome::Written)
             }
         }
+    }
+
+    fn write_access_time(&self, key: AccessKey, time: SystemTime) -> io::Result<()> {
+        let file = open_at(
+            &self.directory,
+            &key.name(),
+            OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            (Mode::RUSR | Mode::WUSR).bits(),
+        )?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "access record must be an empty regular file",
+            ));
+        }
+        file.set_times(FileTimes::new().set_modified(time))
     }
 }
 
@@ -200,6 +218,26 @@ fn report_advisory_error(operation: &str, error: io::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hint_file_io_does_not_hold_the_shared_coalescing_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let tracking = Tracking {
+            directory: File::open(directory.path()).unwrap(),
+            recent: Mutex::default(),
+        };
+        let key =
+            AccessKey::Publication(StoreHash::parse("00000000000000000000000000000000").unwrap());
+        tracking
+            .record_after_coalescing(key, Instant::now(), || {
+                assert!(
+                    tracking.recent.try_lock().is_ok(),
+                    "unrelated readers must not wait for hint-file I/O"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn repeated_reads_are_coalesced_but_the_persisted_hint_survives_a_restart() {

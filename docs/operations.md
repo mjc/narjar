@@ -224,8 +224,9 @@ services.narjar.gc = {
 change publication-age expiration. The module enables `serve --track-access`
 when last-use scheduling is configured. Standalone servers must enable it
 explicitly. Zero-byte records in `.narjar-access/` hold coarse timestamps;
-repeated reads of cached keys update at most once an hour. The coalescing cache
-holds at most 4,096 keys. Evicted keys can be recorded more often. Hints are not
+repeated reads of cached keys are coalesced for an hour. Concurrent first reads
+can write duplicate hints. The coalescing cache holds at most 4,096 keys.
+Evicted keys can be recorded more often. Hints are not
 synced per read and may be lost on a crash; reader pins, protected roots, and
 advertisement grace do not depend on them. Missing or malformed hints fall back
 to publication time; hint write or cleanup failures do not fail reads or GC.

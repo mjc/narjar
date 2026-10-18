@@ -345,13 +345,30 @@ struct RetentionPolicy {
     now: SystemTime,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CollectionReason {
     MaximumAge,
     SizePressure,
 }
 
 impl RetentionPolicy {
+    fn eviction_key(
+        self,
+        modified: SystemTime,
+        last_use: impl FnOnce() -> SystemTime,
+    ) -> (CollectionReason, SystemTime) {
+        match self.reason(modified, false, 0) {
+            Some(CollectionReason::MaximumAge) => (CollectionReason::MaximumAge, modified),
+            Some(CollectionReason::SizePressure) | None => (
+                CollectionReason::SizePressure,
+                match self.budget.eviction_order {
+                    EvictionOrder::Publication => modified,
+                    EvictionOrder::LastUse => last_use(),
+                },
+            ),
+        }
+    }
+
     fn new(
         options: &GcOptions,
         current_bytes: u64,
@@ -609,15 +626,22 @@ fn run_flat_gc<'storage>(
     let shared = shared_count(&entries);
     let shared_bytes_total = shared_bytes(&entries);
     let (temporary, temporary_bytes) = temporary_inventory(storage)?;
-    let selected = select(&entries, before_bytes, policy);
-    let after_publications = projected_published_bytes(&entries, &selected);
-    let selected_orphans = select_orphans(
-        &storage.root,
+    let FlatSelection {
+        publications: selected,
+        orphans: selected_orphans,
+    } = select_flat_candidates(
+        &entries,
         &orphans,
-        after_publications + orphan_bytes(&orphans),
+        before_bytes,
         policy,
-        &access,
-        options.retention.remaining_deletions(selected.len()),
+        |orphan| access.protects_nar_name(&orphan.name),
+        |orphan| {
+            payload_last_use_or_publication_time(
+                &storage.root,
+                payload_access_key(&orphan.name),
+                orphan.modified,
+            )
+        },
     );
     let projected_after_bytes =
         logical_after_bytes(&entries, &selected, &orphans, &selected_orphans);
@@ -1440,7 +1464,9 @@ fn select_chunked(
         }),
         EvictionOrder::LastUse => order.sort_by_cached_key(|candidate| {
             (
-                candidate.eviction_time(root, entries, orphans),
+                policy.eviction_key(candidate.modified(entries, orphans), || {
+                    candidate.eviction_time(root, entries, orphans)
+                }),
                 candidate.name(entries, orphans),
             )
         }),
@@ -2011,13 +2037,6 @@ fn reference_counts(entries: &[Entry]) -> BTreeMap<OsString, u64> {
     references
 }
 
-fn flat_eviction_time(entry: &Entry, order: EvictionOrder) -> SystemTime {
-    match order {
-        EvictionOrder::Publication => entry.modified,
-        EvictionOrder::LastUse => entry.last_use,
-    }
-}
-
 fn flat_retention_has_remaining_candidates(
     entries: &[Entry],
     selected: &[usize],
@@ -2089,88 +2108,85 @@ fn update_chunked_last_use(storage: &Storage, entries: &mut [ChunkedEntry]) {
     })
 }
 
-fn select(entries: &[Entry], current_bytes: u64, policy: RetentionPolicy) -> Vec<usize> {
-    let mut references = reference_counts(entries);
-    let sizes = payload_sizes(entries);
-    let mut order = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            policy
-                .reason(entry.modified, entry.protected, current_bytes)
-                .is_some()
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    order.sort_unstable_by(|&left, &right| {
-        flat_eviction_time(&entries[left], policy.budget.eviction_order)
-            .cmp(&flat_eviction_time(
-                &entries[right],
-                policy.budget.eviction_order,
-            ))
-            .then_with(|| entries[left].store.cmp(&entries[right].store))
-    });
-
-    let mut remaining = current_bytes;
-    order
-        .into_iter()
-        .filter_map(|index| {
-            let entry = &entries[index];
-            policy.reason(entry.modified, entry.protected, remaining)?;
-            remaining = remaining.saturating_sub(entry.narinfo_bytes);
-            for name in entry_payload_names(entry) {
-                let count = references
-                    .get_mut(name)
-                    .expect("scanned payload reference count");
-                *count -= 1;
-                if *count == 0 {
-                    remaining = remaining.saturating_sub(sizes[name]);
-                }
-            }
-            Some(index)
-        })
-        .take(policy.budget.remaining_deletions(0))
-        .collect()
+#[derive(Clone, Copy)]
+enum FlatCandidate {
+    Publication(usize),
+    Orphan(usize),
 }
 
-fn select_orphans(
-    root: &File,
+#[derive(Default)]
+struct FlatSelection {
+    publications: Vec<usize>,
+    orphans: Vec<usize>,
+}
+
+impl FlatCandidate {
+    fn modified(self, entries: &[Entry], orphans: &[Orphan]) -> SystemTime {
+        match self {
+            Self::Publication(index) => entries[index].modified,
+            Self::Orphan(index) => orphans[index].modified,
+        }
+    }
+
+    fn name<'a>(self, entries: &'a [Entry], orphans: &'a [Orphan]) -> &'a OsStr {
+        match self {
+            Self::Publication(index) => &entries[index].narinfo_name,
+            Self::Orphan(index) => &orphans[index].name,
+        }
+    }
+
+    fn protected(
+        self,
+        entries: &[Entry],
+        orphans: &[Orphan],
+        protects_orphan: impl Fn(&Orphan) -> bool,
+    ) -> bool {
+        match self {
+            Self::Publication(index) => entries[index].protected,
+            Self::Orphan(index) => protects_orphan(&orphans[index]),
+        }
+    }
+}
+
+fn select_flat_candidates(
+    entries: &[Entry],
     orphans: &[Orphan],
     current_bytes: u64,
     policy: RetentionPolicy,
-    access: &CollectionAccess<'_>,
-    remaining_deletions: usize,
-) -> Vec<usize> {
-    let mut order = orphans
-        .iter()
-        .enumerate()
-        .filter(|(_, orphan)| {
+    protects_orphan: impl Fn(&Orphan) -> bool,
+    orphan_last_use: impl Fn(&Orphan) -> SystemTime,
+) -> FlatSelection {
+    let mut references = reference_counts(entries);
+    let sizes = payload_sizes(entries);
+    let mut order = (0..entries.len())
+        .map(FlatCandidate::Publication)
+        .chain((0..orphans.len()).map(FlatCandidate::Orphan))
+        .filter(|candidate| {
             policy
                 .reason(
-                    orphan.modified,
-                    access.protects_nar_name(&orphan.name),
+                    candidate.modified(entries, orphans),
+                    candidate.protected(entries, orphans, &protects_orphan),
                     current_bytes,
                 )
                 .is_some()
         })
-        .map(|(index, _)| index)
         .collect::<Vec<_>>();
     match policy.budget.eviction_order {
-        EvictionOrder::Publication => order.sort_unstable_by(|&left, &right| {
-            orphans[left]
-                .modified
-                .cmp(&orphans[right].modified)
-                .then_with(|| orphans[left].name.cmp(&orphans[right].name))
-        }),
-        EvictionOrder::LastUse => order.sort_by_cached_key(|&index| {
-            let orphan = &orphans[index];
+        EvictionOrder::Publication => order.sort_unstable_by_key(|candidate| {
             (
-                payload_last_use_or_publication_time(
-                    root,
-                    payload_access_key(&orphan.name),
-                    orphan.modified,
-                ),
-                &orphan.name,
+                policy.eviction_key(candidate.modified(entries, orphans), || {
+                    candidate.modified(entries, orphans)
+                }),
+                candidate.name(entries, orphans),
+            )
+        }),
+        EvictionOrder::LastUse => order.sort_by_cached_key(|candidate| {
+            (
+                policy.eviction_key(candidate.modified(entries, orphans), || match *candidate {
+                    FlatCandidate::Publication(index) => entries[index].last_use,
+                    FlatCandidate::Orphan(index) => orphan_last_use(&orphans[index]),
+                }),
+                candidate.name(entries, orphans),
             )
         }),
     }
@@ -2178,18 +2194,42 @@ fn select_orphans(
     let mut remaining = current_bytes;
     order
         .into_iter()
-        .filter_map(|index| {
-            let orphan = &orphans[index];
-            policy.reason(
-                orphan.modified,
-                access.protects_nar_name(&orphan.name),
-                remaining,
-            )?;
-            remaining = remaining.saturating_sub(orphan.bytes);
-            Some(index)
+        .filter_map(|candidate| {
+            policy.reason(candidate.modified(entries, orphans), false, remaining)?;
+            let removed = match candidate {
+                FlatCandidate::Publication(index) => {
+                    remove_publication_bytes(&entries[index], &mut references, &sizes)
+                }
+                FlatCandidate::Orphan(index) => orphans[index].bytes,
+            };
+            remaining = remaining.saturating_sub(removed);
+            Some(candidate)
         })
-        .take(remaining_deletions)
-        .collect()
+        .take(policy.budget.remaining_deletions(0))
+        .fold(FlatSelection::default(), |mut selected, candidate| {
+            match candidate {
+                FlatCandidate::Publication(index) => selected.publications.push(index),
+                FlatCandidate::Orphan(index) => selected.orphans.push(index),
+            }
+            selected
+        })
+}
+
+fn remove_publication_bytes(
+    entry: &Entry,
+    references: &mut BTreeMap<OsString, u64>,
+    sizes: &BTreeMap<OsString, u64>,
+) -> u64 {
+    entry_payload_names(entry).fold(entry.narinfo_bytes, |bytes, name| {
+        let count = references
+            .get_mut(name)
+            .expect("scanned payload reference count");
+        *count -= 1;
+        bytes.saturating_add(match *count {
+            0 => sizes[name],
+            _ => 0,
+        })
+    })
 }
 
 fn logical_after_bytes(
@@ -2212,17 +2252,11 @@ fn projected_published_bytes(entries: &[Entry], selected: &[usize]) -> u64 {
     let mut references = reference_counts(entries);
     let sizes = payload_sizes(entries);
     for &index in selected {
-        let entry = &entries[index];
-        total = total.saturating_sub(entry.narinfo_bytes);
-        for name in entry_payload_names(entry) {
-            let count = references
-                .get_mut(name)
-                .expect("scanned payload reference count");
-            *count -= 1;
-            if *count == 0 {
-                total = total.saturating_sub(sizes[name]);
-            }
-        }
+        total = total.saturating_sub(remove_publication_bytes(
+            &entries[index],
+            &mut references,
+            &sizes,
+        ));
     }
     total
 }
@@ -2368,6 +2402,18 @@ mod tests {
         min_age: Duration,
     }
 
+    fn select(entries: &[Entry], current_bytes: u64, policy: RetentionPolicy) -> Vec<usize> {
+        select_flat_candidates(
+            entries,
+            &[],
+            current_bytes,
+            policy,
+            |_| unreachable!(),
+            |_| unreachable!(),
+        )
+        .publications
+    }
+
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
         CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
             .and_then(|creation| creation.create_or_complete())
@@ -2459,7 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_pressure_candidates_do_not_spend_the_deletion_budget_before_expired_entries() {
+    fn expiration_that_meets_the_byte_target_does_not_evict_pressure_candidates() {
         let (_, _, mut entries) = mixed_pair_fixture();
         let (_, _, third) = pair_fixture();
         entries.push(third);
@@ -2489,8 +2535,8 @@ mod tests {
         };
         assert_eq!(
             select(&entries, 100, policy),
-            [0, 2],
-            "a skipped pressure candidate cannot hide a later expired publication"
+            [2],
+            "expiration alone meets the target; younger pressure candidates must survive"
         );
     }
 
@@ -2845,6 +2891,7 @@ mod tests {
             for (index, name) in names.iter().enumerate() {
                 let file = match (backend.backend(), output_only) {
                     (StorageBackend::Chunked, false) => storage
+                        .payloads
                         .chunk_store()
                         .unwrap()
                         .open_manifest(name.raw_hash().unwrap())
@@ -2994,6 +3041,79 @@ mod tests {
     }
 
     #[test]
+    fn capped_last_use_collection_expires_publications_before_evicting_cold_younger_ones() {
+        let (_directory, _storage, mut entries) = mixed_pair_fixture();
+        let now = UNIX_EPOCH + Duration::from_secs(1000);
+        entries[0].modified = UNIX_EPOCH;
+        entries[0].last_use = now;
+        entries[1].modified = now;
+        entries[1].last_use = now - Duration::from_secs(1);
+        let options = GcOptions {
+            max_age: Some(Duration::from_secs(100)),
+            retention: RetentionOptions {
+                eviction_order: EvictionOrder::LastUse,
+                max_deletions: std::num::NonZeroUsize::new(1),
+                ..Default::default()
+            },
+            ..online_options()
+        };
+        let bytes = total_bytes(&entries);
+        let selected = select(
+            &entries,
+            bytes,
+            RetentionPolicy::new(&options, bytes, Some(0), now),
+        );
+        assert_eq!(
+            selected,
+            [0],
+            "recency must not defer publication-age expiration"
+        );
+    }
+
+    #[test]
+    fn expired_orphans_precede_pressure_evictions_and_can_satisfy_the_target_alone() {
+        for cap in [1, 2] {
+            let (directory, storage, entry) = scannable_pair_fixture();
+            let orphan = NarFileName::raw(NarHash::from_digest([42; 32])).to_string();
+            let orphan_path = directory.path().join("nar").join(&orphan);
+            fs::write(&orphan_path, b"old orphan").unwrap();
+            File::open(&orphan_path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH)
+                .unwrap();
+            let trusted =
+                TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+            let published_bytes = total_bytes(std::slice::from_ref(&entry));
+            let options = GcOptions {
+                mode: GcMode::DryRun,
+                target_bytes: Some(published_bytes),
+                max_age: Some(Duration::from_secs(86400)),
+                retention: RetentionOptions {
+                    max_deletions: std::num::NonZeroUsize::new(cap),
+                    ..Default::default()
+                },
+                ..online_options()
+            };
+            let mut entries = Some(vec![entry]);
+            let pass = run_flat_gc(
+                options,
+                &storage,
+                &trusted,
+                Some(published_bytes),
+                CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
+                |_, _| Ok(entries.take().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(
+                pass.report.after_bytes, published_bytes,
+                "cap {cap}: only the expired orphan needs eviction"
+            );
+            assert_eq!(pass.report.evicted, 1);
+            assert_eq!(pass.report.pending_expired, 0);
+        }
+    }
+
+    #[test]
     fn a_flat_pass_caps_publication_deletions_even_when_its_byte_target_is_unmet() {
         let (_, _, entry) = pair_fixture();
         let entries = [entry];
@@ -3011,29 +3131,23 @@ mod tests {
                 SystemTime::now(),
             )
         };
-        let selected = select(&entries, 100, policy);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(policy.budget.remaining_deletions(selected.len()), 0);
         let orphans = [Orphan {
             name: OsString::from("orphan"),
             bytes: 100,
             modified: UNIX_EPOCH,
         }];
-        let directory = tempfile::tempdir().unwrap();
-        let storage = initialize_storage(directory.path()).unwrap();
-        let access = CollectionAccess::Offline(storage.collection.snapshot().unwrap());
-        let exhausted_policy = RetentionPolicy {
-            budget: RetentionOptions {
-                max_deletions: std::num::NonZeroUsize::new(1),
-                ..Default::default()
-            },
-            ..policy
-        };
-        let selected_orphans =
-            select_orphans(&storage.root, &orphans, 100, exhausted_policy, &access, 0);
-        assert!(
-            selected_orphans.is_empty(),
-            "the publication used the pass's only deletion slot"
+        let selected = select_flat_candidates(
+            &entries,
+            &orphans,
+            200,
+            policy,
+            |_| false,
+            |orphan| orphan.modified,
+        );
+        assert_eq!(
+            selected.publications.len() + selected.orphans.len(),
+            1,
+            "publications and orphans share one deletion budget"
         );
     }
 
