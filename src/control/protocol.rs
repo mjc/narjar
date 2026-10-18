@@ -5,7 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 pub(super) const MAX_FRAME_BYTES: usize = 16 * 1024;
 const HEADER_BYTES: usize = 8;
-const MAGIC: &[u8; 4] = b"NGC2";
+const MAGIC: &[u8; 4] = b"NGC3";
 
 pub(super) fn read_frame<T: DeserializeOwned>(mut reader: impl Read) -> io::Result<T> {
     let mut header = [0; HEADER_BYTES];
@@ -66,13 +66,37 @@ mod tests {
     fn unsupported_versions_and_oversized_headers_are_rejected_before_reading_a_body() {
         for header in [
             *b"NGC1\0\0\0\x01",
-            [b'N', b'G', b'C', b'2', 255, 255, 255, 255],
+            [b'N', b'G', b'C', b'3', 255, 255, 255, 255],
         ] {
             assert_eq!(
                 read_frame::<u64>(&header[..]).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
         }
+    }
+
+    #[test]
+    fn previous_request_and_report_schemas_are_rejected_without_reading_their_bodies() {
+        fn reject<T: DeserializeOwned>(body: &[u8]) {
+            let mut frame = b"NGC2".to_vec();
+            frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            frame.extend_from_slice(body);
+            let mut reader = io::Cursor::new(frame);
+            let error = read_frame::<T>(&mut reader)
+                .err()
+                .expect("old schema must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "unsupported control protocol");
+            assert_eq!(reader.position(), HEADER_BYTES as u64);
+        }
+        // NGC2 options: no maximum, target 0, no age, zero minimum age,
+        // empty protected roots, Apply, Flat; before retention fields existed.
+        reject::<crate::cache::storage::gc::GcOptions>(&[0, 1, 0, 0, 0, 0, 0, 1, 0]);
+        // Completed(Logical, dry_run=true, zero counters, target_met=true).
+        let mut report = [0; 26];
+        report[2] = 1;
+        report[5] = 1;
+        reject::<super::super::Reply>(&report);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+#[path = "storage/access.rs"]
+mod access;
 #[path = "storage/backend.rs"]
 mod backend;
 #[path = "storage/cache_info.rs"]
