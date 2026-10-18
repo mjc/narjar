@@ -827,7 +827,7 @@ impl Storage {
                     crate::cache::narinfo::MAX_NARINFO_BYTES,
                 )
                 .map_err(io::Error::from)?;
-                self.renew_advertisement_lease(*store)?;
+                self.renew_advertisement_lease(&activity)?;
                 self.access
                     .record(super::access::AccessKey::Publication(*store));
                 Ok(AdvertisedNarInfo {
@@ -915,8 +915,8 @@ impl Storage {
     where
         Checkpoint: FnMut(PublishBoundary) -> Result<(), StorageError>,
     {
-        let activity = self.collection.mutation()?;
         let destination = target.destination();
+        let activity = self.publication_activity(&destination)?;
         let mut publication = self
             .begin_journaled_temporary(&target, || checkpoint(PublishBoundary::BeforeTempCreate))?;
         publication
@@ -977,7 +977,7 @@ impl Storage {
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
     ) -> Result<PublishOutcome, StorageError> {
         let mut progress = PublicationProgress::Unpublished;
-        let _activity = self.collection.mutation()?;
+        let _activity = self.publication_activity(&destination)?;
         let result = (|| {
             let root = self.root_directory()?;
             let destination_directory = destination.path.open_parent(&root)?;
@@ -992,6 +992,23 @@ impl Storage {
             )
         })();
         progress.finish(result, self, temp, transaction)
+    }
+
+    fn publication_activity(
+        &self,
+        destination: &PublicationDestination,
+    ) -> Result<ActivityLease<'_>, StorageError> {
+        match destination.publication {
+            DestinationPublication::RenewAdvertisement(store) => {
+                destination.validate_path()?;
+                self.collection
+                    .reader(ProtectedObject::Publication(store))?
+                    .ok_or(StorageError::CollectionBusy)
+            }
+            DestinationPublication::Link
+            | DestinationPublication::Replace
+            | DestinationPublication::Repair(_) => self.collection.mutation(),
+        }
     }
 
     fn publish_temporary_at_destination_or_resolve_existing(
@@ -1015,14 +1032,15 @@ impl Storage {
                         progress,
                     )
                 }),
-            DestinationPublication::Replace => self.publish_temporary_and_finalize_destination(
-                destination,
-                destination_directory,
-                temp,
-                transaction,
-                checkpoint,
-                progress,
-            ),
+            DestinationPublication::Replace | DestinationPublication::RenewAdvertisement(_) => self
+                .publish_temporary_and_finalize_destination(
+                    destination,
+                    destination_directory,
+                    temp,
+                    transaction,
+                    checkpoint,
+                    progress,
+                ),
         }
     }
 
@@ -1090,7 +1108,7 @@ impl Storage {
         temp: &TemporaryFile,
     ) -> Result<DestinationPublicationAttempt, StorageError> {
         match destination.publication {
-            DestinationPublication::Replace => {
+            DestinationPublication::Replace | DestinationPublication::RenewAdvertisement(_) => {
                 rename_at(
                     &temp.directory,
                     &temp.name,

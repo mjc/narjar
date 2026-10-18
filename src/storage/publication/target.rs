@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::{ffi::OsString, io};
 
 use super::super::{
-    compression::IngestionReceipt, egress::EgressReceipt, ids::StoreHash, location::StorePath,
+    advertisement::lease_name, collection::AdvertisementRenewal, compression::IngestionReceipt,
+    egress::EgressReceipt, ids::StoreHash, location::StorePath,
 };
 use crate::cache::object::{EncodedIdentity, NarFileName};
 
@@ -64,6 +65,7 @@ pub(crate) enum PublishTarget<'a> {
     EgressReceipt(&'a EgressReceipt),
     RepairEgressNar(EncodedIdentity),
     AdvertisementRecord(&'a std::ffi::OsStr),
+    AdvertisementRenewal(&'a AdvertisementRenewal<'a>),
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +83,14 @@ pub(crate) struct PublicationDestination {
 
 impl PublicationDestination {
     pub(crate) fn validate_path(&self) -> io::Result<()> {
+        if let DestinationPublication::RenewAdvertisement(store) = self.publication
+            && self.path != StorePath::Advertisement(lease_name(store))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "advertisement renewal destination does not match its reader",
+            ));
+        }
         let path = self.path.relative_path();
         path.to_str().ok_or_else(|| {
             io::Error::new(
@@ -97,11 +107,18 @@ pub(crate) enum DestinationPublication {
     Link,
     Replace,
     Repair(EncodedIdentity),
+    RenewAdvertisement(StoreHash),
 }
 
 impl PublishTarget<'_> {
     pub(crate) fn destination(&self) -> PublicationDestination {
         match self {
+            Self::AdvertisementRenewal(renewal) => PublicationDestination {
+                path: StorePath::Advertisement(lease_name(renewal.store())),
+                temporary_directory: TemporaryDirectory::Root,
+                publication: DestinationPublication::RenewAdvertisement(renewal.store()),
+                temp_prefix: "advertisement",
+            },
             Self::AdvertisementRecord(name) => PublicationDestination {
                 path: StorePath::Advertisement(name.to_os_string()),
                 temporary_directory: TemporaryDirectory::Root,
@@ -144,6 +161,36 @@ impl PublishTarget<'_> {
                 publication: DestinationPublication::Repair(*output),
                 temp_prefix: "nar",
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::collection::{CollectionCoordinator, ProtectedObject};
+    use super::*;
+
+    #[test]
+    fn renewal_destination_cannot_redirect_its_reader_permission_to_payload_or_other_metadata() {
+        let coordinator = CollectionCoordinator::without_startup_grace();
+        let store = StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let reader = coordinator
+            .reader(ProtectedObject::Publication(store))
+            .unwrap()
+            .unwrap();
+        let renewal = reader.advertisement_renewal().unwrap();
+        let mut destination = PublishTarget::AdvertisementRenewal(&renewal).destination();
+        destination.validate_path().unwrap();
+        for path in [
+            StorePath::Root("nix-cache-info".into()),
+            StorePath::Nar("payload.nar".into()),
+            StorePath::Advertisement("11111111111111111111111111111111.lease".into()),
+        ] {
+            destination.path = path;
+            assert_eq!(
+                destination.validate_path().unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
         }
     }
 }

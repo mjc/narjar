@@ -125,6 +125,14 @@ enum ChunkedCollectionAction<'storage> {
 }
 
 impl<'storage> CollectionAccess<'storage> {
+    fn refresh_read_protection(mut self) -> Result<Self, StorageError> {
+        match &mut self {
+            Self::Offline(_) => {}
+            Self::Online(snapshot) => snapshot.refresh_read_protection()?,
+        }
+        Ok(self)
+    }
+
     fn protects(&self, object: ProtectedObject) -> bool {
         match self {
             Self::Offline(snapshot) => snapshot.durable.protects(object),
@@ -617,6 +625,7 @@ fn run_flat_gc<'storage>(
     mut scan_entries: impl FnMut(&Storage, &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError>,
 ) -> Result<CollectedPass<'storage>, StorageError> {
     let mut entries = scan_entries(storage, trusted)?;
+    let access = access.refresh_read_protection()?;
     if options.retention.eviction_order == EvictionOrder::LastUse {
         update_flat_last_use(storage, &mut entries);
     }
@@ -874,6 +883,7 @@ fn run_chunked<'storage>(
     access: CollectionAccess<'storage>,
 ) -> Result<CollectedPass<'storage>, StorageError> {
     let mut entries = scan_chunked(storage, chunk_store, trusted)?;
+    let access = access.refresh_read_protection()?;
     if options.retention.eviction_order == EvictionOrder::LastUse {
         update_chunked_last_use(storage, &mut entries);
     }
@@ -4297,6 +4307,142 @@ mod tests {
     }
 
     #[test]
+    fn flat_reads_with_missing_lease_evidence_remain_available_and_conservatively_protected() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        age_publication(directory.path(), &entry);
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
+        let advertised = storage
+            .read_advertised_narinfo(&entry.store)
+            .expect("flat reads must tolerate missing evidence from an interrupted publication")
+            .unwrap();
+        assert!(!advertised.bytes.is_empty());
+        drop(advertised);
+        assert!(matches!(
+            storage.advertisement_evidence(entry.store).unwrap(),
+            super::super::advertisement::AdvertisementEvidence::Missing
+        ));
+        // Remove transient read protection so this exercises durable missing-record policy.
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let report = run_online(online_options(), &storage, &trusted).unwrap();
+        assert_eq!(report.deleted_narinfos, 0);
+        assert!(directory.path().join(&entry.narinfo_name).exists());
+        assert!(directory.path().join("nar").join(&entry.nar_name).exists());
+    }
+
+    #[test]
+    fn renewed_aged_publication_survives_gc_after_transient_read_grace_expires() {
+        let (directory, mut storage, victim) = scannable_pair_fixture();
+        age_publication(directory.path(), &victim);
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+            3.into(),
+        );
+        let retained = StoreHash::parse(TEST_SECOND_STORE_HASH).unwrap();
+        write_signed_raw_metadata(
+            directory.path(),
+            TEST_SECOND_STORE_HASH,
+            identity,
+            Vec::new(),
+        );
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        [victim.store, retained].into_iter().for_each(|store| {
+            storage.record_publication_lease(store, identity).unwrap();
+            storage.expire_advertisement_lease_for_test(store).unwrap();
+        });
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let retained_entry = scan(&storage, &trusted)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.store == retained)
+            .unwrap();
+        age_publication(directory.path(), &retained_entry);
+        let mut options = online_options();
+        options.target_bytes = None;
+        options.max_age = Some(ONLINE_GC_GRACE);
+        let access = CollectionAccess::Online(storage.collection.snapshot().unwrap())
+            .with_durable_protection(storage.advertisement_protection(SystemTime::now()).unwrap());
+        let pass = run_flat_gc(
+            options,
+            &storage,
+            &trusted,
+            None,
+            access,
+            |storage, trusted| {
+                let entries = scan(storage, trusted)?;
+                drop(storage.read_advertised_narinfo(&retained)?.unwrap());
+                storage.collection.expire_transient_protection_for_test();
+                Ok(entries)
+            },
+        )
+        .expect("replacement renewal of retained metadata must not abort online collection");
+        let report = pass.finish(&storage, GcMode::Apply).unwrap();
+        assert_eq!(report.deleted_narinfos, 1);
+        assert!(!directory.path().join(&victim.narinfo_name).exists());
+        assert!(
+            directory
+                .path()
+                .join(format!("{TEST_SECOND_STORE_HASH}.narinfo"))
+                .exists()
+        );
+        assert!(directory.path().join("nar").join(&victim.nar_name).exists());
+        assert!(
+            storage
+                .advertisement_protection(SystemTime::now())
+                .unwrap()
+                .protects(ProtectedObject::Publication(retained))
+        );
+    }
+
+    #[test]
+    fn publication_lease_recording_during_online_gc_still_invalidates_the_scan() {
+        let (directory, mut storage, victim) = scannable_pair_fixture();
+        age_publication(directory.path(), &victim);
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+            3.into(),
+        );
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        storage
+            .record_publication_lease(victim.store, identity)
+            .unwrap();
+        storage
+            .expire_advertisement_lease_for_test(victim.store)
+            .unwrap();
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let access = CollectionAccess::Online(storage.collection.snapshot().unwrap())
+            .with_durable_protection(storage.advertisement_protection(SystemTime::now()).unwrap());
+        let result = run_flat_gc(
+            online_options(),
+            &storage,
+            &trusted,
+            Some(0),
+            access,
+            |storage, trusted| {
+                let entries = scan(storage, trusted)?;
+                storage.record_publication_lease(victim.store, identity)?;
+                Ok(entries)
+            },
+        );
+        assert!(matches!(result, Err(StorageError::CollectionChanged)));
+        assert!(directory.path().join(&victim.narinfo_name).exists());
+        assert!(directory.path().join("nar").join(&victim.nar_name).exists());
+    }
+
+    #[test]
     fn online_collection_aborts_before_unlink_when_publication_changes_the_scan() {
         let (directory, storage, entry) = scannable_pair_fixture();
         age_publication(directory.path(), &entry);
@@ -4363,14 +4509,15 @@ mod tests {
                     Ok(entries)
                 },
             );
+            let pass =
+                result.expect("reads observed during scanning must update candidate protection");
             if depends_on_victim {
-                assert!(
-                    matches!(result, Err(StorageError::CollectionChanged)),
-                    "a newly advertised dependent must keep the selected dependency alive"
+                assert_eq!(
+                    pass.report.deleted_narinfos, 0,
+                    "the protected dependent and its dependency must be excluded before selection"
                 );
                 assert!(directory.path().join(&victim.narinfo_name).exists());
             } else {
-                let pass = result.expect("unrelated metadata traffic must allow the real deletion");
                 assert_eq!(pass.report.deleted_narinfos, 1);
                 assert!(!directory.path().join(&victim.narinfo_name).exists());
             }

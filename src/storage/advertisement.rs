@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Storage, StorageError, StoreHash,
-    collection::ProtectedObject,
+    collection::{ActivityLease, AdvertisementRenewal, ProtectedObject},
     fs::{ensure_directory_at, read_dir_names, require_directory_at, unlink_at},
     publication::PublishTarget,
 };
@@ -104,9 +104,10 @@ impl AdvertisementLeases {
     }
 }
 
-enum LeasePurpose {
+#[derive(Clone, Copy)]
+enum LeasePurpose<'reader> {
     Publication(NarIdentity),
-    Advertisement,
+    Advertisement(&'reader AdvertisementRenewal<'reader>),
 }
 
 pub(crate) enum AdvertisementEvidence {
@@ -174,10 +175,14 @@ impl Storage {
         )
     }
 
-    pub(super) fn renew_advertisement_lease(&self, store: StoreHash) -> Result<(), StorageError> {
+    pub(super) fn renew_advertisement_lease(
+        &self,
+        activity: &ActivityLease<'_>,
+    ) -> Result<(), StorageError> {
+        let renewal = activity.advertisement_renewal()?;
         self.update_advertisement_lease(
-            store,
-            LeasePurpose::Advertisement,
+            renewal.store(),
+            LeasePurpose::Advertisement(&renewal),
             unix_seconds()?,
             File::sync_all,
         )
@@ -186,7 +191,7 @@ impl Storage {
     fn update_advertisement_lease(
         &self,
         store: StoreHash,
-        purpose: LeasePurpose,
+        purpose: LeasePurpose<'_>,
         now: u64,
         synchronize_reused: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<(), StorageError> {
@@ -213,11 +218,9 @@ impl Storage {
                     }
                     (_, Some(record)) => record.identity,
                     (LeasePurpose::Publication(identity), None) => identity,
-                    (LeasePurpose::Advertisement, None) => {
-                        return Err(invalid(
-                            "advertised publication is missing its lease evidence",
-                        ));
-                    }
+                    // Collection retains missing evidence conservatively. Edge reads repair it
+                    // from trusted metadata and canonical bytes before advertising success.
+                    (LeasePurpose::Advertisement(_), None) => return Ok(()),
                 };
                 let required_expiry = now
                     .checked_add(policy.lifetime_seconds.get())
@@ -235,7 +238,19 @@ impl Storage {
                                 .checked_add(headroom)
                                 .ok_or_else(|| invalid("advertisement expiry overflow"))?,
                         };
-                        self.publish_advertisement_record(name, &lease, policy.min_free_bytes)
+                        match purpose {
+                            LeasePurpose::Publication(_) => self.publish_advertisement_record(
+                                name,
+                                &lease,
+                                policy.min_free_bytes,
+                            ),
+                            LeasePurpose::Advertisement(renewal) => self
+                                .publish_advertisement_target(
+                                    PublishTarget::AdvertisementRenewal(renewal),
+                                    &lease,
+                                    policy.min_free_bytes,
+                                ),
+                        }
                     }
                 }
             }
@@ -248,13 +263,37 @@ impl Storage {
         record: &impl Serialize,
         min_free_bytes: u64,
     ) -> Result<(), StorageError> {
+        self.publish_advertisement_target(
+            PublishTarget::AdvertisementRecord(&name),
+            record,
+            min_free_bytes,
+        )
+    }
+
+    fn publish_advertisement_target(
+        &self,
+        target: PublishTarget<'_>,
+        record: &impl Serialize,
+        min_free_bytes: u64,
+    ) -> Result<(), StorageError> {
         let bytes = postcard::to_allocvec(record).map_err(|error| invalid(error.to_string()))?;
         let _reservation = self.reserve_staging(bytes.len() as u64, min_free_bytes)?;
-        self.publish(
-            PublishTarget::AdvertisementRecord(&name),
-            Cursor::new(bytes),
-        )
-        .map(|_| ())
+        self.publish(target, Cursor::new(bytes)).map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_advertisement_lease_for_test(
+        &self,
+        store: StoreHash,
+    ) -> Result<(), StorageError> {
+        let AdvertisementLeases::Active { directory, .. } = &self.advertisements else {
+            return Err(invalid("test requires configured advertisement retention"));
+        };
+        let name = lease_name(store);
+        let mut record: AdvertisementLease = read_record(directory, &name)?
+            .ok_or_else(|| invalid("test requires an existing advertisement"))?;
+        record.expires_at = 0;
+        self.publish_advertisement_record(name, &record, 0)
     }
 
     #[cfg(test)]
@@ -347,7 +386,7 @@ fn read_record<T: for<'de> Deserialize<'de>>(
     }
 }
 
-fn lease_name(store: StoreHash) -> OsString {
+pub(super) fn lease_name(store: StoreHash) -> OsString {
     format!("{}.lease", store.as_str()).into()
 }
 
@@ -399,8 +438,13 @@ mod tests {
         };
         let before: AdvertisementLease =
             read_record(directory, &lease_name(store)).unwrap().unwrap();
+        let reader = storage
+            .collection
+            .reader(ProtectedObject::Publication(store))
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            storage.renew_advertisement_lease(store),
+            storage.renew_advertisement_lease(&reader),
             Err(StorageError::InsufficientSpace)
         ));
         let after: AdvertisementLease =
@@ -421,10 +465,15 @@ mod tests {
             identity,
             expires_at: now + 7200,
         };
-        let name = lease_name(store);
         let bytes = postcard::to_allocvec(&record).unwrap();
+        let reader = storage
+            .collection
+            .reader(ProtectedObject::Publication(store))
+            .unwrap()
+            .unwrap();
+        let renewal = reader.advertisement_renewal().unwrap();
         let failure = storage.publish_with(
-            PublishTarget::AdvertisementRecord(&name),
+            PublishTarget::AdvertisementRenewal(&renewal),
             Cursor::new(bytes),
             |boundary| match boundary {
                 PublishBoundary::BeforeParentSync => {
@@ -437,17 +486,25 @@ mod tests {
             failure.is_err(),
             "rename is visible but not acknowledged as durable"
         );
-        let failure =
-            storage.update_advertisement_lease(store, LeasePurpose::Advertisement, now, |_| {
-                Err(io::Error::other("directory synchronization still fails"))
-            });
+        let failure = storage.update_advertisement_lease(
+            store,
+            LeasePurpose::Advertisement(&renewal),
+            now,
+            |_| Err(io::Error::other("directory synchronization still fails")),
+        );
         assert!(
             failure.is_err(),
             "a visible future expiry cannot bypass the missing durability barrier"
         );
         storage
-            .update_advertisement_lease(store, LeasePurpose::Advertisement, now, File::sync_all)
+            .update_advertisement_lease(
+                store,
+                LeasePurpose::Advertisement(&renewal),
+                now,
+                File::sync_all,
+            )
             .unwrap();
+        drop(reader);
         drop(storage);
         let storage = Storage::open(
             &Directory::open(directory.path()).unwrap(),
