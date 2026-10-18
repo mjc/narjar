@@ -283,7 +283,7 @@ pub struct Metrics {
     queued_connections: AtomicU64,
     request_queue_capacity: AtomicU64,
     active_workers: EnumMap<WorkerKind, AtomicU64>,
-    publication_worker_limit: AtomicU64,
+    worker_limits: EnumMap<WorkerKind, AtomicU64>,
     publication_queue_capacity: AtomicU64,
     declared_upload_bytes: AtomicU64,
     received_upload_bytes: AtomicU64,
@@ -348,7 +348,7 @@ impl Default for Metrics {
             queued_connections: AtomicU64::new(0),
             request_queue_capacity: AtomicU64::new(0),
             active_workers: EnumMap::default(),
-            publication_worker_limit: AtomicU64::new(0),
+            worker_limits: EnumMap::default(),
             publication_queue_capacity: AtomicU64::new(0),
             declared_upload_bytes: AtomicU64::new(0),
             received_upload_bytes: AtomicU64::new(0),
@@ -545,10 +545,11 @@ impl Metrics {
             request_queue_capacity: self.request_queue_capacity.load(Ordering::Relaxed),
             active_request_workers: self.active_workers[WorkerKind::Request]
                 .load(Ordering::Relaxed),
-            request_worker_limit: self.publication_worker_limit.load(Ordering::Relaxed),
+            request_worker_limit: self.worker_limits[WorkerKind::Request].load(Ordering::Relaxed),
             active_publication_workers: self.active_workers[WorkerKind::Publication]
                 .load(Ordering::Relaxed),
-            publication_worker_limit: self.publication_worker_limit.load(Ordering::Relaxed),
+            publication_worker_limit: self.worker_limits[WorkerKind::Publication]
+                .load(Ordering::Relaxed),
             publication_queue_depth: self.publication_queue_depth.load(Ordering::Relaxed),
             publication_queue_capacity: self.publication_queue_capacity.load(Ordering::Relaxed),
             capacity,
@@ -596,12 +597,13 @@ impl Metrics {
         })
     }
 
-    pub fn configure_pressure_limits(&self, connections: u64, workers: u64) {
+    pub fn configure_pressure_limits(&self, connections: u64, workers: EnumMap<WorkerKind, u64>) {
         self.connections_limit.store(connections, Ordering::Relaxed);
         self.request_queue_capacity
             .store(connections, Ordering::Relaxed);
-        self.publication_worker_limit
-            .store(workers, Ordering::Relaxed);
+        workers
+            .into_iter()
+            .for_each(|(kind, limit)| self.worker_limits[kind].store(limit, Ordering::Relaxed));
         self.publication_queue_capacity
             .store(connections, Ordering::Relaxed);
     }
@@ -3755,7 +3757,7 @@ mod tests {
     #[test]
     fn pressure_snapshot_shows_configured_limits_and_active_work() {
         let metrics = Metrics::default();
-        metrics.configure_pressure_limits(8, 2);
+        metrics.configure_pressure_limits(8, enum_map::enum_map! {super::WorkerKind::Request => 2, super::WorkerKind::Publication => 2});
         metrics.record_connection_outcome(ConnectionOutcome::AdmissionRejected);
         metrics.record_connection_outcome(ConnectionOutcome::MalformedRequest);
         metrics.connection_admitted();
@@ -4227,7 +4229,7 @@ mod tests {
     #[test]
     fn worker_activity_is_released_on_completion_and_unwind() {
         let metrics = Metrics::default();
-        metrics.configure_pressure_limits(8, 2);
+        metrics.configure_pressure_limits(8, enum_map::enum_map! {super::WorkerKind::Request => 2, super::WorkerKind::Publication => 2});
         let publication = metrics.worker(super::WorkerKind::Publication);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _request = metrics.worker(super::WorkerKind::Request);

@@ -3979,7 +3979,10 @@ mod tests {
                     let request = crate::cache::http_server::Request::read(stream).unwrap();
                     drop(crate::cache::http::respond(
                         request,
-                        storage,
+                        crate::cache::http::ReadContext {
+                            storage,
+                            source: &crate::cache::http::ReadSource::FlatCache,
+                        },
                         &authorizer,
                         &metrics,
                         0,

@@ -2,6 +2,15 @@
 #[allow(dead_code, unused_imports)]
 #[path = "../src/cache.rs"]
 mod cache;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/narinfo_signing.rs"]
+mod narinfo_signing;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/native_store.rs"]
+mod native_store;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/verified_stream.rs"]
+mod verified_stream;
 
 use std::{
     fs,

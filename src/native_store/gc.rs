@@ -9,6 +9,10 @@ pub(crate) struct GcReadLock {
 }
 
 impl GcReadLock {
+    pub(crate) fn check_access(state_dir: &Path) -> io::Result<()> {
+        open_regular_at(CWD, state_dir.join("gc.lock")).map(drop)
+    }
+
     pub(crate) fn acquire(state_dir: &Path) -> io::Result<Self> {
         let file = open_or_create_gc_lock(&state_dir.join("gc.lock"))?;
         lock_file(&file, FlockOperation::LockShared)?;

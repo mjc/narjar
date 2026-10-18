@@ -147,6 +147,7 @@ impl NativeStoreLease {
         &self.path
     }
 
+    #[cfg(test)]
     pub(crate) const fn expires_at_unix_seconds(&self) -> u64 {
         self.expires_at
     }
@@ -185,6 +186,7 @@ pub(crate) struct NativeLeaseSnapshot {
     pub(crate) active: usize,
     pub(crate) maximum: NonZeroUsize,
     pub(crate) capacity_rejections: u64,
+    pub(crate) expired_released: u64,
 }
 
 pub(crate) struct NativeStoreLeaseManager {
@@ -202,6 +204,7 @@ struct LeaseManagerState {
     record_index: RecordPathIndex,
     record_scan: Option<RecordPathScan>,
     capacity_rejections: u64,
+    expired_released: u64,
     record_paths: BTreeSet<PathBuf>,
     cleanup_cursor: Option<PathBuf>,
 }
@@ -348,6 +351,7 @@ impl NativeStoreLeaseManager {
                 record_index: RecordPathIndex::Current(0),
                 record_scan: None,
                 capacity_rejections: 0,
+                expired_released: 0,
                 record_paths: BTreeSet::new(),
                 cleanup_cursor: None,
             })),
@@ -662,6 +666,7 @@ impl NativeStoreLeaseManager {
         self.ensure_root(&self.root_path(path), path)
     }
 
+    #[cfg(test)]
     pub(crate) fn release(
         &self,
         lease: &NativeStoreLease,
@@ -696,6 +701,11 @@ impl NativeStoreLeaseManager {
         })()
     }
 
+    pub(crate) fn probe(&self) -> Result<(), NativeStoreLeaseError> {
+        GcReadLock::check_access(&self.state_dir).map_err(NativeStoreLeaseError::Io)?;
+        self.snapshot().map(drop)
+    }
+
     pub(crate) fn snapshot(&self) -> Result<NativeLeaseSnapshot, NativeStoreLeaseError> {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
@@ -707,6 +717,7 @@ impl NativeStoreLeaseManager {
             active: state.active,
             maximum: self.maximum_active,
             capacity_rejections: state.capacity_rejections,
+            expired_released: state.expired_released,
         })
     }
 
@@ -719,6 +730,7 @@ impl NativeStoreLeaseManager {
         self.cleanup_expired_records(now, MAX_EXPIRY_CLEANUP_PER_CALL, &mut state)
     }
 
+    #[cfg(test)]
     fn cleanup_expired_at(&self, now: u64) -> Result<(), NativeStoreLeaseError> {
         let mut state = self.lock_state()?;
         let _cross_process_lock = self.acquire_sidecar_lock()?;
@@ -1143,6 +1155,12 @@ impl NativeStoreLeaseManager {
                     )?;
                     state.record_removed(&record_path);
                     self.complete_capacity_mutation(state)?;
+                    match record.state {
+                        PersistedLeaseState::Pending => {}
+                        PersistedLeaseState::Live => {
+                            state.expired_released = state.expired_released.saturating_add(1)
+                        }
+                    }
                     Ok(())
                 })
         })()

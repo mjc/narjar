@@ -27,6 +27,12 @@ use tempfile::TempDir;
 use std::sync::{Barrier, atomic::AtomicU64};
 
 const CONFIG_ENV: &[&str] = &[
+    "NARJAR_SERVE_SOURCE",
+    "NARJAR_NATIVE_STORE_DIR",
+    "NARJAR_NATIVE_STATE_DIR",
+    "NARJAR_NATIVE_ROOTS_DIR",
+    "NARJAR_NATIVE_MIN_LEASE_SECONDS",
+    "NARJAR_NATIVE_SIGNING_KEY_FILE",
     "NOTIFY_SOCKET",
     "NARJAR_DATA_DIR",
     "NARJAR_LISTEN",
@@ -40,6 +46,9 @@ const CONFIG_ENV: &[&str] = &[
     "NARJAR_IO_TIMEOUT_SECONDS",
     "NARJAR_PUSH_TIMEOUT_SECONDS",
 ];
+
+#[path = "support/native_http.rs"]
+mod native_http;
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const NAR_BYTES: &[u8] = b"narjar";
@@ -380,12 +389,20 @@ fn cli_help_and_version_work_for_the_packaged_binary() {
 }
 
 #[test]
-fn serve_help_does_not_advertise_unimplemented_native_store_options() {
+fn serve_help_advertises_native_store_source_and_explicit_configuration() {
     let output = run(&["serve", "--help"]);
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
-    assert!(!help.contains("native-store"), "{help}");
-    assert!(!help.contains("--native-"), "{help}");
+    assert!(help.contains("native-store"), "{help}");
+    for flag in [
+        "--native-store-dir",
+        "--native-state-dir",
+        "--native-roots-dir",
+        "--native-min-lease-seconds",
+        "--native-signing-key-file",
+    ] {
+        assert!(help.contains(flag), "{help}");
+    }
 }
 
 #[test]

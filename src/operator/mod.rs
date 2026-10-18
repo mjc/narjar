@@ -813,6 +813,8 @@ pub(crate) struct Doctor {
     native_roots_dir: Option<PathBuf>,
     #[arg(long, env = "NARJAR_NATIVE_MIN_LEASE_SECONDS")]
     native_min_lease_seconds: Option<NonZeroU64>,
+    #[arg(long, env = "NARJAR_NATIVE_SIGNING_KEY_FILE")]
+    native_signing_key_file: Option<PathBuf>,
     #[arg(long, env = "NARJAR_EGRESS_COMPRESSION", default_value = "none")]
     egress_compression: WireEncoding,
     #[arg(long, env = "NARJAR_STORAGE_BACKEND", default_value = "flat")]
@@ -830,6 +832,7 @@ impl Doctor {
                 state_dir: self.native_state_dir.as_deref(),
                 roots_dir: self.native_roots_dir.as_deref(),
                 min_lease_seconds: self.native_min_lease_seconds,
+                signing_key_file: self.native_signing_key_file.as_deref(),
             },
         )
     }
@@ -2127,6 +2130,7 @@ machine other.example password other-secret
             state_dir: Some(Path::new("/private/state-path")),
             roots_dir: Some(Path::new("/private/roots-path")),
             min_lease_seconds: NonZeroU64::new(60),
+            signing_key_file: None,
         };
         for (choice, native, encoding, backend, expected_error, detail) in [
             (
@@ -2181,6 +2185,7 @@ machine other.example password other-secret
                 native_state_dir: native.state_dir.map(Path::to_owned),
                 native_roots_dir: native.roots_dir.map(Path::to_owned),
                 native_min_lease_seconds: native.min_lease_seconds,
+                native_signing_key_file: None,
                 egress_compression: encoding,
                 storage_backend: backend,
             };
@@ -2229,6 +2234,7 @@ machine other.example password other-secret
                 native_state_dir: complete.then(|| directory.path().join("private-state")),
                 native_roots_dir: Some(directory.path().join("private-roots")),
                 native_min_lease_seconds: NonZeroU64::new(60),
+                native_signing_key_file: None,
                 egress_compression: encoding,
                 storage_backend: StorageBackend::Chunked,
             };
@@ -2259,6 +2265,7 @@ machine other.example password other-secret
             native_state_dir: Some(PathBuf::from("/private/state-path")),
             native_roots_dir: Some(PathBuf::from("/private/roots-path")),
             native_min_lease_seconds: NonZeroU64::new(60),
+            native_signing_key_file: None,
             egress_compression: WireEncoding::Raw,
             storage_backend: StorageBackend::Flat,
         };

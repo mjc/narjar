@@ -46,10 +46,12 @@ impl NativeNarDelivery {
         Ok(Self { identity, reader })
     }
 
+    #[cfg(test)]
     pub(crate) fn content_length(&self) -> u64 {
         self.identity.size().get()
     }
 
+    #[cfg(test)]
     pub(crate) fn into_reader(self) -> impl Read + Send {
         self.reader
     }
