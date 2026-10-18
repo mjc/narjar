@@ -810,7 +810,7 @@ mod tests {
         )
         .unwrap();
         let mut connection = socket::connect(root.path()).unwrap();
-        connection.write_all(b"NGC2\xff\xff\xff\xff").unwrap();
+        connection.write_all(b"NGC3\xff\xff\xff\xff").unwrap();
         connection.shutdown(std::net::Shutdown::Write).unwrap();
         let mut byte = [0];
         connection
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn expired_deadlines_reject_an_available_partial_frame_without_extending_the_budget() {
         let (mut connection, mut peer) = UnixStream::pair().unwrap();
-        peer.write_all(b"NGC2").unwrap();
+        peer.write_all(b"NGC3").unwrap();
         let mut reader = DeadlineReader {
             connection: &mut connection,
             deadline: Instant::now(),

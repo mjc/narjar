@@ -612,6 +612,7 @@ fn run_flat_gc<'storage>(
     let selected = select(&entries, before_bytes, policy);
     let after_publications = projected_published_bytes(&entries, &selected);
     let selected_orphans = select_orphans(
+        &storage.root,
         &orphans,
         after_publications + orphan_bytes(&orphans),
         policy,
@@ -885,6 +886,7 @@ fn run_chunked<'storage>(
         chunked_bytes_for_entries(chunk_store, entries.iter().filter(|entry| entry.protected))?;
     let policy = RetentionPolicy::new(&options, before_bytes, target_bytes, now);
     let selected = select_chunked(
+        &storage.root,
         chunk_store,
         &entries,
         &orphans,
@@ -1408,6 +1410,7 @@ fn chunked_before_bytes(
 }
 
 fn select_chunked(
+    root: &File,
     chunk_store: &ChunkStore,
     entries: &[ChunkedEntry],
     orphans: &ChunkedOrphans,
@@ -1426,14 +1429,22 @@ fn select_chunked(
                 .is_some()
         })
         .collect::<Vec<_>>();
-    order.sort_unstable_by(|left, right| {
-        left.eviction_time(entries, orphans, policy.budget.eviction_order)
-            .cmp(&right.eviction_time(entries, orphans, policy.budget.eviction_order))
-            .then_with(|| {
-                left.name(entries, orphans)
-                    .cmp(right.name(entries, orphans))
-            })
-    });
+    match policy.budget.eviction_order {
+        EvictionOrder::Publication => order.sort_unstable_by(|left, right| {
+            left.modified(entries, orphans)
+                .cmp(&right.modified(entries, orphans))
+                .then_with(|| {
+                    left.name(entries, orphans)
+                        .cmp(right.name(entries, orphans))
+                })
+        }),
+        EvictionOrder::LastUse => order.sort_by_cached_key(|candidate| {
+            (
+                candidate.eviction_time(root, entries, orphans),
+                candidate.name(entries, orphans),
+            )
+        }),
+    }
     let (maximum_age, pressure_candidates): (Vec<_>, Vec<_>) =
         order.into_iter().partition(|candidate| {
             policy.reason(
@@ -1487,16 +1498,24 @@ impl ChunkedCandidate {
     }
     fn eviction_time(
         self,
+        root: &File,
         entries: &[ChunkedEntry],
         orphans: &ChunkedOrphans,
-        order: EvictionOrder,
     ) -> SystemTime {
-        match (self, order) {
-            (Self::Entry(index), EvictionOrder::LastUse) => entries[index].last_use,
-            (_, EvictionOrder::Publication)
-            | (Self::Manifest(_) | Self::Output(_), EvictionOrder::LastUse) => {
-                self.modified(entries, orphans)
-            }
+        match self {
+            Self::Entry(index) => entries[index].last_use,
+            Self::Manifest(index) => payload_last_use_or_publication_time(
+                root,
+                Some(super::access::AccessKey::Payload(NarFileName::raw(
+                    orphans.manifests[index].hash,
+                ))),
+                orphans.manifests[index].modified,
+            ),
+            Self::Output(index) => payload_last_use_or_publication_time(
+                root,
+                payload_access_key(&orphans.outputs[index].name),
+                orphans.outputs[index].modified,
+            ),
         }
     }
     fn modified(self, entries: &[ChunkedEntry], orphans: &ChunkedOrphans) -> SystemTime {
@@ -2031,6 +2050,16 @@ fn payload_access_key(name: &OsStr) -> Option<super::access::AccessKey> {
         .map(super::access::AccessKey::Payload)
 }
 
+fn payload_last_use_or_publication_time(
+    root: &File,
+    key: Option<super::access::AccessKey>,
+    modified: SystemTime,
+) -> SystemTime {
+    super::access::last_use(root, key)
+        .unwrap_or(modified)
+        .max(modified)
+}
+
 fn update_flat_last_use(storage: &Storage, entries: &mut [Entry]) {
     entries.iter_mut().for_each(|entry| {
         let keys = std::iter::once(super::access::AccessKey::Publication(entry.store))
@@ -2105,6 +2134,7 @@ fn select(entries: &[Entry], current_bytes: u64, policy: RetentionPolicy) -> Vec
 }
 
 fn select_orphans(
+    root: &File,
     orphans: &[Orphan],
     current_bytes: u64,
     policy: RetentionPolicy,
@@ -2125,12 +2155,25 @@ fn select_orphans(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    order.sort_unstable_by(|&left, &right| {
-        orphans[left]
-            .modified
-            .cmp(&orphans[right].modified)
-            .then_with(|| orphans[left].name.cmp(&orphans[right].name))
-    });
+    match policy.budget.eviction_order {
+        EvictionOrder::Publication => order.sort_unstable_by(|&left, &right| {
+            orphans[left]
+                .modified
+                .cmp(&orphans[right].modified)
+                .then_with(|| orphans[left].name.cmp(&orphans[right].name))
+        }),
+        EvictionOrder::LastUse => order.sort_by_cached_key(|&index| {
+            let orphan = &orphans[index];
+            (
+                payload_last_use_or_publication_time(
+                    root,
+                    payload_access_key(&orphan.name),
+                    orphan.modified,
+                ),
+                &orphan.name,
+            )
+        }),
+    }
 
     let mut remaining = current_bytes;
     order
@@ -2713,6 +2756,7 @@ mod tests {
                 ..online_options()
             };
             let selected = select_chunked(
+                &storage.root,
                 storage.chunk_store().unwrap(),
                 &[],
                 &orphans,
@@ -2723,6 +2767,124 @@ mod tests {
             .unwrap();
             assert_eq!(selected.outputs.len(), 1);
             assert!(selected.entries.is_empty() && selected.manifests.is_empty());
+        }
+    }
+
+    #[test]
+    fn last_use_keeps_recently_read_flat_orphans_under_pressure_but_not_past_maximum_age() {
+        assert_orphan_read_hints_control_pressure_order(SupportedStorageBackend::FLAT, false);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn last_use_keeps_recently_read_chunked_orphans_under_pressure_but_not_past_maximum_age() {
+        assert_orphan_read_hints_control_pressure_order(
+            SupportedStorageBackend::try_from(StorageBackend::Chunked).unwrap(),
+            false,
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn last_use_keeps_recently_read_orphan_outputs_under_pressure_but_not_past_maximum_age() {
+        assert_orphan_read_hints_control_pressure_order(
+            SupportedStorageBackend::try_from(StorageBackend::Chunked).unwrap(),
+            true,
+        );
+    }
+
+    fn assert_orphan_read_hints_control_pressure_order(
+        backend: SupportedStorageBackend,
+        output_only: bool,
+    ) {
+        use crate::cache::object::{CompressionCodec, FileHash, WireEncoding};
+        for expire in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut storage =
+                CacheCreation::prepare(&Directory::open(directory.path()).unwrap(), backend)
+                    .unwrap()
+                    .create_or_complete()
+                    .unwrap();
+            install_private_cache_policies(directory.path()).unwrap();
+            let old = SystemTime::now() - Duration::from_secs(86400);
+            let names = [
+                b"hot older object".as_slice(),
+                b"cold newer object".as_slice(),
+            ]
+            .map(|raw| {
+                let hash = NarHash::from_digest(sha2::Sha256::digest(raw).into());
+                match output_only {
+                    false => {
+                        let name = NarFileName::raw(hash);
+                        storage
+                            .publish_nar(
+                                name,
+                                io::Cursor::new(raw),
+                                raw.len() as u64,
+                                NarUploadPolicy::new(1024, 0),
+                            )
+                            .unwrap();
+                        name
+                    }
+                    true => {
+                        // Orphan output scanning treats these bytes as opaque files.
+                        let name = NarFileName::new(
+                            FileHash::from_digest(sha2::Sha256::digest(raw).into()),
+                            WireEncoding::Compressed(CompressionCodec::Zstd),
+                        );
+                        storage
+                            .publish(
+                                super::super::publication::PublishTarget::Nar(name),
+                                io::Cursor::new(raw),
+                            )
+                            .unwrap();
+                        name
+                    }
+                }
+            });
+            for (index, name) in names.iter().enumerate() {
+                let file = match (backend.backend(), output_only) {
+                    (StorageBackend::Chunked, false) => storage
+                        .chunk_store()
+                        .unwrap()
+                        .open_manifest(name.raw_hash().unwrap())
+                        .unwrap()
+                        .unwrap(),
+                    (StorageBackend::Flat, _) | (StorageBackend::Chunked, true) => {
+                        File::open(directory.path().join("nar").join(name.to_string())).unwrap()
+                    }
+                };
+                file.set_modified(old + Duration::from_secs(index as u64))
+                    .unwrap();
+            }
+            storage.collection =
+                super::super::collection::CollectionCoordinator::without_startup_grace();
+            storage.enable_access_tracking().unwrap();
+            storage
+                .access
+                .record(super::super::access::AccessKey::Payload(names[0]));
+            let trusted =
+                TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+            let mut options = online_options();
+            options.backend = backend.backend();
+            options.max_age = expire.then_some(Duration::from_secs(60));
+            options.target_bytes = (!expire).then_some(0);
+            options.retention = RetentionOptions {
+                eviction_order: EvictionOrder::LastUse,
+                max_deletions: std::num::NonZeroUsize::new(if expire { 2 } else { 1 }),
+                ..Default::default()
+            };
+            let report = run_online(options, &storage, &trusted).unwrap();
+            assert!(report.after_bytes < report.before_bytes);
+            assert_eq!(
+                storage.nar_size(names[0]).unwrap().is_some(),
+                !expire,
+                "read recency protects pressure ordering, not age expiration"
+            );
+            assert!(
+                storage.nar_size(names[1]).unwrap().is_none(),
+                "the cold orphan is removed first"
+            );
         }
     }
 
@@ -2867,7 +3029,8 @@ mod tests {
             },
             ..policy
         };
-        let selected_orphans = select_orphans(&orphans, 100, exhausted_policy, &access, 0);
+        let selected_orphans =
+            select_orphans(&storage.root, &orphans, 100, exhausted_policy, &access, 0);
         assert!(
             selected_orphans.is_empty(),
             "the publication used the pass's only deletion slot"
@@ -3162,6 +3325,7 @@ mod tests {
         let orphans = ChunkedOrphans::default();
 
         let selected = select_chunked(
+            &storage.root,
             chunk_store,
             &entries,
             &orphans,
@@ -3182,6 +3346,7 @@ mod tests {
         assert!(selected.outputs.is_empty());
 
         let selected = select_chunked(
+            &storage.root,
             chunk_store,
             &entries,
             &orphans,
@@ -3204,6 +3369,7 @@ mod tests {
         );
         entries[0].protected = true;
         let selected = select_chunked(
+            &storage.root,
             chunk_store,
             &entries,
             &orphans,
@@ -4562,6 +4728,7 @@ mod tests {
             .reachable_chunk_bytes([retained_hash])
             .expect("measure chunks reachable from retained NAR");
         let selected = select_chunked(
+            &storage.root,
             chunk_store,
             &entries,
             &orphans,
