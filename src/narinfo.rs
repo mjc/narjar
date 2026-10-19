@@ -16,6 +16,20 @@ pub use trust::TrustedPublicKeys;
 
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
+/// Require uncompressed narinfo without rereading or hashing the stored NAR.
+pub(crate) fn require_raw_narinfo_transport(bytes: &[u8]) -> Result<(), NarInfoError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| NarInfoError)?;
+    let document = NarInfoDocument::parse(text)?;
+    match document
+        .required(NarInfoField::Compression)?
+        .parse::<WireEncoding>()
+        .map_err(|_| NarInfoError)?
+    {
+        WireEncoding::Raw => Ok(()),
+        WireEncoding::Compressed(_) => Err(NarInfoError),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NixStorePath {
     value: String,

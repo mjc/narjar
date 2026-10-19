@@ -45,11 +45,10 @@ impl Activity {
         snapshot: &CollectionSnapshot<'_>,
     ) -> bool {
         (!retiring.is_empty() && self.protect_all_until > snapshot.protect_all_until)
-            || self.recent.iter().any(|(object, until)| {
-                *until > Instant::now()
-                    && retiring.contains(*object)
-                    && !snapshot.protection.contains(*object)
-            })
+            || self
+                .recent
+                .keys()
+                .any(|object| retiring.contains(*object) && !snapshot.protection.contains(*object))
     }
 
     fn invalidate_snapshot(&mut self) -> Result<(), StorageError> {
@@ -60,7 +59,14 @@ impl Activity {
         Ok(())
     }
     fn protect(&mut self, object: ProtectedObject, now: Instant) {
-        self.recent.retain(|_, until| *until > now);
+        // Protect objects read during a GC scan until the scan finishes, even if
+        // their usual grace period expires before GC decides what to delete.
+        match &self.phase {
+            CollectionPhase::Scanning => {}
+            CollectionPhase::Idle | CollectionPhase::Deleting(_) => {
+                self.recent.retain(|_, until| *until > now);
+            }
+        }
         let until = now + ONLINE_GC_GRACE;
         let has_room = self.recent.len() < RECENT_OBJECT_LIMIT;
         match self.recent.get_mut(&object) {
@@ -86,6 +92,17 @@ impl Default for CollectionCoordinator {
 }
 
 impl CollectionCoordinator {
+    #[cfg(test)]
+    pub(super) fn expire_transient_protection_for_test(&self) {
+        let mut activity = self.lock().unwrap();
+        let expired = Instant::now() - Duration::from_secs(1);
+        activity
+            .recent
+            .values_mut()
+            .for_each(|until| *until = expired);
+        activity.protect_all_until = expired;
+    }
+
     #[cfg(test)]
     pub(super) fn without_startup_grace() -> Self {
         let mut coordinator = Self::default();
@@ -176,6 +193,7 @@ impl CollectionCoordinator {
         if activity.phase != CollectionPhase::Idle || activity.mutations != 0 {
             return Err(StorageError::CollectionBusy);
         }
+        activity.recent.retain(|_, until| *until > now);
         activity.phase = CollectionPhase::Scanning;
         let protection = if activity.protect_all_until > now {
             ObjectSelection::All
@@ -194,6 +212,7 @@ impl CollectionCoordinator {
             generation: activity.generation,
             protect_all_until: activity.protect_all_until,
             protection,
+            durable: super::advertisement::AdvertisementProtection::Absent,
         })
     }
 }
@@ -210,7 +229,35 @@ pub(crate) struct ActivityLease<'coordinator> {
     advertisement: Option<ProtectedObject>,
 }
 
+/// Allow a retention-record update while protecting the reader's object from GC.
+pub(crate) struct AdvertisementRenewal<'reader> {
+    store: StoreHash,
+    _reader: &'reader ActivityLease<'reader>,
+}
+
+impl AdvertisementRenewal<'_> {
+    pub(super) fn store(&self) -> StoreHash {
+        self.store
+    }
+}
+
 impl ActivityLease<'_> {
+    pub(super) fn advertisement_renewal(&self) -> Result<AdvertisementRenewal<'_>, StorageError> {
+        let store = match self.kind {
+            ActivityKind::Reader(ProtectedObject::Publication(store)) => store,
+            ActivityKind::Mutation | ActivityKind::Reader(ProtectedObject::CanonicalNar(_)) => {
+                return Err(io::Error::other(
+                    "advertisement renewal requires a publication reader",
+                )
+                .into());
+            }
+        };
+        Ok(AdvertisementRenewal {
+            store,
+            _reader: self,
+        })
+    }
+
     pub(super) fn advertise(mut self, store: StoreHash) -> Result<Self, StorageError> {
         let object = ProtectedObject::Publication(store);
         let mut activity = self.coordinator.lock()?;
@@ -261,9 +308,22 @@ pub(super) struct CollectionSnapshot<'coordinator> {
     generation: u64,
     protect_all_until: Instant,
     pub(super) protection: ObjectSelection,
+    pub(super) durable: super::advertisement::AdvertisementProtection,
 }
 
 impl<'coordinator> CollectionSnapshot<'coordinator> {
+    pub(super) fn refresh_read_protection(&mut self) -> Result<(), StorageError> {
+        let activity = self.lease.coordinator.lock()?;
+        if activity.protect_all_until > self.protect_all_until {
+            self.protection = ObjectSelection::All;
+        }
+        match &mut self.protection {
+            ObjectSelection::All => {}
+            ObjectSelection::Objects(objects) => objects.extend(activity.recent.keys().copied()),
+        }
+        Ok(())
+    }
+
     pub(super) fn authorize_deletion(self) -> Result<CollectionLease<'coordinator>, StorageError> {
         self.authorize_retirement(ObjectSelection::All)
     }
@@ -323,6 +383,28 @@ pub(super) struct CollectionLease<'coordinator> {
     coordinator: &'coordinator CollectionCoordinator,
 }
 
+impl CollectionLease<'_> {
+    pub(super) fn authorize_retention_removal(
+        &self,
+        coordinator: &CollectionCoordinator,
+        store: StoreHash,
+    ) -> Result<(), StorageError> {
+        if !std::ptr::eq(self.coordinator, coordinator) {
+            return Err(io::Error::other("retention removal belongs to another cache").into());
+        }
+        match &self.coordinator.lock()?.phase {
+            CollectionPhase::Deleting(retiring)
+                if retiring.contains(ProtectedObject::Publication(store)) =>
+            {
+                Ok(())
+            }
+            CollectionPhase::Deleting(_) | CollectionPhase::Idle | CollectionPhase::Scanning => {
+                Err(StorageError::CollectionBusy)
+            }
+        }
+    }
+}
+
 impl Drop for CollectionLease<'_> {
     fn drop(&mut self) {
         self.coordinator
@@ -338,8 +420,53 @@ impl Drop for CollectionLease<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn retention_removal_requires_the_selected_publication_in_the_same_cache() {
+        let coordinator = CollectionCoordinator::without_startup_grace();
+        let other = CollectionCoordinator::without_startup_grace();
+        let store = StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let unselected = StoreHash::parse("11111111111111111111111111111111").unwrap();
+        let lease = coordinator
+            .snapshot()
+            .unwrap()
+            .authorize_retirement(ObjectSelection::Objects(
+                [ProtectedObject::Publication(store)].into_iter().collect(),
+            ))
+            .unwrap();
+        lease
+            .authorize_retention_removal(&coordinator, store)
+            .unwrap();
+        assert!(lease.authorize_retention_removal(&other, store).is_err());
+        assert!(
+            lease
+                .authorize_retention_removal(&coordinator, unselected)
+                .is_err()
+        );
+    }
+
     fn publication(index: u8) -> ProtectedObject {
         ProtectedObject::Publication(StoreHash::parse(&format!("{index:032o}")).unwrap())
+    }
+
+    #[test]
+    fn only_publication_readers_can_authorize_advertisement_renewal() {
+        let coordinator = CollectionCoordinator::without_startup_grace();
+        let object = publication(1);
+        let reader = coordinator.reader(object).unwrap().unwrap();
+        let renewal = reader.advertisement_renewal().unwrap();
+        assert_eq!(ProtectedObject::Publication(renewal.store()), object);
+        let payload = coordinator
+            .reader(ProtectedObject::CanonicalNar(NarHash::from_digest([1; 32])))
+            .unwrap()
+            .unwrap();
+        assert!(payload.advertisement_renewal().is_err());
+        assert!(
+            coordinator
+                .mutation()
+                .unwrap()
+                .advertisement_renewal()
+                .is_err()
+        );
     }
 
     #[test]
@@ -595,5 +722,60 @@ mod tests {
                     [255; 32]
                 )))
         );
+    }
+
+    #[test]
+    fn active_scan_pins_reads_beyond_grace_but_next_scan_expires_them() {
+        let coordinator = CollectionCoordinator::without_startup_grace();
+        let first = publication(1);
+        let second = publication(2);
+        let mut snapshot = coordinator.snapshot().unwrap();
+        drop(
+            coordinator
+                .reader(first)
+                .unwrap()
+                .unwrap()
+                .advertise(match first {
+                    ProtectedObject::Publication(store) => store,
+                    ProtectedObject::CanonicalNar(_) => unreachable!(),
+                })
+                .unwrap(),
+        );
+        coordinator.expire_transient_protection_for_test();
+        // Another read must not remove expired protections still needed by this GC scan.
+        coordinator
+            .reader(second)
+            .unwrap()
+            .unwrap()
+            .protect(second)
+            .unwrap();
+        snapshot.refresh_read_protection().unwrap();
+        assert!(snapshot.protection.contains(first));
+        assert!(snapshot.protection.contains(second));
+        drop(snapshot);
+        let next = coordinator
+            .snapshot_at(Instant::now() + ONLINE_GC_GRACE * 2)
+            .unwrap();
+        assert!(!next.protection.contains(first));
+        assert!(!next.protection.contains(second));
+    }
+
+    #[test]
+    fn read_after_selection_still_blocks_retirement_after_grace_expires() {
+        let coordinator = CollectionCoordinator::without_startup_grace();
+        let retiring = publication(1);
+        let snapshot = coordinator.snapshot().unwrap();
+        coordinator
+            .reader(retiring)
+            .unwrap()
+            .unwrap()
+            .protect(retiring)
+            .unwrap();
+        coordinator.expire_transient_protection_for_test();
+        assert!(matches!(
+            snapshot
+                .authorize_retirement(ObjectSelection::Objects([retiring].into_iter().collect())),
+            Err(StorageError::CollectionChanged)
+        ));
     }
 }

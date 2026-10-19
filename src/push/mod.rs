@@ -23,7 +23,6 @@ mod plan;
 mod root;
 mod signing;
 mod store;
-mod timeout;
 mod transfer;
 mod upstream;
 use nar_stream::open_upload_reader;
@@ -359,7 +358,8 @@ struct DestinationClient {
 impl DestinationClient {
     fn new(options: &NativeCopyOptions) -> Result<Self, PushError> {
         let authorization = authorization_for_destination(options)?;
-        let agent = timeout::native_agent(Duration::from_secs(options.timeout_seconds.get()));
+        let agent =
+            crate::http_client::idle_agent(Duration::from_secs(options.timeout_seconds.get()));
         Ok(Self {
             base_url: options.target.clone(),
             agent,
@@ -538,6 +538,19 @@ impl fmt::Display for UploadArtifact {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redirect_retry_and_new_connections_keep_idle_timeouts() {
+        crate::http_client::tests::assert_redirect_retry_and_new_connections_keep_idle_timeouts(
+            |agent| {
+                let url = "https://cache.example/nar".parse().unwrap();
+                super::transfer::put(agent, &url, 3, "application/x-nix-nar", None, || {
+                    Ok(b"nar".as_slice())
+                })
+                .unwrap()
+            },
+        );
+    }
+
     use clap::{Args, Command, FromArgMatches};
 
     use super::transfer::retry_after_delay;

@@ -8,6 +8,9 @@ or an external database, with commands to verify and garbage-collect cached data
 Uploads and downloads support uncompressed NARs, Zstd, and XZ.
 It can also serve raw NARs directly from an existing local Nix store without
 keeping another copy of each payload.
+An optional local read-through cache downloads and verifies NARs before telling
+Nix they are available. If the upstream cache is unreachable, uncached paths
+return a cache miss so Nix can build them locally.
 
 ## Installation
 

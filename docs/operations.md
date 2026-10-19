@@ -73,6 +73,114 @@ upload. `--refresh` bypasses upstream checks.
 Push and native-store serving require a local Nix store. Serving an initialized
 standalone Narjar cache does not require Nix.
 
+## Read-through edge
+
+Run a local read-through cache when clients need to keep building during a
+central cache outage. Initialize a Narjar data directory and install the central
+cache's public signing keys in `trusted-public-keys`, then run:
+
+~~~sh
+narjar serve --data-dir ./edge --listen 127.0.0.1:5000 \
+  --serve-source read-through --edge-upstream https://cache.example \
+  --edge-max-fills 4 --edge-timeout-seconds 30
+~~~
+
+Configure Nix to use the local URL, not the central cache URL. Push directly to
+the central cache. The local cache is read-only and rejects PUT requests without
+reading their bodies. It needs neither Nix executables nor a Nix database. Use
+`narjar doctor --data-dir ./edge` for local storage diagnostics; it does not
+probe the upstream. `doctor` also accepts `--serve-source read-through` or
+`NARJAR_SERVE_SOURCE=read-through` for those local storage checks.
+
+A local miss downloads the upstream narinfo, verifies its signature, then
+downloads and verifies the NAR it names. The NAR, rewritten narinfo and retention
+record must be written and synced to disk before the request succeeds. Downloads
+can be uncompressed, XZ or Zstd; the local cache always serves uncompressed NARs.
+Concurrent requests for the same object share the download. Redirects are
+rejected, and NAR downloads must use paths under the configured upstream URL.
+Use a separate data directory for this mode. It does not serve, overwrite or
+migrate existing compressed publications.
+
+An upstream 404, timeout, refused connection, 429/503, invalid signature or
+incomplete/corrupt payload produces a local narinfo 404. Nix can then build a
+path for which it has a build recipe, even with `fallback = false`. A local hit
+needs no upstream connection. Downloading a path does not download all its
+dependencies. If a dependency is unavailable, Nix can build it and the paths that
+depend on it locally, provided it has their build recipes. A cache miss cannot
+make a path buildable when Nix has no recipe for it.
+
+### Limits and timeouts
+
+The existing size, decoder-memory, staging-space and minimum-free controls
+apply to upstream downloads. `--edge-max-fills` limits concurrent downloads;
+additional misses for unrelated objects return 404. Requests downloading or
+waiting for an object can use at most `min(--workers, --max-in-flight) - 1`
+request slots. This leaves a worker and a connection available for local hits,
+NAR downloads and health requests. This mode requires both `--workers` and
+`--max-in-flight` to be at least two.
+
+`--edge-timeout-seconds` limits connection setup, idle network I/O and the time
+a request can wait for another request's download. A download that keeps making
+progress can run longer. `--edge-fill-timeout-seconds` limits the total download
+time and defaults to 3600 seconds; increase it for large NARs on slow links.
+
+`--edge-negative-ttl-seconds` sets how long the local cache remembers upstream
+misses and failures. It defaults to one second; values above 60 use 60 seconds.
+The number of cached failures is also limited. Nix caches missing narinfo
+separately, so a long client negative TTL can delay retries after recovery.
+
+### Retention and client caching
+
+Before returning narinfo, Narjar saves a keep-until time, called a lease, under
+`.narjar-advertisements`. Each narinfo read extends the lease. Online and offline
+GC must retain the metadata and NAR until that time, including after a restart.
+If space runs out, new downloads fail rather than deleting leased data.
+
+The default lease is 5,187,600 seconds: 60 days plus one hour. This covers two
+of Nix's default 30-day positive-cache periods because loading narinfo from its
+disk cache can start another full in-memory cache period. HTTP `no-store` does
+not control these Nix caches. If you shorten the lease, shorten the client TTLs
+as well and allow time for queued NAR requests. After a lease expires, GC can
+delete a NAR even if a paused client still has its narinfo. Do not manually
+delete cache data while clients may still use cached narinfo.
+
+### NixOS
+
+The module can configure both the loopback service and Nix's substituter:
+
+~~~nix
+services.narjar = {
+  enable = true;
+  edge = {
+    enable = true;
+    upstream = "https://cache.example";
+    trustedPublicKeys = [ "cache.example:BASE64_PUBLIC_KEY" ];
+    configureClient = true;
+    clientPositiveTtlSeconds = 300;
+    clientNegativeTtlSeconds = 1;
+    leaseSeconds = 3600;
+  };
+  gc = {
+    enable = true;
+    maxBytes = 20 * 1024 * 1024 * 1024;
+    targetBytes = 15 * 1024 * 1024 * 1024;
+  };
+};
+~~~
+
+`configureClient` replaces Nix's substituter list with this loopback endpoint,
+installs the same public keys for Nix, sets the TTLs, and keeps fallback disabled.
+The module requires a lease of at least twice the positive TTL plus 300 seconds
+to allow for delayed NAR requests. Public keys may be in the Nix store; no secret
+signing key is needed. GC can leave the cache above its size target while leases
+have not expired. `/metrics` reports local hits, upstream results, active
+downloads and cached failures.
+
+Run `nix run .#edge-e2e` on Linux to test builds with fallback disabled, reuse of
+cached narinfo after a restart and offline GC, and recovery after an upstream
+outage. The test uses private Nix stores; it does not change the host store or
+boot a VM.
+
 ## Native-store serving
 
 Select `serve --serve-source native-store` with explicit `--native-store-dir`,

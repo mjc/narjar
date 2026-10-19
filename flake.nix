@@ -168,6 +168,25 @@
               exec ${pkgs.bash}/bin/bash ci/check-rust.sh native-http
             '';
           };
+          edgeE2E = pkgs.writeShellApplication {
+            name = "narjar-edge-e2e";
+            runtimeInputs = [
+              build.narjar
+              pkgs.bash
+              pkgs.coreutils
+              pkgs.curl
+              pkgs.findutils
+              pkgs.gnugrep
+              pkgs.gnused
+              pkgs.jq
+              pkgs.nix
+              pkgs.sqlite
+            ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.util-linux ];
+            text = ''
+              export NARJAR_E2E_BASH=${pkgs.bash}/bin/bash
+              ${builtins.readFile ./tests/fail-open-edge-e2e.sh}
+            '';
+          };
           ociE2E = pkgs.writeShellApplication {
             name = "narjar-oci-e2e";
             runtimeInputs = [
@@ -222,6 +241,7 @@
             advisoryCheck
             nixE2E
             nativeHttpTests
+            edgeE2E
             continuationBenchmark
             ociE2E
             ;
@@ -291,6 +311,7 @@
           default = env.narjar;
           cargo-artifacts = env.cargoArtifacts;
           nix-e2e = env.nixE2E;
+          edge-e2e = env.edgeE2E;
           continuation-benchmark = env.continuationBenchmark;
         }) systems
         // {
@@ -302,6 +323,7 @@
             narjar-oci = ociImage;
             static-cargo-artifacts = static.cargoArtifacts;
             nix-e2e = systems.${staticSystem}.nixE2E;
+            edge-e2e = systems.${staticSystem}.edgeE2E;
             continuation-benchmark = systems.${staticSystem}.continuationBenchmark;
           };
         };
@@ -331,6 +353,11 @@
           type = "app";
           program = lib.getExe env.nativeHttpTests;
           meta.description = "Run native HTTP tests outside the build user namespace";
+        };
+        edge-e2e = {
+          type = "app";
+          program = lib.getExe env.edgeE2E;
+          meta.description = "Test local caching and upstream outages using private Nix stores";
         };
         oci-e2e = {
           type = "app";

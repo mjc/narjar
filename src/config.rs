@@ -10,6 +10,7 @@ use narjar::object::WireEncoding;
 
 use crate::cache::storage::{StorageBackend, SupportedStorageBackend, UnsupportedStorageBackend};
 use crate::native_store::{NativeStoreOptions, NativeStoreSettings};
+use crate::{http_url::HttpUrl, read_through::EdgeSettings};
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
@@ -37,6 +38,10 @@ pub(crate) enum ServeSource {
         egress_compression: WireEncoding,
     },
     NativeStore(NativeStoreSettings),
+    ReadThrough {
+        storage_backend: SupportedStorageBackend,
+        settings: EdgeSettings,
+    },
 }
 
 impl ServeConfig {
@@ -50,6 +55,23 @@ impl ServeConfig {
 }
 
 impl ServeSource {
+    pub(crate) fn prepare_edge_storage(
+        storage_backend: StorageBackend,
+        egress_compression: WireEncoding,
+        native: NativeStoreOptions<'_>,
+    ) -> Result<SupportedStorageBackend, SourcePreparationError> {
+        let cache = Self::prepare(
+            ServeSourceChoice::FlatCache,
+            storage_backend,
+            egress_compression,
+            native,
+        )?;
+        match cache.egress_compression() {
+            WireEncoding::Raw => Ok(cache.storage_backend()),
+            WireEncoding::Compressed(_) => Err(SourcePreparationError::EdgeCompressedOutput),
+        }
+    }
+
     pub(crate) fn prepare(
         choice: ServeSourceChoice,
         storage_backend: StorageBackend,
@@ -106,12 +128,16 @@ impl ServeSource {
             (ServeSourceChoice::NativeStore, _) => {
                 Err(SourcePreparationError::MissingNativeOptions)
             }
+            (ServeSourceChoice::ReadThrough, _) => Err(SourcePreparationError::MissingEdgeUpstream),
         }
     }
 
     pub(crate) const fn storage_backend(&self) -> SupportedStorageBackend {
         match self {
             Self::FlatCache {
+                storage_backend, ..
+            } => *storage_backend,
+            Self::ReadThrough {
                 storage_backend, ..
             } => *storage_backend,
             Self::NativeStore(_) => SupportedStorageBackend::FLAT,
@@ -123,13 +149,21 @@ impl ServeSource {
             Self::FlatCache {
                 egress_compression, ..
             } => *egress_compression,
-            Self::NativeStore(_) => WireEncoding::Raw,
+            Self::NativeStore(_) | Self::ReadThrough { .. } => WireEncoding::Raw,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum SourcePreparationError {
+    #[error("read-through source requires --edge-upstream")]
+    MissingEdgeUpstream,
+    #[error("edge upstream options require --serve-source read-through")]
+    EdgeOptionsForOtherSource,
+    #[error("read-through source requires uncompressed output (--egress-compression none)")]
+    EdgeCompressedOutput,
+    #[error("read-through source requires at least two HTTP workers and connection admissions")]
+    EdgeRequestCapacityTooSmall,
     #[error("native-store HTTP serving requires --native-store-dir /nix/store")]
     NativeStoreDirectory,
     #[error("native-store options require --serve-source native-store")]
@@ -151,6 +185,12 @@ pub(crate) enum SourcePreparationError {
 impl SourcePreparationError {
     pub(crate) const fn doctor_detail(self) -> &'static str {
         match self {
+            Self::MissingEdgeUpstream => "required edge upstream is missing",
+            Self::EdgeOptionsForOtherSource => "edge options require read-through selection",
+            Self::EdgeCompressedOutput => "read-through source requires raw output",
+            Self::EdgeRequestCapacityTooSmall => {
+                "read-through source requires two workers and connection admissions"
+            }
             Self::NativeStoreDirectory => {
                 "native serving requires the standard /nix/store directory"
             }
@@ -169,6 +209,7 @@ pub(crate) enum ServeSourceChoice {
     #[default]
     FlatCache,
     NativeStore,
+    ReadThrough,
 }
 
 impl ServeSourceChoice {
@@ -176,6 +217,7 @@ impl ServeSourceChoice {
         match self {
             Self::FlatCache => "flat-cache",
             Self::NativeStore => "native-store",
+            Self::ReadThrough => "read-through",
         }
     }
 }
@@ -223,6 +265,49 @@ pub(crate) struct ServeArgs {
         default_value = "flat-cache"
     )]
     source: ServeSourceChoice,
+    /// Upstream cache URL. Download and verify each NAR before returning its narinfo.
+    #[arg(long, env = "NARJAR_EDGE_UPSTREAM")]
+    edge_upstream: Option<HttpUrl>,
+    /// Seconds GC must retain a NAR after returning its narinfo. Default: 60 days plus one hour.
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_LEASE_SECONDS",
+        default_value = "5187600",
+        requires = "edge_upstream"
+    )]
+    edge_lease_seconds: NonZeroU64,
+    /// Maximum number of simultaneous downloads from the upstream cache.
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_MAX_FILLS",
+        default_value = "4",
+        requires = "edge_upstream"
+    )]
+    edge_max_fills: NonZeroUsize,
+    /// Timeout in seconds for connecting, idle network I/O or waiting for another request's download.
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_TIMEOUT_SECONDS",
+        default_value = "30",
+        requires = "edge_upstream"
+    )]
+    edge_timeout_seconds: NonZeroU64,
+    /// Total upstream download timeout in seconds, including time spent making progress.
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_FILL_TIMEOUT_SECONDS",
+        default_value = "3600",
+        requires = "edge_upstream"
+    )]
+    edge_fill_timeout_seconds: NonZeroU64,
+    /// Seconds to cache upstream misses and failures, capped at 60.
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_NEGATIVE_TTL_SECONDS",
+        default_value = "1",
+        requires = "edge_upstream"
+    )]
+    edge_negative_ttl_seconds: NonZeroU64,
     #[arg(long, env = "NARJAR_NATIVE_STORE_DIR", value_parser = non_empty_path)]
     native_store_dir: Option<PathBuf>,
     #[arg(long, env = "NARJAR_NATIVE_STATE_DIR", value_parser = non_empty_path)]
@@ -245,23 +330,68 @@ pub(crate) struct ServeArgs {
     stats_filesystem_sample: Option<PathBuf>,
 }
 
+impl ServeArgs {
+    fn native_options(&self) -> NativeStoreOptions<'_> {
+        NativeStoreOptions {
+            store_dir: self.native_store_dir.as_deref(),
+            state_dir: self.native_state_dir.as_deref(),
+            roots_dir: self.native_roots_dir.as_deref(),
+            min_lease_seconds: self.native_min_lease_seconds,
+            signing_key_file: self.native_signing_key_file.as_deref(),
+        }
+    }
+
+    fn prepare_source(&self) -> Result<ServeSource, SourcePreparationError> {
+        match (self.source, self.edge_upstream.as_ref()) {
+            (ServeSourceChoice::ReadThrough, Some(upstream)) => self.prepare_edge_source(upstream),
+            (ServeSourceChoice::ReadThrough, None) => {
+                Err(SourcePreparationError::MissingEdgeUpstream)
+            }
+            (ServeSourceChoice::FlatCache | ServeSourceChoice::NativeStore, Some(_)) => {
+                Err(SourcePreparationError::EdgeOptionsForOtherSource)
+            }
+            (choice, None) => ServeSource::prepare(
+                choice,
+                self.storage_backend,
+                self.egress_compression,
+                self.native_options(),
+            ),
+        }
+    }
+
+    fn prepare_edge_source(
+        &self,
+        upstream: &HttpUrl,
+    ) -> Result<ServeSource, SourcePreparationError> {
+        if self.workers.get() < 2 || self.max_in_flight.get() < 2 {
+            return Err(SourcePreparationError::EdgeRequestCapacityTooSmall);
+        }
+        let storage_backend = ServeSource::prepare_edge_storage(
+            self.storage_backend,
+            self.egress_compression,
+            self.native_options(),
+        )?;
+        Ok(ServeSource::ReadThrough {
+            storage_backend,
+            settings: EdgeSettings {
+                upstream: upstream.clone(),
+                lease_seconds: self.edge_lease_seconds,
+                max_fills: self.edge_max_fills,
+                request_workers: self.workers,
+                max_in_flight: self.max_in_flight,
+                timeout: std::time::Duration::from_secs(self.edge_timeout_seconds.get()),
+                fill_timeout: std::time::Duration::from_secs(self.edge_fill_timeout_seconds.get()),
+                negative_ttl: std::time::Duration::from_secs(self.edge_negative_ttl_seconds.get()),
+            },
+        })
+    }
+}
+
 impl TryFrom<ServeArgs> for ServeConfig {
     type Error = String;
 
     fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
-        let source = ServeSource::prepare(
-            args.source,
-            args.storage_backend,
-            args.egress_compression,
-            NativeStoreOptions {
-                store_dir: args.native_store_dir.as_deref(),
-                state_dir: args.native_state_dir.as_deref(),
-                roots_dir: args.native_roots_dir.as_deref(),
-                min_lease_seconds: args.native_min_lease_seconds,
-                signing_key_file: args.native_signing_key_file.as_deref(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
+        let source = args.prepare_source().map_err(|error| error.to_string())?;
         Ok(Self {
             track_access: args.track_access,
             data_dir: args.data_dir,
@@ -524,6 +654,112 @@ mod tests {
         assert!(matches!(config.source, ServeSource::FlatCache { .. }));
         assert_eq!(config.storage_backend(), SupportedStorageBackend::FLAT);
         assert_eq!(config.egress_compression(), WireEncoding::Raw);
+    }
+
+    fn parse_serve_config(extra: &[&str]) -> Result<ServeConfig, String> {
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from(
+                ["serve", "--data-dir", "/cache"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .expect("serve syntax should parse before source validation");
+        ServeConfig::try_from(ServeArgs::from_arg_matches(&matches).unwrap())
+    }
+
+    #[test]
+    fn explicit_edge_tunings_require_an_upstream_even_when_they_equal_defaults() {
+        for (flag, value) in [
+            ("--edge-lease-seconds", "5187600"),
+            ("--edge-max-fills", "4"),
+            ("--edge-timeout-seconds", "30"),
+            ("--edge-fill-timeout-seconds", "3600"),
+            ("--edge-negative-ttl-seconds", "1"),
+        ] {
+            let error = ServeArgs::augment_args(Command::new("serve"))
+                .try_get_matches_from(["serve", "--data-dir", "/cache", flag, value])
+                .expect_err("explicit edge settings must not be silently ignored");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+            assert!(error.to_string().contains("--edge-upstream"));
+        }
+    }
+
+    #[test]
+    fn edge_configuration_requires_a_fixed_upstream_and_preserves_safe_defaults() {
+        assert_eq!(
+            parse_serve_config(&["--serve-source", "read-through"]).unwrap_err(),
+            SourcePreparationError::MissingEdgeUpstream.to_string()
+        );
+        let config = parse_serve_config(&[
+            "--serve-source",
+            "read-through",
+            "--edge-upstream",
+            "https://cache.example/base",
+        ])
+        .unwrap();
+        assert_eq!(config.egress_compression(), WireEncoding::Raw);
+        let ServeSource::ReadThrough { settings, .. } = config.source else {
+            panic!("edge source required")
+        };
+        assert_eq!(settings.upstream.as_str(), "https://cache.example/base");
+        assert_eq!(settings.lease_seconds.get(), 2 * 2_592_000 + 3600);
+        assert_eq!(settings.max_fills.get(), 4);
+        assert_eq!(settings.request_workers.get(), 8);
+        assert_eq!(settings.fill_timeout, std::time::Duration::from_secs(3600));
+        assert_eq!(settings.negative_ttl, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn edge_source_rejects_compressed_output_and_options_for_other_sources() {
+        assert_eq!(
+            parse_serve_config(&["--edge-upstream", "https://cache.example"]).unwrap_err(),
+            SourcePreparationError::EdgeOptionsForOtherSource.to_string()
+        );
+        assert_eq!(
+            parse_serve_config(&[
+                "--serve-source",
+                "read-through",
+                "--edge-upstream",
+                "https://cache.example",
+                "--egress-compression",
+                "zstd"
+            ])
+            .unwrap_err(),
+            SourcePreparationError::EdgeCompressedOutput.to_string()
+        );
+        assert_eq!(
+            parse_serve_config(&[
+                "--serve-source",
+                "read-through",
+                "--edge-upstream",
+                "https://cache.example",
+                "--native-store-dir",
+                "/nix/store"
+            ])
+            .unwrap_err(),
+            SourcePreparationError::NativeOptionsForCache.to_string()
+        );
+    }
+
+    #[test]
+    fn edge_source_reserves_a_worker_for_non_fill_requests() {
+        for limit in ["--workers", "--max-in-flight"] {
+            assert_eq!(
+                parse_serve_config(&[
+                    "--serve-source",
+                    "read-through",
+                    "--edge-upstream",
+                    "https://cache.example",
+                    limit,
+                    "1"
+                ])
+                .unwrap_err(),
+                SourcePreparationError::EdgeRequestCapacityTooSmall.to_string()
+            );
+        }
     }
 
     #[test]

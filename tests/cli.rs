@@ -27,6 +27,12 @@ use tempfile::TempDir;
 use std::sync::{Barrier, atomic::AtomicU64};
 
 const CONFIG_ENV: &[&str] = &[
+    "NARJAR_EDGE_UPSTREAM",
+    "NARJAR_EDGE_LEASE_SECONDS",
+    "NARJAR_EDGE_MAX_FILLS",
+    "NARJAR_EDGE_TIMEOUT_SECONDS",
+    "NARJAR_EDGE_FILL_TIMEOUT_SECONDS",
+    "NARJAR_EDGE_NEGATIVE_TTL_SECONDS",
     "NARJAR_SERVE_SOURCE",
     "NARJAR_NATIVE_STORE_DIR",
     "NARJAR_NATIVE_STATE_DIR",
@@ -49,6 +55,8 @@ const CONFIG_ENV: &[&str] = &[
 
 #[path = "support/native_http.rs"]
 mod native_http;
+#[path = "support/read_through_http.rs"]
+mod read_through_http;
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const NAR_BYTES: &[u8] = b"narjar";
@@ -7059,6 +7067,45 @@ fn structural_reconcile_reports_temp_age_and_shape() {
     assert!(report.contains(&format!(
         "{{\"class\":\"nar_object\",\"path\":\"nar/{NAR_ID}.nar.zst\",\"action\":\"inspect\"}}"
     )));
+}
+
+#[test]
+fn read_through_doctor_checks_trusted_keys_without_contacting_an_upstream() {
+    let data_dir = init_data_dir("read-through-doctor-trust");
+    let path = data_dir.to_str().unwrap();
+    for contents in ["", "not-a-public-key\n"] {
+        fs::write(data_dir.join("trusted-public-keys"), contents).unwrap();
+        let output = run(&[
+            "doctor",
+            "--data-dir",
+            path,
+            "--serve-source",
+            "read-through",
+            "--json",
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{contents:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["source"]["name"], "read-through");
+        assert_eq!(report["source"]["severity"], "error");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("not-a-public-key"));
+    }
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
+    let output = run(&[
+        "doctor",
+        "--data-dir",
+        path,
+        "--serve-source",
+        "read-through",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["source"]["name"], "read-through");
+    assert_eq!(report["source"]["severity"], "ok");
 }
 
 #[test]

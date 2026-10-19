@@ -19,6 +19,7 @@ pub(super) enum StorePath {
     Nar(OsString),
     IngestionReceipt(OsString),
     EgressReceipt(OsString),
+    Advertisement(OsString),
 }
 
 impl TryFrom<PathBuf> for StorePath {
@@ -63,6 +64,9 @@ impl StorePath {
             (directory, Some(name)) if directory == OsStr::new(EGRESS_RECEIPT_DIRECTORY) => {
                 Ok(Self::EgressReceipt(name))
             }
+            (directory, Some(name)) if directory == OsStr::new(super::advertisement::DIRECTORY) => {
+                Ok(Self::Advertisement(name))
+            }
             _ => Err(invalid_location("store path is outside published storage")),
         }
     }
@@ -79,7 +83,8 @@ impl StorePath {
             Self::Root(name)
             | Self::Nar(name)
             | Self::IngestionReceipt(name)
-            | Self::EgressReceipt(name) => name,
+            | Self::EgressReceipt(name)
+            | Self::Advertisement(name) => name,
         }
     }
 
@@ -89,6 +94,7 @@ impl StorePath {
             Self::Nar(_) => Some(NAR_DIRECTORY),
             Self::IngestionReceipt(_) => Some(INGESTION_RECEIPT_DIRECTORY),
             Self::EgressReceipt(_) => Some(EGRESS_RECEIPT_DIRECTORY),
+            Self::Advertisement(_) => Some(super::advertisement::DIRECTORY),
         }
     }
 }

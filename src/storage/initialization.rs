@@ -76,7 +76,11 @@ pub(super) fn storage_root_directories() -> impl Iterator<Item = &'static str> {
         .iter()
         .copied()
         .chain(CHUNK_DIRECTORIES.iter().copied())
-        .chain([".narjar-control", super::access::ACCESS_DIRECTORY])
+        .chain([
+            ".narjar-control",
+            super::access::ACCESS_DIRECTORY,
+            super::advertisement::DIRECTORY,
+        ])
         .filter(|name| !name.contains('/'))
 }
 
@@ -290,6 +294,7 @@ impl CacheLayout {
         let recovery = RecoveryState::new(&self.root)?;
         Ok(Storage {
             access: Default::default(),
+            advertisements: super::advertisement::AdvertisementLeases::open(&self.root)?,
             #[cfg(test)]
             layout: self.test_layout,
             root: self.root,
@@ -298,6 +303,7 @@ impl CacheLayout {
             collection: Default::default(),
             delivery_validation: DeliveryValidationCache::default(),
             publication_locks: Mutex::new(HashMap::new()),
+            narinfo_publication_locks: Mutex::new(HashMap::new()),
             staging_budget: Arc::new(Mutex::new(Default::default())),
             temporary_objects: AtomicU64::new(0),
             activity,

@@ -1,5 +1,7 @@
 #[path = "storage/access.rs"]
 mod access;
+#[path = "storage/advertisement.rs"]
+mod advertisement;
 #[path = "storage/backend.rs"]
 mod backend;
 #[path = "storage/cache_info.rs"]
@@ -64,6 +66,7 @@ impl CleanupAction {
     }
 }
 
+pub(crate) use advertisement::AdvertisementEvidence;
 pub use fs::{StorageCapacity, capacity_from_statvfs, private_file_mode_is_valid};
 
 pub(crate) use fs::{

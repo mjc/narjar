@@ -31,6 +31,31 @@ leasing an unsigned path. Per-lease association records and the raw-hash index
 are serialized with lease mutation; cleanup retains an index owned by another
 still-live path with identical NAR contents.
 
+## Read-through source
+
+The read-through cache downloads from one configured HTTP upstream. On a local
+miss, it verifies the narinfo signature, downloads the named NAR, checks its hash
+and size, and stores it uncompressed. It returns the rewritten narinfo only after
+the NAR, metadata and retention record have been written and synced to disk.
+This prevents Nix from being told a NAR is available before its download finishes.
+
+Concurrent requests for the same store path or uncompressed NAR share a download.
+The number of downloads, waiting requests and cached failures is limited. An
+upstream failure returns a local cache miss; a local hit does not contact the
+upstream. This mode needs no local Nix store or build daemon and does not queue
+uploads to the upstream.
+
+Each retention record is a lease: a time before which GC must not delete the
+metadata or NAR. Reads extend that time before returning metadata. Storage
+coordinates these updates with GC, including offline GC after a restart. GC
+keeps publications whose records are missing and returns an error for invalid
+records rather than deleting potentially protected data.
+
+Before deleting metadata, GC saves a pending-removal record. An unlink failure
+leaves the object eligible for a later collection, including after restart.
+The record is removed only after the metadata unlink is synced. A successful
+metadata read cancels pending removal by renewing its lease.
+
 ## Identities and representations
 
 A logical NAR has an uncompressed SHA-256 hash and byte count. Its raw, XZ,
@@ -67,6 +92,7 @@ DATA/
   .narjar-chunks/                shared raw chunks, sharded by hash
   .narjar-ingress/               compressed upload-to-raw receipts
   .narjar-egress/                raw-to-compressed download receipts
+  .narjar-advertisements/        keep-until times for read-through metadata and NARs
   .narjar-control/gc.sock        private daemon maintenance socket
   .tmp/                         metadata and receipt staging
   <store-hash>.narinfo

@@ -3,11 +3,13 @@ mod config;
 mod control;
 mod error;
 mod http;
+mod http_client;
 mod http_url;
 mod narinfo_signing;
 mod native_store;
 mod operator;
 mod push;
+mod read_through;
 mod server;
 mod setup;
 mod token;
@@ -85,6 +87,35 @@ mod tests {
     use clap::Parser;
 
     use super::{Cli, Command};
+
+    #[test]
+    fn doctor_accepts_read_through_for_local_storage_diagnostics() {
+        let result = Cli::try_parse_from([
+            "narjar",
+            "doctor",
+            "--data-dir",
+            "/cache",
+            "--serve-source",
+            "read-through",
+        ]);
+        assert!(
+            result.is_ok(),
+            "doctor must accept the source selected by the shared environment variable"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "narjar",
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--serve-source",
+                "read-through",
+                "--edge-upstream",
+                "https://cache.example"
+            ])
+            .is_ok()
+        );
+    }
 
     #[test]
     fn command_schema_rejects_invalid_input() {

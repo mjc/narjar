@@ -7,6 +7,7 @@ use std::{
 };
 
 use super::{
+    advertisement::AdvertisementRemovalContext,
     chunk_store::{ChunkManifestFile, ChunkStore, MarkedChunkSweep},
     collection::{
         CollectionLease, CollectionSnapshot, ONLINE_GC_GRACE, ObjectSelection, ProtectedObject,
@@ -119,24 +120,57 @@ enum CollectionPermit<'storage> {
     Online { _lease: CollectionLease<'storage> },
 }
 
+impl CollectionPermit<'_> {
+    fn removal_context(&self) -> AdvertisementRemovalContext<'_> {
+        match self {
+            Self::Offline { _lease } | Self::Online { _lease } => {
+                AdvertisementRemovalContext::Collection(_lease)
+            }
+        }
+    }
+}
+
 enum ChunkedCollectionAction<'storage> {
     Inspect,
     Apply(MarkedChunkSweep<'storage>),
 }
 
 impl<'storage> CollectionAccess<'storage> {
+    fn refresh_read_protection(mut self) -> Result<Self, StorageError> {
+        match &mut self {
+            Self::Offline(_) => {}
+            Self::Online(snapshot) => snapshot.refresh_read_protection()?,
+        }
+        Ok(self)
+    }
+
     fn protects(&self, object: ProtectedObject) -> bool {
         match self {
-            Self::Offline(_) => false,
-            Self::Online(snapshot) => snapshot.protection.contains(object),
+            Self::Offline(snapshot) => snapshot.durable.protects(object),
+            Self::Online(snapshot) => {
+                snapshot.durable.protects(object) || snapshot.protection.contains(object)
+            }
         }
     }
 
     fn protects_nar_name(&self, name: &OsStr) -> bool {
         match self {
-            Self::Offline(_) => false,
-            Self::Online(snapshot) => snapshot.protection.contains_nar_name(name),
+            Self::Offline(snapshot) => snapshot.durable.protects_nar_name(name),
+            Self::Online(snapshot) => {
+                snapshot.durable.protects_nar_name(name)
+                    || snapshot.protection.contains_nar_name(name)
+            }
         }
+    }
+
+    fn with_durable_protection(
+        mut self,
+        protection: super::advertisement::AdvertisementProtection,
+    ) -> Self {
+        match &mut self {
+            Self::Offline(snapshot) | Self::Online(snapshot) => snapshot.durable = protection,
+        }
+        self
     }
 
     fn authorize(
@@ -513,6 +547,8 @@ fn run_with_capacity_measurement(
     access: CollectionAccess<'_>,
     mut measure: impl FnMut(&Storage) -> Result<super::StorageCapacity, StorageError>,
 ) -> Result<GcReport, StorageError> {
+    let access =
+        access.with_durable_protection(storage.advertisement_protection(SystemTime::now())?);
     let target_bytes = gc_target_bytes(&options)?;
     let mode = options.mode;
     let thresholds = options.retention.free_space;
@@ -600,6 +636,7 @@ fn run_flat_gc<'storage>(
     mut scan_entries: impl FnMut(&Storage, &TrustedPublicKeys) -> Result<Vec<Entry>, StorageError>,
 ) -> Result<CollectedPass<'storage>, StorageError> {
     let mut entries = scan_entries(storage, trusted)?;
+    let access = access.refresh_read_protection()?;
     if options.retention.eviction_order == EvictionOrder::LastUse {
         update_flat_last_use(storage, &mut entries);
     }
@@ -684,7 +721,13 @@ fn run_flat_gc<'storage>(
         (0, 0, 0)
     } else {
         let result: Result<(usize, usize, usize), StorageError> = (|| {
-            let (deleted_narinfos, deleted_nars) = apply(storage, &entries, &selected)?;
+            let (deleted_narinfos, deleted_nars) = apply_with_checkpoint(
+                storage,
+                &entries,
+                &selected,
+                permit.removal_context(),
+                |_| Ok(()),
+            )?;
             let deleted_orphans = apply_orphans(storage, &orphans, &selected_orphans)?;
             Ok((deleted_narinfos, deleted_nars, deleted_orphans))
         })();
@@ -857,6 +900,7 @@ fn run_chunked<'storage>(
     access: CollectionAccess<'storage>,
 ) -> Result<CollectedPass<'storage>, StorageError> {
     let mut entries = scan_chunked(storage, chunk_store, trusted)?;
+    let access = access.refresh_read_protection()?;
     if options.retention.eviction_order == EvictionOrder::LastUse {
         update_chunked_last_use(storage, &mut entries);
     }
@@ -960,7 +1004,14 @@ fn run_chunked<'storage>(
     let (after_bytes, deleted) = match action {
         ChunkedCollectionAction::Inspect => (after_bytes, (0, 0, 0)),
         ChunkedCollectionAction::Apply(sweep) => {
-            let deleted = apply_marked_chunked(storage, &entries, &orphans, &selected, sweep)?;
+            let deleted = apply_marked_chunked(
+                storage,
+                &entries,
+                &orphans,
+                &selected,
+                sweep,
+                permit.removal_context(),
+            )?;
             let actual_after = match &permit {
                 CollectionPermit::Offline { .. } => {
                     let remaining = scan_chunked(storage, chunk_store, trusted)?;
@@ -1640,7 +1691,14 @@ fn apply_chunked(
     let sweep = chunk_store
         .mark_retained_manifests(retained_chunked_manifests(entries, orphans, selected))
         .map_err(chunk_store_error)?;
-    apply_marked_chunked(storage, entries, orphans, selected, sweep)
+    apply_marked_chunked(
+        storage,
+        entries,
+        orphans,
+        selected,
+        sweep,
+        AdvertisementRemovalContext::Standalone,
+    )
 }
 
 fn apply_marked_chunked(
@@ -1649,12 +1707,17 @@ fn apply_marked_chunked(
     orphans: &ChunkedOrphans,
     selected: &ChunkedSelection,
     sweep: MarkedChunkSweep<'_>,
+    removal: AdvertisementRemovalContext<'_>,
 ) -> Result<(usize, usize, usize), StorageError> {
     storage.recovery.require()?;
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
     for &index in &selected.entries {
-        unlink_at(&root, &entries[index].narinfo_name)?;
+        storage.remove_narinfo_with_retention_and_unlink(
+            &entries[index].store,
+            removal,
+            unlink_at,
+        )?;
     }
     if !selected.entries.is_empty() {
         root.sync_all()?;
@@ -2278,6 +2341,7 @@ fn fail_if(failure: Option<FailurePoint>, point: FailurePoint) -> Result<(), Sto
     }
 }
 
+#[cfg(test)]
 fn apply(
     storage: &Storage,
     entries: &[Entry],
@@ -2286,21 +2350,27 @@ fn apply(
     apply_with_failure(storage, entries, selected, None)
 }
 
+#[cfg(test)]
 fn apply_with_failure(
     storage: &Storage,
     entries: &[Entry],
     selected: &[usize],
     failure: Option<FailurePoint>,
 ) -> Result<(usize, usize), StorageError> {
-    apply_with_checkpoint(storage, entries, selected, |boundary| {
-        fail_if(failure, boundary)
-    })
+    apply_with_checkpoint(
+        storage,
+        entries,
+        selected,
+        AdvertisementRemovalContext::Standalone,
+        |boundary| fail_if(failure, boundary),
+    )
 }
 
 fn apply_with_checkpoint(
     storage: &Storage,
     entries: &[Entry],
     selected: &[usize],
+    removal: AdvertisementRemovalContext<'_>,
     mut checkpoint: impl FnMut(FailurePoint) -> Result<(), StorageError>,
 ) -> Result<(usize, usize), StorageError> {
     storage.recovery.require()?;
@@ -2311,7 +2381,7 @@ fn apply_with_checkpoint(
     for &index in selected {
         let entry = &entries[index];
         checkpoint(FailurePoint::BeforeNarinfoDelete)?;
-        unlink_at(&root, &entry.narinfo_name)?;
+        storage.remove_narinfo_with_retention_and_unlink(&entry.store, removal, unlink_at)?;
         checkpoint(FailurePoint::AfterNarinfoDeleteBeforeSync)?;
         root.sync_all()?;
         super::access::forget(&root, super::access::AccessKey::Publication(entry.store));
@@ -2417,6 +2487,211 @@ mod tests {
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
         CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
             .and_then(|creation| creation.create_or_complete())
+    }
+
+    #[test]
+    fn failed_metadata_unlink_remains_a_gc_candidate_after_restart() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+            3.into(),
+        );
+        storage
+            .record_publication_lease(entry.store, identity)
+            .unwrap();
+        storage
+            .expire_advertisement_lease_for_test(entry.store)
+            .unwrap();
+        let failure = storage.remove_narinfo_with_retention_and_unlink(
+            &entry.store,
+            AdvertisementRemovalContext::Standalone,
+            |_, _| {
+                Err(io::Error::from_raw_os_error(
+                    rustix::io::Errno::BUSY.raw_os_error(),
+                ))
+            },
+        );
+        assert!(failure.is_err());
+        assert!(directory.path().join(&entry.narinfo_name).is_file());
+        drop(storage);
+        let root = Directory::open(directory.path()).unwrap();
+        let storage = Storage::open(&root, SupportedStorageBackend::FLAT).unwrap();
+        let trusted = TrustedPublicKeys::load(&root).unwrap();
+        let report = run_dry_run(online_options(), &storage, &trusted).unwrap();
+        assert_eq!(
+            report.eligible, 1,
+            "a failed unlink must remain retryable by GC"
+        );
+        let recovered = storage.recover_for_mutation(&trusted).unwrap();
+        let report = run_apply(online_options(), &recovered, &trusted).unwrap();
+        assert_eq!(report.deleted_narinfos, 1);
+        assert_eq!(report.deleted_nars, 1);
+        assert!(!directory.path().join(&entry.narinfo_name).exists());
+        assert!(!directory.path().join("nar").join(&entry.nar_name).exists());
+    }
+
+    #[test]
+    fn gc_keeps_metadata_retryable_when_lease_cleanup_fails() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let lease_path = directory
+            .path()
+            .join(super::super::advertisement::DIRECTORY)
+            .join(format!("{}.lease", entry.store.as_str()));
+        fs::create_dir(&lease_path).unwrap();
+        let result = apply(&storage, std::slice::from_ref(&entry), &[0]);
+        assert!(
+            result.is_err(),
+            "GC must propagate retention cleanup failures"
+        );
+        assert!(directory.path().join(&entry.narinfo_name).is_file());
+        assert!(directory.path().join("nar").join(&entry.nar_name).is_file());
+        fs::remove_dir(&lease_path).unwrap();
+        assert_eq!(
+            apply(&storage, std::slice::from_ref(&entry), &[0]).unwrap(),
+            (1, 1)
+        );
+        assert!(!directory.path().join(&entry.narinfo_name).exists());
+        assert!(!directory.path().join("nar").join(&entry.nar_name).exists());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn chunked_gc_marks_expired_leases_pending_under_its_existing_deletion_permit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = initialize_chunked_storage(directory.path()).unwrap();
+        let bytes = b"raw NAR";
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(bytes).into()),
+            (bytes.len() as u64).into(),
+        );
+        storage
+            .publish_nar(
+                NarFileName::raw(identity.hash()),
+                bytes.as_slice(),
+                bytes.len() as u64,
+                NarUploadPolicy::new(1024, 0),
+            )
+            .unwrap();
+        write_signed_raw_metadata(directory.path(), TEST_STORE_HASH, identity, Vec::new());
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let store = StoreHash::parse(TEST_STORE_HASH).unwrap();
+        storage.record_publication_lease(store, identity).unwrap();
+        storage.expire_advertisement_lease_for_test(store).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let trusted = TrustedPublicKeys::parse(&format!(
+            "online-gc:{}",
+            data_encoding::BASE64.encode(key.verifying_key().as_bytes())
+        ))
+        .unwrap();
+        let recovered = storage.recover_for_mutation(&trusted).unwrap();
+        let mut options = online_options();
+        options.backend = StorageBackend::Chunked;
+        let report = run_apply(options, &recovered, &trusted).unwrap();
+        assert_eq!(report.deleted_narinfos, 1);
+        assert!(storage.open_narinfo(&store).unwrap().is_none());
+        assert!(
+            storage
+                .nar_size(NarFileName::raw(identity.hash()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn chunked_gc_keeps_metadata_retryable_when_lease_cleanup_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = initialize_chunked_storage(directory.path()).unwrap();
+        let bytes = b"raw NAR";
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(bytes).into()),
+            (bytes.len() as u64).into(),
+        );
+        storage
+            .publish_nar(
+                NarFileName::raw(identity.hash()),
+                bytes.as_slice(),
+                bytes.len() as u64,
+                NarUploadPolicy::new(1024, 0),
+            )
+            .unwrap();
+        write_signed_raw_metadata(directory.path(), TEST_STORE_HASH, identity, Vec::new());
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let lease_path = directory
+            .path()
+            .join(super::super::advertisement::DIRECTORY)
+            .join(format!("{TEST_STORE_HASH}.lease"));
+        fs::create_dir(&lease_path).unwrap();
+        let store = storage.chunk_store().unwrap();
+        let entries = [ChunkedEntry {
+            last_use: UNIX_EPOCH,
+            store: StoreHash::parse(TEST_STORE_HASH).unwrap(),
+            store_path: format!("/nix/store/{TEST_STORE_HASH}-narjar"),
+            references: Vec::new(),
+            narinfo_name: format!("{TEST_STORE_HASH}.narinfo").into(),
+            output_name: None,
+            output_bytes: 0,
+            raw_hash: identity.hash(),
+            manifest_bytes: 0,
+            narinfo_bytes: 0,
+            modified: UNIX_EPOCH,
+            protected: false,
+        }];
+        let selected = ChunkedSelection {
+            entries: vec![0],
+            ..Default::default()
+        };
+        assert!(apply_chunked(&storage, store, &entries, &Default::default(), &selected).is_err());
+        assert!(directory.path().join(&entries[0].narinfo_name).is_file());
+        assert!(store.validate_manifest(identity.hash()).unwrap().is_some());
+        fs::remove_dir(&lease_path).unwrap();
+        apply_chunked(&storage, store, &entries, &Default::default(), &selected).unwrap();
+        assert!(!directory.path().join(&entries[0].narinfo_name).exists());
+        assert!(store.validate_manifest(identity.hash()).unwrap().is_none());
+    }
+
+    #[test]
+    fn durable_advertisement_leases_survive_restart_and_protect_offline_collection() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        storage
+            .record_publication_lease(
+                entry.store,
+                crate::cache::object::NarIdentity::new(
+                    NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+                    3.into(),
+                ),
+            )
+            .unwrap();
+        drop(storage);
+        let root = Directory::open(directory.path()).unwrap();
+        let storage = Storage::open(&root, SupportedStorageBackend::FLAT).unwrap();
+        let trusted = TrustedPublicKeys::load(&root).unwrap();
+        let report = run_with_access(
+            online_options(),
+            &storage,
+            &trusted,
+            CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            report.deleted_narinfos, 0,
+            "restarting must not erase the promise to a client's cached narinfo"
+        );
+        assert!(directory.path().join(entry.narinfo_name).is_file());
+        assert!(directory.path().join("nar").join(entry.nar_name).is_file());
     }
 
     #[test]
@@ -3959,13 +4234,19 @@ mod tests {
         std::thread::scope(|scope| {
             let collection = scope.spawn(move || {
                 let _permit = permit;
-                apply_with_checkpoint(storage, entries, selected, |boundary| {
-                    if boundary == FailurePoint::AfterNarinfoSyncBeforeNarDelete {
-                        entered_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    }
-                    Ok(())
-                })
+                apply_with_checkpoint(
+                    storage,
+                    entries,
+                    selected,
+                    AdvertisementRemovalContext::Collection(&_permit),
+                    |boundary| {
+                        if boundary == FailurePoint::AfterNarinfoSyncBeforeNarDelete {
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }
+                        Ok(())
+                    },
+                )
                 .unwrap()
             });
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4244,6 +4525,142 @@ mod tests {
     }
 
     #[test]
+    fn flat_reads_with_missing_lease_evidence_remain_available_and_conservatively_protected() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        age_publication(directory.path(), &entry);
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
+        let advertised = storage
+            .read_advertised_narinfo(&entry.store)
+            .expect("flat reads must tolerate missing evidence from an interrupted publication")
+            .unwrap();
+        assert!(!advertised.bytes.is_empty());
+        drop(advertised);
+        assert!(matches!(
+            storage.advertisement_evidence(entry.store).unwrap(),
+            super::super::advertisement::AdvertisementEvidence::Missing
+        ));
+        // Clear in-memory read protection to test GC's handling of missing retention records.
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let report = run_online(online_options(), &storage, &trusted).unwrap();
+        assert_eq!(report.deleted_narinfos, 0);
+        assert!(directory.path().join(&entry.narinfo_name).exists());
+        assert!(directory.path().join("nar").join(&entry.nar_name).exists());
+    }
+
+    #[test]
+    fn renewed_aged_publication_survives_gc_after_transient_read_grace_expires() {
+        let (directory, mut storage, victim) = scannable_pair_fixture();
+        age_publication(directory.path(), &victim);
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+            3.into(),
+        );
+        let retained = StoreHash::parse(TEST_SECOND_STORE_HASH).unwrap();
+        write_signed_raw_metadata(
+            directory.path(),
+            TEST_SECOND_STORE_HASH,
+            identity,
+            Vec::new(),
+        );
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        [victim.store, retained].into_iter().for_each(|store| {
+            storage.record_publication_lease(store, identity).unwrap();
+            storage.expire_advertisement_lease_for_test(store).unwrap();
+        });
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let retained_entry = scan(&storage, &trusted)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.store == retained)
+            .unwrap();
+        age_publication(directory.path(), &retained_entry);
+        let mut options = online_options();
+        options.target_bytes = None;
+        options.max_age = Some(ONLINE_GC_GRACE);
+        let access = CollectionAccess::Online(storage.collection.snapshot().unwrap())
+            .with_durable_protection(storage.advertisement_protection(SystemTime::now()).unwrap());
+        let pass = run_flat_gc(
+            options,
+            &storage,
+            &trusted,
+            None,
+            access,
+            |storage, trusted| {
+                let entries = scan(storage, trusted)?;
+                drop(storage.read_advertised_narinfo(&retained)?.unwrap());
+                storage.collection.expire_transient_protection_for_test();
+                Ok(entries)
+            },
+        )
+        .expect("replacement renewal of retained metadata must not abort online collection");
+        let report = pass.finish(&storage, GcMode::Apply).unwrap();
+        assert_eq!(report.deleted_narinfos, 1);
+        assert!(!directory.path().join(&victim.narinfo_name).exists());
+        assert!(
+            directory
+                .path()
+                .join(format!("{TEST_SECOND_STORE_HASH}.narinfo"))
+                .exists()
+        );
+        assert!(directory.path().join("nar").join(&victim.nar_name).exists());
+        assert!(
+            storage
+                .advertisement_protection(SystemTime::now())
+                .unwrap()
+                .protects(ProtectedObject::Publication(retained))
+        );
+    }
+
+    #[test]
+    fn publication_lease_recording_during_online_gc_still_invalidates_the_scan() {
+        let (directory, mut storage, victim) = scannable_pair_fixture();
+        age_publication(directory.path(), &victim);
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+            3.into(),
+        );
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        storage
+            .record_publication_lease(victim.store, identity)
+            .unwrap();
+        storage
+            .expire_advertisement_lease_for_test(victim.store)
+            .unwrap();
+        storage.collection =
+            super::super::collection::CollectionCoordinator::without_startup_grace();
+        let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let access = CollectionAccess::Online(storage.collection.snapshot().unwrap())
+            .with_durable_protection(storage.advertisement_protection(SystemTime::now()).unwrap());
+        let result = run_flat_gc(
+            online_options(),
+            &storage,
+            &trusted,
+            Some(0),
+            access,
+            |storage, trusted| {
+                let entries = scan(storage, trusted)?;
+                storage.record_publication_lease(victim.store, identity)?;
+                Ok(entries)
+            },
+        );
+        assert!(matches!(result, Err(StorageError::CollectionChanged)));
+        assert!(directory.path().join(&victim.narinfo_name).exists());
+        assert!(directory.path().join("nar").join(&victim.nar_name).exists());
+    }
+
+    #[test]
     fn online_collection_aborts_before_unlink_when_publication_changes_the_scan() {
         let (directory, storage, entry) = scannable_pair_fixture();
         age_publication(directory.path(), &entry);
@@ -4310,14 +4727,15 @@ mod tests {
                     Ok(entries)
                 },
             );
+            let pass =
+                result.expect("reads observed during scanning must update candidate protection");
             if depends_on_victim {
-                assert!(
-                    matches!(result, Err(StorageError::CollectionChanged)),
-                    "a newly advertised dependent must keep the selected dependency alive"
+                assert_eq!(
+                    pass.report.deleted_narinfos, 0,
+                    "the protected dependent and its dependency must be excluded before selection"
                 );
                 assert!(directory.path().join(&victim.narinfo_name).exists());
             } else {
-                let pass = result.expect("unrelated metadata traffic must allow the real deletion");
                 assert_eq!(pass.report.deleted_narinfos, 1);
                 assert!(!directory.path().join(&victim.narinfo_name).exists());
             }

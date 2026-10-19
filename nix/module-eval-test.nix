@@ -27,12 +27,16 @@
     egressCompression ? "none",
     storageBackend ? "flat",
     readTokens ? null,
+    trustedPublicKeys ? null,
     nativeStoreEnable ? false,
     nativeStateDir ? "/nix/var/nix",
     nativeRootsDir ? "${nativeStateDir}/gcroots/auto/narjar",
     nativeSigningKeyFile ? null,
     collectorPackages ? null,
     gc ? {},
+    edge ? {},
+    workers ? 8,
+    maxInFlight ? 64,
   }:
     (import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = pkgs.system;
@@ -68,13 +72,17 @@
               shutdownGraceSeconds
               egressCompression
               storageBackend
+              workers
+              maxInFlight
               ;
             auth.readTokens = readTokens;
+            auth.trustedPublicKeys = trustedPublicKeys;
             nativeStore.enable = nativeStoreEnable;
             nativeStore.stateDir = nativeStateDir;
             nativeStore.rootsDir = nativeRootsDir;
             nativeStore.signingKeyFile = nativeSigningKeyFile;
             inherit gc;
+            inherit edge;
             minFreeBytes = 0;
             package = package;
           };
@@ -111,6 +119,62 @@
     "/var/lib//foo"
   ];
   defaultConfig = configuration {dataDir = "/var/lib/narjar";};
+  edgeOptions = {
+    enable = true;
+    upstream = "https://cache.example";
+    trustedPublicKeys = ["cache.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="];
+    configureClient = true;
+    leaseSeconds = 3600;
+  };
+  edgeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge = edgeOptions;
+  };
+  disabledEdgeKeysConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge.trustedPublicKeys = edgeOptions.trustedPublicKeys;
+  };
+  disabledEdgeKeysWithNormalTrustConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge.trustedPublicKeys = edgeOptions.trustedPublicKeys;
+    trustedPublicKeys = "/run/cache-signing.pub";
+  };
+  conflictingEdgeKeysConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge = edgeOptions;
+    trustedPublicKeys = "/run/cache-signing.pub";
+  };
+  invalidEdgeConfigs = map (edge:
+    configuration {
+      dataDir = "/var/lib/narjar";
+      inherit edge;
+    }) [
+    (edgeOptions // {leaseSeconds = 599;})
+    (edgeOptions // {upstream = "file:///tmp/cache";})
+    (edgeOptions // {trustedPublicKeys = [];})
+    (edgeOptions // {enable = false;})
+  ];
+  mixedSourcesConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    dynamicUser = false;
+    nativeStoreEnable = true;
+    edge = edgeOptions;
+  };
+  compressedEdgeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    egressCompression = "zstd";
+    edge = edgeOptions;
+  };
+  singleWorkerEdgeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge = edgeOptions;
+    workers = 1;
+  };
+  singleAdmissionEdgeConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge = edgeOptions;
+    maxInFlight = 1;
+  };
   unattendedConfig = configuration {
     dataDir = "/var/lib/narjar";
     gc = {
@@ -490,6 +554,28 @@
       touch "$out"
     '';
 in
+  assert evaluatesConfig edgeConfig;
+  assert evaluatesConfig disabledEdgeKeysConfig;
+  assert disabledEdgeKeysConfig.systemd.services.narjar.serviceConfig.LoadCredential == defaultConfig.systemd.services.narjar.serviceConfig.LoadCredential;
+  assert evaluatesConfig disabledEdgeKeysWithNormalTrustConfig;
+  assert !(evaluatesConfig conflictingEdgeKeysConfig);
+  assert builtins.elem "trusted-public-keys:/run/cache-signing.pub" disabledEdgeKeysWithNormalTrustConfig.systemd.services.narjar.serviceConfig.LoadCredential;
+  assert lib.any (credential: lib.hasInfix "narjar-edge-trusted-keys" credential) edgeConfig.systemd.services.narjar.serviceConfig.LoadCredential;
+  assert lib.all (config: !(evaluatesConfig config)) invalidEdgeConfigs;
+  assert !(evaluatesConfig mixedSourcesConfig);
+  assert !(evaluatesConfig compressedEdgeConfig);
+  assert lib.hasInfix "--serve-source read-through" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert lib.hasInfix "--edge-upstream https://cache.example" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert lib.hasInfix "--edge-lease-seconds 3600" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert lib.hasInfix "--edge-fill-timeout-seconds 3600" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert !(evaluatesConfig singleWorkerEdgeConfig);
+  assert !(evaluatesConfig singleAdmissionEdgeConfig);
+  assert edgeConfig.nix.settings.substituters == ["http://127.0.0.1:5000"];
+  assert edgeConfig.nix.settings.fallback == false;
+  assert edgeConfig.nix.settings.narinfo-cache-positive-ttl == 300;
+  assert edgeConfig.nix.settings.narinfo-cache-negative-ttl == 1;
+  assert lib.all (key: builtins.elem key edgeConfig.nix.settings.trusted-public-keys) edgeOptions.trustedPublicKeys;
+  assert !(lib.hasInfix "--edge-upstream" defaultConfig.systemd.services.narjar.serviceConfig.ExecStart);
   assert builtins.all evaluates valid;
   assert builtins.all (dataDir: !(evaluates dataDir)) invalid;
   assert !(evaluatesConfig invalidGcThresholdConfig);
