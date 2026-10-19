@@ -153,11 +153,16 @@ impl Storage {
         {
             return Ok(());
         }
+        let bytes = postcard::to_allocvec(&policy).map_err(|error| invalid(error.to_string()))?;
+        let _reservation = self.reserve_staging(bytes.len() as u64, min_free_bytes)?;
         let directory =
             ensure_directory_at(&self.root, DIRECTORY.as_ref(), "advertisement directory")?;
         directory.sync_all()?;
         self.root.sync_all()?;
-        self.publish_advertisement_record(POLICY.into(), &policy, min_free_bytes)?;
+        self.publish(
+            PublishTarget::AdvertisementRecord(POLICY.as_ref()),
+            Cursor::new(bytes),
+        )?;
         self.advertisements = AdvertisementLeases::Active { directory, policy };
         Ok(())
     }
@@ -420,15 +425,20 @@ mod tests {
     use super::*;
     use crate::cache::object::NarHash;
 
-    fn advertised_fixture() -> (tempfile::TempDir, Storage, StoreHash, NarIdentity) {
+    fn unconfigured_fixture() -> (tempfile::TempDir, Storage) {
         let directory = tempfile::tempdir().unwrap();
-        let mut storage = CacheCreation::prepare(
+        let storage = CacheCreation::prepare(
             &Directory::open(directory.path()).unwrap(),
             SupportedStorageBackend::FLAT,
         )
         .unwrap()
         .create_or_complete()
         .unwrap();
+        (directory, storage)
+    }
+
+    fn advertised_fixture() -> (tempfile::TempDir, Storage, StoreHash, NarIdentity) {
+        let (directory, mut storage) = unconfigured_fixture();
         storage
             .configure_advertisement_leases(NonZeroU64::new(3600).unwrap(), 0)
             .unwrap();
@@ -436,6 +446,72 @@ mod tests {
         let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
         storage.record_publication_lease(store, identity).unwrap();
         (directory, storage, store, identity)
+    }
+
+    #[test]
+    fn rejected_initial_retention_policy_does_not_disable_the_cache_after_restart() {
+        let (directory, mut storage) = unconfigured_fixture();
+        let store = StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let metadata = directory.path().join(format!("{}.narinfo", store.as_str()));
+        std::fs::write(&metadata, b"existing cached metadata").unwrap();
+        assert!(matches!(
+            storage.configure_advertisement_leases(NonZeroU64::new(60).unwrap(), u64::MAX),
+            Err(StorageError::InsufficientSpace)
+        ));
+        assert!(
+            !directory.path().join(DIRECTORY).exists(),
+            "failed admission must not leave an incomplete retention directory"
+        );
+        drop(storage);
+        let mut storage = Storage::open(
+            &Directory::open(directory.path()).unwrap(),
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap();
+        assert_eq!(
+            storage
+                .read_advertised_narinfo(&store)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"existing cached metadata"
+        );
+        assert!(
+            !storage
+                .advertisement_protection(SystemTime::now())
+                .unwrap()
+                .protects(ProtectedObject::Publication(store))
+        );
+        storage.delete_narinfo(&store).unwrap();
+        assert!(!metadata.exists());
+        storage
+            .configure_advertisement_leases(NonZeroU64::new(60).unwrap(), 0)
+            .unwrap();
+        assert!(matches!(
+            storage.advertisements,
+            AdvertisementLeases::Active { .. }
+        ));
+    }
+
+    #[test]
+    fn rejected_retention_policy_update_preserves_existing_promises_after_restart() {
+        let (directory, mut storage, store, identity) = advertised_fixture();
+        let policy_path = directory.path().join(DIRECTORY).join(POLICY);
+        let previous_policy = std::fs::read(&policy_path).unwrap();
+        assert!(matches!(
+            storage.configure_advertisement_leases(NonZeroU64::new(60).unwrap(), u64::MAX),
+            Err(StorageError::InsufficientSpace)
+        ));
+        assert_eq!(std::fs::read(&policy_path).unwrap(), previous_policy);
+        drop(storage);
+        let storage = Storage::open(
+            &Directory::open(directory.path()).unwrap(),
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap();
+        let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
+        assert!(protection.protects(ProtectedObject::Publication(store)));
+        assert!(protection.protects(ProtectedObject::CanonicalNar(identity.hash())));
     }
 
     #[test]
