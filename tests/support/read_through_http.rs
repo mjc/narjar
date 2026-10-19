@@ -147,6 +147,7 @@ fn read_through_http_turns_mid_payload_disconnect_into_a_clean_miss() {
 #[test]
 fn doctor_accepts_the_edge_source_environment_for_local_checks() {
     let data_dir = init_data_dir("edge-doctor-environment");
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
     let output = run_with_env(
         &["doctor", "--data-dir", data_dir.to_str().unwrap(), "--json"],
         &[("NARJAR_SERVE_SOURCE", "read-through")],
@@ -163,7 +164,10 @@ fn doctor_accepts_the_edge_source_environment_for_local_checks() {
         &[("NARJAR_SERVE_SOURCE", "read-through")],
     );
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("source\tread-through\tok\tselected"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("source\tread-through\tok\tsource configuration is valid")
+    );
 }
 
 #[test]

@@ -1039,7 +1039,13 @@ fn inspect_doctor_source(
     source: Result<ServeSource, SourcePreparationError>,
 ) -> DoctorSource {
     let validation = match source {
-        Ok(ServeSource::FlatCache { .. } | ServeSource::ReadThrough { .. }) => Ok("selected"),
+        Ok(ServeSource::FlatCache { .. } | ServeSource::ReadThrough { .. }) => {
+            match options.serve_source {
+                ServeSourceChoice::ReadThrough => validate_doctor_read_through(&options.data_dir)
+                    .map(|()| "source configuration is valid"),
+                ServeSourceChoice::FlatCache | ServeSourceChoice::NativeStore => Ok("selected"),
+            }
+        }
         Err(error) => Err(error.doctor_detail()),
         Ok(ServeSource::NativeStore(settings)) => {
             validate_doctor_native_store(&options.data_dir, &settings)
@@ -1061,15 +1067,26 @@ fn validate_doctor_native_store(
     data_dir: &Path,
     settings: &NativeStoreSettings,
 ) -> Result<(), &'static str> {
-    let data_directory =
-        Directory::open(data_dir).map_err(|_| "Narjar data directory is unavailable")?;
-    let (_, trusted_keys) = CachePolicies::load(&data_directory)
-        .map_err(|_| "cache policy is invalid")?
-        .into_parts();
+    let trusted_keys = load_doctor_trusted_keys(data_dir)?;
     settings
         .validate(data_dir, &trusted_keys)
         .map(drop)
         .map_err(|error| error.doctor_detail())
+}
+
+fn load_doctor_trusted_keys(data_dir: &Path) -> Result<TrustedPublicKeys, &'static str> {
+    let data_directory =
+        Directory::open(data_dir).map_err(|_| "Narjar data directory is unavailable")?;
+    CachePolicies::load(&data_directory)
+        .map(|policies| policies.into_parts().1)
+        .map_err(|_| "cache policy is invalid")
+}
+
+fn validate_doctor_read_through(data_dir: &Path) -> Result<(), &'static str> {
+    if load_doctor_trusted_keys(data_dir)?.is_empty() {
+        return Err("read-through source requires trusted public keys");
+    }
+    Ok(())
 }
 
 fn inspect_doctor_recovery_markers(root: &Path) -> [DoctorPath; 2] {
@@ -2291,6 +2308,15 @@ machine other.example password other-secret
     #[test]
     fn read_through_doctor_keeps_its_source_name_when_checking_flat_storage() {
         let directory = initialized_doctor_cache();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        fs::write(
+            directory.path().join("trusted-public-keys"),
+            format!(
+                "fixture:{}\n",
+                BASE64.encode(key.verifying_key().as_bytes())
+            ),
+        )
+        .unwrap();
         let options = Doctor {
             data_dir: directory.path().to_owned(),
             json: true,

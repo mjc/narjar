@@ -7070,6 +7070,45 @@ fn structural_reconcile_reports_temp_age_and_shape() {
 }
 
 #[test]
+fn read_through_doctor_checks_trusted_keys_without_contacting_an_upstream() {
+    let data_dir = init_data_dir("read-through-doctor-trust");
+    let path = data_dir.to_str().unwrap();
+    for contents in ["", "not-a-public-key\n"] {
+        fs::write(data_dir.join("trusted-public-keys"), contents).unwrap();
+        let output = run(&[
+            "doctor",
+            "--data-dir",
+            path,
+            "--serve-source",
+            "read-through",
+            "--json",
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{contents:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["source"]["name"], "read-through");
+        assert_eq!(report["source"]["severity"], "error");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("not-a-public-key"));
+    }
+    write_test_trusted_public_keys(data_dir.join("trusted-public-keys"));
+    let output = run(&[
+        "doctor",
+        "--data-dir",
+        path,
+        "--serve-source",
+        "read-through",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["source"]["name"], "read-through");
+    assert_eq!(report["source"]["severity"], "ok");
+}
+
+#[test]
 fn doctor_returns_failure_for_invalid_layout() {
     let data_dir = init_data_dir("operator-doctor-failure");
     fs::remove_file(data_dir.join("trusted-public-keys"))
