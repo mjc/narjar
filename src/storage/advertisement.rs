@@ -362,12 +362,6 @@ impl Storage {
         }
     }
 
-    pub(super) fn forget_advertisement(&self, store: StoreHash) {
-        if let Err(error) = self.remove_advertisement_record(store) {
-            eprintln!("narjar: remove advertisement record: {error}");
-        }
-    }
-
     pub(super) fn remove_advertisement_record(&self, store: StoreHash) -> Result<(), StorageError> {
         match &self.advertisements {
             AdvertisementLeases::Absent => Ok(()),
@@ -442,6 +436,81 @@ mod tests {
         let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
         storage.record_publication_lease(store, identity).unwrap();
         (directory, storage, store, identity)
+    }
+
+    #[test]
+    fn initial_lease_capacity_failure_does_not_leave_unreclaimable_metadata() {
+        use crate::cache::{narinfo::NarInfoMetadata, object::NarRepresentation};
+        use sha2::Digest;
+
+        let (directory, mut storage, store, _) = advertised_fixture();
+        storage.remove_advertisement_record(store).unwrap();
+        let bytes = b"raw NAR";
+        let identity = NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(bytes).into()),
+            (bytes.len() as u64).into(),
+        );
+        storage
+            .publish_nar(
+                crate::cache::object::NarFileName::raw(identity.hash()),
+                bytes.as_slice(),
+                bytes.len() as u64,
+                super::super::NarUploadPolicy::new(1024, 0),
+            )
+            .unwrap();
+        let metadata = NarInfoMetadata::from_store_metadata(
+            format!("/nix/store/{}-fixture", store.as_str()),
+            None,
+            None,
+            identity,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let encoded = metadata
+            .serialize(NarRepresentation::Raw(identity))
+            .unwrap();
+        let AdvertisementLeases::Active { policy, .. } = &mut storage.advertisements else {
+            panic!("fixture configures retention");
+        };
+        policy.min_free_bytes = u64::MAX;
+        assert!(matches!(
+            storage.publish_narinfo_with_claims(metadata.claims(), encoded.clone()),
+            Err(StorageError::InsufficientSpace)
+        ));
+        assert!(storage.open_narinfo(&store).unwrap().is_none());
+        assert!(
+            directory
+                .path()
+                .join("nar")
+                .join(crate::cache::object::NarFileName::raw(identity.hash()).to_string())
+                .is_file(),
+            "the raw NAR remains an orphan that GC can reclaim"
+        );
+
+        let AdvertisementLeases::Active { policy, .. } = &mut storage.advertisements else {
+            panic!("fixture configures retention");
+        };
+        policy.min_free_bytes = 0;
+        storage
+            .publish_narinfo_with_claims(metadata.claims(), encoded.clone())
+            .unwrap();
+        storage
+            .force_advertisement_renewal_with_unavailable_reserve_for_test(store)
+            .unwrap();
+        assert!(matches!(
+            storage.publish_narinfo_with_claims(metadata.claims(), encoded.clone()),
+            Err(StorageError::InsufficientSpace)
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join(format!("{}.narinfo", store.as_str()))).unwrap(),
+            encoded,
+            "a failed retry must not delete metadata already accepted by clients"
+        );
+        assert!(matches!(
+            storage.advertisement_evidence(store).unwrap(),
+            AdvertisementEvidence::Recorded
+        ));
     }
 
     #[test]

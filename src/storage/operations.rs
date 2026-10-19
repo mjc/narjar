@@ -384,6 +384,15 @@ impl Storage {
         claims: &NarInfoClaims,
         bytes: Vec<u8>,
     ) -> Result<PublishOutcome, StorageError> {
+        let _activity = self.collection.mutation()?;
+        // Keep another publication from succeeding between lease failure and cleanup.
+        let lock = self.destination_lock(
+            PathBuf::from(super::advertisement::DIRECTORY)
+                .join(format!("{}.publish", claims.store().as_str())),
+        );
+        let _guard = lock
+            .lock()
+            .map_err(|_| io::Error::other("narinfo publication lock poisoned"))?;
         let outcome = match self.publish(PublishTarget::NarInfo(claims.store()), Cursor::new(bytes))
         {
             Err(StorageError::Conflict) if self.existing_narinfo_matches(claims)? => {
@@ -391,8 +400,27 @@ impl Storage {
             }
             result => result,
         }?;
-        self.record_publication_lease(*claims.store(), claims.identity())?;
-        Ok(outcome)
+        self.record_narinfo_lease_or_remove_new_metadata(claims, outcome)
+    }
+
+    fn record_narinfo_lease_or_remove_new_metadata(
+        &self,
+        claims: &NarInfoClaims,
+        outcome: PublishOutcome,
+    ) -> Result<PublishOutcome, StorageError> {
+        match self.record_publication_lease(*claims.store(), claims.identity()) {
+            Ok(()) => Ok(outcome),
+            Err(error) => {
+                match outcome {
+                    PublishOutcome::Created => {
+                        self.unlink_narinfo_after_lease_cleanup(claims.store())?;
+                        self.root.sync_all()?;
+                    }
+                    PublishOutcome::Identical => {}
+                }
+                Err(error)
+            }
+        }
     }
 
     fn existing_narinfo_matches(&self, expected: &NarInfoClaims) -> Result<bool, StorageError> {
@@ -885,9 +913,7 @@ impl Storage {
         let name = OsString::from(format!("{}.narinfo", store.as_str()));
         match entry_is_regular_at(&root, &name) {
             Ok(true) => {
-                // Remove the lease first so a failed removal leaves the metadata available for retry.
-                self.remove_advertisement_record(*store)?;
-                unlink_at(&root, &name)?;
+                self.unlink_narinfo_after_lease_cleanup(store)?;
                 root.sync_all()?;
                 Ok(NarInfoDeletion::Deleted)
             }
@@ -902,6 +928,19 @@ impl Storage {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub(super) fn unlink_narinfo_after_lease_cleanup(
+        &self,
+        store: &StoreHash,
+    ) -> Result<(), StorageError> {
+        // A failed lease removal must leave the metadata available for retry.
+        self.remove_advertisement_record(*store)?;
+        unlink_at(
+            &self.root,
+            &OsString::from(format!("{}.narinfo", store.as_str())),
+        )?;
+        Ok(())
     }
 
     pub(super) fn publish(

@@ -1681,7 +1681,7 @@ fn apply_marked_chunked(
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
     for &index in &selected.entries {
-        unlink_at(&root, &entries[index].narinfo_name)?;
+        storage.unlink_narinfo_after_lease_cleanup(&entries[index].store)?;
     }
     if !selected.entries.is_empty() {
         root.sync_all()?;
@@ -1691,7 +1691,6 @@ fn apply_marked_chunked(
             &root,
             super::access::AccessKey::Publication(entries[index].store),
         );
-        storage.forget_advertisement(entries[index].store);
     });
     let selected_outputs = selected
         .entries
@@ -2339,11 +2338,10 @@ fn apply_with_checkpoint(
     for &index in selected {
         let entry = &entries[index];
         checkpoint(FailurePoint::BeforeNarinfoDelete)?;
-        unlink_at(&root, &entry.narinfo_name)?;
+        storage.unlink_narinfo_after_lease_cleanup(&entry.store)?;
         checkpoint(FailurePoint::AfterNarinfoDeleteBeforeSync)?;
         root.sync_all()?;
         super::access::forget(&root, super::access::AccessKey::Publication(entry.store));
-        storage.forget_advertisement(entry.store);
         checkpoint(FailurePoint::AfterNarinfoSyncBeforeNarDelete)?;
         let mut deleted_payload = false;
         let mut deleted_raw_nar = false;
@@ -2446,6 +2444,88 @@ mod tests {
     fn initialize_storage(path: &Path) -> Result<Storage, StorageError> {
         CacheCreation::prepare(&Directory::open(path)?, SupportedStorageBackend::FLAT)
             .and_then(|creation| creation.create_or_complete())
+    }
+
+    #[test]
+    fn gc_keeps_metadata_retryable_when_lease_cleanup_fails() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let lease_path = directory
+            .path()
+            .join(super::super::advertisement::DIRECTORY)
+            .join(format!("{}.lease", entry.store.as_str()));
+        fs::create_dir(&lease_path).unwrap();
+        let result = apply(&storage, std::slice::from_ref(&entry), &[0]);
+        assert!(
+            result.is_err(),
+            "GC must propagate retention cleanup failures"
+        );
+        assert!(directory.path().join(&entry.narinfo_name).is_file());
+        assert!(directory.path().join("nar").join(&entry.nar_name).is_file());
+        fs::remove_dir(&lease_path).unwrap();
+        assert_eq!(
+            apply(&storage, std::slice::from_ref(&entry), &[0]).unwrap(),
+            (1, 1)
+        );
+        assert!(!directory.path().join(&entry.narinfo_name).exists());
+        assert!(!directory.path().join("nar").join(&entry.nar_name).exists());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn chunked_gc_keeps_metadata_retryable_when_lease_cleanup_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = initialize_chunked_storage(directory.path()).unwrap();
+        let bytes = b"raw NAR";
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(bytes).into()),
+            (bytes.len() as u64).into(),
+        );
+        storage
+            .publish_nar(
+                NarFileName::raw(identity.hash()),
+                bytes.as_slice(),
+                bytes.len() as u64,
+                NarUploadPolicy::new(1024, 0),
+            )
+            .unwrap();
+        write_signed_raw_metadata(directory.path(), TEST_STORE_HASH, identity, Vec::new());
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let lease_path = directory
+            .path()
+            .join(super::super::advertisement::DIRECTORY)
+            .join(format!("{TEST_STORE_HASH}.lease"));
+        fs::create_dir(&lease_path).unwrap();
+        let store = storage.chunk_store().unwrap();
+        let entries = [ChunkedEntry {
+            last_use: UNIX_EPOCH,
+            store: StoreHash::parse(TEST_STORE_HASH).unwrap(),
+            store_path: format!("/nix/store/{TEST_STORE_HASH}-narjar"),
+            references: Vec::new(),
+            narinfo_name: format!("{TEST_STORE_HASH}.narinfo").into(),
+            output_name: None,
+            output_bytes: 0,
+            raw_hash: identity.hash(),
+            manifest_bytes: 0,
+            narinfo_bytes: 0,
+            modified: UNIX_EPOCH,
+            protected: false,
+        }];
+        let selected = ChunkedSelection {
+            entries: vec![0],
+            ..Default::default()
+        };
+        assert!(apply_chunked(&storage, store, &entries, &Default::default(), &selected).is_err());
+        assert!(directory.path().join(&entries[0].narinfo_name).is_file());
+        assert!(store.validate_manifest(identity.hash()).unwrap().is_some());
+        fs::remove_dir(&lease_path).unwrap();
+        apply_chunked(&storage, store, &entries, &Default::default(), &selected).unwrap();
+        assert!(!directory.path().join(&entries[0].narinfo_name).exists());
+        assert!(store.validate_manifest(identity.hash()).unwrap().is_none());
     }
 
     #[test]
