@@ -306,7 +306,7 @@ impl ReadThroughSource {
         let metadata = self.metadata(store, deadline)?;
         let payload = metadata.payload();
         self.policy
-            .ensure_representation_within_limits(payload)
+            .ensure_decoded_size_within_limit(payload.identity().size())
             .map_err(EdgeFailure::ingestion)?;
         self.coalesce(
             Key::Nar(payload.identity().hash()),
@@ -389,6 +389,9 @@ impl ReadThroughSource {
         deadline: Deadline,
     ) -> Result<(), EdgeFailure> {
         let encoded_size = payload.encoded_size().get();
+        self.policy
+            .ensure_encoded_size_within_limit(encoded_size)
+            .map_err(EdgeFailure::ingestion)?;
         let reservation = storage
             .reserve_staging(encoded_size, self.policy.min_free_bytes())
             .map_err(EdgeFailure::ingestion)?;

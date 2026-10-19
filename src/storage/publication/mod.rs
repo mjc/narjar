@@ -299,7 +299,7 @@ impl NarUploadPolicy {
         }
     }
 
-    pub(super) fn ensure_encoded_size_within_limit(
+    pub(crate) fn ensure_encoded_size_within_limit(
         self,
         encoded_bytes: u64,
     ) -> Result<(), StorageError> {
@@ -313,12 +313,11 @@ impl NarUploadPolicy {
         self.min_free_bytes
     }
 
-    pub(crate) fn ensure_representation_within_limits(
+    pub(crate) fn ensure_decoded_size_within_limit(
         self,
-        representation: crate::cache::object::NarRepresentation,
+        size: crate::cache::object::NarSize,
     ) -> Result<(), StorageError> {
-        self.ensure_encoded_size_within_limit(representation.encoded_size().get())?;
-        if representation.identity().size().get() > self.max_decoded_bytes {
+        if size.get() > self.max_decoded_bytes {
             return Err(StorageError::UploadTooLarge);
         }
         Ok(())

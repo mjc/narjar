@@ -452,6 +452,59 @@ fn overlapping_store_requests_make_one_upstream_generation_and_local_hits_stay_o
 }
 
 #[test]
+fn cached_raw_nars_satisfy_aliases_whose_encoded_download_would_exceed_the_limit() {
+    let fixture = Fixture::new();
+    assert!(fixture.raw.len() as u64 > fixture.encoded.size().get());
+    let compressed_metadata = fixture.metadata(
+        STORE,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+    );
+    let raw_metadata = fixture.metadata(
+        ALIAS,
+        NarRepresentation::Raw(fixture.identity),
+        &signing_key(),
+    );
+    let compressed = fixture.compressed.clone();
+    let upstream = Upstream::new(move |route, stream| {
+        let body = if route.ends_with(&format!("/{STORE}.narinfo")) {
+            &compressed_metadata
+        } else if route.ends_with(&format!("/{ALIAS}.narinfo")) {
+            &raw_metadata
+        } else if route.ends_with(".zst") {
+            &compressed
+        } else {
+            reply(stream, 404, b"raw download must not be needed");
+            return;
+        };
+        reply(stream, 200, body);
+    });
+    let policy = NarUploadPolicy::with_limits(
+        fixture.encoded.size().get(),
+        fixture.identity.size().get(),
+        128 * 1024 * 1024,
+        0,
+    );
+    let source = ReadThroughSource::new(settings(upstream.url()), trusted_keys(), policy).unwrap();
+    let (_directory, storage) = storage();
+    for hash in [STORE, ALIAS] {
+        let store = StoreHash::parse(hash).unwrap();
+        assert_eq!(source.ensure_local(&storage, &store), EdgeLookup::Ready);
+        let metadata = storage.read_advertised_narinfo(&store).unwrap().unwrap();
+        assert_eq!(
+            trusted_keys()
+                .validate(&store, metadata.bytes)
+                .unwrap()
+                .payload(),
+            NarRepresentation::Raw(fixture.identity)
+        );
+    }
+    assert_eq!(upstream.count(".narinfo"), 2);
+    assert_eq!(upstream.count(".zst"), 1);
+    assert_eq!(upstream.count(".nar"), 0);
+}
+
+#[test]
 fn aliases_with_different_encodings_share_one_logical_payload_fill() {
     let fixture = Fixture::new();
     let raw_metadata = fixture.metadata(
