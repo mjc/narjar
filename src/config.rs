@@ -269,19 +269,44 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "NARJAR_EDGE_UPSTREAM")]
     edge_upstream: Option<HttpUrl>,
     /// Seconds GC must retain a NAR after returning its narinfo. Default: 60 days plus one hour.
-    #[arg(long, env = "NARJAR_EDGE_LEASE_SECONDS", default_value = "5187600")]
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_LEASE_SECONDS",
+        default_value = "5187600",
+        requires = "edge_upstream"
+    )]
     edge_lease_seconds: NonZeroU64,
     /// Maximum number of simultaneous downloads from the upstream cache.
-    #[arg(long, env = "NARJAR_EDGE_MAX_FILLS", default_value = "4")]
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_MAX_FILLS",
+        default_value = "4",
+        requires = "edge_upstream"
+    )]
     edge_max_fills: NonZeroUsize,
     /// Timeout in seconds for connecting, idle network I/O or waiting for another request's download.
-    #[arg(long, env = "NARJAR_EDGE_TIMEOUT_SECONDS", default_value = "30")]
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_TIMEOUT_SECONDS",
+        default_value = "30",
+        requires = "edge_upstream"
+    )]
     edge_timeout_seconds: NonZeroU64,
     /// Total upstream download timeout in seconds, including time spent making progress.
-    #[arg(long, env = "NARJAR_EDGE_FILL_TIMEOUT_SECONDS", default_value = "3600")]
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_FILL_TIMEOUT_SECONDS",
+        default_value = "3600",
+        requires = "edge_upstream"
+    )]
     edge_fill_timeout_seconds: NonZeroU64,
     /// Seconds to cache upstream misses and failures, capped at 60.
-    #[arg(long, env = "NARJAR_EDGE_NEGATIVE_TTL_SECONDS", default_value = "1")]
+    #[arg(
+        long,
+        env = "NARJAR_EDGE_NEGATIVE_TTL_SECONDS",
+        default_value = "1",
+        requires = "edge_upstream"
+    )]
     edge_negative_ttl_seconds: NonZeroU64,
     #[arg(long, env = "NARJAR_NATIVE_STORE_DIR", value_parser = non_empty_path)]
     native_store_dir: Option<PathBuf>,
@@ -640,6 +665,26 @@ mod tests {
             )
             .expect("serve syntax should parse before source validation");
         ServeConfig::try_from(ServeArgs::from_arg_matches(&matches).unwrap())
+    }
+
+    #[test]
+    fn explicit_edge_tunings_require_an_upstream_even_when_they_equal_defaults() {
+        for (flag, value) in [
+            ("--edge-lease-seconds", "5187600"),
+            ("--edge-max-fills", "4"),
+            ("--edge-timeout-seconds", "30"),
+            ("--edge-fill-timeout-seconds", "3600"),
+            ("--edge-negative-ttl-seconds", "1"),
+        ] {
+            let error = ServeArgs::augment_args(Command::new("serve"))
+                .try_get_matches_from(["serve", "--data-dir", "/cache", flag, value])
+                .expect_err("explicit edge settings must not be silently ignored");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+            assert!(error.to_string().contains("--edge-upstream"));
+        }
     }
 
     #[test]

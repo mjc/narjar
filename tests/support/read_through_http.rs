@@ -167,6 +167,31 @@ fn doctor_accepts_the_edge_source_environment_for_local_checks() {
 }
 
 #[test]
+fn edge_tuning_environment_requires_read_through_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing_cache = directory.path().join("uninitialized-cache");
+    for (variable, value) in [
+        ("NARJAR_EDGE_LEASE_SECONDS", "5187600"),
+        ("NARJAR_EDGE_MAX_FILLS", "4"),
+        ("NARJAR_EDGE_TIMEOUT_SECONDS", "30"),
+        ("NARJAR_EDGE_FILL_TIMEOUT_SECONDS", "3600"),
+        ("NARJAR_EDGE_NEGATIVE_TTL_SECONDS", "1"),
+    ] {
+        let output = run_with_env(
+            &["serve", "--data-dir", missing_cache.to_str().unwrap()],
+            &[(variable, value)],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{variable} must fail before opening storage"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--edge-upstream"));
+    }
+    assert!(!missing_cache.exists());
+}
+
+#[test]
 fn doctor_rejects_compressed_edge_output_from_the_environment() {
     let data_dir = init_data_dir("edge-doctor-output-policy");
     for encoding in ["xz", "zstd"] {
