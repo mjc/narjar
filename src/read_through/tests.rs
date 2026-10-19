@@ -208,6 +208,41 @@ fn reply(stream: &mut TcpStream, status: u16, body: &[u8]) {
     .and_then(|()| stream.write_all(body));
 }
 
+#[test]
+fn identity_content_encoding_accepts_mixed_case_without_accepting_other_codings() {
+    for coding in ["identity", "Identity", "IDENTITY", "gzip"] {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(
+            STORE,
+            NarRepresentation::Raw(fixture.identity),
+            &signing_key(),
+        );
+        let upstream = Upstream::new(move |route, stream| {
+            let body = if route.ends_with(".narinfo") {
+                &metadata
+            } else {
+                &fixture.raw
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {coding}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .and_then(|()| stream.write_all(body))
+            .unwrap();
+        });
+        let source = source(&upstream);
+        let (_directory, storage) = storage();
+        let result = source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap());
+        let expected = if coding == "gzip" {
+            EdgeLookup::Miss(EdgeFailure::Invalid)
+        } else {
+            EdgeLookup::Ready
+        };
+        assert_eq!(result, expected, "Content-Encoding: {coding}");
+    }
+}
+
 #[derive(Default)]
 struct Gate {
     open: Mutex<bool>,

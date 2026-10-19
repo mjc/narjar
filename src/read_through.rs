@@ -426,7 +426,7 @@ impl ReadThroughSource {
         if response
             .headers()
             .get("Content-Encoding")
-            .is_some_and(|value| value != "identity")
+            .is_some_and(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
         {
             return Err(EdgeFailure::Invalid);
         }
