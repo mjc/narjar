@@ -6,7 +6,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process,
-    sync::{Arc, Mutex, Weak, atomic::Ordering},
+    sync::{Arc, Mutex, TryLockError, Weak, atomic::Ordering},
     time::SystemTime,
 };
 
@@ -30,6 +30,7 @@ use crate::cache::{
 
 use super::{
     CleanupAction, INGESTION_RECEIPT_DIRECTORY, VALIDATION_DIRECTORY,
+    advertisement::AdvertisementLeases,
     cache_info::{MAX_CACHE_INFO_BYTES, validate as validate_cache_info},
     chunk_store::{ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
     chunked::ChunkProfile,
@@ -385,11 +386,8 @@ impl Storage {
         bytes: Vec<u8>,
     ) -> Result<PublishOutcome, StorageError> {
         let _activity = self.collection.mutation()?;
-        // Keep another publication from succeeding between lease failure and cleanup.
-        let lock = self.destination_lock(
-            PathBuf::from(super::advertisement::DIRECTORY)
-                .join(format!("{}.publish", claims.store().as_str())),
-        );
+        // Block reads and other publishers until retention is recorded or rollback finishes.
+        let lock = self.narinfo_publication_lock(claims.store());
         let _guard = lock
             .lock()
             .map_err(|_| io::Error::other("narinfo publication lock poisoned"))?;
@@ -401,6 +399,13 @@ impl Storage {
             result => result,
         }?;
         self.record_narinfo_lease_or_remove_new_metadata(claims, outcome)
+    }
+
+    pub(super) fn narinfo_publication_lock(&self, store: &StoreHash) -> Arc<Mutex<()>> {
+        self.destination_lock(
+            PathBuf::from(super::advertisement::DIRECTORY)
+                .join(format!("{}.publish", store.as_str())),
+        )
     }
 
     fn record_narinfo_lease_or_remove_new_metadata(
@@ -839,6 +844,25 @@ impl Storage {
     }
 
     pub(crate) fn read_advertised_narinfo(
+        &self,
+        store: &StoreHash,
+    ) -> Result<Option<AdvertisedNarInfo<'_>>, StorageError> {
+        match &self.advertisements {
+            AdvertisementLeases::Absent => self.read_narinfo_and_renew_retention(store),
+            AdvertisementLeases::Incomplete | AdvertisementLeases::Active { .. } => {
+                let publication = self.narinfo_publication_lock(store);
+                match publication.try_lock() {
+                    Ok(_guard) => self.read_narinfo_and_renew_retention(store),
+                    Err(TryLockError::WouldBlock) => Ok(None),
+                    Err(TryLockError::Poisoned(_)) => {
+                        Err(io::Error::other("narinfo publication lock poisoned").into())
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_narinfo_and_renew_retention(
         &self,
         store: &StoreHash,
     ) -> Result<Option<AdvertisedNarInfo<'_>>, StorageError> {

@@ -439,6 +439,51 @@ mod tests {
     }
 
     #[test]
+    fn pending_publication_reads_return_a_miss_without_waiting_for_rollback() {
+        use std::{sync::mpsc, time::Duration};
+
+        let (directory, storage, store, _) = advertised_fixture();
+        std::fs::write(
+            directory.path().join(format!("{}.narinfo", store.as_str())),
+            b"metadata visible before publication completion",
+        )
+        .unwrap();
+        let publication = storage.narinfo_publication_lock(&store);
+        let pending = publication.lock().unwrap();
+        let (completed, response) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let result = storage
+                    .read_advertised_narinfo(&store)
+                    .map(|metadata| metadata.map(|metadata| metadata.bytes));
+                completed.send(result).unwrap();
+            });
+            let before_rollback = response.recv_timeout(Duration::from_secs(5));
+            storage.unlink_narinfo_after_lease_cleanup(&store).unwrap();
+            storage.root.sync_all().unwrap();
+            drop(pending);
+            reader.join().unwrap();
+            assert!(
+                before_rollback
+                    .expect("a reader must return without waiting for publication")
+                    .unwrap()
+                    .is_none(),
+                "a reader must not acknowledge metadata that can still be rolled back"
+            );
+        });
+        assert!(
+            !directory
+                .path()
+                .join(format!("{}.narinfo", store.as_str()))
+                .exists()
+        );
+        assert!(matches!(
+            storage.advertisement_evidence(store).unwrap(),
+            AdvertisementEvidence::Missing
+        ));
+    }
+
+    #[test]
     fn initial_lease_capacity_failure_does_not_leave_unreclaimable_metadata() {
         use crate::cache::{narinfo::NarInfoMetadata, object::NarRepresentation};
         use sha2::Digest;
