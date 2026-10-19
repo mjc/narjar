@@ -156,7 +156,14 @@ fn doctor_accepts_the_edge_source_environment_for_local_checks() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("flat-cache"));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["source"]["name"], "read-through");
+    let output = run_with_env(
+        &["doctor", "--data-dir", data_dir.to_str().unwrap()],
+        &[("NARJAR_SERVE_SOURCE", "read-through")],
+    );
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("source\tread-through\tok\tselected"));
 }
 
 #[test]

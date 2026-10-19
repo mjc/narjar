@@ -1030,22 +1030,20 @@ fn inspect_doctor_source(
     options: &Doctor,
     source: Result<ServeSource, SourcePreparationError>,
 ) -> DoctorSource {
-    let (name, validation) = match source {
-        Ok(ServeSource::FlatCache { .. }) => ("flat-cache", Ok("selected")),
-        Ok(ServeSource::ReadThrough { .. }) => ("read-through", Ok("selected")),
-        Err(error) => (options.serve_source.name(), Err(error.doctor_detail())),
-        Ok(ServeSource::NativeStore(settings)) => (
-            "native-store",
+    let validation = match source {
+        Ok(ServeSource::FlatCache { .. } | ServeSource::ReadThrough { .. }) => Ok("selected"),
+        Err(error) => Err(error.doctor_detail()),
+        Ok(ServeSource::NativeStore(settings)) => {
             validate_doctor_native_store(&options.data_dir, &settings)
-                .map(|()| "source configuration is valid"),
-        ),
+                .map(|()| "source configuration is valid")
+        }
     };
     let (severity, detail) = match validation {
         Ok(detail) => (DoctorSeverity::Ok, detail),
         Err(detail) => (DoctorSeverity::Error, detail),
     };
     DoctorSource {
-        name,
+        name: options.serve_source.name(),
         severity,
         detail,
     }
@@ -2264,6 +2262,29 @@ machine other.example password other-secret
             0,
             "failed source preparation must not create cache or native directories"
         );
+    }
+
+    #[test]
+    fn read_through_doctor_keeps_its_source_name_when_checking_flat_storage() {
+        let directory = initialized_doctor_cache();
+        let options = Doctor {
+            data_dir: directory.path().to_owned(),
+            json: true,
+            serve_source: ServeSourceChoice::ReadThrough,
+            native_store_dir: None,
+            native_state_dir: None,
+            native_roots_dir: None,
+            native_min_lease_seconds: None,
+            native_signing_key_file: None,
+            egress_compression: WireEncoding::Raw,
+            storage_backend: StorageBackend::Flat,
+        };
+        let mut report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT).unwrap();
+        report.source = inspect_doctor_source(&options, options.prepare_source());
+        assert_eq!(report.source.name, "read-through");
+        assert!(matches!(report.source.severity, DoctorSeverity::Ok));
+        let json = serde_json::to_value(doctor_json(&report)).unwrap();
+        assert_eq!(json["source"]["name"], "read-through");
     }
 
     #[test]
