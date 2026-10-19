@@ -314,9 +314,7 @@ impl ReadThroughSource {
             || match storage.ensure_canonical_nar_available(payload.identity()) {
                 Ok(()) => Ok(()),
                 Err(StorageError::MissingNar) => {
-                    self.coalesce(Key::Representation(payload.file_name()), deadline, || {
-                        self.receive_payload(storage, payload, deadline)
-                    })
+                    self.receive_missing_canonical_nar(storage, payload, deadline)
                 }
                 Err(error) => Err(EdgeFailure::ingestion(error)),
             },
@@ -332,6 +330,26 @@ impl ReadThroughSource {
         bound.publish().map_err(EdgeFailure::ingestion)?;
         deadline.remaining()?;
         Ok(())
+    }
+
+    fn receive_missing_canonical_nar(
+        &self,
+        storage: &Storage,
+        payload: NarRepresentation,
+        deadline: Deadline,
+    ) -> Result<(), EdgeFailure> {
+        self.coalesce(
+            Key::Representation(payload.file_name(), payload.encoded_size()),
+            deadline,
+            || self.receive_encoded_representation(storage, payload, deadline),
+        )?;
+        // Sharing the download does not mean sharing another request's NarHash or NarSize.
+        storage
+            .ensure_canonical_nar_available(payload.identity())
+            .map_err(|error| match error {
+                StorageError::MissingNar | StorageError::NarMismatch => EdgeFailure::Invalid,
+                error => EdgeFailure::ingestion(error),
+            })
     }
 
     fn metadata(
@@ -364,7 +382,7 @@ impl ReadThroughSource {
             .map_err(|_| EdgeFailure::Invalid)
     }
 
-    fn receive_payload(
+    fn receive_encoded_representation(
         &self,
         storage: &Storage,
         payload: NarRepresentation,
@@ -389,14 +407,6 @@ impl ReadThroughSource {
             .publish_nar_with_staging(name, reader, encoded_size, self.policy, reservation)
             .map_err(EdgeFailure::ingestion)?;
         deadline.remaining()?;
-        // Ingestion checked FileHash and computed the uncompressed hash and size.
-        // Those must also match the signed NarHash and NarSize before we return success.
-        storage
-            .ensure_canonical_nar_available(payload.identity())
-            .map_err(|error| match error {
-                StorageError::MissingNar | StorageError::NarMismatch => EdgeFailure::Invalid,
-                error => EdgeFailure::ingestion(error),
-            })?;
         Ok(())
     }
 
@@ -535,7 +545,7 @@ fn finish_shared_fill_or_retry_representation(
     retry: impl FnOnce() -> Result<(), EdgeFailure>,
 ) -> Result<(), EdgeFailure> {
     match key {
-        Key::Store(_) | Key::Representation(_) => result,
+        Key::Store(_) | Key::Representation(_, _) => result,
         Key::Nar(_) => result.or_else(|failure| match failure {
             EdgeFailure::Authoritative404 | EdgeFailure::Transient | EdgeFailure::Invalid => {
                 retry()

@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::cache::{
-    object::{NarFileName, NarHash},
+    object::{EncodedSize, NarFileName, NarHash},
     storage::StoreHash,
 };
 
@@ -18,7 +18,7 @@ const MAX_WAITERS: usize = 64;
 pub(super) enum Key {
     Store(StoreHash),
     Nar(NarHash),
-    Representation(NarFileName),
+    Representation(NarFileName, EncodedSize),
 }
 
 pub(super) enum Join {
@@ -77,7 +77,7 @@ impl State {
         match key {
             // A failed download of one encoding must not block trying another encoding.
             Key::Nar(_) => return,
-            Key::Store(_) | Key::Representation(_) => {}
+            Key::Store(_) | Key::Representation(_, _) => {}
         }
         if !failure.cacheable() || ttl.is_zero() {
             return;
@@ -177,7 +177,7 @@ mod tests {
     fn key(index: u64) -> Key {
         let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&index.to_le_bytes());
-        Key::Representation(NarFileName::raw(NarHash::from_digest(bytes)))
+        Key::Representation(NarFileName::raw(NarHash::from_digest(bytes)), 0.into())
     }
 
     #[test]

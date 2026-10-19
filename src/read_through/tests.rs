@@ -656,6 +656,122 @@ fn a_failed_compressed_alias_does_not_poison_a_valid_raw_alias() {
 }
 
 #[test]
+fn a_wrong_decoded_claim_cannot_poison_a_valid_claim_sharing_the_encoded_payload() {
+    let fixture = Fixture::new();
+    let wrong_identity = NarIdentity::new(NarHash::from_digest([42; 32]), fixture.identity.size());
+    let wrong = fixture.metadata(
+        STORE,
+        NarRepresentation::compressed(fixture.encoded, wrong_identity),
+        &signing_key(),
+    );
+    let valid = fixture.metadata(
+        ALIAS,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+    );
+    let gate = Arc::new(Gate::default());
+    let upstream = {
+        let gate = gate.clone();
+        Upstream::new(move |route, stream| {
+            if route.ends_with(".narinfo") {
+                reply(
+                    stream,
+                    200,
+                    if route.contains(STORE) {
+                        &wrong
+                    } else {
+                        &valid
+                    },
+                );
+            } else {
+                gate.wait();
+                reply(stream, 200, &fixture.compressed);
+            }
+        })
+    };
+    let source = source(&upstream);
+    let (_directory, storage) = storage();
+    thread::scope(|scope| {
+        let invalid =
+            scope.spawn(|| source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap()));
+        wait_for(|| upstream.count(".zst") == 1);
+        let valid =
+            scope.spawn(|| source.ensure_local(&storage, &StoreHash::parse(ALIAS).unwrap()));
+        wait_for(|| source.counters.followers.load(Ordering::Relaxed) == 1);
+        gate.release();
+        assert_eq!(
+            invalid.join().unwrap(),
+            EdgeLookup::Miss(EdgeFailure::Invalid)
+        );
+        assert_eq!(valid.join().unwrap(), EdgeLookup::Ready);
+    });
+    assert_eq!(upstream.count(".zst"), 1);
+    assert!(
+        storage
+            .open_narinfo(&StoreHash::parse(STORE).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .open_narinfo(&StoreHash::parse(ALIAS).unwrap())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn an_incorrect_encoded_size_cannot_poison_a_valid_alias_before_negative_expiry() {
+    let fixture = Fixture::new();
+    let wrong_encoded = EncodedIdentity::new(
+        fixture.encoded.codec(),
+        fixture.encoded.hash(),
+        (fixture.encoded.size().get() + 1).into(),
+    );
+    let wrong = fixture.metadata(
+        STORE,
+        NarRepresentation::compressed(wrong_encoded, fixture.identity),
+        &signing_key(),
+    );
+    let valid = fixture.metadata(
+        ALIAS,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+    );
+    let upstream = Upstream::new(move |route, stream| {
+        let body = if route.ends_with(".narinfo") {
+            if route.contains(STORE) {
+                &wrong
+            } else {
+                &valid
+            }
+        } else {
+            &fixture.compressed
+        };
+        reply(stream, 200, body);
+    });
+    let mut settings = settings(upstream.url());
+    settings.negative_ttl = Duration::from_secs(60);
+    let source = ReadThroughSource::new(
+        settings,
+        trusted_keys(),
+        NarUploadPolicy::new(1024 * 1024, 0),
+    )
+    .unwrap();
+    let (_directory, storage) = storage();
+    assert_eq!(
+        source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap()),
+        EdgeLookup::Miss(EdgeFailure::Invalid)
+    );
+    assert!(source.state.lock().unwrap().negative_entries() > 0);
+    assert_eq!(
+        source.ensure_local(&storage, &StoreHash::parse(ALIAS).unwrap()),
+        EdgeLookup::Ready
+    );
+    assert_eq!(upstream.count(".zst"), 2);
+}
+
+#[test]
 fn progressing_payload_can_outlive_the_network_idle_timeout() {
     let fixture = Fixture::new();
     let metadata = fixture.metadata(
