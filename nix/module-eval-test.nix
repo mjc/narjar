@@ -27,6 +27,7 @@
     egressCompression ? "none",
     storageBackend ? "flat",
     readTokens ? null,
+    trustedPublicKeys ? null,
     nativeStoreEnable ? false,
     nativeStateDir ? "/nix/var/nix",
     nativeRootsDir ? "${nativeStateDir}/gcroots/auto/narjar",
@@ -75,6 +76,7 @@
               maxInFlight
               ;
             auth.readTokens = readTokens;
+            auth.trustedPublicKeys = trustedPublicKeys;
             nativeStore.enable = nativeStoreEnable;
             nativeStore.stateDir = nativeStateDir;
             nativeStore.rootsDir = nativeRootsDir;
@@ -127,6 +129,20 @@
   edgeConfig = configuration {
     dataDir = "/var/lib/narjar";
     edge = edgeOptions;
+  };
+  disabledEdgeKeysConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge.trustedPublicKeys = edgeOptions.trustedPublicKeys;
+  };
+  disabledEdgeKeysWithNormalTrustConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge.trustedPublicKeys = edgeOptions.trustedPublicKeys;
+    trustedPublicKeys = "/run/cache-signing.pub";
+  };
+  conflictingEdgeKeysConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    edge = edgeOptions;
+    trustedPublicKeys = "/run/cache-signing.pub";
   };
   invalidEdgeConfigs = map (edge:
     configuration {
@@ -539,6 +555,12 @@
     '';
 in
   assert evaluatesConfig edgeConfig;
+  assert evaluatesConfig disabledEdgeKeysConfig;
+  assert disabledEdgeKeysConfig.systemd.services.narjar.serviceConfig.LoadCredential == defaultConfig.systemd.services.narjar.serviceConfig.LoadCredential;
+  assert evaluatesConfig disabledEdgeKeysWithNormalTrustConfig;
+  assert !(evaluatesConfig conflictingEdgeKeysConfig);
+  assert builtins.elem "trusted-public-keys:/run/cache-signing.pub" disabledEdgeKeysWithNormalTrustConfig.systemd.services.narjar.serviceConfig.LoadCredential;
+  assert lib.any (credential: lib.hasInfix "narjar-edge-trusted-keys" credential) edgeConfig.systemd.services.narjar.serviceConfig.LoadCredential;
   assert lib.all (config: !(evaluatesConfig config)) invalidEdgeConfigs;
   assert !(evaluatesConfig mixedSourcesConfig);
   assert !(evaluatesConfig compressedEdgeConfig);

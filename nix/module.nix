@@ -40,7 +40,7 @@
   trustedPublicKeysFile =
     if cfg.auth.trustedPublicKeys != null
     then cfg.auth.trustedPublicKeys
-    else if cfg.edge.trustedPublicKeys != []
+    else if cfg.edge.enable && cfg.edge.trustedPublicKeys != []
     then pkgs.writeText "narjar-edge-trusted-keys" (lib.concatStringsSep "\n" cfg.edge.trustedPublicKeys + "\n")
     else null;
   filesystemSampleFile =
@@ -836,7 +836,7 @@ in {
         message = "services.narjar.edge requires trustedPublicKeys or auth.trustedPublicKeys";
       }
       {
-        assertion = cfg.edge.trustedPublicKeys == [] || cfg.auth.trustedPublicKeys == null;
+        assertion = !cfg.edge.enable || cfg.edge.trustedPublicKeys == [] || cfg.auth.trustedPublicKeys == null;
         message = "services.narjar.edge.trustedPublicKeys and auth.trustedPublicKeys are mutually exclusive";
       }
       {
