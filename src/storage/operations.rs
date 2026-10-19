@@ -30,11 +30,11 @@ use crate::cache::{
 
 use super::{
     CleanupAction, INGESTION_RECEIPT_DIRECTORY, VALIDATION_DIRECTORY,
-    advertisement::AdvertisementLeases,
+    advertisement::{AdvertisementLeases, AdvertisementRemovalContext, lease_name},
     cache_info::{MAX_CACHE_INFO_BYTES, validate as validate_cache_info},
     chunk_store::{ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
     chunked::ChunkProfile,
-    collection::{ActivityLease, ProtectedObject},
+    collection::{ActivityLease, CollectionLease, ProtectedObject},
     compression::{
         IngestionReceipt, ReceivedNar, compressed_file_identity, encoded_file_matches,
         nar_file_matches, receive_uploaded_nar,
@@ -48,7 +48,7 @@ use super::{
     ids::StoreHash,
     location::{StorePath, TemporaryPath},
     publication::{
-        DestinationPublication, NEXT_TEMP, NarUploadPolicy, OwnedPublication,
+        DestinationPublication, NEXT_TEMP, NarUploadPolicy, OwnedPublication, PublicationActivity,
         PublicationDestination, PublishBoundary, PublishOutcome, PublishTarget, StagedPublication,
         StagingReservation, StorageError, TemporaryDirectory, TemporaryFile,
     },
@@ -415,7 +415,7 @@ impl Storage {
             Err(error) => {
                 match outcome {
                     PublishOutcome::Created => {
-                        self.unlink_narinfo_after_lease_cleanup(claims.store())?;
+                        self.remove_narinfo_with_retention(claims.store())?;
                         self.root.sync_all()?;
                     }
                     PublishOutcome::Identical => {}
@@ -876,7 +876,7 @@ impl Storage {
                     crate::cache::narinfo::MAX_NARINFO_BYTES,
                 )
                 .map_err(io::Error::from)?;
-                self.renew_advertisement_lease(&activity)?;
+                self.renew_advertisement_lease(&activity, &bytes)?;
                 self.access
                     .record(super::access::AccessKey::Publication(*store));
                 Ok(AdvertisedNarInfo {
@@ -930,11 +930,15 @@ impl Storage {
 
     pub fn delete_narinfo(&self, store: &StoreHash) -> Result<NarInfoDeletion, StorageError> {
         let _activity = self.collection.mutation()?;
+        let publication = self.narinfo_publication_lock(store);
+        let _guard = publication
+            .write()
+            .map_err(|_| io::Error::other("narinfo publication lock poisoned"))?;
         let root = self.root_directory()?;
         let name = OsString::from(format!("{}.narinfo", store.as_str()));
         match entry_is_regular_at(&root, &name) {
             Ok(true) => {
-                self.unlink_narinfo_after_lease_cleanup(store)?;
+                self.remove_narinfo_with_retention(store)?;
                 root.sync_all()?;
                 Ok(NarInfoDeletion::Deleted)
             }
@@ -951,17 +955,29 @@ impl Storage {
         }
     }
 
-    pub(super) fn unlink_narinfo_after_lease_cleanup(
+    pub(super) fn remove_narinfo_with_retention(
         &self,
         store: &StoreHash,
     ) -> Result<(), StorageError> {
-        // A failed lease removal must leave the metadata available for retry.
-        self.remove_advertisement_record(*store)?;
-        unlink_at(
+        self.remove_narinfo_with_retention_and_unlink(
+            store,
+            AdvertisementRemovalContext::Standalone,
+            unlink_at,
+        )
+    }
+
+    pub(super) fn remove_narinfo_with_retention_and_unlink(
+        &self,
+        store: &StoreHash,
+        context: AdvertisementRemovalContext<'_>,
+        unlink_metadata: impl FnOnce(&File, &OsStr) -> io::Result<()>,
+    ) -> Result<(), StorageError> {
+        self.mark_advertisement_removal_pending(*store, context)?;
+        unlink_metadata(
             &self.root,
             &OsString::from(format!("{}.narinfo", store.as_str())),
         )?;
-        Ok(())
+        self.remove_advertisement_record(*store)
     }
 
     pub(super) fn publish(
@@ -975,13 +991,29 @@ impl Storage {
     pub(super) fn begin_publication<'storage, 'target, Checkpoint>(
         &'storage self,
         target: PublishTarget<'target>,
+        checkpoint: Checkpoint,
+    ) -> Result<StagedPublication<'storage, Checkpoint, Streaming>, StorageError>
+    where
+        Checkpoint: FnMut(PublishBoundary) -> Result<(), StorageError>,
+    {
+        let activity = self.publication_activity(&target.destination())?;
+        self.begin_publication_with_activity(
+            target,
+            checkpoint,
+            PublicationActivity::Operation { _lease: activity },
+        )
+    }
+
+    fn begin_publication_with_activity<'storage, Checkpoint>(
+        &'storage self,
+        target: PublishTarget<'_>,
         mut checkpoint: Checkpoint,
+        activity: PublicationActivity<'storage>,
     ) -> Result<StagedPublication<'storage, Checkpoint, Streaming>, StorageError>
     where
         Checkpoint: FnMut(PublishBoundary) -> Result<(), StorageError>,
     {
         let destination = target.destination();
-        let activity = self.publication_activity(&destination)?;
         let mut publication = self
             .begin_journaled_temporary(&target, || checkpoint(PublishBoundary::BeforeTempCreate))?;
         publication
@@ -995,6 +1027,25 @@ impl Storage {
             checkpoint,
             activity,
         ))
+    }
+
+    pub(super) fn publish_advertisement_removal_during_collection(
+        &self,
+        store: StoreHash,
+        bytes: Vec<u8>,
+        lease: &CollectionLease<'_>,
+    ) -> Result<(), StorageError> {
+        lease.authorize_retention_removal(&self.collection, store)?;
+        let _reservation = self.reserve_staging(bytes.len() as u64, 0)?;
+        let name = lease_name(store);
+        self.begin_publication_with_activity(
+            PublishTarget::AdvertisementRecord(&name),
+            |_| Ok(()),
+            PublicationActivity::Collection { _lease: lease },
+        )?
+        .finish_and_sync(Cursor::new(bytes))?
+        .commit()
+        .map(|_| ())
     }
 
     pub(super) fn begin_journaled_temporary(
@@ -1038,11 +1089,28 @@ impl Storage {
         &self,
         destination: PublicationDestination,
         temp: &TemporaryFile,
+        transaction: PublicationTransaction,
+        checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+    ) -> Result<PublishOutcome, StorageError> {
+        let activity = self.publication_activity(&destination)?;
+        self.commit_temporary_with_activity(
+            destination,
+            temp,
+            transaction,
+            checkpoint,
+            PublicationActivity::Operation { _lease: activity },
+        )
+    }
+
+    pub(super) fn commit_temporary_with_activity(
+        &self,
+        destination: PublicationDestination,
+        temp: &TemporaryFile,
         mut transaction: PublicationTransaction,
         mut checkpoint: impl FnMut(PublishBoundary) -> Result<(), StorageError>,
+        _activity: PublicationActivity<'_>,
     ) -> Result<PublishOutcome, StorageError> {
         let mut progress = PublicationProgress::Unpublished;
-        let _activity = self.publication_activity(&destination)?;
         let result = (|| {
             let root = self.root_directory()?;
             let destination_directory = destination.path.open_parent(&root)?;

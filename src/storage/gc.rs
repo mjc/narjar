@@ -7,6 +7,7 @@ use std::{
 };
 
 use super::{
+    advertisement::AdvertisementRemovalContext,
     chunk_store::{ChunkManifestFile, ChunkStore, MarkedChunkSweep},
     collection::{
         CollectionLease, CollectionSnapshot, ONLINE_GC_GRACE, ObjectSelection, ProtectedObject,
@@ -117,6 +118,16 @@ enum CollectionAccess<'storage> {
 enum CollectionPermit<'storage> {
     Offline { _lease: CollectionLease<'storage> },
     Online { _lease: CollectionLease<'storage> },
+}
+
+impl CollectionPermit<'_> {
+    fn removal_context(&self) -> AdvertisementRemovalContext<'_> {
+        match self {
+            Self::Offline { _lease } | Self::Online { _lease } => {
+                AdvertisementRemovalContext::Collection(_lease)
+            }
+        }
+    }
 }
 
 enum ChunkedCollectionAction<'storage> {
@@ -710,7 +721,13 @@ fn run_flat_gc<'storage>(
         (0, 0, 0)
     } else {
         let result: Result<(usize, usize, usize), StorageError> = (|| {
-            let (deleted_narinfos, deleted_nars) = apply(storage, &entries, &selected)?;
+            let (deleted_narinfos, deleted_nars) = apply_with_checkpoint(
+                storage,
+                &entries,
+                &selected,
+                permit.removal_context(),
+                |_| Ok(()),
+            )?;
             let deleted_orphans = apply_orphans(storage, &orphans, &selected_orphans)?;
             Ok((deleted_narinfos, deleted_nars, deleted_orphans))
         })();
@@ -987,7 +1004,14 @@ fn run_chunked<'storage>(
     let (after_bytes, deleted) = match action {
         ChunkedCollectionAction::Inspect => (after_bytes, (0, 0, 0)),
         ChunkedCollectionAction::Apply(sweep) => {
-            let deleted = apply_marked_chunked(storage, &entries, &orphans, &selected, sweep)?;
+            let deleted = apply_marked_chunked(
+                storage,
+                &entries,
+                &orphans,
+                &selected,
+                sweep,
+                permit.removal_context(),
+            )?;
             let actual_after = match &permit {
                 CollectionPermit::Offline { .. } => {
                     let remaining = scan_chunked(storage, chunk_store, trusted)?;
@@ -1667,7 +1691,14 @@ fn apply_chunked(
     let sweep = chunk_store
         .mark_retained_manifests(retained_chunked_manifests(entries, orphans, selected))
         .map_err(chunk_store_error)?;
-    apply_marked_chunked(storage, entries, orphans, selected, sweep)
+    apply_marked_chunked(
+        storage,
+        entries,
+        orphans,
+        selected,
+        sweep,
+        AdvertisementRemovalContext::Standalone,
+    )
 }
 
 fn apply_marked_chunked(
@@ -1676,12 +1707,17 @@ fn apply_marked_chunked(
     orphans: &ChunkedOrphans,
     selected: &ChunkedSelection,
     sweep: MarkedChunkSweep<'_>,
+    removal: AdvertisementRemovalContext<'_>,
 ) -> Result<(usize, usize, usize), StorageError> {
     storage.recovery.require()?;
     let root = storage.root_directory()?;
     let nar_directory = storage.nar_directory()?;
     for &index in &selected.entries {
-        storage.unlink_narinfo_after_lease_cleanup(&entries[index].store)?;
+        storage.remove_narinfo_with_retention_and_unlink(
+            &entries[index].store,
+            removal,
+            unlink_at,
+        )?;
     }
     if !selected.entries.is_empty() {
         root.sync_all()?;
@@ -2305,6 +2341,7 @@ fn fail_if(failure: Option<FailurePoint>, point: FailurePoint) -> Result<(), Sto
     }
 }
 
+#[cfg(test)]
 fn apply(
     storage: &Storage,
     entries: &[Entry],
@@ -2313,21 +2350,27 @@ fn apply(
     apply_with_failure(storage, entries, selected, None)
 }
 
+#[cfg(test)]
 fn apply_with_failure(
     storage: &Storage,
     entries: &[Entry],
     selected: &[usize],
     failure: Option<FailurePoint>,
 ) -> Result<(usize, usize), StorageError> {
-    apply_with_checkpoint(storage, entries, selected, |boundary| {
-        fail_if(failure, boundary)
-    })
+    apply_with_checkpoint(
+        storage,
+        entries,
+        selected,
+        AdvertisementRemovalContext::Standalone,
+        |boundary| fail_if(failure, boundary),
+    )
 }
 
 fn apply_with_checkpoint(
     storage: &Storage,
     entries: &[Entry],
     selected: &[usize],
+    removal: AdvertisementRemovalContext<'_>,
     mut checkpoint: impl FnMut(FailurePoint) -> Result<(), StorageError>,
 ) -> Result<(usize, usize), StorageError> {
     storage.recovery.require()?;
@@ -2338,7 +2381,7 @@ fn apply_with_checkpoint(
     for &index in selected {
         let entry = &entries[index];
         checkpoint(FailurePoint::BeforeNarinfoDelete)?;
-        storage.unlink_narinfo_after_lease_cleanup(&entry.store)?;
+        storage.remove_narinfo_with_retention_and_unlink(&entry.store, removal, unlink_at)?;
         checkpoint(FailurePoint::AfterNarinfoDeleteBeforeSync)?;
         root.sync_all()?;
         super::access::forget(&root, super::access::AccessKey::Publication(entry.store));
@@ -2447,6 +2490,50 @@ mod tests {
     }
 
     #[test]
+    fn failed_metadata_unlink_remains_a_gc_candidate_after_restart() {
+        let (directory, mut storage, entry) = scannable_pair_fixture();
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(b"nar").into()),
+            3.into(),
+        );
+        storage
+            .record_publication_lease(entry.store, identity)
+            .unwrap();
+        storage
+            .expire_advertisement_lease_for_test(entry.store)
+            .unwrap();
+        let failure = storage.remove_narinfo_with_retention_and_unlink(
+            &entry.store,
+            AdvertisementRemovalContext::Standalone,
+            |_, _| {
+                Err(io::Error::from_raw_os_error(
+                    rustix::io::Errno::BUSY.raw_os_error(),
+                ))
+            },
+        );
+        assert!(failure.is_err());
+        assert!(directory.path().join(&entry.narinfo_name).is_file());
+        drop(storage);
+        let root = Directory::open(directory.path()).unwrap();
+        let storage = Storage::open(&root, SupportedStorageBackend::FLAT).unwrap();
+        let trusted = TrustedPublicKeys::load(&root).unwrap();
+        let report = run_dry_run(online_options(), &storage, &trusted).unwrap();
+        assert_eq!(
+            report.eligible, 1,
+            "a failed unlink must remain retryable by GC"
+        );
+        let recovered = storage.recover_for_mutation(&trusted).unwrap();
+        let report = run_apply(online_options(), &recovered, &trusted).unwrap();
+        assert_eq!(report.deleted_narinfos, 1);
+        assert_eq!(report.deleted_nars, 1);
+        assert!(!directory.path().join(&entry.narinfo_name).exists());
+        assert!(!directory.path().join("nar").join(&entry.nar_name).exists());
+    }
+
+    #[test]
     fn gc_keeps_metadata_retryable_when_lease_cleanup_fails() {
         let (directory, mut storage, entry) = scannable_pair_fixture();
         storage
@@ -2471,6 +2558,51 @@ mod tests {
         );
         assert!(!directory.path().join(&entry.narinfo_name).exists());
         assert!(!directory.path().join("nar").join(&entry.nar_name).exists());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn chunked_gc_marks_expired_leases_pending_under_its_existing_deletion_permit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = initialize_chunked_storage(directory.path()).unwrap();
+        let bytes = b"raw NAR";
+        let identity = crate::cache::object::NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(bytes).into()),
+            (bytes.len() as u64).into(),
+        );
+        storage
+            .publish_nar(
+                NarFileName::raw(identity.hash()),
+                bytes.as_slice(),
+                bytes.len() as u64,
+                NarUploadPolicy::new(1024, 0),
+            )
+            .unwrap();
+        write_signed_raw_metadata(directory.path(), TEST_STORE_HASH, identity, Vec::new());
+        storage
+            .configure_advertisement_leases(std::num::NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let store = StoreHash::parse(TEST_STORE_HASH).unwrap();
+        storage.record_publication_lease(store, identity).unwrap();
+        storage.expire_advertisement_lease_for_test(store).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let trusted = TrustedPublicKeys::parse(&format!(
+            "online-gc:{}",
+            data_encoding::BASE64.encode(key.verifying_key().as_bytes())
+        ))
+        .unwrap();
+        let recovered = storage.recover_for_mutation(&trusted).unwrap();
+        let mut options = online_options();
+        options.backend = StorageBackend::Chunked;
+        let report = run_apply(options, &recovered, &trusted).unwrap();
+        assert_eq!(report.deleted_narinfos, 1);
+        assert!(storage.open_narinfo(&store).unwrap().is_none());
+        assert!(
+            storage
+                .nar_size(NarFileName::raw(identity.hash()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4102,13 +4234,19 @@ mod tests {
         std::thread::scope(|scope| {
             let collection = scope.spawn(move || {
                 let _permit = permit;
-                apply_with_checkpoint(storage, entries, selected, |boundary| {
-                    if boundary == FailurePoint::AfterNarinfoSyncBeforeNarDelete {
-                        entered_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    }
-                    Ok(())
-                })
+                apply_with_checkpoint(
+                    storage,
+                    entries,
+                    selected,
+                    AdvertisementRemovalContext::Collection(&_permit),
+                    |boundary| {
+                        if boundary == FailurePoint::AfterNarinfoSyncBeforeNarDelete {
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }
+                        Ok(())
+                    },
+                )
                 .unwrap()
             });
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();

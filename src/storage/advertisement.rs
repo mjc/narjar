@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Storage, StorageError, StoreHash,
-    collection::{ActivityLease, AdvertisementRenewal, ProtectedObject},
+    collection::{ActivityLease, AdvertisementRenewal, CollectionLease, ProtectedObject},
     fs::{ensure_directory_at, read_dir_names, require_directory_at, unlink_at},
     publication::PublishTarget,
 };
@@ -24,6 +24,13 @@ use crate::cache::{
 pub(super) const DIRECTORY: &str = ".narjar-advertisements";
 const POLICY: &str = "policy";
 const MAX_RECORD_BYTES: u64 = 256;
+const LEASE_VERSION: u8 = 2;
+
+#[derive(Clone, Copy)]
+pub(super) enum AdvertisementRemovalContext<'operation> {
+    Standalone,
+    Collection(&'operation CollectionLease<'operation>),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct LeasePolicy {
@@ -36,7 +43,22 @@ pub(super) struct LeasePolicy {
 struct AdvertisementLease {
     version: u8,
     identity: NarIdentity,
-    expires_at: u64,
+    retention: AdvertisementRetention,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum AdvertisementRetention {
+    Until(u64),
+    RemovalPending,
+}
+
+impl AdvertisementRetention {
+    fn expires_at(self) -> u64 {
+        match self {
+            Self::Until(expiry) => expiry,
+            Self::RemovalPending => 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -107,7 +129,7 @@ impl AdvertisementLeases {
 #[derive(Clone, Copy)]
 enum LeasePurpose<'reader> {
     Publication(NarIdentity),
-    Advertisement(&'reader AdvertisementRenewal<'reader>),
+    Advertisement(&'reader AdvertisementRenewal<'reader>, &'reader [u8]),
 }
 
 pub(crate) enum AdvertisementEvidence {
@@ -127,7 +149,12 @@ impl Storage {
             AdvertisementLeases::Incomplete => Err(invalid("advertisement policy is missing")),
             AdvertisementLeases::Active { directory, .. } => {
                 match read_record::<AdvertisementLease>(directory, &lease_name(store))? {
-                    Some(record) if record.version == 1 => Ok(AdvertisementEvidence::Recorded),
+                    Some(record) if record.version == LEASE_VERSION => match record.retention {
+                        AdvertisementRetention::Until(_) => Ok(AdvertisementEvidence::Recorded),
+                        AdvertisementRetention::RemovalPending => {
+                            Ok(AdvertisementEvidence::Missing)
+                        }
+                    },
                     Some(_) => Err(invalid("unsupported advertisement lease")),
                     None => Ok(AdvertisementEvidence::Missing),
                 }
@@ -183,11 +210,12 @@ impl Storage {
     pub(super) fn renew_advertisement_lease(
         &self,
         activity: &ActivityLease<'_>,
+        metadata: &[u8],
     ) -> Result<(), StorageError> {
         let renewal = activity.advertisement_renewal()?;
         self.update_advertisement_lease(
             renewal.store(),
-            LeasePurpose::Advertisement(&renewal),
+            LeasePurpose::Advertisement(&renewal, metadata),
             unix_seconds()?,
             File::sync_all,
         )
@@ -213,35 +241,46 @@ impl Storage {
                 let name = lease_name(store);
                 let existing = read_record::<AdvertisementLease>(directory, &name)?;
                 let identity = match (purpose, existing) {
-                    (_, Some(record)) if record.version != 1 => {
+                    (_, Some(record)) if record.version != LEASE_VERSION => {
                         return Err(invalid("unsupported advertisement lease"));
                     }
-                    (LeasePurpose::Publication(identity), Some(record))
-                        if identity != record.identity =>
-                    {
-                        return Err(StorageError::NarMismatch);
+                    (LeasePurpose::Publication(identity), Some(record)) => match record.retention {
+                        AdvertisementRetention::Until(_) if identity != record.identity => {
+                            return Err(StorageError::NarMismatch);
+                        }
+                        AdvertisementRetention::Until(_)
+                        | AdvertisementRetention::RemovalPending => identity,
+                    },
+                    (LeasePurpose::Advertisement(renewal, metadata), Some(record)) => {
+                        match record.retention {
+                            AdvertisementRetention::Until(_) => record.identity,
+                            AdvertisementRetention::RemovalPending => {
+                                identity_from_pending_metadata(renewal.store(), metadata)?
+                            }
+                        }
                     }
-                    (_, Some(record)) => record.identity,
                     (LeasePurpose::Publication(identity), None) => identity,
                     // GC keeps publications with missing retention records. Read-through
                     // requests recreate them from verified metadata and NARs before success.
-                    (LeasePurpose::Advertisement(_), None) => return Ok(()),
+                    (LeasePurpose::Advertisement(_, _), None) => return Ok(()),
                 };
                 let required_expiry = now
                     .checked_add(policy.lifetime_seconds.get())
                     .ok_or_else(|| invalid("advertisement expiry overflow"))?;
                 match existing {
-                    Some(record) if record.expires_at >= required_expiry => {
+                    Some(record) if record.retention.expires_at() >= required_expiry => {
                         synchronize_reused(directory).map_err(Into::into)
                     }
                     Some(_) | None => {
                         let headroom = policy.lifetime_seconds.get().div_ceil(10).min(3600);
                         let lease = AdvertisementLease {
-                            version: 1,
+                            version: LEASE_VERSION,
                             identity,
-                            expires_at: required_expiry
-                                .checked_add(headroom)
-                                .ok_or_else(|| invalid("advertisement expiry overflow"))?,
+                            retention: AdvertisementRetention::Until(
+                                required_expiry
+                                    .checked_add(headroom)
+                                    .ok_or_else(|| invalid("advertisement expiry overflow"))?,
+                            ),
                         };
                         match purpose {
                             LeasePurpose::Publication(_) => self.publish_advertisement_record(
@@ -249,7 +288,7 @@ impl Storage {
                                 &lease,
                                 policy.min_free_bytes,
                             ),
-                            LeasePurpose::Advertisement(renewal) => self
+                            LeasePurpose::Advertisement(renewal, _) => self
                                 .publish_advertisement_target(
                                     PublishTarget::AdvertisementRenewal(renewal),
                                     &lease,
@@ -297,7 +336,7 @@ impl Storage {
         let name = lease_name(store);
         let mut record: AdvertisementLease = read_record(directory, &name)?
             .ok_or_else(|| invalid("test requires an existing advertisement"))?;
-        record.expires_at = 0;
+        record.retention = AdvertisementRetention::Until(0);
         self.publish_advertisement_record(name, &record, 0)
     }
 
@@ -315,7 +354,9 @@ impl Storage {
         let name = lease_name(store);
         let mut record: AdvertisementLease = read_record(&directory, &name)?
             .ok_or_else(|| invalid("test requires an existing advertisement"))?;
-        record.expires_at = unix_seconds()? + (policy.lifetime_seconds.get() / 2).max(1);
+        record.retention = AdvertisementRetention::Until(
+            unix_seconds()? + (policy.lifetime_seconds.get() / 2).max(1),
+        );
         // Set the test's space limit without filling the filesystem.
         self.publish_advertisement_record(POLICY.into(), &policy, 0)?;
         self.publish_advertisement_record(name, &record, 0)?;
@@ -350,11 +391,12 @@ impl Storage {
                         read_record::<AdvertisementLease>(directory, &name)?.ok_or_else(|| {
                             invalid("advertisement lease disappeared during collection")
                         })?;
-                    if lease.version != 1 {
+                    if lease.version != LEASE_VERSION {
                         return Err(invalid("unsupported advertisement lease"));
                     }
-                    publications.insert(store, lease.expires_at);
-                    if lease.expires_at > now {
+                    let expires_at = lease.retention.expires_at();
+                    publications.insert(store, expires_at);
+                    if expires_at > now {
                         nars.insert(lease.identity.hash());
                     }
                 }
@@ -363,6 +405,52 @@ impl Storage {
                     nars,
                     now,
                 })
+            }
+        }
+    }
+
+    pub(super) fn mark_advertisement_removal_pending(
+        &self,
+        store: StoreHash,
+        context: AdvertisementRemovalContext<'_>,
+    ) -> Result<(), StorageError> {
+        match &self.advertisements {
+            AdvertisementLeases::Absent => Ok(()),
+            AdvertisementLeases::Incomplete => Err(invalid("advertisement policy is missing")),
+            AdvertisementLeases::Active { directory, .. } => {
+                let lock = self.destination_lock(
+                    PathBuf::from(DIRECTORY).join(format!("{}.renew", store.as_str())),
+                );
+                let _guard = lock
+                    .lock()
+                    .map_err(|_| invalid("advertisement renewal lock poisoned"))?;
+                let name = lease_name(store);
+                match read_record::<AdvertisementLease>(directory, &name)? {
+                    None => Ok(()),
+                    Some(record) if record.version != LEASE_VERSION => {
+                        Err(invalid("unsupported advertisement lease"))
+                    }
+                    Some(mut record) => match record.retention {
+                        AdvertisementRetention::RemovalPending => {
+                            directory.sync_all().map_err(Into::into)
+                        }
+                        AdvertisementRetention::Until(_) => {
+                            record.retention = AdvertisementRetention::RemovalPending;
+                            match context {
+                                AdvertisementRemovalContext::Standalone => {
+                                    self.publish_advertisement_record(name, &record, 0)
+                                }
+                                AdvertisementRemovalContext::Collection(lease) => self
+                                    .publish_advertisement_removal_during_collection(
+                                        store,
+                                        postcard::to_allocvec(&record)
+                                            .map_err(|error| invalid(error.to_string()))?,
+                                        lease,
+                                    ),
+                            }
+                        }
+                    },
+                }
             }
         }
     }
@@ -378,6 +466,8 @@ impl Storage {
                 let _guard = lock
                     .lock()
                     .map_err(|_| invalid("advertisement renewal lock poisoned"))?;
+                // Keep the pending record until the metadata unlink is durable.
+                self.root.sync_all()?;
                 match unlink_at(directory, &lease_name(store)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -400,6 +490,15 @@ fn read_record<T: for<'de> Deserialize<'de>>(
             .map(Some)
             .map_err(|error| invalid(error.to_string())),
     }
+}
+
+fn identity_from_pending_metadata(
+    store: StoreHash,
+    metadata: &[u8],
+) -> Result<NarIdentity, StorageError> {
+    crate::cache::narinfo::NarInfoClaims::parse_external_narinfo(&store, metadata.to_vec())
+        .map(|claims| claims.identity())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
 }
 
 pub(super) fn lease_name(store: StoreHash) -> OsString {
@@ -446,6 +545,20 @@ mod tests {
         let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
         storage.record_publication_lease(store, identity).unwrap();
         (directory, storage, store, identity)
+    }
+
+    fn raw_metadata(store: StoreHash, identity: NarIdentity) -> Vec<u8> {
+        crate::cache::narinfo::NarInfoMetadata::from_store_metadata(
+            format!("/nix/store/{}-fixture", store.as_str()),
+            None,
+            None,
+            identity,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+        .serialize(crate::cache::object::NarRepresentation::Raw(identity))
+        .unwrap()
     }
 
     #[test]
@@ -598,7 +711,7 @@ mod tests {
                 completed.send(result).unwrap();
             });
             let before_rollback = response.recv_timeout(Duration::from_secs(5));
-            storage.unlink_narinfo_after_lease_cleanup(&store).unwrap();
+            storage.remove_narinfo_with_retention(&store).unwrap();
             storage.root.sync_all().unwrap();
             drop(pending);
             reader.join().unwrap();
@@ -698,6 +811,74 @@ mod tests {
     }
 
     #[test]
+    fn reading_metadata_after_failed_removal_restores_its_retention() {
+        let (directory, storage, store, identity) = advertised_fixture();
+        std::fs::write(
+            directory.path().join(format!("{}.narinfo", store.as_str())),
+            raw_metadata(store, identity),
+        )
+        .unwrap();
+        assert!(
+            storage
+                .remove_narinfo_with_retention_and_unlink(
+                    &store,
+                    AdvertisementRemovalContext::Standalone,
+                    |_, _| Err(io::Error::other("injected unlink failure"))
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            storage.advertisement_evidence(store).unwrap(),
+            AdvertisementEvidence::Missing
+        ));
+        assert!(storage.read_advertised_narinfo(&store).unwrap().is_some());
+        let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
+        assert!(protection.protects(ProtectedObject::Publication(store)));
+        assert!(protection.protects(ProtectedObject::CanonicalNar(identity.hash())));
+        assert!(matches!(
+            storage.advertisement_evidence(store).unwrap(),
+            AdvertisementEvidence::Recorded
+        ));
+    }
+
+    #[test]
+    fn pending_removal_does_not_bind_a_later_publication_to_the_deleted_identity() {
+        let (directory, storage, store, original) = advertised_fixture();
+        std::fs::write(
+            directory.path().join(format!("{}.narinfo", store.as_str())),
+            raw_metadata(store, original),
+        )
+        .unwrap();
+        storage
+            .mark_advertisement_removal_pending(store, AdvertisementRemovalContext::Standalone)
+            .unwrap();
+        unlink_at(
+            &storage.root,
+            OsStr::new(&format!("{}.narinfo", store.as_str())),
+        )
+        .unwrap();
+        storage.root.sync_all().unwrap();
+        drop(storage);
+        let storage = Storage::open(
+            &Directory::open(directory.path()).unwrap(),
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap();
+        let replacement = NarIdentity::new(NarHash::from_digest([99; 32]), 4.into());
+        let metadata_path = directory.path().join(format!("{}.narinfo", store.as_str()));
+        std::fs::write(&metadata_path, raw_metadata(store, replacement)).unwrap();
+        File::open(&metadata_path).unwrap().sync_all().unwrap();
+        storage.root.sync_all().unwrap();
+        assert!(storage.read_advertised_narinfo(&store).unwrap().is_some());
+        storage
+            .record_publication_lease(store, replacement)
+            .unwrap();
+        let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
+        assert!(protection.protects(ProtectedObject::CanonicalNar(replacement.hash())));
+        assert!(!protection.protects(ProtectedObject::CanonicalNar(original.hash())));
+    }
+
+    #[test]
     fn explicit_metadata_deletion_removes_its_lease_before_identity_replacement() {
         let (directory, storage, store, _) = advertised_fixture();
         std::fs::write(
@@ -733,12 +914,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            storage.renew_advertisement_lease(&reader),
+            storage.renew_advertisement_lease(&reader, &[]),
             Err(StorageError::InsufficientSpace)
         ));
         let after: AdvertisementLease =
             read_record(directory, &lease_name(store)).unwrap().unwrap();
-        assert_eq!(after.expires_at, before.expires_at);
+        assert_eq!(after.retention.expires_at(), before.retention.expires_at());
         assert_eq!(after.identity, identity);
         let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
         assert!(protection.protects(ProtectedObject::Publication(store)));
@@ -750,9 +931,9 @@ mod tests {
         let (directory, storage, store, identity) = advertised_fixture();
         let now = unix_seconds().unwrap();
         let record = AdvertisementLease {
-            version: 1,
+            version: LEASE_VERSION,
             identity,
-            expires_at: now + 7200,
+            retention: AdvertisementRetention::Until(now + 7200),
         };
         let bytes = postcard::to_allocvec(&record).unwrap();
         let reader = storage
@@ -777,7 +958,7 @@ mod tests {
         );
         let failure = storage.update_advertisement_lease(
             store,
-            LeasePurpose::Advertisement(&renewal),
+            LeasePurpose::Advertisement(&renewal, &[]),
             now,
             |_| Err(io::Error::other("directory synchronization still fails")),
         );
@@ -788,7 +969,7 @@ mod tests {
         storage
             .update_advertisement_lease(
                 store,
-                LeasePurpose::Advertisement(&renewal),
+                LeasePurpose::Advertisement(&renewal, &[]),
                 now,
                 File::sync_all,
             )

@@ -383,6 +383,28 @@ pub(super) struct CollectionLease<'coordinator> {
     coordinator: &'coordinator CollectionCoordinator,
 }
 
+impl CollectionLease<'_> {
+    pub(super) fn authorize_retention_removal(
+        &self,
+        coordinator: &CollectionCoordinator,
+        store: StoreHash,
+    ) -> Result<(), StorageError> {
+        if !std::ptr::eq(self.coordinator, coordinator) {
+            return Err(io::Error::other("retention removal belongs to another cache").into());
+        }
+        match &self.coordinator.lock()?.phase {
+            CollectionPhase::Deleting(retiring)
+                if retiring.contains(ProtectedObject::Publication(store)) =>
+            {
+                Ok(())
+            }
+            CollectionPhase::Deleting(_) | CollectionPhase::Idle | CollectionPhase::Scanning => {
+                Err(StorageError::CollectionBusy)
+            }
+        }
+    }
+}
+
 impl Drop for CollectionLease<'_> {
     fn drop(&mut self) {
         self.coordinator
@@ -397,6 +419,30 @@ impl Drop for CollectionLease<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_removal_requires_the_selected_publication_in_the_same_cache() {
+        let coordinator = CollectionCoordinator::without_startup_grace();
+        let other = CollectionCoordinator::without_startup_grace();
+        let store = StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let unselected = StoreHash::parse("11111111111111111111111111111111").unwrap();
+        let lease = coordinator
+            .snapshot()
+            .unwrap()
+            .authorize_retirement(ObjectSelection::Objects(
+                [ProtectedObject::Publication(store)].into_iter().collect(),
+            ))
+            .unwrap();
+        lease
+            .authorize_retention_removal(&coordinator, store)
+            .unwrap();
+        assert!(lease.authorize_retention_removal(&other, store).is_err());
+        assert!(
+            lease
+                .authorize_retention_removal(&coordinator, unselected)
+                .is_err()
+        );
+    }
 
     fn publication(index: u8) -> ProtectedObject {
         ProtectedObject::Publication(StoreHash::parse(&format!("{index:032o}")).unwrap())

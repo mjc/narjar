@@ -51,6 +51,11 @@ coordinates these updates with GC, including offline GC after a restart. GC
 keeps publications whose records are missing and returns an error for invalid
 records rather than deleting potentially protected data.
 
+Before deleting metadata, GC saves a pending-removal record. An unlink failure
+leaves the object eligible for a later collection, including after restart.
+The record is removed only after the metadata unlink is synced. A successful
+metadata read cancels pending removal by renewing its lease.
+
 ## Identities and representations
 
 A logical NAR has an uncompressed SHA-256 hash and byte count. Its raw, XZ,

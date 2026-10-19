@@ -9,7 +9,7 @@ use std::{
 use rustix::fs::OFlags;
 
 use super::{
-    collection::ActivityLease,
+    collection::{ActivityLease, CollectionLease},
     fs::{StorageCapacity, filesystem_space, lock_exclusive, open_at, private_file_mode_is_valid},
     operations::OwnedTemporary,
     recovery::{PublicationState, PublicationTransaction},
@@ -94,13 +94,22 @@ impl Drop for OwnedPublication<'_> {
     }
 }
 
+pub(super) enum PublicationActivity<'storage> {
+    Operation {
+        _lease: ActivityLease<'storage>,
+    },
+    Collection {
+        _lease: &'storage CollectionLease<'storage>,
+    },
+}
+
 pub(super) struct StagedPublication<'storage, Checkpoint, State> {
     pub(super) storage: &'storage Storage,
     pub(super) destination: PublicationDestination,
     publication: OwnedPublication<'storage>,
     checkpoint: Checkpoint,
     _state: State,
-    _activity: ActivityLease<'storage>,
+    _activity: PublicationActivity<'storage>,
 }
 
 impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
@@ -109,7 +118,7 @@ impl<'storage, Checkpoint> StagedPublication<'storage, Checkpoint, Streaming> {
         destination: PublicationDestination,
         publication: OwnedPublication<'storage>,
         checkpoint: Checkpoint,
-        activity: ActivityLease<'storage>,
+        activity: PublicationActivity<'storage>,
     ) -> Self {
         Self {
             storage,
@@ -173,7 +182,13 @@ where
         } = self;
         let (temporary, transaction) = publication.into_parts();
         let temporary = temporary.into_file();
-        storage.commit_temporary(destination, &temporary, transaction, checkpoint)
+        storage.commit_temporary_with_activity(
+            destination,
+            &temporary,
+            transaction,
+            checkpoint,
+            _activity,
+        )
     }
 }
 
