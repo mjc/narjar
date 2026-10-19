@@ -167,6 +167,28 @@ fn doctor_accepts_the_edge_source_environment_for_local_checks() {
 }
 
 #[test]
+fn doctor_rejects_compressed_edge_output_from_the_environment() {
+    let data_dir = init_data_dir("edge-doctor-output-policy");
+    for encoding in ["xz", "zstd"] {
+        let output = run_with_env(
+            &["doctor", "--data-dir", data_dir.to_str().unwrap(), "--json"],
+            &[
+                ("NARJAR_SERVE_SOURCE", "read-through"),
+                ("NARJAR_EGRESS_COMPRESSION", encoding),
+            ],
+        );
+        assert!(!output.status.success(), "compressed edge output must fail");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["source"]["name"], "read-through");
+        assert_eq!(report["source"]["severity"], "error");
+        assert_eq!(
+            report["source"]["detail"],
+            "read-through source requires raw output"
+        );
+    }
+}
+
+#[test]
 fn read_through_http_failed_renewal_is_a_miss_without_revoking_the_payload() {
     use crate::cache::storage::{Directory, Storage, StoreHash, SupportedStorageBackend};
     let central = RunningServer::start("edge-renewal-central");

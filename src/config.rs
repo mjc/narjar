@@ -55,6 +55,23 @@ impl ServeConfig {
 }
 
 impl ServeSource {
+    pub(crate) fn prepare_edge_storage(
+        storage_backend: StorageBackend,
+        egress_compression: WireEncoding,
+        native: NativeStoreOptions<'_>,
+    ) -> Result<SupportedStorageBackend, SourcePreparationError> {
+        let cache = Self::prepare(
+            ServeSourceChoice::FlatCache,
+            storage_backend,
+            egress_compression,
+            native,
+        )?;
+        match cache.egress_compression() {
+            WireEncoding::Raw => Ok(cache.storage_backend()),
+            WireEncoding::Compressed(_) => Err(SourcePreparationError::EdgeCompressedOutput),
+        }
+    }
+
     pub(crate) fn prepare(
         choice: ServeSourceChoice,
         storage_backend: StorageBackend,
@@ -324,32 +341,24 @@ impl ServeArgs {
         if self.workers.get() < 2 || self.max_in_flight.get() < 2 {
             return Err(SourcePreparationError::EdgeRequestCapacityTooSmall);
         }
-        let cache = ServeSource::prepare(
-            ServeSourceChoice::FlatCache,
+        let storage_backend = ServeSource::prepare_edge_storage(
             self.storage_backend,
             self.egress_compression,
             self.native_options(),
         )?;
-        match cache.egress_compression() {
-            WireEncoding::Raw => Ok(ServeSource::ReadThrough {
-                storage_backend: cache.storage_backend(),
-                settings: EdgeSettings {
-                    upstream: upstream.clone(),
-                    lease_seconds: self.edge_lease_seconds,
-                    max_fills: self.edge_max_fills,
-                    request_workers: self.workers,
-                    max_in_flight: self.max_in_flight,
-                    timeout: std::time::Duration::from_secs(self.edge_timeout_seconds.get()),
-                    fill_timeout: std::time::Duration::from_secs(
-                        self.edge_fill_timeout_seconds.get(),
-                    ),
-                    negative_ttl: std::time::Duration::from_secs(
-                        self.edge_negative_ttl_seconds.get(),
-                    ),
-                },
-            }),
-            WireEncoding::Compressed(_) => Err(SourcePreparationError::EdgeCompressedOutput),
-        }
+        Ok(ServeSource::ReadThrough {
+            storage_backend,
+            settings: EdgeSettings {
+                upstream: upstream.clone(),
+                lease_seconds: self.edge_lease_seconds,
+                max_fills: self.edge_max_fills,
+                request_workers: self.workers,
+                max_in_flight: self.max_in_flight,
+                timeout: std::time::Duration::from_secs(self.edge_timeout_seconds.get()),
+                fill_timeout: std::time::Duration::from_secs(self.edge_fill_timeout_seconds.get()),
+                negative_ttl: std::time::Duration::from_secs(self.edge_negative_ttl_seconds.get()),
+            },
+        })
     }
 }
 

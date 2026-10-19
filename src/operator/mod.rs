@@ -823,24 +823,32 @@ pub(crate) struct Doctor {
 
 impl Doctor {
     fn prepare_source(&self) -> Result<ServeSource, SourcePreparationError> {
-        let choice = match self.serve_source {
-            ServeSourceChoice::FlatCache | ServeSourceChoice::ReadThrough => {
-                ServeSourceChoice::FlatCache
-            }
-            ServeSourceChoice::NativeStore => ServeSourceChoice::NativeStore,
+        let native = NativeStoreOptions {
+            store_dir: self.native_store_dir.as_deref(),
+            state_dir: self.native_state_dir.as_deref(),
+            roots_dir: self.native_roots_dir.as_deref(),
+            min_lease_seconds: self.native_min_lease_seconds,
+            signing_key_file: self.native_signing_key_file.as_deref(),
         };
-        ServeSource::prepare(
-            choice,
-            self.storage_backend,
-            self.egress_compression,
-            NativeStoreOptions {
-                store_dir: self.native_store_dir.as_deref(),
-                state_dir: self.native_state_dir.as_deref(),
-                roots_dir: self.native_roots_dir.as_deref(),
-                min_lease_seconds: self.native_min_lease_seconds,
-                signing_key_file: self.native_signing_key_file.as_deref(),
-            },
-        )
+        match self.serve_source {
+            ServeSourceChoice::ReadThrough => ServeSource::prepare_edge_storage(
+                self.storage_backend,
+                self.egress_compression,
+                native,
+            )
+            .map(|storage_backend| ServeSource::FlatCache {
+                storage_backend,
+                egress_compression: WireEncoding::Raw,
+            }),
+            choice @ (ServeSourceChoice::FlatCache | ServeSourceChoice::NativeStore) => {
+                ServeSource::prepare(
+                    choice,
+                    self.storage_backend,
+                    self.egress_compression,
+                    native,
+                )
+            }
+        }
     }
 }
 
@@ -2143,6 +2151,22 @@ machine other.example password other-secret
             signing_key_file: None,
         };
         for (choice, native, encoding, backend, expected_error, detail) in [
+            (
+                ServeSourceChoice::ReadThrough,
+                NativeStoreOptions::default(),
+                WireEncoding::Compressed(CompressionCodec::Zstd),
+                StorageBackend::Flat,
+                SourcePreparationError::EdgeCompressedOutput,
+                "read-through source requires raw output",
+            ),
+            (
+                ServeSourceChoice::ReadThrough,
+                NativeStoreOptions::default(),
+                WireEncoding::Compressed(CompressionCodec::Xz),
+                StorageBackend::Flat,
+                SourcePreparationError::EdgeCompressedOutput,
+                "read-through source requires raw output",
+            ),
             (
                 ServeSourceChoice::FlatCache,
                 complete,
