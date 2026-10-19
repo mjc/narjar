@@ -357,7 +357,7 @@
         edge-e2e = {
           type = "app";
           program = lib.getExe env.edgeE2E;
-          meta.description = "Test fail-open edge behavior with isolated Nix stores";
+          meta.description = "Test local caching and upstream outages using private Nix stores";
         };
         oci-e2e = {
           type = "app";

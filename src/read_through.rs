@@ -1,4 +1,4 @@
-//! Fill local storage before making upstream metadata available to readers.
+//! Download and verify upstream NARs before returning their metadata to clients.
 
 #[path = "read_through/state.rs"]
 mod state;
@@ -209,7 +209,7 @@ impl ReadThroughSource {
         })
     }
 
-    /// HTTP performs the advertised read and lease renewal after this succeeds.
+    /// Make the NAR and metadata available locally. HTTP then renews retention and reads the metadata.
     pub(crate) fn ensure_local(&self, storage: &Storage, store: &StoreHash) -> EdgeLookup {
         let result = self.lookup(storage, store);
         match result {
@@ -229,12 +229,12 @@ impl ReadThroughSource {
             }
             LocalLookup::Repair | LocalLookup::Missing => {}
         }
-        // Both leaders and followers consume this budget. Leave a worker for local hits,
-        // payload delivery and health requests even while every admitted fill is stalled.
+        // Count requests downloading and waiting for downloads. Leave a worker and
+        // connection free for cached responses and health checks if upstream stalls.
         let _request = reserve_activity_slot(&self.blocked_requests, self.max_blocked_requests)?;
         let deadline = Deadline::new(self.fill_timeout)?;
         self.coalesce(Key::Store(*store), deadline, || {
-            // Another completed flight may have published between the first lookup and admission.
+            // Another request may have stored the object since our first lookup.
             match Self::local_lookup(storage, store)? {
                 LocalLookup::Ready => Ok(()),
                 LocalLookup::Repair => {
@@ -322,13 +322,13 @@ impl ReadThroughSource {
             },
         )?;
         deadline.remaining()?;
-        // Binding proves the signed logical identity against canonical bytes, including aliases
-        // whose upstream transport encoding differs from the first fill's encoding.
+        // Check the signed NarHash and NarSize against the stored uncompressed NAR,
+        // even if another request downloaded it with a different compression format.
         let bound = storage
             .bind_canonical_narinfo(metadata)
             .map_err(EdgeFailure::ingestion)?;
         deadline.remaining()?;
-        // Storage publishes metadata and its durable advertisement lease in this order.
+        // Store and sync the metadata, then its retention record, before returning success.
         bound.publish().map_err(EdgeFailure::ingestion)?;
         deadline.remaining()?;
         Ok(())
@@ -389,8 +389,8 @@ impl ReadThroughSource {
             .publish_nar_with_staging(name, reader, encoded_size, self.policy, reservation)
             .map_err(EdgeFailure::ingestion)?;
         deadline.remaining()?;
-        // Ingestion checks the transport hash and computes the decoded identity. A compressed
-        // stream must also agree with the signed identity before its flight can succeed.
+        // Ingestion checked FileHash and computed the uncompressed hash and size.
+        // Those must also match the signed NarHash and NarSize before we return success.
         storage
             .ensure_canonical_nar_available(payload.identity())
             .map_err(|error| match error {
@@ -565,7 +565,7 @@ impl Drop for ActiveSlot<'_> {
     }
 }
 
-// Wake followers even when the leader unwinds before recording its result.
+// Wake waiting requests even if the downloading request panics before recording its result.
 struct Completion<'a> {
     flight: &'a Flight,
     result: Result<(), EdgeFailure>,

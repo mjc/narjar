@@ -570,52 +570,52 @@ in {
     };
 
     edge = {
-      enable = lib.mkEnableOption "a read-only, fail-open local cache for a fixed upstream";
+      enable = lib.mkEnableOption "a read-only local cache that returns cache misses when the upstream is unavailable";
       upstream = lib.mkOption {
         type = lib.types.str;
         default = "";
-        description = "Fixed HTTP(S) binary cache used for read-through fills. Redirects are rejected.";
+        description = "HTTP(S) binary cache to download from on local misses. Redirects are rejected.";
       };
       trustedPublicKeys = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [];
-        description = "Nix signing keys trusted for fills, also used by the optional local Nix client profile. Public keys are stored in the Nix store.";
+        description = "Public signing keys used to verify upstream narinfo, also installed for Nix when configureClient is enabled. These public keys are stored in the Nix store.";
       };
       leaseSeconds = lib.mkOption {
         type = lib.types.ints.positive;
         default = 5187600;
-        description = "Durable protection after advertisement. Default covers two 30-day positive TTL windows plus one hour; GC cannot revoke a live promise.";
+        description = "Seconds GC must retain metadata and its NAR after returning narinfo. The default is 60 days plus one hour, covering two default Nix positive-cache periods and delayed NAR requests. Retention survives restarts.";
       };
       maxFills = lib.mkOption {
         type = lib.types.ints.positive;
         default = 4;
-        description = "Maximum simultaneous upstream fills; additional unrelated misses return 404.";
+        description = "Maximum simultaneous upstream downloads. Additional misses for unrelated objects return 404.";
       };
       timeoutSeconds = lib.mkOption {
         type = lib.types.ints.positive;
         default = 30;
-        description = "Upstream connection, inactive-I/O and follower-wait timeout in seconds; progressing fills may outlive it.";
+        description = "Timeout in seconds for upstream connection setup, idle network I/O or waiting for another request's download. Downloads that keep making progress can run longer.";
       };
       fillTimeoutSeconds = lib.mkOption {
         type = lib.types.ints.positive;
         default = 3600;
-        description = "Total fill deadline in seconds, separate from the inactive-I/O timeout. Increase for large objects on slow links.";
+        description = "Total upstream download timeout in seconds, including time spent making progress. Increase for large NARs on slow links.";
       };
       negativeTtlSeconds = lib.mkOption {
         type = lib.types.ints.positive;
         default = 1;
-        description = "Bounded edge negative-cache lifetime for misses and failed fills.";
+        description = "Seconds the local cache remembers upstream misses and failures, capped at 60.";
       };
       configureClient = lib.mkEnableOption "using this loopback edge as the sole Nix substituter, with fallback disabled";
       clientPositiveTtlSeconds = lib.mkOption {
         type = lib.types.ints.positive;
         default = 300;
-        description = "Nix positive narinfo TTL for the local client profile. Lease must cover two TTL windows plus 300 seconds of delay.";
+        description = "Seconds Nix caches successful narinfo lookups. leaseSeconds must be at least twice this value plus 300 seconds to allow for delayed NAR requests.";
       };
       clientNegativeTtlSeconds = lib.mkOption {
         type = lib.types.ints.positive;
         default = 1;
-        description = "Nix negative narinfo TTL for the local client profile.";
+        description = "Seconds Nix caches missing narinfo before trying again.";
       };
     };
 

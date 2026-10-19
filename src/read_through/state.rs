@@ -54,7 +54,8 @@ impl State {
     }
 
     pub(super) fn join(&mut self, key: Key, now: Instant) -> Result<Join, EdgeFailure> {
-        // Prefer the active generation to a cached failure from its completion path.
+        // Join an existing request before checking cached failures: it may have just
+        // recorded its failure but not yet notified everyone waiting for it.
         if let Some(flight) = self.flights.get(&key).and_then(Weak::upgrade) {
             return Ok(Join::Follower(flight));
         }
@@ -74,7 +75,7 @@ impl State {
 
     pub(super) fn remember(&mut self, key: Key, failure: EdgeFailure, now: Instant, ttl: Duration) {
         match key {
-            // A failed transport says nothing about another representation of this NAR.
+            // A failed download of one encoding must not block trying another encoding.
             Key::Nar(_) => return,
             Key::Store(_) | Key::Representation(_) => {}
         }

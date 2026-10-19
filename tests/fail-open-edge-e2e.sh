@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Linux / Nix 2.34.8 acceptance; run outside a Nix build sandbox. Required:
-# NARJAR_E2E_BASH=/nix/store/<packaged-bash>/bin/bash (already realised).
+# Test read-through caching and upstream outages with private Nix stores.
+# Requires Linux and Nix 2.34.8; run outside a Nix build sandbox.
+# Set NARJAR_E2E_BASH=/nix/store/<packaged-bash>/bin/bash to an installed Bash.
 # PATH: narjar, nix, nix-store, nix-instantiate, curl, jq, sqlite3, coreutils,
 # grep, sed, find, and util-linux (unshare). No nixpkgs evaluation or downloads.
-# --prerequisites-only checks namespaces, recipe seeding, signing and real
-# private-store builds without Narjar. Full acceptance needs the
-# NARJ-131 CLI, durable edge leases honoured by offline GC, and raw edge egress.
+# --prerequisites-only checks namespaces, signing and local builds from the test
+# recipes without running Narjar. The full test also checks uncompressed serving
+# and retention after a restart and offline GC.
 # If user namespaces are unavailable, use the same packaged entrypoint and Bash
 # path as root for this invocation only; do not change host namespace settings.
 
@@ -58,7 +59,7 @@ same_server() {
   IFS= read -r -d '' command < "/proc/$pid/cmdline" || return 1
   [[ "$command" == "$narjar_bin" ]]
 }
-# Direct child handles, command and kernel start time are checked before signals.
+# Check the saved PID, command and start time before signalling: the PID may have been reused.
 stop_server() {
   local role=$1 pid started attempt
   case "$role" in
@@ -94,9 +95,9 @@ cleanup() {
       cat "$log" >&2
     done
   fi
-  # Only this invocation's unique, canonical mktemp directory is removed.
-  # Nix makes imported store directories read-only. Change only directories,
-  # never regular files (which may be hard-linked inside a store).
+  # Remove only the directory created by this test. Nix makes imported store
+  # directories read-only, so make them writable first. Do not chmod regular
+  # files: they may share hard links with other store paths.
   find "$temp_root" -type d -exec chmod u+rwx {} +
   rm -rf -- "$temp_root"
   exit "$status"
@@ -108,7 +109,7 @@ mkdir -p "$temp_root"/{home,tmp,config,cache,state,conf,unused-state,empty-path}
 printf 'TEMP_ROOT %s\n' "$temp_root"
 
 # Ignore host/user Nix configuration and inherited NARJAR_* settings. Any Nix
-# invocation missing an explicit --store still lands in this private guard store.
+# invocation missing an explicit --store still uses a private store, not the host store.
 cat > "$temp_root/conf/nix.conf" <<'CONFIG'
 experimental-features = nix-command read-only-local-store
 eval-cache = false
@@ -207,7 +208,7 @@ b_path=$(ns "$producer" --query --outputs "$b_drv")
 miss_path=$(ns "$producer" --query --outputs "$miss_drv")
 hit_path=$(ns "$producer" --query --outputs "$hit_drv")
 recovery_path=$(ns "$producer" --query --outputs "$recovery_drv")
-# A must carry B's derivation as inputDrvs, not an opaque storePath string.
+# A's build recipe must depend on B's recipe, not just mention B's output path.
 nx "$producer" derivation show "$a_drv" > "$temp_root/a.drv.json"
 jq -e --arg a "${a_drv##*/}" --arg b "${b_drv##*/}" \
   '.derivations[$a].inputs.drvs | has($b)' "$temp_root/a.drv.json" >/dev/null ||
@@ -228,7 +229,7 @@ isolated timeout 30 nix key generate-secret --key-name narjar-edge-e2e > "$secre
 isolated timeout 30 nix key convert-secret-to-public < "$secret_key" > "$public_key"
 trusted_key=$(<"$public_key")
 if "$prerequisites_only"; then
-  # Exercise the fixture graph and recipe-only seeding independently of Narjar.
+  # Check that the test dependencies build from recipes without Narjar.
   ns "$producer" --realise "$a_drv" >"$temp_root/producer.out" 2>"$temp_root/producer.log"
   nx "$producer" store sign --key-file "$secret_key" "$a_path" "$b_path"
   seed_consumer "$temp_root/probe-consumer"
@@ -270,9 +271,9 @@ start_server() {
         --edge-max-fills 2 --edge-timeout-seconds 2 --edge-negative-ttl-seconds 1) ;;
     *) fail "unknown server: $role" ;;
   esac
-  # Empty PATH proves the servers need no runtime Nix executable. In particular
-  # the edge's native-store paths are absent sentinels, checked after shutdown.
-  # Clear the previous run before forking, not in the background child's redirect.
+  # Start with an empty PATH to check that the servers do not run Nix commands.
+  # After shutdown, check that they did not create a Nix store or database.
+  # Clear stdout before starting the child so we cannot read an old startup message.
   : > "$temp_root/$role.stdout"
   "${isolated_env[@]}" PATH="$temp_root/empty-path" \
     NIX_REMOTE="$(store_uri "$temp_root/$role-native")" \
@@ -311,8 +312,8 @@ expect_status() {
 }
 client_build() {
   local root=$1 drv=$2 jobs=$3 log=$4
-  # Sole substituter and fallback=false are explicit on every consumer build.
-  # Do not add --refresh: disk narinfo TTL behaviour is part of this acceptance.
+  # Use only the local cache, with fallback disabled, for every consumer build.
+  # Do not add --refresh: the test must reuse Nix's cached narinfo.
   ns "$root" --realise "$drv" --max-jobs "$jobs" \
     --option builders '' --option substituters "$edge_url" --option fallback false \
     --option trusted-public-keys "$trusted_key" --option require-sigs true \
@@ -421,8 +422,8 @@ fi
 negative_row=$(cached_row "$recovery_path")
 [[ "$negative_row" == 0\|* ]] || fail 'Nix did not retain a negative narinfo entry'
 start_server central "${central_url#http://}"
-# Both Nix and the edge use a one-second negative TTL; cross the integer clock
-# boundary as well. Keep the same XDG cache, edge process and endpoint.
+# Wait for both one-second cached misses to expire, allowing for whole-second
+# clock rounding. Keep the same XDG cache, server process and URL.
 sleep 2
 client_build "$consumer" "$recovery_drv" 0 "$temp_root/recovery.log"
 cmp "$producer$recovery_path" "$consumer$recovery_path"

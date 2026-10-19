@@ -248,22 +248,22 @@ pub(crate) struct ServeArgs {
         default_value = "flat-cache"
     )]
     source: ServeSourceChoice,
-    /// Fixed trusted upstream for read-through fills. Payloads are secured locally before advertisement.
+    /// Upstream cache URL. Download and verify each NAR before returning its narinfo.
     #[arg(long, env = "NARJAR_EDGE_UPSTREAM")]
     edge_upstream: Option<HttpUrl>,
-    /// Durable advertisement retention, covering two default Nix positive TTL windows plus delay.
+    /// Seconds GC must retain a NAR after returning its narinfo. Default: 60 days plus one hour.
     #[arg(long, env = "NARJAR_EDGE_LEASE_SECONDS", default_value = "5187600")]
     edge_lease_seconds: NonZeroU64,
-    /// Maximum concurrently active upstream fills.
+    /// Maximum number of simultaneous downloads from the upstream cache.
     #[arg(long, env = "NARJAR_EDGE_MAX_FILLS", default_value = "4")]
     edge_max_fills: NonZeroUsize,
-    /// Connection, inactive network I/O and follower-wait timeout, in seconds.
+    /// Timeout in seconds for connecting, idle network I/O or waiting for another request's download.
     #[arg(long, env = "NARJAR_EDGE_TIMEOUT_SECONDS", default_value = "30")]
     edge_timeout_seconds: NonZeroU64,
-    /// Total fill deadline, separate from inactive network I/O, in seconds.
+    /// Total upstream download timeout in seconds, including time spent making progress.
     #[arg(long, env = "NARJAR_EDGE_FILL_TIMEOUT_SECONDS", default_value = "3600")]
     edge_fill_timeout_seconds: NonZeroU64,
-    /// Short negative-cache lifetime for upstream misses and failures.
+    /// Seconds to cache upstream misses and failures, capped at 60.
     #[arg(long, env = "NARJAR_EDGE_NEGATIVE_TTL_SECONDS", default_value = "1")]
     edge_negative_ttl_seconds: NonZeroU64,
     #[arg(long, env = "NARJAR_NATIVE_STORE_DIR", value_parser = non_empty_path)]

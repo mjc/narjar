@@ -396,7 +396,7 @@ fn overlapping_store_requests_make_one_upstream_generation_and_local_hits_stay_o
     assert_eq!(upstream.count(".narinfo"), 1);
     assert_eq!(upstream.count(".nar"), 1);
     drop(upstream);
-    // Even a cached upstream failure cannot hide a durable local hit.
+    // Return a locally stored object even if an earlier upstream failure is cached.
     source.state.lock().unwrap().remember(
         Key::Store(store),
         EdgeFailure::Transient,
@@ -704,7 +704,7 @@ fn transient_negative_expires_and_allows_a_healthy_fill() {
         EdgeLookup::Miss(EdgeFailure::Transient)
     );
     assert_eq!(upstream.count(".narinfo"), 1);
-    // Advance maintenance time rather than sleeping through the negative TTL.
+    // Advance the cleanup clock instead of sleeping until the cached failure expires.
     source
         .state
         .lock()

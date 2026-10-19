@@ -135,7 +135,7 @@ impl Storage {
         }
     }
 
-    /// Configure durable advertisement retention before sharing storage with workers.
+    /// Set how long GC must retain served metadata and NARs before starting workers.
     pub(crate) fn configure_advertisement_leases(
         &mut self,
         lifetime: NonZeroU64,
@@ -218,8 +218,8 @@ impl Storage {
                     }
                     (_, Some(record)) => record.identity,
                     (LeasePurpose::Publication(identity), None) => identity,
-                    // Collection retains missing evidence conservatively. Edge reads repair it
-                    // from trusted metadata and canonical bytes before advertising success.
+                    // GC keeps publications with missing retention records. Read-through
+                    // requests recreate them from verified metadata and NARs before success.
                     (LeasePurpose::Advertisement(_), None) => return Ok(()),
                 };
                 let required_expiry = now
@@ -311,7 +311,7 @@ impl Storage {
         let mut record: AdvertisementLease = read_record(&directory, &name)?
             .ok_or_else(|| invalid("test requires an existing advertisement"))?;
         record.expires_at = unix_seconds()? + (policy.lifetime_seconds.get() / 2).max(1);
-        // Set controlled admission policy without consuming real filesystem capacity.
+        // Set the test's space limit without filling the filesystem.
         self.publish_advertisement_record(POLICY.into(), &policy, 0)?;
         self.publish_advertisement_record(name, &record, 0)?;
         self.advertisements = AdvertisementLeases::Active { directory, policy };

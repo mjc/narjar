@@ -4325,7 +4325,7 @@ mod tests {
             storage.advertisement_evidence(entry.store).unwrap(),
             super::super::advertisement::AdvertisementEvidence::Missing
         ));
-        // Remove transient read protection so this exercises durable missing-record policy.
+        // Clear in-memory read protection to test GC's handling of missing retention records.
         storage.collection =
             super::super::collection::CollectionCoordinator::without_startup_grace();
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();

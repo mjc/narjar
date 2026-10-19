@@ -33,22 +33,23 @@ still-live path with identical NAR contents.
 
 ## Read-through source
 
-The edge uses normal cache storage and publication with a fixed trusted HTTP
-upstream. A metadata miss obtains trusted claims, secures the exact payload
-through existing bounded ingestion, then publishes raw metadata. It returns no
-positive narinfo before both objects and an advertisement lease are durable.
-It never streams upstream metadata ahead of payload completion.
+The read-through cache downloads from one configured HTTP upstream. On a local
+miss, it verifies the narinfo signature, downloads the named NAR, checks its hash
+and size, and stores it uncompressed. It returns the rewritten narinfo only after
+the NAR, metadata and retention record have been written and synced to disk.
+This prevents Nix from being told a NAR is available before its download finishes.
 
-Per-store and logical-NAR fill ownership coalesces duplicate work. Active fills,
-waiting requests and negative entries are bounded. Failures become local misses;
-committed hits do not contact the upstream. There is no native Nix store,
-build daemon or write-behind queue.
+Concurrent requests for the same store path or uncompressed NAR share a download.
+The number of downloads, waiting requests and cached failures is limited. An
+upstream failure returns a local cache miss; a local hit does not contact the
+upstream. This mode needs no local Nix store or build daemon and does not queue
+uploads to the upstream.
 
-Storage owns durable advertisement leases, independent of HTTP source selection.
-Reads renew them before returning metadata. GC loads them under the existing
-collection coordination, including offline collection after restart. Missing
-lease evidence protects publications conservatively; malformed evidence cannot
-silently disable retention.
+Each retention record is a lease: a time before which GC must not delete the
+metadata or NAR. Reads extend that time before returning metadata. Storage
+coordinates these updates with GC, including offline GC after a restart. GC
+keeps publications whose records are missing and returns an error for invalid
+records rather than deleting potentially protected data.
 
 ## Identities and representations
 
@@ -86,7 +87,7 @@ DATA/
   .narjar-chunks/                shared raw chunks, sharded by hash
   .narjar-ingress/               compressed upload-to-raw receipts
   .narjar-egress/                raw-to-compressed download receipts
-  .narjar-advertisements/        optional durable metadata/payload retention leases
+  .narjar-advertisements/        keep-until times for read-through metadata and NARs
   .narjar-control/gc.sock        private daemon maintenance socket
   .tmp/                         metadata and receipt staging
   <store-hash>.narinfo

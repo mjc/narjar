@@ -59,8 +59,8 @@ impl Activity {
         Ok(())
     }
     fn protect(&mut self, object: ProtectedObject, now: Instant) {
-        // Reads observed during a scan stay pinned until that scan finishes, even
-        // if their ordinary grace period expires before retirement is authorized.
+        // Protect objects read during a GC scan until the scan finishes, even if
+        // their usual grace period expires before GC decides what to delete.
         match &self.phase {
             CollectionPhase::Scanning => {}
             CollectionPhase::Idle | CollectionPhase::Deleting(_) => {
@@ -229,7 +229,7 @@ pub(crate) struct ActivityLease<'coordinator> {
     advertisement: Option<ProtectedObject>,
 }
 
-/// Permission to replace one publication's lease while its reader remains pinned.
+/// Allow a retention-record update while protecting the reader's object from GC.
 pub(crate) struct AdvertisementRenewal<'reader> {
     store: StoreHash,
     _reader: &'reader ActivityLease<'reader>,
@@ -696,7 +696,7 @@ mod tests {
                 .unwrap(),
         );
         coordinator.expire_transient_protection_for_test();
-        // A later read must not prune expired hints pinned by the active scan.
+        // Another read must not remove expired protections still needed by this GC scan.
         coordinator
             .reader(second)
             .unwrap()

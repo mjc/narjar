@@ -82,8 +82,9 @@ fn assert_edge_waits_for_the_exact_payload(end: PayloadEnd) {
     ));
     assert!(!edge.data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
 
-    // Admission is smaller than the worker pool. The leader must still own the
-    // sole blocking slot, leaving health and cached delivery runnable.
+    // Connection capacity is smaller than the worker pool. The downloading
+    // request must keep the only download/wait slot; cached reads and health
+    // checks stay available.
     let rejected_follower = edge.request("GET", &route);
     assert!(
         response_parts(&rejected_follower)

@@ -601,7 +601,7 @@ impl Storage {
             .map_err(|_| StorageError::NarMismatch)
     }
 
-    /// Bind signed logical claims to canonical bytes independently of upload encoding.
+    /// Match signed NarHash and NarSize to the stored raw NAR, regardless of upload compression.
     pub(crate) fn bind_canonical_narinfo(
         &self,
         narinfo: ValidatedNarInfo,
@@ -885,7 +885,7 @@ impl Storage {
         let name = OsString::from(format!("{}.narinfo", store.as_str()));
         match entry_is_regular_at(&root, &name) {
             Ok(true) => {
-                // Cleanup first keeps metadata retryable if removing its lease fails.
+                // Remove the lease first so a failed removal leaves the metadata available for retry.
                 self.remove_advertisement_record(*store)?;
                 unlink_at(&root, &name)?;
                 root.sync_all()?;

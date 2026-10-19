@@ -16,7 +16,7 @@ pub use trust::TrustedPublicKeys;
 
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
-/// Check a stored publication's transport without rehashing its immutable payload.
+/// Require uncompressed narinfo without rereading or hashing the stored NAR.
 pub(crate) fn require_raw_narinfo_transport(bytes: &[u8]) -> Result<(), NarInfoError> {
     let text = std::str::from_utf8(bytes).map_err(|_| NarInfoError)?;
     let document = NarInfoDocument::parse(text)?;
