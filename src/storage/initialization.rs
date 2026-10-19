@@ -303,6 +303,7 @@ impl CacheLayout {
             collection: Default::default(),
             delivery_validation: DeliveryValidationCache::default(),
             publication_locks: Mutex::new(HashMap::new()),
+            narinfo_publication_locks: Mutex::new(HashMap::new()),
             staging_budget: Arc::new(Mutex::new(Default::default())),
             temporary_objects: AtomicU64::new(0),
             activity,

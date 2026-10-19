@@ -3,12 +3,13 @@ use std::{
     fs::File,
     os::unix::fs::MetadataExt,
     path::PathBuf,
-    sync::{Arc, Mutex, Weak, atomic::AtomicU64},
+    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64},
 };
 
 use super::backend::StorageBackend;
 use super::chunk_store::ChunkStore;
 use super::collection::CollectionCoordinator;
+use super::ids::StoreHash;
 #[cfg(test)]
 use super::publication::Layout;
 use super::publication::{ProcessLock, StagingBudget};
@@ -49,12 +50,33 @@ pub struct Storage {
     pub(super) collection: CollectionCoordinator,
     pub(super) delivery_validation: DeliveryValidationCache,
     pub(super) publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    pub(super) narinfo_publication_locks: Mutex<HashMap<StoreHash, Weak<RwLock<()>>>>,
     pub(super) staging_budget: Arc<Mutex<StagingBudget>>,
     pub(super) temporary_objects: AtomicU64,
     pub(super) activity: Arc<StorageActivity>,
     #[cfg(test)]
     pub(super) egress_generations: AtomicU64,
     pub(super) _lock: ProcessLock,
+}
+
+pub(super) fn publication_lock_for_key<Key, Lock>(
+    locks: &Mutex<HashMap<Key, Weak<Lock>>>,
+    key: Key,
+) -> Arc<Lock>
+where
+    Key: Eq + std::hash::Hash,
+    Lock: Default,
+{
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() != 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Lock::default());
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
 }
 
 #[derive(Debug, Default)]

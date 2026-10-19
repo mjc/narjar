@@ -439,6 +439,69 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_cached_readers_do_not_turn_each_other_into_cache_misses() {
+        use std::{
+            sync::{Arc, mpsc},
+            time::{Duration, Instant},
+        };
+
+        let (directory, storage, store, _) = advertised_fixture();
+        std::fs::write(
+            directory.path().join(format!("{}.narinfo", store.as_str())),
+            b"cached metadata",
+        )
+        .unwrap();
+        let renewal = storage
+            .destination_lock(PathBuf::from(DIRECTORY).join(format!("{}.renew", store.as_str())));
+        std::thread::scope(|scope| {
+            let storage = &storage;
+            let paused = renewal.lock().unwrap();
+            let first = scope.spawn(move || {
+                storage
+                    .read_advertised_narinfo(&store)
+                    .map(|metadata| metadata.map(|metadata| metadata.bytes))
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Arc::strong_count(&renewal) < 2 {
+                assert!(Instant::now() < deadline, "first reader must reach renewal");
+                std::thread::yield_now();
+            }
+            let (completed, response) = mpsc::channel();
+            let second = scope.spawn(move || {
+                let result = storage
+                    .read_advertised_narinfo(&store)
+                    .map(|metadata| metadata.map(|metadata| metadata.bytes));
+                completed.send(result).unwrap();
+            });
+            let early_response = loop {
+                match response.try_recv() {
+                    Ok(result) => break Some(result),
+                    Err(mpsc::TryRecvError::Empty) if Arc::strong_count(&renewal) >= 3 => {
+                        break None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "second reader must reach renewal"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => panic!("reader must send its result"),
+                }
+            };
+            drop(paused);
+            let second_result = early_response
+                .unwrap_or_else(|| response.recv_timeout(Duration::from_secs(5)).unwrap());
+            second.join().unwrap();
+            assert!(first.join().unwrap().unwrap().is_some());
+            assert!(
+                second_result.unwrap().is_some(),
+                "another reader is not a pending publisher"
+            );
+        });
+    }
+
+    #[test]
     fn pending_publication_reads_return_a_miss_without_waiting_for_rollback() {
         use std::{sync::mpsc, time::Duration};
 
@@ -449,7 +512,7 @@ mod tests {
         )
         .unwrap();
         let publication = storage.narinfo_publication_lock(&store);
-        let pending = publication.lock().unwrap();
+        let pending = publication.write().unwrap();
         let (completed, response) = mpsc::channel();
         std::thread::scope(|scope| {
             let reader = scope.spawn(|| {

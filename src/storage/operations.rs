@@ -6,7 +6,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process,
-    sync::{Arc, Mutex, TryLockError, Weak, atomic::Ordering},
+    sync::{Arc, Mutex, RwLock, TryLockError, atomic::Ordering},
     time::SystemTime,
 };
 
@@ -54,7 +54,7 @@ use super::{
     },
     reconcile::{self, ReconcileEntry, ReconcileReport},
     recovery::{PublicationState, PublicationTransaction, RecoveryStatus},
-    state::{PayloadStorage, Storage},
+    state::{PayloadStorage, Storage, publication_lock_for_key},
     typestate::Streaming,
 };
 
@@ -389,7 +389,7 @@ impl Storage {
         // Block reads and other publishers until retention is recorded or rollback finishes.
         let lock = self.narinfo_publication_lock(claims.store());
         let _guard = lock
-            .lock()
+            .write()
             .map_err(|_| io::Error::other("narinfo publication lock poisoned"))?;
         let outcome = match self.publish(PublishTarget::NarInfo(claims.store()), Cursor::new(bytes))
         {
@@ -401,11 +401,8 @@ impl Storage {
         self.record_narinfo_lease_or_remove_new_metadata(claims, outcome)
     }
 
-    pub(super) fn narinfo_publication_lock(&self, store: &StoreHash) -> Arc<Mutex<()>> {
-        self.destination_lock(
-            PathBuf::from(super::advertisement::DIRECTORY)
-                .join(format!("{}.publish", store.as_str())),
-        )
+    pub(super) fn narinfo_publication_lock(&self, store: &StoreHash) -> Arc<RwLock<()>> {
+        publication_lock_for_key(&self.narinfo_publication_locks, *store)
     }
 
     fn record_narinfo_lease_or_remove_new_metadata(
@@ -851,7 +848,7 @@ impl Storage {
             AdvertisementLeases::Absent => self.read_narinfo_and_renew_retention(store),
             AdvertisementLeases::Incomplete | AdvertisementLeases::Active { .. } => {
                 let publication = self.narinfo_publication_lock(store);
-                match publication.try_lock() {
+                match publication.try_read() {
                     Ok(_guard) => self.read_narinfo_and_renew_retention(store),
                     Err(TryLockError::WouldBlock) => Ok(None),
                     Err(TryLockError::Poisoned(_)) => {
@@ -1554,17 +1551,7 @@ impl Storage {
     }
 
     pub(super) fn destination_lock(&self, key: PathBuf) -> Arc<Mutex<()>> {
-        let mut locks = self
-            .publication_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        locks.retain(|_, lock| lock.strong_count() != 0);
-        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(Mutex::new(()));
-        locks.insert(key, Arc::downgrade(&lock));
-        lock
+        publication_lock_for_key(&self.publication_locks, key)
     }
 }
 
