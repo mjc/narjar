@@ -1,11 +1,15 @@
 use enum_map::{Enum, EnumMap};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File},
+    fs::File,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use crate::cache::filesystem::{FilePrivacy, PreparedFile, open_directory, unlink_at};
+#[cfg(test)]
+use std::fs;
 
 const MAX_RECORD_BYTES: u64 = 2 * 1024;
 const INVENTORY_CLASS_COUNT: usize = crate::cache::inventory::InventoryClass::ALL.len();
@@ -117,7 +121,7 @@ pub struct Snapshot {
 }
 
 pub struct Recorder {
-    root: PathBuf,
+    root: File,
     operation: Operation,
     mode: Mode,
     started_at_unix_seconds: u64,
@@ -127,7 +131,7 @@ pub struct Recorder {
 impl Recorder {
     pub fn begin(root: &Path, operation: Operation, mode: Mode) -> io::Result<Self> {
         let recorder = Self {
-            root: root.to_owned(),
+            root: open_directory(root)?,
             operation,
             mode,
             started_at_unix_seconds: unix_seconds_now(),
@@ -162,8 +166,11 @@ impl Recorder {
             inventory_class_counts: values.inventory_class_counts,
         };
         write_atomic(&self.root, &last_name(self.operation), &encode_record(run)?)?;
-        match fs::remove_file(self.root.join(started_name(self.operation))) {
-            Ok(()) => File::open(&self.root)?.sync_all(),
+        match unlink_at(
+            &self.root,
+            std::ffi::OsStr::new(&started_name(self.operation)),
+        ) {
+            Ok(()) => self.root.sync_all(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
@@ -237,14 +244,9 @@ fn read_bounded_file(path: &Path) -> io::Result<Vec<u8>> {
     crate::cache::records::read_bounded_bytes(file, MAX_RECORD_BYTES).map_err(Into::into)
 }
 
-fn write_atomic(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
-    let mut temporary = tempfile::NamedTempFile::new_in(root)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(root.join(name))
-        .map_err(|error| error.error)?;
-    File::open(root)?.sync_all()
+fn write_atomic(root: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
+    PreparedFile::write(root, FilePrivacy::Private, |file| file.write_all(bytes))?
+        .replace(std::ffi::OsStr::new(name))
 }
 
 fn started_name(operation: Operation) -> String {

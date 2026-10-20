@@ -226,11 +226,16 @@ fn walk_directories(parent: &File, names: &[ChildName], final_access: u32) -> io
 }
 
 fn reopen(file: &File, kind: Kind, access: u32) -> io::Result<File> {
-    require_kind(file, kind)?;
-    let flags = match kind {
-        Kind::Directory => FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        Kind::Regular => FILE_FLAG_OPEN_REPARSE_POINT,
-    };
+    match kind {
+        // An empty NT name reopens this retained directory itself. It never
+        // resolves the old pathname and gives enumeration an independent cursor.
+        Kind::Directory => open_child(file, Path::new(""), kind, access),
+        Kind::Regular => reopen_regular_file(file, access),
+    }
+}
+
+fn reopen_regular_file(file: &File, access: u32) -> io::Result<File> {
+    require_kind(file, Kind::Regular)?;
     // SAFETY: file is retained throughout this synchronous, handle-bound
     // reopen. The returned handle owns a new file object and independent cursor.
     let handle = unsafe {
@@ -238,7 +243,7 @@ fn reopen(file: &File, kind: Kind, access: u32) -> io::Result<File> {
             file.as_raw_handle(),
             access | FILE_READ_ATTRIBUTES | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            flags,
+            FILE_FLAG_OPEN_REPARSE_POINT,
         )
     };
     if handle == INVALID_HANDLE_VALUE {
@@ -246,7 +251,7 @@ fn reopen(file: &File, kind: Kind, access: u32) -> io::Result<File> {
     }
     // SAFETY: ReOpenFile succeeded and transferred one owned file handle.
     let reopened = unsafe { File::from_raw_handle(handle) };
-    require_kind(&reopened, kind)?;
+    require_kind(&reopened, Kind::Regular)?;
     Ok(reopened)
 }
 

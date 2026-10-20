@@ -231,13 +231,21 @@ impl CacheLayout {
     }
 
     fn prepare_descriptor(&self) -> Result<DescriptorInstallation, StorageError> {
-        match open_optional_at(&self.root, OsStr::new(LAYOUT_DESCRIPTOR))? {
-            None => Ok(DescriptorInstallation::Create),
-            Some(mut descriptor) => {
+        match open_at(
+            &self.root,
+            OsStr::new(LAYOUT_DESCRIPTOR),
+            FileAccess::ReadWrite,
+            FileCreation::Existing,
+            FilePrivacy::Private,
+        ) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(DescriptorInstallation::Create)
+            }
+            Err(error) => Err(error.into()),
+            Ok(mut descriptor) => {
                 let mut bytes = Vec::new();
                 (&mut descriptor).take(64).read_to_end(&mut bytes)?;
                 self.check_descriptor(&bytes)?;
-                require_private_file_at(&self.root, LAYOUT_DESCRIPTOR, true)?;
                 Ok(DescriptorInstallation::Existing(descriptor))
             }
         }
