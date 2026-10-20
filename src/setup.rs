@@ -187,7 +187,7 @@ fn install_trusted_public_key(data_dir: &Path, public_key: &Path) -> Result<(), 
     validate_private_file(&file).map_err(runtime)?;
     if file.metadata().map_err(runtime)?.len() != 0 {
         return Err(Error::runtime(
-            "initialized trusted-public-keys must be an empty regular 0600 file",
+            "initialized trusted-public-keys must be an empty private regular file",
         ));
     }
     let key = fs::read(public_key).map_err(runtime)?;

@@ -411,7 +411,7 @@ mod tests {
                 Some(ReconcileClass::UnexpectedType),
                 "symlinked {name}"
             );
-            fs::remove_file(path).unwrap();
+            crate::cache::test_support::remove_symlink(path).unwrap();
         }
     }
 }

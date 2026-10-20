@@ -1,5 +1,6 @@
 use super::InjectedIoFailure;
 
+pub(crate) use std::fs::remove_file as remove_symlink;
 pub(crate) use std::os::unix::fs::symlink;
 
 pub(crate) fn non_unicode_name(suffix: &str) -> std::ffi::OsString {

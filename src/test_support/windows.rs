@@ -3,6 +3,17 @@ use windows_sys::Win32::Foundation::*;
 
 use super::InjectedIoFailure;
 
+pub(crate) fn remove_symlink(path: impl AsRef<Path>) -> io::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path.as_ref())?
+        .file_type()
+        .is_symlink_dir()
+    {
+        true => std::fs::remove_dir(path),
+        false => std::fs::remove_file(path),
+    }
+}
+
 pub(crate) fn non_unicode_name(suffix: &str) -> std::ffi::OsString {
     use std::os::windows::ffi::OsStringExt;
     let wide: Vec<_> = std::iter::once(0xd800)

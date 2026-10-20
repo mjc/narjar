@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fs::File, path::Path};
+use std::{collections::BTreeSet, fs::File, io::Read, path::Path};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -16,17 +16,18 @@ impl ProtectedRoots {
     pub fn load(path: Option<&Path>) -> Result<Self, StorageError> {
         match path {
             None => Ok(Self::default()),
-            Some(path) => {
-                let bytes = crate::cache::records::read_bounded_bytes(
-                    File::open(path)?,
-                    MAX_ROOT_SOURCE_BYTES,
-                )
-                .map_err(std::io::Error::from)?;
-                let contents =
-                    std::str::from_utf8(&bytes).map_err(|error| invalid(error.to_string()))?;
-                Self::parse(contents)
-            }
+            Some(path) => match path == Path::new("-") {
+                true => Self::read(std::io::stdin().lock()),
+                false => Self::read(File::open(path)?),
+            },
         }
+    }
+
+    fn read(source: impl Read) -> Result<Self, StorageError> {
+        let bytes = crate::cache::records::read_bounded_bytes(source, MAX_ROOT_SOURCE_BYTES)
+            .map_err(std::io::Error::from)?;
+        let contents = std::str::from_utf8(&bytes).map_err(|error| invalid(error.to_string()))?;
+        Self::parse(contents)
     }
 
     pub fn parse(contents: &str) -> Result<Self, StorageError> {

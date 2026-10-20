@@ -114,7 +114,7 @@ pub fn valid_label(label: &str) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("token hash file permissions must be 0600")]
+    #[error("token hash file must be private to its owner")]
     InsecurePermissions,
     #[error("invalid token hash file")]
     Invalid,
@@ -202,7 +202,7 @@ mod error_contract_tests {
         let cases: &[(&dyn std::error::Error, &str)] = &[
             (
                 &Error::InsecurePermissions,
-                "token hash file permissions must be 0600",
+                "token hash file must be private to its owner",
             ),
             (&Error::Invalid, "invalid token hash file"),
             (&Error::InvalidLabel, "invalid token label"),

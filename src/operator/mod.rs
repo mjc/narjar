@@ -510,6 +510,7 @@ pub(crate) struct Gc {
     delete_older_than: Option<Duration>,
     #[arg(long, default_value_t = 0)]
     min_age_seconds: u64,
+    /// File of protected store roots, or - to read from this client's stdin.
     #[arg(long)]
     protected_roots: Option<PathBuf>,
     #[arg(long, conflicts_with = "apply")]

@@ -504,12 +504,13 @@ fn data_dir(test: &str) -> TestDir {
     } else {
         format!("narjar-{test}-")
     };
-    TestDir(
-        tempfile::Builder::new()
-            .prefix(&prefix)
-            .tempdir()
-            .expect("test data directory should be created"),
-    )
+    let directory = tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir()
+        .expect("test data directory should be created");
+    crate::cache::test_support::private_directory(directory.path())
+        .expect("test data directory should be private to this account");
+    TestDir(directory)
 }
 
 fn missing_data_dir(test: &str) -> PathBuf {
@@ -828,10 +829,7 @@ fn gc_delete_older_than_deletes_old_payloads_and_preserves_recent_ones() {
     let old_payload = data.join(format!("nar/{NARJAR_HASH}.nar"));
     fs::write(&old_payload, NAR_BYTES).unwrap();
     let old_time = std::time::SystemTime::now() - Duration::from_secs(14 * 24 * 60 * 60);
-    fs::File::open(&old_payload)
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(old_time))
-        .unwrap();
+    crate::cache::test_support::set_fixture_modified_time(&old_payload, old_time).unwrap();
     let recent_bytes = b"recent NAR payload";
     let recent_payload = data.join(format!("nar/{}.nar", nix32_sha256(recent_bytes)));
     fs::write(&recent_payload, recent_bytes).unwrap();
@@ -902,7 +900,7 @@ fn online_gc_reads_protected_roots_from_the_clients_stdin_not_the_daemons() {
             "--data-dir",
             server.data_dir.to_str().unwrap(),
             "--protected-roots",
-            "/dev/stdin",
+            "-",
             "--target-bytes",
             "0",
             "--dry-run",
@@ -1068,10 +1066,7 @@ fn gc_delete_older_than_preserves_protected_and_recent_publications_and_shared_p
         )
         .unwrap();
         if store != recent_store {
-            fs::File::open(metadata)
-                .unwrap()
-                .set_modified(old_time)
-                .unwrap();
+            crate::cache::test_support::set_fixture_modified_time(metadata, old_time).unwrap();
         }
     }
     let roots = data.join("protected-roots");
@@ -2044,7 +2039,11 @@ fn shutdown_rejects_keep_alive_uploads_and_finishes_already_admitted_uploads() {
                     "shutdown must not acknowledge another upload: {}",
                     String::from_utf8_lossy(&response[..count])
                 ),
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
                 Err(error) => panic!("reading draining connection: {error}"),
             }
         }
@@ -5451,30 +5450,40 @@ fn structural_reconcile_reports_temp_age_and_shape() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report = String::from_utf8(output.stdout).expect("report should be UTF-8");
-    assert!(report.contains(
-        "{\"class\":\"temp_young\",\"path\":\".tmp/nar-young.part\",\"action\":\"inspect\"}"
-    ));
+    assert_structural_json_entry(&report, "temp_young", ".tmp/nar-young.part", "inspect");
     for path in [
         ".tmp/cache-info-young.part",
         "nar/.tmp/nar-young.part",
         "realisations/.tmp/realisation-young.part",
     ] {
-        assert!(
-            report.contains(&format!(
-                "{{\"class\":\"temp_young\",\"path\":\"{path}\",\"action\":\"inspect\"}}"
-            )),
-            "{report}"
-        );
+        assert_structural_json_entry(&report, "temp_young", path, "inspect");
     }
-    assert!(report.contains(
-        "{\"class\":\"invalid_filename\",\"path\":\".tmp/not-a-temp\",\"action\":\"inspect\"}"
-    ));
-    assert!(report.contains(
-        "{\"class\":\"unexpected_type\",\"path\":\".tmp/nar-directory.part\",\"action\":\"inspect\"}"
-    ));
-    assert!(report.contains(&format!(
-        "{{\"class\":\"nar_object\",\"path\":\"nar/{NAR_ID}.nar.zst\",\"action\":\"inspect\"}}"
-    )));
+    assert_structural_json_entry(&report, "invalid_filename", ".tmp/not-a-temp", "inspect");
+    assert_structural_json_entry(
+        &report,
+        "unexpected_type",
+        ".tmp/nar-directory.part",
+        "inspect",
+    );
+    assert_structural_json_entry(
+        &report,
+        "nar_object",
+        &format!("nar/{NAR_ID}.nar.zst"),
+        "inspect",
+    );
+}
+
+fn assert_structural_json_entry(report: &str, class: &str, path: &str, action: &str) {
+    let entry = report
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| {
+            record["class"] == class
+                && record["action"] == action
+                && record["path"].as_str().map(Path::new) == Some(Path::new(path))
+        })
+        .unwrap_or_else(|| panic!("missing {class} {action} for {path}: {report}"));
+    assert_eq!(entry.as_object().unwrap().len(), 3);
 }
 
 #[test]
@@ -5553,13 +5562,8 @@ fn cleanup_deletes_stale_temps_and_reports_the_action() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report = String::from_utf8(output.stdout).expect("report should be UTF-8");
-    assert!(report.contains(
-        "{\"class\":\"temp_stale\",\"path\":\".tmp/nar-stale.part\",\"action\":\"deleted\"}"
-    ));
-    assert!(
-        report
-            .contains("{\"class\":\"unknown_file\",\"path\":\"unknown-file\",\"action\":\"kept\"}")
-    );
+    assert_structural_json_entry(&report, "temp_stale", ".tmp/nar-stale.part", "deleted");
+    assert_structural_json_entry(&report, "unknown_file", "unknown-file", "kept");
     assert!(
         !temporary.exists(),
         "stale temporary file should be removed"
@@ -6409,13 +6413,11 @@ fn gc_dry_run_and_apply_agree_on_partial_orphan_cleanup() {
 
     // Explicit timestamps order the orphans without depending on scheduler delays.
     for (name, seconds) in [(NAR_ID, 1), (retained_orphan_nar.as_str(), 2)] {
-        fs::File::open(data_dir.join(format!("nar/{name}.nar")))
-            .unwrap()
-            .set_times(
-                fs::FileTimes::new()
-                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)),
-            )
-            .unwrap();
+        crate::cache::test_support::set_fixture_modified_time(
+            data_dir.join(format!("nar/{name}.nar")),
+            std::time::UNIX_EPOCH + Duration::from_secs(seconds),
+        )
+        .unwrap();
     }
     let narinfo = signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64);
     let narinfo_bytes = narinfo.len() as u64;

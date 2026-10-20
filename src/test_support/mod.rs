@@ -11,7 +11,15 @@ use unix as host;
 #[cfg(windows)]
 use windows as host;
 
+pub(crate) use host::remove_symlink;
 pub(crate) use host::{non_unicode_name, symlink};
+
+pub(crate) fn set_fixture_modified_time(
+    path: impl AsRef<Path>,
+    time: std::time::SystemTime,
+) -> io::Result<()> {
+    File::options().write(true).open(path)?.set_modified(time)
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum InjectedIoFailure {

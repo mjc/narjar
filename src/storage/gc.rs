@@ -3175,9 +3175,10 @@ mod tests {
                         .open_manifest(name.raw_hash().unwrap())
                         .unwrap()
                         .unwrap(),
-                    (StorageBackend::Flat, _) | (StorageBackend::Chunked, true) => {
-                        File::open(directory.path().join("nar").join(name.to_string())).unwrap()
-                    }
+                    (StorageBackend::Flat, _) | (StorageBackend::Chunked, true) => File::options()
+                        .write(true)
+                        .open(directory.path().join("nar").join(name.to_string()))
+                        .unwrap(),
                 };
                 file.set_modified(old + Duration::from_secs(index as u64))
                     .unwrap();
@@ -3226,17 +3227,17 @@ mod tests {
             Vec::new(),
         );
         let old = SystemTime::now() - Duration::from_secs(86400);
-        File::open(directory.path().join(&original.narinfo_name))
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-        File::open(
+        crate::cache::test_support::set_fixture_modified_time(
+            directory.path().join(&original.narinfo_name),
+            old,
+        )
+        .unwrap();
+        crate::cache::test_support::set_fixture_modified_time(
             directory
                 .path()
                 .join(format!("{TEST_SECOND_STORE_HASH}.narinfo")),
+            old + Duration::from_secs(10),
         )
-        .unwrap()
-        .set_modified(old + Duration::from_secs(10))
         .unwrap();
         storage.enable_access_tracking().unwrap();
         assert!(
@@ -3355,9 +3356,7 @@ mod tests {
             let orphan = NarFileName::raw(NarHash::from_digest([42; 32])).to_string();
             let orphan_path = directory.path().join("nar").join(&orphan);
             fs::write(&orphan_path, b"old orphan").unwrap();
-            File::open(&orphan_path)
-                .unwrap()
-                .set_modified(UNIX_EPOCH)
+            crate::cache::test_support::set_fixture_modified_time(&orphan_path, UNIX_EPOCH)
                 .unwrap();
             let trusted =
                 TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
@@ -4093,14 +4092,16 @@ mod tests {
 
     fn age_publication(directory: &Path, entry: &Entry) {
         let old = SystemTime::now() - ONLINE_GC_GRACE - Duration::from_secs(1);
-        File::open(directory.join(&entry.narinfo_name))
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-        File::open(directory.join("nar").join(&entry.nar_name))
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
+        crate::cache::test_support::set_fixture_modified_time(
+            directory.join(&entry.narinfo_name),
+            old,
+        )
+        .unwrap();
+        crate::cache::test_support::set_fixture_modified_time(
+            directory.join("nar").join(&entry.nar_name),
+            old,
+        )
+        .unwrap();
     }
 
     fn scannable_pair_fixture() -> (tempfile::TempDir, Storage, Entry) {
@@ -4459,10 +4460,7 @@ mod tests {
                 let metadata_path = directory
                     .path()
                     .join(format!("{}.narinfo", metadata.claims().store().as_str()));
-                File::open(metadata_path)
-                    .unwrap()
-                    .set_modified(old)
-                    .unwrap();
+                crate::cache::test_support::set_fixture_modified_time(metadata_path, old).unwrap();
             }
             // Model an aged daemon: reset only the test coordinator, not content or signatures.
             storage.collection =
@@ -4883,10 +4881,11 @@ mod tests {
             )
             .unwrap();
         let path = directory.path().join("nar").join(name.to_string());
-        File::open(&path)
-            .unwrap()
-            .set_modified(SystemTime::now() - ONLINE_GC_GRACE - Duration::from_secs(1))
-            .unwrap();
+        crate::cache::test_support::set_fixture_modified_time(
+            &path,
+            SystemTime::now() - ONLINE_GC_GRACE - Duration::from_secs(1),
+        )
+        .unwrap();
         let trusted = TrustedPublicKeys::load(&Directory::open(directory.path()).unwrap()).unwrap();
         let report = run_online(online_options(), &storage, &trusted).unwrap();
         assert_eq!(report.orphaned, 1);
