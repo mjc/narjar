@@ -51,23 +51,6 @@ jobs:
           CARGO_INSTALL_VERSION: ${{ inputs.version }}
         run: bash ci/check-cargo-install-without-nix.sh
 
-  windows-library:
-    name: Windows library (not the Unix CLI)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ inputs.ref }}
-      - name: Install the pinned Rust toolchain
-        run: |
-          toolchain=$(tr -d '\r' < rust-toolchain.toml | sed -n 's/^channel = "\(.*\)"$/\1/p')
-          test -n "$toolchain"
-          rustup toolchain install "$toolchain" --profile minimal
-          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
-      - name: Test the portable library without application dependencies
-        run: cargo test --locked --no-default-features --lib --test nar_decoder --test nar_encoder
-
   windows-application:
     name: Windows application
     runs-on: windows-latest
@@ -90,11 +73,26 @@ jobs:
           rustup toolchain install $toolchain --profile minimal
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
           "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - name: Probe NTFS synchronization under a standard account
-        run: ./ci/check-windows-filesystem.ps1
-      - name: Check the default-feature application
+      - name: Install the pinned native test runner
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'cargo-nextest-0.9.136.zip'
+          Invoke-WebRequest -Uri 'https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.136/cargo-nextest-0.9.136-x86_64-pc-windows-msvc.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'fb865364e50c15e7be084f84f18e15dde96c6b0d8022cc7d6445f2a3761cda6e') {
+            throw 'Unexpected nextest archive digest'
+          }
+          $cargoBin = Join-Path $env:USERPROFILE '.cargo/bin'
+          Expand-Archive -Path $archive -DestinationPath $cargoBin -Force
+          cargo nextest --version
+      - name: Test the portable library without application dependencies
+        run: cargo nextest run --locked --no-default-features --lib --test nar_decoder --test nar_encoder --test nar_allocations
+      - name: Build the default-feature application
         if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
-        run: cargo check --locked --bin narjar
+        run: cargo build --locked --bin narjar
+      - name: Check NTFS and the application under a standard account
+        run: ./ci/check-windows-filesystem.ps1 -NarjarExecutable (Resolve-Path target/debug/narjar.exe)
       - name: Check the native application test harness
         if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
         run: cargo check --locked --test cli
+      - name: Run the native application suite
+        if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
+        run: cargo nextest run --locked --package narjar --all-features --no-fail-fast

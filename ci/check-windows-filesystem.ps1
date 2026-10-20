@@ -1,9 +1,12 @@
+param([Parameter(Mandatory)][string]$NarjarExecutable)
 $ErrorActionPreference = 'Stop'
 $probeRoot = Join-Path $env:GITHUB_WORKSPACE 'target/windows-filesystem-probe'
 New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
 $executable = Join-Path $probeRoot 'probe.exe'
 rustc --edition 2024 ci/windows-filesystem-probe.rs -o $executable
 if ($LASTEXITCODE -ne 0) { throw 'Windows filesystem probe compilation failed' }
+Copy-Item $NarjarExecutable (Join-Path $probeRoot 'narjar.exe')
+Copy-Item 'ci/windows-application-smoke.ps1' (Join-Path $probeRoot 'application-smoke.ps1')
 
 $accountName = 'NarjarFsProbe'
 $password = ConvertTo-SecureString ('Aa9!' + [guid]::NewGuid().ToString('N')) -AsPlainText -Force
@@ -35,6 +38,7 @@ Write-Output "Account: $($identity.Name); SID: $($identity.User); administrator:
 Write-Output "OS: $([System.Environment]::OSVersion.VersionString)"
 & (Join-Path $Root 'probe.exe') $Root
 if ($LASTEXITCODE -ne 0) { throw "Filesystem probe failed: $LASTEXITCODE" }
+& (Join-Path $Root 'application-smoke.ps1') -Executable (Join-Path $Root 'narjar.exe') -Root $Root
 '@ | Set-Content -Path $childScript
     $credential = [System.Management.Automation.PSCredential]::new(
         "$env:COMPUTERNAME\$accountName", $password)
