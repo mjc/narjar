@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::cache::filesystem::{
-    FileAccess, FileCreation, FilePrivacy, set_file_privacy, validate_file_privacy,
+    FileAccess, FileCreation, FilePrivacy, LeaseCreation, set_file_privacy, validate_file_privacy,
 };
 
 use super::{
@@ -125,7 +125,7 @@ impl CacheCreation {
         root: &Directory,
         backend: SupportedStorageBackend,
     ) -> Result<Self, StorageError> {
-        let layout = CacheLayout::lock(root, backend)?;
+        let layout = CacheLayout::lock(root, backend, LeaseCreation::CreateIfMissing)?;
         let descriptor = layout.prepare_descriptor()?;
         Ok(Self { layout, descriptor })
     }
@@ -199,9 +199,13 @@ struct CacheLayout {
 }
 
 impl CacheLayout {
-    fn lock(root: &Directory, backend: SupportedStorageBackend) -> Result<Self, StorageError> {
+    fn lock(
+        root: &Directory,
+        backend: SupportedStorageBackend,
+        creation: LeaseCreation,
+    ) -> Result<Self, StorageError> {
         let directory = root.file().try_clone()?;
-        let lock = ProcessLock::acquire(root)?;
+        let lock = ProcessLock::acquire(root, creation)?;
         Ok(Self {
             root: directory,
             backend,
@@ -348,7 +352,7 @@ fn directory_parent<'name>(root: &File, name: &'name str) -> io::Result<(File, &
 
 impl Storage {
     pub fn open(root: &Directory, backend: SupportedStorageBackend) -> Result<Self, StorageError> {
-        let layout = CacheLayout::lock(root, backend)?;
+        let layout = CacheLayout::lock(root, backend, LeaseCreation::Existing)?;
         layout.validate_existing()?;
         layout.into_storage()
     }

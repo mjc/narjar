@@ -37,6 +37,12 @@ pub(crate) enum FileCreation {
     Truncate,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum LeaseCreation {
+    Existing,
+    CreateIfMissing,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FilePrivacy {
     Private,

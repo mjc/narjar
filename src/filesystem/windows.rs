@@ -20,7 +20,7 @@ use windows_sys::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
             FILE_CREATE, FILE_DIRECTORY_FILE, FILE_LINK_INFORMATION, FILE_NON_DIRECTORY_FILE,
-            FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+            FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
             FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
             FILE_SYNCHRONOUS_IO_NONALERT, FileLinkInformation, FileRenameInformationEx,
             NtCreateFile, NtSetInformationFile,
@@ -42,7 +42,9 @@ use windows_sys::{
     },
 };
 
-use super::{EntryKind, EntryMetadata, FileAccess, FileCreation, FilePrivacy, FileStamp};
+use super::{
+    EntryKind, EntryMetadata, FileAccess, FileCreation, FilePrivacy, FileStamp, LeaseCreation,
+};
 
 pub(super) fn is_link_traversal_error(error: &io::Error) -> bool {
     error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_CANT_ACCESS_FILE as i32)
@@ -436,14 +438,17 @@ fn create_child_with_sharing(
 /// Opens an independent lease-file handle relative to the retained DATA
 /// directory. Omitting delete sharing prevents lock replacement while this
 /// handle lives; acquiring and releasing the process lock belongs to its owner.
-pub(crate) fn open_process_lease_at(root: &File) -> io::Result<File> {
+pub(crate) fn open_process_lease_at(root: &File, creation: LeaseCreation) -> io::Result<File> {
     let name = ChildName::new(OsStr::new("lock"))?;
     create_child_with_sharing(
         root,
         &name,
         Kind::Regular,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-        FILE_OPEN_IF,
+        match creation {
+            LeaseCreation::Existing => FILE_OPEN,
+            LeaseCreation::CreateIfMissing => FILE_OPEN_IF,
+        },
         FilePrivacy::Private,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
     )

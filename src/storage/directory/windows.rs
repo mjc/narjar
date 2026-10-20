@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::cache::filesystem::{
-    FilePrivacy, open_process_lease_at, validate_directory, validate_file_privacy,
+    FilePrivacy, LeaseCreation, open_process_lease_at, validate_directory, validate_file_privacy,
 };
 
 use super::{super::StorageError, Directory};
@@ -21,8 +21,12 @@ pub(in super::super) struct ProcessLock {
 }
 
 impl ProcessLock {
-    pub(in super::super) fn acquire(root: &Directory) -> Result<Self, StorageError> {
-        let file = open_process_lease_at(root.file())?;
+    pub(in super::super) fn acquire(
+        root: &Directory,
+        creation: LeaseCreation,
+    ) -> Result<Self, StorageError> {
+        let file = open_process_lease_at(root.file(), creation)
+            .map_err(|error| io::Error::new(error.kind(), format!("lock: {error}")))?;
         validate_file_privacy(&file, FilePrivacy::Private)?;
         match file.try_lock() {
             Ok(()) => Ok(Self { file }),
@@ -46,14 +50,14 @@ mod tests {
     fn a_second_lease_contends_even_through_the_same_directory_capability() {
         let root = tempfile::tempdir().unwrap();
         let directory = Directory::open(root.path()).unwrap();
-        let first = ProcessLock::acquire(&directory).unwrap();
+        let first = ProcessLock::acquire(&directory, LeaseCreation::CreateIfMissing).unwrap();
         assert!(matches!(
-            ProcessLock::acquire(&directory),
+            ProcessLock::acquire(&directory, LeaseCreation::Existing),
             Err(StorageError::Locked)
         ));
         assert!(std::fs::remove_file(root.path().join("lock")).is_err());
         drop(first);
-        assert!(ProcessLock::acquire(&directory).is_ok());
+        assert!(ProcessLock::acquire(&directory, LeaseCreation::Existing).is_ok());
     }
 
     #[test]
@@ -62,7 +66,7 @@ mod tests {
         let path = parent.path().join("data");
         std::fs::create_dir(&path).unwrap();
         let original = Directory::open(&path).unwrap();
-        let held = ProcessLock::acquire(&original).unwrap();
+        let held = ProcessLock::acquire(&original, LeaseCreation::CreateIfMissing).unwrap();
         assert_eq!(
             std::fs::rename(&path, parent.path().join("moved"))
                 .unwrap_err()
@@ -70,21 +74,22 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert!(matches!(
-            ProcessLock::acquire(&original),
+            ProcessLock::acquire(&original, LeaseCreation::Existing),
             Err(StorageError::Locked)
         ));
         drop(held);
         std::fs::rename(&path, parent.path().join("moved")).unwrap();
-        let held = ProcessLock::acquire(&original).unwrap();
+        let held = ProcessLock::acquire(&original, LeaseCreation::CreateIfMissing).unwrap();
         std::fs::create_dir(&path).unwrap();
         let replacement = Directory::open(&path).unwrap();
         assert!(matches!(
-            ProcessLock::acquire(&original),
+            ProcessLock::acquire(&original, LeaseCreation::Existing),
             Err(StorageError::Locked)
         ));
-        let independent = ProcessLock::acquire(&replacement).unwrap();
+        let independent =
+            ProcessLock::acquire(&replacement, LeaseCreation::CreateIfMissing).unwrap();
         drop(held);
-        assert!(ProcessLock::acquire(&original).is_ok());
+        assert!(ProcessLock::acquire(&original, LeaseCreation::Existing).is_ok());
         drop(independent);
     }
 
@@ -155,12 +160,12 @@ mod tests {
         );
         let directory = Directory::open(root.path()).unwrap();
         assert!(matches!(
-            ProcessLock::acquire(&directory),
+            ProcessLock::acquire(&directory, LeaseCreation::Existing),
             Err(StorageError::Locked)
         ));
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        assert!(ProcessLock::acquire(&directory).is_ok());
+        assert!(ProcessLock::acquire(&directory, LeaseCreation::Existing).is_ok());
     }
 
     #[test]
@@ -171,7 +176,7 @@ mod tests {
             return;
         };
         let directory = Directory::open(Path::new(&root)).unwrap();
-        let _lease = ProcessLock::acquire(&directory).unwrap();
+        let _lease = ProcessLock::acquire(&directory, LeaseCreation::CreateIfMissing).unwrap();
         let mut ready =
             std::net::TcpStream::connect(std::env::var("NARJAR_WINDOWS_LEASE_READY").unwrap())
                 .unwrap();

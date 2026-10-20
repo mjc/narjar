@@ -22,7 +22,10 @@ pub(in super::super) struct ProcessLock {
 }
 
 impl ProcessLock {
-    pub(in super::super) fn acquire(root: &Directory) -> Result<Self, StorageError> {
+    pub(in super::super) fn acquire(
+        root: &Directory,
+        _: crate::cache::filesystem::LeaseCreation,
+    ) -> Result<Self, StorageError> {
         // Reopen rather than clone: other directory handles must not extend the lease.
         let file: File = fs::openat(
             root.file(),
