@@ -9,7 +9,10 @@ $accountName = 'NarjarFsProbe'
 $password = ConvertTo-SecureString ('Aa9!' + [guid]::NewGuid().ToString('N')) -AsPlainText -Force
 $account = New-LocalUser -Name $accountName -Password $password -AccountNeverExpires
 try {
-    Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account.SID
+    $members = @(Get-LocalGroupMember -SID 'S-1-5-32-545')
+    if ($account.SID.Value -notin $members.SID.Value) {
+        Add-LocalGroupMember -SID 'S-1-5-32-545' -Member "$env:COMPUTERNAME\$accountName"
+    }
     $volume = Get-Volume -FilePath $probeRoot
     Write-Output "Filesystem: $($volume.FileSystemType)"
     if ($volume.FileSystemType -ne 'NTFS') { throw 'Probe requires local NTFS' }
