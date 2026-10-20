@@ -546,12 +546,7 @@ fn serve_rejects_uninitialized_data_dir() {
         "1",
     ]);
 
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .expect("stderr should be UTF-8")
-            .contains("missing its storage-layout descriptor")
-    );
+    assert_incomplete_cache_rejected_without_creating_entries(&data_dir, &[], output);
 }
 
 #[test]
@@ -576,11 +571,40 @@ fn serve_rejects_partial_data_dir() {
         "1",
     ]);
 
-    assert!(!output.status.success());
+    assert_incomplete_cache_rejected_without_creating_entries(
+        &data_dir,
+        &[".tmp", "auth", "nar", "realisations"],
+        output,
+    );
+}
+
+fn assert_incomplete_cache_rejected_without_creating_entries(
+    root: &Path,
+    expected_names: &[&str],
+    output: Output,
+) {
+    assert_eq!(output.status.code(), Some(1));
     assert!(
-        String::from_utf8(output.stderr)
-            .expect("stderr should be UTF-8")
-            .contains("missing its storage-layout descriptor")
+        output.stdout.is_empty(),
+        "an incomplete cache must not start listening"
+    );
+    let error = String::from_utf8(output.stderr).unwrap();
+    // Unix leases DATA itself; Windows first needs an existing lease file.
+    assert!(
+        error.contains("missing its storage-layout descriptor") || error.contains("lock:"),
+        "{error}"
+    );
+    let mut names = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        expected_names
+            .iter()
+            .map(|name| std::ffi::OsString::from(*name))
+            .collect::<Vec<_>>()
     );
 }
 
