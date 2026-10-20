@@ -4310,7 +4310,10 @@ fn process_lock_follows_the_opened_directory_after_its_path_is_replaced() {
     let renamed = parent.path().join("renamed");
     fs::create_dir(&data).unwrap();
     let opened = Directory::open(&data).unwrap();
-    let first = initialize_storage(&data).unwrap();
+    let first = CacheCreation::prepare(&opened, SupportedStorageBackend::FLAT)
+        .unwrap()
+        .create_or_complete()
+        .unwrap();
     fs::rename(&data, &renamed).unwrap();
     fs::create_dir(&data).unwrap();
 
