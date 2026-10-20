@@ -753,14 +753,26 @@ mod tests {
 
     #[test]
     fn ancestors_can_deny_listing_without_blocking_child_creation_or_reads() {
-        use std::io::Read;
+        use std::io::{Read, Write};
 
         let root = tempfile::tempdir().unwrap();
         let root_directory = open_directory(root.path()).unwrap();
         let ancestor_path = root.path().join("unlisted");
         let ancestor = create_private_directory(&ancestor_path).unwrap();
         let payload_path = ancestor_path.join("payload");
-        std::fs::write(&payload_path, b"payload").unwrap();
+        {
+            // Give the payload its own protected ACL: changing its parent's
+            // inheritance must deny listing, not remove the payload's grants.
+            let mut payload = open_writable_at(
+                &ancestor,
+                OsStr::new("payload"),
+                FileAccess::Write,
+                FileCreation::CreateNew,
+                FilePrivacy::Private,
+            )
+            .unwrap();
+            payload.write_all(b"payload").unwrap();
+        }
         let restore_permissions = scopeguard::guard(ancestor, |directory| {
             let _ = security::set(&directory, FilePrivacy::Private);
         });
@@ -780,6 +792,7 @@ mod tests {
             open_regular(&payload_path).unwrap(),
             open_regular_at(&root_directory, Path::new("unlisted").join("payload")).unwrap(),
         ] {
+            validate_private_file(&file).unwrap();
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).unwrap();
             assert_eq!(bytes, b"payload");
