@@ -65,13 +65,25 @@ mod tests {
     }
 
     #[test]
-    fn the_lease_follows_opened_data_when_its_path_is_replaced() {
+    fn a_live_lease_pins_data_and_reacquires_the_retained_directory_after_a_move() {
         let parent = tempfile::tempdir().unwrap();
         let path = parent.path().join("data");
         std::fs::create_dir(&path).unwrap();
         let original = Directory::open(&path).unwrap();
         let held = ProcessLock::acquire(&original).unwrap();
+        assert_eq!(
+            std::fs::rename(&path, parent.path().join("moved"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(matches!(
+            ProcessLock::acquire(&original),
+            Err(StorageError::Locked)
+        ));
+        drop(held);
         std::fs::rename(&path, parent.path().join("moved")).unwrap();
+        let held = ProcessLock::acquire(&original).unwrap();
         std::fs::create_dir(&path).unwrap();
         let replacement = Directory::open(&path).unwrap();
         assert!(matches!(

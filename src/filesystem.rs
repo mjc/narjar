@@ -89,6 +89,7 @@ pub fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
 pub(crate) fn create_private_directory_tree(path: &std::path::Path) -> io::Result<File> {
     let directory = ensure_private_directory_tree(path)?;
     set_file_privacy(&directory, FilePrivacy::Private)?;
+    validate_private_directory(&directory)?;
     Ok(directory)
 }
 

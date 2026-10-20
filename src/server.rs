@@ -878,6 +878,7 @@ mod tests {
         assert_accepts_after_connection_error(io::ErrorKind::ConnectionAborted.into());
     }
 
+    #[cfg(unix)]
     #[test]
     fn permanent_listener_errors_are_not_retried() {
         use rustix::io::Errno;

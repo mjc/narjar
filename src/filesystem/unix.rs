@@ -82,6 +82,17 @@ pub fn validate_private_file(file: &File) -> io::Result<()> {
     validate_file_privacy(file, FilePrivacy::Private)
 }
 
+pub(crate) fn validate_private_directory(directory: &File) -> io::Result<()> {
+    let metadata = directory.metadata()?;
+    match (metadata.is_dir(), metadata.permissions().mode() & 0o777) {
+        (true, 0o700) => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a private 0700 directory",
+        )),
+    }
+}
+
 pub(crate) fn validate_file_privacy_at(
     parent: &File,
     name: &OsStr,
@@ -99,13 +110,20 @@ pub(crate) fn validate_file_privacy_at(
 
 fn validate_mode(mode: u32, privacy: FilePrivacy) -> io::Result<()> {
     let (valid, message) = match privacy {
-        FilePrivacy::Private => (mode & 0o777 == 0o600, "file must have 0600 permissions"),
+        FilePrivacy::Private => (
+            private_file_mode_is_valid(mode),
+            "file must have 0600 permissions",
+        ),
         FilePrivacy::Public => (mode & 0o133 == 0, "file has unsafe permissions"),
     };
     match valid {
         true => Ok(()),
         false => Err(io::Error::new(io::ErrorKind::InvalidData, message)),
     }
+}
+
+pub(crate) const fn private_file_mode_is_valid(mode: u32) -> bool {
+    mode & 0o777 == 0o600
 }
 
 pub(crate) fn validate_managed_file_privacy(file: &File, privacy: FilePrivacy) -> io::Result<()> {

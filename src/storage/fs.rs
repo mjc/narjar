@@ -29,11 +29,6 @@ pub(super) fn require_directory_at(parent: &File, name: &str) -> io::Result<File
     validate_directory(&directory, name)
 }
 
-/// Required permission bits for private layout and policy files.
-pub const fn private_file_mode_is_valid(mode: u32) -> bool {
-    mode & 0o777 == 0o600
-}
-
 pub(super) fn require_private_file_at(
     parent: &File,
     name: &str,
@@ -199,7 +194,6 @@ pub(super) fn remove_temp(temp: &TemporaryFile) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt;
 
     #[test]
     fn immutable_link_classifies_retries_without_overwriting_destinations() {
@@ -238,8 +232,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn relative_filesystem_operations_preserve_bytes_and_symlinks_after_directory_rename() {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().expect("create root");
@@ -287,8 +283,8 @@ mod tests {
         assert_eq!(
             entry_metadata_at(&directory, renamed)
                 .expect_err("link removed")
-                .raw_os_error(),
-            Some(rustix::io::Errno::NOENT.raw_os_error())
+                .kind(),
+            io::ErrorKind::NotFound
         );
         assert!(
             entry_metadata_at(&directory, source).is_ok(),
@@ -316,7 +312,7 @@ mod tests {
     fn injected_readdir_error_propagates() {
         let result = visit_directory_names(
             std::iter::once(Err(io::Error::from_raw_os_error(
-                rustix::io::Errno::IO.raw_os_error(),
+                crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
             ))),
             |_| Ok(DirectoryEntryAction::Continue),
         );
@@ -325,7 +321,7 @@ mod tests {
             result
                 .expect_err("incomplete enumeration must fail")
                 .raw_os_error(),
-            Some(rustix::io::Errno::IO.raw_os_error())
+            Some(crate::cache::test_support::InjectedIoFailure::ReadFailure.code())
         );
     }
 
@@ -341,7 +337,7 @@ mod tests {
         let error = read_dir_names_with(std::iter::from_fn(|| {
             if returned_live_name {
                 return Some(Err(io::Error::from_raw_os_error(
-                    rustix::io::Errno::IO.raw_os_error(),
+                    crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
                 )));
             }
             let entry = entries.next()?;
@@ -358,7 +354,7 @@ mod tests {
         );
         assert_eq!(
             error.raw_os_error(),
-            Some(rustix::io::Errno::IO.raw_os_error())
+            Some(crate::cache::test_support::InjectedIoFailure::ReadFailure.code())
         );
     }
 
@@ -400,14 +396,14 @@ mod tests {
 
         let error = for_each_dir_name(&directory, |_| {
             Err(io::Error::from_raw_os_error(
-                rustix::io::Errno::ACCESS.raw_os_error(),
+                crate::cache::test_support::InjectedIoFailure::AccessDenied.code(),
             ))
         })
         .expect_err("visitor error should propagate");
 
         assert_eq!(
             error.raw_os_error(),
-            Some(rustix::io::Errno::ACCESS.raw_os_error())
+            Some(crate::cache::test_support::InjectedIoFailure::AccessDenied.code())
         );
     }
 

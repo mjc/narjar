@@ -119,6 +119,7 @@ mod tests {
         assert!(read_dir_names(&directory).unwrap().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn publication_and_abandonment_follow_the_directory_handle_after_replacement() {
         let root = tempfile::tempdir().unwrap();
@@ -142,6 +143,33 @@ mod tests {
             read_dir_names(&directory).unwrap(),
             [OsString::from("secret")]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_live_stage_pins_its_parent_and_a_retained_directory_still_follows_a_later_move() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let directory = open_directory(&original).unwrap();
+        let ready = PreparedFile::write(&directory, FilePrivacy::Private, |_| Ok(())).unwrap();
+        assert_eq!(
+            std::fs::rename(&original, &moved).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        drop(ready);
+        assert!(read_dir_names(&directory).unwrap().is_empty());
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        PreparedFile::write(&directory, FilePrivacy::Private, |file| {
+            file.write_all(b"secret")
+        })
+        .unwrap()
+        .publish_new(OsStr::new("secret"))
+        .unwrap();
+        assert_eq!(std::fs::read(moved.join("secret")).unwrap(), b"secret");
+        assert!(std::fs::read_dir(&original).unwrap().next().is_none());
     }
 
     #[test]

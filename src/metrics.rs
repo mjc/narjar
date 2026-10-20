@@ -2944,8 +2944,8 @@ mod tests {
         PopulationCounts, PublishOutcome, StorageBackend, StorageCapacity, StorageError,
         StorageReadiness,
     };
+    use crate::cache::test_support::symlink;
     use std::{
-        os::unix::fs::symlink,
         path::Path,
         time::{Duration, Instant},
     };
@@ -3372,7 +3372,7 @@ mod tests {
 
         std::fs::remove_file(directory.path().join(".narjar-maintenance-gc.last"))
             .expect("record should be replaceable for the failure case");
-        std::os::unix::fs::symlink(
+        symlink(
             directory.path().join("missing"),
             directory.path().join(".narjar-maintenance-gc.last"),
         )
@@ -3479,6 +3479,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn zfs_samples_reject_nonregular_files_without_waiting_for_a_writer() {
         let temporary = tempfile::tempdir().unwrap();

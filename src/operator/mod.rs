@@ -1386,10 +1386,11 @@ fn write_json_line(mut writer: impl Write, value: &impl Serialize) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod unix;
     use super::*;
     use crate::cache::maintenance::{Operation, Outcome};
     use crate::cache::storage::{CacheCreation, Directory, SupportedStorageBackend};
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn doctor_does_not_replace_recovery_inspection_errors_with_missing_marker_diagnostics() {
@@ -1493,10 +1494,11 @@ mod tests {
 
     #[test]
     fn doctor_json_preserves_lossy_paths_nulls_and_flat_capacity_fields() {
-        use std::os::unix::ffi::OsStringExt;
         let directory = initialized_doctor_cache();
         let mut report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT).unwrap();
-        report.root = PathBuf::from(std::ffi::OsString::from_vec(b"cache-\xff".to_vec()));
+        let mut invalid = std::ffi::OsString::from("cache-");
+        invalid.push(crate::cache::test_support::non_unicode_name(""));
+        report.root = PathBuf::from(invalid);
         report.mount_detail = "quote\" slash\\\n\0".into();
         report.paths[0].mode = None;
         let value = serde_json::to_value(doctor_json(&report)).unwrap();
@@ -1749,11 +1751,11 @@ machine other.example password other-secret
             .expect("published recovery fixture should encode"),
         )
         .expect("published transaction should be durable on disk");
-        fs::set_permissions(&transaction_path, fs::Permissions::from_mode(0o600))
+        crate::cache::test_support::make_private_file(&transaction_path)
             .expect("transaction should have private permissions");
         let recovery_marker = directory.path().join(".narjar-recovery");
         fs::write(&recovery_marker, b"interrupted\n").expect("recovery marker should be present");
-        fs::set_permissions(&recovery_marker, fs::Permissions::from_mode(0o600))
+        crate::cache::test_support::make_private_file(&recovery_marker)
             .expect("recovery marker should have private permissions");
 
         let published_destination = directory.path().join("nix-cache-info");
@@ -1962,38 +1964,6 @@ machine other.example password other-secret
     }
 
     #[test]
-    fn doctor_rejects_private_file_modes_that_startup_rejects() {
-        let directory = initialized_doctor_cache();
-        for name in ["lock", LAYOUT_DESCRIPTOR]
-            .into_iter()
-            .chain(CACHE_POLICY_FILES.iter().copied())
-        {
-            let path = directory.path().join(name);
-            for mode in [0o400, 0o644, 0o660] {
-                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
-                let report =
-                    inspect_doctor(directory.path(), SupportedStorageBackend::FLAT).unwrap();
-                let entry = report
-                    .paths
-                    .iter()
-                    .find(|entry| entry.path == name)
-                    .unwrap();
-                assert!(
-                    entry.severity.is_failure(),
-                    "doctor accepted {name} with mode {mode:04o}"
-                );
-                assert!(report.has_failures());
-            }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        assert!(
-            !inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
-                .unwrap()
-                .has_failures()
-        );
-    }
-
-    #[test]
     fn doctor_requires_one_private_recovery_marker_and_checks_both_when_present() {
         let directory = initialized_doctor_cache();
         let clean = directory.path().join(".narjar-clean");
@@ -2006,55 +1976,23 @@ machine other.example password other-secret
             "neither marker is not an initialized cache"
         );
         fs::write(&recovery, b"interrupted\n").unwrap();
-        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::cache::test_support::make_private_file(&recovery).unwrap();
         assert!(!report().has_failures(), "a recovery marker is sufficient");
         fs::write(&clean, b"").unwrap();
-        fs::set_permissions(&clean, fs::Permissions::from_mode(0o644)).unwrap();
+        crate::cache::test_support::make_public_file(&clean).unwrap();
         assert!(
             report().has_failures(),
             "a valid recovery marker cannot hide an unsafe clean marker"
         );
-        fs::set_permissions(&clean, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::cache::test_support::make_private_file(&clean).unwrap();
         assert!(
             !report().has_failures(),
             "both private markers are permitted"
         );
-        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o644)).unwrap();
+        crate::cache::test_support::make_public_file(&recovery).unwrap();
         assert!(
             report().has_failures(),
             "a valid clean marker cannot hide an unsafe recovery marker"
-        );
-    }
-
-    #[test]
-    fn native_doctor_loads_the_same_required_policies_as_startup() {
-        let directory = initialized_doctor_cache();
-        let settings = NativeStoreSettings::new(
-            directory.path().join("missing-store"),
-            directory.path().join("native-state"),
-            directory.path().join("native-roots"),
-            NonZeroU64::new(60).unwrap(),
-        );
-        for name in CACHE_POLICY_FILES {
-            let path = directory.path().join(name);
-            let original = fs::read(&path).unwrap();
-            fs::remove_file(&path).unwrap();
-            assert_eq!(
-                validate_doctor_native_store(directory.path(), &settings),
-                Err("cache policy is invalid")
-            );
-            assert!(!path.exists(), "doctor must not recreate {name}");
-            fs::write(&path, original).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        fs::write(
-            directory.path().join("auth/write.tokens"),
-            b"invalid token record\n",
-        )
-        .unwrap();
-        assert_eq!(
-            validate_doctor_native_store(directory.path(), &settings),
-            Err("cache policy is invalid")
         );
     }
 
@@ -2137,106 +2075,6 @@ machine other.example password other-secret
         assert!(json.contains("\"total_bytes\":"));
         assert!(json.contains("\"lease\":{\"severity\":\"ok\""));
         assert!(json.contains("\"source\":{\"name\":\"flat-cache\""));
-    }
-
-    #[test]
-    fn doctor_source_policy_errors_keep_the_existing_static_details() {
-        use narjar::object::CompressionCodec;
-
-        let complete = NativeStoreOptions {
-            store_dir: Some(Path::new("/private/store-path")),
-            state_dir: Some(Path::new("/private/state-path")),
-            roots_dir: Some(Path::new("/private/roots-path")),
-            min_lease_seconds: NonZeroU64::new(60),
-            signing_key_file: None,
-        };
-        for (choice, native, encoding, backend, expected_error, detail) in [
-            (
-                ServeSourceChoice::ReadThrough,
-                NativeStoreOptions::default(),
-                WireEncoding::Compressed(CompressionCodec::Zstd),
-                StorageBackend::Flat,
-                SourcePreparationError::EdgeCompressedOutput,
-                "read-through source requires raw output",
-            ),
-            (
-                ServeSourceChoice::ReadThrough,
-                NativeStoreOptions::default(),
-                WireEncoding::Compressed(CompressionCodec::Xz),
-                StorageBackend::Flat,
-                SourcePreparationError::EdgeCompressedOutput,
-                "read-through source requires raw output",
-            ),
-            (
-                ServeSourceChoice::FlatCache,
-                complete,
-                WireEncoding::Raw,
-                StorageBackend::Flat,
-                SourcePreparationError::NativeOptionsForCache,
-                "native source options require native-store selection",
-            ),
-            (
-                ServeSourceChoice::NativeStore,
-                NativeStoreOptions {
-                    state_dir: None,
-                    ..complete
-                },
-                WireEncoding::Raw,
-                StorageBackend::Flat,
-                SourcePreparationError::MissingNativeOptions,
-                "required native source options are missing",
-            ),
-            (
-                ServeSourceChoice::NativeStore,
-                complete,
-                WireEncoding::Compressed(CompressionCodec::Xz),
-                StorageBackend::Flat,
-                SourcePreparationError::NativeCompressedOutput,
-                "native source requires raw output and flat storage",
-            ),
-            (
-                ServeSourceChoice::NativeStore,
-                complete,
-                WireEncoding::Compressed(CompressionCodec::Zstd),
-                StorageBackend::Flat,
-                SourcePreparationError::NativeCompressedOutput,
-                "native source requires raw output and flat storage",
-            ),
-            (
-                ServeSourceChoice::NativeStore,
-                complete,
-                WireEncoding::Raw,
-                StorageBackend::Chunked,
-                SourcePreparationError::NativeChunkedBackend,
-                "native source requires raw output and flat storage",
-            ),
-        ] {
-            let options = Doctor {
-                data_dir: PathBuf::from("/unavailable/narjar-cache"),
-                json: true,
-                serve_source: choice,
-                native_store_dir: native.store_dir.map(Path::to_owned),
-                native_state_dir: native.state_dir.map(Path::to_owned),
-                native_roots_dir: native.roots_dir.map(Path::to_owned),
-                native_min_lease_seconds: native.min_lease_seconds,
-                native_signing_key_file: None,
-                egress_compression: encoding,
-                storage_backend: backend,
-            };
-            let source = options.prepare_source();
-            assert_eq!(
-                source.as_ref().unwrap_err(),
-                &expected_error,
-                "doctor must use the same source policy as serve"
-            );
-            let diagnostic = inspect_doctor_source(&options, source);
-            assert_eq!(diagnostic.name, choice.name());
-            assert!(matches!(diagnostic.severity, DoctorSeverity::Error));
-            assert_eq!(
-                diagnostic.detail, detail,
-                "policy errors must retain static details instead of inspecting unavailable paths"
-            );
-        }
     }
 
     #[test]

@@ -357,7 +357,7 @@ fn valid_realisation_filename(name: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use crate::cache::test_support::symlink;
 
     #[test]
     fn known_layout_entries_still_reject_wrong_types_and_symlinks() {

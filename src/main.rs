@@ -5,6 +5,7 @@ mod error;
 mod http;
 mod http_client;
 mod http_url;
+#[cfg(unix)]
 mod narinfo_signing;
 #[cfg(unix)]
 mod native_store;
@@ -18,6 +19,7 @@ mod read_through;
 mod server;
 mod setup;
 mod token;
+#[cfg(unix)]
 mod verified_stream;
 
 use std::process::ExitCode;

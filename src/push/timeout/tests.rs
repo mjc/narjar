@@ -7,7 +7,6 @@ use std::{
     time::Instant,
 };
 
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use ureq::{
     http::{StatusCode, Uri},
     unversioned::{
@@ -277,10 +276,10 @@ pub(crate) fn assert_redirect_retry_and_new_connections_keep_idle_timeouts(
 }
 
 fn accept(listener: &TcpListener) -> TcpStream {
-    let timeout = Timespec::try_from(Duration::from_secs(30)).unwrap();
-    let mut descriptors = [PollFd::new(listener, PollFlags::IN)];
-    assert_eq!(poll(&mut descriptors, Some(&timeout)).unwrap(), 1);
-    let (stream, _) = listener.accept().unwrap();
+    let stream = crate::cache::test_support::accept_before_deadline(
+        listener,
+        Instant::now() + Duration::from_secs(30),
+    );
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();

@@ -879,9 +879,7 @@ mod tests {
 
     impl Write for EnospcWriter {
         fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            Err(io::Error::from_raw_os_error(
-                rustix::io::Errno::NOSPC.raw_os_error(),
-            ))
+            Err(crate::cache::test_support::InjectedIoFailure::NoSpace.error())
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -901,7 +899,7 @@ mod tests {
             .expect_err("physical output exhaustion should fail encoding");
             assert_eq!(
                 error.raw_os_error(),
-                Some(rustix::io::Errno::NOSPC.raw_os_error())
+                Some(crate::cache::test_support::InjectedIoFailure::NoSpace.code())
             );
         }
     }

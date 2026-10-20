@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn invalid_or_symlink_records_fail_the_sample() {
-        use std::os::unix::fs::symlink;
+        use crate::cache::test_support::symlink;
 
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         fs::write(directory.path().join("bad"), b"not a record").unwrap();

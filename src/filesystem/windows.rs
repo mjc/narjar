@@ -326,7 +326,12 @@ pub fn open_regular_at(parent: &File, path: impl AsRef<Path>) -> io::Result<File
         .split_last()
         .ok_or_else(|| invalid_input("a regular-file name is required"))?;
     let directory = walk_directories(parent, ancestors, FILE_GENERIC_READ)?;
-    open_child(&directory, name.path(), Kind::Regular, FILE_GENERIC_READ)
+    open_child(
+        &directory,
+        name.path(),
+        Kind::Regular,
+        regular_access_rights(FileAccess::Read),
+    )
 }
 
 pub fn open_regular(path: &Path) -> io::Result<File> {
@@ -335,7 +340,12 @@ pub fn open_regular(path: &Path) -> io::Result<File> {
         .split_last()
         .ok_or_else(|| invalid_input("a regular-file name is required"))?;
     let directory = walk_directories(&root, ancestors, FILE_GENERIC_READ)?;
-    open_child(&directory, name.path(), Kind::Regular, FILE_GENERIC_READ)
+    open_child(
+        &directory,
+        name.path(),
+        Kind::Regular,
+        regular_access_rights(FileAccess::Read),
+    )
 }
 
 fn create_child(
@@ -474,11 +484,7 @@ pub(crate) fn open_writable_at(
     privacy: FilePrivacy,
 ) -> io::Result<File> {
     let name = ChildName::new(name)?;
-    let desired = match access {
-        FileAccess::Read => FILE_GENERIC_READ,
-        FileAccess::Write => FILE_GENERIC_WRITE | WRITE_DAC,
-        FileAccess::ReadWrite => FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC,
-    };
+    let desired = regular_access_rights(access);
     if let (FileAccess::Read, FileCreation::Truncate) = (access, creation) {
         return Err(invalid_input("truncation requires write access"));
     }
@@ -502,9 +508,22 @@ pub(crate) fn open_writable_at(
     Ok(file)
 }
 
+fn regular_access_rights(access: FileAccess) -> u32 {
+    match access {
+        FileAccess::Read => FILE_GENERIC_READ,
+        FileAccess::Write => FILE_GENERIC_WRITE | WRITE_DAC,
+        FileAccess::ReadWrite => FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC,
+    }
+}
+
 pub fn validate_private_file(file: &File) -> io::Result<()> {
     require_kind(file, Kind::Regular)?;
     security::validate(file, FilePrivacy::Private)
+}
+
+pub(crate) fn validate_private_directory(directory: &File) -> io::Result<()> {
+    require_kind(directory, Kind::Directory)?;
+    security::validate(directory, FilePrivacy::Private)
 }
 
 pub(crate) fn validate_managed_file_privacy(file: &File, privacy: FilePrivacy) -> io::Result<()> {

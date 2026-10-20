@@ -1,5 +1,5 @@
 use super::{DoctorEntryKind, DoctorPath, DoctorSeverity};
-use crate::cache::storage::private_file_mode_is_valid;
+use crate::cache::filesystem::private_file_mode_is_valid;
 use std::{fs, fs::File, io, os::unix::fs::MetadataExt, path::Path};
 
 pub(super) fn inspect_doctor_path(

@@ -2277,13 +2277,13 @@ mod tests {
 
         let result = writer.finish_with(identity, |_| {
             Err(std::io::Error::from_raw_os_error(
-                rustix::io::Errno::IO.raw_os_error(),
+                crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
             ))
         });
 
         assert!(matches!(
             result,
-            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(crate::cache::test_support::InjectedIoFailure::ReadFailure.code())
         ));
         assert!(store.open_manifest(identity.hash()).unwrap().is_none());
         assert!(
@@ -2340,7 +2340,7 @@ mod tests {
         assert!(
             failed
                 .finish_with(identity, |_| Err(std::io::Error::from_raw_os_error(
-                    rustix::io::Errno::IO.raw_os_error()
+                    crate::cache::test_support::InjectedIoFailure::ReadFailure.code()
                 )))
                 .is_err()
         );
@@ -2525,7 +2525,7 @@ mod tests {
         fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
             if self.sent {
                 return Err(std::io::Error::from_raw_os_error(
-                    rustix::io::Errno::IO.raw_os_error(),
+                    crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
                 ));
             }
             let length = output.len().min(self.bytes.len());
@@ -2556,7 +2556,7 @@ mod tests {
                 expected,
                 ChunkProfile::MinCdcHash4V2
             ),
-            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(crate::cache::test_support::InjectedIoFailure::ReadFailure.code())
         ));
         assert!(store.open_manifest(expected.hash()).unwrap().is_none());
         assert_eq!(

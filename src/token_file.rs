@@ -126,13 +126,10 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        os::unix::fs::{PermissionsExt, symlink},
-        process,
-    };
+    use std::{fs, process};
 
     use super::{Error, TokenFile};
+    use crate::cache::test_support::symlink;
 
     #[test]
     fn insert_rejects_invalid_labels_without_mutating_the_file() {
@@ -163,11 +160,8 @@ mod tests {
             .expect("store should not depend on predictable temporary names");
 
         assert_eq!(fs::read(&path).expect("read token file"), b"");
-        let mode = fs::metadata(path)
-            .expect("read token file metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        let file = crate::cache::filesystem::open_regular(&path).unwrap();
+        crate::cache::filesystem::validate_private_file(&file).unwrap();
     }
 
     #[test]

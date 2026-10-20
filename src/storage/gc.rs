@@ -2455,10 +2455,10 @@ fn invalid(message: impl Into<String>) -> StorageError {
 mod tests {
     use super::*;
     use crate::cache::storage::{CacheCreation, Directory, NarUploadPolicy};
+    use crate::cache::test_support::symlink;
     use sha2::Digest;
     use std::{
         fs,
-        os::unix::fs::symlink,
         time::{Duration, UNIX_EPOCH},
     };
 
@@ -2513,7 +2513,7 @@ mod tests {
             AdvertisementRemovalContext::Standalone,
             |_, _| {
                 Err(io::Error::from_raw_os_error(
-                    rustix::io::Errno::BUSY.raw_os_error(),
+                    crate::cache::test_support::InjectedIoFailure::Busy.code(),
                 ))
             },
         );
@@ -2564,7 +2564,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn chunked_gc_marks_expired_leases_pending_under_its_existing_deletion_permit() {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = initialize_chunked_storage(directory.path()).unwrap();
@@ -2609,7 +2609,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn chunked_gc_keeps_metadata_retryable_when_lease_cleanup_fails() {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = initialize_chunked_storage(directory.path()).unwrap();
@@ -3100,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn last_use_keeps_recently_read_chunked_orphans_under_pressure_but_not_past_maximum_age() {
         assert_orphan_read_hints_control_pressure_order(
             SupportedStorageBackend::try_from(StorageBackend::Chunked).unwrap(),
@@ -3109,7 +3109,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn last_use_keeps_recently_read_orphan_outputs_under_pressure_but_not_past_maximum_age() {
         assert_orphan_read_hints_control_pressure_order(
             SupportedStorageBackend::try_from(StorageBackend::Chunked).unwrap(),
@@ -3524,7 +3524,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn initialize_chunked_storage(path: &Path) -> Result<Storage, StorageError> {
         let storage = CacheCreation::prepare(
             &Directory::open(path)?,
@@ -3536,10 +3536,7 @@ mod tests {
     }
 
     fn install_private_cache_policies(path: &Path) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::create_dir_all(path.join("auth"))?;
-        fs::set_permissions(path.join("auth"), fs::Permissions::from_mode(0o700))?;
+        crate::cache::test_support::private_directory(&path.join("auth"))?;
         for (name, contents) in [
             (
                 "nix-cache-info",
@@ -3548,8 +3545,7 @@ mod tests {
             ("trusted-public-keys", ""),
             ("auth/write.tokens", ""),
         ] {
-            fs::write(path.join(name), contents)?;
-            fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600))?;
+            crate::cache::test_support::private_file(path.join(name), contents.as_bytes())?;
         }
         Ok(())
     }
@@ -3628,8 +3624,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn flat_and_chunked_gc_both_wait_until_maximum_pressure_is_crossed() {
+    fn flat_gc_waits_until_maximum_pressure_is_crossed() {
         let now = SystemTime::now();
         let mut flat_entries = [Entry {
             last_use: UNIX_EPOCH,
@@ -3684,7 +3679,12 @@ mod tests {
             .is_empty(),
             "flat GC must preserve protected entries during size pressure"
         );
+    }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chunked_gc_waits_until_maximum_pressure_is_crossed() {
+        let now = SystemTime::now();
         let directory = tempfile::tempdir().unwrap();
         let storage = initialize_chunked_storage(directory.path()).unwrap();
         let raw = vec![b'x'; 100_000];
@@ -3859,7 +3859,7 @@ mod tests {
             |storage, trusted| {
                 scan_with_directory_names(storage, trusted, |_| {
                     Err(io::Error::from_raw_os_error(
-                        rustix::io::Errno::IO.raw_os_error(),
+                        crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
                     ))
                 })
             },
@@ -4384,7 +4384,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
     fn advertising_a_signed_root_retains_its_whole_closure_for_both_storage_backends() {
         use crate::cache::{
             narinfo::NarInfoMetadata,
@@ -4393,10 +4392,9 @@ mod tests {
         use data_encoding::BASE64;
         use ed25519_dalek::{Signer, SigningKey};
 
-        for backend in [
-            SupportedStorageBackend::FLAT,
-            SupportedStorageBackend::try_from(StorageBackend::Chunked).unwrap(),
-        ] {
+        for backend in std::iter::once(SupportedStorageBackend::FLAT)
+            .chain(SupportedStorageBackend::try_from(StorageBackend::Chunked).ok())
+        {
             let directory = tempfile::tempdir().unwrap();
             let mut storage =
                 CacheCreation::prepare(&Directory::open(directory.path()).unwrap(), backend)
@@ -4926,7 +4924,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn online_chunked_gc_does_not_claim_preserved_unknown_files_as_reclaimed() {
         let directory = tempfile::tempdir().unwrap();
         let storage = initialize_chunked_storage(directory.path()).unwrap();
@@ -4968,7 +4966,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn chunked_gc_sweeps_unreferenced_manifests_and_chunks() {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
         let storage =
@@ -5022,7 +5020,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn chunked_gc_preserves_recent_orphans_then_collects_them_after_the_grace() {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
         let storage = initialize_chunked_storage(directory.path()).expect("initialize storage");
@@ -5107,7 +5105,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn chunked_gc_collects_expired_manifests_without_reading_orphan_chunks() {
         for damage in ["truncated manifest", "missing chunk"] {
             let directory = tempfile::tempdir().expect("fixture directory should be created");
@@ -5181,7 +5179,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn collecting_an_old_orphan_manifest_keeps_chunks_reachable_from_a_recent_nar() {
         let directory = tempfile::tempdir().expect("fixture directory should be created");
         let storage = initialize_chunked_storage(directory.path()).expect("initialize storage");
@@ -5351,6 +5349,7 @@ mod tests {
         assert_eq!(reconstructed, retained_nar);
     }
 
+    #[cfg(unix)]
     #[test]
     fn sigterm_after_synced_gc_deletions_retains_recovery_state() {
         use std::{os::unix::process::ExitStatusExt, process::Command};
@@ -5394,6 +5393,7 @@ mod tests {
         assert!(!directory.path().join(".narjar-recovery").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn sigterm_at_post_deletion_scan_probe() {
         let Some(path) = std::env::var_os("NARJAR_GC_SIGTERM_PROBE_DATA") else {

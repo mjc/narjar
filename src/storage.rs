@@ -71,7 +71,6 @@ impl CleanupAction {
 pub(crate) use advertisement::AdvertisementEvidence;
 pub(crate) use capacity::{CapacityErrorKind, capacity_error_kind, filesystem_space};
 pub use capacity::{InodeCapacity, StorageCapacity};
-pub use fs::private_file_mode_is_valid;
 
 pub(crate) use fs::{
     DirectoryEntryAction, DirectoryScanOutcome, entry_identity_at, entry_is_directory_at,

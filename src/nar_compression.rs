@@ -245,13 +245,13 @@ mod tests {
             let error = encode_and_measure_nar(codec, &mut io::sink(), |output| {
                 output.write_all(b"incomplete raw NAR")?;
                 Err(io::Error::from_raw_os_error(
-                    rustix::io::Errno::IO.raw_os_error(),
+                    crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
                 ))
             })
             .unwrap_err();
             assert_eq!(
                 error.raw_os_error(),
-                Some(rustix::io::Errno::IO.raw_os_error())
+                Some(crate::cache::test_support::InjectedIoFailure::ReadFailure.code())
             );
         }
     }
@@ -261,9 +261,7 @@ mod tests {
     impl Write for FailDuringFinish {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if self.0.get() {
-                Err(io::Error::from_raw_os_error(
-                    rustix::io::Errno::NOSPC.raw_os_error(),
-                ))
+                Err(crate::cache::test_support::InjectedIoFailure::NoSpace.error())
             } else {
                 Ok(bytes.len())
             }
@@ -287,7 +285,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(
                 error.raw_os_error(),
-                Some(rustix::io::Errno::NOSPC.raw_os_error())
+                Some(crate::cache::test_support::InjectedIoFailure::NoSpace.code())
             );
         }
     }

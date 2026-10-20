@@ -2,10 +2,6 @@ use std::{
     env, fs,
     io::{self, Cursor, Read, Write},
     num::NonZeroUsize,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{PermissionsExt, symlink},
-    },
     path::{Path, PathBuf},
     process,
     sync::{Arc, Mutex, mpsc},
@@ -25,7 +21,13 @@ use super::{
     CacheCreation, CapacityErrorKind, Directory, PublishOutcome, ReconcileClass, Storage,
     StorageBackend, StorageError, StoreHash, SupportedStorageBackend, capacity_error_kind,
 };
+use crate::cache::filesystem::{open_directory, validate_private_file};
 use crate::cache::narinfo::NarInfoClaims;
+use crate::cache::test_support::{
+    InjectedIoFailure, make_private_file, make_public_file, private_directory, private_file,
+    symlink,
+};
+
 use crate::cache::object::{
     CompressedNarIdentity, CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName,
     NarHash, NarIdentity, NarRepresentation, NarSize, WireEncoding,
@@ -36,6 +38,10 @@ use structured_zstd::decoding::{
     StreamingDecoder as StructuredZstdDecoder, read_frame_header_info,
 };
 use structured_zstd::encoding::{CompressionLevel, compress};
+
+#[cfg(unix)]
+#[path = "tests/unix.rs"]
+mod unix;
 
 const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
 const STORE_HASH: &str = "00000000000000000000000000000000";
@@ -158,7 +164,7 @@ fn a_completed_narinfo_miss_does_not_invalidate_the_collection_snapshot() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn a_lazy_chunk_reader_defers_collection_until_its_final_unopened_chunk_is_read() {
     let (_directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = (0..1_000_000)
@@ -497,7 +503,7 @@ fn population_scan_can_be_cancelled_without_returning_partial_totals() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn chunked_ingestion_publishes_a_verified_manifest() {
     let (_directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = vec![b'x'; 100_000];
@@ -531,7 +537,7 @@ fn chunked_ingestion_publishes_a_verified_manifest() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn chunked_backend_routes_the_complete_nar_publication() {
     let (_directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = vec![b'c'; 100_000];
@@ -586,7 +592,7 @@ fn chunked_backend_routes_the_complete_nar_publication() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn chunked_upload_enforces_encoded_size_before_creating_staging() {
     let (directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = b"compressed body larger than encoded upload limit";
@@ -630,8 +636,8 @@ fn chunked_upload_enforces_encoded_size_before_creating_staging() {
 
 #[test]
 fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
-    let check_backend = |backend: StorageBackend| {
-        let (_directory, storage) = storage_fixture(backend.try_into().unwrap());
+    let check_backend = |backend: SupportedStorageBackend| {
+        let (_directory, storage) = storage_fixture(backend);
         let raw = vec![b'u'; 100_000];
         let hash = NarHash::from_digest(Sha256::digest(&raw).into());
         let name = NarFileName::raw(hash);
@@ -666,13 +672,15 @@ fn nar_upload_activity_counts_only_validated_and_committed_logical_bytes() {
         assert_eq!(activity.upload_created_logical_bytes, raw.len() as u64);
         assert_eq!(activity.upload_identical_logical_bytes, raw.len() as u64);
     };
-    check_backend(StorageBackend::Flat);
-    #[cfg(not(target_os = "macos"))]
-    check_backend(StorageBackend::Chunked);
+    for backend in std::iter::once(SupportedStorageBackend::FLAT)
+        .chain(SupportedStorageBackend::try_from(StorageBackend::Chunked).ok())
+    {
+        check_backend(backend);
+    }
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
     let (directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = vec![b'm'; 100_000];
@@ -700,7 +708,7 @@ fn corrupt_chunk_manifest_cannot_be_bound_as_a_canonical_nar() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
     let (directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
     let raw = vec![b's'; 100_000];
@@ -1043,29 +1051,6 @@ fn abandoned_generic_publication_cleans_up_staging() {
 }
 
 #[test]
-fn abandoned_generic_publication_retains_recovery_when_temp_cleanup_fails() {
-    let (_directory, storage) = flat_storage_fixture();
-    let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
-    let target = PublishTarget::Nar(NarFileName::raw(nar));
-    let streaming = storage.begin_publication(target, |_| Ok(())).unwrap();
-    let temporary_directory = storage.layout().nar_temp_dir();
-    fs::set_permissions(&temporary_directory, fs::Permissions::from_mode(0o500))
-        .expect("make temporary directory unavailable for unlink");
-
-    drop(streaming);
-
-    fs::set_permissions(&temporary_directory, fs::Permissions::from_mode(0o700))
-        .expect("restore temporary directory permissions");
-    assert!(storage.recovery_required().unwrap());
-    assert_eq!(directory_entry_count(&temporary_directory), 1);
-
-    storage.finish_recovery().unwrap();
-
-    assert!(!storage.recovery_required().unwrap());
-    assert_eq!(directory_entry_count(&temporary_directory), 0);
-}
-
-#[test]
 fn failed_generic_publication_stream_cleans_up_staging() {
     let (_directory, storage) = flat_storage_fixture();
     let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
@@ -1074,10 +1059,10 @@ fn failed_generic_publication_stream_cleans_up_staging() {
     let result = storage
         .begin_publication(target, |_| Ok(()))
         .unwrap()
-        .finish_and_sync(BrokenReader::new(rustix::io::Errno::IO.raw_os_error()));
+        .finish_and_sync(BrokenReader::new(InjectedIoFailure::ReadFailure.code()));
 
     assert!(
-        matches!(result, Err(StorageError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()))
+        matches!(result, Err(StorageError::Io(error)) if error.raw_os_error() == Some(InjectedIoFailure::ReadFailure.code()))
     );
     assert_eq!(storage.temporary_objects(), 0);
     assert!(storage.open_nar(NarFileName::raw(nar)).unwrap().is_none());
@@ -1127,9 +1112,9 @@ fn a_completed_upload_commits_its_own_bytes_and_releases_resources() {
 fn source_errors_and_unwinding_release_upload_resources() {
     let (_directory, storage) = flat_storage_fixture();
     let failed = begin_raw_upload(&storage, b"raw NAR")
-        .receive(BrokenReader::new(rustix::io::Errno::IO.raw_os_error()));
+        .receive(BrokenReader::new(InjectedIoFailure::ReadFailure.code()));
     assert!(
-        matches!(failed, Err(StorageError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()))
+        matches!(failed, Err(StorageError::Io(error)) if error.raw_os_error() == Some(InjectedIoFailure::ReadFailure.code()))
     );
     assert_upload_resources_released(&storage);
     assert_eq!(transaction_record_count(&storage), 0);
@@ -1174,9 +1159,7 @@ fn rejected_and_disconnected_uploads_do_not_accumulate_transactions() {
         let receiving = begin_raw_upload(&storage, bytes);
         assert!(
             receiving
-                .receive(BrokenReader::new(
-                    rustix::io::Errno::CONNRESET.raw_os_error()
-                ))
+                .receive(BrokenReader::new(InjectedIoFailure::ConnectionReset.code()))
                 .is_err()
         );
         assert_eq!(transaction_record_count(&storage), 0);
@@ -1206,35 +1189,6 @@ fn failure_before_publication_cancels_its_recovery_record() {
     assert_upload_resources_released(&storage);
 
     assert!(!storage.recovery_required().unwrap());
-}
-
-#[test]
-fn failed_destination_rollback_retains_recovery_evidence() {
-    let (_directory, storage) = flat_storage_fixture();
-    let hash = NarHash::parse(NAR_ID).unwrap();
-    let nar_directory = storage.layout().nar_dir();
-    let result = storage.publish_with(
-        PublishTarget::Nar(NarFileName::raw(hash)),
-        Cursor::new(b"NAR bytes"),
-        |boundary| {
-            if boundary == PublishBoundary::BeforeParentSync {
-                fs::set_permissions(&nar_directory, fs::Permissions::from_mode(0o500))?;
-                return Err(io::Error::other("injected destination sync failure").into());
-            }
-            Ok(())
-        },
-    );
-    fs::set_permissions(&nar_directory, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(matches!(
-        result,
-        Err(StorageError::Io(error)) if error.to_string() == "injected destination sync failure"
-    ));
-    assert!(storage.layout().nar_path(hash).exists());
-    assert_eq!(transaction_record_count(&storage), 1);
-    assert!(storage.recovery_required().unwrap());
-    storage.finish_recovery().unwrap();
-    assert_eq!(transaction_record_count(&storage), 0);
-    assert_eq!(storage.temporary_objects(), 0);
 }
 
 #[test]
@@ -1273,38 +1227,6 @@ fn a_failed_temporary_cleanup_preserves_the_original_publication_error() {
         .unwrap()
         .path();
     fs::remove_dir(temporary_path).unwrap();
-    storage.finish_recovery().unwrap();
-    assert_eq!(transaction_record_count(&storage), 0);
-}
-
-#[test]
-fn a_failed_journal_completion_preserves_the_original_publication_error() {
-    let (directory, storage) = flat_storage_fixture();
-    let transactions = directory.path().join(".narjar-transactions");
-    let hash = NarHash::parse(NAR_ID).unwrap();
-    let result = storage.publish_with(
-        PublishTarget::Nar(NarFileName::raw(hash)),
-        Cursor::new(b"NAR bytes"),
-        |boundary| {
-            if boundary == PublishBoundary::AfterParentSync {
-                fs::set_permissions(&transactions, fs::Permissions::from_mode(0o500))?;
-                return Err(
-                    io::Error::new(io::ErrorKind::ConnectionAborted, "publication failed").into(),
-                );
-            }
-            Ok(())
-        },
-    );
-    fs::set_permissions(&transactions, fs::Permissions::from_mode(0o700)).unwrap();
-
-    assert!(matches!(
-        result,
-        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::ConnectionAborted
-    ));
-    assert!(storage.layout().nar_path(hash).exists());
-    assert_eq!(storage.temporary_objects(), 0);
-    assert_eq!(transaction_record_count(&storage), 1);
-    assert!(storage.recovery_required().unwrap());
     storage.finish_recovery().unwrap();
     assert_eq!(transaction_record_count(&storage), 0);
 }
@@ -1374,27 +1296,6 @@ fn upload_setup_failure_retains_transaction_when_temporary_cleanup_fails() {
     fs::remove_dir(&temporary_path).unwrap();
     storage.finish_recovery().unwrap();
     assert_eq!(transaction_record_count(&storage), 0);
-}
-
-#[test]
-fn a_commit_destination_open_failure_still_cleans_the_owned_staging_file() {
-    let (directory, storage) = flat_storage_fixture();
-    let complete = begin_raw_upload(&storage, b"raw NAR")
-        .receive(&b"raw NAR"[..])
-        .unwrap();
-    let moved = directory.path().join("moved-nar");
-    fs::rename(storage.layout().nar_dir(), &moved).unwrap();
-    symlink(&moved, storage.layout().nar_dir()).unwrap();
-    assert!(
-        complete.commit().is_err(),
-        "publication must reject the replaced directory"
-    );
-    assert_upload_resources_released(&storage);
-    assert_eq!(
-        directory_entry_count(&moved),
-        1,
-        "only the empty .tmp directory remains"
-    );
 }
 
 #[test]
@@ -1482,8 +1383,8 @@ fn normalized_compressed_source_errors_remain_io_errors() {
         WireEncoding::Compressed(CompressionCodec::Zstd),
     ] {
         for source_error in [
-            rustix::io::Errno::IO.raw_os_error(),
-            rustix::io::Errno::OPNOTSUPP.raw_os_error(),
+            InjectedIoFailure::ReadFailure.code(),
+            InjectedIoFailure::Unsupported.code(),
         ] {
             let directory = TestDir::new();
             let destination_path = directory.path().join("raw.nar");
@@ -1511,7 +1412,7 @@ struct UnsupportedOutputWriter;
 impl Write for UnsupportedOutputWriter {
     fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(
-            rustix::io::Errno::OPNOTSUPP.raw_os_error(),
+            InjectedIoFailure::Unsupported.code(),
         ))
     }
 
@@ -1543,7 +1444,7 @@ fn compressed_output_writer_errors_remain_io_errors() {
 
         assert_eq!(
             error.raw_os_error(),
-            Some(rustix::io::Errno::OPNOTSUPP.raw_os_error()),
+            Some(InjectedIoFailure::Unsupported.code()),
             "{encoding:?}"
         );
     }
@@ -2026,7 +1927,6 @@ fn assert_zstd_checksum_mismatch_rejects_upload(backend: SupportedStorageBackend
         0
     );
     assert_eq!(storage.temporary_objects(), 0);
-    #[cfg(target_os = "linux")]
     if backend.backend() == StorageBackend::Chunked {
         assert_eq!(
             directory_entry_count(directory.path().join(".narjar-manifests")),
@@ -2212,7 +2112,7 @@ fn recovery_removes_receipts_without_a_usable_raw_object() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn chunked_recovery_retains_egress_receipts_for_manifest_backed_raw_objects() {
     let directory = TestDir::new();
     let raw = b"chunked raw NAR for egress recovery";
@@ -2709,7 +2609,7 @@ fn interrupted_descriptor_staging_is_replaced_before_completing_creation() {
     let directory = TestDir::new();
     let staging = directory.path().join(".narjar-layout.next");
     fs::write(&staging, b"partial descriptor").unwrap();
-    fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).unwrap();
+    make_private_file(&staging).unwrap();
     drop(initialize_storage(directory.path()).unwrap());
     assert!(
         !staging.exists(),
@@ -2770,7 +2670,7 @@ fn opening_existing_storage_does_not_recreate_a_missing_receipt_directory() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn initialization_rejects_a_different_storage_backend() {
     let directory = TestDir::new();
     let root = Directory::open(directory.path()).unwrap();
@@ -2786,13 +2686,17 @@ fn initialization_rejects_a_different_storage_backend() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 fn unsupported_backend_cannot_be_prepared_for_storage_initialization() {
     let directory = TestDir::new();
     let error = SupportedStorageBackend::try_from(StorageBackend::Chunked)
-        .expect_err("chunked storage is unsupported on macOS");
+        .expect_err("chunked storage is unsupported on this platform");
 
-    assert!(error.to_string().contains("not supported on macOS"));
+    let expected = match std::env::consts::OS {
+        "macos" => "chunked storage is not supported on macOS; choose flat",
+        _ => "chunked storage is supported only on Linux",
+    };
+    assert_eq!(error.to_string(), expected);
     assert!(directory_entry_count(directory.path()) == 0);
 }
 
@@ -2805,7 +2709,7 @@ fn initialization_rejects_a_symlinked_data_directory() {
     symlink(&target, &link).expect("create data directory symlink");
 
     let error = initialize_storage(&link).expect_err("symlinked data must be rejected");
-    assert!(error.to_string().contains("data directory"));
+    assert_invalid_filesystem_entry(error);
     assert!(!target.join("nar").exists());
     assert!(!target.join(".tmp").exists());
     assert!(!target.join("realisations").exists());
@@ -2823,37 +2727,34 @@ fn initialization_rejects_a_symlinked_lock() {
     symlink(&target, &lock).expect("create lock symlink");
 
     let error = initialize_storage(directory.path()).expect_err("symlinked lock must fail");
-    assert!(error.to_string().contains("lock"));
+    assert!(error.to_string().contains("lock"), "{error}");
     assert_eq!(fs::read(&target).unwrap(), b"external lock");
 }
 
 #[test]
-fn creation_rejects_a_lock_whose_permissions_opening_would_reject() {
+fn creation_rejects_a_public_lock_without_repairing_it() {
     let directory = TestDir::new();
     let lock = directory.path().join("lock");
-    fs::write(&lock, b"").unwrap();
-    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    private_file(&lock, b"").unwrap();
+    make_public_file(&lock).unwrap();
     assert!(
         initialize_storage(directory.path()).is_err(),
         "creation cannot approve a non-private lock"
     );
-    assert_eq!(
-        fs::metadata(lock).unwrap().permissions().mode() & 0o777,
-        0o644
+    assert!(
+        validate_private_file(&crate::cache::filesystem::open_regular(&lock).unwrap()).is_err(),
+        "rejected initialization must not repair the non-private lock"
     );
 }
 
-#[test]
-fn initialization_rejects_writable_storage_directories() {
-    let directory = TestDir::new();
-    let nar = directory.path().join("nar");
-    fs::create_dir(&nar).expect("create NAR directory");
-    fs::set_permissions(&nar, fs::Permissions::from_mode(0o777))
-        .expect("make NAR directory writable");
-
-    let error = initialize_storage(directory.path())
-        .expect_err("writable storage directory must be rejected");
-    assert!(error.to_string().contains("nar directory"));
+fn assert_invalid_filesystem_entry(error: StorageError) {
+    let StorageError::Io(error) = error else {
+        panic!("expected an invalid filesystem entry, got {error}");
+    };
+    assert!(matches!(
+        crate::cache::filesystem::EntryOpenFailure::from(error),
+        crate::cache::filesystem::EntryOpenFailure::Invalid
+    ));
 }
 
 #[test]
@@ -2863,16 +2764,7 @@ fn temporary_publication_files_are_private() {
         .create_temp(&PublishTarget::CacheInfo)
         .expect("create temporary publication file");
 
-    assert_eq!(
-        temporary
-            .file
-            .metadata()
-            .expect("read temp metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
+    validate_private_file(&temporary.file).expect("temporary publication file must be private");
 
     remove_temp(&temporary).expect("remove temporary publication file");
 }
@@ -3036,7 +2928,7 @@ fn recovery_cleans_incomplete_publication_transactions() {
     let trusted_keys = directory.path().join("trusted-public-keys");
     let temporary = directory.path().join(".tmp/cache-info-recovery.part");
     let nar_temporary = directory.path().join("nar/.tmp/nar-recovery.part");
-    fs::write(&trusted_keys, b"").expect("create trusted key file");
+    private_file(&trusted_keys, b"").expect("create trusted key file");
     fs::write(&temporary, b"partial publication").expect("create interrupted temporary file");
     fs::write(&nar_temporary, b"partial NAR publication")
         .expect("create interrupted NAR temporary file");
@@ -3062,6 +2954,10 @@ fn recovery_cleans_incomplete_publication_transactions() {
 
 #[test]
 fn recovery_discards_abandoned_transaction_drafts_before_parsing_records() {
+    check_abandoned_transaction_draft_recovery(|_| Ok(()));
+}
+
+fn check_abandoned_transaction_draft_recovery(prepare_draft: impl FnOnce(&Path) -> io::Result<()>) {
     let (directory, storage) = flat_storage_fixture();
     let temporary = directory.path().join(".tmp/abandoned-draft.part");
     fs::write(&temporary, b"incomplete publication").expect("create publication temp");
@@ -3085,8 +2981,7 @@ fn recovery_discards_abandoned_transaction_drafts_before_parsing_records() {
     ));
     fs::write(&abandoned_draft, b"partial state=")
         .expect("simulate process termination during draft write");
-    fs::set_permissions(&abandoned_draft, fs::Permissions::from_mode(0o000))
-        .expect("make abandoned draft unreadable");
+    prepare_draft(&abandoned_draft).expect("prepare abandoned draft fixture");
 
     storage
         .finish_recovery()
@@ -3163,7 +3058,6 @@ fn known_publication_destinations_reject_invalid_paths() {
             .is_ok()
     );
     for path in [
-        StorePath::Root(std::ffi::OsStr::from_bytes(b"invalid-\xff-name").to_os_string()),
         StorePath::Root("../outside".into()),
         StorePath::Root("unknown/object".into()),
         StorePath::Nar("..".into()),
@@ -3249,7 +3143,7 @@ fn text_publication_records_are_rejected_without_removing_their_files() {
         let record = directory
             .path()
             .join(format!(".narjar-transactions/publish-legacy-{state}.txn"));
-        fs::write(&trusted_keys, b"").expect("create trusted key file");
+        private_file(&trusted_keys, b"").expect("create trusted key file");
         fs::write(&temporary, b"legacy temporary publication")
             .expect("create legacy temporary publication");
         fs::write(
@@ -3257,8 +3151,7 @@ fn text_publication_records_are_rejected_without_removing_their_files() {
             format!("state={state}\npath=.tmp/legacy-{state}.part\n"),
         )
         .expect("create legacy transaction record");
-        fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
-            .expect("make legacy record private");
+        make_private_file(&record).expect("make legacy record private");
 
         assert!(
             storage.finish_recovery().is_err(),
@@ -3285,8 +3178,7 @@ fn current_terminal_publication_transactions_still_require_destinations() {
         postcard::to_allocvec(&(0_u8, ".tmp/missing-field.part", 4_u8, "")).unwrap(),
     )
     .expect("create incomplete current transaction record");
-    fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
-        .expect("make incomplete record private");
+    make_private_file(&record).expect("make incomplete record private");
 
     assert!(storage.finish_recovery().is_err());
     assert!(temporary.exists());
@@ -3361,10 +3253,9 @@ fn malformed_publication_transaction_blocks_recovery() {
     let record = directory
         .path()
         .join(".narjar-transactions/publish-malformed.txn");
-    fs::write(&trusted_keys, b"").expect("create trusted key file");
+    private_file(&trusted_keys, b"").expect("create trusted key file");
     fs::write(&record, b"/outside/recovery.part\n").expect("create malformed record");
-    fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
-        .expect("make malformed record private");
+    make_private_file(&record).expect("make malformed record private");
 
     assert!(storage.recovery_required().expect("inspect recovery state"));
     assert!(storage.finish_recovery().is_err());
@@ -3379,7 +3270,7 @@ fn malformed_publication_transaction_destination_blocks_recovery() {
     let record = directory
         .path()
         .join(".narjar-transactions/publish-malformed-destination.txn");
-    fs::write(&trusted_keys, b"").expect("create trusted key file");
+    private_file(&trusted_keys, b"").expect("create trusted key file");
     fs::write(&temporary, b"temporary").expect("create temporary publication");
     fs::write(
         &record,
@@ -3387,8 +3278,7 @@ fn malformed_publication_transaction_destination_blocks_recovery() {
             .unwrap(),
     )
     .expect("create malformed destination record");
-    fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
-        .expect("make malformed record private");
+    make_private_file(&record).expect("make malformed record private");
 
     assert!(storage.finish_recovery().is_err());
     assert!(record.exists(), "failed recovery must retain its evidence");
@@ -3406,15 +3296,14 @@ fn unknown_publication_transaction_state_blocks_recovery() {
     let record = directory
         .path()
         .join(".narjar-transactions/publish-unknown-state.txn");
-    fs::write(&trusted_keys, b"").expect("create trusted key file");
+    private_file(&trusted_keys, b"").expect("create trusted key file");
     fs::write(&temporary, b"temporary").expect("create temporary publication");
     fs::write(
         &record,
         postcard::to_allocvec(&(0_u8, ".tmp/unknown-state.part", 5_u8)).unwrap(),
     )
     .expect("create unknown-state record");
-    fs::set_permissions(&record, fs::Permissions::from_mode(0o600))
-        .expect("make unknown-state record private");
+    make_private_file(&record).expect("make unknown-state record private");
 
     assert!(storage.finish_recovery().is_err());
     assert!(record.exists(), "unknown state must retain its evidence");
@@ -3854,8 +3743,8 @@ fn response_loss_after_parent_sync_is_visible_and_idempotent() {
 #[test]
 fn stream_resource_failures_leave_no_false_publication_state() {
     for raw_error in [
-        rustix::io::Errno::IO.raw_os_error(),
-        rustix::io::Errno::NOSPC.raw_os_error(),
+        InjectedIoFailure::ReadFailure.code(),
+        InjectedIoFailure::NoSpace.code(),
     ] {
         let (_directory, storage) = flat_storage_fixture();
         let nar = NarHash::parse(NAR_ID).expect("valid NAR hash");
@@ -3945,19 +3834,19 @@ fn read_only_filesystems_are_not_ready() {
 fn capacity_errors_have_stable_categories() {
     assert_eq!(
         capacity_error_kind(&io::Error::from_raw_os_error(
-            rustix::io::Errno::NOSPC.raw_os_error()
+            InjectedIoFailure::NoSpace.code()
         )),
         CapacityErrorKind::NoSpace
     );
     assert_eq!(
         capacity_error_kind(&io::Error::from_raw_os_error(
-            rustix::io::Errno::DQUOT.raw_os_error()
+            InjectedIoFailure::QuotaExceeded.code()
         )),
         CapacityErrorKind::Quota
     );
     assert_eq!(
         capacity_error_kind(&io::Error::from_raw_os_error(
-            rustix::io::Errno::ROFS.raw_os_error()
+            InjectedIoFailure::ReadOnly.code()
         )),
         CapacityErrorKind::ReadOnly
     );
@@ -4043,7 +3932,7 @@ fn staging_admission_rejects_read_only_and_inode_exhausted_filesystems() {
 #[test]
 fn staging_reservation_growth_is_atomic_and_monotonic() {
     let directory = TestDir::new();
-    let directory_file = fs::File::open(directory.path()).unwrap();
+    let directory_file = open_directory(directory.path()).unwrap();
     let reservations = Arc::new(Mutex::new(Default::default()));
     let mut reservation = super::publication::StagingReservation::empty(reservations.clone());
 
@@ -4067,7 +3956,7 @@ fn staging_reservation_growth_is_atomic_and_monotonic() {
 #[test]
 fn materialized_staging_bytes_are_not_counted_against_free_space() {
     let directory = TestDir::new();
-    let directory_file = fs::File::open(directory.path()).unwrap();
+    let directory_file = open_directory(directory.path()).unwrap();
     let reservations = Arc::new(Mutex::new(Default::default()));
     let mut first = super::publication::StagingReservation::empty(reservations.clone());
 
@@ -4229,22 +4118,6 @@ fn process_lock_release_does_not_depend_on_storage_directory_handles() {
     drop(lingering_directory_handle);
 }
 
-#[test]
-fn process_lock_survives_lockfile_replacement() {
-    let directory = TestDir::new();
-    let first = initialize_storage(directory.path()).expect("acquire first process lock");
-    let lock = directory.path().join("lock");
-    fs::remove_file(&lock).expect("remove lock pathname");
-    fs::write(&lock, b"replacement").expect("replace lock pathname");
-    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
-
-    assert_lock_probe_status(directory.path(), "held");
-
-    drop(first);
-    assert_lock_probe_status(directory.path(), "available");
-    assert_eq!(fs::read(lock).unwrap(), b"replacement");
-}
-
 fn assert_lock_probe_status(path: &Path, expected: &str) {
     let output = process::Command::new(env::current_exe().expect("test executable path"))
         .args([
@@ -4286,58 +4159,6 @@ fn process_lock_replacement_probe() {
         other => panic!("unexpected lock probe expectation: {other:?}"),
     }
     println!("narjar-lock-probe-ran");
-}
-
-#[test]
-fn process_lock_excludes_a_second_process_using_a_directory_alias() {
-    let directory = TestDir::new();
-    let parent_alias = TestDir::new();
-    let alias = parent_alias.path().join("parent");
-    symlink(directory.path(), &alias).expect("alias the DATA parent directory");
-    let data = directory.path().join("data");
-    fs::create_dir(&data).unwrap();
-    let first = initialize_storage(&data).unwrap();
-
-    assert_lock_probe_status(&alias.join("data"), "held");
-    drop(first);
-    assert_lock_probe_status(&alias.join("data"), "available");
-}
-
-#[test]
-fn process_lock_follows_the_opened_directory_after_its_path_is_replaced() {
-    let parent = TestDir::new();
-    let data = parent.path().join("data");
-    let renamed = parent.path().join("renamed");
-    fs::create_dir(&data).unwrap();
-    let opened = Directory::open(&data).unwrap();
-    let first = CacheCreation::prepare(&opened, SupportedStorageBackend::FLAT)
-        .unwrap()
-        .create_or_complete()
-        .unwrap();
-    fs::rename(&data, &renamed).unwrap();
-    fs::create_dir(&data).unwrap();
-
-    assert!(matches!(
-        CacheCreation::prepare(&opened, SupportedStorageBackend::FLAT),
-        Err(StorageError::Locked)
-    ));
-    assert_lock_probe_status(&renamed, "held");
-    assert_lock_probe_status(&data, "available");
-    drop(first);
-    assert_lock_probe_status(&renamed, "available");
-    CacheCreation::prepare(&opened, SupportedStorageBackend::FLAT)
-        .expect("the original capability can reacquire its own directory");
-}
-
-#[test]
-fn initialization_rejects_a_writable_data_root_before_creating_layout_files() {
-    let directory = TestDir::new();
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
-    assert!(matches!(
-        Directory::open(directory.path()),
-        Err(error) if error.kind() == io::ErrorKind::InvalidData
-    ));
-    assert_eq!(directory_entry_count(directory.path()), 0);
 }
 
 #[test]
@@ -4544,7 +4365,9 @@ struct TestDir(tempfile::TempDir);
 
 impl TestDir {
     fn new() -> Self {
-        Self(tempfile::tempdir().expect("create test directory"))
+        let directory = tempfile::tempdir().expect("create test directory");
+        private_directory(directory.path()).expect("make fixture directory private");
+        Self(directory)
     }
 
     fn path(&self) -> &Path {
