@@ -28,6 +28,7 @@ if ($Version) {
 if ($LASTEXITCODE -ne 0) { throw 'Cargo installation failed' }
 
 $executable = Join-Path $installRoot 'bin/narjar.exe'
+& (Join-Path $PSScriptRoot 'check-windows-runtime-dependencies.ps1') -Executable $executable
 $versionOutput = & $executable --version
 if ($LASTEXITCODE -ne 0 -or $versionOutput -ne "narjar $expectedVersion") {
     throw 'Installed executable has the wrong version'
