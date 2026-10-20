@@ -1,6 +1,9 @@
-param([Parameter(Mandatory)][string]$NarjarExecutable)
+param(
+    [Parameter(Mandatory)][string]$NarjarExecutable,
+    [ValidateSet('checkout', 'installed')][string]$Fixture = 'checkout'
+)
 $ErrorActionPreference = 'Stop'
-$probeRoot = Join-Path $env:GITHUB_WORKSPACE 'target/windows-filesystem-probe'
+$probeRoot = Join-Path $env:GITHUB_WORKSPACE "target/windows-filesystem-probe-$Fixture"
 New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
 $executable = Join-Path $probeRoot 'probe.exe'
 rustc --edition 2024 ci/windows-filesystem-probe.rs -o $executable
