@@ -29,12 +29,33 @@ not the producer secret.
 `token create` prints the secret once and stores only its hash and label.
 Redirect stdout to a private file. `token revoke` removes a label. These are
 offline commands: stop the server before changing its token files. Use a
-mode-`0600` netrc file for HTTP credentials, not command-line secrets.
+private netrc file for HTTP credentials, not command-line secrets (`0600` on Unix).
 
 A write token permits uploading, not signing. Narinfo must
 carry a signature from a key in `trusted-public-keys`. To rotate signing keys,
 trust both public keys while producers switch, then remove the old key once
 clients no longer need its cached signatures.
+
+### Windows
+
+Use flat storage on local NTFS. Install the MSVC Rust toolchain and Windows SDK
+to build with Cargo; the installed cache server does not need Nix or SQLite.
+`push` and native-store serving require Unix. A Windows cache accepts the same
+HTTP uploads and serves raw, XZ, or Zstd output.
+
+In PowerShell, create the cache and its credentials, then run the server:
+
+~~~powershell
+narjar setup --yes --data-dir ./cache --credentials-dir ./credentials
+narjar serve --data-dir ./cache --listen 127.0.0.1:5000
+~~~
+
+Setup does not start the server. Use Ctrl+C to stop it. Keep credentials outside
+DATA and restrict their DACLs to the cache account, SYSTEM, and Administrators.
+Narjar creates these permissions during setup and rejects unsafe existing files.
+
+Online GC runs over a private named pipe bound to the account and opened DATA
+directory. Run it as the cache owner; there is no TCP maintenance listener.
 
 ### Local Nix store access
 
@@ -245,12 +266,13 @@ cleanup phase. Existing request and transfer metrics include native reads.
 
 Choose `flat` or `chunked` at initialization and pass the same
 `--storage-backend` to serving and maintenance commands. Flat is the
-default and works on Linux and macOS; chunked is Linux-only. The layout
+default and works on Linux, macOS, and local Windows NTFS; chunked is Linux-only. The layout
 descriptor records the backend for that data directory; Narjar cannot convert
 it to another backend.
 
-Keep DATA private to the cache owner: directories `0700`, published files,
-token hashes, trusted keys, and the lock `0600`. Producer secrets belong
+Keep DATA private to the cache owner: on Unix, directories use `0700`, and
+published files, token hashes, trusted keys, and the lock use `0600`. Windows
+checks ownership and DACLs instead of permission bits. Producer secrets belong
 outside DATA. Generated public key files can be distributed separately.
 The reverse proxy must not read DATA directly.
 
@@ -261,8 +283,9 @@ bind upload identities to canonical raw identities; egress receipts in
 `.narjar-egress/` bind raw identities to generated compressed downloads.
 Preserve these along with `.narjar-layout` and the recovery records.
 
-The daemon creates a private `.narjar-control/gc.sock` for local online GC.
-It is not an HTTP endpoint and does not need proxy configuration.
+Unix daemons create a private `.narjar-control/gc.sock` for local online GC;
+Windows daemons use an account-private named pipe. Neither is an HTTP endpoint
+or needs proxy configuration.
 
 See the [filesystem requirements](https://github.com/mjc/narjar/blob/main/docs/filesystem-capability-adr.md)
 for publication and synchronization requirements. Narjar does not manage
@@ -426,7 +449,8 @@ as the cache owner and pass the configured storage backend. The command fails
 if no daemon is running, the collector is busy, or the backend differs. Online
 mode never stops the server or falls back to offline collection.
 
-Linux uses a descriptor-relative socket address, so long data-directory paths
+Windows derives its named-pipe address from the account and DATA identity, not
+the pathname. Linux uses a descriptor-relative socket address, so long data-directory paths
 work. On macOS, the control socket pathname must fit the platform's Unix socket
 limit. If it does not, the daemon reports that online GC is unavailable and
 continues serving; offline maintenance still works with the server stopped.

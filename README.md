@@ -14,8 +14,9 @@ return a cache miss so Nix can build them locally.
 
 ## Installation
 
-Install Rust 1.98 or later, a C toolchain, pkg-config, and the SQLite development
-libraries, then install Narjar:
+Install Rust 1.98 or later and a C toolchain. Linux and macOS also need
+pkg-config and SQLite development libraries. Windows uses the MSVC toolchain
+and Windows SDK, without SQLite. Then install Narjar:
 
 ```sh
 cargo install --locked narjar
@@ -29,7 +30,9 @@ cd narjar
 cargo install --locked --path .
 ```
 
-The CLI supports Linux and macOS. On Windows, run it under WSL.
+The CLI supports Linux, macOS, and native Windows. Windows flat storage requires
+local NTFS. Native Nix-store serving and `push` are available on Linux and macOS;
+Windows can serve a standalone cache and accept HTTP uploads from those clients.
 
 Nix packages are available for x86_64 Linux and Apple Silicon macOS, with a
 NixOS module and a Linux OCI image. Use flat storage on macOS; chunked storage
@@ -61,7 +64,8 @@ in scripts. Without options, it uses `./narjar-data`, `./narjar-credentials`,
 
 The public key is installed in the cache's `trusted-public-keys` file. The
 private key (`producer.sec`), tokens, and netrc file are stored outside the
-cache with mode `0600`; the credentials directory has mode `0700`.
+cache with mode `0600`; the credentials directory has mode `0700` on Unix.
+Windows creates private DACLs for these files and directories.
 Keep the credentials directory out of source control and protect its backups.
 Use `--private-read` to create a read token in addition to the write token.
 The generated netrc is for uploads; configure consumers with `read.token`.
