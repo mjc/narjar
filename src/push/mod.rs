@@ -1,3 +1,6 @@
+mod args;
+pub(crate) use args::Push;
+
 use std::{
     fmt,
     num::{NonZeroU64, NonZeroUsize},
@@ -6,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use clap::Args;
 use narjar::object::{NarRepresentation, WireEncoding};
 use ureq::{Agent, http::StatusCode};
 
@@ -17,13 +19,21 @@ use crate::{
     operator::netrc_authorization,
 };
 
+#[path = "nar_stream.rs"]
 mod nar_stream;
+#[path = "payload.rs"]
 mod payload;
+#[path = "plan.rs"]
 mod plan;
+#[path = "root.rs"]
 mod root;
+#[path = "signing.rs"]
 mod signing;
+#[path = "store.rs"]
 mod store;
+#[path = "transfer.rs"]
 mod transfer;
+#[path = "upstream.rs"]
 mod upstream;
 use nar_stream::open_upload_reader;
 use payload::measure_encoded_nar;
@@ -77,57 +87,6 @@ impl From<PushError> for String {
     fn from(error: PushError) -> Self {
         error.message
     }
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct Push {
-    /// Destination binary cache store URI.
-    #[arg(long)]
-    to: HttpUrl,
-
-    /// Maximum number of native HTTP upload workers.
-    #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
-    jobs: NonZeroUsize,
-
-    /// Compression used for the uploaded NAR payload; the cache independently selects its served representation.
-    #[arg(long, default_value = "none")]
-    compression: WireEncoding,
-
-    /// Timeout for native HTTP DNS/connect and inactive network I/O, in seconds.
-    #[arg(long, env = "NARJAR_PUSH_TIMEOUT_SECONDS", default_value_t = NonZeroU64::new(30).unwrap())]
-    timeout_seconds: NonZeroU64,
-
-    /// Netrc file used for HTTP authentication.
-    #[arg(long)]
-    netrc_file: Option<PathBuf>,
-
-    /// Permit sending netrc credentials over plain HTTP.
-    #[arg(long)]
-    insecure_http: bool,
-
-    /// Secret key file used to sign the local store paths before copying.
-    #[arg(long)]
-    signing_key_file: Option<PathBuf>,
-
-    /// Re-check and re-upload paths already present at the destination.
-    #[arg(long)]
-    refresh: bool,
-
-    /// Keep publishing when a destination already has different immutable metadata.
-    #[arg(long)]
-    ignore_conflicts: bool,
-
-    /// Trusted binary cache consulted before generating an upload. Repeat in lookup order.
-    #[arg(long = "trusted-upstream", value_name = "URL")]
-    trusted_upstreams: Vec<HttpUrl>,
-
-    /// Nix public key trusted for one upstream: UPSTREAM#NAME:BASE64. Repeat for key rotation.
-    #[arg(long = "trusted-upstream-key", value_name = "UPSTREAM#NAME:BASE64")]
-    trusted_upstream_keys: Vec<String>,
-
-    /// Concrete local store paths whose closures should be pushed.
-    #[arg(value_name = "STORE_PATH", required = true, num_args = 1..)]
-    paths: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

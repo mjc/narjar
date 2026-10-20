@@ -1,11 +1,13 @@
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
+    fs::File,
     io::{self, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
+use crate::cache::filesystem::{
+    FilePrivacy, PreparedFile, create_private_directory_tree, open_regular, validate_private_file,
+};
 use data_encoding::HEXLOWER;
 
 pub const TOKEN_BYTES: usize = 32;
@@ -21,11 +23,7 @@ struct Record {
 
 impl TokenFile {
     pub fn load(path: &Path) -> Result<Option<Self>, Error> {
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags((rustix::fs::OFlags::NOFOLLOW).bits() as i32)
-            .open(path)
-        {
+        let file = match open_regular(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -34,9 +32,12 @@ impl TokenFile {
     }
 
     pub(crate) fn read(mut file: File) -> Result<Self, Error> {
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
-            return Err(Error::InsecurePermissions);
+        match validate_private_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                return Err(Error::InsecurePermissions);
+            }
+            Err(error) => return Err(error.into()),
         }
 
         let mut contents = String::new();
@@ -93,43 +94,13 @@ impl TokenFile {
         let directory = path
             .parent()
             .expect("token paths always have an auth directory");
-        let directory_file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(
-                (rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
-            )
-            .open(directory)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(directory)?;
-                OpenOptions::new()
-                    .read(true)
-                    .custom_flags(
-                        (rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW).bits()
-                            as i32,
-                    )
-                    .open(directory)?
-            }
-            Err(error) => return Err(error.into()),
-        };
-        directory_file.set_permissions(fs::Permissions::from_mode(0o700))?;
-
-        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))?;
-        for record in &self.0 {
-            writeln!(
-                temporary,
-                "{} {}",
-                record.label,
-                HEXLOWER.encode(&record.digest)
-            )?;
-        }
-        temporary.as_file().sync_all()?;
-        temporary.persist(path).map_err(|error| error.error)?;
-        directory_file.sync_all()?;
+        let directory_file = create_private_directory_tree(directory)?;
+        let temporary = PreparedFile::write(&directory_file, FilePrivacy::Private, |file| {
+            self.0.iter().try_for_each(|record| {
+                writeln!(file, "{} {}", record.label, HEXLOWER.encode(&record.digest))
+            })
+        })?;
+        temporary.replace(path.file_name().expect("token paths name files"))?;
         Ok(())
     }
 }
@@ -143,7 +114,7 @@ pub fn valid_label(label: &str) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("token hash file permissions must be 0600")]
+    #[error("token hash file must be private to its owner")]
     InsecurePermissions,
     #[error("invalid token hash file")]
     Invalid,
@@ -155,13 +126,10 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        os::unix::fs::{PermissionsExt, symlink},
-        process,
-    };
+    use std::{fs, process};
 
     use super::{Error, TokenFile};
+    use crate::cache::test_support::symlink;
 
     #[test]
     fn insert_rejects_invalid_labels_without_mutating_the_file() {
@@ -192,11 +160,8 @@ mod tests {
             .expect("store should not depend on predictable temporary names");
 
         assert_eq!(fs::read(&path).expect("read token file"), b"");
-        let mode = fs::metadata(path)
-            .expect("read token file metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        let file = crate::cache::filesystem::open_regular(&path).unwrap();
+        crate::cache::filesystem::validate_private_file(&file).unwrap();
     }
 
     #[test]
@@ -237,7 +202,7 @@ mod error_contract_tests {
         let cases: &[(&dyn std::error::Error, &str)] = &[
             (
                 &Error::InsecurePermissions,
-                "token hash file permissions must be 0600",
+                "token hash file must be private to its owner",
             ),
             (&Error::Invalid, "invalid token hash file"),
             (&Error::InvalidLabel, "invalid token label"),

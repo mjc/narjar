@@ -19,5 +19,8 @@ pub(crate) use narjar::object;
 pub(crate) mod records;
 #[path = "storage.rs"]
 pub(crate) mod storage;
+#[cfg(test)]
+#[path = "test_support/mod.rs"]
+pub(crate) mod test_support;
 #[path = "token_file.rs"]
 pub(crate) mod token_file;

@@ -158,7 +158,7 @@ mod tests {
     };
 
     use super::{open_upload_reader_at, write_nar};
-    use crate::push::NarInfoMetadata;
+    use crate::cache::narinfo::NarInfoMetadata;
     use crate::verified_stream::VerifiedStream;
     use narjar::nar::{Decoder, Event};
     use narjar::object::{

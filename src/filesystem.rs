@@ -2,91 +2,81 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io,
-    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
-    path::Path,
 };
 
-use rustix::{
-    fd::AsFd,
-    fs::{self, Dir, Mode, OFlags},
-};
+#[path = "filesystem/identity.rs"]
+mod identity;
+pub(crate) use identity::{FileIdentity, FileStamp};
+#[path = "filesystem/staging.rs"]
+mod staging;
+pub(crate) use staging::PreparedFile;
 
-enum ReadonlyKind {
+#[cfg(unix)]
+#[path = "filesystem/unix.rs"]
+mod unix;
+#[cfg(unix)]
+pub use unix::*;
+#[cfg(windows)]
+#[path = "filesystem/windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub use windows::*;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FileAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FileCreation {
+    Existing,
+    CreateNew,
+    OpenOrCreate,
+    Truncate,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LeaseCreation {
+    Existing,
+    CreateIfMissing,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FilePrivacy {
+    Private,
+    Public,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EntryKind {
     Directory,
     Regular,
+    Other,
 }
 
-fn open_readonly(parent: impl AsFd, path: &Path, kind: ReadonlyKind) -> io::Result<File> {
-    let file: File = fs::openat(
-        parent,
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )?
-    .into();
-    let metadata = file.metadata()?;
-    let valid = match kind {
-        ReadonlyKind::Directory => metadata.is_dir(),
-        ReadonlyKind::Regular => metadata.is_file(),
-    };
-    if !valid {
-        let expected = match kind {
-            ReadonlyKind::Directory => "a directory",
-            ReadonlyKind::Regular => "a regular file",
-        };
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not {expected}", path.display()),
-        ));
-    }
-    Ok(file)
+#[derive(Debug)]
+pub(crate) struct EntryMetadata {
+    pub(crate) kind: EntryKind,
+    pub(crate) stamp: FileStamp,
 }
 
-pub fn open_directory_at(parent: impl AsFd, path: impl AsRef<Path>) -> io::Result<File> {
-    open_readonly(parent, path.as_ref(), ReadonlyKind::Directory)
+pub(crate) enum EntryOpenFailure {
+    Missing,
+    Invalid,
+    Io(io::Error),
 }
 
-pub fn open_regular_at(parent: impl AsFd, path: impl AsRef<Path>) -> io::Result<File> {
-    open_readonly(parent, path.as_ref(), ReadonlyKind::Regular)
-}
-
-pub fn open_directory(path: &Path) -> io::Result<File> {
-    open_directory_at(rustix::fs::CWD, path)
-}
-
-pub fn ensure_directory_at(parent: &File, name: &OsStr, label: &str) -> io::Result<File> {
-    match open_directory_at(parent, name) {
-        Ok(directory) => validate_directory(&directory, label),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if let Err(error) = fs::mkdirat(parent, name, Mode::from_raw_mode(0o755))
-                && error != rustix::io::Errno::EXIST
-            {
-                return Err(error.into());
-            }
-            let directory = open_directory_at(parent, name)?;
-            validate_directory(&directory, label)
+impl From<io::Error> for EntryOpenFailure {
+    fn from(error: io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::NotFound => Self::Missing,
+            io::ErrorKind::InvalidData => Self::Invalid,
+            _ if is_link_traversal_error(&error) => Self::Invalid,
+            _ => Self::Io(error),
         }
-        Err(error) => Err(error),
     }
-}
-
-pub fn validate_directory(directory: &File, name: &str) -> io::Result<File> {
-    if directory.metadata()?.permissions().mode() & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} has unsafe permissions"),
-        ));
-    }
-    directory.try_clone()
-}
-
-pub fn directory_names(directory: &File) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
-    // Each scan gets an independent cursor; the borrowed descriptor is not advanced.
-    Ok(Dir::read_from(directory)?.map(|entry| {
-        entry
-            .map(|entry| OsString::from_vec(entry.file_name().to_bytes().to_vec()))
-            .map_err(Into::into)
-    }))
 }
 
 pub fn exclude_dot_directory_entries(
@@ -100,4 +90,31 @@ pub fn exclude_dot_directory_entries(
 
 pub fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
     exclude_dot_directory_entries(directory_names(directory)?).collect()
+}
+
+pub(crate) fn create_private_directory_tree(path: &std::path::Path) -> io::Result<File> {
+    let directory = ensure_private_directory_tree(path)?;
+    set_file_privacy(&directory, FilePrivacy::Private)?;
+    validate_private_directory(&directory)?;
+    Ok(directory)
+}
+
+fn ensure_private_directory_tree(path: &std::path::Path) -> io::Result<File> {
+    match open_directory(path) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                ensure_private_directory_tree(parent)?;
+            }
+            match create_private_directory(path) {
+                Ok(directory) => Ok(directory),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => open_directory(path),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }

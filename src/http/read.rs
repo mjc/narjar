@@ -16,11 +16,13 @@ use crate::cache::{
 };
 
 use super::write::unauthorized;
+#[cfg(unix)]
 use crate::native_store::serving::{NativeReadError, NativeStoreSource};
 use crate::read_through::ReadThroughSource;
 
 pub(crate) enum ReadSource {
     FlatCache,
+    #[cfg(unix)]
     NativeStore(Box<NativeStoreSource>),
     ReadThrough(Box<ReadThroughSource>),
 }
@@ -35,6 +37,7 @@ impl ReadSource {
     pub(crate) fn maintain(&self) {
         match self {
             Self::FlatCache => {}
+            #[cfg(unix)]
             Self::NativeStore(source) => source.maintain(),
             Self::ReadThrough(source) => source.maintain(),
         }
@@ -43,7 +46,9 @@ impl ReadSource {
     fn allowed_methods(&self) -> &'static str {
         match self {
             Self::FlatCache => "GET, HEAD, PUT",
-            Self::NativeStore(_) | Self::ReadThrough(_) => "GET, HEAD",
+            #[cfg(unix)]
+            Self::NativeStore(_) => "GET, HEAD",
+            Self::ReadThrough(_) => "GET, HEAD",
         }
     }
 }
@@ -55,6 +60,7 @@ impl ReadContext<'_> {
                 .storage
                 .is_ready(min_free_bytes)
                 .unwrap_or(StorageReadiness::ProbeFailed),
+            #[cfg(unix)]
             ReadSource::NativeStore(source) => source
                 .readiness(min_free_bytes)
                 .unwrap_or(StorageReadiness::ProbeFailed),
@@ -257,6 +263,7 @@ fn record_narinfo_lookup(
     guard.record_cache_lookup(CacheObject::NarInfo, outcome, lookup_started.elapsed());
 }
 
+#[cfg(unix)]
 fn native_read_failure(
     request: Request,
     guard: &RequestGuard<'_>,
@@ -275,6 +282,7 @@ fn native_read_failure(
     }
 }
 
+#[cfg(unix)]
 fn native_lookup_outcome(error: &NativeReadError) -> CacheLookupOutcome {
     match error {
         NativeReadError::Missing | NativeReadError::Signature => CacheLookupOutcome::Miss,
@@ -284,6 +292,7 @@ fn native_lookup_outcome(error: &NativeReadError) -> CacheLookupOutcome {
     }
 }
 
+#[cfg(unix)]
 fn respond_native_narinfo(
     request: Request,
     source: &NativeStoreSource,
@@ -310,6 +319,7 @@ fn respond_native_narinfo(
     }
 }
 
+#[cfg(unix)]
 fn respond_native_nar(
     request: Request,
     source: &NativeStoreSource,
@@ -959,6 +969,7 @@ fn respond_metrics(
         ReadSource::FlatCache => output.push_str(
             "# TYPE narjar_source_info gauge\nnarjar_source_info{source=\"flat-cache\"} 1\n",
         ),
+        #[cfg(unix)]
         ReadSource::NativeStore(source) => {
             output.push_str(
                 "# TYPE narjar_source_info gauge\nnarjar_source_info{source=\"native-store\"} 1\n",
@@ -1025,6 +1036,7 @@ fn respond_cache_route(
                     ReadSource::FlatCache | ReadSource::ReadThrough(_) => {
                         respond_nar(request, context.storage, name, guard, visibility)
                     }
+                    #[cfg(unix)]
                     ReadSource::NativeStore(source) => {
                         respond_native_nar(request, source, name, guard, visibility)
                     }
@@ -1038,6 +1050,7 @@ fn respond_cache_route(
                         visibility,
                         IMMUTABLE_CACHE_CONTROL,
                     ),
+                    #[cfg(unix)]
                     ReadSource::NativeStore(source) => {
                         respond_native_narinfo(request, source, store, guard, visibility)
                     }

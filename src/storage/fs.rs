@@ -2,17 +2,21 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read},
-    os::unix::fs::PermissionsExt,
 };
-
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawMode, Stat};
 
 use super::StorageError;
 use super::publication::TemporaryFile;
 #[cfg(test)]
 use crate::cache::filesystem::open_directory;
+pub(super) use crate::cache::filesystem::open_writable_at as open_at;
+#[cfg(target_os = "linux")]
+pub(super) use crate::cache::filesystem::sync_filesystem;
+use crate::cache::filesystem::{
+    EntryKind, FilePrivacy, FileStamp, entry_metadata_at, validate_file_privacy,
+};
 use crate::cache::filesystem::{directory_names, exclude_dot_directory_entries};
 pub(super) use crate::cache::filesystem::{ensure_directory_at, validate_directory};
+pub(super) use crate::cache::filesystem::{hard_link_at, rename_at, unlink_at};
 pub(crate) use crate::cache::filesystem::{open_directory_at, open_regular_at, read_dir_names};
 #[cfg(test)]
 use std::path::Path;
@@ -25,22 +29,17 @@ pub(super) fn require_directory_at(parent: &File, name: &str) -> io::Result<File
     validate_directory(&directory, name)
 }
 
-/// Required permission bits for private layout and policy files.
-pub const fn private_file_mode_is_valid(mode: u32) -> bool {
-    mode & 0o777 == 0o600
-}
-
 pub(super) fn require_private_file_at(
     parent: &File,
     name: &str,
     required: bool,
 ) -> io::Result<bool> {
     match open_regular_at(parent, OsStr::new(name)) {
-        Ok(file) if private_file_mode_is_valid(file.metadata()?.permissions().mode()) => Ok(true),
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} must have 0600 permissions"),
-        )),
+        Ok(file) => {
+            validate_file_privacy(&file, FilePrivacy::Private)
+                .map_err(|error| io::Error::new(error.kind(), format!("{name}: {error}")))?;
+            Ok(true)
+        }
         Err(error) if !required && error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io::Error::new(
             error.kind(),
@@ -50,43 +49,15 @@ pub(super) fn require_private_file_at(
 }
 
 pub(crate) fn entry_is_regular_at(directory: &File, name: &OsStr) -> io::Result<bool> {
-    Ok(FileType::from_raw_mode(entry_mode_at(directory, name)?) == FileType::RegularFile)
+    Ok(entry_metadata_at(directory, name)?.kind == EntryKind::Regular)
 }
 
 pub(crate) fn entry_is_directory_at(directory: &File, name: &OsStr) -> io::Result<bool> {
-    Ok(FileType::from_raw_mode(entry_mode_at(directory, name)?) == FileType::Directory)
+    Ok(entry_metadata_at(directory, name)?.kind == EntryKind::Directory)
 }
 
-pub(crate) fn entry_identity_at(
-    directory: &File,
-    name: &OsStr,
-) -> io::Result<(u64, u64, i64, i64)> {
-    let metadata = entry_stat_at(directory, name)?;
-    let (change_time_seconds, change_time_nanoseconds) = metadata_change_time(&metadata);
-    Ok((
-        metadata.st_dev as u64,
-        metadata.st_ino as u64,
-        change_time_seconds,
-        change_time_nanoseconds,
-    ))
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn metadata_change_time(metadata: &Stat) -> (i64, i64) {
-    (metadata.st_ctime, metadata.st_ctime_nsec as i64)
-}
-
-#[cfg(target_os = "macos")]
-pub(super) fn metadata_change_time(metadata: &Stat) -> (i64, i64) {
-    (metadata.st_ctime, metadata.st_ctime_nsec)
-}
-
-pub(super) fn entry_mode_at(directory: &File, name: &OsStr) -> io::Result<RawMode> {
-    Ok(entry_stat_at(directory, name)?.st_mode as RawMode)
-}
-
-pub(super) fn entry_stat_at(directory: &File, name: &OsStr) -> io::Result<Stat> {
-    fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(Into::into)
+pub(crate) fn entry_identity_at(directory: &File, name: &OsStr) -> io::Result<FileStamp> {
+    Ok(entry_metadata_at(directory, name)?.stamp)
 }
 
 pub(super) fn open_optional_at(
@@ -98,15 +69,6 @@ pub(super) fn open_optional_at(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
-}
-
-pub(super) fn open_at(
-    parent: &File,
-    name: &OsStr,
-    flags: OFlags,
-    mode: RawMode,
-) -> io::Result<File> {
-    Ok(fs::openat(parent, name, flags, Mode::from_raw_mode(mode))?.into())
 }
 
 #[cfg(test)]
@@ -155,14 +117,6 @@ pub(super) fn rollback_link_at(directory: &File, name: &OsStr) -> Result<(), Sto
     unlink_at(directory, name)?;
     directory.sync_all()?;
     Ok(())
-}
-
-/// Flush every dirty object and metadata change on the filesystem containing
-/// `file`. Chunked publication uses this once after linking all immutable
-/// chunks and before publishing the authoritative manifest.
-#[cfg(target_os = "linux")]
-pub(super) fn sync_filesystem(file: &File) -> io::Result<()> {
-    fs::syncfs(file).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -233,41 +187,6 @@ pub(super) fn link_or_compare_immutable(
     }
 }
 
-pub(super) fn hard_link_at(
-    source_directory: &File,
-    source_name: &OsStr,
-    destination_directory: &File,
-    destination_name: &OsStr,
-) -> io::Result<()> {
-    fs::linkat(
-        source_directory,
-        source_name,
-        destination_directory,
-        destination_name,
-        AtFlags::empty(),
-    )
-    .map_err(Into::into)
-}
-
-pub(super) fn rename_at(
-    source_directory: &File,
-    source_name: &OsStr,
-    destination_directory: &File,
-    destination_name: &OsStr,
-) -> io::Result<()> {
-    fs::renameat(
-        source_directory,
-        source_name,
-        destination_directory,
-        destination_name,
-    )
-    .map_err(Into::into)
-}
-
-pub(super) fn unlink_at(directory: &File, name: &OsStr) -> io::Result<()> {
-    fs::unlinkat(directory, name, AtFlags::empty()).map_err(Into::into)
-}
-
 pub(super) fn remove_temp(temp: &TemporaryFile) -> io::Result<()> {
     unlink_at(&temp.directory, &temp.name).and_then(|()| temp.directory.sync_all())
 }
@@ -275,7 +194,6 @@ pub(super) fn remove_temp(temp: &TemporaryFile) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt;
 
     #[test]
     fn immutable_link_classifies_retries_without_overwriting_destinations() {
@@ -314,9 +232,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn relative_filesystem_operations_preserve_bytes_and_symlinks_after_directory_rename() {
-        use std::os::unix::fs::{MetadataExt, symlink};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().expect("create root");
         let directory_path = root.path().join("original");
@@ -345,15 +265,7 @@ mod tests {
         };
         let metadata = std::fs::symlink_metadata(moved.join(source)).expect("stat symlink");
         let identity = entry_identity_at(&directory, link).expect("relative nofollow stat");
-        assert_eq!(
-            identity,
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.ctime(),
-                metadata.ctime_nsec()
-            )
-        );
+        assert_eq!(identity, FileStamp::from_metadata(&metadata));
         assert!(!entry_is_regular_at(&directory, link).expect("classify symlink"));
         assert_eq!(
             open_regular_at(&directory, link)
@@ -369,26 +281,15 @@ mod tests {
         );
         unlink_at(&directory, renamed).expect("unlink raw-byte link");
         assert_eq!(
-            entry_stat_at(&directory, renamed)
+            entry_metadata_at(&directory, renamed)
                 .expect_err("link removed")
-                .raw_os_error(),
-            Some(rustix::io::Errno::NOENT.raw_os_error())
+                .kind(),
+            io::ErrorKind::NotFound
         );
         assert!(
-            entry_stat_at(&directory, source).is_ok(),
+            entry_metadata_at(&directory, source).is_ok(),
             "original link survives"
         );
-    }
-
-    #[test]
-    fn stat_change_time_preserves_signed_seconds_and_nanoseconds() {
-        let root = tempfile::tempdir().expect("create directory");
-        let directory = open_directory(root.path()).expect("open directory");
-        let mut metadata = entry_stat_at(&directory, OsStr::new(".")).expect("stat directory");
-        metadata.st_ctime = -7;
-        metadata.st_ctime_nsec = 456_123_987;
-
-        assert_eq!(metadata_change_time(&metadata), (-7, 456_123_987));
     }
 
     #[test]
@@ -411,7 +312,7 @@ mod tests {
     fn injected_readdir_error_propagates() {
         let result = visit_directory_names(
             std::iter::once(Err(io::Error::from_raw_os_error(
-                rustix::io::Errno::IO.raw_os_error(),
+                crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
             ))),
             |_| Ok(DirectoryEntryAction::Continue),
         );
@@ -420,7 +321,7 @@ mod tests {
             result
                 .expect_err("incomplete enumeration must fail")
                 .raw_os_error(),
-            Some(rustix::io::Errno::IO.raw_os_error())
+            Some(crate::cache::test_support::InjectedIoFailure::ReadFailure.code())
         );
     }
 
@@ -436,7 +337,7 @@ mod tests {
         let error = read_dir_names_with(std::iter::from_fn(|| {
             if returned_live_name {
                 return Some(Err(io::Error::from_raw_os_error(
-                    rustix::io::Errno::IO.raw_os_error(),
+                    crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
                 )));
             }
             let entry = entries.next()?;
@@ -453,7 +354,7 @@ mod tests {
         );
         assert_eq!(
             error.raw_os_error(),
-            Some(rustix::io::Errno::IO.raw_os_error())
+            Some(crate::cache::test_support::InjectedIoFailure::ReadFailure.code())
         );
     }
 
@@ -495,14 +396,14 @@ mod tests {
 
         let error = for_each_dir_name(&directory, |_| {
             Err(io::Error::from_raw_os_error(
-                rustix::io::Errno::ACCESS.raw_os_error(),
+                crate::cache::test_support::InjectedIoFailure::AccessDenied.code(),
             ))
         })
         .expect_err("visitor error should propagate");
 
         assert_eq!(
             error.raw_os_error(),
-            Some(rustix::io::Errno::ACCESS.raw_os_error())
+            Some(crate::cache::test_support::InjectedIoFailure::AccessDenied.code())
         );
     }
 

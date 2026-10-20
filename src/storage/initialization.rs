@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fs::{File, Permissions},
+    fs::File,
     io::{self, Read, Write},
-    os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
-use rustix::fs::OFlags;
+use crate::cache::filesystem::{
+    FileAccess, FileCreation, FilePrivacy, LeaseCreation, set_file_privacy, validate_file_privacy,
+};
 
 use super::{
     LAYOUT_DESCRIPTOR, SupportedStorageBackend,
@@ -15,8 +16,8 @@ use super::{
     chunk_store::ChunkStore,
     directory::{Directory, ProcessLock},
     fs::{
-        ensure_directory_at, hard_link_at, open_at, open_optional_at, private_file_mode_is_valid,
-        require_directory_at, require_private_file_at, unlink_at,
+        ensure_directory_at, hard_link_at, open_at, open_optional_at, require_directory_at,
+        require_private_file_at, unlink_at,
     },
     publication::StorageError,
     recovery::RecoveryState,
@@ -124,7 +125,7 @@ impl CacheCreation {
         root: &Directory,
         backend: SupportedStorageBackend,
     ) -> Result<Self, StorageError> {
-        let layout = CacheLayout::lock(root, backend)?;
+        let layout = CacheLayout::lock(root, backend, LeaseCreation::CreateIfMissing)?;
         let descriptor = layout.prepare_descriptor()?;
         Ok(Self { layout, descriptor })
     }
@@ -175,8 +176,9 @@ fn install_complete_descriptor(
         let mut file = open_at(
             root,
             draft,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::Write,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )?;
         file.write_all(backend.backend().layout_descriptor())?;
         file.sync_all()?;
@@ -197,9 +199,13 @@ struct CacheLayout {
 }
 
 impl CacheLayout {
-    fn lock(root: &Directory, backend: SupportedStorageBackend) -> Result<Self, StorageError> {
+    fn lock(
+        root: &Directory,
+        backend: SupportedStorageBackend,
+        creation: LeaseCreation,
+    ) -> Result<Self, StorageError> {
         let directory = root.file().try_clone()?;
-        let lock = ProcessLock::acquire(root)?;
+        let lock = ProcessLock::acquire(root, creation)?;
         Ok(Self {
             root: directory,
             backend,
@@ -213,8 +219,9 @@ impl CacheLayout {
         let file = open_at(
             &self.root,
             OsStr::new("lock"),
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::ReadWrite,
+            FileCreation::OpenOrCreate,
+            FilePrivacy::Private,
         )
         .map_err(|error| io::Error::new(error.kind(), format!("lock: {error}")))?;
         let metadata = file.metadata()?;
@@ -223,22 +230,27 @@ impl CacheLayout {
                 io::Error::new(io::ErrorKind::InvalidData, "lock is not a regular file").into(),
             );
         }
-        if !private_file_mode_is_valid(metadata.permissions().mode()) {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "lock has unsafe permissions").into(),
-            );
-        }
+        validate_file_privacy(&file, FilePrivacy::Private)?;
         Ok(())
     }
 
     fn prepare_descriptor(&self) -> Result<DescriptorInstallation, StorageError> {
-        match open_optional_at(&self.root, OsStr::new(LAYOUT_DESCRIPTOR))? {
-            None => Ok(DescriptorInstallation::Create),
-            Some(mut descriptor) => {
+        match open_at(
+            &self.root,
+            OsStr::new(LAYOUT_DESCRIPTOR),
+            FileAccess::ReadWrite,
+            FileCreation::Existing,
+            FilePrivacy::Private,
+        ) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(DescriptorInstallation::Create)
+            }
+            Err(error) => Err(error.into()),
+            Ok(mut descriptor) => {
+                validate_file_privacy(&descriptor, FilePrivacy::Private)?;
                 let mut bytes = Vec::new();
                 (&mut descriptor).take(64).read_to_end(&mut bytes)?;
                 self.check_descriptor(&bytes)?;
-                require_private_file_at(&self.root, LAYOUT_DESCRIPTOR, true)?;
                 Ok(DescriptorInstallation::Existing(descriptor))
             }
         }
@@ -271,7 +283,7 @@ impl CacheLayout {
             let (parent, leaf) = directory_parent(&self.root, name)?;
             let directory =
                 ensure_directory_at(&parent, OsStr::new(leaf), &format!("{name} directory"))?;
-            directory.set_permissions(Permissions::from_mode(0o700))?;
+            set_file_privacy(&directory, FilePrivacy::Private)?;
             directory.sync_all()?;
             parent.sync_all()
         })
@@ -340,7 +352,7 @@ fn directory_parent<'name>(root: &File, name: &'name str) -> io::Result<(File, &
 
 impl Storage {
     pub fn open(root: &Directory, backend: SupportedStorageBackend) -> Result<Self, StorageError> {
-        let layout = CacheLayout::lock(root, backend)?;
+        let layout = CacheLayout::lock(root, backend, LeaseCreation::Existing)?;
         layout.validate_existing()?;
         layout.into_storage()
     }

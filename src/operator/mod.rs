@@ -2,11 +2,14 @@ use std::{
     fs::{self, File},
     io::Write,
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
+use crate::cache::filesystem::{
+    FileAccess, FileCreation, FileIdentity, FilePrivacy, PreparedFile, open_directory,
+    open_writable_at, validate_managed_file_privacy,
+};
 use crate::cache::{
     inventory::{Inventory, InventoryClass, InventoryEntry, VerificationMode},
     maintenance::{
@@ -22,7 +25,7 @@ use crate::cache::{
             self, EvictionOrder, FreeSpaceThresholds, GcMode, GcOptions, GcReport, ProtectedRoots,
             RetentionOptions,
         },
-        private_file_mode_is_valid, storage_directories,
+        storage_directories,
     },
 };
 use clap::{Args, builder::TypedValueParser};
@@ -31,14 +34,22 @@ use narjar::object::WireEncoding;
 use serde::Serialize;
 use ureq::Agent;
 
+#[cfg(unix)]
+use crate::native_store::NativeStoreSettings;
 use crate::{
-    config::{ServeSource, ServeSourceChoice, SourcePreparationError},
+    config::{NativeStoreOptions, ServeSource, ServeSourceChoice, SourcePreparationError},
     error::Error,
     http_url::HttpUrl,
-    native_store::{NativeStoreOptions, NativeStoreSettings},
 };
 
+#[cfg(unix)]
+#[path = "host/unix.rs"]
+mod host;
+#[cfg(windows)]
+#[path = "host/windows.rs"]
+mod host;
 mod lifecycle;
+use host::inspect_doctor_path;
 mod maintenance_session;
 pub(crate) use lifecycle::{Init, Key, generate_key_pair, init, initialize_cache, key};
 use maintenance_session::{MaintenanceRecord, MaintenanceSession, record_maintenance_result};
@@ -499,6 +510,7 @@ pub(crate) struct Gc {
     delete_older_than: Option<Duration>,
     #[arg(long, default_value_t = 0)]
     min_age_seconds: u64,
+    /// File of protected store roots, or - to read from this client's stdin.
     #[arg(long)]
     protected_roots: Option<PathBuf>,
     #[arg(long, conflicts_with = "apply")]
@@ -879,11 +891,44 @@ impl DoctorSeverity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DoctorEntryKind {
+    Missing,
+    Unavailable,
+    Symlink,
+    Directory,
+    File,
+    Other,
+}
+
+impl std::fmt::Display for DoctorEntryKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "missing",
+            Self::Unavailable => "unavailable",
+            Self::Symlink => "symlink",
+            Self::Directory => "directory",
+            Self::File => "file",
+            Self::Other => "other",
+        })
+    }
+}
+
+impl DoctorEntryKind {
+    fn inspection_failure(error: &std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => Self::Missing,
+            _ => Self::Unavailable,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct DoctorPath {
     path: &'static str,
     required: bool,
-    kind: &'static str,
+    kind: DoctorEntryKind,
     mode: Option<u32>,
     uid: Option<u32>,
     gid: Option<u32>,
@@ -929,6 +974,12 @@ impl DoctorReport {
 pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
     let source = options.prepare_source();
     let backend = match &source {
+        #[cfg(windows)]
+        Err(SourcePreparationError::NativeUnavailable) => {
+            return Err(Error::usage(
+                "native Nix store serving is not supported on Windows; choose --serve-source flat-cache",
+            ));
+        }
         Err(SourcePreparationError::UnsupportedBackend(error)) => {
             return Err(Error::usage(error.to_string()));
         }
@@ -1001,20 +1052,12 @@ fn inspect_doctor(root: &Path, backend: SupportedStorageBackend) -> Result<Docto
         ),
     };
 
-    let lease = match File::open(root) {
-        Ok(file) => match doctor_try_lease(&file) {
-            Ok(()) => (DoctorSeverity::Ok, "lease is available".to_owned()),
-            Err(error)
-                if error.raw_os_error() == Some(rustix::io::Errno::WOULDBLOCK.raw_os_error())
-                    || error.raw_os_error() == Some(rustix::io::Errno::AGAIN.raw_os_error()) =>
-            {
-                (
-                    DoctorSeverity::Warning,
-                    "lease is held by another process".to_owned(),
-                )
-            }
-            Err(error) => (DoctorSeverity::Unavailable, error.to_string()),
-        },
+    let lease = match host::inspect_lease(root) {
+        Ok(()) => (DoctorSeverity::Ok, "lease is available".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (
+            DoctorSeverity::Warning,
+            "lease is held by another process".to_owned(),
+        ),
         Err(error) => (DoctorSeverity::Unavailable, error.to_string()),
     };
 
@@ -1047,6 +1090,7 @@ fn inspect_doctor_source(
             }
         }
         Err(error) => Err(error.doctor_detail()),
+        #[cfg(unix)]
         Ok(ServeSource::NativeStore(settings)) => {
             validate_doctor_native_store(&options.data_dir, &settings)
                 .map(|()| "source configuration is valid")
@@ -1063,6 +1107,7 @@ fn inspect_doctor_source(
     }
 }
 
+#[cfg(unix)]
 fn validate_doctor_native_store(
     data_dir: &Path,
     settings: &NativeStoreSettings,
@@ -1091,114 +1136,28 @@ fn validate_doctor_read_through(data_dir: &Path) -> Result<(), &'static str> {
 
 fn inspect_doctor_recovery_markers(root: &Path) -> [DoctorPath; 2] {
     let markers = CACHE_RECOVERY_MARKERS.map(|name| inspect_doctor_path(root, name, false, false));
-    match markers.each_ref().map(|marker| marker.mode) {
-        [None, None] => markers.map(|mut marker| {
+    classify_doctor_recovery_markers(markers)
+}
+
+fn classify_doctor_recovery_markers(markers: [DoctorPath; 2]) -> [DoctorPath; 2] {
+    match markers.each_ref().map(|marker| marker.kind) {
+        [DoctorEntryKind::Missing, DoctorEntryKind::Missing] => markers.map(|mut marker| {
             marker.severity = DoctorSeverity::Error;
             marker.detail = "cache requires a clean or recovery marker".to_owned();
             marker
         }),
-        [Some(_), _] | [None, Some(_)] => markers,
-    }
-}
-
-fn inspect_doctor_path(
-    root: &Path,
-    relative: &'static str,
-    required: bool,
-    directory: bool,
-) -> DoctorPath {
-    let path = root.join(relative);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => {
-            return DoctorPath {
-                path: relative,
-                required,
-                kind: "missing",
-                mode: None,
-                uid: None,
-                gid: None,
-                severity: DoctorSeverity::Ok,
-                detail: "optional".to_owned(),
-            };
-        }
-        Err(error) => {
-            return DoctorPath {
-                path: relative,
-                required,
-                kind: "missing",
-                mode: None,
-                uid: None,
-                gid: None,
-                severity: if required {
-                    DoctorSeverity::Error
-                } else {
-                    DoctorSeverity::Unavailable
-                },
-                detail: error.to_string(),
-            };
-        }
-    };
-    let kind = if metadata.file_type().is_symlink() {
-        "symlink"
-    } else if metadata.is_dir() {
-        "directory"
-    } else if metadata.is_file() {
-        "file"
-    } else {
-        "other"
-    };
-    let mode = metadata.mode() & 0o7777;
-    let wrong_type = (directory && kind != "directory") || (!directory && kind != "file");
-    let unsafe_mode = if directory {
-        mode & 0o022 != 0
-    } else {
-        !private_file_mode_is_valid(mode)
-    };
-    let severity = if wrong_type || unsafe_mode {
-        DoctorSeverity::Error
-    } else {
-        DoctorSeverity::Ok
-    };
-    let detail = if wrong_type {
-        format!(
-            "expected {}, found {kind}",
-            if directory {
-                "directory"
-            } else {
-                "regular file"
-            }
-        )
-    } else if unsafe_mode {
-        format!("unsafe permissions {mode:04o}")
-    } else {
-        "matches portable layout contract".to_owned()
-    };
-    DoctorPath {
-        path: relative,
-        required,
-        kind,
-        mode: Some(mode),
-        uid: Some(metadata.uid()),
-        gid: Some(metadata.gid()),
-        severity,
-        detail,
+        _ => markers,
     }
 }
 
 fn doctor_capacity(path: &Path) -> Result<DoctorCapacity, std::io::Error> {
-    let file = File::open(path)?;
+    let file = open_directory(path)?;
     let capacity = filesystem_space(&file)?;
     Ok(DoctorCapacity {
         path: "",
         capacity,
-        device: file.metadata()?.dev(),
+        device: FileIdentity::from_file(&file)?.volume(),
     })
-}
-
-fn doctor_try_lease(file: &File) -> Result<(), std::io::Error> {
-    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(Into::into)
 }
 
 fn doctor_json(report: &DoctorReport) -> impl Serialize + '_ {
@@ -1356,58 +1315,54 @@ fn netrc_authorization_from_str(text: &str, host: &str) -> Result<String, Error>
 pub(crate) fn create_file(
     path: &Path,
     bytes: &[u8],
-    mode: u32,
+    privacy: FilePrivacy,
     preserve_existing: bool,
 ) -> Result<(), Error> {
-    let mut temporary = tempfile::NamedTempFile::new_in(
+    let directory = open_directory(
         path.parent()
-            .expect("Narjar managed files always have a parent directory"),
+            .expect("managed files have a parent directory"),
     )
     .map_err(runtime)?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(runtime)?;
-    temporary.write_all(bytes).map_err(runtime)?;
-    temporary.as_file().sync_all().map_err(runtime)?;
-
-    match temporary.persist_noclobber(path) {
-        Ok(_) => {}
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            validate_existing_managed_file(path, bytes, mode, preserve_existing)?;
+    let name = path.file_name().expect("managed paths name files");
+    let temporary =
+        PreparedFile::write(&directory, privacy, |file| file.write_all(bytes)).map_err(runtime)?;
+    match temporary.publish_new(name) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_existing_managed_file(&directory, name, bytes, privacy, preserve_existing)
         }
-        Err(error) => return Err(runtime(error.error)),
+        Err(error) => Err(runtime(error)),
     }
-    if let Some(parent) = path.parent() {
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(runtime)?;
-    }
-    Ok(())
 }
 
 fn validate_existing_managed_file(
-    path: &Path,
+    directory: &File,
+    name: &std::ffi::OsStr,
     bytes: &[u8],
-    mode: u32,
+    privacy: FilePrivacy,
     preserve_existing: bool,
 ) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path).map_err(runtime)?;
-    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != mode {
-        return Err(Error::runtime(format!(
-            "initialization entry is not a regular {:o} file: {}",
-            mode,
-            path.display()
-        )));
+    let mut file = open_writable_at(
+        directory,
+        name,
+        FileAccess::ReadWrite,
+        FileCreation::Existing,
+        privacy,
+    )
+    .map_err(runtime)?;
+    validate_managed_file_privacy(&file, privacy).map_err(runtime)?;
+    let mut contents = Vec::new();
+    if !preserve_existing {
+        std::io::Read::read_to_end(&mut file, &mut contents).map_err(runtime)?;
     }
-    if !preserve_existing && fs::read(path).map_err(runtime)? != bytes {
+    if !preserve_existing && contents != bytes {
         return Err(Error::runtime(format!(
             "initialization file differs from requested configuration: {}",
-            path.display()
+            name.to_string_lossy()
         )));
     }
-    File::open(path)
-        .and_then(|file| file.sync_all())
+    file.sync_all()
+        .and_then(|()| directory.sync_all())
         .map_err(runtime)
 }
 
@@ -1432,9 +1387,40 @@ fn write_json_line(mut writer: impl Write, value: &impl Serialize) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod unix;
     use super::*;
     use crate::cache::maintenance::{Operation, Outcome};
     use crate::cache::storage::{CacheCreation, Directory, SupportedStorageBackend};
+
+    #[test]
+    fn doctor_does_not_replace_recovery_inspection_errors_with_missing_marker_diagnostics() {
+        let markers = CACHE_RECOVERY_MARKERS.map(|path| DoctorPath {
+            path,
+            required: false,
+            kind: DoctorEntryKind::Unavailable,
+            mode: None,
+            uid: None,
+            gid: None,
+            severity: DoctorSeverity::Unavailable,
+            detail: "access denied while inspecting recovery marker".to_owned(),
+        });
+        for marker in classify_doctor_recovery_markers(markers) {
+            assert_eq!(marker.kind, DoctorEntryKind::Unavailable);
+            assert_eq!(
+                marker.detail,
+                "access denied while inspecting recovery marker"
+            );
+        }
+        assert_eq!(
+            DoctorEntryKind::inspection_failure(&std::io::ErrorKind::NotFound.into()),
+            DoctorEntryKind::Missing
+        );
+        assert_eq!(
+            DoctorEntryKind::inspection_failure(&std::io::ErrorKind::PermissionDenied.into()),
+            DoctorEntryKind::Unavailable
+        );
+    }
 
     #[test]
     fn gc_day_periods_have_exact_checked_duration_values() {
@@ -1509,10 +1495,11 @@ mod tests {
 
     #[test]
     fn doctor_json_preserves_lossy_paths_nulls_and_flat_capacity_fields() {
-        use std::os::unix::ffi::OsStringExt;
         let directory = initialized_doctor_cache();
         let mut report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT).unwrap();
-        report.root = PathBuf::from(std::ffi::OsString::from_vec(b"cache-\xff".to_vec()));
+        let mut invalid = std::ffi::OsString::from("cache-");
+        invalid.push(crate::cache::test_support::non_unicode_name(""));
+        report.root = PathBuf::from(invalid);
         report.mount_detail = "quote\" slash\\\n\0".into();
         report.paths[0].mode = None;
         let value = serde_json::to_value(doctor_json(&report)).unwrap();
@@ -1529,9 +1516,10 @@ mod tests {
     fn managed_file_conflict_never_replaces_existing_contents_or_leaves_temps() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let path = directory.path().join("credential");
-        create_file(&path, b"original", 0o600, false).expect("initial file should be created");
+        create_file(&path, b"original", FilePrivacy::Private, false)
+            .expect("initial file should be created");
 
-        assert!(create_file(&path, b"replacement", 0o600, false).is_err());
+        assert!(create_file(&path, b"replacement", FilePrivacy::Private, false).is_err());
 
         assert_eq!(
             fs::read(path).expect("original file should remain"),
@@ -1764,11 +1752,11 @@ machine other.example password other-secret
             .expect("published recovery fixture should encode"),
         )
         .expect("published transaction should be durable on disk");
-        fs::set_permissions(&transaction_path, fs::Permissions::from_mode(0o600))
+        crate::cache::test_support::make_private_file(&transaction_path)
             .expect("transaction should have private permissions");
         let recovery_marker = directory.path().join(".narjar-recovery");
         fs::write(&recovery_marker, b"interrupted\n").expect("recovery marker should be present");
-        fs::set_permissions(&recovery_marker, fs::Permissions::from_mode(0o600))
+        crate::cache::test_support::make_private_file(&recovery_marker)
             .expect("recovery marker should have private permissions");
 
         let published_destination = directory.path().join("nix-cache-info");
@@ -1914,7 +1902,7 @@ machine other.example password other-secret
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn init_can_select_the_chunked_storage_backend() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         init(Init {
@@ -1977,38 +1965,6 @@ machine other.example password other-secret
     }
 
     #[test]
-    fn doctor_rejects_private_file_modes_that_startup_rejects() {
-        let directory = initialized_doctor_cache();
-        for name in ["lock", LAYOUT_DESCRIPTOR]
-            .into_iter()
-            .chain(CACHE_POLICY_FILES.iter().copied())
-        {
-            let path = directory.path().join(name);
-            for mode in [0o400, 0o644, 0o660] {
-                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
-                let report =
-                    inspect_doctor(directory.path(), SupportedStorageBackend::FLAT).unwrap();
-                let entry = report
-                    .paths
-                    .iter()
-                    .find(|entry| entry.path == name)
-                    .unwrap();
-                assert!(
-                    entry.severity.is_failure(),
-                    "doctor accepted {name} with mode {mode:04o}"
-                );
-                assert!(report.has_failures());
-            }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        assert!(
-            !inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
-                .unwrap()
-                .has_failures()
-        );
-    }
-
-    #[test]
     fn doctor_requires_one_private_recovery_marker_and_checks_both_when_present() {
         let directory = initialized_doctor_cache();
         let clean = directory.path().join(".narjar-clean");
@@ -2021,55 +1977,23 @@ machine other.example password other-secret
             "neither marker is not an initialized cache"
         );
         fs::write(&recovery, b"interrupted\n").unwrap();
-        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::cache::test_support::make_private_file(&recovery).unwrap();
         assert!(!report().has_failures(), "a recovery marker is sufficient");
         fs::write(&clean, b"").unwrap();
-        fs::set_permissions(&clean, fs::Permissions::from_mode(0o644)).unwrap();
+        crate::cache::test_support::make_public_file(&clean).unwrap();
         assert!(
             report().has_failures(),
             "a valid recovery marker cannot hide an unsafe clean marker"
         );
-        fs::set_permissions(&clean, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::cache::test_support::make_private_file(&clean).unwrap();
         assert!(
             !report().has_failures(),
             "both private markers are permitted"
         );
-        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o644)).unwrap();
+        crate::cache::test_support::make_public_file(&recovery).unwrap();
         assert!(
             report().has_failures(),
             "a valid clean marker cannot hide an unsafe recovery marker"
-        );
-    }
-
-    #[test]
-    fn native_doctor_loads_the_same_required_policies_as_startup() {
-        let directory = initialized_doctor_cache();
-        let settings = NativeStoreSettings::new(
-            directory.path().join("missing-store"),
-            directory.path().join("native-state"),
-            directory.path().join("native-roots"),
-            NonZeroU64::new(60).unwrap(),
-        );
-        for name in CACHE_POLICY_FILES {
-            let path = directory.path().join(name);
-            let original = fs::read(&path).unwrap();
-            fs::remove_file(&path).unwrap();
-            assert_eq!(
-                validate_doctor_native_store(directory.path(), &settings),
-                Err("cache policy is invalid")
-            );
-            assert!(!path.exists(), "doctor must not recreate {name}");
-            fs::write(&path, original).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        fs::write(
-            directory.path().join("auth/write.tokens"),
-            b"invalid token record\n",
-        )
-        .unwrap();
-        assert_eq!(
-            validate_doctor_native_store(directory.path(), &settings),
-            Err("cache policy is invalid")
         );
     }
 
@@ -2155,106 +2079,6 @@ machine other.example password other-secret
     }
 
     #[test]
-    fn doctor_source_policy_errors_keep_the_existing_static_details() {
-        use narjar::object::CompressionCodec;
-
-        let complete = NativeStoreOptions {
-            store_dir: Some(Path::new("/private/store-path")),
-            state_dir: Some(Path::new("/private/state-path")),
-            roots_dir: Some(Path::new("/private/roots-path")),
-            min_lease_seconds: NonZeroU64::new(60),
-            signing_key_file: None,
-        };
-        for (choice, native, encoding, backend, expected_error, detail) in [
-            (
-                ServeSourceChoice::ReadThrough,
-                NativeStoreOptions::default(),
-                WireEncoding::Compressed(CompressionCodec::Zstd),
-                StorageBackend::Flat,
-                SourcePreparationError::EdgeCompressedOutput,
-                "read-through source requires raw output",
-            ),
-            (
-                ServeSourceChoice::ReadThrough,
-                NativeStoreOptions::default(),
-                WireEncoding::Compressed(CompressionCodec::Xz),
-                StorageBackend::Flat,
-                SourcePreparationError::EdgeCompressedOutput,
-                "read-through source requires raw output",
-            ),
-            (
-                ServeSourceChoice::FlatCache,
-                complete,
-                WireEncoding::Raw,
-                StorageBackend::Flat,
-                SourcePreparationError::NativeOptionsForCache,
-                "native source options require native-store selection",
-            ),
-            (
-                ServeSourceChoice::NativeStore,
-                NativeStoreOptions {
-                    state_dir: None,
-                    ..complete
-                },
-                WireEncoding::Raw,
-                StorageBackend::Flat,
-                SourcePreparationError::MissingNativeOptions,
-                "required native source options are missing",
-            ),
-            (
-                ServeSourceChoice::NativeStore,
-                complete,
-                WireEncoding::Compressed(CompressionCodec::Xz),
-                StorageBackend::Flat,
-                SourcePreparationError::NativeCompressedOutput,
-                "native source requires raw output and flat storage",
-            ),
-            (
-                ServeSourceChoice::NativeStore,
-                complete,
-                WireEncoding::Compressed(CompressionCodec::Zstd),
-                StorageBackend::Flat,
-                SourcePreparationError::NativeCompressedOutput,
-                "native source requires raw output and flat storage",
-            ),
-            (
-                ServeSourceChoice::NativeStore,
-                complete,
-                WireEncoding::Raw,
-                StorageBackend::Chunked,
-                SourcePreparationError::NativeChunkedBackend,
-                "native source requires raw output and flat storage",
-            ),
-        ] {
-            let options = Doctor {
-                data_dir: PathBuf::from("/unavailable/narjar-cache"),
-                json: true,
-                serve_source: choice,
-                native_store_dir: native.store_dir.map(Path::to_owned),
-                native_state_dir: native.state_dir.map(Path::to_owned),
-                native_roots_dir: native.roots_dir.map(Path::to_owned),
-                native_min_lease_seconds: native.min_lease_seconds,
-                native_signing_key_file: None,
-                egress_compression: encoding,
-                storage_backend: backend,
-            };
-            let source = options.prepare_source();
-            assert_eq!(
-                source.as_ref().unwrap_err(),
-                &expected_error,
-                "doctor must use the same source policy as serve"
-            );
-            let diagnostic = inspect_doctor_source(&options, source);
-            assert_eq!(diagnostic.name, choice.name());
-            assert!(matches!(diagnostic.severity, DoctorSeverity::Error));
-            assert_eq!(
-                diagnostic.detail, detail,
-                "policy errors must retain static details instead of inspecting unavailable paths"
-            );
-        }
-    }
-
-    #[test]
     #[cfg(target_os = "macos")]
     fn doctor_rejects_unsupported_backend_before_reporting_other_source_errors() {
         use narjar::object::CompressionCodec;
@@ -2336,6 +2160,7 @@ machine other.example password other-secret
     }
 
     #[test]
+    #[cfg(unix)]
     fn native_source_doctor_reports_validation_without_echoing_configured_paths() {
         let directory = initialized_doctor_cache();
         let options = Doctor {
@@ -2389,7 +2214,7 @@ machine other.example password other-secret
             .find(|path| path.path == "nar")
             .expect("nar path should be reported");
         assert!(matches!(nar.severity, DoctorSeverity::Error));
-        assert_eq!(nar.kind, "file");
+        assert_eq!(nar.kind, DoctorEntryKind::File);
     }
 
     #[test]
@@ -2402,8 +2227,9 @@ machine other.example password other-secret
             storage_backend: StorageBackend::Flat,
         })
         .expect("cache should initialize");
-        let held = File::open(directory.path()).expect("data directory should open");
-        doctor_try_lease(&held).expect("test should hold the lease");
+        let root = Directory::open(directory.path()).expect("data directory should open");
+        let _held = Storage::open(&root, SupportedStorageBackend::FLAT)
+            .expect("test should hold the lease");
 
         let report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
             .expect("doctor should inspect cache");

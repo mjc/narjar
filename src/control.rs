@@ -2,7 +2,6 @@
 
 use std::{
     io::{self, Read},
-    os::unix::net::{UnixListener, UnixStream},
     path::Path,
     sync::{
         Arc,
@@ -21,13 +20,17 @@ use crate::cache::{
     },
 };
 use crossbeam_channel::{Sender, bounded};
-use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 mod protocol;
 mod retry;
 pub(crate) use retry::RetryPolicy;
+#[cfg(unix)]
 mod socket;
+#[cfg(windows)]
+#[path = "control/windows.rs"]
+mod socket;
+use socket::{Listener, Stream};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const REPORT_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -93,15 +96,13 @@ fn request_collection(data_dir: &Path, options: &GcOptions) -> io::Result<Reply>
 }
 
 struct CollectionJob {
-    connection: UnixStream,
+    connection: Stream,
     options: GcOptions,
 }
 
 impl CollectionJob {
-    fn receive_bounded_request(mut connection: UnixStream) -> io::Result<Self> {
-        // BSD accept() can inherit the listener's nonblocking flag.
-        connection.set_nonblocking(false)?;
-        connection.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+    fn receive_bounded_request(mut connection: Stream) -> io::Result<Self> {
+        socket::configure_connection(&connection)?;
         let options = protocol::read_frame(DeadlineReader::new(&mut connection, REQUEST_TIMEOUT))?;
         Ok(Self {
             connection,
@@ -179,7 +180,7 @@ impl ControlService {
                         &stopping,
                         &daemon_stopping,
                         &metrics,
-                        |listener| listener.accept().map(|(connection, _)| connection),
+                        socket::accept,
                     )
                 }) {
                 Ok(dispatcher) => dispatcher,
@@ -250,7 +251,7 @@ fn dispatch_requests(
     stopping: &AtomicBool,
     daemon_stopping: &AtomicBool,
     metrics: &Metrics,
-    mut accept: impl FnMut(&UnixListener) -> io::Result<UnixStream>,
+    mut accept: impl FnMut(&Listener) -> io::Result<Stream>,
 ) -> io::Result<()> {
     std::iter::repeat_with(|| ())
         .take_while(|_| !is_stopping(stopping, daemon_stopping))
@@ -263,14 +264,7 @@ fn dispatch_requests(
                     thread::park_timeout(Duration::from_millis(100))
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error)
-                    if error.kind() == io::ErrorKind::ConnectionAborted
-                        || error.raw_os_error().is_some_and(|code| {
-                            [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM]
-                                .iter()
-                                .any(|errno| errno.raw_os_error() == code)
-                        }) =>
-                {
+                Err(error) if socket::retryable_accept_error(&error) => {
                     eprintln!("narjar: online GC accept failed; retrying: {error}");
                     thread::park_timeout(Duration::from_millis(100));
                 }
@@ -281,7 +275,7 @@ fn dispatch_requests(
 }
 
 fn queue_collection_request(
-    connection: UnixStream,
+    connection: Stream,
     jobs: &Sender<CollectionJob>,
     busy: &AtomicBool,
     metrics: &Metrics,
@@ -308,7 +302,7 @@ fn enqueue_admitted_collection_job(
     }
 }
 
-fn send_recorded_reply(connection: &mut UnixStream, reply: Reply, metrics: &Metrics) {
+fn send_recorded_reply(connection: &mut Stream, reply: Reply, metrics: &Metrics) {
     metrics.online_gc_completed(reply.outcome());
     let _ = protocol::write_frame(connection, &reply);
 }
@@ -348,12 +342,12 @@ fn run_collection(
 
 /// A total deadline: partial header/body reads cannot reset the timeout.
 struct DeadlineReader<'a> {
-    connection: &'a mut UnixStream,
+    connection: &'a mut Stream,
     deadline: Instant,
 }
 
 impl<'a> DeadlineReader<'a> {
-    fn new(connection: &'a mut UnixStream, timeout: Duration) -> Self {
+    fn new(connection: &'a mut Stream, timeout: Duration) -> Self {
         Self {
             connection,
             deadline: Instant::now() + timeout,
@@ -365,14 +359,7 @@ impl Read for DeadlineReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match bytes {
             [] => Ok(0),
-            bytes => {
-                socket::wait_for_socket_event_before_deadline(
-                    self.connection,
-                    rustix::event::PollFlags::IN,
-                    self.deadline,
-                )?;
-                self.connection.read(bytes)
-            }
+            bytes => socket::read_before_deadline(self.connection, bytes, self.deadline),
         }
     }
 }
@@ -385,6 +372,35 @@ mod tests {
         storage::{CachePolicies, Directory, StorageBackend, SupportedStorageBackend, gc::GcMode},
     };
     use std::{io::Write, sync::mpsc};
+
+    #[cfg(unix)]
+    mod unix;
+
+    fn test_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        crate::cache::test_support::private_directory(root.path()).unwrap();
+        root
+    }
+
+    fn stream_pair() -> (Stream, Stream) {
+        let root = test_root();
+        let bound = socket::BoundSocket::bind(root.path()).unwrap();
+        let client = socket::connect(root.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let server = loop {
+            match socket::accept(&bound.listener) {
+                Ok(server) => break server,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "test accept deadline expired");
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                Err(error) => panic!("test accept failed: {error}"),
+            }
+        };
+        socket::configure_connection(&server).unwrap();
+        client.set_write_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+        (server, client)
+    }
 
     struct ReleaseCollectorOnDrop<'a>(&'a mpsc::Sender<()>);
 
@@ -407,7 +423,7 @@ mod tests {
 
     #[test]
     fn a_buffered_control_reply_is_read_after_the_daemon_closes_its_socket() {
-        let (mut client, mut daemon) = UnixStream::pair().unwrap();
+        let (mut daemon, mut client) = stream_pair();
         protocol::write_frame(&mut daemon, &Reply::Failed(ControlFailure::Busy)).unwrap();
         drop(daemon);
 
@@ -418,14 +434,14 @@ mod tests {
 
     #[test]
     fn an_empty_control_read_does_not_wait_for_a_reply() {
-        let (mut client, _daemon) = UnixStream::pair().unwrap();
+        let (mut client, _daemon) = stream_pair();
         let mut reader = DeadlineReader::new(&mut client, REPORT_TIMEOUT);
         assert_eq!(reader.read(&mut []).unwrap(), 0);
     }
 
     #[test]
     fn a_control_read_without_available_bytes_expires_at_its_deadline() {
-        let (mut client, _daemon) = UnixStream::pair().unwrap();
+        let (mut client, _daemon) = stream_pair();
         let mut reader = DeadlineReader::new(&mut client, Duration::from_millis(20));
         assert_eq!(
             reader.read(&mut [0]).unwrap_err().kind(),
@@ -446,38 +462,8 @@ mod tests {
         }
     }
 
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn online_requests_accept_non_utf8_cache_paths_without_serializing_them() {
-        use std::os::unix::ffi::OsStringExt;
-        // ZFS can require UTF-8 names; tmpfs lets this exercise the wire boundary.
-        let parent = tempfile::tempdir_in("/dev/shm").unwrap();
-        let root = parent
-            .path()
-            .join(std::ffi::OsString::from_vec(b"cache-\xff".to_vec()));
-        std::fs::create_dir(&root).unwrap();
-        let metrics = Arc::new(Metrics::default());
-        let service = ControlService::start_with_collector(
-            &root,
-            Arc::new(AtomicBool::new(false)),
-            metrics,
-            |_| Reply::Failed(ControlFailure::Stopping),
-        )
-        .unwrap();
-        let error = collect(&root, options(), RetryPolicy::default())
-            .err()
-            .unwrap();
-        service
-            .finish(Instant::now() + Duration::from_secs(2))
-            .unwrap();
-        assert!(
-            error.to_string().contains("shutting down"),
-            "valid Unix paths must reach the collector: {error}"
-        );
-    }
-
     fn fixture() -> (tempfile::TempDir, Arc<Storage>, Arc<TrustedPublicKeys>) {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_root();
         crate::operator::initialize_cache(
             root.path().to_owned(),
             30,
@@ -518,7 +504,7 @@ mod tests {
 
     #[test]
     fn oversized_root_sets_never_send_a_partial_request_or_enter_collection() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_root();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
         let service = ControlService::start_with_collector(
@@ -543,117 +529,6 @@ mod tests {
             .unwrap();
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn transient_accept_errors_preserve_the_listener_and_admit_the_next_request() {
-        let root = tempfile::tempdir().unwrap();
-        let bound = socket::BoundSocket::bind(root.path()).unwrap();
-        let mut client = socket::connect(root.path()).unwrap();
-        protocol::write_frame(&mut client, &options()).unwrap();
-        let (sender, receiver) = bounded(1);
-        let busy = AtomicBool::new(false);
-        let stopping = AtomicBool::new(false);
-        let daemon_stopping = AtomicBool::new(false);
-        let metrics = Metrics::default();
-        let mut errors = [
-            Errno::AGAIN,
-            Errno::INTR,
-            Errno::CONNABORTED,
-            Errno::MFILE,
-            Errno::NFILE,
-            Errno::NOBUFS,
-            Errno::NOMEM,
-        ]
-        .into_iter();
-        dispatch_requests(
-            bound,
-            sender,
-            &busy,
-            &stopping,
-            &daemon_stopping,
-            &metrics,
-            |listener| {
-                assert!(socket::socket_path(root.path()).exists());
-                if let Some(error) = errors.next() {
-                    return Err(error.into());
-                }
-                let (connection, _) = listener.accept()?;
-                stopping.store(true, Ordering::Release);
-                Ok(connection)
-            },
-        )
-        .expect("transient accept failures must leave collection usable");
-        let mut job = receiver
-            .try_recv()
-            .expect("the next request must be queued");
-        assert_eq!(job.options.target_bytes, Some(0));
-        send_recorded_reply(
-            &mut job.connection,
-            Reply::Failed(ControlFailure::Changed),
-            &metrics,
-        );
-        assert!(matches!(
-            protocol::read_frame::<Reply>(&mut client).unwrap(),
-            Reply::Failed(ControlFailure::Changed)
-        ));
-        assert!(!socket::socket_path(root.path()).exists());
-    }
-
-    #[test]
-    fn shutdown_during_a_transient_accept_error_stops_before_accepting_again() {
-        for daemon_shutdown in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let bound = socket::BoundSocket::bind(root.path()).unwrap();
-            let (sender, _receiver) = bounded(1);
-            let stopping = AtomicBool::new(false);
-            let daemon_stopping = AtomicBool::new(false);
-            let mut calls = 0;
-            dispatch_requests(
-                bound,
-                sender,
-                &AtomicBool::new(false),
-                &stopping,
-                &daemon_stopping,
-                &Metrics::default(),
-                |_| {
-                    calls += 1;
-                    if daemon_shutdown {
-                        &daemon_stopping
-                    } else {
-                        &stopping
-                    }
-                    .store(true, Ordering::Release);
-                    Err(rustix::io::Errno::MFILE.into())
-                },
-            )
-            .expect("shutdown during resource exhaustion must finish normally");
-            assert_eq!(calls, 1);
-            assert!(!socket::socket_path(root.path()).exists());
-        }
-    }
-
-    #[test]
-    fn a_fatal_accept_error_is_returned_and_removes_the_owned_socket() {
-        let root = tempfile::tempdir().unwrap();
-        let bound = socket::BoundSocket::bind(root.path()).unwrap();
-        let (sender, receiver) = bounded(1);
-        let error = dispatch_requests(
-            bound,
-            sender,
-            &AtomicBool::new(false),
-            &AtomicBool::new(false),
-            &AtomicBool::new(false),
-            &Metrics::default(),
-            |_| Err(rustix::io::Errno::BADF.into()),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.raw_os_error(),
-            Some(rustix::io::Errno::BADF.raw_os_error())
-        );
-        assert!(receiver.recv().is_err());
-        assert!(!socket::socket_path(root.path()).exists());
     }
 
     #[test]
@@ -703,7 +578,7 @@ mod tests {
         service
             .finish(Instant::now() + Duration::from_secs(5))
             .unwrap();
-        assert!(!socket::socket_path(root.path()).exists());
+        assert!(socket::connect(root.path()).is_err());
     }
 
     #[test]
@@ -750,7 +625,7 @@ mod tests {
 
     #[test]
     fn a_contending_request_is_rejected_before_the_active_collector_is_released() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_root();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let service = ControlService::start_with_collector(
@@ -796,7 +671,7 @@ mod tests {
 
     #[test]
     fn malformed_frames_never_reach_collection_and_do_not_poison_the_next_request() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_root();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
         let service = ControlService::start_with_collector(
@@ -811,12 +686,13 @@ mod tests {
         .unwrap();
         let mut connection = socket::connect(root.path()).unwrap();
         connection.write_all(b"NGC3\xff\xff\xff\xff").unwrap();
-        connection.shutdown(std::net::Shutdown::Write).unwrap();
         let mut byte = [0];
-        connection
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        assert_eq!(connection.read(&mut byte).unwrap(), 0);
+        assert_eq!(
+            DeadlineReader::new(&mut connection, Duration::from_secs(5))
+                .read(&mut byte)
+                .unwrap(),
+            0
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert!(collect(root.path(), options(), RetryPolicy::default()).is_err());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -826,33 +702,95 @@ mod tests {
     }
 
     #[test]
-    fn accepted_nonblocking_streams_become_blocking_before_queueing_and_replying() {
-        let (connection, mut client) = UnixStream::pair().unwrap();
-        connection.set_nonblocking(true).unwrap();
+    fn an_incomplete_request_expires_without_entering_collection_or_poisoning_the_listener() {
+        let root = test_root();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let service = ControlService::start_with_collector(
+            root.path(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Metrics::default()),
+            move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Reply::Failed(ControlFailure::Changed)
+            },
+        )
+        .unwrap();
+        let mut connection = socket::connect(root.path()).unwrap();
+        connection.write_all(b"NGC3\0\0\0\x01").unwrap();
+        assert_eq!(
+            DeadlineReader::new(&mut connection, REQUEST_TIMEOUT + Duration::from_secs(3))
+                .read(&mut [0])
+                .unwrap(),
+            0,
+            "the daemon must close an incomplete request without waiting for client EOF"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        drop(connection);
+        let error = collect(root.path(), options(), RetryPolicy::default())
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error.get_ref().unwrap().downcast_ref::<ControlFailure>(),
+            Some(ControlFailure::Changed)
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        service
+            .finish(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    }
+
+    #[test]
+    fn transport_neutral_transient_accept_errors_preserve_the_next_framed_request() {
+        let root = test_root();
+        let bound = socket::BoundSocket::bind(root.path()).unwrap();
+        let mut client = socket::connect(root.path()).unwrap();
         protocol::write_frame(&mut client, &options()).unwrap();
         let (sender, receiver) = bounded(1);
         let busy = AtomicBool::new(false);
-        queue_collection_request(connection, &sender, &busy, &Metrics::default()).unwrap();
-        let mut job = receiver
-            .try_recv()
-            .expect("the decoded request must be queued");
-        assert!(
-            !rustix::fs::fcntl_getfl(&job.connection)
-                .unwrap()
-                .contains(rustix::fs::OFlags::NONBLOCK),
-            "BSD-inherited nonblocking mode must not bypass protocol deadlines"
+        let stopping = AtomicBool::new(false);
+        let daemon_stopping = AtomicBool::new(false);
+        let metrics = Metrics::default();
+        let mut errors = [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+        ]
+        .into_iter();
+        dispatch_requests(
+            bound,
+            sender,
+            &busy,
+            &stopping,
+            &daemon_stopping,
+            &metrics,
+            |listener| {
+                if let Some(error) = errors.next() {
+                    return Err(error.into());
+                }
+                let connection = socket::accept(listener)?;
+                stopping.store(true, Ordering::Release);
+                Ok(connection)
+            },
+        )
+        .unwrap();
+        let mut job = receiver.try_recv().expect("the request must be queued");
+        assert_eq!(job.options.target_bytes, Some(0));
+        send_recorded_reply(
+            &mut job.connection,
+            Reply::Failed(ControlFailure::Changed),
+            &metrics,
         );
-        assert!(busy.load(Ordering::Acquire));
-        protocol::write_frame(&mut job.connection, &Reply::Failed(ControlFailure::Busy)).unwrap();
         assert!(matches!(
-            protocol::read_frame::<Reply>(&mut client).unwrap(),
-            Reply::Failed(ControlFailure::Busy)
+            protocol::read_frame::<Reply>(DeadlineReader::new(&mut client, REQUEST_TIMEOUT))
+                .unwrap(),
+            Reply::Failed(ControlFailure::Changed)
         ));
     }
 
     #[test]
     fn a_closed_collection_queue_releases_admission_and_reports_stopping() {
-        let (connection, mut client) = UnixStream::pair().unwrap();
+        let (connection, mut client) = stream_pair();
         protocol::write_frame(&mut client, &options()).unwrap();
         let (sender, receiver) = bounded(1);
         drop(receiver);
@@ -870,7 +808,7 @@ mod tests {
 
     #[test]
     fn expired_deadlines_reject_an_available_partial_frame_without_extending_the_budget() {
-        let (mut connection, mut peer) = UnixStream::pair().unwrap();
+        let (mut connection, mut peer) = stream_pair();
         peer.write_all(b"NGC3").unwrap();
         let mut reader = DeadlineReader {
             connection: &mut connection,
@@ -884,7 +822,7 @@ mod tests {
 
     #[test]
     fn shutdown_drains_an_active_collection_before_joining_and_removing_its_socket() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_root();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let service = ControlService::start_with_collector(
@@ -913,12 +851,12 @@ mod tests {
                 .unwrap();
             assert!(client.join().unwrap().is_err());
         });
-        assert!(!socket::socket_path(root.path()).exists());
+        assert!(socket::connect(root.path()).is_err());
     }
 
     #[test]
     fn shutdown_has_a_deadline_even_when_the_active_collector_cannot_finish() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_root();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let service = ControlService::start_with_collector(

@@ -139,7 +139,6 @@ fn authorization_token_hash(request: &Request) -> Option<[u8; TOKEN_BYTES]> {
 mod tests {
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -163,8 +162,7 @@ mod tests {
         fs::create_dir_all(&auth).expect("create test auth directory");
         let path = auth.join("write.tokens");
         fs::write(&path, WRITE_TOKEN).expect("write test token file");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
-            .expect("set insecure test permissions");
+        crate::cache::test_support::make_public_file(&path).expect("set insecure test permissions");
 
         let result = Authorizer::load(&Directory::open(&root).expect("open test root"));
         fs::remove_dir_all(root).expect("remove test data directory");

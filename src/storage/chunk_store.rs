@@ -11,7 +11,7 @@ use std::{
     time::SystemTime,
 };
 
-use rustix::fs::OFlags;
+use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
 
 use mincdc::{MinCdcHash4, SliceChunker};
 use sha2::{Digest, Sha256};
@@ -30,7 +30,7 @@ use super::{
         for_each_dir_name, link_or_compare_immutable, open_at, open_directory_at, open_regular_at,
         read_dir_names, require_directory_at, unlink_at,
     },
-    publication::{StagingReservation, StorageError},
+    publication::StagingReservation,
     state::StorageActivity,
 };
 
@@ -228,8 +228,9 @@ impl ChunkStore {
         let record_file = open_at(
             &self.manifests,
             &record_name,
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::ReadWrite,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )?;
         Ok(ChunkingWriter {
             store: self,
@@ -1175,8 +1176,9 @@ impl DurableChunks<'_> {
             let mut temporary = open_at(
                 directory,
                 &name,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                0o600,
+                FileAccess::Write,
+                FileCreation::CreateNew,
+                FilePrivacy::Private,
             )?;
             write_complete_manifest(&mut temporary, self.manifest, &mut self.writer.record_file)?;
             temporary.sync_all()?;
@@ -1513,7 +1515,7 @@ impl<'store> ChunkingWriter<'store> {
         };
         reservation
             .grow_to(directory, self.min_free_bytes, bytes)
-            .map_err(io_for_storage_error)
+            .map_err(io::Error::from)
     }
 
     fn release_materialized_bytes(&mut self, bytes: u64) {
@@ -1615,8 +1617,9 @@ fn write_temporary_file(directory: &File, name: &OsStr, bytes: &[u8]) -> io::Res
     let mut file = open_at(
         directory,
         name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        0o600,
+        FileAccess::Write,
+        FileCreation::CreateNew,
+        FilePrivacy::Private,
     )?;
     file.write_all(bytes)
 }
@@ -1642,8 +1645,9 @@ fn mark_gc_file(directory: &File, name: &OsStr) -> io::Result<()> {
     match open_at(
         directory,
         name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        0o600,
+        FileAccess::Write,
+        FileCreation::CreateNew,
+        FilePrivacy::Private,
     ) {
         Ok(_file) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
@@ -1745,16 +1749,6 @@ fn is_chunk_shard_name(name: &OsStr) -> bool {
     name.len() == 2 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn io_for_storage_error(error: StorageError) -> io::Error {
-    match error {
-        StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
-            io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
-        }
-        StorageError::Io(error) => error,
-        error => io::Error::other(error),
-    }
-}
-
 fn shard_name(hash: ChunkHash) -> String {
     hex_name(*hash.as_bytes())[..2].to_owned()
 }
@@ -1796,7 +1790,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use super::{ChunkStore, ChunkStoreError, OFlags, remove_abandoned_temps};
+    use super::{ChunkStore, ChunkStoreError, remove_abandoned_temps};
+    use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
     use crate::cache::{
         object::{NarHash, NarIdentity, NarSize},
         storage::{
@@ -2282,13 +2277,13 @@ mod tests {
 
         let result = writer.finish_with(identity, |_| {
             Err(std::io::Error::from_raw_os_error(
-                rustix::io::Errno::IO.raw_os_error(),
+                crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
             ))
         });
 
         assert!(matches!(
             result,
-            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(crate::cache::test_support::InjectedIoFailure::ReadFailure.code())
         ));
         assert!(store.open_manifest(identity.hash()).unwrap().is_none());
         assert!(
@@ -2345,7 +2340,7 @@ mod tests {
         assert!(
             failed
                 .finish_with(identity, |_| Err(std::io::Error::from_raw_os_error(
-                    rustix::io::Errno::IO.raw_os_error()
+                    crate::cache::test_support::InjectedIoFailure::ReadFailure.code()
                 )))
                 .is_err()
         );
@@ -2530,7 +2525,7 @@ mod tests {
         fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
             if self.sent {
                 return Err(std::io::Error::from_raw_os_error(
-                    rustix::io::Errno::IO.raw_os_error(),
+                    crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
                 ));
             }
             let length = output.len().min(self.bytes.len());
@@ -2561,7 +2556,7 @@ mod tests {
                 expected,
                 ChunkProfile::MinCdcHash4V2
             ),
-            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
+            Err(ChunkStoreError::Io(error)) if error.raw_os_error() == Some(crate::cache::test_support::InjectedIoFailure::ReadFailure.code())
         ));
         assert!(store.open_manifest(expected.hash()).unwrap().is_none());
         assert_eq!(
@@ -2753,16 +2748,18 @@ mod tests {
         let mut chunk = super::super::fs::open_at(
             &shard,
             chunk_temp,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::Write,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )
         .unwrap();
         chunk.write_all(b"abandoned").unwrap();
         let mut manifest = super::super::fs::open_at(
             &store.manifests,
             manifest_temp,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::Write,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )
         .unwrap();
         manifest.write_all(b"abandoned").unwrap();

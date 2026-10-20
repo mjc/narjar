@@ -1,16 +1,15 @@
 use std::{
     ffi::{OsStr, OsString},
-    fs::{File, Permissions},
+    fs::File,
     io::{self, Cursor, Read},
     num::NonZeroUsize,
-    os::unix::fs::PermissionsExt,
     path::PathBuf,
     process,
     sync::{Arc, Mutex, RwLock, TryLockError, atomic::Ordering},
     time::SystemTime,
 };
 
-use rustix::fs::OFlags;
+use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy, set_file_privacy};
 
 use serde::{Deserialize, Serialize};
 
@@ -1059,11 +1058,7 @@ impl Storage {
         match before_temp().and_then(|()| self.create_temp_named_owned(target, name)) {
             Ok(temporary) => {
                 let publication = OwnedPublication::new(temporary, transaction);
-                publication
-                    .temporary()
-                    .file()
-                    .file
-                    .set_permissions(Permissions::from_mode(0o600))?;
+                set_file_privacy(&publication.temporary().file().file, FilePrivacy::Private)?;
                 Ok(publication)
             }
             Err(error) => {
@@ -1353,10 +1348,7 @@ impl Storage {
     ) -> Result<TemporaryFile, StorageError> {
         let name = self.next_temp_name(target);
         let temporary = self.create_temp_named_owned(target, name)?;
-        temporary
-            .file()
-            .file
-            .set_permissions(Permissions::from_mode(0o600))?;
+        set_file_privacy(&temporary.file().file, FilePrivacy::Private)?;
         Ok(temporary.into_file())
     }
 
@@ -1393,10 +1385,7 @@ impl Storage {
         name: OsString,
     ) -> Result<TemporaryFile, StorageError> {
         let temporary = self.create_temp_in_directory_owned(directory, name)?;
-        temporary
-            .file()
-            .file
-            .set_permissions(Permissions::from_mode(0o600))?;
+        set_file_privacy(&temporary.file().file, FilePrivacy::Private)?;
         Ok(temporary.into_file())
     }
 
@@ -1408,8 +1397,9 @@ impl Storage {
         let file = open_at(
             &directory,
             &name,
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::ReadWrite,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )?;
         self.temporary_objects.fetch_add(1, Ordering::Relaxed);
         Ok(OwnedTemporary::new(

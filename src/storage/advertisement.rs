@@ -867,7 +867,12 @@ mod tests {
         let replacement = NarIdentity::new(NarHash::from_digest([99; 32]), 4.into());
         let metadata_path = directory.path().join(format!("{}.narinfo", store.as_str()));
         std::fs::write(&metadata_path, raw_metadata(store, replacement)).unwrap();
-        File::open(&metadata_path).unwrap().sync_all().unwrap();
+        File::options()
+            .write(true)
+            .open(&metadata_path)
+            .unwrap()
+            .sync_all()
+            .unwrap();
         storage.root.sync_all().unwrap();
         assert!(storage.read_advertised_narinfo(&store).unwrap().is_some());
         storage

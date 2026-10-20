@@ -91,15 +91,15 @@ impl ReferencedPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    use crate::cache::test_support::non_unicode_name;
 
     #[test]
     fn non_utf8_names_are_ignored_before_filesystem_access() {
-        let metadata_name = OsString::from_vec(b"\xff.narinfo".to_vec());
+        let metadata_name = non_unicode_name(".narinfo");
         assert!(NarinfoName::classify(&metadata_name).is_none());
         // A file in place of the directory makes accidental filesystem access fail.
         let directory = tempfile::tempfile().unwrap();
-        let payload_name = OsString::from_vec(b"\xff.nar.zst".to_vec());
+        let payload_name = non_unicode_name(".nar.zst");
         assert!(
             PayloadEntry::identify(&directory, &payload_name)
                 .unwrap()

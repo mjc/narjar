@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
 use enum_map::{Enum, EnumMap};
-use rustix::fs::{Mode, OFlags};
 
 use super::{
     NarFileName, StoreHash,
@@ -153,8 +153,9 @@ impl Tracking {
         let file = open_at(
             &self.directory,
             &key.name(),
-            OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            (Mode::RUSR | Mode::WUSR).bits(),
+            FileAccess::Write,
+            FileCreation::OpenOrCreate,
+            FilePrivacy::Private,
         )?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() != 0 {
@@ -223,7 +224,7 @@ mod tests {
     fn hint_file_io_does_not_hold_the_shared_coalescing_lock() {
         let directory = tempfile::tempdir().unwrap();
         let tracking = Tracking {
-            directory: File::open(directory.path()).unwrap(),
+            directory: crate::cache::filesystem::open_directory(directory.path()).unwrap(),
             recent: Mutex::default(),
         };
         let key =
@@ -242,7 +243,7 @@ mod tests {
     #[test]
     fn repeated_reads_are_coalesced_but_the_persisted_hint_survives_a_restart() {
         let directory = tempfile::tempdir().unwrap();
-        let root = File::open(directory.path()).unwrap();
+        let root = crate::cache::filesystem::open_directory(directory.path()).unwrap();
         let recorder = AccessRecorder::default();
         recorder.enable(&root).unwrap();
         let key =
@@ -272,7 +273,7 @@ mod tests {
     #[test]
     fn disabled_tracking_does_not_create_sidecars_and_missing_records_are_not_hits() {
         let directory = tempfile::tempdir().unwrap();
-        let root = File::open(directory.path()).unwrap();
+        let root = crate::cache::filesystem::open_directory(directory.path()).unwrap();
         let key =
             AccessKey::Publication(StoreHash::parse("00000000000000000000000000000000").unwrap());
         AccessRecorder::default().record(key);
@@ -283,7 +284,7 @@ mod tests {
     #[test]
     fn malformed_advisory_records_fall_back_to_publication_time() {
         let directory = tempfile::tempdir().unwrap();
-        let root = File::open(directory.path()).unwrap();
+        let root = crate::cache::filesystem::open_directory(directory.path()).unwrap();
         AccessRecorder::default().enable(&root).unwrap();
         let key =
             AccessKey::Publication(StoreHash::parse("00000000000000000000000000000000").unwrap());
@@ -294,7 +295,7 @@ mod tests {
     #[test]
     fn unique_payload_reads_cannot_grow_the_resident_cache_past_its_bound() {
         let directory = tempfile::tempdir().unwrap();
-        let root = File::open(directory.path()).unwrap();
+        let root = crate::cache::filesystem::open_directory(directory.path()).unwrap();
         let recorder = AccessRecorder::default();
         recorder.enable(&root).unwrap();
         let clock = Instant::now();

@@ -1,8 +1,4 @@
-use std::{
-    fs::File,
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use crate::cache::token_file::{TOKEN_BYTES, TokenFile, valid_label};
 use clap::{Args, Subcommand, ValueEnum};
@@ -50,9 +46,7 @@ pub(crate) fn create_secret_token(path: &Path, name: &str) -> Result<String, Err
     let mut tokens = TokenFile::load(path).map_err(runtime)?.unwrap_or_default();
 
     let mut random = [0; TOKEN_BYTES];
-    File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut random))
-        .map_err(runtime)?;
+    getrandom::getrandom(&mut random).map_err(runtime)?;
     let secret = HEXLOWER.encode(&random);
     if !tokens
         .insert(name, Sha256::digest(secret.as_bytes()).into())

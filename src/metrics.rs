@@ -1,5 +1,3 @@
-#[cfg(target_os = "linux")]
-use std::fs::File;
 use std::{
     cell::Cell,
     path::{Path, PathBuf},
@@ -13,6 +11,14 @@ use std::{
 use crate::cache::http_server::{StatusCode, TransferFailure};
 use enum_map::{Enum, EnumMap};
 use serde::Deserialize;
+
+#[cfg(target_os = "linux")]
+#[path = "metrics/host/linux.rs"]
+mod host;
+#[cfg(not(target_os = "linux"))]
+#[path = "metrics/host/unavailable.rs"]
+mod host;
+use host::sample_process_resources;
 
 use crate::cache::{
     http_server::Method,
@@ -99,8 +105,6 @@ impl OnlineGcOutcome {
 }
 // A 5-second sampler needs both endpoints to cover an exact five-minute window.
 const TRAFFIC_SAMPLE_CAPACITY: usize = 61;
-#[cfg(target_os = "linux")]
-const MAX_PROCESS_FD_ENTRIES: usize = 16_384;
 const MAX_ZFS_SAMPLE_BYTES: u64 = 16 * 1024;
 const ZFS_SAMPLE_MAX_AGE: u64 = 180;
 const LATENCY_BUCKET_BOUNDS_SECONDS: [f64; 13] = [
@@ -1694,11 +1698,9 @@ fn read_zfs_sample(
     now_unix_seconds: u64,
 ) -> Result<(u64, FilesystemStats), &'static str> {
     let sample_file =
-        crate::cache::filesystem::open_regular_at(rustix::fs::CWD, path).map_err(|error| {
-            match error.kind() {
-                std::io::ErrorKind::InvalidData => "sample_not_regular_file",
-                _ => "sample_unreadable",
-            }
+        crate::cache::filesystem::open_regular(path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::InvalidData => "sample_not_regular_file",
+            _ => "sample_unreadable",
         })?;
     let bytes = crate::cache::records::read_bounded_bytes(sample_file, MAX_ZFS_SAMPLE_BYTES)
         .map_err(|error| match error {
@@ -2189,85 +2191,6 @@ fn next_sample_state<T: Clone>(
             }
         },
     }
-}
-
-#[cfg(target_os = "linux")]
-fn sample_process_resources() -> Result<ProcessResources, ()> {
-    let status = read_bounded_text("/proc/self/status", 64 * 1024)?;
-    let resident_bytes = status_value_kib(&status, "VmRSS:").ok_or(())?;
-    let high_water_bytes = status_value_kib(&status, "VmHWM:");
-    let threads = status_value(&status, "Threads:");
-    let open_file_descriptors = process_open_file_descriptors();
-    let (user_cpu_seconds, system_cpu_seconds) = process_cpu_seconds()?;
-    Ok(ProcessResources {
-        resident_bytes,
-        high_water_bytes,
-        user_cpu_seconds,
-        system_cpu_seconds,
-        threads,
-        open_file_descriptors,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn sample_process_resources() -> Result<ProcessResources, ()> {
-    Err(())
-}
-
-#[cfg(target_os = "linux")]
-fn read_bounded_text(path: impl AsRef<Path>, limit: u64) -> Result<String, ()> {
-    let bytes = crate::cache::records::read_bounded_bytes(File::open(path).map_err(|_| ())?, limit)
-        .map_err(|_| ())?;
-    String::from_utf8(bytes).map_err(|_| ())
-}
-
-#[cfg(target_os = "linux")]
-fn status_value_kib(status: &str, name: &str) -> Option<u64> {
-    status_value(status, name)?.checked_mul(1024)
-}
-
-#[cfg(target_os = "linux")]
-fn status_value(status: &str, name: &str) -> Option<u64> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix(name))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
-}
-
-#[cfg(target_os = "linux")]
-fn process_cpu_seconds() -> Result<(f64, f64), ()> {
-    let stat = read_bounded_text("/proc/self/stat", 16 * 1024)?;
-    let fields = stat
-        .rsplit_once(')')
-        .ok_or(())?
-        .1
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    let user_ticks: u64 = fields.get(11).ok_or(())?.parse().map_err(|_| ())?;
-    let system_ticks: u64 = fields.get(12).ok_or(())?.parse().map_err(|_| ())?;
-    let ticks_per_second = rustix::param::clock_ticks_per_second();
-    if ticks_per_second == 0 {
-        return Err(());
-    }
-    Ok((
-        user_ticks as f64 / ticks_per_second as f64,
-        system_ticks as f64 / ticks_per_second as f64,
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn process_open_file_descriptors() -> Option<u64> {
-    let entries = std::fs::read_dir("/proc/self/fd").ok()?;
-    let observed = entries
-        .take(MAX_PROCESS_FD_ENTRIES + 1)
-        .try_fold(0_u64, |count, entry| {
-            entry.ok()?;
-            count.checked_add(1)
-        })?;
-    (observed <= MAX_PROCESS_FD_ENTRIES as u64).then_some(observed.saturating_sub(1))
 }
 
 fn lookup_snapshot(counters: &EnumMap<CacheLookupOutcome, AtomicU64>) -> LookupStats {
@@ -3021,8 +2944,8 @@ mod tests {
         PopulationCounts, PublishOutcome, StorageBackend, StorageCapacity, StorageError,
         StorageReadiness,
     };
+    use crate::cache::test_support::symlink;
     use std::{
-        os::unix::fs::symlink,
         path::Path,
         time::{Duration, Instant},
     };
@@ -3449,7 +3372,7 @@ mod tests {
 
         std::fs::remove_file(directory.path().join(".narjar-maintenance-gc.last"))
             .expect("record should be replaceable for the failure case");
-        std::os::unix::fs::symlink(
+        symlink(
             directory.path().join("missing"),
             directory.path().join(".narjar-maintenance-gc.last"),
         )
@@ -3556,6 +3479,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn zfs_samples_reject_nonregular_files_without_waiting_for_a_writer() {
         let temporary = tempfile::tempdir().unwrap();

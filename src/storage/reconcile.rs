@@ -15,6 +15,7 @@ use super::{
     Storage, StorageError, StoreHash, entry_identity_at, entry_is_directory_at,
     entry_is_regular_at, open_regular_at, read_dir_names,
 };
+use crate::cache::filesystem::FileStamp;
 use crate::cache::maintenance::FILE_NAMES as MAINTENANCE_FILES;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -33,7 +34,7 @@ pub enum ReconcileClass {
 pub struct ReconcileEntry {
     relative_path: PathBuf,
     class: ReconcileClass,
-    identity: FileIdentity,
+    identity: FileStamp,
 }
 
 impl ReconcileEntry {
@@ -81,14 +82,6 @@ impl ReconcileReport {
     pub fn truncated(&self) -> bool {
         self.truncated
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-    change_time_seconds: i64,
-    change_time_nanoseconds: i64,
 }
 
 pub(super) fn scan(
@@ -232,12 +225,7 @@ pub(super) fn cleanup_stale_temp(
         .file_name()
         .expect("validated temporary entry has a filename");
     let identity = match entry_identity_at(&directory, name) {
-        Ok((device, inode, change_time_seconds, change_time_nanoseconds)) => FileIdentity {
-            device,
-            inode,
-            change_time_seconds,
-            change_time_nanoseconds,
-        },
+        Ok(identity) => identity,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(CleanupOutcome::Unchanged);
         }
@@ -268,22 +256,12 @@ impl BoundedEntries {
         }
     }
 
-    fn record(
-        &mut self,
-        relative_path: PathBuf,
-        class: ReconcileClass,
-        (device, inode, change_time_seconds, change_time_nanoseconds): (u64, u64, i64, i64),
-    ) {
+    fn record(&mut self, relative_path: PathBuf, class: ReconcileClass, identity: FileStamp) {
         self.seen += 1;
         self.entries.push(ReconcileEntry {
             relative_path,
             class,
-            identity: FileIdentity {
-                device,
-                inode,
-                change_time_seconds,
-                change_time_nanoseconds,
-            },
+            identity,
         });
         if self.entries.len() > self.limit {
             self.entries.pop();
@@ -379,12 +357,12 @@ fn valid_realisation_filename(name: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use crate::cache::test_support::symlink;
 
     #[test]
     fn known_layout_entries_still_reject_wrong_types_and_symlinks() {
         let directory = tempfile::tempdir().unwrap();
-        let root = fs::File::open(directory.path()).unwrap();
+        let root = crate::cache::filesystem::open_directory(directory.path()).unwrap();
         let directories =
             storage_root_directories().chain(CACHE_POLICY_DIRECTORIES.iter().copied());
         let files = storage_root_files()
@@ -433,7 +411,7 @@ mod tests {
                 Some(ReconcileClass::UnexpectedType),
                 "symlinked {name}"
             );
-            fs::remove_file(path).unwrap();
+            crate::cache::test_support::remove_symlink(path).unwrap();
         }
     }
 }

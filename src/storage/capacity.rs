@@ -12,6 +12,11 @@ use super::{StagingReservation, StorageError, publication::StagingBudget};
 mod unix;
 #[cfg(unix)]
 pub(crate) use unix::filesystem_space;
+#[cfg(windows)]
+#[path = "capacity/windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::filesystem_space;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CapacityErrorKind {

@@ -1,5 +1,6 @@
 use super::*;
 use narjar::object::{NarHash, NarIdentity};
+use std::os::unix::fs::PermissionsExt;
 
 fn body(response: &[u8]) -> Vec<u8> {
     response_parts(response).1

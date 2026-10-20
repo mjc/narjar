@@ -1,18 +1,20 @@
 use std::{
     ffi::{OsStr, OsString},
-    fs::{self, File},
+    fs::File,
     io::{self, Read, Write},
-    os::unix::fs::PermissionsExt,
     path::Path,
     process,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use rustix::fs::{FileType, OFlags};
+use crate::cache::filesystem::{
+    FileAccess, FileCreation, FilePrivacy, set_file_privacy, validate_file_privacy,
+    validate_file_privacy_at,
+};
 
 use sha2::{Digest, Sha256};
 
-use super::fs::{entry_mode_at, hard_link_at, open_at, rename_at, unlink_at};
+use super::fs::{hard_link_at, open_at, rename_at, unlink_at};
 use super::{
     StorageError, entry_is_regular_at,
     location::{StorePath, TemporaryPath},
@@ -320,14 +322,7 @@ impl RecoveryState {
             .map(TransactionEntry::parse)
             .collect::<io::Result<Vec<_>>>()?;
         for entry in &entries {
-            let mode = entry_mode_at(&self.transactions, entry.name())?;
-            if FileType::from_raw_mode(mode) != FileType::RegularFile || mode & 0o133 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "publication transaction entry has unsafe type or permissions",
-                )
-                .into());
-            }
+            validate_file_privacy_at(&self.transactions, entry.name(), FilePrivacy::Public)?;
             if let TransactionEntry::Record(name) = entry {
                 open_regular_at(&self.transactions, name)?;
             }
@@ -408,11 +403,12 @@ impl RecoveryState {
         match open_at(
             &self.root,
             name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::Write,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         ) {
             Ok(file) => {
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                set_file_privacy(&file, FilePrivacy::Private)?;
                 file.sync_all()?;
                 self.root.sync_all()?;
                 Ok(())
@@ -431,8 +427,9 @@ impl RecoveryState {
         let mut marker = open_at(
             &self.root,
             name,
-            OFlags::WRONLY | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0,
+            FileAccess::Write,
+            FileCreation::Truncate,
+            FilePrivacy::Private,
         )?;
         if !marker.metadata()?.is_file() {
             return Err(io::Error::new(
@@ -458,13 +455,7 @@ impl RecoveryState {
         match entry_is_regular_at(&self.root, name) {
             Ok(true) => {
                 let marker = open_regular_at(&self.root, name)?;
-                if marker.metadata()?.permissions().mode() & 0o133 != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "recovery marker has unsafe permissions",
-                    )
-                    .into());
-                }
+                validate_file_privacy(&marker, FilePrivacy::Public)?;
                 Ok(true)
             }
             Ok(false) => Err(io::Error::new(
@@ -531,11 +522,12 @@ fn write_transaction_draft(
     let mut draft = open_at(
         directory,
         name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        0o600,
+        FileAccess::Write,
+        FileCreation::CreateNew,
+        FilePrivacy::Private,
     )?;
     fault(TransactionRecordBoundary::DraftCreated)?;
-    draft.set_permissions(fs::Permissions::from_mode(0o600))?;
+    set_file_privacy(&draft, FilePrivacy::Private)?;
     draft.write_all(contents)?;
     fault(TransactionRecordBoundary::DraftWritten)?;
     operations.sync_draft(&draft)?;
@@ -657,7 +649,7 @@ mod tests {
     fn rejected_transitions_preserve_the_live_state_and_record() {
         let (root, directory_path, directory) = transaction_directory();
         let recovery = super::RecoveryState {
-            root: File::open(root.path()).unwrap(),
+            root: crate::cache::filesystem::open_directory(root.path()).unwrap(),
             transactions: directory,
         };
         let mut transaction = recovery
@@ -889,7 +881,8 @@ mod tests {
         let root = tempfile::tempdir().expect("create temporary root");
         let path = root.path().join("transactions");
         fs::create_dir(&path).expect("create transaction directory");
-        let directory = File::open(&path).expect("open transaction directory");
+        let directory =
+            crate::cache::filesystem::open_directory(&path).expect("open transaction directory");
         (root, path, directory)
     }
 }

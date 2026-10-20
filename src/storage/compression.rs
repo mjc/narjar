@@ -161,7 +161,7 @@ impl<'a> CapacityCheckedStagingWriter<'a> {
             self.reservation
                 .grow_to(self.file, self.min_free_bytes, required)
         })
-        .map_err(storage_capacity_error)
+        .map_err(io::Error::from)
     }
 }
 
@@ -190,16 +190,6 @@ impl Write for CapacityCheckedStagingWriter<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
-    }
-}
-
-fn storage_capacity_error(error: StorageError) -> io::Error {
-    match error {
-        StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
-            io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
-        }
-        StorageError::Io(error) => error,
-        error => io::Error::other(error),
     }
 }
 
@@ -889,9 +879,7 @@ mod tests {
 
     impl Write for EnospcWriter {
         fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            Err(io::Error::from_raw_os_error(
-                rustix::io::Errno::NOSPC.raw_os_error(),
-            ))
+            Err(crate::cache::test_support::InjectedIoFailure::NoSpace.error())
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -911,7 +899,7 @@ mod tests {
             .expect_err("physical output exhaustion should fail encoding");
             assert_eq!(
                 error.raw_os_error(),
-                Some(rustix::io::Errno::NOSPC.raw_os_error())
+                Some(crate::cache::test_support::InjectedIoFailure::NoSpace.code())
             );
         }
     }

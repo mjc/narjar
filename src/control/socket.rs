@@ -11,6 +11,37 @@ use std::{
 
 use crate::cache::filesystem::{open_directory, open_directory_at};
 
+pub(super) use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
+
+pub(super) fn accept(listener: &Listener) -> io::Result<Stream> {
+    listener.accept().map(|(connection, _)| connection)
+}
+
+pub(super) fn configure_connection(connection: &Stream) -> io::Result<()> {
+    // BSD accept() can inherit the listener's nonblocking flag.
+    connection.set_nonblocking(false)?;
+    connection.set_write_timeout(Some(super::REQUEST_TIMEOUT))
+}
+
+pub(super) fn retryable_accept_error(error: &io::Error) -> bool {
+    use rustix::io::Errno;
+    error.kind() == io::ErrorKind::ConnectionAborted
+        || error.raw_os_error().is_some_and(|code| {
+            [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM]
+                .into_iter()
+                .any(|errno| errno.raw_os_error() == code)
+        })
+}
+
+pub(super) fn read_before_deadline(
+    connection: &mut Stream,
+    bytes: &mut [u8],
+    deadline: Instant,
+) -> io::Result<usize> {
+    wait_for_socket_event_before_deadline(connection, rustix::event::PollFlags::IN, deadline)?;
+    std::io::Read::read(connection, bytes)
+}
+
 pub(super) const CONTROL_DIRECTORY: &str = ".narjar-control";
 const SOCKET_NAME: &str = "gc.sock";
 

@@ -1,11 +1,13 @@
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
-    io::Read,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    fs,
     path::{Path, PathBuf},
 };
 
+use crate::cache::filesystem::{
+    FileAccess, FileCreation, FilePrivacy, create_private_directory_tree, open_directory,
+    open_writable_at, set_file_privacy, validate_private_file,
+};
 use crate::cache::maintenance::FILE_NAMES as MAINTENANCE_FILES;
 use crate::cache::storage::{
     CacheCreation, Directory, StorageBackend, SupportedStorageBackend, storage_root_entries,
@@ -52,29 +54,40 @@ pub(crate) fn initialize_cache(
         reject_unexpected_init_entries(&root)?;
         reject_unexpected_auth_entries(&root)?;
     } else {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .recursive(true)
-            .create(&root)
-            .map_err(runtime)?;
+        create_private_directory_tree(&root).map_err(runtime)?;
     }
 
     let directory = Directory::open(&root).map_err(runtime)?;
     let creation = CacheCreation::prepare(&directory, backend).map_err(runtime)?;
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(runtime)?;
+    set_file_privacy(directory.file(), FilePrivacy::Private).map_err(runtime)?;
     create_recovery_marker(&root)?;
     let storage = creation.create_or_complete().map_err(runtime)?;
-    ensure_directory(&root.join("auth"), 0o700)?;
+    ensure_directory(&root.join("auth"))?;
     create_file(
         &root.join("nix-cache-info"),
         format!("StoreDir: /nix/store\nWantMassQuery: 0\nPriority: {priority}\n").as_bytes(),
-        0o600,
+        FilePrivacy::Private,
         false,
     )?;
-    create_file(&root.join("trusted-public-keys"), b"", 0o600, true)?;
-    create_file(&root.join("auth/write.tokens"), b"", 0o600, true)?;
+    create_file(
+        &root.join("trusted-public-keys"),
+        b"",
+        FilePrivacy::Private,
+        true,
+    )?;
+    create_file(
+        &root.join("auth/write.tokens"),
+        b"",
+        FilePrivacy::Private,
+        true,
+    )?;
     if private_read || path_exists(&root.join("auth/read.tokens"))? {
-        create_file(&root.join("auth/read.tokens"), b"", 0o600, true)?;
+        create_file(
+            &root.join("auth/read.tokens"),
+            b"",
+            FilePrivacy::Private,
+            true,
+        )?;
     }
     storage.finish_recovery().map_err(runtime)?;
     drop(storage);
@@ -147,48 +160,27 @@ fn path_exists(path: &Path) -> Result<bool, Error> {
 }
 
 fn create_recovery_marker(root: &Path) -> Result<(), Error> {
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(root.join(".narjar-recovery"))
-    {
-        Ok(file) => file.sync_all().map_err(runtime)?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(root.join(".narjar-recovery")).map_err(runtime)?;
-            if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
-                return Err(Error::runtime(
-                    "initialization recovery marker is not a regular 0600 file",
-                ));
-            }
-        }
-        Err(error) => return Err(runtime(error)),
-    }
-    File::open(root)
-        .and_then(|directory| directory.sync_all())
+    let directory = open_directory(root).map_err(runtime)?;
+    let marker = open_writable_at(
+        &directory,
+        std::ffi::OsStr::new(".narjar-recovery"),
+        FileAccess::ReadWrite,
+        FileCreation::OpenOrCreate,
+        FilePrivacy::Private,
+    )
+    .map_err(runtime)?;
+    validate_private_file(&marker).map_err(runtime)?;
+    marker
+        .sync_all()
+        .and_then(|()| directory.sync_all())
         .map_err(runtime)
 }
 
-fn ensure_directory(path: &Path, mode: u32) -> Result<(), Error> {
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(path).map_err(runtime)?;
-            if !metadata.file_type().is_dir() {
-                return Err(Error::runtime(format!(
-                    "initialization entry is not a directory: {}",
-                    path.display()
-                )));
-            }
-        }
-        Err(error) => return Err(runtime(error)),
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(runtime)?;
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(runtime)?;
+fn ensure_directory(path: &Path) -> Result<(), Error> {
+    let directory = create_private_directory_tree(path).map_err(runtime)?;
+    directory.sync_all().map_err(runtime)?;
     if let Some(parent) = path.parent() {
-        File::open(parent)
+        open_directory(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(runtime)?;
     }
@@ -238,9 +230,7 @@ pub(crate) fn generate_key_pair(
     public_path: &Path,
 ) -> Result<(), Error> {
     let mut seed = [0; 32];
-    File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut seed))
-        .map_err(runtime)?;
+    getrandom::getrandom(&mut seed).map_err(runtime)?;
     let signing = SigningKey::from_bytes(&seed);
     let public = signing.verifying_key();
     let secret = signing.to_keypair_bytes();
@@ -248,13 +238,13 @@ pub(crate) fn generate_key_pair(
     create_file(
         secret_path,
         format!("{name}:{}\n", BASE64.encode(&secret)).as_bytes(),
-        0o600,
+        FilePrivacy::Private,
         false,
     )?;
     if let Err(error) = create_file(
         public_path,
         format!("{name}:{}\n", BASE64.encode(public.as_bytes())).as_bytes(),
-        0o644,
+        FilePrivacy::Public,
         false,
     ) {
         let _ = fs::remove_file(secret_path);

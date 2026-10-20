@@ -884,12 +884,10 @@ mod tests {
     #[test]
     fn metadata_read_errors_are_not_reported_as_malformed_content() {
         let directory = tempfile::tempdir().unwrap();
-        let file = std::fs::File::create(directory.path().join("write-only")).unwrap();
+        let mut file = std::fs::File::create(directory.path().join("write-only")).unwrap();
+        let source_error = std::io::Read::read(&mut file, &mut [0; 8]).unwrap_err();
         let error = read_narinfo_file(file).unwrap_err();
-        assert_eq!(
-            error.raw_os_error(),
-            Some(rustix::io::Errno::BADF.raw_os_error())
-        );
+        assert_eq!(error.raw_os_error(), source_error.raw_os_error());
     }
 
     const STORE_HASH: &str = "00000000000000000000000000000000";

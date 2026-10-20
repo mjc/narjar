@@ -135,7 +135,8 @@ sizes, manifests, and chunk presence, not every payload hash. Full content
 verification is an offline command.
 
 Offline maintenance and serving share an exclusive process lock. Online GC
-uses the daemon's storage owner through a bounded private Unix socket.
+uses the daemon's storage owner through a bounded private local transport:
+a Unix socket or a Windows named pipe.
 Publication capabilities invalidate an unlocked collection snapshot when a
 mutation begins. Deletion requires a current snapshot and no active mutation.
 Recent upload and metadata-advertisement protection retains substitution
