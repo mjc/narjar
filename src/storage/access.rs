@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
 use enum_map::{Enum, EnumMap};
-use rustix::fs::{Mode, OFlags};
 
 use super::{
     NarFileName, StoreHash,
@@ -153,8 +153,9 @@ impl Tracking {
         let file = open_at(
             &self.directory,
             &key.name(),
-            OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            (Mode::RUSR | Mode::WUSR).bits(),
+            FileAccess::Write,
+            FileCreation::OpenOrCreate,
+            FilePrivacy::Private,
         )?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() != 0 {

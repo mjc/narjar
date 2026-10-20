@@ -10,7 +10,7 @@ use std::{
     time::SystemTime,
 };
 
-use rustix::fs::OFlags;
+use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
 
 use serde::{Deserialize, Serialize};
 
@@ -1408,8 +1408,9 @@ impl Storage {
         let file = open_at(
             &directory,
             &name,
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::ReadWrite,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )?;
         self.temporary_objects.fetch_add(1, Ordering::Relaxed);
         Ok(OwnedTemporary::new(

@@ -8,7 +8,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use rustix::fs::{FileType, OFlags};
+use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
+use rustix::fs::FileType;
 
 use sha2::{Digest, Sha256};
 
@@ -408,8 +409,9 @@ impl RecoveryState {
         match open_at(
             &self.root,
             name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::Write,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         ) {
             Ok(file) => {
                 file.set_permissions(fs::Permissions::from_mode(0o600))?;
@@ -431,8 +433,9 @@ impl RecoveryState {
         let mut marker = open_at(
             &self.root,
             name,
-            OFlags::WRONLY | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0,
+            FileAccess::Write,
+            FileCreation::Truncate,
+            FilePrivacy::Private,
         )?;
         if !marker.metadata()?.is_file() {
             return Err(io::Error::new(
@@ -531,8 +534,9 @@ fn write_transaction_draft(
     let mut draft = open_at(
         directory,
         name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        0o600,
+        FileAccess::Write,
+        FileCreation::CreateNew,
+        FilePrivacy::Private,
     )?;
     fault(TransactionRecordBoundary::DraftCreated)?;
     draft.set_permissions(fs::Permissions::from_mode(0o600))?;

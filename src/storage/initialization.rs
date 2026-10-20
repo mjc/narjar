@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
-use rustix::fs::OFlags;
+use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
 
 use super::{
     LAYOUT_DESCRIPTOR, SupportedStorageBackend,
@@ -175,8 +175,9 @@ fn install_complete_descriptor(
         let mut file = open_at(
             root,
             draft,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::Write,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )?;
         file.write_all(backend.backend().layout_descriptor())?;
         file.sync_all()?;
@@ -213,8 +214,9 @@ impl CacheLayout {
         let file = open_at(
             &self.root,
             OsStr::new("lock"),
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::ReadWrite,
+            FileCreation::OpenOrCreate,
+            FilePrivacy::Private,
         )
         .map_err(|error| io::Error::new(error.kind(), format!("lock: {error}")))?;
         let metadata = file.metadata()?;

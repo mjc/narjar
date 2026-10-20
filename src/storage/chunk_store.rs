@@ -11,7 +11,7 @@ use std::{
     time::SystemTime,
 };
 
-use rustix::fs::OFlags;
+use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
 
 use mincdc::{MinCdcHash4, SliceChunker};
 use sha2::{Digest, Sha256};
@@ -228,8 +228,9 @@ impl ChunkStore {
         let record_file = open_at(
             &self.manifests,
             &record_name,
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::ReadWrite,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )?;
         Ok(ChunkingWriter {
             store: self,
@@ -1175,8 +1176,9 @@ impl DurableChunks<'_> {
             let mut temporary = open_at(
                 directory,
                 &name,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                0o600,
+                FileAccess::Write,
+                FileCreation::CreateNew,
+                FilePrivacy::Private,
             )?;
             write_complete_manifest(&mut temporary, self.manifest, &mut self.writer.record_file)?;
             temporary.sync_all()?;
@@ -1615,8 +1617,9 @@ fn write_temporary_file(directory: &File, name: &OsStr, bytes: &[u8]) -> io::Res
     let mut file = open_at(
         directory,
         name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        0o600,
+        FileAccess::Write,
+        FileCreation::CreateNew,
+        FilePrivacy::Private,
     )?;
     file.write_all(bytes)
 }
@@ -1642,8 +1645,9 @@ fn mark_gc_file(directory: &File, name: &OsStr) -> io::Result<()> {
     match open_at(
         directory,
         name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        0o600,
+        FileAccess::Write,
+        FileCreation::CreateNew,
+        FilePrivacy::Private,
     ) {
         Ok(_file) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
@@ -1796,7 +1800,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use super::{ChunkStore, ChunkStoreError, OFlags, remove_abandoned_temps};
+    use super::{ChunkStore, ChunkStoreError, remove_abandoned_temps};
+    use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
     use crate::cache::{
         object::{NarHash, NarIdentity, NarSize},
         storage::{
@@ -2753,16 +2758,18 @@ mod tests {
         let mut chunk = super::super::fs::open_at(
             &shard,
             chunk_temp,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::Write,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )
         .unwrap();
         chunk.write_all(b"abandoned").unwrap();
         let mut manifest = super::super::fs::open_at(
             &store.manifests,
             manifest_temp,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-            0o600,
+            FileAccess::Write,
+            FileCreation::CreateNew,
+            FilePrivacy::Private,
         )
         .unwrap();
         manifest.write_all(b"abandoned").unwrap();

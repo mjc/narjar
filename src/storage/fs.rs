@@ -5,12 +5,13 @@ use std::{
     os::unix::fs::PermissionsExt,
 };
 
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawMode, Stat};
+use rustix::fs::{self, AtFlags, FileType, RawMode, Stat};
 
 use super::StorageError;
 use super::publication::TemporaryFile;
 #[cfg(test)]
 use crate::cache::filesystem::open_directory;
+pub(super) use crate::cache::filesystem::open_writable_at as open_at;
 use crate::cache::filesystem::{directory_names, exclude_dot_directory_entries};
 pub(super) use crate::cache::filesystem::{ensure_directory_at, validate_directory};
 pub(crate) use crate::cache::filesystem::{open_directory_at, open_regular_at, read_dir_names};
@@ -98,15 +99,6 @@ pub(super) fn open_optional_at(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
-}
-
-pub(super) fn open_at(
-    parent: &File,
-    name: &OsStr,
-    flags: OFlags,
-    mode: RawMode,
-) -> io::Result<File> {
-    Ok(fs::openat(parent, name, flags, Mode::from_raw_mode(mode))?.into())
 }
 
 #[cfg(test)]

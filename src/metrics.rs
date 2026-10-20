@@ -1694,11 +1694,9 @@ fn read_zfs_sample(
     now_unix_seconds: u64,
 ) -> Result<(u64, FilesystemStats), &'static str> {
     let sample_file =
-        crate::cache::filesystem::open_regular_at(rustix::fs::CWD, path).map_err(|error| {
-            match error.kind() {
-                std::io::ErrorKind::InvalidData => "sample_not_regular_file",
-                _ => "sample_unreadable",
-            }
+        crate::cache::filesystem::open_regular(path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::InvalidData => "sample_not_regular_file",
+            _ => "sample_unreadable",
         })?;
     let bytes = crate::cache::records::read_bounded_bytes(sample_file, MAX_ZFS_SAMPLE_BYTES)
         .map_err(|error| match error {

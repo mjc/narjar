@@ -1,4 +1,4 @@
-use rustix::fs::OFlags;
+use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
 use std::{
     fs::File,
     io::{self, Read, Write},
@@ -143,8 +143,9 @@ fn write_pressure_hint(root: &File, thresholds: FreeSpaceThresholds) -> io::Resu
     let mut file = super::super::fs::open_at(
         root,
         PRESSURE_HINT.as_ref(),
-        OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        0o600,
+        FileAccess::Write,
+        FileCreation::OpenOrCreate,
+        FilePrivacy::Private,
     )?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
