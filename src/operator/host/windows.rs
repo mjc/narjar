@@ -30,6 +30,7 @@ pub(super) fn inspect_doctor_path(
         Ok(metadata) => metadata,
         Err(error) if !required && error.kind() == io::ErrorKind::NotFound => return report,
         Err(error) => {
+            report.kind = DoctorEntryKind::inspection_failure(&error);
             report.severity = if required {
                 DoctorSeverity::Error
             } else {

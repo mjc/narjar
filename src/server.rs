@@ -576,7 +576,7 @@ fn continue_after_accept_error(error: io::Error) -> Result<(), Error> {
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let stopping = Arc::new(AtomicBool::new(false));
     // Register first so this guard outlives every server resource during shutdown.
-    let _shutdown = host::install_shutdown(Arc::clone(&stopping))
+    let shutdown = host::install_shutdown(Arc::clone(&stopping))
         .map_err(|error| Error::runtime(format!("cannot install shutdown handler: {error}")))?;
     let ServerResources {
         storage,
@@ -780,6 +780,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .map_err(|_| Error::runtime("population sampler panicked"))?;
     }
 
+    drop(source);
+    drop(storage);
+    shutdown.complete();
     Ok(())
 }
 

@@ -27,7 +27,7 @@ pub(super) fn inspect_doctor_path(
             return DoctorPath {
                 path: relative,
                 required,
-                kind: DoctorEntryKind::Missing,
+                kind: DoctorEntryKind::inspection_failure(&error),
                 mode: None,
                 uid: None,
                 gid: None,

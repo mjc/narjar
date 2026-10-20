@@ -12,7 +12,7 @@ use windows_sys::Win32::System::{
         CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
         SetConsoleCtrlHandler,
     },
-    Threading::{CreateEventW, ExitProcess, SetEvent, WaitForSingleObject},
+    Threading::{CreateEventW, GetCurrentProcess, SetEvent, TerminateProcess, WaitForSingleObject},
 };
 
 struct ShutdownContext {
@@ -26,6 +26,18 @@ struct ShutdownContext {
 static SHUTDOWN: OnceLock<ShutdownContext> = OnceLock::new();
 
 pub(super) struct ShutdownRegistration;
+
+impl ShutdownRegistration {
+    pub(super) fn complete(self) {
+        if let Some(context) = SHUTDOWN.get() {
+            // SAFETY: all server workers have joined and their storage owners
+            // were explicitly dropped before this completion transition.
+            unsafe {
+                SetEvent(context.complete.as_raw_handle());
+            }
+        }
+    }
+}
 
 pub(super) fn install_shutdown(stopping: Arc<AtomicBool>) -> io::Result<ShutdownRegistration> {
     // SAFETY: null security attributes produce a non-inheritable, unnamed event.
@@ -56,13 +68,6 @@ pub(super) fn install_shutdown(stopping: Arc<AtomicBool>) -> io::Result<Shutdown
 
 impl Drop for ShutdownRegistration {
     fn drop(&mut self) {
-        if let Some(context) = SHUTDOWN.get() {
-            // SAFETY: the context owns this event until process exit. All server
-            // resources have been dropped before this registration guard.
-            unsafe {
-                SetEvent(context.complete.as_raw_handle());
-            }
-        }
         // SAFETY: unregister the exact static callback originally installed.
         unsafe {
             SetConsoleCtrlHandler(Some(console_control), 0);
@@ -82,7 +87,7 @@ unsafe extern "system" fn console_control(event: u32) -> i32 {
     if context.requests.fetch_add(1, Ordering::Relaxed) > 0 {
         // SAFETY: a second interrupt intentionally terminates without cleanup.
         unsafe {
-            ExitProcess(0xC000_013A);
+            TerminateProcess(GetCurrentProcess(), 0xC000_013A);
         }
     }
     context.stopping.store(true, Ordering::Release);

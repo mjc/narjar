@@ -12,7 +12,9 @@ const FILE_SHARE_WRITE: u32 = 2;
 const FILE_SHARE_DELETE: u32 = 4;
 
 fn report_directory_rename(root: &Path, share_delete: bool, lock_child: bool) -> io::Result<()> {
-    let source = root.join(format!("rename-share-delete-{share_delete}-locked-{lock_child}"));
+    let source = root.join(format!(
+        "rename-share-delete-{share_delete}-locked-{lock_child}"
+    ));
     let moved = source.with_extension("moved");
     fs::create_dir(&source)?;
     let directory = OpenOptions::new()
@@ -20,15 +22,25 @@ fn report_directory_rename(root: &Path, share_delete: bool, lock_child: bool) ->
         .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&source)?;
-    let sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
-    let child = OpenOptions::new().read(true).write(true).create_new(true)
-        .share_mode(sharing).open(source.join("lock"))?;
-    if lock_child { child.try_lock().map_err(io::Error::other)?; }
+    let sharing =
+        FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
+    let child = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(sharing)
+        .open(source.join("lock"))?;
+    if lock_child {
+        child.try_lock().map_err(io::Error::other)?;
+    }
     let result = fs::rename(&source, &moved);
     println!("root rename with child share_delete={share_delete} locked={lock_child}: {result:?}");
     drop(child);
     if result.is_err() {
-        println!("root rename after closing child, root handle retained: {:?}", fs::rename(&source, &moved));
+        println!(
+            "root rename after closing child, root handle retained: {:?}",
+            fs::rename(&source, &moved)
+        );
     }
     directory.sync_all()?;
     Ok(())

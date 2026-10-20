@@ -894,6 +894,7 @@ impl DoctorSeverity {
 #[serde(rename_all = "lowercase")]
 enum DoctorEntryKind {
     Missing,
+    Unavailable,
     Symlink,
     Directory,
     File,
@@ -904,11 +905,21 @@ impl std::fmt::Display for DoctorEntryKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Missing => "missing",
+            Self::Unavailable => "unavailable",
             Self::Symlink => "symlink",
             Self::Directory => "directory",
             Self::File => "file",
             Self::Other => "other",
         })
+    }
+}
+
+impl DoctorEntryKind {
+    fn inspection_failure(error: &std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => Self::Missing,
+            _ => Self::Unavailable,
+        }
     }
 }
 
@@ -1124,6 +1135,10 @@ fn validate_doctor_read_through(data_dir: &Path) -> Result<(), &'static str> {
 
 fn inspect_doctor_recovery_markers(root: &Path) -> [DoctorPath; 2] {
     let markers = CACHE_RECOVERY_MARKERS.map(|name| inspect_doctor_path(root, name, false, false));
+    classify_doctor_recovery_markers(markers)
+}
+
+fn classify_doctor_recovery_markers(markers: [DoctorPath; 2]) -> [DoctorPath; 2] {
     match markers.each_ref().map(|marker| marker.kind) {
         [DoctorEntryKind::Missing, DoctorEntryKind::Missing] => markers.map(|mut marker| {
             marker.severity = DoctorSeverity::Error;
@@ -1375,6 +1390,35 @@ mod tests {
     use crate::cache::maintenance::{Operation, Outcome};
     use crate::cache::storage::{CacheCreation, Directory, SupportedStorageBackend};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn doctor_does_not_replace_recovery_inspection_errors_with_missing_marker_diagnostics() {
+        let markers = CACHE_RECOVERY_MARKERS.map(|path| DoctorPath {
+            path,
+            required: false,
+            kind: DoctorEntryKind::Unavailable,
+            mode: None,
+            uid: None,
+            gid: None,
+            severity: DoctorSeverity::Unavailable,
+            detail: "access denied while inspecting recovery marker".to_owned(),
+        });
+        for marker in classify_doctor_recovery_markers(markers) {
+            assert_eq!(marker.kind, DoctorEntryKind::Unavailable);
+            assert_eq!(
+                marker.detail,
+                "access denied while inspecting recovery marker"
+            );
+        }
+        assert_eq!(
+            DoctorEntryKind::inspection_failure(&std::io::ErrorKind::NotFound.into()),
+            DoctorEntryKind::Missing
+        );
+        assert_eq!(
+            DoctorEntryKind::inspection_failure(&std::io::ErrorKind::PermissionDenied.into()),
+            DoctorEntryKind::Unavailable
+        );
+    }
 
     #[test]
     fn gc_day_periods_have_exact_checked_duration_values() {

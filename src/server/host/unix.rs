@@ -37,6 +37,10 @@ pub(super) fn notify_service_ready(socket: Option<&std::ffi::OsStr>) -> io::Resu
 
 pub(super) struct ShutdownRegistration(Vec<SigId>);
 
+impl ShutdownRegistration {
+    pub(super) fn complete(self) {}
+}
+
 impl Drop for ShutdownRegistration {
     fn drop(&mut self) {
         self.0.drain(..).for_each(|id| {
