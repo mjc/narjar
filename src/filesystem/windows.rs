@@ -48,10 +48,13 @@ pub(super) fn is_link_traversal_error(error: &io::Error) -> bool {
     error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_CANT_ACCESS_FILE as i32)
 }
 
+#[path = "windows/control.rs"]
+mod control;
 #[path = "windows/enumeration.rs"]
 mod enumeration;
 #[path = "windows/security.rs"]
 mod security;
+pub(crate) use control::ControlPipeName;
 
 pub(crate) fn validate_file_privacy_at(
     parent: &File,

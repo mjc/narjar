@@ -95,3 +95,6 @@ jobs:
       - name: Check the default-feature application
         if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
         run: cargo check --locked --bin narjar
+      - name: Check the native application test harness
+        if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
+        run: cargo check --locked --test cli

@@ -2,7 +2,6 @@
 
 use std::{
     io::{self, Read},
-    os::unix::net::{UnixListener, UnixStream},
     path::Path,
     sync::{
         Arc,
@@ -21,13 +20,17 @@ use crate::cache::{
     },
 };
 use crossbeam_channel::{Sender, bounded};
-use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 mod protocol;
 mod retry;
 pub(crate) use retry::RetryPolicy;
+#[cfg(unix)]
 mod socket;
+#[cfg(windows)]
+#[path = "control/windows.rs"]
+mod socket;
+use socket::{Listener, Stream};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const REPORT_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -93,15 +96,13 @@ fn request_collection(data_dir: &Path, options: &GcOptions) -> io::Result<Reply>
 }
 
 struct CollectionJob {
-    connection: UnixStream,
+    connection: Stream,
     options: GcOptions,
 }
 
 impl CollectionJob {
-    fn receive_bounded_request(mut connection: UnixStream) -> io::Result<Self> {
-        // BSD accept() can inherit the listener's nonblocking flag.
-        connection.set_nonblocking(false)?;
-        connection.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+    fn receive_bounded_request(mut connection: Stream) -> io::Result<Self> {
+        socket::configure_connection(&connection)?;
         let options = protocol::read_frame(DeadlineReader::new(&mut connection, REQUEST_TIMEOUT))?;
         Ok(Self {
             connection,
@@ -179,7 +180,7 @@ impl ControlService {
                         &stopping,
                         &daemon_stopping,
                         &metrics,
-                        |listener| listener.accept().map(|(connection, _)| connection),
+                        socket::accept,
                     )
                 }) {
                 Ok(dispatcher) => dispatcher,
@@ -250,7 +251,7 @@ fn dispatch_requests(
     stopping: &AtomicBool,
     daemon_stopping: &AtomicBool,
     metrics: &Metrics,
-    mut accept: impl FnMut(&UnixListener) -> io::Result<UnixStream>,
+    mut accept: impl FnMut(&Listener) -> io::Result<Stream>,
 ) -> io::Result<()> {
     std::iter::repeat_with(|| ())
         .take_while(|_| !is_stopping(stopping, daemon_stopping))
@@ -263,14 +264,7 @@ fn dispatch_requests(
                     thread::park_timeout(Duration::from_millis(100))
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error)
-                    if error.kind() == io::ErrorKind::ConnectionAborted
-                        || error.raw_os_error().is_some_and(|code| {
-                            [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM]
-                                .iter()
-                                .any(|errno| errno.raw_os_error() == code)
-                        }) =>
-                {
+                Err(error) if socket::retryable_accept_error(&error) => {
                     eprintln!("narjar: online GC accept failed; retrying: {error}");
                     thread::park_timeout(Duration::from_millis(100));
                 }
@@ -281,7 +275,7 @@ fn dispatch_requests(
 }
 
 fn queue_collection_request(
-    connection: UnixStream,
+    connection: Stream,
     jobs: &Sender<CollectionJob>,
     busy: &AtomicBool,
     metrics: &Metrics,
@@ -308,7 +302,7 @@ fn enqueue_admitted_collection_job(
     }
 }
 
-fn send_recorded_reply(connection: &mut UnixStream, reply: Reply, metrics: &Metrics) {
+fn send_recorded_reply(connection: &mut Stream, reply: Reply, metrics: &Metrics) {
     metrics.online_gc_completed(reply.outcome());
     let _ = protocol::write_frame(connection, &reply);
 }
@@ -348,12 +342,12 @@ fn run_collection(
 
 /// A total deadline: partial header/body reads cannot reset the timeout.
 struct DeadlineReader<'a> {
-    connection: &'a mut UnixStream,
+    connection: &'a mut Stream,
     deadline: Instant,
 }
 
 impl<'a> DeadlineReader<'a> {
-    fn new(connection: &'a mut UnixStream, timeout: Duration) -> Self {
+    fn new(connection: &'a mut Stream, timeout: Duration) -> Self {
         Self {
             connection,
             deadline: Instant::now() + timeout,
@@ -365,25 +359,20 @@ impl Read for DeadlineReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match bytes {
             [] => Ok(0),
-            bytes => {
-                socket::wait_for_socket_event_before_deadline(
-                    self.connection,
-                    rustix::event::PollFlags::IN,
-                    self.deadline,
-                )?;
-                self.connection.read(bytes)
-            }
+            bytes => socket::read_before_deadline(self.connection, bytes, self.deadline),
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::cache::{
         maintenance::{self, Operation, Outcome},
         storage::{CachePolicies, Directory, StorageBackend, SupportedStorageBackend, gc::GcMode},
     };
+    use rustix::io::Errno;
+    use std::os::unix::net::UnixStream;
     use std::{io::Write, sync::mpsc};
 
     struct ReleaseCollectorOnDrop<'a>(&'a mpsc::Sender<()>);
