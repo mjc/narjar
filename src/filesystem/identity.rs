@@ -14,14 +14,6 @@ impl FileIdentity {
     pub(crate) const fn volume(self) -> u64 {
         self.volume
     }
-
-    #[cfg(windows)]
-    pub(crate) fn namespace_bytes(self) -> [u8; 24] {
-        let mut bytes = [0; 24];
-        bytes[..8].copy_from_slice(&self.volume.to_le_bytes());
-        bytes[8..].copy_from_slice(&self.object);
-        bytes
-    }
 }
 
 /// Object identity and mutation evidence; access-time changes do not invalidate it.
@@ -37,28 +29,6 @@ impl FileStamp {
     pub(crate) fn from_file(file: &File) -> io::Result<Self> {
         platform::stamp(file)
     }
-
-    #[cfg(all(test, unix))]
-    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        platform::stamp_from_metadata(metadata)
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn from_stat(statistics: &rustix::fs::Stat) -> Self {
-        let mut object = [0; 16];
-        object[..8].copy_from_slice(&(statistics.st_ino as u64).to_le_bytes());
-        Self {
-            identity: FileIdentity {
-                volume: statistics.st_dev as u64,
-                object,
-            },
-            size: statistics.st_size as u64,
-            modified: i128::from(statistics.st_mtime) * 1_000_000_000
-                + i128::from(statistics.st_mtime_nsec),
-            changed: i128::from(statistics.st_ctime) * 1_000_000_000
-                + i128::from(statistics.st_ctime_nsec),
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -66,6 +36,33 @@ mod platform {
     use std::os::unix::fs::MetadataExt;
 
     use super::*;
+
+    impl FileStamp {
+        #[cfg(test)]
+        pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+            platform::stamp_from_metadata(metadata)
+        }
+
+        pub(crate) fn from_stat(statistics: &rustix::fs::Stat) -> Self {
+            let mut object = [0; 16];
+            object[..8].copy_from_slice(&statistics.st_ino.to_le_bytes());
+            Self {
+                identity: FileIdentity {
+                    #[allow(
+                        clippy::unnecessary_cast,
+                        reason = "Darwin stat uses a signed dev_t; Linux uses u64"
+                    )]
+                    volume: statistics.st_dev as u64,
+                    object,
+                },
+                size: statistics.st_size as u64,
+                modified: i128::from(statistics.st_mtime) * 1_000_000_000
+                    + i128::from(statistics.st_mtime_nsec),
+                changed: i128::from(statistics.st_ctime) * 1_000_000_000
+                    + i128::from(statistics.st_ctime_nsec),
+            }
+        }
+    }
 
     fn identity_from_metadata(metadata: &std::fs::Metadata) -> FileIdentity {
         let mut object = [0; 16];
@@ -101,6 +98,15 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use std::os::windows::io::AsRawHandle;
+
+    impl super::FileIdentity {
+        pub(crate) fn namespace_bytes(self) -> [u8; 24] {
+            let mut bytes = [0; 24];
+            bytes[..8].copy_from_slice(&self.volume.to_le_bytes());
+            bytes[8..].copy_from_slice(&self.object);
+            bytes
+        }
+    }
 
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_BASIC_INFO, FILE_ID_INFO, FILE_STANDARD_INFO, FileBasicInfo, FileIdInfo,
@@ -175,6 +181,20 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_stamps_preserve_signed_seconds_and_nanoseconds() {
+        let file = tempfile::tempfile().unwrap();
+        let mut statistics = rustix::fs::fstat(&file).unwrap();
+        statistics.st_ctime = -7;
+        statistics.st_ctime_nsec = 456_123_987;
+        statistics.st_mtime = -2;
+        statistics.st_mtime_nsec = 123_456_789;
+        let stamp = FileStamp::from_stat(&statistics);
+        assert_eq!(stamp.changed, -6_543_876_013);
+        assert_eq!(stamp.modified, -1_876_543_211);
+    }
 
     #[test]
     fn an_open_file_keeps_its_identity_after_a_rename() {
