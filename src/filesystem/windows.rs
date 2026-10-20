@@ -162,15 +162,12 @@ fn require_kind(file: &File, kind: Kind) -> io::Result<()> {
 
 fn open_child(parent: &File, name: &Path, kind: Kind, access: u32) -> io::Result<File> {
     require_kind(parent, Kind::Directory)?;
-    let type_flag = match kind {
-        Kind::Directory => FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT,
-        Kind::Regular => FILE_NON_DIRECTORY_FILE,
-    };
     // fs_at 0.2.1 sends this one component to NtCreateFile.RootDirectory.
-    // Explicit options override follow(); retain OPEN_REPARSE_POINT here.
+    // Inspect the opened kind ourselves: NT's NON_DIRECTORY_FILE mismatch is
+    // ACCESS_DENIED, which would hide invalid entries as operational I/O errors.
     let file = fs_at::OpenOptions::default()
         .desired_access(access | FILE_READ_ATTRIBUTES | READ_CONTROL)
-        .create_options(type_flag | FILE_OPEN_REPARSE_POINT)
+        .create_options(FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT)
         .object_attributes(OBJ_CASE_INSENSITIVE)
         .open_path_at(parent, name)?;
     require_kind(&file, kind)?;
@@ -731,6 +728,17 @@ fn invalid_data(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_at_a_regular_file_location_is_invalid_content_not_access_denial() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("record")).unwrap();
+        let directory = open_directory(root.path()).unwrap();
+        assert_eq!(
+            open_regular_at(&directory, "record").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn independent_directory_handles_have_the_access_required_for_enumeration() {
