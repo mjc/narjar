@@ -32,4 +32,4 @@ $versionOutput = & $executable --version
 if ($LASTEXITCODE -ne 0 -or $versionOutput -ne "narjar $expectedVersion") {
     throw 'Installed executable has the wrong version'
 }
-& (Join-Path $PSScriptRoot 'check-windows-filesystem.ps1') -NarjarExecutable $executable -Fixture installed
+& (Join-Path $PSScriptRoot 'check-windows-filesystem.ps1') -NarjarExecutable $executable -ApplicationTests $env:NARJAR_APPLICATION_TEST_BINARY -Fixture installed

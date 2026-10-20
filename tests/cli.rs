@@ -343,7 +343,9 @@ fn signed_zstd_narinfo(file_hash: &str, nar_hash: &str, nar_size: u64, file_size
 }
 
 fn command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_narjar"));
+    let executable = std::env::var_os("NARJAR_TEST_EXECUTABLE")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_narjar").into());
+    let mut command = Command::new(executable);
     for variable in CONFIG_ENV {
         command.env_remove(*variable);
     }

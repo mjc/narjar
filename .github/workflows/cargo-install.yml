@@ -54,6 +54,7 @@ jobs:
   windows-application:
     name: Windows application
     runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
         shell: pwsh
@@ -84,18 +85,25 @@ jobs:
           Expand-Archive -Path $archive -DestinationPath $cargoBin -Force
           cargo nextest --version
       - name: Test the portable library without application dependencies
-        run: cargo nextest run --locked --no-default-features --lib --test nar_decoder --test nar_encoder --test nar_allocations
+        run: cargo nextest run --config-file ci/nextest.toml --profile windows --locked --no-default-features --lib --test nar_decoder --test nar_encoder --test nar_allocations
       - name: Build the default-feature application
         if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
         run: cargo build --locked --bin narjar
-      - name: Check NTFS and the application under a standard account
-        run: ./ci/check-windows-filesystem.ps1 -NarjarExecutable (Resolve-Path target/debug/narjar.exe)
-      - name: Check the native application test harness
+      - name: Build and locate the native application test harness
         if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
-        run: cargo check --locked --test cli
+        run: |
+          $suite = cargo nextest list --locked --all-features --test cli --message-format json | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Application test build failed' }
+          $binary = $suite.'rust-suites'.'narjar::cli'.'binary-path'
+          if (-not $binary -or -not (Test-Path $binary -PathType Leaf)) {
+            throw 'Missing application test executable'
+          }
+          "NARJAR_APPLICATION_TEST_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Check NTFS and the application under a standard account
+        run: ./ci/check-windows-filesystem.ps1 -NarjarExecutable (Resolve-Path target/debug/narjar.exe) -ApplicationTests $env:NARJAR_APPLICATION_TEST_BINARY
       - name: Run the native application suite
         if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
-        run: cargo nextest run --locked --package narjar --all-features --no-fail-fast
+        run: cargo nextest run --config-file ci/nextest.toml --profile windows --locked --package narjar --all-features --no-fail-fast
       - name: Install the Cargo package and run it without developer tools
         env:
           CARGO_INSTALL_VERSION: ${{ inputs.version }}

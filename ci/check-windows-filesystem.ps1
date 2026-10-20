@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory)][string]$NarjarExecutable,
+    [string]$ApplicationTests = '',
     [ValidateSet('checkout', 'installed')][string]$Fixture = 'checkout'
 )
 $ErrorActionPreference = 'Stop'
@@ -10,6 +11,7 @@ rustc --edition 2024 ci/windows-filesystem-probe.rs -o $executable
 if ($LASTEXITCODE -ne 0) { throw 'Windows filesystem probe compilation failed' }
 Copy-Item $NarjarExecutable (Join-Path $probeRoot 'narjar.exe')
 Copy-Item 'ci/windows-application-smoke.ps1' (Join-Path $probeRoot 'application-smoke.ps1')
+if ($ApplicationTests) { Copy-Item $ApplicationTests (Join-Path $probeRoot 'application-tests.exe') }
 
 $accountName = 'NarjarFsProbe'
 $password = ConvertTo-SecureString ('Aa9!' + [guid]::NewGuid().ToString('N')) -AsPlainText -Force
