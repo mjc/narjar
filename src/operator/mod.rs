@@ -2,7 +2,6 @@ use std::{
     fs::{self, File},
     io::Write,
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -26,7 +25,7 @@ use crate::cache::{
             self, EvictionOrder, FreeSpaceThresholds, GcMode, GcOptions, GcReport, ProtectedRoots,
             RetentionOptions,
         },
-        private_file_mode_is_valid, storage_directories,
+        storage_directories,
     },
 };
 use clap::{Args, builder::TypedValueParser};
@@ -43,7 +42,14 @@ use crate::{
     http_url::HttpUrl,
 };
 
+#[cfg(unix)]
+#[path = "host/unix.rs"]
+mod host;
+#[cfg(windows)]
+#[path = "host/windows.rs"]
+mod host;
 mod lifecycle;
+use host::inspect_doctor_path;
 mod maintenance_session;
 pub(crate) use lifecycle::{Init, Key, generate_key_pair, init, initialize_cache, key};
 use maintenance_session::{MaintenanceRecord, MaintenanceSession, record_maintenance_result};
@@ -884,11 +890,33 @@ impl DoctorSeverity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DoctorEntryKind {
+    Missing,
+    Symlink,
+    Directory,
+    File,
+    Other,
+}
+
+impl std::fmt::Display for DoctorEntryKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "missing",
+            Self::Symlink => "symlink",
+            Self::Directory => "directory",
+            Self::File => "file",
+            Self::Other => "other",
+        })
+    }
+}
+
 #[derive(Serialize)]
 struct DoctorPath {
     path: &'static str,
     required: bool,
-    kind: &'static str,
+    kind: DoctorEntryKind,
     mode: Option<u32>,
     uid: Option<u32>,
     gid: Option<u32>,
@@ -1012,20 +1040,12 @@ fn inspect_doctor(root: &Path, backend: SupportedStorageBackend) -> Result<Docto
         ),
     };
 
-    let lease = match File::open(root) {
-        Ok(file) => match doctor_try_lease(&file) {
-            Ok(()) => (DoctorSeverity::Ok, "lease is available".to_owned()),
-            Err(error)
-                if error.raw_os_error() == Some(rustix::io::Errno::WOULDBLOCK.raw_os_error())
-                    || error.raw_os_error() == Some(rustix::io::Errno::AGAIN.raw_os_error()) =>
-            {
-                (
-                    DoctorSeverity::Warning,
-                    "lease is held by another process".to_owned(),
-                )
-            }
-            Err(error) => (DoctorSeverity::Unavailable, error.to_string()),
-        },
+    let lease = match host::inspect_lease(root) {
+        Ok(()) => (DoctorSeverity::Ok, "lease is available".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (
+            DoctorSeverity::Warning,
+            "lease is held by another process".to_owned(),
+        ),
         Err(error) => (DoctorSeverity::Unavailable, error.to_string()),
     };
 
@@ -1104,114 +1124,24 @@ fn validate_doctor_read_through(data_dir: &Path) -> Result<(), &'static str> {
 
 fn inspect_doctor_recovery_markers(root: &Path) -> [DoctorPath; 2] {
     let markers = CACHE_RECOVERY_MARKERS.map(|name| inspect_doctor_path(root, name, false, false));
-    match markers.each_ref().map(|marker| marker.mode) {
-        [None, None] => markers.map(|mut marker| {
+    match markers.each_ref().map(|marker| marker.kind) {
+        [DoctorEntryKind::Missing, DoctorEntryKind::Missing] => markers.map(|mut marker| {
             marker.severity = DoctorSeverity::Error;
             marker.detail = "cache requires a clean or recovery marker".to_owned();
             marker
         }),
-        [Some(_), _] | [None, Some(_)] => markers,
-    }
-}
-
-fn inspect_doctor_path(
-    root: &Path,
-    relative: &'static str,
-    required: bool,
-    directory: bool,
-) -> DoctorPath {
-    let path = root.join(relative);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => {
-            return DoctorPath {
-                path: relative,
-                required,
-                kind: "missing",
-                mode: None,
-                uid: None,
-                gid: None,
-                severity: DoctorSeverity::Ok,
-                detail: "optional".to_owned(),
-            };
-        }
-        Err(error) => {
-            return DoctorPath {
-                path: relative,
-                required,
-                kind: "missing",
-                mode: None,
-                uid: None,
-                gid: None,
-                severity: if required {
-                    DoctorSeverity::Error
-                } else {
-                    DoctorSeverity::Unavailable
-                },
-                detail: error.to_string(),
-            };
-        }
-    };
-    let kind = if metadata.file_type().is_symlink() {
-        "symlink"
-    } else if metadata.is_dir() {
-        "directory"
-    } else if metadata.is_file() {
-        "file"
-    } else {
-        "other"
-    };
-    let mode = metadata.mode() & 0o7777;
-    let wrong_type = (directory && kind != "directory") || (!directory && kind != "file");
-    let unsafe_mode = if directory {
-        mode & 0o022 != 0
-    } else {
-        !private_file_mode_is_valid(mode)
-    };
-    let severity = if wrong_type || unsafe_mode {
-        DoctorSeverity::Error
-    } else {
-        DoctorSeverity::Ok
-    };
-    let detail = if wrong_type {
-        format!(
-            "expected {}, found {kind}",
-            if directory {
-                "directory"
-            } else {
-                "regular file"
-            }
-        )
-    } else if unsafe_mode {
-        format!("unsafe permissions {mode:04o}")
-    } else {
-        "matches portable layout contract".to_owned()
-    };
-    DoctorPath {
-        path: relative,
-        required,
-        kind,
-        mode: Some(mode),
-        uid: Some(metadata.uid()),
-        gid: Some(metadata.gid()),
-        severity,
-        detail,
+        _ => markers,
     }
 }
 
 fn doctor_capacity(path: &Path) -> Result<DoctorCapacity, std::io::Error> {
-    let file = File::open(path)?;
+    let file = open_directory(path)?;
     let capacity = filesystem_space(&file)?;
     Ok(DoctorCapacity {
         path: "",
         capacity,
         device: FileIdentity::from_file(&file)?.volume(),
     })
-}
-
-fn doctor_try_lease(file: &File) -> Result<(), std::io::Error> {
-    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(Into::into)
 }
 
 fn doctor_json(report: &DoctorReport) -> impl Serialize + '_ {
@@ -2400,7 +2330,7 @@ machine other.example password other-secret
             .find(|path| path.path == "nar")
             .expect("nar path should be reported");
         assert!(matches!(nar.severity, DoctorSeverity::Error));
-        assert_eq!(nar.kind, "file");
+        assert_eq!(nar.kind, DoctorEntryKind::File);
     }
 
     #[test]
@@ -2413,8 +2343,9 @@ machine other.example password other-secret
             storage_backend: StorageBackend::Flat,
         })
         .expect("cache should initialize");
-        let held = File::open(directory.path()).expect("data directory should open");
-        doctor_try_lease(&held).expect("test should hold the lease");
+        let root = Directory::open(directory.path()).expect("data directory should open");
+        let _held = Storage::open(&root, SupportedStorageBackend::FLAT)
+            .expect("test should hold the lease");
 
         let report = inspect_doctor(directory.path(), SupportedStorageBackend::FLAT)
             .expect("doctor should inspect cache");

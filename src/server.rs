@@ -21,10 +21,6 @@ use crate::cache::{
         StorageError,
     },
 };
-use signal_hook::{
-    consts::{SIGINT, SIGTERM},
-    low_level,
-};
 
 use crate::cache::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure, WorkerKind};
 use crate::{
@@ -33,31 +29,14 @@ use crate::{
     http::{PublicationRequest, ReadContext, ReadSource, prepare_publication, respond},
 };
 
+#[cfg(unix)]
+#[path = "server/host/unix.rs"]
+mod host;
+#[cfg(windows)]
+#[path = "server/host/windows.rs"]
+mod host;
 mod idle;
-
-fn notify_service_ready(socket: Option<&std::ffi::OsStr>) -> io::Result<()> {
-    let Some(socket) = socket else {
-        return Ok(());
-    };
-    let sender = std::os::unix::net::UnixDatagram::unbound()?;
-    sender.set_nonblocking(true)?;
-    match socket.as_encoded_bytes() {
-        [b'/', ..] => sender.send_to(b"READY=1", std::path::Path::new(socket))?,
-        #[cfg(target_os = "linux")]
-        [b'@', name @ ..] => {
-            use std::os::linux::net::SocketAddrExt;
-            let address = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
-            sender.send_to_addr(b"READY=1", &address)?
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "NOTIFY_SOCKET must be an absolute Unix socket path or Linux abstract address",
-            ));
-        }
-    };
-    Ok(())
-}
+use host::notify_service_ready;
 
 struct Admissions {
     limit: usize,
@@ -538,28 +517,6 @@ fn spawn_metrics_sampler(
         })
 }
 
-fn install_signal_handlers(
-    stopping: Arc<AtomicBool>,
-    signal_count: Arc<AtomicUsize>,
-) -> Result<(), Error> {
-    [SIGINT, SIGTERM].into_iter().try_for_each(|signal| {
-        let stopping = Arc::clone(&stopping);
-        let signal_count = Arc::clone(&signal_count);
-        // SAFETY: the handler only performs atomic operations and `_exit`,
-        // both of which are async-signal-safe.
-        unsafe {
-            low_level::register(signal, move || {
-                if signal_count.fetch_add(1, Ordering::Relaxed) > 0 {
-                    low_level::exit(128 + signal);
-                }
-                stopping.store(true, Ordering::Release);
-            })
-        }
-        .map(|_| ())
-        .map_err(|error| Error::runtime(format!("cannot install signal handler: {error}")))
-    })
-}
-
 struct AcceptLoopContext {
     sender: Sender<AcceptedRequest>,
     admissions: Arc<Admissions>,
@@ -606,27 +563,7 @@ fn run_accept_loop_with(
 }
 
 fn continue_after_accept_error(error: io::Error) -> Result<(), Error> {
-    let kind = error.kind();
-    // Linux reports pending per-connection network failures from accept().
-    // Its accept(2) contract requires treating these like an empty queue.
-    #[cfg(target_os = "linux")]
-    let kind = match error
-        .raw_os_error()
-        .map(rustix::io::Errno::from_raw_os_error)
-    {
-        Some(
-            rustix::io::Errno::NETDOWN
-            | rustix::io::Errno::PROTO
-            | rustix::io::Errno::NOPROTOOPT
-            | rustix::io::Errno::HOSTDOWN
-            | rustix::io::Errno::NONET
-            | rustix::io::Errno::HOSTUNREACH
-            | rustix::io::Errno::OPNOTSUPP
-            | rustix::io::Errno::NETUNREACH,
-        ) => io::ErrorKind::WouldBlock,
-        _ => kind,
-    };
-    match kind {
+    match host::accept_error_kind(&error) {
         io::ErrorKind::WouldBlock => {
             thread::sleep(Duration::from_millis(50));
             Ok(())
@@ -637,6 +574,10 @@ fn continue_after_accept_error(error: io::Error) -> Result<(), Error> {
 }
 
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
+    let stopping = Arc::new(AtomicBool::new(false));
+    // Register first so this guard outlives every server resource during shutdown.
+    let _shutdown = host::install_shutdown(Arc::clone(&stopping))
+        .map_err(|error| Error::runtime(format!("cannot install shutdown handler: {error}")))?;
     let ServerResources {
         storage,
         source,
@@ -661,7 +602,6 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     listener
         .set_nonblocking(true)
         .map_err(|error| Error::runtime(format!("cannot configure listener: {error}")))?;
-    let stopping = Arc::new(AtomicBool::new(false));
     let metrics_sampler = spawn_metrics_sampler(
         &config,
         Arc::clone(&metrics),
@@ -682,8 +622,6 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         })
         .transpose()
         .map_err(|error| Error::runtime(format!("cannot start population sampler: {error}")))?;
-    let signal_count = Arc::new(AtomicUsize::new(0));
-    install_signal_handlers(Arc::clone(&stopping), signal_count)?;
     let control = match crate::control::ControlService::start(
         &config.data_dir,
         Arc::clone(&storage),
