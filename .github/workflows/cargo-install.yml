@@ -96,3 +96,7 @@ jobs:
       - name: Run the native application suite
         if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
         run: cargo nextest run --locked --package narjar --all-features --no-fail-fast
+      - name: Install the Cargo package and run it without developer tools
+        env:
+          CARGO_INSTALL_VERSION: ${{ inputs.version }}
+        run: ./ci/check-cargo-install-without-nix.ps1 -Version $env:CARGO_INSTALL_VERSION
