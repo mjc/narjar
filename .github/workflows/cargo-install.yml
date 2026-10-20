@@ -67,3 +67,29 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - name: Test the portable library without application dependencies
         run: cargo test --locked --no-default-features --lib --test nar_decoder --test nar_encoder
+
+  windows-application:
+    name: Windows application
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+      - name: Install the pinned Rust toolchain
+        run: |
+          $toolchainFile = Get-Content rust-toolchain.toml -Raw
+          if ($toolchainFile -notmatch '(?m)^channel\s*=\s*"([^"]+)"') {
+            throw 'Missing Rust toolchain channel'
+          }
+          $toolchain = $Matches[1]
+          rustup toolchain install $toolchain --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+          "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Probe NTFS synchronization under a standard account
+        run: ./ci/check-windows-filesystem.ps1
+      - name: Check the default-feature application
+        run: cargo check --locked --bin narjar
