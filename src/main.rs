@@ -9,6 +9,10 @@ mod narinfo_signing;
 #[cfg(unix)]
 mod native_store;
 mod operator;
+#[cfg(unix)]
+mod push;
+#[cfg(windows)]
+#[path = "push/windows.rs"]
 mod push;
 mod read_through;
 mod server;
