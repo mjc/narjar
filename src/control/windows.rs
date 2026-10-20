@@ -462,10 +462,10 @@ mod tests {
             // reply bytes must remain available to the connected client.
         });
         let mut client = connect(root.path()).unwrap();
+        worker.join().unwrap();
         let mut reply = [0; 5];
         client.read_exact(&mut reply).unwrap();
         assert_eq!(&reply, b"reply");
-        worker.join().unwrap();
     }
 
     #[test]

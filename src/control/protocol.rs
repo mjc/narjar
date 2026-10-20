@@ -30,22 +30,77 @@ pub(super) fn read_frame<T: DeserializeOwned>(mut reader: impl Read) -> io::Resu
 }
 
 pub(super) fn write_frame(mut writer: impl Write, value: &impl Serialize) -> io::Result<()> {
-    let body = postcard::to_allocvec(value).map_err(io::Error::other)?;
-    let length = u32::try_from(body.len()).map_err(io::Error::other)?;
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "control frame too large",
-        ));
-    }
-    writer.write_all(MAGIC)?;
-    writer.write_all(&length.to_be_bytes())?;
-    writer.write_all(&body)
+    let mut frame = vec![0; HEADER_BYTES + MAX_FRAME_BYTES];
+    let length = postcard::to_slice(value, &mut frame[HEADER_BYTES..])
+        .map_err(|error| match error {
+            postcard::Error::SerializeBufferFull => {
+                io::Error::new(io::ErrorKind::InvalidInput, "control frame too large")
+            }
+            error => io::Error::other(error),
+        })?
+        .len();
+    let wire_length = u32::try_from(length).map_err(io::Error::other)?;
+    frame[..4].copy_from_slice(MAGIC);
+    frame[4..HEADER_BYTES].copy_from_slice(&wire_length.to_be_bytes());
+    writer.write_all(&frame[..HEADER_BYTES + length])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FrameWriter {
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FrameWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            panic!("frame encoding must use the transport's write_all budget")
+        }
+
+        fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.calls += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_complete_frame_uses_one_transport_write_budget() {
+        let mut writer = FrameWriter::default();
+        let value = (42_u64, "one frame");
+        write_frame(&mut writer, &value).unwrap();
+        assert_eq!(writer.calls, 1);
+        assert_eq!(
+            read_frame::<(u64, String)>(&writer.bytes[..]).unwrap(),
+            (42, "one frame".to_owned())
+        );
+    }
+
+    #[test]
+    fn oversized_frames_do_not_start_a_transport_write() {
+        let mut writer = FrameWriter::default();
+        let error = write_frame(&mut writer, &vec![0_u8; MAX_FRAME_BYTES]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(writer.calls, 0);
+        assert!(writer.bytes.is_empty());
+    }
+
+    #[test]
+    fn a_maximum_sized_frame_fits_the_bounded_encoding_buffer() {
+        let mut writer = FrameWriter::default();
+        let value = vec![0_u8; MAX_FRAME_BYTES - 2];
+        write_frame(&mut writer, &value).unwrap();
+        assert_eq!(writer.calls, 1);
+        assert_eq!(writer.bytes.len(), HEADER_BYTES + MAX_FRAME_BYTES);
+        assert_eq!(read_frame::<Vec<u8>>(&writer.bytes[..]).unwrap(), value);
+    }
 
     #[test]
     fn a_complete_versioned_frame_round_trips_without_accepting_trailing_record_bytes() {
