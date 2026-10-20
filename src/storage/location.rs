@@ -37,12 +37,10 @@ impl From<StorePath> for PathBuf {
 
 impl StorePath {
     pub(super) fn relative_path(&self) -> PathBuf {
-        let mut path = PathBuf::new();
-        if let Some(directory) = self.directory() {
-            path.push(directory);
+        match self.directory() {
+            Some(directory) => portable_relative_path(directory, self.name()),
+            None => PathBuf::from(self.name()),
         }
-        path.push(self.name());
-        path
     }
 
     pub(super) fn parse(path: &Path) -> io::Result<Self> {
@@ -131,10 +129,8 @@ impl TemporaryPath {
 
     pub(super) fn relative_path(&self) -> PathBuf {
         match self {
-            Self::Root(name) => PathBuf::from(TEMPORARY_DIRECTORY).join(name),
-            Self::Nar(name) => PathBuf::from(NAR_DIRECTORY)
-                .join(TEMPORARY_DIRECTORY)
-                .join(name),
+            Self::Root(name) => portable_relative_path(TEMPORARY_DIRECTORY, name),
+            Self::Nar(name) => portable_relative_path("nar/.tmp", name),
         }
     }
 
@@ -190,6 +186,15 @@ impl TemporaryPath {
             Self::Root(name) | Self::Nar(name) => name,
         }
     }
+}
+
+// These paths are also serialized into recovery records. Keep their spelling
+// independent of the host's preferred separator without converting filenames.
+fn portable_relative_path(directory: &str, name: &OsStr) -> PathBuf {
+    let mut path = OsString::from(directory);
+    path.push("/");
+    path.push(name);
+    path.into()
 }
 
 fn next_normal_component(

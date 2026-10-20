@@ -29,7 +29,7 @@ use config::{ServeArgs, ServeConfig};
 use error::Error;
 
 #[derive(Parser)]
-#[command(name = "narjar", version)]
+#[command(name = "narjar", bin_name = "narjar", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -262,6 +262,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn invalid_native_configuration_is_a_usage_error_before_storage_access() {
         let cli = Cli::try_parse_from([
             "narjar",

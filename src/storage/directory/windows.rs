@@ -5,21 +5,13 @@ use std::{
 };
 
 use crate::cache::filesystem::{
-    FilePrivacy, open_directory, open_process_lease_at, validate_directory, validate_file_privacy,
+    FilePrivacy, open_process_lease_at, validate_directory, validate_file_privacy,
 };
 
 use super::{super::StorageError, Directory};
 
-impl Directory {
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let opened = open_directory(path)?;
-        let file = validate_directory(&opened, "data directory")?;
-        Ok(Self {
-            file,
-            #[cfg(test)]
-            path: path.to_owned(),
-        })
-    }
+pub(super) fn validate_data_directory(file: &File, _: &Path) -> io::Result<()> {
+    validate_directory(file, "data directory").map(drop)
 }
 
 /// The no-delete handle keeps the locked file bound to this opened DATA directory.

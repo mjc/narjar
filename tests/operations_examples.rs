@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::process::{Command, Output};
 
 const OPERATIONS: &str = include_str!("../docs/operations.md");

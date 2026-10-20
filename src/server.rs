@@ -841,6 +841,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn notification_requires_an_absolute_or_abstract_address() {
         for address in ["", "relative.sock"] {
             assert_eq!(

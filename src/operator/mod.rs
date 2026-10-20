@@ -1901,7 +1901,7 @@ machine other.example password other-secret
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn init_can_select_the_chunked_storage_backend() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         init(Init {
@@ -2159,6 +2159,7 @@ machine other.example password other-secret
     }
 
     #[test]
+    #[cfg(unix)]
     fn native_source_doctor_reports_validation_without_echoing_configured_paths() {
         let directory = initialized_doctor_cache();
         let options = Doctor {
