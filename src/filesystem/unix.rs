@@ -2,7 +2,10 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io,
-    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{DirBuilderExt, PermissionsExt},
+    },
     path::Path,
 };
 
@@ -12,6 +15,10 @@ use rustix::{
 };
 
 use super::{EntryKind, EntryMetadata, FileAccess, FileCreation, FilePrivacy, FileStamp};
+
+pub(super) fn is_link_traversal_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+}
 
 pub(crate) fn entry_metadata_at(parent: &File, name: &OsStr) -> io::Result<EntryMetadata> {
     let metadata = fs::statat(parent, name, fs::AtFlags::SYMLINK_NOFOLLOW)?;
@@ -65,6 +72,16 @@ pub(crate) fn validate_file_privacy(file: &File, privacy: FilePrivacy) -> io::Re
     validate_mode(mode, privacy)
 }
 
+pub fn validate_private_file(file: &File) -> io::Result<()> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a regular file is required",
+        ));
+    }
+    validate_file_privacy(file, FilePrivacy::Private)
+}
+
 pub(crate) fn validate_file_privacy_at(
     parent: &File,
     name: &OsStr,
@@ -88,6 +105,22 @@ fn validate_mode(mode: u32, privacy: FilePrivacy) -> io::Result<()> {
     match valid {
         true => Ok(()),
         false => Err(io::Error::new(io::ErrorKind::InvalidData, message)),
+    }
+}
+
+pub(crate) fn validate_managed_file_privacy(file: &File, privacy: FilePrivacy) -> io::Result<()> {
+    let mode = match privacy {
+        FilePrivacy::Private => 0o600,
+        FilePrivacy::Public => 0o644,
+    };
+    let metadata = file.metadata()?;
+    if metadata.is_file() && metadata.permissions().mode() & 0o777 == mode {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected a regular {mode:04o} file"),
+        ))
     }
 }
 
@@ -187,6 +220,19 @@ pub fn open_regular_at(parent: impl AsFd, path: impl AsRef<Path>) -> io::Result<
 
 pub fn open_directory(path: &Path) -> io::Result<File> {
     open_directory_at(rustix::fs::CWD, path)
+}
+
+pub fn create_private_directory(path: &Path) -> io::Result<File> {
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    let directory = open_directory(path)?;
+    set_file_privacy(&directory, FilePrivacy::Private)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        open_directory(parent)?.sync_all()?;
+    }
+    Ok(directory)
 }
 
 pub fn ensure_directory_at(parent: &File, name: &OsStr, label: &str) -> io::Result<File> {

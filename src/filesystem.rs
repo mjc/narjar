@@ -7,6 +7,9 @@ use std::{
 #[path = "filesystem/identity.rs"]
 mod identity;
 pub(crate) use identity::{FileIdentity, FileStamp};
+#[path = "filesystem/staging.rs"]
+mod staging;
+pub(crate) use staging::PreparedFile;
 
 #[cfg(unix)]
 #[path = "filesystem/unix.rs"]
@@ -53,6 +56,23 @@ pub(crate) struct EntryMetadata {
     pub(crate) stamp: FileStamp,
 }
 
+pub(crate) enum EntryOpenFailure {
+    Missing,
+    Invalid,
+    Io(io::Error),
+}
+
+impl From<io::Error> for EntryOpenFailure {
+    fn from(error: io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::NotFound => Self::Missing,
+            io::ErrorKind::InvalidData => Self::Invalid,
+            _ if is_link_traversal_error(&error) => Self::Invalid,
+            _ => Self::Io(error),
+        }
+    }
+}
+
 pub fn exclude_dot_directory_entries(
     entries: impl Iterator<Item = io::Result<OsString>>,
 ) -> impl Iterator<Item = io::Result<OsString>> {
@@ -64,4 +84,30 @@ pub fn exclude_dot_directory_entries(
 
 pub fn read_dir_names(directory: &File) -> io::Result<Vec<OsString>> {
     exclude_dot_directory_entries(directory_names(directory)?).collect()
+}
+
+pub(crate) fn create_private_directory_tree(path: &std::path::Path) -> io::Result<File> {
+    let directory = ensure_private_directory_tree(path)?;
+    set_file_privacy(&directory, FilePrivacy::Private)?;
+    Ok(directory)
+}
+
+fn ensure_private_directory_tree(path: &std::path::Path) -> io::Result<File> {
+    match open_directory(path) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                ensure_private_directory_tree(parent)?;
+            }
+            match create_private_directory(path) {
+                Ok(directory) => Ok(directory),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => open_directory(path),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }

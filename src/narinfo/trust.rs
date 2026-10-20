@@ -2,12 +2,12 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     io::{self, Read},
-    os::unix::fs::MetadataExt,
 };
 
 use data_encoding::BASE64;
 use ed25519_dalek::VerifyingKey;
 
+use crate::cache::filesystem::{FilePrivacy, validate_file_privacy};
 use crate::cache::storage::{Directory, StoreHash, open_regular_at};
 
 use super::{
@@ -66,9 +66,12 @@ impl TrustedPublicKeys {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(error.into()),
         };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.mode() & 0o133 != 0 {
-            return Err(TrustError::InvalidTrustFile);
+        match validate_file_privacy(&file, FilePrivacy::Public) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                return Err(TrustError::InvalidTrustFile);
+            }
+            Err(error) => return Err(error.into()),
         }
 
         let mut contents = String::new();

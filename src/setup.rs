@@ -1,12 +1,16 @@
 use std::{
-    fs::{self, File},
+    fs,
     io::{self, IsTerminal, Write},
     net::SocketAddr,
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
-use crate::cache::storage::{StorageBackend, SupportedStorageBackend};
+use crate::cache::{
+    filesystem::{
+        self, FilePrivacy, PreparedFile, open_directory, open_regular_at, validate_private_file,
+    },
+    storage::{StorageBackend, SupportedStorageBackend},
+};
 use clap::Args;
 
 use crate::{
@@ -66,14 +70,14 @@ pub(crate) fn run(mut options: Setup) -> Result<(), Error> {
     operator::create_file(
         &options.credentials_dir.join("write.token"),
         write_token.as_bytes(),
-        0o600,
+        FilePrivacy::Private,
         false,
     )?;
     let netrc = netrc_entry(options.cache_url.host(), &write_token);
     operator::create_file(
         &options.credentials_dir.join("narjar.netrc"),
         netrc.as_bytes(),
-        0o600,
+        FilePrivacy::Private,
         false,
     )?;
 
@@ -132,10 +136,9 @@ fn create_setup_directories(data_dir: &Path, credentials_dir: &Path) -> Result<(
 }
 
 fn create_private_directory(path: &Path) -> Result<(), Error> {
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder.create(path).map_err(runtime)?;
-    set_directory_mode(path)
+    filesystem::create_private_directory(path)
+        .map(|_| ())
+        .map_err(runtime)
 }
 
 fn absolute_destination(path: &Path) -> Result<PathBuf, Error> {
@@ -177,35 +180,22 @@ fn confirm_setup(options: &Setup) -> Result<(), Error> {
     Err(Error::runtime("setup cancelled"))
 }
 
-fn set_directory_mode(path: &Path) -> Result<(), Error> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(runtime)
-}
-
 fn install_trusted_public_key(data_dir: &Path, public_key: &Path) -> Result<(), Error> {
-    let target = data_dir.join("trusted-public-keys");
-    let metadata = fs::symlink_metadata(&target).map_err(runtime)?;
-    if !metadata.file_type().is_file()
-        || metadata.len() != 0
-        || metadata.permissions().mode() & 0o777 != 0o600
-    {
+    let directory = open_directory(data_dir).map_err(runtime)?;
+    let target = std::ffi::OsStr::new("trusted-public-keys");
+    let file = open_regular_at(&directory, target).map_err(runtime)?;
+    validate_private_file(&file).map_err(runtime)?;
+    if file.metadata().map_err(runtime)?.len() != 0 {
         return Err(Error::runtime(
             "initialized trusted-public-keys must be an empty regular 0600 file",
         ));
     }
     let key = fs::read(public_key).map_err(runtime)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(data_dir).map_err(runtime)?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(runtime)?;
-    temporary.write_all(&key).map_err(runtime)?;
-    temporary.as_file().sync_all().map_err(runtime)?;
-    temporary
-        .persist(&target)
-        .map_err(|error| runtime(error.error))?;
-    File::open(data_dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(runtime)
+    let temporary = PreparedFile::write(&directory, FilePrivacy::Private, |file| {
+        file.write_all(&key)
+    })
+    .map_err(runtime)?;
+    temporary.replace(target).map_err(runtime)
 }
 
 fn create_private_read_token(options: &Setup) -> Result<(), Error> {
@@ -214,7 +204,7 @@ fn create_private_read_token(options: &Setup) -> Result<(), Error> {
     operator::create_file(
         &options.credentials_dir.join("read.token"),
         token_value.as_bytes(),
-        0o600,
+        FilePrivacy::Private,
         false,
     )
 }

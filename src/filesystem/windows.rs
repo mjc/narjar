@@ -44,6 +44,10 @@ use windows_sys::{
 
 use super::{EntryKind, EntryMetadata, FileAccess, FileCreation, FilePrivacy, FileStamp};
 
+pub(super) fn is_link_traversal_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_CANT_ACCESS_FILE as i32)
+}
+
 #[path = "windows/enumeration.rs"]
 mod enumeration;
 #[path = "windows/security.rs"]
@@ -498,6 +502,11 @@ pub(crate) fn open_writable_at(
 pub fn validate_private_file(file: &File) -> io::Result<()> {
     require_kind(file, Kind::Regular)?;
     security::validate(file, FilePrivacy::Private)
+}
+
+pub(crate) fn validate_managed_file_privacy(file: &File, privacy: FilePrivacy) -> io::Result<()> {
+    require_kind(file, Kind::Regular)?;
+    security::validate(file, privacy)
 }
 
 pub(crate) fn validate_file_privacy(file: &File, privacy: FilePrivacy) -> io::Result<()> {

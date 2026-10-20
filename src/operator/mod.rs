@@ -2,12 +2,15 @@ use std::{
     fs::{self, File},
     io::Write,
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
-use crate::cache::filesystem::FileIdentity;
+use crate::cache::filesystem::{
+    FileAccess, FileCreation, FileIdentity, FilePrivacy, PreparedFile, open_directory,
+    open_writable_at, validate_managed_file_privacy,
+};
 use crate::cache::{
     inventory::{Inventory, InventoryClass, InventoryEntry, VerificationMode},
     maintenance::{
@@ -1366,58 +1369,54 @@ fn netrc_authorization_from_str(text: &str, host: &str) -> Result<String, Error>
 pub(crate) fn create_file(
     path: &Path,
     bytes: &[u8],
-    mode: u32,
+    privacy: FilePrivacy,
     preserve_existing: bool,
 ) -> Result<(), Error> {
-    let mut temporary = tempfile::NamedTempFile::new_in(
+    let directory = open_directory(
         path.parent()
-            .expect("Narjar managed files always have a parent directory"),
+            .expect("managed files have a parent directory"),
     )
     .map_err(runtime)?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(runtime)?;
-    temporary.write_all(bytes).map_err(runtime)?;
-    temporary.as_file().sync_all().map_err(runtime)?;
-
-    match temporary.persist_noclobber(path) {
-        Ok(_) => {}
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            validate_existing_managed_file(path, bytes, mode, preserve_existing)?;
+    let name = path.file_name().expect("managed paths name files");
+    let temporary =
+        PreparedFile::write(&directory, privacy, |file| file.write_all(bytes)).map_err(runtime)?;
+    match temporary.publish_new(name) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_existing_managed_file(&directory, name, bytes, privacy, preserve_existing)
         }
-        Err(error) => return Err(runtime(error.error)),
+        Err(error) => Err(runtime(error)),
     }
-    if let Some(parent) = path.parent() {
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(runtime)?;
-    }
-    Ok(())
 }
 
 fn validate_existing_managed_file(
-    path: &Path,
+    directory: &File,
+    name: &std::ffi::OsStr,
     bytes: &[u8],
-    mode: u32,
+    privacy: FilePrivacy,
     preserve_existing: bool,
 ) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path).map_err(runtime)?;
-    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != mode {
-        return Err(Error::runtime(format!(
-            "initialization entry is not a regular {:o} file: {}",
-            mode,
-            path.display()
-        )));
+    let mut file = open_writable_at(
+        directory,
+        name,
+        FileAccess::ReadWrite,
+        FileCreation::Existing,
+        privacy,
+    )
+    .map_err(runtime)?;
+    validate_managed_file_privacy(&file, privacy).map_err(runtime)?;
+    let mut contents = Vec::new();
+    if !preserve_existing {
+        std::io::Read::read_to_end(&mut file, &mut contents).map_err(runtime)?;
     }
-    if !preserve_existing && fs::read(path).map_err(runtime)? != bytes {
+    if !preserve_existing && contents != bytes {
         return Err(Error::runtime(format!(
             "initialization file differs from requested configuration: {}",
-            path.display()
+            name.to_string_lossy()
         )));
     }
-    File::open(path)
-        .and_then(|file| file.sync_all())
+    file.sync_all()
+        .and_then(|()| directory.sync_all())
         .map_err(runtime)
 }
 
@@ -1445,6 +1444,7 @@ mod tests {
     use super::*;
     use crate::cache::maintenance::{Operation, Outcome};
     use crate::cache::storage::{CacheCreation, Directory, SupportedStorageBackend};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn gc_day_periods_have_exact_checked_duration_values() {
@@ -1539,9 +1539,10 @@ mod tests {
     fn managed_file_conflict_never_replaces_existing_contents_or_leaves_temps() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let path = directory.path().join("credential");
-        create_file(&path, b"original", 0o600, false).expect("initial file should be created");
+        create_file(&path, b"original", FilePrivacy::Private, false)
+            .expect("initial file should be created");
 
-        assert!(create_file(&path, b"replacement", 0o600, false).is_err());
+        assert!(create_file(&path, b"replacement", FilePrivacy::Private, false).is_err());
 
         assert_eq!(
             fs::read(path).expect("original file should remain"),

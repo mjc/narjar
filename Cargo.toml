@@ -43,7 +43,7 @@ application = [
     "dep:enum-map", "dep:fluent-uri", "dep:lzma-rust2", "dep:xz4rust",
     "dep:memchr", "dep:mincdc", "dep:mio", "dep:httparse", "dep:postcard", "dep:rustix",
     "dep:sqlite", "dep:signal-hook", "dep:serde_json", "dep:subtle",
-    "dep:tempfile", "dep:structured-zstd", "dep:ureq", "dep:fs_at", "dep:windows-sys",
+    "dep:tempfile", "dep:structured-zstd", "dep:ureq", "dep:fs_at", "dep:windows-sys", "dep:getrandom", "dep:scopeguard",
 ]
 
 [[bin]]
@@ -74,6 +74,7 @@ digest-io = { optional = true, version = "=0.1.0", default-features = false }
 ed25519-dalek = { optional = true, version = "=3.0.0", default-features = false, features = ["signature"] }
 enum-map = { optional = true, version = "=3.1.0", default-features = false, features = ["derive"] }
 fluent-uri = { optional = true, version = "=0.4.1", default-features = false, features = ["std"] }
+getrandom = { optional = true, version = "=0.2.17", default-features = false, features = ["std"] }
 lzma-rust2 = { optional = true, version = "=0.21.0", default-features = false, features = ["std", "xz", "encoder", "optimization"] }
 xz4rust = { optional = true, version = "=0.2.3", default-features = false, features = ["std", "bcj", "crc64", "sha256", "delta", "no_unsafe"] }
 memchr = { optional = true, version = "=2.8.3", default-features = false, features = ["std"] }
@@ -84,6 +85,7 @@ postcard = { optional = true, version = "=1.1.3", default-features = false, feat
 sha2 = { version = "=0.11.0", default-features = false }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151", optional = true }
+scopeguard = { version = "=1.2.0", optional = true, default-features = false }
 subtle = { optional = true, version = "=2.6.1", default-features = false }
 thiserror = "=2.0.21"
 tempfile = { optional = true, version = "=3.27.0", default-features = false }
