@@ -23,7 +23,10 @@ $stored = Get-Content (Join-Path $cache 'auth/write.tokens') -Raw
 if ($stored.Contains($token)) { throw 'Token file contains the plaintext token' }
 Invoke-Narjar token revoke --data-dir $cache --scope write --name smoke
 
-$setupCache = Join-Path $Root "setup cache é's‘’‚‛;Write-Output injected;#"
+$setupName = @'
+setup cache é's‘’‚‛“”„$`;Write-Output injected;#
+'@
+$setupCache = Join-Path $Root $setupName
 $credentials = Join-Path $Root "setup credentials é's"
 $summary = Invoke-Narjar setup --yes --data-dir $setupCache --credentials-dir $credentials --private-read | Out-String
 $lines = $summary -split '\r?\n'

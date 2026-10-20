@@ -3,19 +3,22 @@ use std::path::Path;
 use super::Setup;
 
 pub(super) fn quote_shell_argument(value: &str) -> String {
-    std::iter::once('\'')
-        .chain(value.chars().flat_map(double_powershell_quote_delimiter))
-        .chain(std::iter::once('\''))
+    std::iter::once('"')
+        .chain(
+            value
+                .chars()
+                .flat_map(escape_powershell_expandable_string_character),
+        )
+        .chain(std::iter::once('"'))
         .collect()
 }
 
-fn double_powershell_quote_delimiter(character: char) -> impl Iterator<Item = char> {
-    // PowerShell also treats these typographic characters as quote delimiters.
-    let duplicate = match character {
-        '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => Some(character),
+fn escape_powershell_expandable_string_character(character: char) -> impl Iterator<Item = char> {
+    let escape = match character {
+        '`' | '$' | '"' | '\u{201c}' | '\u{201d}' | '\u{201e}' => Some('`'),
         _ => None,
     };
-    std::iter::once(character).chain(duplicate)
+    escape.into_iter().chain(std::iter::once(character))
 }
 
 pub(super) fn print_upload_instructions(options: &Setup, _: &Path) {
@@ -32,11 +35,14 @@ mod tests {
 
     #[test]
     fn copied_powershell_arguments_preserve_backslashes_unicode_and_apostrophes() {
-        assert_eq!(quote_shell_argument(r"C:\cache é's"), r"'C:\cache é''s'");
+        assert_eq!(quote_shell_argument(r"C:\cache é's"), r#""C:\cache é's""#);
     }
 
     #[test]
-    fn every_powershell_single_quote_delimiter_is_doubled_without_changing_its_value() {
-        assert_eq!(quote_shell_argument("'‘’‚‛"), "'''‘‘’’‚‚‛‛'");
+    fn powershell_expansion_and_quote_characters_are_escaped_but_single_quotes_are_literal() {
+        assert_eq!(
+            quote_shell_argument("'‘’‚‛\"“”„$`"),
+            "\"'‘’‚‛`\"`“`”`„`$``\""
+        );
     }
 }
