@@ -34,9 +34,17 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($serveCommand, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw "Setup printed an invalid PowerShell command: $serveCommand" }
 $command = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $false)
-if ($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true).Count -ne 1 -or
+$commandCount = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true).Count
+if ($commandCount -ne 1 -or
     $command.CommandElements.Count -ne 8 -or $command.CommandElements[3].Value -ne $printedData) {
-    throw 'Setup command changed the data-directory argument'
+    $diagnostic = @{
+        command = $serveCommand
+        commandCount = $commandCount
+        elements = @($command.CommandElements | ForEach-Object { $_.Extent.Text })
+        expectedPath = $printedData
+        actualPath = $command.CommandElements[3].Value
+    } | ConvertTo-Json -Compress
+    throw "Setup command did not preserve its literal argument: $diagnostic"
 }
 Invoke-Narjar doctor --data-dir $setupCache --json
 foreach ($file in 'producer.sec', 'producer.pub', 'read.token', 'write.token', 'narjar.netrc') {
