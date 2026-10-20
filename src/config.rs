@@ -9,8 +9,18 @@ use clap::ValueEnum;
 use narjar::object::WireEncoding;
 
 use crate::cache::storage::{StorageBackend, SupportedStorageBackend, UnsupportedStorageBackend};
-use crate::native_store::{NativeStoreOptions, NativeStoreSettings};
+#[cfg(unix)]
+use crate::native_store::NativeStoreSettings;
 use crate::{http_url::HttpUrl, read_through::EdgeSettings};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NativeStoreOptions<'a> {
+    pub(crate) store_dir: Option<&'a std::path::Path>,
+    pub(crate) state_dir: Option<&'a std::path::Path>,
+    pub(crate) roots_dir: Option<&'a std::path::Path>,
+    pub(crate) min_lease_seconds: Option<NonZeroU64>,
+    pub(crate) signing_key_file: Option<&'a std::path::Path>,
+}
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
@@ -37,6 +47,7 @@ pub(crate) enum ServeSource {
         storage_backend: SupportedStorageBackend,
         egress_compression: WireEncoding,
     },
+    #[cfg(unix)]
     NativeStore(NativeStoreSettings),
     ReadThrough {
         storage_backend: SupportedStorageBackend,
@@ -79,6 +90,8 @@ impl ServeSource {
         native: NativeStoreOptions<'_>,
     ) -> Result<Self, SourcePreparationError> {
         match (choice, native) {
+            #[cfg(windows)]
+            (ServeSourceChoice::NativeStore, _) => Err(SourcePreparationError::NativeUnavailable),
             (
                 ServeSourceChoice::FlatCache,
                 NativeStoreOptions {
@@ -94,6 +107,7 @@ impl ServeSource {
                 egress_compression,
             }),
             (ServeSourceChoice::FlatCache, _) => Err(SourcePreparationError::NativeOptionsForCache),
+            #[cfg(unix)]
             (
                 ServeSourceChoice::NativeStore,
                 NativeStoreOptions {
@@ -125,6 +139,7 @@ impl ServeSource {
                     Err(SourcePreparationError::NativeCompressedOutput)
                 }
             },
+            #[cfg(unix)]
             (ServeSourceChoice::NativeStore, _) => {
                 Err(SourcePreparationError::MissingNativeOptions)
             }
@@ -140,6 +155,7 @@ impl ServeSource {
             Self::ReadThrough {
                 storage_backend, ..
             } => *storage_backend,
+            #[cfg(unix)]
             Self::NativeStore(_) => SupportedStorageBackend::FLAT,
         }
     }
@@ -149,13 +165,20 @@ impl ServeSource {
             Self::FlatCache {
                 egress_compression, ..
             } => *egress_compression,
-            Self::NativeStore(_) | Self::ReadThrough { .. } => WireEncoding::Raw,
+            #[cfg(unix)]
+            Self::NativeStore(_) => WireEncoding::Raw,
+            Self::ReadThrough { .. } => WireEncoding::Raw,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum SourcePreparationError {
+    #[cfg(windows)]
+    #[error(
+        "native Nix store serving is not supported on Windows; choose --serve-source flat-cache"
+    )]
+    NativeUnavailable,
     #[error("read-through source requires --edge-upstream")]
     MissingEdgeUpstream,
     #[error("edge upstream options require --serve-source read-through")]
@@ -185,6 +208,8 @@ pub(crate) enum SourcePreparationError {
 impl SourcePreparationError {
     pub(crate) const fn doctor_detail(self) -> &'static str {
         match self {
+            #[cfg(windows)]
+            Self::NativeUnavailable => "native Nix store serving is unavailable on Windows",
             Self::MissingEdgeUpstream => "required edge upstream is missing",
             Self::EdgeOptionsForOtherSource => "edge options require read-through selection",
             Self::EdgeCompressedOutput => "read-through source requires raw output",
@@ -427,7 +452,7 @@ mod tests {
     use narjar::object::{CompressionCodec, WireEncoding};
 
     use super::{ServeArgs, ServeConfig, ServeSource, ServeSourceChoice, SourcePreparationError};
-    use crate::native_store::NativeStoreOptions;
+    use crate::config::NativeStoreOptions;
 
     fn native_options() -> NativeStoreOptions<'static> {
         NativeStoreOptions {

@@ -4,6 +4,10 @@ use std::{
     io,
 };
 
+#[path = "filesystem/identity.rs"]
+mod identity;
+pub(crate) use identity::{FileIdentity, FileStamp};
+
 #[cfg(unix)]
 #[path = "filesystem/unix.rs"]
 mod unix;
@@ -34,6 +38,19 @@ pub(crate) enum FileCreation {
 pub(crate) enum FilePrivacy {
     Private,
     Public,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EntryKind {
+    Directory,
+    Regular,
+    Other,
+}
+
+#[derive(Debug)]
+pub(crate) struct EntryMetadata {
+    pub(crate) kind: EntryKind,
+    pub(crate) stamp: FileStamp,
 }
 
 pub fn exclude_dot_directory_entries(

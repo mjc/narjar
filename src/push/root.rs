@@ -215,7 +215,7 @@ mod tests {
             Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "push::root::tests::temporary_roots_child",
+                    "push::native::root::tests::temporary_roots_child",
                     "--nocapture",
                 ])
                 .env("NARJAR_TEMP_ROOT_CHILD_STATE", state_dir)

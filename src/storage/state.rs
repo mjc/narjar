@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
-    os::unix::fs::MetadataExt,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64},
 };
@@ -15,6 +14,7 @@ use super::ids::StoreHash;
 use super::publication::Layout;
 use super::publication::StagingBudget;
 use super::recovery::RecoveryState;
+use crate::cache::filesystem::FileStamp;
 use crate::cache::object::{NarFileName, NarIdentity};
 
 #[derive(Debug)]
@@ -253,32 +253,6 @@ struct DeliveryProof {
     identity: NarIdentity,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileStamp {
-    size: u64,
-    device: u64,
-    inode: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-}
-
-impl FileStamp {
-    fn from_file(file: &File) -> std::io::Result<Self> {
-        let metadata = file.metadata()?;
-        Ok(Self {
-            size: metadata.len(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
-        })
-    }
-}
-
 impl DeliveryValidationCache {
     pub(super) fn get(
         &self,
@@ -364,16 +338,9 @@ mod tests {
     fn delivery_validation_proofs_are_fifo_bounded() {
         let mut proofs = DeliveryProofs::default();
         let identity = NarIdentity::new(NarHash::from_digest([1; 32]), NarSize::new(4));
+        let file = tempfile::tempfile().unwrap();
         let proof = DeliveryProof {
-            stamp: FileStamp {
-                size: 4,
-                device: 1,
-                inode: 1,
-                modified_seconds: 1,
-                modified_nanoseconds: 1,
-                changed_seconds: 1,
-                changed_nanoseconds: 1,
-            },
+            stamp: FileStamp::from_file(&file).unwrap(),
             identity,
         };
 

@@ -1,19 +1,20 @@
 use std::{
     ffi::{OsStr, OsString},
-    fs::{self, File},
+    fs::File,
     io::{self, Read, Write},
-    os::unix::fs::PermissionsExt,
     path::Path,
     process,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
-use rustix::fs::FileType;
+use crate::cache::filesystem::{
+    FileAccess, FileCreation, FilePrivacy, set_file_privacy, validate_file_privacy,
+    validate_file_privacy_at,
+};
 
 use sha2::{Digest, Sha256};
 
-use super::fs::{entry_mode_at, hard_link_at, open_at, rename_at, unlink_at};
+use super::fs::{hard_link_at, open_at, rename_at, unlink_at};
 use super::{
     StorageError, entry_is_regular_at,
     location::{StorePath, TemporaryPath},
@@ -321,14 +322,7 @@ impl RecoveryState {
             .map(TransactionEntry::parse)
             .collect::<io::Result<Vec<_>>>()?;
         for entry in &entries {
-            let mode = entry_mode_at(&self.transactions, entry.name())?;
-            if FileType::from_raw_mode(mode) != FileType::RegularFile || mode & 0o133 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "publication transaction entry has unsafe type or permissions",
-                )
-                .into());
-            }
+            validate_file_privacy_at(&self.transactions, entry.name(), FilePrivacy::Public)?;
             if let TransactionEntry::Record(name) = entry {
                 open_regular_at(&self.transactions, name)?;
             }
@@ -414,7 +408,7 @@ impl RecoveryState {
             FilePrivacy::Private,
         ) {
             Ok(file) => {
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                set_file_privacy(&file, FilePrivacy::Private)?;
                 file.sync_all()?;
                 self.root.sync_all()?;
                 Ok(())
@@ -461,13 +455,7 @@ impl RecoveryState {
         match entry_is_regular_at(&self.root, name) {
             Ok(true) => {
                 let marker = open_regular_at(&self.root, name)?;
-                if marker.metadata()?.permissions().mode() & 0o133 != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "recovery marker has unsafe permissions",
-                    )
-                    .into());
-                }
+                validate_file_privacy(&marker, FilePrivacy::Public)?;
                 Ok(true)
             }
             Ok(false) => Err(io::Error::new(
@@ -539,7 +527,7 @@ fn write_transaction_draft(
         FilePrivacy::Private,
     )?;
     fault(TransactionRecordBoundary::DraftCreated)?;
-    draft.set_permissions(fs::Permissions::from_mode(0o600))?;
+    set_file_privacy(&draft, FilePrivacy::Private)?;
     draft.write_all(contents)?;
     fault(TransactionRecordBoundary::DraftWritten)?;
     operations.sync_draft(&draft)?;

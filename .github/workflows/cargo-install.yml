@@ -80,6 +80,7 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.ref }}
       - name: Install the pinned Rust toolchain
+        id: windows-toolchain
         run: |
           $toolchainFile = Get-Content rust-toolchain.toml -Raw
           if ($toolchainFile -notmatch '(?m)^channel\s*=\s*"([^"]+)"') {
@@ -92,4 +93,5 @@ jobs:
       - name: Probe NTFS synchronization under a standard account
         run: ./ci/check-windows-filesystem.ps1
       - name: Check the default-feature application
+        if: ${{ !cancelled() && steps.windows-toolchain.outcome == 'success' }}
         run: cargo check --locked --bin narjar

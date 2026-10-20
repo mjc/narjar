@@ -6,7 +6,9 @@ use std::path::PathBuf;
 #[cfg(unix)]
 #[path = "directory/unix.rs"]
 mod platform;
-#[cfg(unix)]
+#[cfg(windows)]
+#[path = "directory/windows.rs"]
+mod platform;
 pub(super) use platform::ProcessLock;
 
 #[derive(Debug)]

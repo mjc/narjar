@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fs::{File, Permissions},
+    fs::File,
     io::{self, Read, Write},
-    os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
-use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
+use crate::cache::filesystem::{
+    FileAccess, FileCreation, FilePrivacy, set_file_privacy, validate_file_privacy,
+};
 
 use super::{
     LAYOUT_DESCRIPTOR, SupportedStorageBackend,
@@ -15,8 +16,8 @@ use super::{
     chunk_store::ChunkStore,
     directory::{Directory, ProcessLock},
     fs::{
-        ensure_directory_at, hard_link_at, open_at, open_optional_at, private_file_mode_is_valid,
-        require_directory_at, require_private_file_at, unlink_at,
+        ensure_directory_at, hard_link_at, open_at, open_optional_at, require_directory_at,
+        require_private_file_at, unlink_at,
     },
     publication::StorageError,
     recovery::RecoveryState,
@@ -225,11 +226,7 @@ impl CacheLayout {
                 io::Error::new(io::ErrorKind::InvalidData, "lock is not a regular file").into(),
             );
         }
-        if !private_file_mode_is_valid(metadata.permissions().mode()) {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "lock has unsafe permissions").into(),
-            );
-        }
+        validate_file_privacy(&file, FilePrivacy::Private)?;
         Ok(())
     }
 
@@ -273,7 +270,7 @@ impl CacheLayout {
             let (parent, leaf) = directory_parent(&self.root, name)?;
             let directory =
                 ensure_directory_at(&parent, OsStr::new(leaf), &format!("{name} directory"))?;
-            directory.set_permissions(Permissions::from_mode(0o700))?;
+            set_file_privacy(&directory, FilePrivacy::Private)?;
             directory.sync_all()?;
             parent.sync_all()
         })

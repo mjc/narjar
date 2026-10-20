@@ -9,6 +9,10 @@ $accountName = 'NarjarFsProbe'
 $password = ConvertTo-SecureString ('Aa9!' + [guid]::NewGuid().ToString('N')) -AsPlainText -Force
 $account = New-LocalUser -Name $accountName -Password $password -AccountNeverExpires
 try {
+    Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account.SID
+    $volume = Get-Volume -FilePath $probeRoot
+    Write-Output "Filesystem: $($volume.FileSystemType)"
+    if ($volume.FileSystemType -ne 'NTFS') { throw 'Probe requires local NTFS' }
     $acl = Get-Acl $probeRoot
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
         $account.SID, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
@@ -26,9 +30,6 @@ if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administ
 }
 Write-Output "Account: $($identity.Name); SID: $($identity.User); administrator: false"
 Write-Output "OS: $([System.Environment]::OSVersion.VersionString)"
-$volume = Get-Volume -FilePath $Root
-Write-Output "Filesystem: $($volume.FileSystemType)"
-if ($volume.FileSystemType -ne 'NTFS') { throw 'Probe requires local NTFS' }
 & (Join-Path $Root 'probe.exe') $Root
 if ($LASTEXITCODE -ne 0) { throw "Filesystem probe failed: $LASTEXITCODE" }
 '@ | Set-Content -Path $childScript

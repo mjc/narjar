@@ -6,6 +6,7 @@ mod http;
 mod http_client;
 mod http_url;
 mod narinfo_signing;
+#[cfg(unix)]
 mod native_store;
 mod operator;
 mod push;

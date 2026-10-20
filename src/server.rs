@@ -438,6 +438,7 @@ fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, 
     recover_server_storage(&storage, &trusted_keys)?;
     let source = match &config.source {
         ServeSource::FlatCache { .. } => ReadSource::FlatCache,
+        #[cfg(unix)]
         ServeSource::NativeStore(settings) => {
             let source = settings
                 .validate(&config.data_dir, &trusted_keys)
@@ -646,7 +647,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     } = initialize_server_resources(&config)?;
     let publication_workers = match source.as_ref() {
         ReadSource::FlatCache => config.workers.get(),
-        ReadSource::NativeStore(_) | ReadSource::ReadThrough(_) => 0,
+        #[cfg(unix)]
+        ReadSource::NativeStore(_) => 0,
+        ReadSource::ReadThrough(_) => 0,
     };
     if config.track_access {
         storage

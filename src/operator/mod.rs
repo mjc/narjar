@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::cache::filesystem::FileIdentity;
 use crate::cache::{
     inventory::{Inventory, InventoryClass, InventoryEntry, VerificationMode},
     maintenance::{
@@ -31,11 +32,12 @@ use narjar::object::WireEncoding;
 use serde::Serialize;
 use ureq::Agent;
 
+#[cfg(unix)]
+use crate::native_store::NativeStoreSettings;
 use crate::{
-    config::{ServeSource, ServeSourceChoice, SourcePreparationError},
+    config::{NativeStoreOptions, ServeSource, ServeSourceChoice, SourcePreparationError},
     error::Error,
     http_url::HttpUrl,
-    native_store::{NativeStoreOptions, NativeStoreSettings},
 };
 
 mod lifecycle;
@@ -929,6 +931,12 @@ impl DoctorReport {
 pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
     let source = options.prepare_source();
     let backend = match &source {
+        #[cfg(windows)]
+        Err(SourcePreparationError::NativeUnavailable) => {
+            return Err(Error::usage(
+                "native Nix store serving is not supported on Windows; choose --serve-source flat-cache",
+            ));
+        }
         Err(SourcePreparationError::UnsupportedBackend(error)) => {
             return Err(Error::usage(error.to_string()));
         }
@@ -1047,6 +1055,7 @@ fn inspect_doctor_source(
             }
         }
         Err(error) => Err(error.doctor_detail()),
+        #[cfg(unix)]
         Ok(ServeSource::NativeStore(settings)) => {
             validate_doctor_native_store(&options.data_dir, &settings)
                 .map(|()| "source configuration is valid")
@@ -1063,6 +1072,7 @@ fn inspect_doctor_source(
     }
 }
 
+#[cfg(unix)]
 fn validate_doctor_native_store(
     data_dir: &Path,
     settings: &NativeStoreSettings,
@@ -1192,7 +1202,7 @@ fn doctor_capacity(path: &Path) -> Result<DoctorCapacity, std::io::Error> {
     Ok(DoctorCapacity {
         path: "",
         capacity,
-        device: file.metadata()?.dev(),
+        device: FileIdentity::from_file(&file)?.volume(),
     })
 }
 
