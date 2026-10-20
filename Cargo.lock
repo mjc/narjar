@@ -424,6 +424,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d2923e26fcf6c3699531d13e141a4c18bb0852d5614da154805dcf6348fbf21"
 
 [[package]]
+name = "mio"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
+dependencies = [
+ "libc",
+ "wasi",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "narjar"
 version = "0.1.0"
 dependencies = [
@@ -439,6 +450,7 @@ dependencies = [
  "lzma-rust2",
  "memchr",
  "mincdc",
+ "mio",
  "postcard",
  "rustix",
  "serde",

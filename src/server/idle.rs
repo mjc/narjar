@@ -1,6 +1,6 @@
 use std::{
-    io::{self, Read, Write},
-    os::unix::net::UnixStream,
+    collections::HashMap,
+    io,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -10,18 +10,21 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use mio::{Events, Interest, Poll, Registry, Token, Waker, net::TcpStream};
 
 use super::{AcceptedRequest, Metrics};
 
+const WAKE_TOKEN: Token = Token(0);
+const SHUTDOWN_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
 pub(super) struct IdleConnections {
     sender: Sender<WaitingConnection>,
-    wake: UnixStream,
+    wake: Waker,
     timeout: Duration,
 }
 
 struct WaitingConnection {
-    accepted: AcceptedRequest,
+    accepted: AcceptedRequest<TcpStream>,
     deadline: Instant,
 }
 
@@ -29,8 +32,43 @@ impl WaitingConnection {
     fn new(accepted: AcceptedRequest, timeout: Duration) -> io::Result<Self> {
         accepted.stream.set_nonblocking(true)?;
         Ok(Self {
-            accepted,
+            accepted: AcceptedRequest {
+                stream: TcpStream::from_std(accepted.stream),
+                _admission: accepted._admission,
+            },
             deadline: Instant::now() + timeout,
+        })
+    }
+
+    fn readiness(&self, now: Instant) -> Readiness {
+        if now >= self.deadline {
+            return Readiness::Closed;
+        }
+        // Readability includes EOF. Peeking preserves the request byte and
+        // rearms Windows readiness when the socket reports WouldBlock.
+        match self.accepted.stream.peek(&mut [0]) {
+            Ok(0) => Readiness::Closed,
+            Ok(_) => Readiness::Request,
+            Err(error) => match error.kind() {
+                io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut => Readiness::Waiting,
+                _ => Readiness::Closed,
+            },
+        }
+    }
+
+    fn deregister(mut self, registry: &Registry) -> io::Result<Self> {
+        registry.deregister(&mut self.accepted.stream)?;
+        Ok(self)
+    }
+
+    fn resume(self) -> io::Result<AcceptedRequest> {
+        let stream = std::net::TcpStream::from(self.accepted.stream);
+        stream.set_nonblocking(false)?;
+        Ok(AcceptedRequest {
+            stream,
+            _admission: self.accepted._admission,
         })
     }
 }
@@ -50,15 +88,13 @@ impl IdleConnections {
         capacity: usize,
         timeout: Duration,
     ) -> io::Result<(Arc<Self>, thread::JoinHandle<io::Result<()>>)> {
-        let (wake_reader, wake) = UnixStream::pair()?;
-        wake_reader.set_nonblocking(true)?;
-        wake.set_nonblocking(true)?;
+        let monitor = IdleMonitor::new()?;
+        let wake = Waker::new(monitor.poll.registry(), WAKE_TOKEN)?;
         let (sender, receiver) = bounded(capacity);
         let handle = thread::Builder::new()
             .name("narjar-idle-connections".into())
             .spawn(move || {
-                let result =
-                    monitor_idle_connections(receiver, wake_reader, ready, metrics, &stopping);
+                let result = monitor.run(receiver, &ready, &metrics, &stopping);
                 stopping.store(true, Ordering::Release);
                 result
             })?;
@@ -77,109 +113,118 @@ impl IdleConnections {
             Ok(waiting) => waiting,
             Err(_) => return,
         };
-        // Each waiting connection still owns an admission, so this bounded
-        // queue cannot exceed the server's connection limit.
+        // Each parked connection retains its admission, bounding both the
+        // pending queue and registered sockets by the server connection limit.
         if self.sender.try_send(waiting).is_ok() {
-            // WouldBlock means a wakeup is already pending. A disconnected
-            // monitor drops the queued connection and its admission.
-            let _ = (&self.wake).write(&[1]);
+            let _ = self.wake.wake();
         }
     }
 }
 
-fn monitor_idle_connections(
-    receiver: Receiver<WaitingConnection>,
-    mut wake: UnixStream,
-    ready: Sender<AcceptedRequest>,
-    metrics: Arc<Metrics>,
-    stopping: &AtomicBool,
-) -> io::Result<()> {
-    let mut waiting = Vec::new();
-    std::iter::from_fn(|| (!stopping.load(Ordering::Acquire)).then_some(())).try_for_each(|()| {
-        waiting.extend(receiver.try_iter());
-        let states = poll_waiting_connections(&waiting, &wake)?;
-        drain_wake_notifications(&mut wake)?;
-        waiting = waiting
-            .drain(..)
-            .zip(states)
-            .filter_map(|(connection, state)| match state {
-                Readiness::Waiting => Some(connection),
-                Readiness::Closed => None,
-                Readiness::Request => {
-                    enqueue_ready_connection(connection.accepted, &ready, &metrics);
-                    None
-                }
-            })
-            .collect();
+struct IdleMonitor {
+    // Drop registered socket owners before their poller.
+    sockets: ParkedSockets,
+    poll: Poll,
+    events: Events,
+}
+
+#[derive(Default)]
+struct ParkedSockets {
+    waiting: HashMap<Token, WaitingConnection>,
+    last_token: usize,
+}
+
+impl IdleMonitor {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            poll: Poll::new()?,
+            events: Events::with_capacity(128),
+            sockets: ParkedSockets::default(),
+        })
+    }
+
+    fn run(
+        mut self,
+        receiver: Receiver<WaitingConnection>,
+        ready: &Sender<AcceptedRequest>,
+        metrics: &Metrics,
+        stopping: &AtomicBool,
+    ) -> io::Result<()> {
+        std::iter::from_fn(|| (!stopping.load(Ordering::Acquire)).then_some(())).try_for_each(
+            |()| {
+                receiver
+                    .try_iter()
+                    .try_for_each(|waiting| self.sockets.register(self.poll.registry(), waiting))?;
+                self.poll_once(ready, metrics)?;
+                self.sockets.expire(Instant::now());
+                Ok(())
+            },
+        )
+    }
+
+    fn poll_once(&mut self, ready: &Sender<AcceptedRequest>, metrics: &Metrics) -> io::Result<()> {
+        match self
+            .poll
+            .poll(&mut self.events, Some(SHUTDOWN_CHECK_INTERVAL))
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let now = Instant::now();
+        self.events.iter().try_for_each(|event| {
+            self.sockets
+                .dispatch(self.poll.registry(), event.token(), now, ready, metrics)
+        })
+    }
+}
+
+impl ParkedSockets {
+    fn register(&mut self, registry: &Registry, mut waiting: WaitingConnection) -> io::Result<()> {
+        // Never reuse keys: a queued event must not identify a later socket.
+        self.last_token = self
+            .last_token
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("idle connection tokens exhausted"))?;
+        let token = Token(self.last_token);
+        registry.register(&mut waiting.accepted.stream, token, Interest::READABLE)?;
+        self.waiting.insert(token, waiting);
         Ok(())
-    })
-}
+    }
 
-fn poll_waiting_connections(
-    waiting: &[WaitingConnection],
-    wake: &UnixStream,
-) -> io::Result<Vec<Readiness>> {
-    let mut descriptors: Vec<_> = waiting
-        .iter()
-        .map(|connection| PollFd::new(&connection.accepted.stream, PollFlags::IN))
-        .chain(std::iter::once(PollFd::new(wake, PollFlags::IN)))
-        .collect();
-    // The wake socket handles completed responses immediately. This bound
-    // also checks shutdown and idle expiry when no socket becomes readable.
-    let timeout = Timespec {
-        tv_sec: 0,
-        tv_nsec: 50_000_000,
-    };
-    match poll(&mut descriptors, Some(&timeout)) {
-        Ok(_) | Err(rustix::io::Errno::INTR) => {}
-        Err(error) => return Err(error.into()),
+    fn dispatch(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        now: Instant,
+        ready: &Sender<AcceptedRequest>,
+        metrics: &Metrics,
+    ) -> io::Result<()> {
+        match self.waiting.remove(&token) {
+            // Wakes and stale events do not have a parked socket owner.
+            None => Ok(()),
+            Some(mut waiting) => match waiting.readiness(now) {
+                Readiness::Waiting => {
+                    registry.reregister(&mut waiting.accepted.stream, token, Interest::READABLE)?;
+                    self.waiting.insert(token, waiting);
+                    Ok(())
+                }
+                Readiness::Closed => waiting.deregister(registry).map(drop),
+                Readiness::Request => {
+                    enqueue_ready_connection(
+                        waiting.deregister(registry)?.resume()?,
+                        ready,
+                        metrics,
+                    );
+                    Ok(())
+                }
+            },
+        }
     }
-    let now = Instant::now();
-    Ok(waiting
-        .iter()
-        .zip(descriptors)
-        .map(|(connection, descriptor)| {
-            classify_waiting_connection(connection, descriptor.revents(), now)
-        })
-        .collect())
-}
 
-fn classify_waiting_connection(
-    connection: &WaitingConnection,
-    events: PollFlags,
-    now: Instant,
-) -> Readiness {
-    if now >= connection.deadline {
-        return Readiness::Closed;
+    fn expire(&mut self, now: Instant) {
+        self.waiting.retain(|_, waiting| now < waiting.deadline);
     }
-    if events.is_empty() {
-        return Readiness::Waiting;
-    }
-    // poll reports both data and EOF as readable. Peeking leaves the request
-    // byte for Request::read and does not change its header-read timeout.
-    match connection.accepted.stream.peek(&mut [0]) {
-        Ok(0) => Readiness::Closed,
-        Ok(_) => Readiness::Request,
-        Err(error) => match error.kind() {
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-                Readiness::Waiting
-            }
-            _ => Readiness::Closed,
-        },
-    }
-}
-
-fn drain_wake_notifications(wake: &mut UnixStream) -> io::Result<()> {
-    std::iter::repeat_with(|| wake.read(&mut [0; 256]))
-        .try_for_each(|result| match result {
-            Ok(0) => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
-            Ok(_) => Ok(()),
-            Err(error) => Err(error),
-        })
-        .or_else(|error| match error.kind() {
-            io::ErrorKind::WouldBlock => Ok(()),
-            _ => Err(error),
-        })
 }
 
 fn enqueue_ready_connection(
@@ -187,9 +232,6 @@ fn enqueue_ready_connection(
     ready: &Sender<AcceptedRequest>,
     metrics: &Metrics,
 ) {
-    if accepted.stream.set_nonblocking(false).is_err() {
-        return;
-    }
     metrics.connection_queued();
     match ready.try_send(accepted) {
         Ok(()) => {}
@@ -199,10 +241,12 @@ fn enqueue_ready_connection(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{TcpListener, TcpStream};
-
     use super::*;
     use crate::server::{Admissions, configure_accepted_socket};
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+    };
 
     fn connection_pair() -> (WaitingConnection, TcpStream, Arc<Admissions>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -221,13 +265,34 @@ mod tests {
         )
     }
 
+    fn register(monitor: &mut IdleMonitor, waiting: WaitingConnection) {
+        monitor
+            .sockets
+            .register(monitor.poll.registry(), waiting)
+            .unwrap();
+    }
+
+    fn receive_ready_connection(
+        monitor: &mut IdleMonitor,
+        sender: &Sender<AcceptedRequest>,
+        receiver: &Receiver<AcceptedRequest>,
+    ) -> AcceptedRequest {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        std::iter::from_fn(|| {
+            (Instant::now() < deadline).then(|| {
+                monitor.poll_once(sender, &Metrics::default()).unwrap();
+                receiver.try_recv().ok()
+            })
+        })
+        .flatten()
+        .next()
+        .expect("readable socket must reach the worker queue")
+    }
+
     #[test]
     fn idle_deadline_closes_the_connection_without_consuming_a_worker() {
         let (connection, _client, admissions) = connection_pair();
-        assert_eq!(
-            classify_waiting_connection(&connection, PollFlags::empty(), connection.deadline),
-            Readiness::Closed
-        );
+        assert_eq!(connection.readiness(connection.deadline), Readiness::Closed);
         drop(connection);
         assert!(admissions.try_acquire().is_some());
     }
@@ -236,17 +301,15 @@ mod tests {
     fn readiness_preserves_the_header_timeout_and_first_request_byte() {
         let (connection, mut client, _) = connection_pair();
         client.write_all(b"G").unwrap();
-        let (wake, _writer) = UnixStream::pair().unwrap();
+        let mut monitor = IdleMonitor::new().unwrap();
+        let (sender, receiver) = bounded(1);
+        register(&mut monitor, connection);
+        let ready = receive_ready_connection(&mut monitor, &sender, &receiver);
         assert_eq!(
-            poll_waiting_connections(std::slice::from_ref(&connection), &wake).unwrap(),
-            [Readiness::Request]
-        );
-        assert_eq!(
-            connection.accepted.stream.read_timeout().unwrap(),
+            ready.stream.read_timeout().unwrap(),
             Some(Duration::from_millis(100))
         );
-        connection.accepted.stream.set_nonblocking(false).unwrap();
-        let error = match super::super::Request::read(connection.accepted.stream) {
+        let error = match super::super::Request::read(ready.stream) {
             Ok(_) => panic!("a partial request must still hit its header timeout"),
             Err((_, error)) => error,
         };
@@ -258,21 +321,167 @@ mod tests {
 
     #[test]
     fn clean_idle_disconnect_is_not_dispatched_as_a_request() {
-        let (connection, client, _) = connection_pair();
+        let (connection, client, admissions) = connection_pair();
         drop(client);
-        let (wake, _writer) = UnixStream::pair().unwrap();
-        assert_eq!(
-            poll_waiting_connections(&[connection], &wake).unwrap(),
-            [Readiness::Closed]
-        );
+        let mut monitor = IdleMonitor::new().unwrap();
+        let (sender, receiver) = bounded(1);
+        register(&mut monitor, connection);
+        monitor.poll_once(&sender, &Metrics::default()).unwrap();
+        assert!(receiver.is_empty());
+        assert!(monitor.sockets.waiting.is_empty());
+        assert!(admissions.try_acquire().is_some());
     }
 
     #[test]
     fn idle_socket_without_data_remains_parked() {
         let (connection, _client, _) = connection_pair();
-        assert_eq!(
-            classify_waiting_connection(&connection, PollFlags::empty(), Instant::now()),
-            Readiness::Waiting
+        assert_eq!(connection.readiness(Instant::now()), Readiness::Waiting);
+    }
+
+    #[test]
+    fn registered_idle_expiry_releases_its_admission_without_dispatch() {
+        let (connection, _client, admissions) = connection_pair();
+        let deadline = connection.deadline;
+        let mut monitor = IdleMonitor::new().unwrap();
+        register(&mut monitor, connection);
+        assert!(admissions.try_acquire().is_none());
+        monitor.sockets.expire(deadline);
+        assert!(monitor.sockets.waiting.is_empty());
+        assert!(admissions.try_acquire().is_some());
+    }
+
+    #[test]
+    fn repeated_parking_preserves_the_socket_and_admission() {
+        let (connection, mut client, admissions) = connection_pair();
+        let mut monitor = IdleMonitor::new().unwrap();
+        let (sender, receiver) = bounded(1);
+        let mut waiting = connection;
+        for byte in b"GET" {
+            client.write_all(&[*byte]).unwrap();
+            register(&mut monitor, waiting);
+            let mut ready = receive_ready_connection(&mut monitor, &sender, &receiver);
+            let mut actual = [0];
+            ready.stream.read_exact(&mut actual).unwrap();
+            assert_eq!(actual, [*byte]);
+            assert!(admissions.try_acquire().is_none());
+            waiting = WaitingConnection::new(ready, Duration::from_secs(30)).unwrap();
+        }
+        drop(waiting);
+        assert!(admissions.try_acquire().is_some());
+    }
+
+    #[test]
+    fn dropping_the_monitor_releases_all_parked_admissions() {
+        let (connection, _client, admissions) = connection_pair();
+        let mut monitor = IdleMonitor::new().unwrap();
+        register(&mut monitor, connection);
+        drop(monitor);
+        assert!(admissions.try_acquire().is_some());
+    }
+
+    #[test]
+    fn full_ready_queue_drops_the_connection_and_releases_its_admission() {
+        let (connection, mut client, admissions) = connection_pair();
+        let mut monitor = IdleMonitor::new().unwrap();
+        let (sender, _receiver) = bounded(0);
+        client.write_all(b"G").unwrap();
+        register(&mut monitor, connection);
+        monitor.poll_once(&sender, &Metrics::default()).unwrap();
+        assert!(admissions.try_acquire().is_some());
+    }
+
+    #[test]
+    fn wake_notification_survives_until_the_next_wait() {
+        let mut monitor = IdleMonitor::new().unwrap();
+        let wake = Waker::new(monitor.poll.registry(), WAKE_TOKEN).unwrap();
+        wake.wake().unwrap();
+        monitor
+            .poll
+            .poll(&mut monitor.events, Some(Duration::ZERO))
+            .unwrap();
+        assert!(
+            monitor
+                .events
+                .iter()
+                .any(|event| event.token() == WAKE_TOKEN)
         );
+    }
+
+    #[test]
+    fn stale_readiness_cannot_dispatch_a_new_socket_after_expiry() {
+        let (old, _old_client, old_admissions) = connection_pair();
+        let deadline = old.deadline;
+        let mut monitor = IdleMonitor::new().unwrap();
+        register(&mut monitor, old);
+        let old_token = Token(monitor.sockets.last_token);
+        monitor.sockets.expire(deadline);
+        assert!(old_admissions.try_acquire().is_some());
+
+        let (new, mut client, _) = connection_pair();
+        register(&mut monitor, new);
+        assert_ne!(old_token, Token(monitor.sockets.last_token));
+        let (sender, receiver) = bounded(1);
+        monitor
+            .sockets
+            .dispatch(
+                monitor.poll.registry(),
+                old_token,
+                Instant::now(),
+                &sender,
+                &Metrics::default(),
+            )
+            .unwrap();
+        assert!(receiver.is_empty());
+        assert_eq!(monitor.sockets.waiting.len(), 1);
+        client.write_all(b"N").unwrap();
+        let mut ready = receive_ready_connection(&mut monitor, &sender, &receiver);
+        let mut byte = [0];
+        ready.stream.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"N");
+    }
+
+    #[test]
+    fn spurious_readiness_keeps_the_socket_armed_for_later_data() {
+        let (waiting, mut client, admissions) = connection_pair();
+        let mut monitor = IdleMonitor::new().unwrap();
+        register(&mut monitor, waiting);
+        let (sender, receiver) = bounded(1);
+        monitor
+            .sockets
+            .dispatch(
+                monitor.poll.registry(),
+                Token(monitor.sockets.last_token),
+                Instant::now(),
+                &sender,
+                &Metrics::default(),
+            )
+            .unwrap();
+        assert!(receiver.is_empty());
+        assert!(admissions.try_acquire().is_none());
+        client.write_all(b"G").unwrap();
+        let _ready = receive_ready_connection(&mut monitor, &sender, &receiver);
+        assert!(monitor.sockets.waiting.is_empty());
+    }
+
+    #[test]
+    fn an_expired_readable_socket_is_closed_instead_of_dispatched() {
+        let (waiting, mut client, admissions) = connection_pair();
+        let deadline = waiting.deadline;
+        let mut monitor = IdleMonitor::new().unwrap();
+        register(&mut monitor, waiting);
+        client.write_all(b"G").unwrap();
+        let (sender, receiver) = bounded(1);
+        monitor
+            .sockets
+            .dispatch(
+                monitor.poll.registry(),
+                Token(monitor.sockets.last_token),
+                deadline,
+                &sender,
+                &Metrics::default(),
+            )
+            .unwrap();
+        assert!(receiver.is_empty());
+        assert!(admissions.try_acquire().is_some());
     }
 }

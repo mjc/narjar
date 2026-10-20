@@ -101,8 +101,8 @@ impl Drop for Admission {
     }
 }
 
-struct AcceptedRequest {
-    stream: TcpStream,
+struct AcceptedRequest<S = TcpStream> {
+    stream: S,
     _admission: Admission,
 }
 
