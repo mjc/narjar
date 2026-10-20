@@ -23,9 +23,21 @@ $stored = Get-Content (Join-Path $cache 'auth/write.tokens') -Raw
 if ($stored.Contains($token)) { throw 'Token file contains the plaintext token' }
 Invoke-Narjar token revoke --data-dir $cache --scope write --name smoke
 
-$setupCache = Join-Path $Root 'setup cache é'
-$credentials = Join-Path $Root 'setup credentials é'
-Invoke-Narjar setup --yes --data-dir $setupCache --credentials-dir $credentials --private-read | Out-Null
+$setupCache = Join-Path $Root "setup cache é's‘’‚‛;Write-Output injected;#"
+$credentials = Join-Path $Root "setup credentials é's"
+$summary = Invoke-Narjar setup --yes --data-dir $setupCache --credentials-dir $credentials --private-read | Out-String
+$lines = $summary -split '\r?\n'
+$serveCommand = ($lines | Where-Object { $_.StartsWith('start the cache: ') }).Substring('start the cache: '.Length)
+$printedData = ($lines | Where-Object { $_.StartsWith('data directory: ') }).Substring('data directory: '.Length)
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($serveCommand, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -ne 0) { throw "Setup printed an invalid PowerShell command: $serveCommand" }
+$command = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $false)
+if ($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true).Count -ne 1 -or
+    $command.CommandElements.Count -ne 8 -or $command.CommandElements[3].Value -ne $printedData) {
+    throw 'Setup command changed the data-directory argument'
+}
 Invoke-Narjar doctor --data-dir $setupCache --json
 foreach ($file in 'producer.sec', 'producer.pub', 'read.token', 'write.token', 'narjar.netrc') {
     if (-not (Test-Path (Join-Path $credentials $file) -PathType Leaf)) {

@@ -13,6 +13,13 @@ use crate::cache::{
 };
 use clap::Args;
 
+#[cfg(unix)]
+#[path = "setup/unix.rs"]
+mod host;
+#[cfg(windows)]
+#[path = "setup/windows.rs"]
+mod host;
+
 use crate::{
     error::Error,
     http_url::HttpUrl,
@@ -226,44 +233,25 @@ fn print_setup_summary(options: &Setup, secret_key: &Path, public_key: &Path) {
         secret_key.display()
     );
     println!(
-        "write credentials: {}/narjar.netrc",
-        options.credentials_dir.display()
+        "write credentials: {}",
+        options.credentials_dir.join("narjar.netrc").display()
     );
     if options.private_read {
         println!(
-            "read token: {}/read.token",
-            options.credentials_dir.display()
+            "read token: {}",
+            options.credentials_dir.join("read.token").display()
         );
     }
     println!(
         "start the cache: narjar serve --data-dir {} --listen {} --storage-backend {}",
-        shell_quote(&options.data_dir.to_string_lossy()),
+        host::quote_shell_argument(&options.data_dir.to_string_lossy()),
         options.listen,
         storage_backend_name(options.storage_backend)
     );
-    println!(
-        "push a path: narjar push {}--to {} --netrc-file {} --signing-key-file {} <store-path>",
-        if options.cache_url.is_https() {
-            ""
-        } else {
-            "--insecure-http "
-        },
-        shell_quote(&options.cache_url.to_string()),
-        shell_quote(
-            &options
-                .credentials_dir
-                .join("narjar.netrc")
-                .to_string_lossy()
-        ),
-        shell_quote(&secret_key.to_string_lossy())
-    );
+    host::print_upload_instructions(options, secret_key);
     if !options.cache_url.is_https() {
         println!("warning: HTTP is suitable only for trusted local networks; use HTTPS remotely");
     }
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 const fn storage_backend_name(backend: StorageBackend) -> &'static str {

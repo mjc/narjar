@@ -4943,7 +4943,12 @@ fn assert_setup_creates_ready_cache_and_private_credentials(backend: &str) {
     let netrc_text = fs::read_to_string(&netrc).expect("netrc should exist");
 
     assert!(output_text.contains("Narjar setup complete"));
-    assert!(output_text.contains("narjar push --to 'https://cache.example/cache'"));
+    let upload_instruction = if cfg!(windows) {
+        "Upload from a Linux or macOS Nix host with narjar push to https://cache.example/cache."
+    } else {
+        "narjar push --to 'https://cache.example/cache'"
+    };
+    assert!(output_text.contains(upload_instruction), "{output_text}");
     assert!(!output_text.contains(write_token_text.trim()));
     assert!(!output_text.contains(read_token_text.trim()));
     assert_eq!(
