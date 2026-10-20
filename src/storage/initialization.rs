@@ -243,6 +243,7 @@ impl CacheLayout {
             }
             Err(error) => Err(error.into()),
             Ok(mut descriptor) => {
+                validate_file_privacy(&descriptor, FilePrivacy::Private)?;
                 let mut bytes = Vec::new();
                 (&mut descriptor).take(64).read_to_end(&mut bytes)?;
                 self.check_descriptor(&bytes)?;

@@ -1,6 +1,28 @@
 //! POSIX permission faults, directory-flock behavior, and renames with open descendants.
 
 use super::*;
+
+#[test]
+fn initialization_and_startup_reject_public_descriptors_without_repairing_them() {
+    let (root, storage) = flat_storage_fixture();
+    drop(storage);
+    let path = root.path().join(crate::cache::storage::LAYOUT_DESCRIPTOR);
+    let contents = fs::read(&path).unwrap();
+    for mode in [0o644, 0o666] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        let directory = Directory::open(root.path()).unwrap();
+        assert!(Storage::open(&directory, SupportedStorageBackend::FLAT).is_err());
+        assert!(
+            initialize_storage(root.path()).is_err(),
+            "initialization accepted descriptor mode {mode:04o}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), contents);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+    }
+}
 use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 
 #[test]
