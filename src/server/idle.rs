@@ -289,6 +289,18 @@ mod tests {
         .expect("readable socket must reach the worker queue")
     }
 
+    fn poll_until_socket_is_retired(monitor: &mut IdleMonitor, sender: &Sender<AcceptedRequest>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Readiness polling can return spuriously, even when the peer has
+        // already sent data or closed. Wait for the ownership transition.
+        std::iter::from_fn(|| {
+            (!monitor.sockets.waiting.is_empty() && Instant::now() < deadline)
+                .then(|| monitor.poll_once(sender, &Metrics::default()).unwrap())
+        })
+        .for_each(drop);
+        assert!(monitor.sockets.waiting.is_empty());
+    }
+
     #[test]
     fn idle_deadline_closes_the_connection_without_consuming_a_worker() {
         let (connection, _client, admissions) = connection_pair();
@@ -326,7 +338,7 @@ mod tests {
         let mut monitor = IdleMonitor::new().unwrap();
         let (sender, receiver) = bounded(1);
         register(&mut monitor, connection);
-        monitor.poll_once(&sender, &Metrics::default()).unwrap();
+        poll_until_socket_is_retired(&mut monitor, &sender);
         assert!(receiver.is_empty());
         assert!(monitor.sockets.waiting.is_empty());
         assert!(admissions.try_acquire().is_some());
@@ -386,7 +398,7 @@ mod tests {
         let (sender, _receiver) = bounded(0);
         client.write_all(b"G").unwrap();
         register(&mut monitor, connection);
-        monitor.poll_once(&sender, &Metrics::default()).unwrap();
+        poll_until_socket_is_retired(&mut monitor, &sender);
         assert!(admissions.try_acquire().is_some());
     }
 
@@ -395,15 +407,23 @@ mod tests {
         let mut monitor = IdleMonitor::new().unwrap();
         let wake = Waker::new(monitor.poll.registry(), WAKE_TOKEN).unwrap();
         wake.wake().unwrap();
-        monitor
-            .poll
-            .poll(&mut monitor.events, Some(Duration::ZERO))
-            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observed = std::iter::from_fn(|| {
+            (Instant::now() < deadline).then(|| {
+                monitor
+                    .poll
+                    .poll(&mut monitor.events, Some(SHUTDOWN_CHECK_INTERVAL))
+                    .unwrap();
+                monitor
+                    .events
+                    .iter()
+                    .any(|event| event.token() == WAKE_TOKEN)
+            })
+        })
+        .any(|notified| notified);
         assert!(
-            monitor
-                .events
-                .iter()
-                .any(|event| event.token() == WAKE_TOKEN)
+            observed,
+            "queued notification must survive spurious poll returns"
         );
     }
 
