@@ -2824,6 +2824,7 @@ fn initialization_rejects_a_symlinked_lock() {
 
     let error = initialize_storage(directory.path()).expect_err("symlinked lock must fail");
     assert!(error.to_string().contains("lock"));
+    assert_eq!(fs::read(&target).unwrap(), b"external lock");
 }
 
 #[test]
@@ -4235,27 +4236,36 @@ fn process_lock_survives_lockfile_replacement() {
     let lock = directory.path().join("lock");
     fs::remove_file(&lock).expect("remove lock pathname");
     fs::write(&lock, b"replacement").expect("replace lock pathname");
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
 
     assert_lock_probe_status(directory.path(), "held");
 
     drop(first);
     assert_lock_probe_status(directory.path(), "available");
+    assert_eq!(fs::read(lock).unwrap(), b"replacement");
 }
 
 fn assert_lock_probe_status(path: &Path, expected: &str) {
-    let status = process::Command::new(env::current_exe().expect("test executable path"))
+    let output = process::Command::new(env::current_exe().expect("test executable path"))
         .args([
             "--exact",
-            "storage::tests::process_lock_replacement_probe",
+            "cache::storage::tests::process_lock_replacement_probe",
             "--nocapture",
         ])
         .env("NARJAR_LOCK_PROBE_DATA", path)
         .env("NARJAR_LOCK_PROBE_EXPECTED", expected)
-        .status()
+        .output()
         .expect("run lock probe child");
     assert!(
-        status.success(),
-        "child process should report the {expected} lease state"
+        output.status.success(),
+        "child process should report the {expected} lease state: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("narjar-lock-probe-ran"),
+        "child process must actually execute the lock probe: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
 }
 
@@ -4275,6 +4285,56 @@ fn process_lock_replacement_probe() {
         )),
         other => panic!("unexpected lock probe expectation: {other:?}"),
     }
+    println!("narjar-lock-probe-ran");
+}
+
+#[test]
+fn process_lock_excludes_a_second_process_using_a_directory_alias() {
+    let directory = TestDir::new();
+    let parent_alias = TestDir::new();
+    let alias = parent_alias.path().join("parent");
+    symlink(directory.path(), &alias).expect("alias the DATA parent directory");
+    let data = directory.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let first = initialize_storage(&data).unwrap();
+
+    assert_lock_probe_status(&alias.join("data"), "held");
+    drop(first);
+    assert_lock_probe_status(&alias.join("data"), "available");
+}
+
+#[test]
+fn process_lock_follows_the_opened_directory_after_its_path_is_replaced() {
+    let parent = TestDir::new();
+    let data = parent.path().join("data");
+    let renamed = parent.path().join("renamed");
+    fs::create_dir(&data).unwrap();
+    let opened = Directory::open(&data).unwrap();
+    let first = initialize_storage(&data).unwrap();
+    fs::rename(&data, &renamed).unwrap();
+    fs::create_dir(&data).unwrap();
+
+    assert!(matches!(
+        CacheCreation::prepare(&opened, SupportedStorageBackend::FLAT),
+        Err(StorageError::Locked)
+    ));
+    assert_lock_probe_status(&renamed, "held");
+    assert_lock_probe_status(&data, "available");
+    drop(first);
+    assert_lock_probe_status(&renamed, "available");
+    CacheCreation::prepare(&opened, SupportedStorageBackend::FLAT)
+        .expect("the original capability can reacquire its own directory");
+}
+
+#[test]
+fn initialization_rejects_a_writable_data_root_before_creating_layout_files() {
+    let directory = TestDir::new();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(matches!(
+        Directory::open(directory.path()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData
+    ));
+    assert_eq!(directory_entry_count(directory.path()), 0);
 }
 
 #[test]

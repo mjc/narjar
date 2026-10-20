@@ -3322,6 +3322,32 @@ impl Drop for RunningServer {
 }
 
 #[test]
+fn process_lock_is_released_when_its_daemon_owner_is_killed() {
+    use crate::cache::storage::{CacheCreation, Directory, StorageError, SupportedStorageBackend};
+
+    let mut server = RunningServer::start("process-lease-owner-death");
+    let opened = Directory::open(&server.data_dir).unwrap();
+    assert!(matches!(
+        CacheCreation::prepare(&opened, SupportedStorageBackend::FLAT),
+        Err(StorageError::Locked)
+    ));
+
+    let child = server.child.as_mut().expect("fixture owns the daemon");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the lease owner is running"
+    );
+    child
+        .kill()
+        .expect("terminate the owned daemon without cleanup");
+    assert!(!child.wait().unwrap().success());
+    server.child.take();
+
+    CacheCreation::prepare(&opened, SupportedStorageBackend::FLAT)
+        .expect("owner death releases the lease even with a retained directory handle");
+}
+
+#[test]
 fn serve_reports_listener_and_stops_on_sigterm() {
     let server =
         RunningServer::start_with_args("lifecycle", &["--stats-inventory-interval-seconds", "900"]);
