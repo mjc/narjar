@@ -649,7 +649,7 @@ mod tests {
     fn rejected_transitions_preserve_the_live_state_and_record() {
         let (root, directory_path, directory) = transaction_directory();
         let recovery = super::RecoveryState {
-            root: File::open(root.path()).unwrap(),
+            root: crate::cache::filesystem::open_directory(root.path()).unwrap(),
             transactions: directory,
         };
         let mut transaction = recovery
@@ -881,7 +881,8 @@ mod tests {
         let root = tempfile::tempdir().expect("create temporary root");
         let path = root.path().join("transactions");
         fs::create_dir(&path).expect("create transaction directory");
-        let directory = File::open(&path).expect("open transaction directory");
+        let directory =
+            crate::cache::filesystem::open_directory(&path).expect("open transaction directory");
         (root, path, directory)
     }
 }

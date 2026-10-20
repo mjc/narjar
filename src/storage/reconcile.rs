@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn known_layout_entries_still_reject_wrong_types_and_symlinks() {
         let directory = tempfile::tempdir().unwrap();
-        let root = fs::File::open(directory.path()).unwrap();
+        let root = crate::cache::filesystem::open_directory(directory.path()).unwrap();
         let directories =
             storage_root_directories().chain(CACHE_POLICY_DIRECTORIES.iter().copied());
         let files = storage_root_files()

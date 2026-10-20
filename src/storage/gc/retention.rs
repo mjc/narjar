@@ -237,12 +237,12 @@ mod tests {
     #[test]
     fn unfinished_pressure_survives_restart_but_not_a_policy_change_or_met_target() {
         let directory = tempfile::tempdir().unwrap();
-        let root = File::open(directory.path()).unwrap();
+        let root = crate::cache::filesystem::open_directory(directory.path()).unwrap();
         let limits = FreeSpaceThresholds::new(100, 200).unwrap();
         let report = limits.measure(80).report(Some(150));
         record_pressure_cycle(&root, Some(limits), &report);
         drop(root);
-        let root = File::open(directory.path()).unwrap();
+        let root = crate::cache::filesystem::open_directory(directory.path()).unwrap();
         let unfinished = unfinished_pressure_cycle(&root);
         assert_eq!(unfinished, Some(limits));
         assert!(limits.measure_cycle(150, unfinished).requires_collection());
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn malformed_pressure_hints_and_failed_hint_cleanup_cannot_fail_collection() {
         let directory = tempfile::tempdir().unwrap();
-        let root = File::open(directory.path()).unwrap();
+        let root = crate::cache::filesystem::open_directory(directory.path()).unwrap();
         std::fs::write(directory.path().join(PRESSURE_HINT), b"broken").unwrap();
         assert_eq!(unfinished_pressure_cycle(&root), None);
         std::fs::remove_file(directory.path().join(PRESSURE_HINT)).unwrap();

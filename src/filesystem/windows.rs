@@ -727,3 +727,39 @@ fn invalid_input(message: &str) -> io::Error {
 fn invalid_data(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn independent_directory_handles_have_the_access_required_for_enumeration() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = open_directory(root.path()).expect("open writable directory capability");
+        let cursor = reopen(&directory, Kind::Directory, FILE_GENERIC_READ)
+            .expect("reopen an independent read-only directory cursor");
+        let entries = enumeration::Names::new(cursor)
+            .expect("start directory enumeration")
+            .collect::<io::Result<Vec<_>>>()
+            .expect("finish directory enumeration");
+        assert!(
+            crate::cache::filesystem::exclude_dot_directory_entries(entries.into_iter().map(Ok))
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn private_directory_creation_can_set_and_verify_its_dacl() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        let directory =
+            create_private_directory(&path).expect("create directory with private DACL");
+        set_file_privacy(&directory, FilePrivacy::Private)
+            .expect("normalize private directory DACL");
+        validate_private_directory(&directory).expect("verify normalized directory DACL");
+        directory
+            .sync_all()
+            .expect("synchronize writable directory");
+    }
+}
