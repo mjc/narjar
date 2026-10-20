@@ -298,12 +298,12 @@ impl UploadRequest {
 }
 
 fn capacity_status(error: &io::Error) -> Option<StatusCode> {
-    match error.raw_os_error().map(capacity_error_kind) {
-        Some(CapacityErrorKind::NoSpace | CapacityErrorKind::Quota) => {
+    match capacity_error_kind(error) {
+        CapacityErrorKind::NoSpace | CapacityErrorKind::Quota => {
             Some(StatusCode::INSUFFICIENT_STORAGE)
         }
-        Some(CapacityErrorKind::ReadOnly) => Some(StatusCode::SERVICE_UNAVAILABLE),
-        Some(CapacityErrorKind::Inodes | CapacityErrorKind::Other) | None => None,
+        CapacityErrorKind::ReadOnly => Some(StatusCode::SERVICE_UNAVAILABLE),
+        CapacityErrorKind::Inodes | CapacityErrorKind::Other => None,
     }
 }
 
@@ -311,10 +311,7 @@ fn record_capacity_error(metrics: &Metrics, error: &StorageError) {
     let kind = match error {
         StorageError::InsufficientSpace => CapacityErrorKind::NoSpace,
         StorageError::InsufficientInodes => CapacityErrorKind::Inodes,
-        StorageError::Io(error) => error
-            .raw_os_error()
-            .map(capacity_error_kind)
-            .unwrap_or(CapacityErrorKind::Other),
+        StorageError::Io(error) => capacity_error_kind(error),
         _ => CapacityErrorKind::Other,
     };
     metrics.capacity_failure(kind);
@@ -542,4 +539,33 @@ pub(super) fn unauthorized(guard: &RequestGuard<'_>, request: Request) -> Option
             Response::empty(StatusCode::UNAUTHORIZED).with_header(challenge),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_status_accepts_portable_io_errors_without_raw_os_codes() {
+        for (kind, expected) in [
+            (
+                io::ErrorKind::StorageFull,
+                Some(StatusCode::INSUFFICIENT_STORAGE),
+            ),
+            (
+                io::ErrorKind::QuotaExceeded,
+                Some(StatusCode::INSUFFICIENT_STORAGE),
+            ),
+            (
+                io::ErrorKind::ReadOnlyFilesystem,
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+            ),
+            (io::ErrorKind::PermissionDenied, None),
+            (io::ErrorKind::Other, None),
+        ] {
+            let error = io::Error::from(kind);
+            assert_eq!(error.raw_os_error(), None);
+            assert_eq!(capacity_status(&error), expected, "{kind:?}");
+        }
+    }
 }

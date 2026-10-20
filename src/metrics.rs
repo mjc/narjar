@@ -19,8 +19,8 @@ use crate::cache::{
     maintenance,
     object::WireEncoding,
     storage::{
-        CapacityErrorKind, PopulationCounts, PublishOutcome, Storage, StorageActivitySnapshot,
-        StorageBackend, StorageCapacity, StorageError, StorageReadiness,
+        CapacityErrorKind, InodeCapacity, PopulationCounts, PublishOutcome, Storage,
+        StorageActivitySnapshot, StorageBackend, StorageCapacity, StorageError, StorageReadiness,
     },
 };
 
@@ -1240,16 +1240,25 @@ fn append_capacity_metrics(output: &mut String, sample: &SampleState<CapacitySta
         ));
         output.push_str(&format!(
             "# HELP narjar_storage_capacity_bytes Destination filesystem bytes.\n# TYPE narjar_storage_capacity_bytes gauge\nnarjar_storage_capacity_bytes{{kind=\"total\"}} {}\nnarjar_storage_capacity_bytes{{kind=\"available\"}} {}\n\
-             # HELP narjar_storage_capacity_inodes Destination filesystem inodes.\n# TYPE narjar_storage_capacity_inodes gauge\nnarjar_storage_capacity_inodes{{kind=\"total\"}} {}\nnarjar_storage_capacity_inodes{{kind=\"available\"}} {}\n\
              # HELP narjar_storage_read_only Whether the destination filesystem is read-only.\n# TYPE narjar_storage_read_only gauge\nnarjar_storage_read_only {}\n\
              # HELP narjar_staging_outstanding_bytes Staging bytes currently reserved by active work.\n# TYPE narjar_staging_outstanding_bytes gauge\nnarjar_staging_outstanding_bytes {}\n\
              # HELP narjar_staging_min_free_reserve_bytes Configured filesystem free-space reserve.\n# TYPE narjar_staging_min_free_reserve_bytes gauge\nnarjar_staging_min_free_reserve_bytes {}\n\
              # HELP narjar_storage_estimated_headroom_bytes Observed available bytes minus reserve and outstanding staging credit.\n# TYPE narjar_storage_estimated_headroom_bytes gauge\nnarjar_storage_estimated_headroom_bytes {}\n",
-            capacity.total_bytes, capacity.available_bytes, capacity.total_inodes,
-            capacity.available_inodes, u8::from(capacity.read_only),
+            capacity.capacity.total_bytes, capacity.capacity.available_bytes,
+            u8::from(capacity.capacity.read_only),
             capacity.outstanding_staging_bytes, capacity.configured_min_free_bytes,
             capacity.estimated_headroom_bytes,
         ));
+        append_inode_capacity_metrics(output, capacity.capacity.inodes);
+    }
+}
+
+fn append_inode_capacity_metrics(output: &mut String, capacity: InodeCapacity) {
+    match capacity {
+        InodeCapacity::Measured { total, available } => output.push_str(&format!(
+            "# HELP narjar_storage_capacity_inodes Destination filesystem inodes.\n# TYPE narjar_storage_capacity_inodes gauge\nnarjar_storage_capacity_inodes{{kind=\"total\"}} {total}\nnarjar_storage_capacity_inodes{{kind=\"available\"}} {available}\n"
+        )),
+        InodeCapacity::NotReported => {},
     }
 }
 
@@ -2693,11 +2702,7 @@ pub struct PressureStats {
 #[derive(Clone, Debug)]
 pub struct CapacityStats {
     pub readiness: StorageReadiness,
-    pub total_bytes: u64,
-    pub available_bytes: u64,
-    pub total_inodes: u64,
-    pub available_inodes: u64,
-    pub read_only: bool,
+    pub capacity: StorageCapacity,
     pub configured_min_free_bytes: u64,
     pub outstanding_staging_bytes: u64,
     pub estimated_headroom_bytes: u64,
@@ -2711,11 +2716,7 @@ impl CapacityStats {
     ) -> Self {
         Self {
             readiness: StorageReadiness::from_capacity(capacity, configured_min_free_bytes),
-            total_bytes: capacity.total_bytes,
-            available_bytes: capacity.available_bytes,
-            total_inodes: capacity.total_inodes,
-            available_inodes: capacity.available_inodes,
-            read_only: capacity.read_only,
+            capacity,
             configured_min_free_bytes,
             outstanding_staging_bytes,
             estimated_headroom_bytes: capacity
@@ -3121,8 +3122,10 @@ mod tests {
                 StorageCapacity {
                     total_bytes: 100,
                     available_bytes: 40,
-                    total_inodes: 10,
-                    available_inodes: 0,
+                    inodes: crate::cache::storage::InodeCapacity::Measured {
+                        total: 10,
+                        available: 0,
+                    },
                     read_only: false,
                 },
                 0,
@@ -4343,8 +4346,10 @@ mod tests {
                 StorageCapacity {
                     total_bytes: 100,
                     available_bytes: 40,
-                    total_inodes: 10,
-                    available_inodes: 6,
+                    inodes: crate::cache::storage::InodeCapacity::Measured {
+                        total: 10,
+                        available: 6,
+                    },
                     read_only: false,
                 },
                 25,
@@ -4396,8 +4401,10 @@ mod tests {
             Some(StorageCapacity {
                 total_bytes: 100,
                 available_bytes: 40,
-                total_inodes: 10,
-                available_inodes: 6,
+                inodes: crate::cache::storage::InodeCapacity::Measured {
+                    total: 10,
+                    available: 6,
+                },
                 read_only: false,
             }),
             25,
@@ -4412,5 +4419,30 @@ mod tests {
         assert!(exposition.contains("narjar_staging_outstanding_bytes 25"));
         assert!(exposition.contains("narjar_staging_min_free_reserve_bytes 10"));
         assert!(exposition.contains("narjar_storage_estimated_headroom_bytes 5"));
+    }
+
+    #[test]
+    fn capacity_without_inode_counts_omits_inode_gauges_but_keeps_byte_metrics_and_readiness() {
+        let metrics = Metrics::default();
+        metrics.record_capacity_sample(
+            Ok((
+                StorageCapacity {
+                    total_bytes: 100,
+                    available_bytes: 40,
+                    inodes: crate::cache::storage::InodeCapacity::NotReported,
+                    read_only: false,
+                },
+                25,
+            )),
+            10,
+            100,
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.pressure.readiness, StorageReadiness::Ready);
+        let exposition = render_prometheus(&snapshot);
+        assert!(exposition.contains("narjar_storage_capacity_bytes{kind=\"available\"} 40\n"));
+        assert!(exposition.contains("narjar_storage_estimated_headroom_bytes 5\n"));
+        assert!(exposition.contains("narjar_storage_read_only 0\n"));
+        assert!(!exposition.contains("narjar_storage_capacity_inodes{"));
     }
 }

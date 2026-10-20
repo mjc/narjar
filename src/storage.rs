@@ -6,6 +6,8 @@ mod advertisement;
 mod backend;
 #[path = "storage/cache_info.rs"]
 mod cache_info;
+#[path = "storage/capacity.rs"]
+mod capacity;
 #[allow(dead_code)]
 #[path = "storage/chunk_store.rs"]
 pub(crate) mod chunk_store;
@@ -67,12 +69,13 @@ impl CleanupAction {
 }
 
 pub(crate) use advertisement::AdvertisementEvidence;
-pub use fs::{StorageCapacity, capacity_from_statvfs, private_file_mode_is_valid};
+pub(crate) use capacity::{CapacityErrorKind, capacity_error_kind, filesystem_space};
+pub use capacity::{InodeCapacity, StorageCapacity};
+pub use fs::private_file_mode_is_valid;
 
 pub(crate) use fs::{
-    CapacityErrorKind, DirectoryEntryAction, DirectoryScanOutcome, capacity_error_kind,
-    entry_identity_at, entry_is_directory_at, entry_is_regular_at, for_each_dir_name,
-    open_directory_at, open_regular_at, read_dir_names,
+    DirectoryEntryAction, DirectoryScanOutcome, entry_identity_at, entry_is_directory_at,
+    entry_is_regular_at, for_each_dir_name, open_directory_at, open_regular_at, read_dir_names,
 };
 
 pub use crate::cache::object::{FileHash, NarFileName, NarHash};

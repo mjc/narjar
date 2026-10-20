@@ -1801,9 +1801,9 @@ mod tests {
         object::{NarHash, NarIdentity, NarSize},
         storage::{
             StorageBackend,
+            capacity::StorageCapacity,
             chunked::{ChunkHash, ChunkProfile, ManifestReader},
             directory::Directory,
-            fs::StorageCapacity,
             publication::{StagingBudget, StagingReservation},
             state::StorageActivity,
         },
@@ -1833,8 +1833,10 @@ mod tests {
         let exact_capacity = StorageCapacity {
             total_bytes: writer.pending.len() as u64,
             available_bytes: writer.pending.len() as u64,
-            total_inodes: 2,
-            available_inodes: 2,
+            inodes: crate::cache::storage::InodeCapacity::Measured {
+                total: 2,
+                available: 2,
+            },
             read_only: false,
         };
         let mut capacity = StagingBudget::default();
@@ -1885,11 +1887,13 @@ mod tests {
         let capacity = StorageCapacity {
             total_bytes: input.len() as u64 + 10,
             available_bytes: input.len() as u64 + 10,
-            total_inodes: 100,
-            available_inodes: 100,
+            inodes: crate::cache::storage::InodeCapacity::Measured {
+                total: 100,
+                available: 100,
+            },
             read_only: false,
         };
-        let reservation = crate::cache::storage::fs::reserve_staging_bytes_for_test(
+        let reservation = crate::cache::storage::capacity::reserve_staging_bytes_for_test(
             &budget,
             10,
             input.len() as u64,

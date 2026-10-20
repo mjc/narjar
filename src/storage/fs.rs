@@ -1,27 +1,14 @@
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CapacityErrorKind {
-    NoSpace,
-    Quota,
-    Inodes,
-    ReadOnly,
-    Other,
-}
-
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read},
     os::unix::fs::PermissionsExt,
-    sync::{Arc, Mutex},
 };
 
-use rustix::fs::{
-    self, AtFlags, FileType, FlockOperation, Mode, OFlags, RawMode, Stat, StatVfs,
-    StatVfsMountFlags,
-};
+use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RawMode, Stat};
 
-use super::publication::{StagingBudget, TemporaryFile};
-use super::{StagingReservation, StorageError};
+use super::StorageError;
+use super::publication::TemporaryFile;
 use crate::cache::filesystem::{directory_names, exclude_dot_directory_entries};
 pub(super) use crate::cache::filesystem::{ensure_directory_at, validate_directory};
 pub(crate) use crate::cache::filesystem::{
@@ -31,100 +18,6 @@ pub(crate) use crate::cache::filesystem::{
 use std::path::Path;
 
 const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
-
-pub(crate) fn capacity_error_kind(raw_error: i32) -> CapacityErrorKind {
-    match raw_error {
-        raw if raw == rustix::io::Errno::NOSPC.raw_os_error() => CapacityErrorKind::NoSpace,
-        raw if raw == rustix::io::Errno::DQUOT.raw_os_error() => CapacityErrorKind::Quota,
-        raw if raw == rustix::io::Errno::ROFS.raw_os_error() => CapacityErrorKind::ReadOnly,
-        _ => CapacityErrorKind::Other,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct StorageCapacity {
-    pub total_bytes: u64,
-    pub available_bytes: u64,
-    pub total_inodes: u64,
-    pub available_inodes: u64,
-    pub read_only: bool,
-}
-
-impl StorageCapacity {
-    pub(super) fn required_capacity(self, required_bytes: u64) -> Result<(), StorageError> {
-        if self.read_only {
-            return Err(StorageError::Io(io::Error::from_raw_os_error(
-                rustix::io::Errno::ROFS.raw_os_error(),
-            )));
-        }
-        if self.available_bytes < required_bytes {
-            return Err(StorageError::InsufficientSpace);
-        }
-        if self.available_inodes == 0 {
-            return Err(StorageError::InsufficientInodes);
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn reserve_staging_bytes(
-    budget: &Arc<Mutex<StagingBudget>>,
-    directory: &File,
-    min_free_bytes: u64,
-    bytes: u64,
-) -> Result<StagingReservation, StorageError> {
-    reserve_staging_bytes_with_measurement(budget, min_free_bytes, bytes, || {
-        filesystem_space(directory)
-    })
-}
-
-fn reserve_staging_bytes_with_measurement(
-    budget: &Arc<Mutex<StagingBudget>>,
-    min_free_bytes: u64,
-    bytes: u64,
-    measure: impl FnOnce() -> io::Result<StorageCapacity>,
-) -> Result<StagingReservation, StorageError> {
-    let mut budget_guard = budget
-        .lock()
-        .map_err(|_| StorageError::Io(io::Error::other("staging budget lock poisoned")))?;
-    budget_guard.reserve(measure()?, min_free_bytes, bytes)?;
-    drop(budget_guard);
-    Ok(StagingReservation {
-        budget: Arc::clone(budget),
-        bytes,
-    })
-}
-
-#[cfg(test)]
-pub(super) fn reserve_staging_bytes_for_test(
-    budget: &Arc<Mutex<StagingBudget>>,
-    min_free_bytes: u64,
-    bytes: u64,
-    measure: impl FnOnce() -> io::Result<StorageCapacity>,
-) -> Result<StagingReservation, StorageError> {
-    reserve_staging_bytes_with_measurement(budget, min_free_bytes, bytes, measure)
-}
-
-pub(super) fn filesystem_space(directory: &File) -> io::Result<StorageCapacity> {
-    let statistics = fs::fstatvfs(directory)?;
-    Ok(capacity_from_statvfs(&statistics))
-}
-
-pub fn capacity_from_statvfs(statistics: &StatVfs) -> StorageCapacity {
-    let scale = u128::from(statistics.f_frsize);
-    let bytes = |blocks: u64| {
-        u128::from(blocks)
-            .saturating_mul(scale)
-            .min(u128::from(u64::MAX)) as u64
-    };
-    StorageCapacity {
-        total_bytes: bytes(statistics.f_blocks),
-        available_bytes: bytes(statistics.f_bavail),
-        total_inodes: statistics.f_files,
-        available_inodes: statistics.f_favail,
-        read_only: statistics.f_flag.contains(StatVfsMountFlags::RDONLY),
-    }
-}
 
 pub(super) fn require_directory_at(parent: &File, name: &str) -> io::Result<File> {
     let directory = open_directory_at(parent, OsStr::new(name))
@@ -504,31 +397,6 @@ mod tests {
         metadata.st_ctime_nsec = 456_123_987;
 
         assert_eq!(metadata_change_time(&metadata), (-7, 456_123_987));
-    }
-
-    #[test]
-    fn statvfs_capacity_conversion_saturates_bytes_and_inode_counts() {
-        let statistics = StatVfs {
-            f_bsize: 0,
-            f_frsize: u64::MAX,
-            f_blocks: u64::MAX,
-            f_bfree: 0,
-            f_bavail: u64::MAX,
-            f_files: u64::MAX,
-            f_ffree: 0,
-            f_favail: u64::MAX,
-            f_fsid: 0,
-            f_flag: StatVfsMountFlags::RDONLY,
-            f_namemax: 0,
-        };
-
-        let capacity = capacity_from_statvfs(&statistics);
-
-        assert_eq!(capacity.total_bytes, u64::MAX);
-        assert_eq!(capacity.available_bytes, u64::MAX);
-        assert_eq!(capacity.total_inodes, u64::MAX);
-        assert_eq!(capacity.available_inodes, u64::MAX);
-        assert!(capacity.read_only);
     }
 
     #[test]

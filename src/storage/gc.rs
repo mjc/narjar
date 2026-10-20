@@ -536,7 +536,7 @@ fn run_with_access(
     access: CollectionAccess<'_>,
 ) -> Result<GcReport, StorageError> {
     run_with_capacity_measurement(options, storage, trusted, access, |storage| {
-        Ok(super::fs::filesystem_space(&storage.root)?)
+        Ok(super::capacity::filesystem_space(&storage.root)?)
     })
 }
 
@@ -2765,7 +2765,7 @@ mod tests {
                 &trusted,
                 CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
                 |storage| {
-                    let mut capacity = super::super::fs::filesystem_space(&storage.root)?;
+                    let mut capacity = super::super::capacity::filesystem_space(&storage.root)?;
                     capacity.available_bytes = measurements.next().unwrap();
                     Ok(capacity)
                 },
@@ -2896,7 +2896,7 @@ mod tests {
                 &trusted,
                 CollectionAccess::Offline(storage.collection.snapshot().unwrap()),
                 |storage| {
-                    let mut capacity = super::super::fs::filesystem_space(&storage.root)?;
+                    let mut capacity = super::super::capacity::filesystem_space(&storage.root)?;
                     capacity.available_bytes = measurements
                         .next()
                         .expect("one pre-pass and one post-pass measurement");

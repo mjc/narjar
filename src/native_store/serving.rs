@@ -20,7 +20,7 @@ use super::{
 };
 use crate::cache::{
     narinfo::TrustedPublicKeys,
-    storage::{StorageReadiness, StoreHash, capacity_from_statvfs},
+    storage::{StorageReadiness, StoreHash, filesystem_space},
 };
 
 pub(crate) struct NativeStoreSource {
@@ -248,11 +248,8 @@ impl NativeStoreSource {
     ) -> Result<StorageReadiness, NativeReadError> {
         self.store.metadata_snapshot()?;
         self.store.leases().probe()?;
-        let space = rustix::fs::fstatvfs(&self.store._roots_directory).map_err(io::Error::from)?;
-        Ok(StorageReadiness::from_capacity(
-            capacity_from_statvfs(&space),
-            min_free_bytes,
-        ))
+        let space = filesystem_space(&self.store._roots_directory)?;
+        Ok(StorageReadiness::from_capacity(space, min_free_bytes))
     }
 
     pub(crate) fn maintain(&self) {
@@ -263,8 +260,7 @@ impl NativeStoreSource {
     }
 
     pub(crate) fn append_metrics(&self, output: &mut String) {
-        if let Ok(space) = rustix::fs::fstatvfs(&self.store._roots_directory) {
-            let space = capacity_from_statvfs(&space);
+        if let Ok(space) = filesystem_space(&self.store._roots_directory) {
             let _ = writeln!(
                 output,
                 "# TYPE narjar_native_roots_available_bytes gauge\nnarjar_native_roots_available_bytes {}",

@@ -32,6 +32,7 @@ use super::{
     CleanupAction, INGESTION_RECEIPT_DIRECTORY, VALIDATION_DIRECTORY,
     advertisement::{AdvertisementLeases, AdvertisementRemovalContext, lease_name},
     cache_info::{MAX_CACHE_INFO_BYTES, validate as validate_cache_info},
+    capacity::{StorageCapacity, filesystem_space, reserve_staging_bytes},
     chunk_store::{ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
     chunked::ChunkProfile,
     collection::{ActivityLease, CollectionLease, ProtectedObject},
@@ -41,9 +42,9 @@ use super::{
     },
     egress::NarReadBody,
     fs::{
-        ImmutableLinkOutcome, StorageCapacity, entry_is_regular_at, filesystem_space,
-        link_or_compare_immutable, open_at, open_directory_at, open_optional_at, open_regular_at,
-        read_dir_names, remove_temp, rename_at, reserve_staging_bytes, rollback_link_at, unlink_at,
+        ImmutableLinkOutcome, entry_is_regular_at, link_or_compare_immutable, open_at,
+        open_directory_at, open_optional_at, open_regular_at, read_dir_names, remove_temp,
+        rename_at, rollback_link_at, unlink_at,
     },
     ids::StoreHash,
     location::{StorePath, TemporaryPath},
@@ -227,9 +228,7 @@ impl StorageReadiness {
             Ok(()) => Self::Ready,
             Err(StorageError::InsufficientSpace) => Self::LowSpace,
             Err(StorageError::InsufficientInodes) => Self::NoInodes,
-            Err(StorageError::Io(error))
-                if error.raw_os_error() == Some(rustix::io::Errno::ROFS.raw_os_error()) =>
-            {
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::ReadOnlyFilesystem => {
                 Self::ReadOnly
             }
             Err(_) => Self::ProbeFailed,

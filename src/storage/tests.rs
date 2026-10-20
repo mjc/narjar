@@ -12,12 +12,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use super::capacity::{StorageCapacity, reserve_staging_bytes_for_test};
 use super::compression::{
     CheckedUploadReader, nar_file_size_matches, receive_uploaded_nar,
     verify_decoded_compressed_file, verify_encoded_compressed_file, xz_decoder_memory_requirement,
 };
 use super::egress::{EgressReceipt, EgressSlot};
-use super::fs::{StorageCapacity, remove_temp, reserve_staging_bytes_for_test, sync_dir};
+use super::fs::{remove_temp, sync_dir};
 use super::ids::nix32_sha256;
 use super::publication::{DecoderMemoryLimit, Layout, PublishBoundary, PublishTarget};
 use super::{
@@ -3878,8 +3879,10 @@ fn destination_capacity_rejects_inode_exhaustion() {
     let space = StorageCapacity {
         total_bytes: u64::MAX,
         available_bytes: u64::MAX,
-        total_inodes: u64::MAX,
-        available_inodes: 0,
+        inodes: crate::cache::storage::InodeCapacity::Measured {
+            total: u64::MAX,
+            available: 0,
+        },
         read_only: false,
     };
 
@@ -3890,37 +3893,78 @@ fn destination_capacity_rejects_inode_exhaustion() {
 }
 
 #[test]
+fn staging_capacity_without_inode_counts_preserves_byte_and_read_only_checks() {
+    let space = StorageCapacity {
+        total_bytes: 100,
+        available_bytes: 100,
+        inodes: super::InodeCapacity::NotReported,
+        read_only: false,
+    };
+    let budget = Arc::new(Mutex::new(Default::default()));
+    let reservation = reserve_staging_bytes_for_test(&budget, 10, 90, || Ok(space))
+        .expect("unknown inode counts must not pretend the filesystem is exhausted");
+    assert_eq!(budget.lock().unwrap().outstanding_bytes(), 90);
+    assert!(matches!(
+        reserve_staging_bytes_for_test(&budget, 10, 1, || Ok(space)),
+        Err(StorageError::InsufficientSpace)
+    ));
+    drop(reservation);
+    assert_eq!(budget.lock().unwrap().outstanding_bytes(), 0);
+    let read_only = StorageCapacity {
+        read_only: true,
+        ..space
+    };
+    let error = reserve_staging_bytes_for_test(&budget, 10, 1, || Ok(read_only))
+        .expect_err("unknown inode counts do not make a read-only destination writable");
+    assert!(
+        matches!(error, StorageError::Io(error) if error.kind() == io::ErrorKind::ReadOnlyFilesystem)
+    );
+    assert_eq!(budget.lock().unwrap().outstanding_bytes(), 0);
+}
+
+#[test]
 fn read_only_filesystems_are_not_ready() {
     let space = StorageCapacity {
         total_bytes: u64::MAX,
         available_bytes: u64::MAX,
-        total_inodes: u64::MAX,
-        available_inodes: u64::MAX,
+        inodes: crate::cache::storage::InodeCapacity::Measured {
+            total: u64::MAX,
+            available: u64::MAX,
+        },
         read_only: true,
     };
 
     assert!(matches!(
         space.required_capacity(1),
-        Err(StorageError::Io(error)) if error.raw_os_error() == Some(rustix::io::Errno::ROFS.raw_os_error())
+        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::ReadOnlyFilesystem
     ));
 }
 
 #[test]
 fn capacity_errors_have_stable_categories() {
     assert_eq!(
-        capacity_error_kind(rustix::io::Errno::NOSPC.raw_os_error()),
+        capacity_error_kind(&io::Error::from_raw_os_error(
+            rustix::io::Errno::NOSPC.raw_os_error()
+        )),
         CapacityErrorKind::NoSpace
     );
     assert_eq!(
-        capacity_error_kind(rustix::io::Errno::DQUOT.raw_os_error()),
+        capacity_error_kind(&io::Error::from_raw_os_error(
+            rustix::io::Errno::DQUOT.raw_os_error()
+        )),
         CapacityErrorKind::Quota
     );
     assert_eq!(
-        capacity_error_kind(rustix::io::Errno::ROFS.raw_os_error()),
+        capacity_error_kind(&io::Error::from_raw_os_error(
+            rustix::io::Errno::ROFS.raw_os_error()
+        )),
         CapacityErrorKind::ReadOnly
     );
     for raw_error in [0, -1, 4096, i32::MIN, i32::MAX] {
-        assert_eq!(capacity_error_kind(raw_error), CapacityErrorKind::Other);
+        assert_eq!(
+            capacity_error_kind(&io::Error::from_raw_os_error(raw_error)),
+            CapacityErrorKind::Other
+        );
     }
 }
 
@@ -3930,8 +3974,10 @@ fn staging_reservations_are_bounded_and_released() {
     let space = StorageCapacity {
         total_bytes: 100,
         available_bytes: 100,
-        total_inodes: 2,
-        available_inodes: 2,
+        inodes: crate::cache::storage::InodeCapacity::Measured {
+            total: 2,
+            available: 2,
+        },
         read_only: false,
     };
     let min_free_bytes = 10;
@@ -3952,24 +3998,39 @@ fn staging_admission_rejects_read_only_and_inode_exhausted_filesystems() {
     let read_only = StorageCapacity {
         total_bytes: 100,
         available_bytes: 100,
-        total_inodes: 2,
-        available_inodes: 2,
+        inodes: crate::cache::storage::InodeCapacity::Measured {
+            total: 2,
+            available: 2,
+        },
         read_only: true,
     };
     let inode_exhausted = StorageCapacity {
         total_bytes: 100,
         available_bytes: 100,
-        total_inodes: 2,
-        available_inodes: 0,
+        inodes: crate::cache::storage::InodeCapacity::Measured {
+            total: 2,
+            available: 0,
+        },
         read_only: false,
     };
 
-    for space in [read_only, inode_exhausted] {
+    for (space, expected) in [
+        (read_only, super::StorageReadiness::ReadOnly),
+        (inode_exhausted, super::StorageReadiness::NoInodes),
+    ] {
         let reservations = Arc::new(Mutex::new(Default::default()));
-        assert!(
-            reserve_staging_bytes_for_test(&reservations, 10, 1, || Ok(space)).is_err(),
-            "staging admission must retain all filesystem capability checks"
-        );
+        let error = reserve_staging_bytes_for_test(&reservations, 10, 1, || Ok(space))
+            .expect_err("staging admission must retain all filesystem capability checks");
+        match expected {
+            super::StorageReadiness::ReadOnly => assert!(matches!(
+                error, StorageError::Io(error) if error.kind() == io::ErrorKind::ReadOnlyFilesystem
+            )),
+            super::StorageReadiness::NoInodes => {
+                assert!(matches!(error, StorageError::InsufficientInodes))
+            }
+            _ => panic!("test fixture must describe a capacity failure"),
+        }
+        assert_eq!(super::StorageReadiness::from_capacity(space, 10), expected);
         assert_eq!(
             reservations.lock().unwrap().outstanding_bytes(),
             0,

@@ -9,8 +9,9 @@ use std::{
 use rustix::fs::OFlags;
 
 use super::{
+    capacity::{StorageCapacity, filesystem_space},
     collection::{ActivityLease, CollectionLease},
-    fs::{StorageCapacity, filesystem_space, lock_exclusive, open_at, private_file_mode_is_valid},
+    fs::{lock_exclusive, open_at, private_file_mode_is_valid},
     operations::OwnedTemporary,
     recovery::{PublicationState, PublicationTransaction},
     state::Storage,

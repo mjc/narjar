@@ -940,8 +940,10 @@ mod tests {
         let space = StorageCapacity {
             total_bytes: 2 * 1024 * 1024,
             available_bytes: 2 * 1024 * 1024,
-            total_inodes: 1,
-            available_inodes: 1,
+            inodes: crate::cache::storage::InodeCapacity::Measured {
+                total: 1,
+                available: 1,
+            },
             read_only: false,
         };
         let mut budget = StagingBudget::default();

@@ -17,7 +17,7 @@ use crate::cache::{
     storage::{
         CACHE_POLICY_DIRECTORIES, CACHE_POLICY_FILES, CACHE_RECOVERY_MARKERS, CachePolicies,
         CleanupOutcome, Directory, LAYOUT_DESCRIPTOR, ReconcileClass, Storage, StorageBackend,
-        StorageCapacity, StoreHash, SupportedStorageBackend, capacity_from_statvfs,
+        StorageCapacity, StoreHash, SupportedStorageBackend, filesystem_space,
         gc::{
             self, EvictionOrder, FreeSpaceThresholds, GcMode, GcOptions, GcReport, ProtectedRoots,
             RetentionOptions,
@@ -1188,8 +1188,7 @@ fn inspect_doctor_path(
 
 fn doctor_capacity(path: &Path) -> Result<DoctorCapacity, std::io::Error> {
     let file = File::open(path)?;
-    let statistics = rustix::fs::fstatvfs(&file)?;
-    let capacity = capacity_from_statvfs(&statistics);
+    let capacity = filesystem_space(&file)?;
     Ok(DoctorCapacity {
         path: "",
         capacity,
@@ -1247,12 +1246,11 @@ fn print_doctor(report: &DoctorReport) {
     println!("lease\t{}\t{}", report.lease.as_str(), report.lease_detail);
     for capacity in &report.capacities {
         println!(
-            "capacity\t{}\t{} bytes available / {} total\t{} inodes available / {} total\tread_only={}",
+            "capacity\t{}\t{} bytes available / {} total\t{}\tread_only={}",
             capacity.path,
             capacity.capacity.available_bytes,
             capacity.capacity.total_bytes,
-            capacity.capacity.available_inodes,
-            capacity.capacity.total_inodes,
+            capacity.capacity.inodes,
             capacity.capacity.read_only
         );
     }
