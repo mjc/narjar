@@ -1,6 +1,6 @@
 [package]
 name = "narjar"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 description = "A filesystem-backed Nix binary cache"
@@ -10,6 +10,7 @@ keywords = ["nix", "cache", "nar", "archive"]
 categories = ["command-line-utilities", "network-programming", "parser-implementations"]
 include = [
     "/Cargo.lock",
+    "/CHANGELOG.md",
     "/LICENSE-APACHE",
     "/LICENSE-MIT",
     "/README.md",
