@@ -58,6 +58,8 @@ mod enumeration;
 mod security;
 pub(crate) use control::ControlPipeName;
 
+const DIRECTORY_TRAVERSAL_ACCESS: u32 = FILE_READ_ATTRIBUTES | READ_CONTROL;
+
 pub(crate) fn validate_file_privacy_at(
     parent: &File,
     name: &OsStr,
@@ -211,20 +213,26 @@ pub(crate) fn entry_metadata_at(parent: &File, name: &OsStr) -> io::Result<Entry
 }
 
 fn walk_directories(parent: &File, names: &[ChildName], final_access: u32) -> io::Result<File> {
-    let mut directory = parent.try_clone()?;
-    for (index, name) in names.iter().enumerate() {
-        let access = if index + 1 == names.len() {
-            final_access
-        } else {
-            FILE_GENERIC_READ
-        };
-        directory = open_child(&directory, name.path(), Kind::Directory, access)?;
+    match names.split_last() {
+        Some((name, ancestors)) => {
+            let directory = open_directory_ancestors(parent, ancestors)?;
+            open_child(&directory, name.path(), Kind::Directory, final_access)
+        }
+        None => reopen(parent, Kind::Directory, final_access),
     }
-    if names.is_empty() {
-        // Reopen rather than DuplicateHandle: enumeration needs its own cursor.
-        directory = reopen(&directory, Kind::Directory, final_access)?;
-    }
-    Ok(directory)
+}
+
+fn open_directory_ancestors(parent: &File, names: &[ChildName]) -> io::Result<File> {
+    names
+        .iter()
+        .try_fold(parent.try_clone()?, |directory, name| {
+            open_child(
+                &directory,
+                name.path(),
+                Kind::Directory,
+                DIRECTORY_TRAVERSAL_ACCESS,
+            )
+        })
 }
 
 fn reopen(file: &File, kind: Kind, access: u32) -> io::Result<File> {
@@ -303,7 +311,7 @@ fn host_path(path: &Path) -> io::Result<(PathBuf, Vec<ChildName>)> {
 fn open_host_parent(path: &Path) -> io::Result<(File, Vec<ChildName>)> {
     let (root, names) = host_path(path)?;
     let directory = OpenOptions::new()
-        .read(true)
+        .access_mode(DIRECTORY_TRAVERSAL_ACCESS)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(root)?;
@@ -329,7 +337,7 @@ pub fn open_regular_at(parent: &File, path: impl AsRef<Path>) -> io::Result<File
     let (name, ancestors) = names
         .split_last()
         .ok_or_else(|| invalid_input("a regular-file name is required"))?;
-    let directory = walk_directories(parent, ancestors, FILE_GENERIC_READ)?;
+    let directory = walk_directories(parent, ancestors, DIRECTORY_TRAVERSAL_ACCESS)?;
     open_child(
         &directory,
         name.path(),
@@ -343,7 +351,7 @@ pub fn open_regular(path: &Path) -> io::Result<File> {
     let (name, ancestors) = names
         .split_last()
         .ok_or_else(|| invalid_input("a regular-file name is required"))?;
-    let directory = walk_directories(&root, ancestors, FILE_GENERIC_READ)?;
+    let directory = walk_directories(&root, ancestors, DIRECTORY_TRAVERSAL_ACCESS)?;
     open_child(
         &directory,
         name.path(),
@@ -566,7 +574,11 @@ pub fn create_private_directory(path: &Path) -> io::Result<File> {
     let (name, ancestors) = names
         .split_last()
         .ok_or_else(|| invalid_input("a new directory name is required"))?;
-    let parent = walk_directories(&root, ancestors, FILE_GENERIC_READ | FILE_GENERIC_WRITE)?;
+    let parent = walk_directories(
+        &root,
+        ancestors,
+        DIRECTORY_TRAVERSAL_ACCESS | FILE_GENERIC_WRITE,
+    )?;
     let directory = create_child(
         &parent,
         name,
@@ -738,6 +750,41 @@ fn invalid_data(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ancestors_can_deny_listing_without_blocking_child_creation_or_reads() {
+        use std::io::Read;
+
+        let root = tempfile::tempdir().unwrap();
+        let root_directory = open_directory(root.path()).unwrap();
+        let ancestor_path = root.path().join("unlisted");
+        let ancestor = create_private_directory(&ancestor_path).unwrap();
+        let payload_path = ancestor_path.join("payload");
+        std::fs::write(&payload_path, b"payload").unwrap();
+        let restore_permissions = scopeguard::guard(ancestor, |directory| {
+            let _ = security::set(&directory, FilePrivacy::Private);
+        });
+        security::deny_directory_listing(&restore_permissions).unwrap();
+        assert_eq!(
+            open_directory(&ancestor_path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "the fixture must actually deny directory-list access"
+        );
+
+        let cache_path = ancestor_path.join("cache");
+        let created = create_private_directory(&cache_path).unwrap();
+        validate_private_directory(&created).unwrap();
+        let reopened = open_directory(&cache_path).unwrap();
+        assert!(reopened.metadata().unwrap().is_dir());
+        for mut file in [
+            open_regular(&payload_path).unwrap(),
+            open_regular_at(&root_directory, Path::new("unlisted").join("payload")).unwrap(),
+        ] {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"payload");
+        }
+    }
 
     #[test]
     fn a_directory_at_a_regular_file_location_is_invalid_content_not_access_denial() {

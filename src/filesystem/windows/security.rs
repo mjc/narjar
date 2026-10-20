@@ -60,6 +60,10 @@ impl Descriptor {
                 sddl.push_str(&format!("(A;{inheritance};{rights};;;WD)"));
             }
         }
+        Self::from_sddl(&sddl)
+    }
+
+    fn from_sddl(sddl: &str) -> io::Result<Self> {
         let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
         let mut descriptor = ptr::null_mut();
         // SAFETY: the input is NUL terminated and lives for the call; the
@@ -291,6 +295,11 @@ fn validate_ace(
 
 pub(super) fn set(file: &File, privacy: FilePrivacy) -> io::Result<()> {
     let descriptor = Descriptor::for_creation(privacy, file.metadata()?.is_dir())?;
+    replace_dacl(file, &descriptor)?;
+    validate(file, privacy)
+}
+
+fn replace_dacl(file: &File, descriptor: &Descriptor) -> io::Result<()> {
     let dacl = descriptor.dacl()?;
     // SAFETY: file is retained, dacl borrows descriptor, and SetSecurityInfo
     // copies the ACL. WRITE_DAC must have been requested on the file handle.
@@ -308,5 +317,16 @@ pub(super) fn set(file: &File, privacy: FilePrivacy) -> io::Result<()> {
     if error != 0 {
         return Err(io::Error::from_raw_os_error(error as i32));
     }
-    validate(file, privacy)
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn deny_directory_listing(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY;
+
+    let sid = Account::current()?.string_sid()?;
+    let descriptor = Descriptor::from_sddl(&format!(
+        "O:{sid}D:P(D;;{FILE_LIST_DIRECTORY:#x};;;{sid})(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)"
+    ))?;
+    replace_dacl(file, &descriptor)
 }
