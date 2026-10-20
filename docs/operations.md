@@ -40,6 +40,8 @@ clients no longer need its cached signatures.
 
 Use flat storage on local NTFS. Install the MSVC Rust toolchain and Windows SDK
 to build with Cargo; the installed cache server does not need Nix or SQLite.
+The executable uses the Microsoft Visual C++ runtime (`VCRUNTIME140.dll`).
+Install the Visual C++ Redistributable when moving it to a machine without that runtime.
 `push` and native-store serving require Unix. A Windows cache accepts the same
 HTTP uploads and serves raw, XZ, or Zstd output.
 

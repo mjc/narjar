@@ -15,14 +15,18 @@ $imports = @($report | ForEach-Object {
 })
 if ($imports.Count -eq 0) { throw 'PE import inspection found no runtime libraries' }
 
-# Windows API contracts need not have a matching on-disk DLL. Other imports
-# must resolve from Windows itself, not the compiler or the build directory.
+# API contracts need not have matching files. Other imports are Windows DLLs
+# or the documented Microsoft Visual C++ runtime, never build-directory DLLs.
+$systemLibraries = @('kernel32.dll', 'advapi32.dll', 'ws2_32.dll', 'ntdll.dll', 'bcryptprimitives.dll', 'bcrypt.dll')
+$vcRuntime = @('vcruntime140.dll', 'vcruntime140_1.dll')
 foreach ($library in $imports) {
-    if ($library -notmatch '^(api-ms-win-|ext-ms-win-)' -and
-        -not (Test-Path (Join-Path "$env:SystemRoot/System32" $library) -PathType Leaf)) {
-        throw "Installed executable requires an extra runtime DLL: $library"
+    if ($library -match '^(api-ms-win-|ext-ms-win-)[a-z0-9-]+\.dll$') {
+        continue
     }
-    if ($library -match '(sqlite|libssl|libcrypto|libgcc|libstdc\+\+)') {
-        throw "Unexpected application runtime dependency: $library"
+    if ($library -notin $systemLibraries -and $library -notin $vcRuntime) {
+        throw "Undeclared runtime DLL: $library"
+    }
+    if (-not (Test-Path (Join-Path "$env:SystemRoot/System32" $library) -PathType Leaf)) {
+        throw "Runtime DLL is not installed: $library"
     }
 }

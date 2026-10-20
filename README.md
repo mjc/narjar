@@ -33,6 +33,9 @@ cargo install --locked --path .
 The CLI supports Linux, macOS, and native Windows. Windows flat storage requires
 local NTFS. Native Nix-store serving and `push` are available on Linux and macOS;
 Windows can serve a standalone cache and accept HTTP uploads from those clients.
+Windows binaries link the Microsoft Visual C++ runtime supplied by the build
+tools. Install the [Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)
+when copying a binary to a machine without that runtime.
 
 Nix packages are available for x86_64 Linux and Apple Silicon macOS, with a
 NixOS module and a Linux OCI image. Use flat storage on macOS; chunked storage
