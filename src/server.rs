@@ -403,9 +403,7 @@ fn staging_reservation_status(error: &StorageError) -> StatusCode {
         StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
             StatusCode::INSUFFICIENT_STORAGE
         }
-        StorageError::Io(error)
-            if error.raw_os_error() == Some(rustix::io::Errno::ROFS.raw_os_error()) =>
-        {
+        StorageError::Io(error) if error.kind() == io::ErrorKind::ReadOnlyFilesystem => {
             StatusCode::SERVICE_UNAVAILABLE
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,

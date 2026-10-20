@@ -14,6 +14,14 @@ impl FileIdentity {
     pub(crate) const fn volume(self) -> u64 {
         self.volume
     }
+
+    #[cfg(windows)]
+    pub(crate) fn namespace_bytes(self) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&self.volume.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.object);
+        bytes
+    }
 }
 
 /// Object identity and mutation evidence; access-time changes do not invalidate it.

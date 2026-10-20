@@ -161,7 +161,7 @@ impl<'a> CapacityCheckedStagingWriter<'a> {
             self.reservation
                 .grow_to(self.file, self.min_free_bytes, required)
         })
-        .map_err(storage_capacity_error)
+        .map_err(io::Error::from)
     }
 }
 
@@ -190,16 +190,6 @@ impl Write for CapacityCheckedStagingWriter<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
-    }
-}
-
-fn storage_capacity_error(error: StorageError) -> io::Error {
-    match error {
-        StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
-            io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
-        }
-        StorageError::Io(error) => error,
-        error => io::Error::other(error),
     }
 }
 

@@ -6,7 +6,10 @@ use super::{
     NativeStorePath, read_required_record, remove_record, write_bytes_atomically,
 };
 use crate::{
-    cache::records::{BoundedRegularFile, decode_complete, read_bounded_regular_file},
+    cache::{
+        filesystem::open_regular,
+        records::{BoundedRegularFile, decode_complete, read_bounded_open_file},
+    },
     native_store::metadata::SignedNativeNarInfo,
 };
 
@@ -153,7 +156,7 @@ impl NativeStoreLeaseManager {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<AdvertisementRecord>, NativeStoreLeaseError> {
-        let record = match read_bounded_regular_file(rustix::fs::CWD, path, MAX_RECORD_BYTES)
+        let record = match read_bounded_open_file(open_regular(path), MAX_RECORD_BYTES)
             .map_err(NativeStoreLeaseError::Io)?
         {
             BoundedRegularFile::Missing => return Ok(None),

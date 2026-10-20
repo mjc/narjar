@@ -265,14 +265,17 @@ fn inspect_trusted_gc_publication(
     name: OsString,
 ) -> Result<TrustedGcPublication, StorageError> {
     let name_str = name.to_string_lossy();
-    let file = open_regular_at(root, &name).map_err(|error| match error.kind() {
-        io::ErrorKind::NotFound => invalid(format!("narinfo disappeared during scan: {name_str}")),
-        io::ErrorKind::InvalidData => invalid(format!("narinfo is not a regular file: {name_str}")),
-        _ if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
-            invalid(format!("narinfo is not a regular file: {name_str}"))
-        }
-        _ => error.into(),
-    })?;
+    use crate::cache::filesystem::EntryOpenFailure;
+    let file =
+        open_regular_at(root, &name).map_err(|error| match EntryOpenFailure::from(error) {
+            EntryOpenFailure::Missing => {
+                invalid(format!("narinfo disappeared during scan: {name_str}"))
+            }
+            EntryOpenFailure::Invalid => {
+                invalid(format!("narinfo is not a regular file: {name_str}"))
+            }
+            EntryOpenFailure::Io(error) => error.into(),
+        })?;
     let metadata = file.metadata()?;
     let validated =
         trusted

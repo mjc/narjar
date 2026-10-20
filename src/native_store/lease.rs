@@ -10,7 +10,10 @@ use std::{
 };
 
 use super::gc::{GcReadLock, lock_file};
-use crate::cache::records::{BoundedRegularFile, decode_complete, read_bounded_regular_file};
+use crate::cache::{
+    filesystem::open_regular,
+    records::{BoundedRegularFile, decode_complete, read_bounded_open_file},
+};
 use data_encoding::HEXLOWER;
 use rustix::fs::FlockOperation;
 #[cfg(test)]
@@ -1408,7 +1411,7 @@ fn read_optional_record(
     path: &Path,
     store_dir: &Path,
 ) -> Result<Option<LeaseRecord>, NativeStoreLeaseError> {
-    let record = match read_bounded_regular_file(rustix::fs::CWD, path, MAX_RECORD_BYTES)
+    let record = match read_bounded_open_file(open_regular(path), MAX_RECORD_BYTES)
         .map_err(NativeStoreLeaseError::Io)?
         .parse(|bytes| decode_complete::<LeaseRecord>(bytes).ok())
     {
@@ -1447,7 +1450,7 @@ fn write_record_atomically(
 
 fn read_capacity_record(roots_dir: &Path) -> Result<CapacityRecord, NativeStoreLeaseError> {
     let path = roots_dir.join(CAPACITY_FILE);
-    match read_bounded_regular_file(rustix::fs::CWD, &path, MAX_CAPACITY_RECORD_BYTES)
+    match read_bounded_open_file(open_regular(&path), MAX_CAPACITY_RECORD_BYTES)
         .map_err(NativeStoreLeaseError::Io)?
         .parse(|bytes| decode_complete(bytes).ok())
     {

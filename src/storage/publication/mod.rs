@@ -432,6 +432,18 @@ impl From<io::Error> for StorageError {
     }
 }
 
+impl From<StorageError> for io::Error {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
+                io::ErrorKind::StorageFull.into()
+            }
+            StorageError::Io(error) => error,
+            error => io::Error::other(error),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("decoded NAR exceeds configured size limit")]
 pub(super) struct DecodedSizeLimitExceeded;

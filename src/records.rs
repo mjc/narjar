@@ -1,12 +1,12 @@
 use std::{
+    fs::File,
     io::{self, Read},
     path::Path,
 };
 
-use rustix::fd::AsFd;
 use serde::Deserialize;
 
-use crate::cache::filesystem::open_regular_at;
+use crate::cache::filesystem::{EntryOpenFailure, open_regular_at};
 
 #[derive(Debug)]
 pub enum BoundedRegularFile<T> {
@@ -29,22 +29,26 @@ impl BoundedRegularFile<Vec<u8>> {
 
 /// Classify absence and invalid record files without swallowing source I/O errors.
 pub fn read_bounded_regular_file(
-    parent: impl AsFd,
+    parent: &File,
     path: impl AsRef<Path>,
     max_bytes: u64,
 ) -> io::Result<BoundedRegularFile<Vec<u8>>> {
-    let file = match open_regular_at(parent, path) {
+    read_bounded_open_file(open_regular_at(parent, path), max_bytes)
+}
+
+pub fn read_bounded_open_file(
+    file: io::Result<File>,
+    max_bytes: u64,
+) -> io::Result<BoundedRegularFile<Vec<u8>>> {
+    let file = match file.map_err(EntryOpenFailure::from) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Err(EntryOpenFailure::Missing) => {
             return Ok(BoundedRegularFile::Missing);
         }
-        Err(error)
-            if error.kind() == io::ErrorKind::InvalidData
-                || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
-        {
+        Err(EntryOpenFailure::Invalid) => {
             return Ok(BoundedRegularFile::Invalid);
         }
-        Err(error) => return Err(error),
+        Err(EntryOpenFailure::Io(error)) => return Err(error),
     };
     match read_bounded_bytes(file, max_bytes) {
         Ok(bytes) => Ok(BoundedRegularFile::Valid(bytes)),

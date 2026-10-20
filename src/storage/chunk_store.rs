@@ -30,7 +30,7 @@ use super::{
         for_each_dir_name, link_or_compare_immutable, open_at, open_directory_at, open_regular_at,
         read_dir_names, require_directory_at, unlink_at,
     },
-    publication::{StagingReservation, StorageError},
+    publication::StagingReservation,
     state::StorageActivity,
 };
 
@@ -1515,7 +1515,7 @@ impl<'store> ChunkingWriter<'store> {
         };
         reservation
             .grow_to(directory, self.min_free_bytes, bytes)
-            .map_err(io_for_storage_error)
+            .map_err(io::Error::from)
     }
 
     fn release_materialized_bytes(&mut self, bytes: u64) {
@@ -1747,16 +1747,6 @@ fn is_chunk_shard_name(name: &OsStr) -> bool {
         return false;
     };
     name.len() == 2 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn io_for_storage_error(error: StorageError) -> io::Error {
-    match error {
-        StorageError::InsufficientSpace | StorageError::InsufficientInodes => {
-            io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
-        }
-        StorageError::Io(error) => error,
-        error => io::Error::other(error),
-    }
 }
 
 fn shard_name(hash: ChunkHash) -> String {
