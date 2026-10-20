@@ -13,12 +13,12 @@ use super::{
     LAYOUT_DESCRIPTOR, SupportedStorageBackend,
     backend::BackendSupport,
     chunk_store::ChunkStore,
-    directory::Directory,
+    directory::{Directory, ProcessLock},
     fs::{
-        ensure_directory_at, hard_link_at, open_at, open_optional_at, require_directory_at,
-        require_private_file_at, unlink_at,
+        ensure_directory_at, hard_link_at, open_at, open_optional_at, private_file_mode_is_valid,
+        require_directory_at, require_private_file_at, unlink_at,
     },
-    publication::{ProcessLock, StorageError},
+    publication::StorageError,
     recovery::RecoveryState,
     state::{DeliveryValidationCache, PayloadStorage, Storage, StorageActivity},
 };
@@ -94,9 +94,9 @@ impl CachePolicies {
     pub fn load(root: &Directory) -> Result<Self, StorageError> {
         CACHE_POLICY_DIRECTORIES
             .iter()
-            .try_for_each(|name| require_directory_at(&root.file, name).map(drop))?;
+            .try_for_each(|name| require_directory_at(root.file(), name).map(drop))?;
         CACHE_POLICY_FILES.iter().try_for_each(|name| {
-            let (parent, leaf) = directory_parent(&root.file, name)?;
+            let (parent, leaf) = directory_parent(root.file(), name)?;
             require_private_file_at(&parent, leaf, true).map(|_| ())
         })?;
         let invalid_policy = |error| io::Error::new(io::ErrorKind::InvalidData, error);
@@ -132,7 +132,7 @@ impl CacheCreation {
     pub fn create_or_complete(self) -> Result<Storage, StorageError> {
         self.descriptor.install(&self.layout)?;
         self.layout.create_directories()?;
-        ProcessLock::validate_lock_file(&self.layout.root)?;
+        self.layout.ensure_private_layout_lock_file()?;
         let storage = self.layout.into_storage()?;
         storage.recovery.initialize_clean()?;
         Ok(storage)
@@ -198,13 +198,8 @@ struct CacheLayout {
 
 impl CacheLayout {
     fn lock(root: &Directory, backend: SupportedStorageBackend) -> Result<Self, StorageError> {
-        let directory = root.file.try_clone()?;
-        let lock = ProcessLock::acquire(open_at(
-            &directory,
-            OsStr::new("."),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            0,
-        )?)?;
+        let directory = root.file().try_clone()?;
+        let lock = ProcessLock::acquire(root)?;
         Ok(Self {
             root: directory,
             backend,
@@ -212,6 +207,28 @@ impl CacheLayout {
             #[cfg(test)]
             test_layout: Layout::new(root.path.clone()),
         })
+    }
+
+    fn ensure_private_layout_lock_file(&self) -> Result<(), StorageError> {
+        let file = open_at(
+            &self.root,
+            OsStr::new("lock"),
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            0o600,
+        )
+        .map_err(|error| io::Error::new(error.kind(), format!("lock: {error}")))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "lock is not a regular file").into(),
+            );
+        }
+        if !private_file_mode_is_valid(metadata.permissions().mode()) {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "lock has unsafe permissions").into(),
+            );
+        }
+        Ok(())
     }
 
     fn prepare_descriptor(&self) -> Result<DescriptorInstallation, StorageError> {

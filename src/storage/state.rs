@@ -9,10 +9,11 @@ use std::{
 use super::backend::StorageBackend;
 use super::chunk_store::ChunkStore;
 use super::collection::CollectionCoordinator;
+use super::directory::ProcessLock;
 use super::ids::StoreHash;
 #[cfg(test)]
 use super::publication::Layout;
-use super::publication::{ProcessLock, StagingBudget};
+use super::publication::StagingBudget;
 use super::recovery::RecoveryState;
 use crate::cache::object::{NarFileName, NarIdentity};
 

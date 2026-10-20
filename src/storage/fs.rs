@@ -5,15 +5,15 @@ use std::{
     os::unix::fs::PermissionsExt,
 };
 
-use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RawMode, Stat};
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawMode, Stat};
 
 use super::StorageError;
 use super::publication::TemporaryFile;
+#[cfg(test)]
+use crate::cache::filesystem::open_directory;
 use crate::cache::filesystem::{directory_names, exclude_dot_directory_entries};
 pub(super) use crate::cache::filesystem::{ensure_directory_at, validate_directory};
-pub(crate) use crate::cache::filesystem::{
-    open_directory, open_directory_at, open_regular_at, read_dir_names,
-};
+pub(crate) use crate::cache::filesystem::{open_directory_at, open_regular_at, read_dir_names};
 #[cfg(test)]
 use std::path::Path;
 
@@ -155,14 +155,6 @@ pub(super) fn rollback_link_at(directory: &File, name: &OsStr) -> Result<(), Sto
     unlink_at(directory, name)?;
     directory.sync_all()?;
     Ok(())
-}
-
-pub(super) fn lock_exclusive(file: &File) -> Result<(), StorageError> {
-    match fs::flock(file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(()),
-        Err(rustix::io::Errno::AGAIN) => Err(StorageError::Locked),
-        Err(error) => Err(io::Error::from(error).into()),
-    }
 }
 
 /// Flush every dirty object and metadata change on the filesystem containing

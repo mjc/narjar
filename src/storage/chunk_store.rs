@@ -2714,7 +2714,7 @@ mod tests {
     fn abandoned_temp_cleanup_preserves_nonmatching_entries_and_symlink_targets() {
         for prefix in [".manifest-", ".chunk-"] {
             let root = tempdir().unwrap();
-            let directory = super::super::fs::open_directory(root.path()).unwrap();
+            let directory = crate::cache::filesystem::open_directory(root.path()).unwrap();
             std::fs::write(root.path().join("keep"), b"published content").unwrap();
             std::fs::write(root.path().join(".unrelated"), b"unrelated content").unwrap();
             let temporary = format!("{prefix}abandoned");

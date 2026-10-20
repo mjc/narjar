@@ -1,17 +1,13 @@
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs::File,
     io::{self, Read},
-    os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
-
-use rustix::fs::OFlags;
 
 use super::{
     capacity::{StorageCapacity, filesystem_space},
     collection::{ActivityLease, CollectionLease},
-    fs::{lock_exclusive, open_at, private_file_mode_is_valid},
     operations::OwnedTemporary,
     recovery::{PublicationState, PublicationTransaction},
     state::Storage,
@@ -214,54 +210,6 @@ pub(super) fn injected_fault(
         Err(io::Error::other(format!("injected fault at {boundary:?}")).into())
     } else {
         Ok(())
-    }
-}
-
-/// The lease is held on the opened DATA directory, not `DATA/lock`.
-///
-/// This keeps replacing the lock pathname from creating a second lease. It
-/// relies on local-filesystem `flock` semantics for directory file
-/// descriptions; distributed filesystems are outside the supported guarantee.
-#[derive(Debug)]
-pub(super) struct ProcessLock {
-    file: File,
-}
-
-impl ProcessLock {
-    pub(super) fn acquire(parent: File) -> Result<Self, StorageError> {
-        lock_exclusive(&parent)?;
-        Ok(Self { file: parent })
-    }
-
-    pub(super) fn validate_lock_file(root: &File) -> Result<(), StorageError> {
-        let file = open_at(
-            root,
-            OsStr::new("lock"),
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            0o600,
-        )
-        .map_err(|error| io::Error::new(error.kind(), format!("lock: {error}")))?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "lock is not a regular file").into(),
-            );
-        }
-        if !private_file_mode_is_valid(metadata.permissions().mode()) {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "lock has unsafe permissions").into(),
-            );
-        }
-        Ok(())
-    }
-}
-
-impl Drop for ProcessLock {
-    fn drop(&mut self) {
-        // Releasing explicitly makes the lease transition independent of any
-        // unrelated directory descriptors and occurs before the descriptor is
-        // closed by `File::drop`.
-        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
     }
 }
 
