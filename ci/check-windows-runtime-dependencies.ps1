@@ -17,7 +17,8 @@ if ($imports.Count -eq 0) { throw 'PE import inspection found no runtime librari
 
 # API contracts need not have matching files. Other imports are Windows DLLs
 # or the documented Microsoft Visual C++ runtime, never build-directory DLLs.
-$systemLibraries = @('kernel32.dll', 'advapi32.dll', 'ws2_32.dll', 'ntdll.dll', 'bcryptprimitives.dll', 'bcrypt.dll')
+# LAN discovery enumerates network interfaces through Windows IP Helper.
+$systemLibraries = @('kernel32.dll', 'advapi32.dll', 'ws2_32.dll', 'ntdll.dll', 'bcryptprimitives.dll', 'bcrypt.dll', 'iphlpapi.dll')
 $vcRuntime = @('vcruntime140.dll', 'vcruntime140_1.dll')
 foreach ($library in $imports) {
     if ($library -match '^(api-ms-win-|ext-ms-win-)[a-z0-9-]+\.dll$') {
