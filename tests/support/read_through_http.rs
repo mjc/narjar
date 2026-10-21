@@ -6,6 +6,284 @@ enum PayloadEnd {
     Disconnect,
 }
 
+#[test]
+fn read_through_http_reports_fill_hit_and_cached_negative_for_get_and_head() {
+    let central = RunningServer::start("edge-outcome-central");
+    assert!(
+        response_parts(&central.request_with_body(
+            "PUT",
+            &format!("/nar/{NARJAR_HASH}.nar"),
+            &[],
+            NAR_BYTES,
+        ))
+        .0
+        .starts_with("HTTP/1.1 201")
+    );
+    assert!(
+        response_parts(&central.request_with_body(
+            "PUT",
+            &format!("/{STORE_HASH}.narinfo"),
+            &[],
+            signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64).as_bytes(),
+        ))
+        .0
+        .starts_with("HTTP/1.1 201")
+    );
+    let upstream = format!("http://{}", central.address);
+    for method in ["GET", "HEAD"] {
+        let edge = RunningServer::start_with_workers(
+            "edge-request-outcomes",
+            4,
+            &[
+                "--serve-source",
+                "read-through",
+                "--edge-upstream",
+                &upstream,
+                "--edge-negative-ttl-seconds",
+                "60",
+                "--min-free-bytes",
+                "0",
+            ],
+        );
+        let route = format!("/{STORE_HASH}.narinfo");
+        for expected in ["fill", "hit"] {
+            let response = edge.request(method, &route);
+            let (headers, body) = response_parts(&response);
+            assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+            assert!(
+                headers.contains(&format!("Narjar-Cache-Status: {expected}\r\n")),
+                "{headers}"
+            );
+            assert!(headers.contains("Cache-Control: no-store"), "{headers}");
+            if method == "HEAD" {
+                assert!(body.is_empty());
+            }
+        }
+        for expected in ["error; reason=not_found", "negative; reason=not_found"] {
+            let response = edge.request(method, "/11111111111111111111111111111111.narinfo");
+            let (headers, body) = response_parts(&response);
+            assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
+            assert!(
+                headers.contains(&format!("Narjar-Cache-Status: {expected}\r\n")),
+                "{headers}"
+            );
+            assert!(headers.contains("Cache-Control: no-store"), "{headers}");
+            assert!(body.is_empty());
+        }
+        for route in ["/healthz", "/not-a-store-hash.narinfo"] {
+            let response = edge.request(method, route);
+            assert!(!response_parts(&response).0.contains("Narjar-Cache-Status"));
+        }
+        let (signal, status) = edge.stop();
+        assert_clean_shutdown(signal, status);
+    }
+    let (signal, status) = central.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn read_through_http_reports_coalesced_followers_and_shared_failures_for_get_and_head() {
+    for method in ["GET", "HEAD"] {
+        for status in [200, 503] {
+            let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", upstream.local_addr().unwrap());
+            let (paused, receive_pause) = mpsc::channel();
+            let (release, receive_release) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let (mut metadata, _) = upstream.accept().unwrap();
+                read_http_request(&mut metadata);
+                paused.send(()).unwrap();
+                receive_release
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                let body = if status == 200 {
+                    signed_narinfo(NARJAR_HASH, NAR_BYTES.len() as u64)
+                } else {
+                    String::new()
+                };
+                write!(metadata, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                drop(metadata);
+                if status == 200 {
+                    let (mut payload, _) = upstream.accept().unwrap();
+                    read_http_request(&mut payload);
+                    write!(
+                        payload,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        NAR_BYTES.len()
+                    )
+                    .unwrap();
+                    payload.write_all(NAR_BYTES).unwrap();
+                }
+            });
+            let edge = RunningServer::start_with_workers(
+                "edge-shared-outcomes",
+                4,
+                &[
+                    "--serve-source",
+                    "read-through",
+                    "--edge-upstream",
+                    &url,
+                    "--min-free-bytes",
+                    "0",
+                ],
+            );
+            let route = format!("/{STORE_HASH}.narinfo");
+            let mut leader = edge.open_request(method, &route, &[]);
+            receive_pause.recv_timeout(Duration::from_secs(10)).unwrap();
+            let mut follower = edge.open_request(method, &route, &[]);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let metrics = edge.request("GET", "/metrics");
+                if String::from_utf8_lossy(&response_parts(&metrics).1)
+                    .contains("narjar_edge_followers_total 1\n")
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "follower never joined the gated request"
+                );
+                thread::yield_now();
+            }
+            release.send(()).unwrap();
+            for (request, expected) in [
+                (
+                    &mut leader,
+                    if status == 200 {
+                        "fill"
+                    } else {
+                        "error; reason=transient"
+                    },
+                ),
+                (
+                    &mut follower,
+                    if status == 200 {
+                        "coalesced"
+                    } else {
+                        "error; reason=transient"
+                    },
+                ),
+            ] {
+                let mut response = Vec::new();
+                request.read_to_end(&mut response).unwrap();
+                let (headers, body) = response_parts(&response);
+                assert!(
+                    headers.starts_with(if status == 200 {
+                        "HTTP/1.1 200"
+                    } else {
+                        "HTTP/1.1 404"
+                    }),
+                    "{headers}"
+                );
+                assert!(
+                    headers.contains(&format!("Narjar-Cache-Status: {expected}\r\n")),
+                    "{headers}"
+                );
+                assert!(headers.contains("Cache-Control: no-store"), "{headers}");
+                if method == "HEAD" || status != 200 {
+                    assert!(body.is_empty());
+                }
+            }
+            worker.join().unwrap();
+            let (signal, status) = edge.stop();
+            assert_clean_shutdown(signal, status);
+        }
+    }
+}
+
+#[test]
+fn read_through_http_authorizes_before_exposing_outcomes_or_contacting_upstream() {
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    upstream.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", upstream.local_addr().unwrap());
+    let edge = RunningServer::start_with_auth_and_workers(
+        "edge-private-outcomes",
+        2,
+        &[
+            "--serve-source",
+            "read-through",
+            "--edge-upstream",
+            &url,
+            "--min-free-bytes",
+            "0",
+        ],
+        Some(TEST_WRITE_TOKEN),
+        None,
+    );
+    for method in ["GET", "HEAD"] {
+        let response = edge.request(method, &format!("/{STORE_HASH}.narinfo"));
+        let (headers, _) = response_parts(&response);
+        assert!(headers.starts_with("HTTP/1.1 401"), "{headers}");
+        assert!(!headers.contains("Narjar-Cache-Status"), "{headers}");
+    }
+    assert_eq!(
+        upstream.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let (signal, status) = edge.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn read_through_http_distinguishes_cached_invalid_metadata_from_uncached_storage_failures() {
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", upstream.local_addr().unwrap());
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = upstream.accept().unwrap();
+        read_http_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ninvalid")
+            .unwrap();
+    });
+    let edge = RunningServer::start_with_workers(
+        "edge-failure-reasons",
+        2,
+        &[
+            "--serve-source",
+            "read-through",
+            "--edge-upstream",
+            &url,
+            "--edge-negative-ttl-seconds",
+            "60",
+            "--min-free-bytes",
+            "0",
+        ],
+    );
+    for (method, expected) in [
+        ("GET", "error; reason=invalid"),
+        ("HEAD", "negative; reason=invalid"),
+    ] {
+        let response = edge.request(method, &format!("/{STORE_HASH}.narinfo"));
+        let (headers, body) = response_parts(&response);
+        assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
+        assert!(
+            headers.contains(&format!("Narjar-Cache-Status: {expected}\r\n")),
+            "{headers}"
+        );
+        assert!(headers.contains("Cache-Control: no-store"), "{headers}");
+        assert!(body.is_empty());
+    }
+    worker.join().unwrap();
+    fs::create_dir(
+        edge.data_dir
+            .join("11111111111111111111111111111111.narinfo"),
+    )
+    .unwrap();
+    for method in ["GET", "HEAD"] {
+        let response = edge.request(method, "/11111111111111111111111111111111.narinfo");
+        let (headers, body) = response_parts(&response);
+        assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
+        assert!(
+            headers.contains("Narjar-Cache-Status: error; reason=storage\r\n"),
+            "{headers}"
+        );
+        assert!(headers.contains("Cache-Control: no-store"), "{headers}");
+        assert!(body.is_empty());
+    }
+    let (signal, status) = edge.stop();
+    assert_clean_shutdown(signal, status);
+}
+
 fn assert_edge_waits_for_the_exact_payload(end: PayloadEnd) {
     let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
     let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
@@ -92,6 +370,11 @@ fn assert_edge_waits_for_the_exact_payload(end: PayloadEnd) {
             .starts_with("HTTP/1.1 404")
     );
     assert!(
+        response_parts(&rejected_follower)
+            .0
+            .contains("Narjar-Cache-Status: error; reason=capacity\r\n")
+    );
+    assert!(
         response_parts(&edge.request("GET", "/healthz"))
             .0
             .starts_with("HTTP/1.1 200")
@@ -113,11 +396,19 @@ fn assert_edge_waits_for_the_exact_payload(end: PayloadEnd) {
     if successful {
         assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
         assert!(headers.contains("Cache-Control: no-store"), "{headers}");
+        assert!(
+            headers.contains("Narjar-Cache-Status: fill\r\n"),
+            "{headers}"
+        );
         assert!(String::from_utf8_lossy(&body).contains("Compression: none\n"));
         let payload = edge.request("GET", &format!("/nar/{NARJAR_HASH}.nar"));
         assert_eq!(response_parts(&payload).1, NAR_BYTES);
     } else {
         assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
+        assert!(
+            headers.contains("Narjar-Cache-Status: error; reason=transient\r\n"),
+            "{headers}"
+        );
         assert!(!edge.data_dir.join(format!("{STORE_HASH}.narinfo")).exists());
         assert_eq!(
             fs::read_dir(edge.data_dir.join("nar/.tmp"))
@@ -288,6 +579,11 @@ fn read_through_http_failed_renewal_is_a_miss_without_revoking_the_payload() {
     let edge = RunningServer::start_in_with_workers(directory, 2, &args);
     for method in ["GET", "HEAD"] {
         let response = edge.request(method, &route);
+        assert!(
+            response_parts(&response)
+                .0
+                .contains("Narjar-Cache-Status: error; reason=capacity\r\n")
+        );
         assert!(
             response_parts(&response).0.starts_with("HTTP/1.1 404"),
             "{method} must fail open when a new durable promise cannot be made: {}",

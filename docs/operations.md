@@ -132,6 +132,39 @@ dependencies. If a dependency is unavailable, Nix can build it and the paths tha
 depend on it locally, provided it has their build recipes. A cache miss cannot
 make a path buildable when Nix has no recipe for it.
 
+### Request outcomes
+
+Read-through narinfo GET and HEAD responses include `Narjar-Cache-Status`:
+
+| Value | Meaning |
+| --- | --- |
+| `hit` | Served local content, including a repaired local retention record, without fetching upstream. |
+| `fill` | This request completed an upstream fill and durable local publication. |
+| `coalesced` | This request waited for another request's successful fill. |
+| `negative; reason=REASON` | Reused a cached failure, retaining its original reason. |
+| `error; reason=REASON` | This request failed, including a failed shared fill or local admission failure. |
+
+Reasons are `not_found`, `transient`, `invalid`, `capacity`, and `storage`, the
+same vocabulary used by `narjar_edge_failures_total`. `transient` includes
+timeouts, connection errors and upstream overload; `invalid` includes rejected
+metadata and payloads. Capacity and local storage failures are not negatively
+cached. Every failure remains a local 404 with `Cache-Control: no-store`.
+Headers contain no upstream addresses, paths or raw error messages. Requests
+rejected before edge lookup, including unauthorized requests, omit this header.
+
+To distinguish the initial download from a warm local read, request the same
+store hash twice:
+
+~~~sh
+curl -sS -D - -o /dev/null http://127.0.0.1:5000/STORE_HASH.narinfo
+curl -sS -D - -o /dev/null http://127.0.0.1:5000/STORE_HASH.narinfo
+~~~
+
+A cold successful request reports `fill`; the next reports `hit`. A simultaneous
+request may report `coalesced`. The header describes this request's narinfo
+lookup, not subsequent NAR downloads. It uses a Narjar-specific field because
+fail-open 404s are generated locally rather than forwarded upstream responses.
+
 ### Limits and timeouts
 
 The existing size, decoder-memory, staging-space and minimum-free controls

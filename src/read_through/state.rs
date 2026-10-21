@@ -9,7 +9,7 @@ use crate::cache::{
     storage::StoreHash,
 };
 
-use super::{Deadline, EdgeFailure};
+use super::{Deadline, EdgeFailure, EdgeHit, EdgeMiss};
 
 const MAX_TABLE_ENTRIES: usize = 4096;
 const MAX_WAITERS: usize = 64;
@@ -106,7 +106,7 @@ impl State {
 
 enum Progress {
     Running { waiters: usize },
-    Complete(Result<(), EdgeFailure>),
+    Complete(Result<EdgeHit, EdgeMiss>),
 }
 
 impl Default for Progress {
@@ -125,19 +125,22 @@ impl Flight {
     pub(super) fn wait(
         &self,
         deadline: Deadline,
-        completed: impl FnOnce(Result<(), EdgeFailure>) -> Result<(), EdgeFailure>,
-    ) -> Result<(), EdgeFailure> {
-        let mut progress = self.progress.lock().map_err(|_| EdgeFailure::Storage)?;
-        let remaining = deadline.remaining()?;
+        completed: impl FnOnce(Result<EdgeHit, EdgeMiss>) -> Result<EdgeHit, EdgeMiss>,
+    ) -> Result<EdgeHit, EdgeMiss> {
+        let mut progress = self
+            .progress
+            .lock()
+            .map_err(|_| EdgeMiss::Failed(EdgeFailure::Storage))?;
+        let remaining = deadline.remaining().map_err(EdgeMiss::Failed)?;
         match &mut *progress {
             Progress::Complete(result) => {
-                deadline.remaining()?;
+                deadline.remaining().map_err(EdgeMiss::Failed)?;
                 let result = *result;
                 drop(progress);
                 return completed(result);
             }
             Progress::Running { waiters } if *waiters >= MAX_WAITERS => {
-                return Err(EdgeFailure::Capacity);
+                return Err(EdgeMiss::Failed(EdgeFailure::Capacity));
             }
             Progress::Running { waiters } => *waiters += 1,
         }
@@ -147,22 +150,22 @@ impl Flight {
                 Progress::Running { .. } => true,
                 Progress::Complete(_) => false,
             })
-            .map_err(|_| EdgeFailure::Storage)?;
+            .map_err(|_| EdgeMiss::Failed(EdgeFailure::Storage))?;
         match &mut *progress {
             Progress::Complete(result) => {
-                deadline.remaining()?;
+                deadline.remaining().map_err(EdgeMiss::Failed)?;
                 let result = *result;
                 drop(progress);
                 completed(result)
             }
             Progress::Running { waiters } => {
                 *waiters -= 1;
-                Err(EdgeFailure::Transient)
+                Err(EdgeMiss::Failed(EdgeFailure::Transient))
             }
         }
     }
 
-    pub(super) fn finish(&self, result: Result<(), EdgeFailure>) {
+    pub(super) fn finish(&self, result: Result<EdgeHit, EdgeMiss>) {
         if let Ok(mut progress) = self.progress.lock() {
             *progress = Progress::Complete(result);
             self.completed.notify_all();
@@ -227,13 +230,13 @@ mod tests {
     #[test]
     fn followers_share_a_failed_generation_even_without_negative_caching() {
         let flight = Flight::default();
-        flight.finish(Err(EdgeFailure::Invalid));
+        flight.finish(Err(EdgeMiss::Failed(EdgeFailure::Invalid)));
         assert_eq!(
             flight.wait(
                 Deadline::new(Duration::from_secs(1)).unwrap(),
                 std::convert::identity
             ),
-            Err(EdgeFailure::Invalid)
+            Err(EdgeMiss::Failed(EdgeFailure::Invalid))
         );
     }
 
@@ -245,19 +248,19 @@ mod tests {
             flight.wait(expired, |_| panic!(
                 "an expired wait must not retry a running fill"
             )),
-            Err(EdgeFailure::Transient)
+            Err(EdgeMiss::Failed(EdgeFailure::Transient))
         );
         assert!(matches!(
             *flight.progress.lock().unwrap(),
             Progress::Running { waiters: 0 }
         ));
-        flight.finish(Ok(()));
+        flight.finish(Ok(EdgeHit::Local));
         assert_eq!(
             flight.wait(
                 Deadline::new(Duration::from_secs(1)).unwrap(),
                 std::convert::identity
             ),
-            Ok(())
+            Ok(EdgeHit::Local)
         );
     }
 
@@ -289,7 +292,7 @@ mod tests {
                 Deadline::new(Duration::from_secs(1)).unwrap(),
                 std::convert::identity
             ),
-            Err(EdgeFailure::Capacity)
+            Err(EdgeMiss::Failed(EdgeFailure::Capacity))
         );
     }
 }
