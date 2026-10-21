@@ -66,9 +66,9 @@ pub(super) enum Diagnostics {
 
 impl HostingArgs {
     pub(crate) fn prepare(self, minimum_lease: Option<u64>) -> Result<HostingConfig, String> {
-        match (self.onboarding, minimum_lease) {
-            (true, Some(lease)) if lease < 900 => return Err("onboarding's 300-second client TTL requires an advertisement lease of at least 900 seconds".into()),
-            (true, Some(_) | None) | (false, _) => {}
+        match !self.onboarding || minimum_lease.is_none_or(|lease| lease >= 900) {
+            true => {}
+            false => return Err("onboarding's 300-second client TTL requires an advertisement lease of at least 900 seconds".into()),
         }
         match self.public_url {
             None => Ok(HostingConfig(HostingState::Disabled)),
@@ -429,6 +429,33 @@ mod tests {
             removed,
             "dropping the owned advertisement sends its goodbye"
         );
+    }
+
+    #[test]
+    fn onboarding_retention_is_only_required_for_an_enabled_page() {
+        for (onboarding, minimum_lease, accepted) in [
+            (false, None, true),
+            (false, Some(0), true),
+            (false, Some(899), true),
+            (true, None, true),
+            (true, Some(0), false),
+            (true, Some(899), false),
+            (true, Some(900), true),
+            (true, Some(901), true),
+        ] {
+            let arguments = HostingArgs {
+                public_url: Some("https://cache.example".parse().unwrap()),
+                advertise: false,
+                discovery_name: None,
+                onboarding,
+                onboarding_diagnostics: false,
+            };
+            assert_eq!(
+                arguments.prepare(minimum_lease).is_ok(),
+                accepted,
+                "onboarding={onboarding}, lease={minimum_lease:?}"
+            );
+        }
     }
 
     #[test]
