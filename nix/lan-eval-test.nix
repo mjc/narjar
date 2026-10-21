@@ -124,6 +124,10 @@ in
   assert valid directClient;
   assert valid multipleKeys;
   assert valid privateCache;
+  # Keep setup-page defaults aligned with discover config's offline output.
+  assert lan.services.narjar.client.priority == 30;
+  assert lan.services.narjar.client.positiveTtlSeconds == 300;
+  assert lan.services.narjar.client.negativeTtlSeconds == 1;
   assert localClient.services.avahi.nssmdns4;
   assert localClient.services.narjar.edge.leaseSeconds >= 2 * localClient.services.narjar.client.positiveTtlSeconds + 300;
   assert !directClient.services.narjar.enable;

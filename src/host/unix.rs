@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-pub(super) fn notify_service_ready(socket: Option<&std::ffi::OsStr>) -> io::Result<()> {
+pub(crate) fn notify_service_ready(socket: Option<&std::ffi::OsStr>) -> io::Result<()> {
     let Some(socket) = socket else {
         return Ok(());
     };
@@ -35,10 +35,10 @@ pub(super) fn notify_service_ready(socket: Option<&std::ffi::OsStr>) -> io::Resu
     Ok(())
 }
 
-pub(super) struct ShutdownRegistration(Vec<SigId>);
+pub(crate) struct ShutdownRegistration(Vec<SigId>);
 
 impl ShutdownRegistration {
-    pub(super) fn complete(self) {}
+    pub(crate) fn complete(self) {}
 }
 
 impl Drop for ShutdownRegistration {
@@ -49,7 +49,7 @@ impl Drop for ShutdownRegistration {
     }
 }
 
-pub(super) fn install_shutdown(stopping: Arc<AtomicBool>) -> io::Result<ShutdownRegistration> {
+pub(crate) fn install_shutdown(stopping: Arc<AtomicBool>) -> io::Result<ShutdownRegistration> {
     let signal_count = Arc::new(AtomicUsize::new(0));
     [SIGINT, SIGTERM].into_iter().try_fold(
         ShutdownRegistration(Vec::new()),
@@ -71,7 +71,7 @@ pub(super) fn install_shutdown(stopping: Arc<AtomicBool>) -> io::Result<Shutdown
     )
 }
 
-pub(super) fn accept_error_kind(error: &io::Error) -> io::ErrorKind {
+pub(crate) fn accept_error_kind(error: &io::Error) -> io::ErrorKind {
     pending_connection_error_kind(error)
 }
 

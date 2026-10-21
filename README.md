@@ -347,6 +347,29 @@ Advertisement and the page are independently opt-in. Existing HTTPS cache URLs
 work too; discovery retains their TLS policy. See [LAN discovery](https://github.com/mjc/narjar/blob/main/docs/operations.md#lan-discovery-and-setup)
 for the announcement format, firewall settings, and removal.
 
+Find advertised caches without changing your Nix configuration:
+
+```sh
+narjar discover browse --timeout-seconds 5 --probe
+```
+
+Browsing shows cache URLs and whether a setup page is advertised. Optional
+probes check availability without sending credentials or accepting signing keys.
+After confirming the operator's keys, print client configuration offline:
+
+```sh
+narjar discover config --url http://cache.local:8080 \
+  --trusted-public-key 'cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=' \
+  --format nixos --mode local-edge
+```
+
+That key applies to the read-through example above. Use your operator's key for
+another cache. Import Narjar's NixOS module before applying the printed
+configuration. Use `--format nix-conf` for direct Nix configuration on Linux or
+macOS, and `--mode direct` for a private cache with separately provisioned read
+credentials. `--positive-ttl-seconds` must fit the operator's retention policy.
+Keys and settings are never installed automatically.
+
 ## Storage and compression
 
 The default `flat` backend stores each canonical, uncompressed NAR as a file.

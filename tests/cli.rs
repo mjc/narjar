@@ -365,6 +365,51 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
 }
 
 #[test]
+fn discovery_configuration_is_offline_repeatable_and_keeps_notices_off_stdout() {
+    let key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
+    let arguments = [
+        "discover",
+        "config",
+        "--url",
+        "https://offline.example",
+        "--trusted-public-key",
+        key,
+        "--format",
+        "nix-conf",
+    ];
+    let first = run(&arguments);
+    let second = run(&arguments);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(first.stdout, second.stdout);
+    let text = String::from_utf8(first.stdout).unwrap();
+    assert!(text.starts_with("extra-substituters = https://offline.example?priority=30\n"));
+    assert!(!text.contains("SHA-256"));
+    assert!(String::from_utf8_lossy(&first.stderr).contains("SHA-256 of public-key line"));
+    assert_eq!(
+        run(&["discover", "config", "--url", "https://offline.example"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        run(&["discover", "browse", "--timeout-seconds", "0"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        run(&["discover", "browse", "--max-results", "65"])
+            .status
+            .code(),
+        Some(2)
+    );
+}
+
+#[test]
 fn cli_help_and_version_work_for_the_packaged_binary() {
     for arguments in [&["--help"][..], &["-h"][..]] {
         let output = run(arguments);

@@ -103,6 +103,17 @@ impl HttpUrl {
         self.0.scheme().as_str() == "https"
     }
 
+    pub(crate) fn is_origin(&self) -> bool {
+        (self.0.path().is_empty() || self.0.path().as_str() == "/") && self.0.query().is_none()
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.authority()
+            .port_to_u16()
+            .expect("validated port")
+            .unwrap_or(if self.is_https() { 443 } else { 80 })
+    }
+
     fn try_from_uri(uri: Uri<String>) -> Result<Self, HttpUrlError> {
         let uri = uri.normalize();
         match uri.scheme().as_str() {

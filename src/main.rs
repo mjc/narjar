@@ -1,7 +1,14 @@
 mod cache;
 mod config;
 mod control;
+mod discovery;
 mod error;
+#[cfg(unix)]
+#[path = "host/unix.rs"]
+mod host;
+#[cfg(windows)]
+#[path = "host/windows.rs"]
+mod host;
 mod http;
 mod http_client;
 mod http_url;
@@ -49,6 +56,7 @@ enum Command {
     Delete(operator::Delete),
     Stats(operator::Stats),
     Doctor(operator::Doctor),
+    Discover(discovery::Discover),
     Token(token::Token),
     Push(push::Push),
 }
@@ -84,6 +92,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Gc(args) => operator::gc(args),
         Command::Stats(args) => operator::stats(args),
         Command::Doctor(args) => operator::doctor(args),
+        Command::Discover(args) => discovery::run(args),
         Command::Token(args) => token::run(args),
         Command::Push(args) => push::run(args),
     }

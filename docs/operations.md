@@ -770,3 +770,28 @@ Disable `discovery.enable` to withdraw the service; previously cached
 announcements can remain until their TTL expires. Disable `onboarding.enable`
 to remove the root page. Neither action removes client configuration already
 installed on another machine. Avahi remains enabled if another service needs it.
+
+`narjar discover browse` listens for versioned Narjar advertisements for five
+seconds by default, with a maximum of 30 seconds and 16 retained instances.
+`--max-results` raises the instance cap up to 64. Repeated URLs are deduplicated;
+withdrawn services and invalid updates are removed. The command shuts down its
+discovery thread before exiting. It does not run discovery inside `serve`.
+
+`--probe` adds credential-free `/nix-cache-info` checks, with a five-second
+overall probe budget and at most two seconds per request. Redirects are rejected
+and response bodies are limited to 1 KiB. Probes use the canonical URL and normal
+certificate verification. `.local` probing requires the host's mDNS resolver;
+browsing itself uses native Rust DNS-SD. An availability result is not a signing
+trust decision. Windows can browse and print instructions, but Nix client
+configuration is for Linux/macOS hosts.
+
+`narjar discover config` requires a URL and one or more explicit
+`--trusted-public-key` arguments. It validates keys without making requests and
+prints either a NixOS module or additive `nix.conf` lines. Fingerprints and
+instructions go to stderr; stdout contains only the configuration. NixOS output
+defaults to a local edge; `nix-conf` supports direct substitution only. Local
+edges require public upstream reads. For a private cache, use direct mode and
+provision Nix read credentials separately. Client positive TTL defaults to 300
+seconds; use `--positive-ttl-seconds` to match the operator's policy. The remote
+retention period must cover twice that TTL plus 300 seconds. Remove the printed
+settings to stop using the cache. The command never edits system configuration.

@@ -29,14 +29,8 @@ use crate::{
     http::{PublicationRequest, ReadContext, ReadSource, prepare_publication, respond},
 };
 
-#[cfg(unix)]
-#[path = "server/host/unix.rs"]
-mod host;
-#[cfg(windows)]
-#[path = "server/host/windows.rs"]
-mod host;
 mod idle;
-use host::notify_service_ready;
+use crate::host::{self, notify_service_ready};
 
 struct Admissions {
     limit: usize,
