@@ -108,6 +108,14 @@ jobs:
         env:
           CARGO_INSTALL_VERSION: ${{ inputs.version }}
         run: ./ci/check-cargo-install-without-nix.ps1 -Version $env:CARGO_INSTALL_VERSION
+      - name: Package and run the Windows release archive
+        run: ./ci/package-windows-release.ps1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-release-${{ inputs.version == '' && 'source' || 'registry' }}
+          path: target/windows-release/*.zip
+          if-no-files-found: error
+          retention-days: 14
       - name: Stage the verified Windows executable and acceptance tests
         run: |
           $bundle = New-Item -ItemType Directory -Path target/windows-candidate -Force

@@ -8,6 +8,7 @@ export GITHUB_REPOSITORY=mjc/narjar RELEASE_TAG=v0.1.0 RELEASE_VERSION=0.1.0
 export GITHUB_OUTPUT=$PWD/target/output
 printf 'crate bytes\n' > target/release/narjar-0.1.0.crate
 printf 'binary bytes\n' > target/release/narjar-v0.1.0-x86_64-linux.tar.gz
+printf 'Windows binary bytes\n' > target/release/narjar-v0.1.0-x86_64-pc-windows-msvc.zip
 printf 'checksums\n' > target/release/SHA256SUMS
 printf 'notes\n' > target/release/release-notes.md
 
@@ -78,7 +79,7 @@ gh() {
     fi
     case "$scenario" in
       github-missing|github-draft|github-upload-failure) printf '{"draft":true}\n' ;;
-      github-public|github-mismatch) printf '{"draft":false}\n' ;;
+      github-public|github-mismatch|github-windows-mismatch) printf '{"draft":false}\n' ;;
       github-invalid-state) printf '{}\n' ;;
       *) printf 'Unexpected GitHub scenario: %s\n' "$scenario" >&2; return 1 ;;
     esac
@@ -95,6 +96,9 @@ gh() {
       local asset=$5
       cp "target/release/$asset" "target/github-release/$asset"
       [[ "$scenario" != github-mismatch ]] || printf 'different bytes\n' > "target/github-release/$asset"
+      if [[ "$scenario" == github-windows-mismatch && "$asset" == *.zip ]]; then
+        printf 'different Windows binary bytes\n' > "target/github-release/$asset"
+      fi
       ;;
     *) printf 'Unexpected gh call: %s\n' "$*" >&2; return 1 ;;
   esac
@@ -116,22 +120,24 @@ for scenario in github-missing github-draft github-public; do
   bash "$repository_root/ci/publish-github-release.sh"
   case "$scenario" in
     github-missing)
-      grep -Fq 'release create v0.1.0 target/release/narjar-0.1.0.crate target/release/narjar-v0.1.0-x86_64-linux.tar.gz target/release/SHA256SUMS --verify-tag' target/calls
+      grep -Fq 'release create v0.1.0 target/release/narjar-0.1.0.crate target/release/narjar-v0.1.0-x86_64-linux.tar.gz target/release/narjar-v0.1.0-x86_64-pc-windows-msvc.zip target/release/SHA256SUMS --verify-tag' target/calls
       test "$(grep -c 'releases?per_page=100' target/calls)" -eq 1
       if grep -Eq 'release (upload|edit)|--draft' target/calls; then exit 1; fi
       ;;
     github-draft)
       grep -Fq 'release upload v0.1.0' target/calls
       grep -Fq -- '--clobber' target/calls
+      grep -Fq 'target/release/narjar-v0.1.0-x86_64-pc-windows-msvc.zip' target/calls
       if grep -Fq 'release create' target/calls; then exit 1; fi
       ;;
     github-public)
-      test "$(grep -c 'release download' target/calls)" -eq 3
+      test "$(grep -c 'release download' target/calls)" -eq 4
+      grep -Fq -- '--pattern narjar-v0.1.0-x86_64-pc-windows-msvc.zip' target/calls
       require_no_release_mutation
       ;;
   esac
 done
-for scenario in github-unavailable github-mismatch github-invalid-state; do
+for scenario in github-unavailable github-mismatch github-windows-mismatch github-invalid-state; do
   export scenario
   : > target/calls
   if output=$(bash "$repository_root/ci/publish-github-release.sh" 2>&1); then
