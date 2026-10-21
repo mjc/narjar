@@ -14,9 +14,13 @@ return a cache miss so Nix can build them locally.
 
 ## Installation
 
-Install Rust 1.98 or later and a C toolchain. Linux and macOS also need
-pkg-config and SQLite development libraries. Windows uses the MSVC toolchain
-and Windows SDK, without SQLite. Then install Narjar:
+Prebuilt x86-64 Linux and Windows binaries are available from
+[GitHub releases](https://github.com/mjc/narjar/releases). See the
+[Windows quick start](#windows) for PowerShell commands.
+
+To build with Cargo, install Rust 1.98 or later and a C toolchain. Linux and
+macOS also need pkg-config and SQLite development libraries. Windows uses the
+MSVC toolchain and Windows SDK, without SQLite. Then install Narjar:
 
 ```sh
 cargo install --locked narjar
@@ -30,12 +34,9 @@ cd narjar
 cargo install --locked --path .
 ```
 
-The CLI supports Linux, macOS, and native Windows. Windows flat storage requires
-local NTFS. Native Nix-store serving and `push` are available on Linux and macOS;
-Windows can serve a standalone cache and accept HTTP uploads from those clients.
-Windows binaries link the Microsoft Visual C++ runtime supplied by the build
-tools. Install the [Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)
-when copying a binary to a machine without that runtime.
+The CLI supports Linux, macOS, and native Windows. Native Nix-store serving and
+`push` are available on Linux and macOS; Windows can serve a standalone cache
+and accept HTTP uploads from those clients.
 
 Nix packages are available for x86_64 Linux and Apple Silicon macOS, with a
 NixOS module and a Linux OCI image. Use flat storage on macOS; chunked storage
@@ -44,6 +45,51 @@ is Linux-only. To run with Nix:
 ```sh
 nix run github:mjc/narjar -- --help
 ```
+
+### Windows
+
+Download `narjar-v0.2.0-x86_64-pc-windows-msvc.zip` and `SHA256SUMS` from
+[GitHub releases](https://github.com/mjc/narjar/releases). In PowerShell, check
+the archive's hash against its entry in `SHA256SUMS`, then extract it:
+
+```powershell
+Get-FileHash .\narjar-v0.2.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+Expand-Archive .\narjar-v0.2.0-x86_64-pc-windows-msvc.zip -DestinationPath .
+Set-Location .\narjar-v0.2.0-x86_64-pc-windows-msvc
+```
+
+Install the [x64 Visual C++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe)
+if it is not already installed. The prebuilt binary needs no Rust toolchain,
+Windows SDK, Nix installation, or WSL.
+
+Keep the cache on local NTFS. Run setup and the server as the Windows account
+that will own the cache. This stores data and credentials under Local AppData,
+separately from the downloaded executable:
+
+```powershell
+.\narjar.exe --version
+$cache = "$env:LOCALAPPDATA\narjar-data"
+$credentials = "$env:LOCALAPPDATA\narjar-credentials"
+.\narjar.exe setup --data-dir $cache --credentials-dir $credentials
+.\narjar.exe serve --data-dir $cache --listen 127.0.0.1:5000
+```
+
+Setup asks for confirmation before creating files. The server runs in the
+foreground; stop it with Ctrl+C. In a second PowerShell window, opened in the
+same extracted directory, check the server and preview online GC:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:5000/healthz
+.\narjar.exe stats --url http://127.0.0.1:5000
+.\narjar.exe gc --online --data-dir "$env:LOCALAPPDATA\narjar-data" --delete-older-than 7d --dry-run --json
+```
+
+These commands bind to loopback. For remote clients, put the server behind a
+TLS reverse proxy and pass its public HTTPS URL to `setup --cache-url` when
+creating the cache. Securely copy `producer.sec` and `narjar.netrc` from the
+credentials directory to a Linux or macOS Nix host to [upload paths](#push-a-closure). Configure consumers using
+the public key as described in [Use the cache from Nix](#use-the-cache-from-nix).
+Use flat storage on Windows; chunked storage requires Linux.
 
 ## Create a cache
 
