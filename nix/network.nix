@@ -6,33 +6,9 @@
   inherit (lib) mkOption mkEnableOption mkIf mkMerge mkDefault types;
   cfg = config.services.narjar;
   client = cfg.client;
-  # An origin, without credentials, paths, queries or fragments.
-  originPattern = "(http|https)://([a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?)(:([1-9][0-9]{0,4}))?";
-  originType = types.addCheck (types.strMatching originPattern) (url: let
-    parts = builtins.match originPattern url;
-    portText = builtins.elemAt parts 4;
-    labels = lib.splitString "." (builtins.elemAt parts 1);
-  in
-    (portText == null || lib.toInt portText <= 65535)
-    && builtins.all (label: builtins.match "[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?" label != null) labels);
-  originParts =
-    if cfg.publicUrl == null
-    then null
-    else builtins.match originPattern cfg.publicUrl;
-  host =
-    if originParts == null
-    then ""
-    else builtins.elemAt originParts 1;
-  secure = originParts != null && builtins.elemAt originParts 0 == "https";
-  port =
-    if originParts == null || builtins.elemAt originParts 4 == null
-    then
-      (
-        if secure
-        then 443
-        else 80
-      )
-    else lib.toInt (builtins.elemAt originParts 4);
+  endpoint = import ./endpoint.nix {inherit lib;};
+  originType = endpoint.type;
+  inherit (endpoint.parse cfg.publicUrl) host secure port;
   loopbackParts = builtins.match "(127[.]0[.]0[.]1|[[]::1[]]):([1-9][0-9]{0,4})" cfg.listen;
   loopback = loopbackParts != null && lib.toInt (builtins.elemAt loopbackParts 1) <= 65535;
   acme = cfg.proxy.tls == "acme";

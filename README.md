@@ -314,6 +314,39 @@ without a local daemon or that outage behavior. Other substituters are retained
 unless `substituterPolicy = "only"` is selected. See [shared-cache deployment](https://github.com/mjc/narjar/blob/main/docs/operations.md#shared-cache-deployment)
 for priorities, TTLs, certificates, readiness and monitoring.
 
+### LAN discovery and setup
+
+A shared NixOS cache can advertise itself through Avahi and serve a setup page
+at its public URL. For a read-only cache on a trusted LAN:
+
+```nix
+{ config, ... }: {
+  services.narjar = {
+    enable = true;
+    publicUrl = "http://${config.services.avahi.hostName}.local:8080";
+    proxy = { enable = true; tls = "off"; };
+    edge = {
+      enable = true;
+      upstream = "https://cache.nixos.org";
+      trustedPublicKeys = [ "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=" ];
+    };
+    discovery.enable = true;
+    onboarding.enable = true;
+  };
+  networking.firewall.allowedTCPPorts = [ 8080 ];
+}
+```
+
+Use a configured hostname for Avahi. The page includes the cache URL, public
+keys, and client configurations for direct substitution or a local fail-open
+edge. Confirm signing keys with the operator over a trusted channel before
+using them; LAN discovery does not establish trust. NixOS clients configured
+with a `.local` cache URL enable Avahi name resolution.
+
+Advertisement and the page are independently opt-in. Existing HTTPS cache URLs
+work too; discovery retains their TLS policy. See [LAN discovery](https://github.com/mjc/narjar/blob/main/docs/operations.md#lan-discovery-and-setup)
+for the announcement format, firewall settings, and removal.
+
 ## Storage and compression
 
 The default `flat` backend stores each canonical, uncompressed NAR as a file.

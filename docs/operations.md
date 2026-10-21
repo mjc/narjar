@@ -707,3 +707,66 @@ For a separately managed proxy, terminate TLS there. Preserve Content-Length and
 Authorization, disable PUT request buffering, and align body limits and
 timeouts with Narjar. Restrict the direct HTTP listener to loopback or a trusted
 network. Socket activation is not supported.
+
+### LAN discovery and setup
+
+`services.narjar.discovery.enable` publishes an Avahi DNS-SD service derived
+from `publicUrl`. It uses `_http._tcp` or `_https._tcp` and the configured public
+port, including custom ports. The SRV target is the machine's Avahi hostname;
+the TXT URL is the canonical cache address that clients must use. A public DNS
+hostname still needs its normal DNS record. A `.local` public hostname must
+match `services.avahi.hostName` and `services.avahi.domainName`; advertising a
+different name does not register an alias. The [README](../README.md#lan-discovery-and-setup)
+shows a configuration using the existing hostname.
+
+The TXT records are:
+
+| Record | Meaning |
+| --- | --- |
+| `nix-cache=1` | Identifies a Nix binary cache to compatible HTTP service browsers. |
+| `narjar=1` | Version 1 of Narjar's announcement format. |
+| `url=...` | Configured canonical cache origin, including scheme and port. |
+| `path=/` | Cache root. |
+| `setup=/` | Setup page is enabled at the root; omitted otherwise. |
+
+Announcements contain no signing keys or credentials. Discovery does not add
+substituters, trust a key, or grant upload access. Avahi adjusts colliding service
+instance names; `discovery.name` can set a distinct display name without
+changing the cache URL. Clients must discard removed or expired announcements.
+Multicast normally remains within one LAN: VLANs, wireless isolation, and
+multicast filtering can prevent discovery even when the cache URL is reachable.
+
+The module enables native Avahi service and address publishing. Avahi's own
+`openFirewall` setting controls UDP 5353 and defaults to true; explicit settings
+and unrelated service records are preserved. Open the public cache's TCP port
+separately. Use Avahi's native interface restrictions where needed. Enabling
+discovery does not change HTTP versus HTTPS, read authentication, or metrics
+authorization. `.local` client URLs enable Avahi's NSS resolver on NixOS.
+
+`services.narjar.onboarding.enable` adds a static page to the exact `/` route
+of the managed proxy. Cache and API routes keep their existing handlers. The
+page shows the configured URL, role, public keys with their SHA-256 fingerprints,
+direct client examples, and retention guidance. Public-read caches also offer
+a local-edge example; private caches require direct clients with separately
+provisioned read credentials. Fingerprints
+hash the exact public-key line without a newline. Verify keys through an
+authenticated operator channel; the discovered page alone is not evidence of
+trust.
+
+The page and server share `auth.trustedPublicKeyValues`. This list contains
+public keys only and may be stored in Nix; read-through caches default it to
+`edge.trustedPublicKeys`. Uploaded and native-store caches can supply it
+directly. It is mutually exclusive with the runtime `auth.trustedPublicKeys`
+file, which evaluation cannot read to generate a page. Private signing keys,
+tokens, and netrc credentials must remain outside the Nix store.
+
+Set `onboarding.diagnostics = true` to include readiness and metrics links.
+They retain existing authorization. The page does not grant read credentials
+or expose private backend settings. Its client examples preserve other
+substituters by default; select `substituterPolicy = "only"` explicitly when
+the local edge must handle every substitution attempt.
+
+Disable `discovery.enable` to withdraw the service; previously cached
+announcements can remain until their TTL expires. Disable `onboarding.enable`
+to remove the root page. Neither action removes client configuration already
+installed on another machine. Avahi remains enabled if another service needs it.

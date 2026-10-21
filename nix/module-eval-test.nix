@@ -562,7 +562,7 @@ in
   assert evaluatesConfig disabledEdgeKeysWithNormalTrustConfig;
   assert !(evaluatesConfig conflictingEdgeKeysConfig);
   assert builtins.elem "trusted-public-keys:/run/cache-signing.pub" disabledEdgeKeysWithNormalTrustConfig.systemd.services.narjar.serviceConfig.LoadCredential;
-  assert lib.any (credential: lib.hasInfix "narjar-edge-trusted-keys" credential) edgeConfig.systemd.services.narjar.serviceConfig.LoadCredential;
+  assert lib.any (credential: lib.hasInfix "trusted-public-keys:/nix/store/" credential) edgeConfig.systemd.services.narjar.serviceConfig.LoadCredential;
   assert lib.all (config: !(evaluatesConfig config)) invalidEdgeConfigs;
   assert !(evaluatesConfig mixedSourcesConfig);
   assert !(evaluatesConfig compressedEdgeConfig);

@@ -26,6 +26,7 @@
       ];
     }).config;
   valid = cfg: (builtins.tryEval cfg.system.build.toplevel.drvPath).success;
+  lanCheck = import ./lan-eval-test.nix {inherit pkgs evaluate valid;};
   server = settings:
     evaluate {
       services.narjar = {enable = true;} // settings;
@@ -396,4 +397,4 @@ in
         };
       };
     })
-  ]; "${proxyCheck}"
+  ]; "${proxyCheck}; ${lanCheck}"

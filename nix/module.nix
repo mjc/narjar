@@ -40,8 +40,8 @@
   trustedPublicKeysFile =
     if cfg.auth.trustedPublicKeys != null
     then cfg.auth.trustedPublicKeys
-    else if cfg.edge.enable && cfg.edge.trustedPublicKeys != []
-    then pkgs.writeText "narjar-edge-trusted-keys" (lib.concatStringsSep "\n" cfg.edge.trustedPublicKeys + "\n")
+    else if cfg.auth.trustedPublicKeyValues != []
+    then pkgs.writeText "narjar-trusted-keys" (lib.concatStringsSep "\n" cfg.auth.trustedPublicKeyValues + "\n")
     else null;
   filesystemSampleFile =
     if cfg.statsFilesystemSample != null
@@ -501,7 +501,7 @@
     ]
   );
 in {
-  imports = [./network.nix];
+  imports = [./network.nix ./lan.nix];
   options.services.narjar = {
     enable = lib.mkEnableOption "the Narjar binary cache";
 
@@ -795,6 +795,15 @@ in {
     };
 
     auth = {
+      trustedPublicKeyValues = lib.mkOption {
+        type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9._-]+:[A-Za-z0-9+/]{43}=");
+        default =
+          if cfg.edge.enable
+          then cfg.edge.trustedPublicKeys
+          else [];
+        defaultText = lib.literalExpression "if config.services.narjar.edge.enable then config.services.narjar.edge.trustedPublicKeys else []";
+        description = "Inline producer public keys shared by server verification and setup instructions. Public keys are stored in the Nix store. Mutually exclusive with the trustedPublicKeys file.";
+      };
       readTokens = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
@@ -834,11 +843,15 @@ in {
       }
       {
         assertion = !cfg.edge.enable || trustedPublicKeysFile != null;
-        message = "services.narjar.edge requires trustedPublicKeys or auth.trustedPublicKeys";
+        message = "services.narjar.edge requires inline trusted public keys or auth.trustedPublicKeys";
       }
       {
-        assertion = !cfg.edge.enable || cfg.edge.trustedPublicKeys == [] || cfg.auth.trustedPublicKeys == null;
-        message = "services.narjar.edge.trustedPublicKeys and auth.trustedPublicKeys are mutually exclusive";
+        assertion = cfg.auth.trustedPublicKeyValues == [] || cfg.auth.trustedPublicKeys == null;
+        message = "services.narjar.auth.trustedPublicKeyValues and auth.trustedPublicKeys are mutually exclusive";
+      }
+      {
+        assertion = !cfg.edge.enable || cfg.edge.trustedPublicKeys == [] || cfg.auth.trustedPublicKeyValues == cfg.edge.trustedPublicKeys;
+        message = "services.narjar.edge.trustedPublicKeys must match auth.trustedPublicKeyValues";
       }
       {
         assertion = !cfg.edge.configureClient || (cfg.edge.enable && !cfg.privateRead && cfg.edge.trustedPublicKeys != [] && (lib.hasPrefix "127.0.0.1:" cfg.listen || lib.hasPrefix "[::1]:" cfg.listen));
