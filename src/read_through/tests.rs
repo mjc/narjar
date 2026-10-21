@@ -948,6 +948,24 @@ fn followers_keep_the_local_hit_outcome_from_a_shared_flight() {
 }
 
 #[test]
+fn a_cached_representation_failure_retries_for_a_coalesced_logical_nar() {
+    let fixture = Fixture::new();
+    let retries = AtomicUsize::new(0);
+
+    let result = finish_shared_fill_or_retry_representation(
+        Key::Nar(fixture.identity.hash()),
+        Err(EdgeMiss::Cached(EdgeFailure::Transient)),
+        || {
+            retries.fetch_add(1, Ordering::Relaxed);
+            Ok(EdgeHit::Filled)
+        },
+    );
+
+    assert_eq!(result, Ok(EdgeHit::Filled));
+    assert_eq!(retries.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn progressing_payload_can_outlive_the_network_idle_timeout() {
     let fixture = Fixture::new();
     let metadata = fixture.metadata(

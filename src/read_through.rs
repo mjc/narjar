@@ -599,9 +599,9 @@ fn finish_shared_fill_or_retry_representation(
         Key::Nar(_) => result.or_else(|miss| match miss {
             EdgeMiss::Failed(
                 EdgeFailure::Authoritative404 | EdgeFailure::Transient | EdgeFailure::Invalid,
-            ) => retry(),
-            EdgeMiss::Failed(EdgeFailure::Capacity | EdgeFailure::Storage)
-            | EdgeMiss::Cached(_) => Err(miss),
+            )
+            | EdgeMiss::Cached(_) => retry(),
+            EdgeMiss::Failed(EdgeFailure::Capacity | EdgeFailure::Storage) => Err(miss),
         }),
     }
 }
