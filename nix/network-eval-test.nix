@@ -186,6 +186,25 @@ in
   assert ipv6Backend.services.nginx.virtualHosts."cache.example".locations."/".proxyPass == "http://[::1]:5000";
   assert inheritedUrl.services.narjar.client.url == inheritedUrl.services.narjar.publicUrl;
   assert builtins.all (cfg: !valid cfg) [
+    (client {
+      mode = "local-edge";
+      url = "http://127.0.0.1:5000";
+    })
+    (client {
+      mode = "local-edge";
+      url = "http://localhost:5000";
+    })
+    (evaluate {
+      services.narjar = {
+        listen = "[::1]:5000";
+        client = {
+          enable = true;
+          mode = "local-edge";
+          url = "http://localhost:5000";
+          trustedPublicKeys = [key];
+        };
+      };
+    })
     (server (sharedEdgeOptions
       // {
         listen = "[::1]:5000";

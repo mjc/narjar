@@ -67,24 +67,21 @@
         else 80;
     };
   upstreamOrigin = normalizedOrigin cfg.edge.upstream;
-  localOrigins =
-    [
-      {
-        scheme = "http";
-        host = "127.0.0.1";
-        port = backendPort;
-      }
-    ]
-    ++ lib.concatMap (listener:
-      map (name: {
-        scheme =
-          if listener.ssl
-          then "https"
-          else "http";
-        host = normalizedHost name;
-        port = listener.port;
-      }) ([host listener.addr] ++ lib.optional (builtins.elem listener.addr ["*" "0.0.0.0"]) "127.0.0.1"))
-    proxyListeners;
+  backendOrigin = {
+    scheme = "http";
+    host = "127.0.0.1";
+    port = backendPort;
+  };
+  proxyOrigins = lib.concatMap (listener:
+    map (name: {
+      scheme =
+        if listener.ssl
+        then "https"
+        else "http";
+      host = normalizedHost name;
+      port = listener.port;
+    }) ([host listener.addr] ++ lib.optional (builtins.elem listener.addr ["*" "0.0.0.0"]) "127.0.0.1"))
+  proxyListeners;
   localEdge = client.enable && client.mode == "local-edge";
   substituter =
     if localEdge
@@ -164,6 +161,14 @@ in {
   };
 
   config = mkMerge [
+    (mkIf (cfg.enable && cfg.edge.enable) {
+      assertions = [
+        {
+          assertion = upstreamOrigin != backendOrigin;
+          message = "services.narjar.edge.upstream must not point back to the loopback backend";
+        }
+      ];
+    })
     (mkIf cfg.proxy.enable {
       assertions = [
         {
@@ -179,7 +184,7 @@ in {
           message = "services.narjar.proxy.tls must agree with publicUrl's HTTP or HTTPS scheme";
         }
         {
-          assertion = !cfg.edge.enable || (upstreamOrigin != null && !builtins.elem upstreamOrigin localOrigins);
+          assertion = !cfg.edge.enable || (upstreamOrigin != null && !builtins.elem upstreamOrigin proxyOrigins);
           message = "services.narjar.edge.upstream must have a DNS or IPv4 HTTP(S) origin outside this server's backend and proxy listeners";
         }
         {
