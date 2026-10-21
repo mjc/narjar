@@ -20,6 +20,7 @@
             acceptTerms = true;
             defaults.email = "operator@example.org";
           };
+          services.nginx.enableReload = true;
         }
         extra
       ];
