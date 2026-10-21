@@ -41,7 +41,7 @@ default-members = ["."]
 default = ["application"]
 application = [
     "dep:clap", "dep:crossbeam-channel", "dep:digest-io", "dep:ed25519-dalek",
-    "dep:enum-map", "dep:fluent-uri", "dep:lzma-rust2", "dep:xz4rust",
+    "dep:enum-map", "dep:fluent-uri", "dep:hostname-validator", "dep:lzma-rust2", "dep:xz4rust",
     "dep:memchr", "dep:mincdc", "dep:mio", "dep:mdns-sd", "dep:httparse", "dep:postcard", "dep:rustix",
     "dep:sqlite", "dep:signal-hook", "dep:serde_json", "dep:subtle",
     "dep:tempfile", "dep:structured-zstd", "dep:ureq", "dep:fs_at", "dep:windows-sys", "dep:getrandom", "dep:scopeguard",
@@ -74,7 +74,8 @@ data-encoding = { version = "=2.11.1", default-features = false, features = ["al
 digest-io = { optional = true, version = "=0.1.0", default-features = false }
 ed25519-dalek = { optional = true, version = "=3.0.0", default-features = false, features = ["signature"] }
 enum-map = { optional = true, version = "=3.1.0", default-features = false, features = ["derive"] }
-fluent-uri = { optional = true, version = "=0.4.1", default-features = false, features = ["std"] }
+fluent-uri = { optional = true, version = "=0.4.1", default-features = false, features = ["std", "net"] }
+hostname-validator = { optional = true, version = "=1.1.1", default-features = false }
 getrandom = { optional = true, version = "=0.2.17", default-features = false, features = ["std"] }
 lzma-rust2 = { optional = true, version = "=0.21.0", default-features = false, features = ["std", "xz", "encoder", "optimization"] }
 xz4rust = { optional = true, version = "=0.2.3", default-features = false, features = ["std", "bcj", "crc64", "sha256", "delta", "no_unsafe"] }

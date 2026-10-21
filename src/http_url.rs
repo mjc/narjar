@@ -2,7 +2,7 @@ use std::{fmt, str::FromStr};
 
 use fluent_uri::{
     Uri, UriRef,
-    component::Authority,
+    component::{Authority, Host},
     pct_enc::{
         EStr, EString,
         encoder::{Data, Path},
@@ -103,8 +103,29 @@ impl HttpUrl {
         self.0.scheme().as_str() == "https"
     }
 
-    pub(crate) fn is_origin(&self) -> bool {
-        (self.0.path().is_empty() || self.0.path().as_str() == "/") && self.0.query().is_none()
+    pub(crate) fn into_origin(self) -> Option<Self> {
+        let is_origin =
+            (self.0.path().is_empty() || self.0.path().as_str() == "/") && self.0.query().is_none();
+        let builder = Uri::builder().scheme(self.0.scheme());
+        let builder = match (is_origin, self.authority().host_parsed()) {
+            (true, Host::Ipv4(address)) => {
+                builder.authority_with(|builder| builder.host(address).port(self.port()))
+            }
+            (true, Host::Ipv6(address)) => {
+                builder.authority_with(|builder| builder.host(address).port(self.port()))
+            }
+            (true, Host::RegName(name)) => {
+                builder.authority_with(|builder| builder.host(name).port(self.port()))
+            }
+            (false, _) | (true, Host::IpvFuture { .. }) => return None,
+        };
+        Some(Self(
+            builder
+                .path(EStr::EMPTY)
+                .build()
+                .expect("validated origin components form an HTTP URL")
+                .normalize(),
+        ))
     }
 
     pub(crate) fn port(&self) -> u16 {

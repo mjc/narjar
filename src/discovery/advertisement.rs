@@ -18,39 +18,14 @@ impl FromStr for CacheOrigin {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let url: HttpUrl = value.parse().map_err(|error| format!("{error}"))?;
-        let host = url.host();
-        let supported_host = host.parse::<IpAddr>().is_ok()
-            || (!is_legacy_numeric_host(host)
-                && host.split('.').all(|label| {
-                    let bytes = label.as_bytes();
-                    bytes.len() <= 63
-                        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-                        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-                        && bytes
-                            .iter()
-                            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-                }));
-        match url.is_origin() && supported_host && url.port() != 0 && url.as_str().len() <= 251 {
-            true => {
-                let scheme = if url.is_https() { "https" } else { "http" };
-                let host = if host.contains(':') {
-                    format!("[{host}]")
-                } else {
-                    host.to_owned()
-                };
-                let default_port = if url.is_https() { 443 } else { 80 };
-                let port = if url.port() == default_port {
-                    String::new()
-                } else {
-                    format!(":{}", url.port())
-                };
-                let canonical = format!("{scheme}://{host}{port}")
-                    .parse()
-                    .expect("validated origin components form an HTTP URL");
-                Ok(Self(canonical))
-            }
-            false => Err("cache URL must be an HTTP(S) origin of at most 251 bytes".into()),
-        }
+        url.into_origin()
+            .filter(|origin| {
+                origin.port() != 0
+                    && origin.as_str().len() <= 251
+                    && is_unambiguous_network_host(origin.host())
+            })
+            .map(Self)
+            .ok_or_else(|| "cache URL must be an HTTP(S) origin of at most 251 bytes".into())
     }
 }
 
@@ -66,9 +41,14 @@ impl CacheOrigin {
     pub(super) fn is_network_host(&self) -> bool {
         match self.0.host().parse::<IpAddr>() {
             Ok(address) => is_permitted_probe_destination(address),
-            Err(_) => self.0.host() != "localhost" && !self.0.host().ends_with(".localhost"),
+            Err(_) => !(self.0.host() == "localhost" || self.0.host().ends_with(".localhost")),
         }
     }
+}
+
+fn is_unambiguous_network_host(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok()
+        || (hostname_validator::is_valid(host) && !is_legacy_numeric_host(host))
 }
 
 fn is_legacy_numeric_host(host: &str) -> bool {
@@ -80,7 +60,7 @@ fn is_legacy_numeric_host(host: &str) -> bool {
 
 pub(super) fn is_permitted_probe_destination(address: IpAddr) -> bool {
     let address = address.to_canonical();
-    !address.is_loopback() && !address.is_unspecified()
+    !(address.is_loopback() || address.is_unspecified())
 }
 
 #[derive(Debug)]
@@ -293,6 +273,36 @@ mod tests {
         assert!(
             catalog.unique_caches().is_empty(),
             "invalid updates must remove stale accepted data"
+        );
+    }
+
+    #[test]
+    fn origin_normalization_preserves_network_identity_without_rebuilding_urls() {
+        for (input, expected) in [
+            ("HTTP://CACHE.EXAMPLE:80/", "http://cache.example"),
+            ("https://CACHE.EXAMPLE:0443", "https://cache.example"),
+            ("http://cache.example:08081", "http://cache.example:8081"),
+            (
+                "http://[2001:0DB8:0:0::1]:08080/",
+                "http://[2001:db8::1]:8080",
+            ),
+            ("https://[2001:db8::1]:443/", "https://[2001:db8::1]"),
+        ] {
+            assert_eq!(input.parse::<CacheOrigin>().unwrap().as_str(), expected);
+        }
+        assert!(
+            "http://[v1.cache]".parse::<CacheOrigin>().is_err(),
+            "an unsupported address family must not become a DNS name"
+        );
+        assert!(
+            format!("http://{}.example", "a".repeat(64))
+                .parse::<CacheOrigin>()
+                .is_err()
+        );
+        assert!(
+            format!("http://{}.example", "a".repeat(63))
+                .parse::<CacheOrigin>()
+                .is_ok()
         );
     }
 
