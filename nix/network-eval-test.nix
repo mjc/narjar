@@ -42,23 +42,27 @@
       tls = "off";
     };
   };
-  existingProxy = evaluate {
-    services.narjar = {
-      enable = true;
-      publicUrl = "https://cache.example";
-      proxy = {
+  existingTlsProxy = policy:
+    evaluate {
+      services.narjar = {
         enable = true;
-        tls = "existing";
+        publicUrl = "https://cache.example";
+        proxy = {
+          enable = true;
+          tls = "existing";
+        };
       };
+      services.nginx.virtualHosts."cache.example" =
+        {
+          sslCertificate = "/run/secrets/cache.crt";
+          sslCertificateKey = "/run/secrets/cache.key";
+          locations."/other".return = "200 ok";
+        }
+        // policy;
+      services.nginx.virtualHosts."other.example".locations."/".return = "200 ok";
     };
-    services.nginx.virtualHosts."cache.example" = {
-      forceSSL = true;
-      sslCertificate = "/run/secrets/cache.crt";
-      sslCertificateKey = "/run/secrets/cache.key";
-      locations."/other".return = "200 ok";
-    };
-    services.nginx.virtualHosts."other.example".locations."/".return = "200 ok";
-  };
+  existingProxy = existingTlsProxy {forceSSL = true;};
+  existingAddSSL = existingTlsProxy {addSSL = true;};
   client = settings:
     evaluate {
       services.narjar.client =
@@ -155,6 +159,9 @@ in
   assert builtins.all (listener: listener.port == 8080 && !listener.ssl) lan.services.nginx.virtualHosts."cache.example".listen;
   assert !lan.services.nginx.virtualHosts."cache.example".enableACME;
   assert valid existingProxy;
+  assert valid existingAddSSL;
+  assert !existingAddSSL.services.nginx.virtualHosts."cache.example".onlySSL;
+  assert builtins.any (listener: listener.port == 80 && !listener.ssl) existingAddSSL.services.nginx.virtualHosts."cache.example".listen;
   assert existingProxy.services.nginx.virtualHosts."cache.example".forceSSL;
   assert !existingProxy.services.nginx.virtualHosts."cache.example".onlySSL;
   assert existingProxy.services.nginx.virtualHosts ? "other.example";

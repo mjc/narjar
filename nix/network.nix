@@ -212,7 +212,7 @@ in {
         virtualHosts.${host} = {
           enableACME = mkDefault acme;
           forceSSL = mkDefault acme;
-          onlySSL = mkDefault (secure && !publicHost.forceSSL);
+          onlySSL = mkDefault (secure && !publicHost.forceSSL && !publicHost.addSSL);
           listen = mkDefault (lib.concatMap (addr:
             [
               {
@@ -220,7 +220,7 @@ in {
                 ssl = secure;
               }
             ]
-            ++ lib.optional publicHost.forceSSL {
+            ++ lib.optional (publicHost.forceSSL || publicHost.addSSL) {
               inherit addr;
               port = 80;
               ssl = false;
