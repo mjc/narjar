@@ -79,6 +79,11 @@ const CONFIG_ENV: &[&str] = &[
     "NARJAR_SHUTDOWN_GRACE_SECONDS",
     "NARJAR_IO_TIMEOUT_SECONDS",
     "NARJAR_PUSH_TIMEOUT_SECONDS",
+    "NARJAR_PUBLIC_URL",
+    "NARJAR_ADVERTISE",
+    "NARJAR_DISCOVERY_NAME",
+    "NARJAR_ONBOARDING",
+    "NARJAR_ONBOARDING_DIAGNOSTICS",
 ];
 
 #[cfg(unix)]
@@ -362,6 +367,89 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
         .envs(environment.iter().copied())
         .output()
         .expect("narjar should run")
+}
+
+#[test]
+fn discovery_notices_only_require_the_narjar_module_for_a_local_edge() {
+    for (format, mode, needs_module) in [
+        ("nix-conf", "direct", false),
+        ("nixos", "direct", false),
+        ("nixos", "local-edge", true),
+    ] {
+        let output = run(&[
+            "discover",
+            "config",
+            "--url",
+            "https://offline.example",
+            "--trusted-public-key",
+            "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+            "--format",
+            format,
+            "--mode",
+            mode,
+        ]);
+        let notices = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{notices}");
+        assert_eq!(
+            notices.contains("requires Narjar's NixOS module"),
+            needs_module,
+            "{format}/{mode}: {notices}"
+        );
+        assert!(
+            notices.contains("at least 900 seconds"),
+            "all client modes need retention guidance: {notices}"
+        );
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("requires Narjar's NixOS module")
+        );
+    }
+}
+
+#[test]
+fn discovery_configuration_is_offline_repeatable_and_keeps_notices_off_stdout() {
+    let key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
+    let arguments = [
+        "discover",
+        "config",
+        "--url",
+        "https://offline.example",
+        "--trusted-public-key",
+        key,
+        "--format",
+        "nix-conf",
+    ];
+    let first = run(&arguments);
+    let second = run(&arguments);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(first.stdout, second.stdout);
+    let text = String::from_utf8(first.stdout).unwrap();
+    assert!(text.starts_with("extra-substituters = https://offline.example?priority=30\n"));
+    assert!(!text.contains("SHA-256"));
+    assert!(String::from_utf8_lossy(&first.stderr).contains("SHA-256 of public-key line"));
+    assert_eq!(
+        run(&["discover", "config", "--url", "https://offline.example"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        run(&["discover", "browse", "--timeout-seconds", "0"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        run(&["discover", "browse", "--max-results", "65"])
+            .status
+            .code(),
+        Some(2)
+    );
 }
 
 #[test]
@@ -1416,6 +1504,127 @@ struct HttpExchange {
     response: Vec<u8>,
 }
 
+#[test]
+fn onboarding_is_served_by_the_binary_without_external_services() {
+    let server = RunningServer::start_with_args(
+        "onboarding-native",
+        &["--public-url", "https://cache.example:8443", "--onboarding"],
+    );
+    let (headers, body) = response_parts(&server.request("GET", "/"));
+    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(headers.contains("Cache-Control: no-store\r\n"));
+    assert!(headers.contains("Content-Security-Policy:"));
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("https://cache.example:8443"));
+    assert!(text.contains(test_trusted_public_key().trim()));
+    assert!(text.contains("extra-substituters"));
+    assert!(!text.contains("href=\"/metrics\""));
+    assert!(text.contains("http://127.0.0.1:5000?priority=30"));
+    assert!(!text.contains(&format!("http://{}", server.address)));
+    assert!(!text.contains("producer.sec"));
+    let (head, body) = response_parts(&server.request("HEAD", "/"));
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(body.is_empty());
+    assert_eq!(
+        response_parts(&server.request("GET", "/nix-cache-info")).1,
+        CACHE_INFO
+    );
+    for path in ["/index.html", "/?ignored=1", "/main/", "/setup"] {
+        assert!(
+            !response_parts(&server.request("GET", path))
+                .0
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn private_onboarding_does_not_grant_cache_or_metrics_access() {
+    let server = RunningServer::start_with_auth(
+        "private-onboarding",
+        &[
+            "--public-url",
+            "https://private.example",
+            "--onboarding",
+            "--onboarding-diagnostics",
+        ],
+        Some(TEST_WRITE_TOKEN),
+        None,
+    );
+    let (headers, body) = response_parts(&server.request("GET", "/"));
+    assert!(headers.starts_with("HTTP/1.1 200"));
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("netrc"));
+    assert!(text.contains("href=\"/metrics\""));
+    assert!(!text.contains("local-edge"));
+    assert!(!text.contains("test-write-token"));
+    for path in ["/metrics", "/readyz", "/nix-cache-info"] {
+        assert!(
+            response_parts(&server.request("GET", path))
+                .0
+                .starts_with("HTTP/1.1 401")
+        );
+    }
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn onboarding_is_disabled_by_default_and_requires_an_explicit_origin() {
+    let server = RunningServer::start("no-onboarding");
+    assert!(
+        response_parts(&server.request("GET", "/"))
+            .0
+            .starts_with("HTTP/1.1 404")
+    );
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+    let output = run(&["serve", "--data-dir", "not-opened", "--onboarding"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--public-url"));
+}
+
+#[test]
+fn onboarding_rejects_incompatible_retention_before_opening_storage() {
+    let output = run(&[
+        "serve",
+        "--data-dir",
+        "not-opened",
+        "--serve-source",
+        "read-through",
+        "--edge-upstream",
+        "https://upstream.example",
+        "--edge-lease-seconds",
+        "600",
+        "--public-url",
+        "https://cache.example",
+        "--onboarding",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least 900 seconds"));
+    let server = RunningServer::start_with_workers(
+        "onboarding-retention",
+        2,
+        &[
+            "--serve-source",
+            "read-through",
+            "--edge-upstream",
+            "https://upstream.example",
+            "--edge-lease-seconds",
+            "900",
+            "--public-url",
+            "https://cache.example",
+            "--onboarding",
+        ],
+    );
+    let (_, body) = response_parts(&server.request("GET", "/"));
+    assert!(String::from_utf8_lossy(&body).contains("minimum advertisement lease is 900 seconds"));
+    let (signal, status) = server.stop();
+    assert_clean_shutdown(signal, status);
+}
+
 impl HttpExchange {
     fn sanitized_transcript(&self) -> String {
         let header_end = self
@@ -1574,6 +1783,9 @@ impl RunningServer {
     fn spawn(data_dir: &Path, workers: usize, extra_args: &[&str]) -> Child {
         let mut process = command();
         platform::configure_server_process(&mut process).expect("configure server process");
+        if extra_args.contains(&"--onboarding") {
+            process.env("PATH", "");
+        }
         process
             .args([
                 "serve",

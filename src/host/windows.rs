@@ -25,20 +25,19 @@ struct ShutdownContext {
 // therefore survives unregistration until that callback returns.
 static ACTIVE_SHUTDOWN: Mutex<Option<Arc<ShutdownContext>>> = Mutex::new(None);
 
-pub(super) struct ShutdownRegistration(Arc<ShutdownContext>);
+pub(crate) struct ShutdownRegistration(Arc<ShutdownContext>);
 
 impl ShutdownRegistration {
-    pub(super) fn complete(self) {
-        // SAFETY: all server workers have joined and their storage owners
-        // were explicitly dropped before this completion transition. This
-        // registration owns the event for its own shutdown, not a later server.
+    pub(crate) fn complete(self) {
+        // SAFETY: the caller has finished its work and released its resources.
+        // This registration owns its completion event, not a later command's.
         unsafe {
             SetEvent(self.0.complete.as_raw_handle());
         }
     }
 }
 
-pub(super) fn install_shutdown(stopping: Arc<AtomicBool>) -> io::Result<ShutdownRegistration> {
+pub(crate) fn install_shutdown(stopping: Arc<AtomicBool>) -> io::Result<ShutdownRegistration> {
     // SAFETY: null security attributes produce a non-inheritable, unnamed event.
     let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
     if event.is_null() {
@@ -124,7 +123,7 @@ unsafe extern "system" fn console_control(event: u32) -> i32 {
     1
 }
 
-pub(super) fn notify_service_ready(socket: Option<&std::ffi::OsStr>) -> io::Result<()> {
+pub(crate) fn notify_service_ready(socket: Option<&std::ffi::OsStr>) -> io::Result<()> {
     match socket {
         None => Ok(()),
         Some(_) => Err(io::Error::new(

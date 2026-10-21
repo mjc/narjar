@@ -22,6 +22,11 @@ const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 pub struct TrustedPublicKeys(BTreeMap<String, VerifyingKey>);
 
 impl TrustedPublicKeys {
+    pub(crate) fn encoded_keys(&self) -> impl ExactSizeIterator<Item = String> + '_ {
+        self.0
+            .iter()
+            .map(|(name, key)| format!("{name}:{}", BASE64.encode(key.as_bytes())))
+    }
     /// Returns whether this trust store contains no verification keys.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()

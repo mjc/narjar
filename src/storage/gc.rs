@@ -4265,6 +4265,7 @@ mod tests {
                     drop(crate::http::respond(
                         request,
                         crate::http::ReadContext {
+                            setup: None,
                             storage,
                             source: &crate::http::ReadSource::FlatCache,
                         },

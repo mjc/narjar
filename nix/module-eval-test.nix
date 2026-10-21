@@ -3,7 +3,15 @@
   package = pkgs.writeShellScriptBin "narjar" "exit 0";
   self = {packages.${pkgs.system}.default = package;};
   module = import ./module.nix {inherit self;};
-  networkCheck = import ./network-eval-test.nix {inherit pkgs module;};
+  lanCheck = import ./lan-eval-test.nix {
+    inherit pkgs;
+    evaluate = extra:
+      (import (pkgs.path + "/nixos/lib/eval-config.nix") {
+        system = pkgs.system;
+        modules = [module base extra];
+      }).config;
+    valid = evaluatesConfig;
+  };
   base = {
     boot.loader.grub.devices = ["nodev"];
     fileSystems."/" = {
@@ -555,14 +563,14 @@
       touch "$out"
     '';
 in
-  assert networkCheck != "";
+  assert lanCheck != "";
   assert evaluatesConfig edgeConfig;
   assert evaluatesConfig disabledEdgeKeysConfig;
   assert disabledEdgeKeysConfig.systemd.services.narjar.serviceConfig.LoadCredential == defaultConfig.systemd.services.narjar.serviceConfig.LoadCredential;
   assert evaluatesConfig disabledEdgeKeysWithNormalTrustConfig;
   assert !(evaluatesConfig conflictingEdgeKeysConfig);
   assert builtins.elem "trusted-public-keys:/run/cache-signing.pub" disabledEdgeKeysWithNormalTrustConfig.systemd.services.narjar.serviceConfig.LoadCredential;
-  assert lib.any (credential: lib.hasInfix "narjar-edge-trusted-keys" credential) edgeConfig.systemd.services.narjar.serviceConfig.LoadCredential;
+  assert lib.any (credential: lib.hasInfix "trusted-public-keys:/nix/store/" credential) edgeConfig.systemd.services.narjar.serviceConfig.LoadCredential;
   assert lib.all (config: !(evaluatesConfig config)) invalidEdgeConfigs;
   assert !(evaluatesConfig mixedSourcesConfig);
   assert !(evaluatesConfig compressedEdgeConfig);
@@ -665,4 +673,4 @@ in
   assert !(builtins.elem "/nix/var/nix/db" nativeStoreConfig.systemd.services.narjar.serviceConfig.ReadWritePaths);
   assert lib.hasPrefix "+" nativeStorePreStartCommand;
   assert lib.hasPrefix "+" customNativeStorePreStartCommand;
-  assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules)); "narjar module assertions passed; generated preStart check: ${preStartCheck}; generated collector check: ${collectorCheck}; generated proxy check: ${networkCheck}"
+  assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules)); "narjar module assertions passed; generated preStart check: ${preStartCheck}; generated collector check: ${collectorCheck}; native LAN options check: ${lanCheck}"

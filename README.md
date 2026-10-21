@@ -245,74 +245,76 @@ scheduled GC options; see the [module options](https://github.com/mjc/narjar/blo
 and [service configuration](https://github.com/mjc/narjar/blob/main/docs/operations.md#deployment).
 Initialization, serving, and collection use the selected `storageBackend`.
 
-### Local read-through cache
+### LAN discovery and setup
 
-To keep verified copies of upstream paths and build locally when that upstream
-is unavailable, configure a loopback edge:
+A Cargo-installed Narjar can advertise itself and serve client setup instructions.
+Neither feature needs Nix, Avahi, or Nginx:
+
+```sh
+narjar serve --data-dir ./cache --listen 0.0.0.0:8080 \
+  --public-url http://cache.local:8080 --advertise --onboarding
+```
+
+The initialized cache must contain the operator's public signing keys. The page
+reads that same trust policy; do not configure a second set of page keys.
+Open TCP 8080 and multicast UDP 5353 where needed. Use HTTPS through your
+existing reverse proxy outside a trusted LAN; set `--public-url` to its address.
+Narjar itself serves HTTP.
+
+The optional NixOS module passes the same daemon settings:
 
 ```nix
-services.narjar = {
-  enable = true;
-  edge = {
+{
+  services.narjar = {
     enable = true;
-    upstream = "https://cache.nixos.org";
-    trustedPublicKeys = [ "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=" ];
-    configureClient = true;
+    listen = "0.0.0.0:8080";
+    publicUrl = "http://cache.local:8080";
+    edge = {
+      enable = true;
+      upstream = "https://cache.nixos.org";
+      trustedPublicKeys = [ "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=" ];
+    };
+    discovery.enable = true;
+    onboarding.enable = true;
   };
-  gc = {
-    enable = true;
-    maxBytes = 20 * 1024 * 1024 * 1024;
-    targetBytes = 15 * 1024 * 1024 * 1024;
-  };
-};
+  networking.firewall.allowedTCPPorts = [ 8080 ];
+  networking.firewall.allowedUDPPorts = [ 5353 ];
+}
 ```
 
-This replaces Nix's substituters with the loopback cache and disables fallback.
-The edge verifies upstream signatures and retains advertised data under durable
-leases. GC may exceed its target until those leases expire. No producer signing
-key is needed. See [retention and client caching](https://github.com/mjc/narjar/blob/main/docs/operations.md#retention-and-client-caching)
-before shortening the lease.
+The page includes the configured cache URL, public
+keys, and client configurations for direct substitution or a local fail-open
+edge. Confirm signing keys with the operator over a trusted channel before
+using them; LAN discovery does not establish trust. Nix clients using a `.local`
+URL need their platform's mDNS name resolution. Use a regular DNS hostname if
+that is not available. Narjar's own browser and probes resolve mDNS directly.
 
-### Shared cache
+Advertisement and the page are independently opt-in. Existing HTTPS cache URLs
+work too; discovery retains their TLS policy. See [LAN discovery](https://github.com/mjc/narjar/blob/main/docs/operations.md#lan-discovery-and-setup)
+for the announcement format, firewall settings, and removal.
 
-Add `publicUrl` and enable the streaming Nginx proxy on the server:
+Find advertised caches without changing your Nix configuration:
 
-```nix
-services.narjar = {
-  enable = true;
-  publicUrl = "https://cache.example";
-  proxy.enable = true;
-  # Keep the backend on the default 127.0.0.1:5000 listener.
-};
-security.acme = {
-  acceptTerms = true;
-  defaults.email = "operator@example.org";
-};
-networking.firewall.allowedTCPPorts = [ 80 443 ];
+```sh
+narjar discover browse --timeout-seconds 5 --probe
 ```
 
-Configure credentials as above for uploads, or add `edge` settings for verified
-read-through caching. The module does not open firewall ports. Configure ACME
-DNS challenges or existing certificates when HTTP challenges are unsuitable.
-For explicit LAN HTTP, use an `http://` URL and `proxy.tls = "off"`.
+Browsing shows cache URLs and whether a setup page is advertised. Optional
+probes check availability without sending credentials or accepting signing keys.
+After confirming the operator's keys, print client configuration offline:
 
-On another NixOS machine, install the module and configure its client options:
-
-```nix
-services.narjar.client = {
-  enable = true;
-  url = "https://cache.example";
-  trustedPublicKeys = [ "cache.example:BASE64_PUBLIC_KEY" ];
-  mode = "local-edge";
-};
+```sh
+narjar discover config --url http://cache.local:8080 \
+  --trusted-public-key 'cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=' \
+  --format nixos --mode local-edge
 ```
 
-Obtain the producer public keys from the operator over a trusted channel; a
-read-through cache uses its upstream's keys. `local-edge` starts a local daemon
-and turns remote failures into misses. `direct` configures remote substitution
-without a local daemon or that outage behavior. Other substituters are retained
-unless `substituterPolicy = "only"` is selected. See [shared-cache deployment](https://github.com/mjc/narjar/blob/main/docs/operations.md#shared-cache-deployment)
-for priorities, TTLs, certificates, readiness and monitoring.
+That key applies to the read-through example above. Use your operator's key for
+another cache. Import Narjar's NixOS module before applying the printed
+configuration. Use `--format nix-conf` for direct Nix configuration on Linux or
+macOS, and `--mode direct` for a private cache with separately provisioned read
+credentials. `--positive-ttl-seconds` must fit the operator's retention policy.
+Keys and settings are never installed automatically.
 
 ## Storage and compression
 

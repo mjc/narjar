@@ -594,116 +594,102 @@ the persistent data mount and install credentials before serving. The image
 runs as UID/GID 65532; arrange matching mount permissions. It does not include
 a reverse proxy or provision upload credentials.
 
-### Shared-cache deployment
-
-The module's `publicUrl` is the single shared cache origin for uploads and
-downloads. It accepts an HTTP(S) hostname with an optional port, without a path,
-trailing slash, credentials, query or fragment. `proxy.enable` derives an Nginx
-virtual host from it and requires Narjar's backend to listen on `127.0.0.1` or
-`[::1]`. Setting `publicUrl` alone does not enable a proxy or configure Nix.
-Listeners follow NixOS's `services.nginx.defaultListenAddresses`, including
-IPv6 when enabled. Per-host `listen` settings can override them; each must use
-an explicit TCP port different from the Narjar backend. Empty listener lists
-and implicit ports are rejected.
-Overrides must retain the public URL's port/TLS combination and ACME's HTTP
-challenge listener. Existing HTTPS redirect policies are preserved.
-With the managed proxy, read-through upstreams use a DNS or IPv4 HTTP(S)
-origin. Equivalent spellings of this server's own origin are rejected.
-
-The [README](../README.md#shared-cache) has a TLS example. `proxy.tls` selects
-`acme` (the default), `existing`, or `off`. ACME uses HTTPS on port 443 and an
-HTTP listener on port 80 for challenges and HTTPS redirects. Use existing
-certificates for a custom HTTPS port. For existing certificates:
-
-~~~nix
-services.narjar = {
-  enable = true;
-  publicUrl = "https://cache.example";
-  proxy = { enable = true; tls = "existing"; };
-};
-services.nginx.virtualHosts."cache.example" = {
-  sslCertificate = "/run/secrets/cache.crt";
-  sslCertificateKey = "/run/secrets/cache.key";
-};
-~~~
-
-Existing virtual hosts and extra locations are preserved. If another proxy
-already serves this origin, leave `proxy.enable` off and route to `listen`
-there. NixOS ACME contact, challenge method and firewall access remain under
-their native options; evaluation does not request certificates. The module
-does not open ports or generate secrets in the Nix store.
-
-For a trusted LAN with explicit plain HTTP:
-
-~~~nix
-services.narjar = {
-  enable = true;
-  publicUrl = "http://cache.example:8080";
-  proxy = { enable = true; tls = "off"; };
-};
-networking.firewall.allowedTCPPorts = [ 8080 ];
-~~~
-
-Plain HTTP exposes traffic and bearer tokens to the network. Signature
-verification still requires trusted producer keys. Do not use it for secret
-uploads or private reads on an untrusted network.
-
-The proxy streams PUT bodies and responses without disk spooling or a second
-proxy cache. It forwards Authorization, GET, HEAD, Range and response cache
-headers unchanged. The body limit covers `maxEncodedNarBytes` and the 1 MiB
-metadata limit.
-`proxy.idleTimeoutSeconds` limits gaps between I/O operations, not total request
-time. Its default covers a complete upstream fill while narinfo is pending.
-`ioTimeoutSeconds` still controls Narjar's socket I/O; the edge has separate
-idle and total fill limits.
-
-On consumers, `services.narjar.client` works without enabling the server:
-
-~~~nix
-services.narjar.client = {
-  enable = true;
-  url = "https://cache.example";
-  trustedPublicKeys = [ "cache.example:BASE64_PUBLIC_KEY" ];
-  mode = "direct";
-  substituterPolicy = "append";
-  priority = 30;
-  fallback = false;
-  positiveTtlSeconds = 300;
-  negativeTtlSeconds = 1;
-};
-~~~
-
-`url` defaults to `publicUrl` when both are configured on the same host.
-`append` retains existing substituters; `only` explicitly replaces that list.
-Lower priorities are tried first. Public keys are appended to Nix's trust list;
-they must come from an authenticated operator channel. For read-through
-servers, use the upstream producers' keys. The server's `trusted-public-keys`
-file is local cache state, not a public HTTP key-distribution endpoint.
-
-`mode = "local-edge"` starts the loopback server, using the same URL and keys
-for upstream verification. It requires public reads and `fallback = false`.
-An upstream outage becomes a miss at this edge; another configured substituter
-can still fail, so select `only` when the edge must be Nix's only cache.
-Direct remote substitution does not provide that guarantee. Private direct
-clients must separately provision Nix's netrc credential file outside the store.
-The existing `edge.configureClient` option remains loopback-only and always
-replaces the substituter list; it cannot be combined with `client.enable`.
-
-Set storage limits through the existing `minFreeBytes` and `gc` options. On a
-local edge, `edge.leaseSeconds` must cover twice `client.positiveTtlSeconds`
-plus 300 seconds. On a shared read-through server, choose a lease that covers
-all consumers, including clients not managed by this module. GC retains leased
-data even above its target; exhausting admission headroom rejects new fills.
-
-`narjar.service` uses systemd readiness notification. Dependents should use
-`Requires=narjar.service` and `After=narjar.service`; remote readiness is
-`GET /readyz`. `/metrics` uses Narjar's normal read authentication: public-read
-caches expose it publicly, and private caches require a read token. The proxy
-does not change this policy. Use an explicit Nginx `/metrics` location with
-network restrictions if public reads should not expose metrics. Keep proxy
-logs free of Authorization and token values.
-
-For a separately managed proxy, terminate TLS there. Preserve Content-Length and
+For remote access, terminate TLS at a reverse proxy. Preserve Content-Length and
 Authorization, disable PUT request buffering, and align body limits and
 timeouts with Narjar. Restrict the direct HTTP listener to loopback or a trusted
 network. Socket activation is not supported.
+
+### LAN discovery and setup
+
+`narjar serve --public-url URL --advertise` publishes DNS-SD through the native
+Rust mDNS implementation. It needs no Nix installation, Avahi, or subprocess.
+The advertisement uses `_http._tcp` or `_https._tcp` and the configured public
+port, including reverse-proxy ports. A `.local` origin is registered directly;
+other origins use a separate mDNS hostname while retaining the canonical URL
+in TXT. Public DNS names still need their normal DNS records.
+
+The TXT records are:
+
+| Record | Meaning |
+| --- | --- |
+| `nix-cache=1` | Identifies a Nix binary cache to compatible HTTP service browsers. |
+| `narjar=1` | Version 1 of Narjar's announcement format. |
+| `url=...` | Configured canonical cache origin, including scheme and port. |
+| `path=/` | Cache root. |
+| `setup=/` | Setup page is enabled at the root; omitted otherwise. |
+
+Announcements contain no signing keys or credentials. Discovery does not add
+substituters, trust a key, or grant upload access. mDNS probing handles colliding
+instance names; `--discovery-name` sets a display name without
+changing the cache URL. Clients must discard removed or expired announcements.
+Multicast normally remains within one LAN: VLANs, wireless isolation, and
+multicast filtering can prevent discovery even when the cache URL is reachable.
+
+Open multicast UDP 5353 and the public cache's TCP port as needed. Narjar does
+not change firewall rules. Advertisement starts after server initialization and
+is withdrawn on shutdown. Startup waits up to five seconds for an announcement;
+socket errors fail startup. A conflict with the configured `.local` hostname
+fails or withdraws the advertisement rather than changing its URL. A specific non-loopback listener restricts advertised
+addresses to that interface. A loopback backend behind a proxy advertises the
+configured public origin, not the backend address. Discovery does not change
+TLS policy, authentication, or metrics access.
+
+`--onboarding` serves a static page at exactly `/` from the daemon's own HTTP
+listener. Cache and API routes keep their existing handlers. The page shows
+the configured URL, public keys with their SHA-256 fingerprints,
+direct client examples, and retention guidance. Public-read caches also offer
+a local-edge example; private caches require direct clients with separately
+provisioned read credentials. Fingerprints
+hash the exact public-key line without a newline. Verify keys through an
+authenticated operator channel; the discovered page alone is not evidence of
+trust.
+
+The page reads the initialized cache's trusted public keys at startup. It uses
+neither request Host headers nor a separately configured page key list. At least
+one trusted key is required; onboarding accepts at most 32 keys to keep the
+page and its client examples bounded. No private signing key, token, or netrc
+content is rendered. The setup page is public even for private-read caches;
+it provides instructions, not read credentials.
+Known edge/native-store retention must cover the examples' 300-second positive
+TTL twice, plus 300 seconds; shorter leases reject onboarding at startup.
+
+Set `--onboarding-diagnostics` to include readiness and metrics links.
+They retain existing authorization. The page does not grant read credentials
+or expose private backend settings. Its client examples preserve other
+substituters. To route every substitution attempt through the local edge,
+set `nix.settings.substituters = lib.mkForce [ "http://127.0.0.1:5000" ];`
+and remove or clear other `extra-substituters` entries. NixOS list definitions
+otherwise merge with existing settings.
+
+Remove `--advertise` to disable announcements and `--onboarding` to disable the
+page. Cached announcements can remain until their TTL expires. Neither action
+removes client configuration already installed elsewhere. The optional NixOS
+settings `publicUrl`, `discovery.enable`, `discovery.name`, `onboarding.enable`,
+and `onboarding.diagnostics` only pass these flags; they do not create a second
+web server or advertiser.
+
+`narjar discover browse` listens for versioned Narjar advertisements for five
+seconds by default, with a maximum of 30 seconds and 16 retained instances.
+`--max-results` raises the instance cap up to 64. Repeated URLs are deduplicated;
+withdrawn services and invalid updates are removed. The command shuts down its
+discovery thread before exiting. `serve` does not browse or retain a catalog.
+
+`--probe` adds credential-free `/nix-cache-info` checks, with a five-second
+overall probe budget and at most two seconds per request. Redirects are rejected
+and response bodies are limited to 1 KiB. Probes use the canonical URL and normal
+certificate verification. `.local` probes use the discovered mDNS addresses,
+without a system mDNS resolver. Nix clients and browsers still need platform
+name resolution for `.local` URLs. An availability result is not a signing
+trust decision. Windows can browse and print instructions, but Nix client
+configuration is for Linux/macOS hosts.
+
+`narjar discover config` requires a URL and one or more explicit
+`--trusted-public-key` arguments. It validates keys without making requests and
+prints either a NixOS module or additive `nix.conf` lines. Fingerprints and
+instructions go to stderr; stdout contains only the configuration. NixOS output
+defaults to a local edge; `nix-conf` supports direct substitution only. Local
+edges require public upstream reads. For a private cache, use direct mode and
+provision Nix read credentials separately. Client positive TTL defaults to 300
+seconds; use `--positive-ttl-seconds` to match the operator's policy. The remote
+retention period must cover twice that TTL plus 300 seconds. Remove the printed
+settings to stop using the cache. The command never edits system configuration.

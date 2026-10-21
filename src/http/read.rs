@@ -29,6 +29,7 @@ pub(crate) enum ReadSource {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ReadContext<'a> {
+    pub(crate) setup: Option<&'a [u8]>,
     pub(crate) storage: &'a Storage,
     pub(crate) source: &'a ReadSource,
 }
@@ -755,12 +756,16 @@ enum ProtectedOperatorRoute {
 }
 
 enum ReadRoute {
+    Setup,
     Operator(OperatorRoute),
     Cache(RouteMatch),
 }
 
 impl ReadRoute {
     fn classify(url: &str) -> Self {
+        if url == "/" {
+            return Self::Setup;
+        }
         let url = match normalize_main_alias(url) {
             Ok(url) => url,
             Err(route) => return Self::Cache(route),
@@ -777,6 +782,7 @@ impl ReadRoute {
 
     fn metrics_route(&self) -> RequestRoute {
         match self {
+            Self::Setup => RequestRoute::Other,
             Self::Operator(OperatorRoute::Health) => RequestRoute::Health,
             Self::Operator(OperatorRoute::Protected(ProtectedOperatorRoute::Readiness)) => {
                 RequestRoute::Ready
@@ -848,6 +854,7 @@ pub fn respond(
     let route = ReadRoute::classify(request.url());
     let guard = metrics.request(RequestMethod::from(request.method()), route.metrics_route());
     match route {
+        ReadRoute::Setup => respond_setup(request, context.setup, &guard),
         ReadRoute::Operator(operator) => respond_operator_route(
             operator,
             request,
@@ -860,6 +867,28 @@ pub fn respond(
         ReadRoute::Cache(route) => {
             respond_cache_route(route, request, context, authorizer, metrics, &guard)
         }
+    }
+}
+
+fn respond_setup(
+    request: Request,
+    page: Option<&[u8]>,
+    guard: &RequestGuard<'_>,
+) -> Option<TcpStream> {
+    match (page, request.method()) {
+        (None, _) => not_found(guard, request),
+        (Some(page), Method::Get | Method::Head) => send_response(
+            guard,
+            request,
+            Response::new(StatusCode::OK, std::io::Cursor::new(page), page.len())
+                .with_header(header("Content-Type", "text/html; charset=utf-8"))
+                .with_header(header("Cache-Control", "no-store"))
+                .with_header(header(
+                    "Content-Security-Policy",
+                    "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+                )),
+        ),
+        (Some(_), Method::Put | Method::Other) => method_not_allowed(guard, request, "GET, HEAD"),
     }
 }
 

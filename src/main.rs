@@ -1,7 +1,14 @@
 mod cache;
 mod config;
 mod control;
+mod discovery;
 mod error;
+#[cfg(unix)]
+#[path = "host/unix.rs"]
+mod host;
+#[cfg(windows)]
+#[path = "host/windows.rs"]
+mod host;
 mod http;
 mod http_client;
 mod http_url;
@@ -37,7 +44,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     Init(operator::Init),
     Setup(setup::Setup),
     Key(operator::Key),
@@ -49,6 +56,7 @@ enum Command {
     Delete(operator::Delete),
     Stats(operator::Stats),
     Doctor(operator::Doctor),
+    Discover(discovery::Discover),
     Token(token::Token),
     Push(push::Push),
 }
@@ -72,7 +80,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
-        Command::Serve(args) => server::serve(ServeConfig::try_from(args).map_err(Error::usage)?),
+        Command::Serve(args) => server::serve(ServeConfig::try_from(*args).map_err(Error::usage)?),
         Command::Init(args) => operator::init(args),
         Command::Setup(args) => setup::run(args),
         Command::Key(args) => operator::key(args),
@@ -84,6 +92,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Gc(args) => operator::gc(args),
         Command::Stats(args) => operator::stats(args),
         Command::Doctor(args) => operator::doctor(args),
+        Command::Discover(args) => discovery::run(args),
         Command::Token(args) => token::run(args),
         Command::Push(args) => push::run(args),
     }
