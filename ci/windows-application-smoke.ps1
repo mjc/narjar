@@ -73,7 +73,7 @@ if (Test-Path $tests -PathType Leaf) {
         'cli_tests::gc_deletes_a_shared_nar_only_after_the_last_narinfo',
         'cli_tests::interrupted_gc_deletion_is_recovered_before_serving_shared_payloads',
         'cache::filesystem::windows::tests::ancestors_can_deny_listing_without_blocking_child_creation_or_reads',
-        'server::host::tests::sequential_shutdown_registrations_reset_state_and_retain_inflight_contexts'
+        'host::tests::sequential_shutdown_registrations_reset_state_and_retain_inflight_contexts'
     )) {
         $listed = & $tests --list --exact $name
         if ($LASTEXITCODE -ne 0 -or "$name`: test" -notin $listed) {
