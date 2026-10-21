@@ -602,8 +602,9 @@ trailing slash, credentials, query or fragment. `proxy.enable` derives an Nginx
 virtual host from it and requires Narjar's backend to listen on `127.0.0.1` or
 `[::1]`. Setting `publicUrl` alone does not enable a proxy or configure Nix.
 Listeners follow NixOS's `services.nginx.defaultListenAddresses`, including
-IPv6 when enabled. Per-host `listen` settings can override them; the module
-rejects sockets that overlap the Narjar backend.
+IPv6 when enabled. Per-host `listen` settings can override them; each must use
+an explicit TCP port different from the Narjar backend. Empty listener lists
+and implicit ports are rejected.
 
 The [README](../README.md#shared-cache) has a TLS example. `proxy.tls` selects
 `acme` (the default), `existing`, or `off`. ACME uses HTTPS on port 443 and an

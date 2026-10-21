@@ -36,16 +36,12 @@
   loopbackParts = builtins.match "(127[.]0[.]0[.]1|[[]::1[]]):([1-9][0-9]{0,4})" cfg.listen;
   loopback = loopbackParts != null && lib.toInt (builtins.elemAt loopbackParts 1) <= 65535;
   acme = cfg.proxy.tls == "acme";
-  overlapsBackend = listener:
-    loopbackParts
-    != null
-    && listener.port == lib.toInt (builtins.elemAt loopbackParts 1)
-    && builtins.elem listener.addr ([(builtins.elemAt loopbackParts 0)]
-      ++ (
-        if builtins.elemAt loopbackParts 0 == "127.0.0.1"
-        then ["0.0.0.0"]
-        else ["[::]" "[::0]"]
-      ));
+  backendPort =
+    if loopbackParts == null
+    then 0
+    else lib.toInt (builtins.elemAt loopbackParts 1);
+  proxyListeners = config.services.nginx.virtualHosts.${host}.listen;
+  hasDistinctBackendPort = listener: listener.port != null && listener.port != backendPort;
   localEdge = client.enable && client.mode == "local-edge";
   substituter =
     if localEdge
@@ -148,8 +144,8 @@ in {
           message = "services.narjar.proxy ACME mode requires the standard HTTPS port; use existing certificates for custom HTTPS ports";
         }
         {
-          assertion = !builtins.any overlapsBackend config.services.nginx.virtualHosts.${host}.listen;
-          message = "services.narjar.proxy listener must not overlap the Narjar backend socket";
+          assertion = proxyListeners != [] && builtins.all hasDistinctBackendPort proxyListeners;
+          message = "services.narjar.proxy requires explicit listener ports different from the Narjar backend; empty or implicit listeners are unsupported";
         }
         {
           assertion = !cfg.edge.enable || cfg.proxy.idleTimeoutSeconds >= cfg.edge.fillTimeoutSeconds + cfg.ioTimeoutSeconds;

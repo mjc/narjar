@@ -204,6 +204,45 @@ in
       };
       services.nginx.defaultListenAddresses = ["127.0.0.1"];
     })
+    (evaluate {
+      services.narjar = {
+        enable = true;
+        publicUrl = "http://cache.example:5000";
+        proxy = {
+          enable = true;
+          tls = "off";
+        };
+      };
+      services.nginx.virtualHosts."cache.example".listen = [
+        {
+          addr = "*";
+          port = 5000;
+        }
+      ];
+    })
+    (evaluate {
+      services.narjar = {
+        enable = true;
+        publicUrl = "http://cache.example:5000";
+        proxy = {
+          enable = true;
+          tls = "off";
+        };
+      };
+      services.nginx.virtualHosts."cache.example".listen = [];
+      services.nginx.defaultHTTPListenPort = 5000;
+    })
+    (evaluate {
+      services.narjar = {
+        enable = true;
+        publicUrl = "http://cache.example";
+        proxy = {
+          enable = true;
+          tls = "off";
+        };
+      };
+      services.nginx.virtualHosts."cache.example".listen = [{addr = "127.0.0.1:5000";}];
+    })
     (server {
       publicUrl = "http://cache.example";
       proxy.enable = true;
