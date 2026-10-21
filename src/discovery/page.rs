@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -106,22 +108,43 @@ fn render_nixos_choices(
     ))
 }
 
-fn escape_html(text: &str) -> String {
-    text.chars()
-        .map(|character| match character {
-            '&' => "&amp;".into(),
-            '<' => "&lt;".into(),
-            '>' => "&gt;".into(),
-            '"' => "&quot;".into(),
-            '\'' => "&#39;".into(),
-            character => character.to_string(),
-        })
-        .collect()
+fn escape_html(text: &str) -> Cow<'_, str> {
+    match text.find(['&', '<', '>', '"', '\'']) {
+        None => Cow::Borrowed(text),
+        Some(first_escape) => {
+            let mut escaped = String::with_capacity(text.len());
+            let (prefix, suffix) = text.split_at(first_escape);
+            escaped.push_str(prefix);
+            suffix.chars().for_each(|character| match character {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                '"' => escaped.push_str("&quot;"),
+                '\'' => escaped.push_str("&#39;"),
+                character => escaped.push(character),
+            });
+            Cow::Owned(escaped)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_escaping_borrows_unchanged_text_and_preserves_utf8_around_entities() {
+        for text in ["", "https://cache.example", "clé publique 🔑"] {
+            assert!(matches!(escape_html(text), Cow::Borrowed(value) if value == text));
+        }
+        assert_eq!(
+            escape_html("clé <publique> & \"trust\" '🔑'"),
+            "clé &lt;publique&gt; &amp; &quot;trust&quot; &#39;🔑&#39;"
+        );
+        assert!(
+            matches!(escape_html("<&\"'>"), Cow::Owned(value) if value == "&lt;&amp;&quot;&#39;&gt;")
+        );
+    }
 
     #[test]
     fn setup_on_the_local_edge_port_does_not_offer_a_recursive_edge() {

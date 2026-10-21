@@ -65,7 +65,6 @@ pub(super) fn is_permitted_probe_destination(address: IpAddr) -> bool {
 
 #[derive(Debug)]
 pub(super) struct AdvertisedCache {
-    instance: String,
     pub(super) origin: CacheOrigin,
     pub(super) setup: SetupPage,
     pub(super) addresses: Vec<SocketAddr>,
@@ -114,7 +113,6 @@ impl TryFrom<&ResolvedService> for AdvertisedCache {
         };
         match valid {
             true => Ok(Self {
-                instance: service.get_fullname().to_owned(),
                 origin,
                 setup,
                 addresses: service
@@ -170,7 +168,8 @@ impl Catalog {
         self.instances.remove(service.get_fullname());
         match AdvertisedCache::try_from(service) {
             Ok(cache) if self.instances.len() < self.limit => {
-                self.instances.insert(cache.instance.clone(), cache);
+                self.instances
+                    .insert(service.get_fullname().to_owned(), cache);
             }
             Ok(_) | Err(_) => {}
         }

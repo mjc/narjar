@@ -123,15 +123,15 @@ impl HostingConfig {
     }
 
     pub(crate) fn advertise(
-        &self,
+        self,
         listener: SocketAddr,
     ) -> Result<Option<RunningAdvertisement>, Error> {
-        match &self.0 {
+        match self.0 {
             HostingState::Enabled {
                 advertisement: Some(service),
                 origin,
                 ..
-            } => RunningAdvertisement::start(service.as_ref().clone(), origin, listener).map(Some),
+            } => RunningAdvertisement::start(*service, &origin, listener).map(Some),
             HostingState::Disabled
             | HostingState::Enabled {
                 advertisement: None,

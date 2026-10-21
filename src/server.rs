@@ -25,6 +25,7 @@ use crate::cache::{
 use crate::cache::metrics::{ConnectionOutcome, Metrics, PopulationScanFailure, WorkerKind};
 use crate::{
     config::{ServeConfig, ServeSource},
+    discovery::page::SetupDocument,
     error::Error,
     http::{PublicationRequest, ReadContext, ReadSource, prepare_publication, respond},
 };
@@ -144,7 +145,7 @@ impl PublicationQueue {
 
 #[derive(Clone)]
 struct RequestWorkerContext {
-    setup: Arc<Option<crate::discovery::page::SetupDocument>>,
+    setup: Option<Arc<SetupDocument>>,
     storage: Arc<Storage>,
     source: Arc<ReadSource>,
     authorizer: Arc<Authorizer>,
@@ -268,7 +269,7 @@ fn process_next_request(
             Method::Get | Method::Head | Method::Other | Method::Put => respond(
                 request,
                 ReadContext {
-                    setup: context.setup.as_ref().as_ref().map(|page| page.bytes()),
+                    setup: context.setup.as_deref().map(SetupDocument::bytes),
                     storage: &context.storage,
                     source: &context.source,
                 },
@@ -580,11 +581,10 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         authorizer,
         trusted_keys,
     } = initialize_server_resources(&config)?;
-    let setup = Arc::new(
-        config
-            .hosting
-            .setup_document(&trusted_keys, authorizer.read_visibility())?,
-    );
+    let setup = config
+        .hosting
+        .setup_document(&trusted_keys, authorizer.read_visibility())?
+        .map(Arc::new);
     let publication_workers = match source.as_ref() {
         ReadSource::FlatCache => config.workers.get(),
         #[cfg(unix)]
@@ -995,7 +995,7 @@ mod tests {
         )
         .unwrap();
         let context = super::RequestWorkerContext {
-            setup: Arc::new(None),
+            setup: None,
             storage: Arc::new(storage),
             source: Arc::new(super::ReadSource::FlatCache),
             authorizer: Arc::new(Authorizer::load(&root).unwrap()),
