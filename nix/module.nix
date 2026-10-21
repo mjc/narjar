@@ -501,6 +501,7 @@
     ]
   );
 in {
+  imports = [./network.nix];
   options.services.narjar = {
     enable = lib.mkEnableOption "the Narjar binary cache";
 

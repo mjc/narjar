@@ -3,6 +3,7 @@
   package = pkgs.writeShellScriptBin "narjar" "exit 0";
   self = {packages.${pkgs.system}.default = package;};
   module = import ./module.nix {inherit self;};
+  networkCheck = import ./network-eval-test.nix {inherit pkgs module;};
   base = {
     boot.loader.grub.devices = ["nodev"];
     fileSystems."/" = {
@@ -554,6 +555,7 @@
       touch "$out"
     '';
 in
+  assert networkCheck != "";
   assert evaluatesConfig edgeConfig;
   assert evaluatesConfig disabledEdgeKeysConfig;
   assert disabledEdgeKeysConfig.systemd.services.narjar.serviceConfig.LoadCredential == defaultConfig.systemd.services.narjar.serviceConfig.LoadCredential;
@@ -663,4 +665,4 @@ in
   assert !(builtins.elem "/nix/var/nix/db" nativeStoreConfig.systemd.services.narjar.serviceConfig.ReadWritePaths);
   assert lib.hasPrefix "+" nativeStorePreStartCommand;
   assert lib.hasPrefix "+" customNativeStorePreStartCommand;
-  assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules)); "narjar module assertions passed; generated preStart check: ${preStartCheck}; generated collector check: ${collectorCheck}"
+  assert (!(lib.any (rule: lib.hasInfix "/nix/var/nix/gcroots/auto/narjar" rule) nativeStoreConfig.systemd.tmpfiles.rules)); "narjar module assertions passed; generated preStart check: ${preStartCheck}; generated collector check: ${collectorCheck}; generated proxy check: ${networkCheck}"
