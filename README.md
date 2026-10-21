@@ -245,6 +245,75 @@ scheduled GC options; see the [module options](https://github.com/mjc/narjar/blo
 and [service configuration](https://github.com/mjc/narjar/blob/main/docs/operations.md#deployment).
 Initialization, serving, and collection use the selected `storageBackend`.
 
+### Local read-through cache
+
+To keep verified copies of upstream paths and build locally when that upstream
+is unavailable, configure a loopback edge:
+
+```nix
+services.narjar = {
+  enable = true;
+  edge = {
+    enable = true;
+    upstream = "https://cache.nixos.org";
+    trustedPublicKeys = [ "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=" ];
+    configureClient = true;
+  };
+  gc = {
+    enable = true;
+    maxBytes = 20 * 1024 * 1024 * 1024;
+    targetBytes = 15 * 1024 * 1024 * 1024;
+  };
+};
+```
+
+This replaces Nix's substituters with the loopback cache and disables fallback.
+The edge verifies upstream signatures and retains advertised data under durable
+leases. GC may exceed its target until those leases expire. No producer signing
+key is needed. See [retention and client caching](https://github.com/mjc/narjar/blob/main/docs/operations.md#retention-and-client-caching)
+before shortening the lease.
+
+### Shared cache
+
+Add `publicUrl` and enable the streaming Nginx proxy on the server:
+
+```nix
+services.narjar = {
+  enable = true;
+  publicUrl = "https://cache.example";
+  proxy.enable = true;
+  # Keep the backend on the default 127.0.0.1:5000 listener.
+};
+security.acme = {
+  acceptTerms = true;
+  defaults.email = "operator@example.org";
+};
+networking.firewall.allowedTCPPorts = [ 80 443 ];
+```
+
+Configure credentials as above for uploads, or add `edge` settings for verified
+read-through caching. The module does not open firewall ports. Configure ACME
+DNS challenges or existing certificates when HTTP challenges are unsuitable.
+For explicit LAN HTTP, use an `http://` URL and `proxy.tls = "off"`.
+
+On another NixOS machine, install the module and configure its client options:
+
+```nix
+services.narjar.client = {
+  enable = true;
+  url = "https://cache.example";
+  trustedPublicKeys = [ "cache.example:BASE64_PUBLIC_KEY" ];
+  mode = "local-edge";
+};
+```
+
+Obtain the producer public keys from the operator over a trusted channel; a
+read-through cache uses its upstream's keys. `local-edge` starts a local daemon
+and turns remote failures into misses. `direct` configures remote substitution
+without a local daemon or that outage behavior. Other substituters are retained
+unless `substituterPolicy = "only"` is selected. See [shared-cache deployment](https://github.com/mjc/narjar/blob/main/docs/operations.md#shared-cache-deployment)
+for priorities, TTLs, certificates, readiness and monitoring.
+
 ## Storage and compression
 
 The default `flat` backend stores each canonical, uncompressed NAR as a file.

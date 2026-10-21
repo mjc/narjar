@@ -594,7 +594,116 @@ the persistent data mount and install credentials before serving. The image
 runs as UID/GID 65532; arrange matching mount permissions. It does not include
 a reverse proxy or provision upload credentials.
 
-For remote use, terminate TLS at a reverse proxy. Preserve Content-Length and
+### Shared-cache deployment
+
+The module's `publicUrl` is the single shared cache origin for uploads and
+downloads. It accepts an HTTP(S) hostname with an optional port, without a path,
+trailing slash, credentials, query or fragment. `proxy.enable` derives an Nginx
+virtual host from it and requires Narjar's backend to listen on `127.0.0.1` or
+`[::1]`. Setting `publicUrl` alone does not enable a proxy or configure Nix.
+Listeners follow NixOS's `services.nginx.defaultListenAddresses`, including
+IPv6 when enabled. Per-host `listen` settings can override them; each must use
+an explicit TCP port different from the Narjar backend. Empty listener lists
+and implicit ports are rejected.
+Overrides must retain the public URL's port/TLS combination and ACME's HTTP
+challenge listener. Existing HTTPS redirect policies are preserved.
+With the managed proxy, read-through upstreams use a DNS or IPv4 HTTP(S)
+origin. Equivalent spellings of this server's own origin are rejected.
+
+The [README](../README.md#shared-cache) has a TLS example. `proxy.tls` selects
+`acme` (the default), `existing`, or `off`. ACME uses HTTPS on port 443 and an
+HTTP listener on port 80 for challenges and HTTPS redirects. Use existing
+certificates for a custom HTTPS port. For existing certificates:
+
+~~~nix
+services.narjar = {
+  enable = true;
+  publicUrl = "https://cache.example";
+  proxy = { enable = true; tls = "existing"; };
+};
+services.nginx.virtualHosts."cache.example" = {
+  sslCertificate = "/run/secrets/cache.crt";
+  sslCertificateKey = "/run/secrets/cache.key";
+};
+~~~
+
+Existing virtual hosts and extra locations are preserved. If another proxy
+already serves this origin, leave `proxy.enable` off and route to `listen`
+there. NixOS ACME contact, challenge method and firewall access remain under
+their native options; evaluation does not request certificates. The module
+does not open ports or generate secrets in the Nix store.
+
+For a trusted LAN with explicit plain HTTP:
+
+~~~nix
+services.narjar = {
+  enable = true;
+  publicUrl = "http://cache.example:8080";
+  proxy = { enable = true; tls = "off"; };
+};
+networking.firewall.allowedTCPPorts = [ 8080 ];
+~~~
+
+Plain HTTP exposes traffic and bearer tokens to the network. Signature
+verification still requires trusted producer keys. Do not use it for secret
+uploads or private reads on an untrusted network.
+
+The proxy streams PUT bodies and responses without disk spooling or a second
+proxy cache. It forwards Authorization, GET, HEAD, Range and response cache
+headers unchanged. The body limit covers `maxEncodedNarBytes` and the 1 MiB
+metadata limit.
+`proxy.idleTimeoutSeconds` limits gaps between I/O operations, not total request
+time. Its default covers a complete upstream fill while narinfo is pending.
+`ioTimeoutSeconds` still controls Narjar's socket I/O; the edge has separate
+idle and total fill limits.
+
+On consumers, `services.narjar.client` works without enabling the server:
+
+~~~nix
+services.narjar.client = {
+  enable = true;
+  url = "https://cache.example";
+  trustedPublicKeys = [ "cache.example:BASE64_PUBLIC_KEY" ];
+  mode = "direct";
+  substituterPolicy = "append";
+  priority = 30;
+  fallback = false;
+  positiveTtlSeconds = 300;
+  negativeTtlSeconds = 1;
+};
+~~~
+
+`url` defaults to `publicUrl` when both are configured on the same host.
+`append` retains existing substituters; `only` explicitly replaces that list.
+Lower priorities are tried first. Public keys are appended to Nix's trust list;
+they must come from an authenticated operator channel. For read-through
+servers, use the upstream producers' keys. The server's `trusted-public-keys`
+file is local cache state, not a public HTTP key-distribution endpoint.
+
+`mode = "local-edge"` starts the loopback server, using the same URL and keys
+for upstream verification. It requires public reads and `fallback = false`.
+An upstream outage becomes a miss at this edge; another configured substituter
+can still fail, so select `only` when the edge must be Nix's only cache.
+Direct remote substitution does not provide that guarantee. Private direct
+clients must separately provision Nix's netrc credential file outside the store.
+The existing `edge.configureClient` option remains loopback-only and always
+replaces the substituter list; it cannot be combined with `client.enable`.
+
+Set storage limits through the existing `minFreeBytes` and `gc` options. On a
+local edge, `edge.leaseSeconds` must cover twice `client.positiveTtlSeconds`
+plus 300 seconds. On a shared read-through server, choose a lease that covers
+all consumers, including clients not managed by this module. GC retains leased
+data even above its target; exhausting admission headroom rejects new fills.
+
+`narjar.service` uses systemd readiness notification. Dependents should use
+`Requires=narjar.service` and `After=narjar.service`; remote readiness is
+`GET /readyz`. `/metrics` uses Narjar's normal read authentication: public-read
+caches expose it publicly, and private caches require a read token. The proxy
+does not change this policy. Use an explicit Nginx `/metrics` location with
+network restrictions if public reads should not expose metrics. Keep proxy
+logs free of Authorization and token values.
+
+For a separately managed proxy, terminate TLS there. Preserve Content-Length and
 Authorization, disable PUT request buffering, and align body limits and
 timeouts with Narjar. Restrict the direct HTTP listener to loopback or a trusted
 network. Socket activation is not supported.
