@@ -22,13 +22,29 @@ $files = [ordered]@{
 $zip = [IO.Compression.ZipFile]::Open($archive, [IO.Compression.ZipArchiveMode]::Create)
 try {
     foreach ($file in $files.GetEnumerator()) {
-        $entry = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-            $zip, $file.Value, "$bundleName/$($file.Key)", [IO.Compression.CompressionLevel]::Optimal
-        )
+        $entry = $zip.CreateEntry("$bundleName/$($file.Key)", [IO.Compression.CompressionLevel]::Optimal)
         $entry.LastWriteTime = $timestamp
+        $destination = $entry.Open()
+        try {
+            $source = [IO.File]::OpenRead($file.Value)
+            try { $source.CopyTo($destination) } finally { $source.Dispose() }
+        } finally {
+            $destination.Dispose()
+        }
     }
 } finally {
     $zip.Dispose()
+}
+
+$contents = [IO.Compression.ZipFile]::OpenRead($archive)
+try {
+    foreach ($entry in $contents.Entries) {
+        if ([Math]::Abs(($entry.LastWriteTime.DateTime - $timestamp.UtcDateTime).TotalSeconds) -gt 1) {
+            throw "Archive entry does not have the release timestamp: $($entry.FullName)"
+        }
+    }
+} finally {
+    $contents.Dispose()
 }
 
 $extracted = Join-Path $PWD 'target/windows-release-smoke'
