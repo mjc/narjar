@@ -16,17 +16,35 @@ impl FromStr for CacheOrigin {
         let url: HttpUrl = value.parse().map_err(|error| format!("{error}"))?;
         let host = url.host();
         let supported_host = host.parse::<IpAddr>().is_ok()
-            || host.split('.').all(|label| {
-                let bytes = label.as_bytes();
-                bytes.len() <= 63
-                    && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-                    && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-                    && bytes
-                        .iter()
-                        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-            });
+            || (!is_legacy_numeric_host(host)
+                && host.split('.').all(|label| {
+                    let bytes = label.as_bytes();
+                    bytes.len() <= 63
+                        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                        && bytes
+                            .iter()
+                            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+                }));
         match url.is_origin() && supported_host && url.port() != 0 && url.as_str().len() <= 251 {
-            true => Ok(Self(url)),
+            true => {
+                let scheme = if url.is_https() { "https" } else { "http" };
+                let host = if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host.to_owned()
+                };
+                let default_port = if url.is_https() { 443 } else { 80 };
+                let port = if url.port() == default_port {
+                    String::new()
+                } else {
+                    format!(":{}", url.port())
+                };
+                let canonical = format!("{scheme}://{host}{port}")
+                    .parse()
+                    .expect("validated origin components form an HTTP URL");
+                Ok(Self(canonical))
+            }
             false => Err("cache URL must be an HTTP(S) origin of at most 251 bytes".into()),
         }
     }
@@ -43,10 +61,22 @@ impl CacheOrigin {
 
     fn is_network_host(&self) -> bool {
         match self.0.host().parse::<IpAddr>() {
-            Ok(address) => !address.is_loopback() && !address.is_unspecified(),
+            Ok(address) => is_permitted_probe_destination(address),
             Err(_) => self.0.host() != "localhost" && !self.0.host().ends_with(".localhost"),
         }
     }
+}
+
+fn is_legacy_numeric_host(host: &str) -> bool {
+    host.split('.').all(|label| match label.strip_prefix("0x") {
+        Some(hex) => !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        None => !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()),
+    })
+}
+
+pub(super) fn is_permitted_probe_destination(address: IpAddr) -> bool {
+    let address = address.to_canonical();
+    !address.is_loopback() && !address.is_unspecified()
 }
 
 #[derive(Debug)]
@@ -197,6 +227,11 @@ mod tests {
             "http://cache.local:8080/x",
             "http://cache.local:8080?x",
             "http://127.0.0.1:8080",
+            "http://2130706433:8080",
+            "http://127.1:8080",
+            "http://0x7f000001:8080",
+            "http://0177.0.0.1:8080",
+            "http://[::ffff:127.0.0.1]:8080",
             "http://other.local:8080",
             "https://cache.local:8080",
             "http://cache.local:8081",
@@ -219,6 +254,13 @@ mod tests {
         }
         assert_eq!(catalog.instances.len(), 2);
         assert_eq!(catalog.unique_caches().len(), 1);
+        assert_eq!(
+            "http://cache.example:08081"
+                .parse::<CacheOrigin>()
+                .unwrap()
+                .as_str(),
+            "http://cache.example:8081"
+        );
         catalog.record(ServiceEvent::ServiceRemoved(
             SERVICE_TYPES[0].into(),
             "one._http._tcp.local.".into(),

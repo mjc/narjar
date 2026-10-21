@@ -9,11 +9,17 @@ use std::{
 
 use clap::Args;
 use mdns_sd::{DaemonEvent, DaemonStatus, Receiver, RecvTimeoutError, ServiceDaemon, ServiceEvent};
+use ureq::unversioned::{
+    resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
+    transport::{DefaultConnector, NextTimeout},
+};
 
 use crate::{error::Error, host};
 
 use super::{
-    advertisement::{AdvertisedCache, Catalog, SERVICE_TYPES, SetupPage},
+    advertisement::{
+        AdvertisedCache, Catalog, SERVICE_TYPES, SetupPage, is_permitted_probe_destination,
+    },
     runtime,
 };
 
@@ -169,7 +175,7 @@ fn probe_cache(cache: &AdvertisedCache, deadline: Instant) -> Availability {
         .min(Duration::from_secs(2));
     match remaining.is_zero() {
         true => Availability::NotProbed,
-        false => match request_cache_info(&cache.origin, remaining) {
+        false => match request_cache_info(&cache.origin, remaining, NetworkResolver) {
             Ok(status) => status,
             Err(_) => Availability::Unavailable,
         },
@@ -179,16 +185,17 @@ fn probe_cache(cache: &AdvertisedCache, deadline: Instant) -> Availability {
 fn request_cache_info(
     origin: &super::advertisement::CacheOrigin,
     timeout: Duration,
+    resolver: impl Resolver,
 ) -> Result<Availability, ureq::Error> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .proxy(None)
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_global(Some(timeout))
         .timeout_connect(Some(timeout))
         .timeout_recv_body(Some(timeout))
-        .build()
-        .into();
+        .build();
+    let agent = ureq::Agent::with_parts(config, DefaultConnector::default(), resolver);
     let mut response = agent
         .get(origin.url().endpoint(&["nix-cache-info"]).as_str())
         .call()?;
@@ -207,6 +214,36 @@ fn request_cache_info(
         }
         401 | 403 => Ok(Availability::RequiresCredentials),
         _ => Ok(Availability::Unavailable),
+    }
+}
+
+#[derive(Debug)]
+struct NetworkResolver;
+
+impl Resolver for NetworkResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let addresses = DefaultResolver::default().resolve(uri, config, timeout)?;
+        permitted_addresses(&addresses)
+    }
+}
+
+fn permitted_addresses(
+    addresses: &ResolvedSocketAddrs,
+) -> Result<ResolvedSocketAddrs, ureq::Error> {
+    let mut accepted = NetworkResolver.empty();
+    addresses
+        .iter()
+        .copied()
+        .filter(|address| is_permitted_probe_destination(address.ip()))
+        .for_each(|address| accepted.push(address));
+    match accepted.is_empty() {
+        true => Err(ureq::Error::HostNotFound),
+        false => Ok(accepted),
     }
 }
 
@@ -284,7 +321,8 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).unwrap();
         });
-        let result = request_cache_info(&origin, Duration::from_secs(2));
+        let result =
+            request_cache_info(&origin, Duration::from_secs(2), DefaultResolver::default());
         server.join().unwrap();
         result
     }
@@ -308,5 +346,26 @@ mod tests {
             Availability::Unavailable
         );
         assert!(probe_response(200, &"x".repeat(1025), "").is_err());
+    }
+
+    #[test]
+    fn resolved_loopback_unspecified_and_mapped_ipv4_addresses_never_reach_the_connector() {
+        let mut addresses = NetworkResolver.empty();
+        for address in [
+            "127.0.0.1:8080",
+            "0.0.0.0:8080",
+            "[::1]:8080",
+            "[::]:8080",
+            "[::ffff:127.0.0.1]:8080",
+        ] {
+            addresses.push(address.parse().unwrap());
+        }
+        assert!(permitted_addresses(&addresses).is_err());
+        addresses.push("192.0.2.1:8080".parse().unwrap());
+        let accepted = permitted_addresses(&addresses).unwrap();
+        assert_eq!(
+            accepted.as_ref(),
+            &["192.0.2.1:8080".parse::<std::net::SocketAddr>().unwrap()]
+        );
     }
 }
