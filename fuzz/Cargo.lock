@@ -371,7 +371,7 @@ checksum = "1d2923e26fcf6c3699531d13e141a4c18bb0852d5614da154805dcf6348fbf21"
 
 [[package]]
 name = "narjar"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "data-encoding",
  "serde",

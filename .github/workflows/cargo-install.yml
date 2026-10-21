@@ -108,3 +108,32 @@ jobs:
         env:
           CARGO_INSTALL_VERSION: ${{ inputs.version }}
         run: ./ci/check-cargo-install-without-nix.ps1 -Version $env:CARGO_INSTALL_VERSION
+      - name: Package and run the Windows release archive
+        run: ./ci/package-windows-release.ps1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-release-${{ inputs.version == '' && 'source' || 'registry' }}
+          path: target/windows-release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+      - name: Stage the verified Windows executable and acceptance tests
+        run: |
+          $bundle = New-Item -ItemType Directory -Path target/windows-candidate -Force
+          Copy-Item target/cargo-install/bin/narjar.exe $bundle
+          Copy-Item $env:NARJAR_APPLICATION_TEST_BINARY (Join-Path $bundle 'application-tests.exe')
+          Copy-Item target/windows-filesystem-probe-installed/probe.exe $bundle
+          Copy-Item ci/windows-application-smoke.ps1 $bundle
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the candidate commit' }
+          @{ commit = $commit; target = 'x86_64-pc-windows-msvc' } |
+            ConvertTo-Json | Set-Content (Join-Path $bundle 'candidate.json') -Encoding utf8
+          Get-ChildItem $bundle -File | Sort-Object Name | ForEach-Object {
+            $digest = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$digest  $($_.Name)"
+          } | Set-Content (Join-Path $bundle 'SHA256SUMS') -Encoding ascii
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-candidate-${{ inputs.version == '' && 'source' || 'registry' }}
+          path: target/windows-candidate/
+          if-no-files-found: error
+          retention-days: 14

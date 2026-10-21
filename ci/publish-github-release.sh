@@ -11,6 +11,7 @@ find_release_id_including_drafts() {
 assets=(
   "narjar-$RELEASE_VERSION.crate"
   "narjar-v$RELEASE_VERSION-x86_64-linux.tar.gz"
+  "narjar-v$RELEASE_VERSION-x86_64-pc-windows-msvc.zip"
   SHA256SUMS
 )
 paths=("${assets[@]/#/target/release/}")
