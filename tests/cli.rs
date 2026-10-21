@@ -370,6 +370,44 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
 }
 
 #[test]
+fn discovery_notices_only_require_the_narjar_module_for_a_local_edge() {
+    for (format, mode, needs_module) in [
+        ("nix-conf", "direct", false),
+        ("nixos", "direct", false),
+        ("nixos", "local-edge", true),
+    ] {
+        let output = run(&[
+            "discover",
+            "config",
+            "--url",
+            "https://offline.example",
+            "--trusted-public-key",
+            "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+            "--format",
+            format,
+            "--mode",
+            mode,
+        ]);
+        let notices = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{notices}");
+        assert_eq!(
+            notices.contains("requires Narjar's NixOS module"),
+            needs_module,
+            "{format}/{mode}: {notices}"
+        );
+        assert!(
+            notices.contains("at least 900 seconds"),
+            "all client modes need retention guidance: {notices}"
+        );
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("requires Narjar's NixOS module")
+        );
+    }
+}
+
+#[test]
 fn discovery_configuration_is_offline_repeatable_and_keeps_notices_off_stdout() {
     let key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
     let arguments = [

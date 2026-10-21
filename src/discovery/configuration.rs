@@ -36,6 +36,7 @@ pub(super) enum ClientMode {
     LocalEdge,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum ConfigurationTarget {
     Nixos(ClientMode),
     NixConf,
@@ -62,7 +63,7 @@ pub(super) struct LocalEdgeUpstream<'a>(&'a CacheOrigin);
 
 impl<'a> LocalEdgeUpstream<'a> {
     pub(super) fn from_origin(origin: &'a CacheOrigin) -> Option<Self> {
-        match origin.url().is_https() || origin.url().port() != 5000 || origin.is_network_host() {
+        match origin.url().port() != 5000 || origin.is_network_host() {
             true => Some(Self(origin)),
             false => None,
         }
@@ -103,7 +104,22 @@ pub(super) fn run(options: Configure) -> Result<(), Error> {
         "Configuration uses only the keys you supplied; discovery does not establish trust."
     )
     .map_err(runtime)?;
-    writeln!(notices, "The local-edge example requires Narjar's NixOS module. Confirm the operator retains advertised payloads for at least {} seconds.", 2 * u64::from(options.positive_ttl_seconds) + 300).map_err(runtime)?;
+    match target {
+        ConfigurationTarget::Nixos(ClientMode::LocalEdge) => {
+            writeln!(
+                notices,
+                "The local-edge example requires Narjar's NixOS module."
+            )
+            .map_err(runtime)?;
+        }
+        ConfigurationTarget::Nixos(ClientMode::Direct) | ConfigurationTarget::NixConf => {}
+    }
+    writeln!(
+        notices,
+        "Confirm the operator retains advertised payloads for at least {} seconds.",
+        2 * u64::from(options.positive_ttl_seconds) + 300
+    )
+    .map_err(runtime)?;
     keys.0.iter().try_for_each(|key| {
         writeln!(
             notices,
@@ -244,6 +260,12 @@ mod tests {
             "http://[::1]:5000",
             "http://[::ffff:127.0.0.1]:5000",
             "http://0.0.0.0:5000",
+            "https://127.0.0.1:5000",
+            "https://localhost:5000",
+            "https://cache.localhost:5000",
+            "https://[::1]:5000",
+            "https://[::ffff:127.0.0.1]:5000",
+            "https://0.0.0.0:5000",
         ] {
             let origin = url.parse().unwrap();
             assert!(
@@ -269,7 +291,7 @@ mod tests {
         }
         for url in [
             "http://localhost:8080",
-            "https://localhost:5000",
+            "https://localhost:8080",
             "https://cache.example",
         ] {
             let origin = url.parse().unwrap();
