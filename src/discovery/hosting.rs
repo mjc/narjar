@@ -289,23 +289,25 @@ fn await_announcement(
     deadline: Instant,
     fixed_hostname: Option<&str>,
 ) -> Result<(), Error> {
-    std::iter::from_fn(|| {
-        deadline
-            .checked_duration_since(Instant::now())
-            .map(&mut receive)
-    })
-    .find_map(|event| {
-        match event.and_then(|event| classify_advertisement_event(event, fixed_hostname)) {
-            Ok(AnnouncementProgress::Announced) => Some(Ok(())),
-            Ok(AnnouncementProgress::Waiting) => None,
-            Err(error) => Some(Err(error)),
-        }
-    })
-    .unwrap_or_else(|| {
-        Err(Error::runtime(
-            "LAN advertisement did not announce within five seconds",
-        ))
-    })
+    std::iter::from_fn(|| remaining_announcement_wait(deadline, Instant::now()).map(&mut receive))
+        .find_map(|event| {
+            match event.and_then(|event| classify_advertisement_event(event, fixed_hostname)) {
+                Ok(AnnouncementProgress::Announced) => Some(Ok(())),
+                Ok(AnnouncementProgress::Waiting) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(Error::runtime(
+                "LAN advertisement did not announce within five seconds",
+            ))
+        })
+}
+
+fn remaining_announcement_wait(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
 }
 
 fn observe_advertisement(
@@ -431,6 +433,16 @@ mod tests {
 
     #[test]
     fn readiness_requires_an_announcement_and_propagates_socket_errors() {
+        let now = Instant::now();
+        assert_eq!(remaining_announcement_wait(now, now), None);
+        assert_eq!(
+            remaining_announcement_wait(now, now + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            remaining_announcement_wait(now + Duration::from_secs(1), now),
+            Some(Duration::from_secs(1))
+        );
         let ready = await_announcement(
             |_| Ok(DaemonEvent::Announce("cache".into(), "127.0.0.1".into())),
             Instant::now() + Duration::from_secs(1),
