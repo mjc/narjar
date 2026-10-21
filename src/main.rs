@@ -44,7 +44,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     Init(operator::Init),
     Setup(setup::Setup),
     Key(operator::Key),
@@ -80,7 +80,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
-        Command::Serve(args) => server::serve(ServeConfig::try_from(args).map_err(Error::usage)?),
+        Command::Serve(args) => server::serve(ServeConfig::try_from(*args).map_err(Error::usage)?),
         Command::Init(args) => operator::init(args),
         Command::Setup(args) => setup::run(args),
         Command::Key(args) => operator::key(args),

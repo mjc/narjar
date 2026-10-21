@@ -175,10 +175,12 @@ fn probe_cache(cache: &AdvertisedCache, deadline: Instant) -> Availability {
         .min(Duration::from_secs(2));
     match remaining.is_zero() {
         true => Availability::NotProbed,
-        false => match request_cache_info(&cache.origin, remaining, NetworkResolver) {
-            Ok(status) => status,
-            Err(_) => Availability::Unavailable,
-        },
+        false => {
+            match request_cache_info(&cache.origin, remaining, NetworkResolver::for_cache(cache)) {
+                Ok(status) => status,
+                Err(_) => Availability::Unavailable,
+            }
+        }
     }
 }
 
@@ -218,7 +220,19 @@ fn request_cache_info(
 }
 
 #[derive(Debug)]
-struct NetworkResolver;
+enum NetworkResolver {
+    System,
+    Mdns(Vec<std::net::SocketAddr>),
+}
+
+impl NetworkResolver {
+    fn for_cache(cache: &AdvertisedCache) -> Self {
+        match cache.origin.url().host().ends_with(".local") {
+            true => Self::Mdns(cache.addresses.clone()),
+            false => Self::System,
+        }
+    }
+}
 
 impl Resolver for NetworkResolver {
     fn resolve(
@@ -227,7 +241,17 @@ impl Resolver for NetworkResolver {
         config: &ureq::config::Config,
         timeout: NextTimeout,
     ) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        let addresses = DefaultResolver::default().resolve(uri, config, timeout)?;
+        let addresses = match self {
+            Self::System => DefaultResolver::default().resolve(uri, config, timeout)?,
+            Self::Mdns(addresses) => {
+                let mut resolved = self.empty();
+                addresses
+                    .iter()
+                    .copied()
+                    .for_each(|address| resolved.push(address));
+                resolved
+            }
+        };
         permitted_addresses(&addresses)
     }
 }
@@ -235,7 +259,7 @@ impl Resolver for NetworkResolver {
 fn permitted_addresses(
     addresses: &ResolvedSocketAddrs,
 ) -> Result<ResolvedSocketAddrs, ureq::Error> {
-    let mut accepted = NetworkResolver.empty();
+    let mut accepted = NetworkResolver::System.empty();
     addresses
         .iter()
         .copied()
@@ -350,7 +374,7 @@ mod tests {
 
     #[test]
     fn resolved_loopback_unspecified_and_mapped_ipv4_addresses_never_reach_the_connector() {
-        let mut addresses = NetworkResolver.empty();
+        let mut addresses = NetworkResolver::System.empty();
         for address in [
             "127.0.0.1:8080",
             "0.0.0.0:8080",
@@ -366,6 +390,45 @@ mod tests {
         assert_eq!(
             accepted.as_ref(),
             &["192.0.2.1:8080".parse::<std::net::SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn local_probes_use_mdns_addresses_without_system_name_resolution() {
+        let origin = "http://unregistered-name.local:8080".parse().unwrap();
+        let cache = mdns_sd::ServiceInfo::new(
+            SERVICE_TYPES[0],
+            "offline fixture",
+            "unregistered-name.local.",
+            "192.0.2.45",
+            8080,
+            [
+                ("nix-cache", "1"),
+                ("narjar", "1"),
+                ("path", "/"),
+                ("url", "http://unregistered-name.local:8080"),
+            ]
+            .as_slice(),
+        )
+        .unwrap()
+        .as_resolved_service();
+        let cache = AdvertisedCache::try_from(&cache).unwrap();
+        assert_eq!(cache.origin, origin);
+        let addresses = NetworkResolver::for_cache(&cache)
+            .resolve(
+                &"http://unregistered-name.local:8080/nix-cache-info"
+                    .parse()
+                    .unwrap(),
+                &ureq::Agent::config_builder().build(),
+                NextTimeout {
+                    after: Duration::from_secs(1).into(),
+                    reason: ureq::Timeout::Resolve,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            addresses.as_ref(),
+            &["192.0.2.45:8080".parse::<std::net::SocketAddr>().unwrap()]
         );
     }
 }

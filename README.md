@@ -316,15 +316,28 @@ for priorities, TTLs, certificates, readiness and monitoring.
 
 ### LAN discovery and setup
 
-A shared NixOS cache can advertise itself through Avahi and serve a setup page
-at its public URL. For a read-only cache on a trusted LAN:
+A Cargo-installed Narjar can advertise itself and serve client setup instructions.
+Neither feature needs Nix, Avahi, or Nginx:
+
+```sh
+narjar serve --data-dir ./cache --listen 0.0.0.0:8080 \
+  --public-url http://cache.local:8080 --advertise --onboarding
+```
+
+The initialized cache must contain the operator's public signing keys. The page
+reads that same trust policy; do not configure a second set of page keys.
+Open TCP 8080 and multicast UDP 5353 where needed. Use HTTPS through your
+existing reverse proxy outside a trusted LAN; set `--public-url` to its address.
+Narjar itself serves HTTP.
+
+The optional NixOS module passes the same daemon settings:
 
 ```nix
-{ config, ... }: {
+{
   services.narjar = {
     enable = true;
-    publicUrl = "http://${config.services.avahi.hostName}.local:8080";
-    proxy = { enable = true; tls = "off"; };
+    listen = "0.0.0.0:8080";
+    publicUrl = "http://cache.local:8080";
     edge = {
       enable = true;
       upstream = "https://cache.nixos.org";
@@ -334,14 +347,16 @@ at its public URL. For a read-only cache on a trusted LAN:
     onboarding.enable = true;
   };
   networking.firewall.allowedTCPPorts = [ 8080 ];
+  networking.firewall.allowedUDPPorts = [ 5353 ];
 }
 ```
 
-Use a configured hostname for Avahi. The page includes the cache URL, public
+The page includes the configured cache URL, public
 keys, and client configurations for direct substitution or a local fail-open
 edge. Confirm signing keys with the operator over a trusted channel before
-using them; LAN discovery does not establish trust. NixOS clients configured
-with a `.local` cache URL enable Avahi name resolution.
+using them; LAN discovery does not establish trust. Nix clients using a `.local`
+URL need their platform's mDNS name resolution. Use a regular DNS hostname if
+that is not available. Narjar's own browser and probes resolve mDNS directly.
 
 Advertisement and the page are independently opt-in. Existing HTTPS cache URLs
 work too; discovery retains their TLS policy. See [LAN discovery](https://github.com/mjc/narjar/blob/main/docs/operations.md#lan-discovery-and-setup)

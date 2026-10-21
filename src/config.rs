@@ -24,6 +24,7 @@ pub(crate) struct NativeStoreOptions<'a> {
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
+    pub(crate) hosting: crate::discovery::hosting::HostingConfig,
     pub(crate) track_access: bool,
     pub(crate) data_dir: PathBuf,
     pub(crate) listen: SocketAddr,
@@ -66,6 +67,14 @@ impl ServeConfig {
 }
 
 impl ServeSource {
+    fn minimum_advertisement_lease(&self) -> Option<u64> {
+        match self {
+            Self::FlatCache { .. } => None,
+            Self::ReadThrough { settings, .. } => Some(settings.lease_seconds.get()),
+            #[cfg(unix)]
+            Self::NativeStore(settings) => Some(settings.minimum_advertisement_lease()),
+        }
+    }
     pub(crate) fn prepare_edge_storage(
         storage_backend: StorageBackend,
         egress_compression: WireEncoding,
@@ -249,6 +258,8 @@ impl ServeSourceChoice {
 
 #[derive(Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    hosting: crate::discovery::hosting::HostingArgs,
     /// Record coalesced read-use hints for last-use GC ordering.
     #[arg(long, env = "NARJAR_TRACK_ACCESS")]
     track_access: bool,
@@ -418,6 +429,7 @@ impl TryFrom<ServeArgs> for ServeConfig {
     fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
         let source = args.prepare_source().map_err(|error| error.to_string())?;
         Ok(Self {
+            hosting: args.hosting.prepare(source.minimum_advertisement_lease())?,
             track_access: args.track_access,
             data_dir: args.data_dir,
             listen: args.listen,

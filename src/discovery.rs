@@ -1,6 +1,8 @@
 mod advertisement;
 mod browse;
 mod configuration;
+pub(crate) mod hosting;
+pub(crate) mod page;
 
 use clap::{Args, Subcommand};
 

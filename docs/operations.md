@@ -710,14 +710,12 @@ network. Socket activation is not supported.
 
 ### LAN discovery and setup
 
-`services.narjar.discovery.enable` publishes an Avahi DNS-SD service derived
-from `publicUrl`. It uses `_http._tcp` or `_https._tcp` and the configured public
-port, including custom ports. The SRV target is the machine's Avahi hostname;
-the TXT URL is the canonical cache address that clients must use. A public DNS
-hostname still needs its normal DNS record. A `.local` public hostname must
-match `services.avahi.hostName` and `services.avahi.domainName`; advertising a
-different name does not register an alias. The [README](../README.md#lan-discovery-and-setup)
-shows a configuration using the existing hostname.
+`narjar serve --public-url URL --advertise` publishes DNS-SD through the native
+Rust mDNS implementation. It needs no Nix installation, Avahi, or subprocess.
+The advertisement uses `_http._tcp` or `_https._tcp` and the configured public
+port, including reverse-proxy ports. A `.local` origin is registered directly;
+other origins use a separate mDNS hostname while retaining the canonical URL
+in TXT. Public DNS names still need their normal DNS records.
 
 The TXT records are:
 
@@ -730,22 +728,24 @@ The TXT records are:
 | `setup=/` | Setup page is enabled at the root; omitted otherwise. |
 
 Announcements contain no signing keys or credentials. Discovery does not add
-substituters, trust a key, or grant upload access. Avahi adjusts colliding service
-instance names; `discovery.name` can set a distinct display name without
+substituters, trust a key, or grant upload access. mDNS probing handles colliding
+instance names; `--discovery-name` sets a display name without
 changing the cache URL. Clients must discard removed or expired announcements.
 Multicast normally remains within one LAN: VLANs, wireless isolation, and
 multicast filtering can prevent discovery even when the cache URL is reachable.
 
-The module enables native Avahi service and address publishing. Avahi's own
-`openFirewall` setting controls UDP 5353 and defaults to true; explicit settings
-and unrelated service records are preserved. Open the public cache's TCP port
-separately. Use Avahi's native interface restrictions where needed. Enabling
-discovery does not change HTTP versus HTTPS, read authentication, or metrics
-authorization. `.local` client URLs enable Avahi's NSS resolver on NixOS.
+Open multicast UDP 5353 and the public cache's TCP port as needed. Narjar does
+not change firewall rules. Advertisement starts after server initialization and
+is withdrawn on shutdown. Startup waits up to five seconds for an announcement;
+socket errors fail startup. A conflict with the configured `.local` hostname
+fails or withdraws the advertisement rather than changing its URL. A specific non-loopback listener restricts advertised
+addresses to that interface. A loopback backend behind a proxy advertises the
+configured public origin, not the backend address. Discovery does not change
+TLS policy, authentication, or metrics access.
 
-`services.narjar.onboarding.enable` adds a static page to the exact `/` route
-of the managed proxy. Cache and API routes keep their existing handlers. The
-page shows the configured URL, role, public keys with their SHA-256 fingerprints,
+`--onboarding` serves a static page at exactly `/` from the daemon's own HTTP
+listener. Cache and API routes keep their existing handlers. The page shows
+the configured URL, public keys with their SHA-256 fingerprints,
 direct client examples, and retention guidance. Public-read caches also offer
 a local-edge example; private caches require direct clients with separately
 provisioned read credentials. Fingerprints
@@ -753,35 +753,40 @@ hash the exact public-key line without a newline. Verify keys through an
 authenticated operator channel; the discovered page alone is not evidence of
 trust.
 
-The page and server share `auth.trustedPublicKeyValues`. This list contains
-public keys only and may be stored in Nix; read-through caches default it to
-`edge.trustedPublicKeys`. Uploaded and native-store caches can supply it
-directly. It is mutually exclusive with the runtime `auth.trustedPublicKeys`
-file, which evaluation cannot read to generate a page. Private signing keys,
-tokens, and netrc credentials must remain outside the Nix store.
+The page reads the initialized cache's trusted public keys at startup. It uses
+neither request Host headers nor a separately configured page key list. At least
+one trusted key is required; onboarding accepts at most 32 keys to keep the
+page and its client examples bounded. No private signing key, token, or netrc
+content is rendered. The setup page is public even for private-read caches;
+it provides instructions, not read credentials.
+Known edge/native-store retention must cover the examples' 300-second positive
+TTL twice, plus 300 seconds; shorter leases reject onboarding at startup.
 
-Set `onboarding.diagnostics = true` to include readiness and metrics links.
+Set `--onboarding-diagnostics` to include readiness and metrics links.
 They retain existing authorization. The page does not grant read credentials
 or expose private backend settings. Its client examples preserve other
 substituters by default; select `substituterPolicy = "only"` explicitly when
 the local edge must handle every substitution attempt.
 
-Disable `discovery.enable` to withdraw the service; previously cached
-announcements can remain until their TTL expires. Disable `onboarding.enable`
-to remove the root page. Neither action removes client configuration already
-installed on another machine. Avahi remains enabled if another service needs it.
+Remove `--advertise` to disable announcements and `--onboarding` to disable the
+page. Cached announcements can remain until their TTL expires. Neither action
+removes client configuration already installed elsewhere. The optional NixOS
+settings `publicUrl`, `discovery.enable`, `discovery.name`, `onboarding.enable`,
+and `onboarding.diagnostics` only pass these flags; they do not create a second
+web server or advertiser.
 
 `narjar discover browse` listens for versioned Narjar advertisements for five
 seconds by default, with a maximum of 30 seconds and 16 retained instances.
 `--max-results` raises the instance cap up to 64. Repeated URLs are deduplicated;
 withdrawn services and invalid updates are removed. The command shuts down its
-discovery thread before exiting. It does not run discovery inside `serve`.
+discovery thread before exiting. `serve` does not browse or retain a catalog.
 
 `--probe` adds credential-free `/nix-cache-info` checks, with a five-second
 overall probe budget and at most two seconds per request. Redirects are rejected
 and response bodies are limited to 1 KiB. Probes use the canonical URL and normal
-certificate verification. `.local` probing requires the host's mDNS resolver;
-browsing itself uses native Rust DNS-SD. An availability result is not a signing
+certificate verification. `.local` probes use the discovered mDNS addresses,
+without a system mDNS resolver. Nix clients and browsers still need platform
+name resolution for `.local` URLs. An availability result is not a signing
 trust decision. Windows can browse and print instructions, but Nix client
 configuration is for Linux/macOS hosts.
 

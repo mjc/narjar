@@ -124,6 +124,9 @@ const MAX_ACTIVE_NATIVE_LEASES: NonZeroUsize =
     NonZeroUsize::new(100_000).expect("native lease capacity is nonzero");
 
 impl NativeStoreSettings {
+    pub(crate) fn minimum_advertisement_lease(&self) -> u64 {
+        self.min_lease_seconds.get()
+    }
     pub(crate) fn with_signing_key_file(mut self, path: Option<&Path>) -> Self {
         self.signing_key_file = path.map(Path::to_owned);
         self

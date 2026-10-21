@@ -31,12 +31,12 @@ enum Format {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum ClientMode {
+pub(super) enum ClientMode {
     Direct,
     LocalEdge,
 }
 
-enum ConfigurationTarget {
+pub(super) enum ConfigurationTarget {
     Nixos(ClientMode),
     NixConf,
 }
@@ -56,7 +56,13 @@ impl ConfigurationTarget {
     }
 }
 
-struct ExplicitlyTrustedKeys(Vec<String>);
+pub(super) struct ExplicitlyTrustedKeys(Vec<String>);
+
+impl ExplicitlyTrustedKeys {
+    pub(super) fn tokens(&self) -> &[String] {
+        &self.0
+    }
+}
 
 impl TryFrom<Vec<String>> for ExplicitlyTrustedKeys {
     type Error = Error;
@@ -101,7 +107,7 @@ pub(super) fn run(options: Configure) -> Result<(), Error> {
         .map_err(runtime)
 }
 
-fn render(
+pub(super) fn render(
     origin: &CacheOrigin,
     keys: &ExplicitlyTrustedKeys,
     target: ConfigurationTarget,
@@ -123,6 +129,13 @@ fn render_nixos(
     mode: ClientMode,
     positive_ttl_seconds: u32,
 ) -> Result<String, Error> {
+    let edge = match mode {
+        ClientMode::Direct => String::new(),
+        ClientMode::LocalEdge => format!(
+            "  services.narjar.edge.leaseSeconds = {};\n",
+            5_187_600_u64.max(2 * u64::from(positive_ttl_seconds) + 300)
+        ),
+    };
     let mode = match mode {
         ClientMode::Direct => "direct",
         ClientMode::LocalEdge => "local-edge",
@@ -132,7 +145,7 @@ fn render_nixos(
             "the NixOS module currently requires a DNS or IPv4 cache origin; use --format nix-conf for an IPv6 literal",
         )),
         false => Ok(format!(
-            "{{\n  services.narjar.client = {{\n    enable = true;\n    url = {};\n    mode = \"{mode}\";\n    trustedPublicKeys = [ {} ];\n    substituterPolicy = \"append\";\n    priority = 30;\n    fallback = false;\n    positiveTtlSeconds = {positive_ttl_seconds};\n    negativeTtlSeconds = 1;\n  }};\n}}\n",
+            "{{\n  services.narjar.client = {{\n    enable = true;\n    url = {};\n    mode = \"{mode}\";\n    trustedPublicKeys = [ {} ];\n    substituterPolicy = \"append\";\n    priority = 30;\n    fallback = false;\n    positiveTtlSeconds = {positive_ttl_seconds};\n    negativeTtlSeconds = 1;\n  }};\n{edge}}}\n",
             nix_string(origin.as_str()),
             keys.0
                 .iter()
@@ -172,6 +185,15 @@ mod tests {
         assert!(nixos.contains("substituterPolicy = \"append\""));
         assert!(nixos.contains("mode = \"local-edge\""));
         assert!(nixos.contains("positiveTtlSeconds = 300"));
+        assert!(nixos.contains("services.narjar.edge.leaseSeconds = 5187600;"));
+        let direct = render(
+            &origin,
+            &keys,
+            ConfigurationTarget::Nixos(ClientMode::Direct),
+            86_400,
+        )
+        .unwrap();
+        assert!(!direct.contains("edge.leaseSeconds"));
         let conf = render(&origin, &keys, ConfigurationTarget::NixConf, 300).unwrap();
         assert!(conf.starts_with("extra-substituters = https://cache.example?priority=30\n"));
         assert!(conf.contains(KEY));

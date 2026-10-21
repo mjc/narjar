@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, net::IpAddr, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+};
 
 use mdns_sd::{ResolvedService, ServiceEvent};
 
@@ -7,7 +11,7 @@ use crate::http_url::HttpUrl;
 pub(super) const SERVICE_TYPES: [&str; 2] = ["_http._tcp.local.", "_https._tcp.local."];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct CacheOrigin(HttpUrl);
+pub(crate) struct CacheOrigin(HttpUrl);
 
 impl FromStr for CacheOrigin {
     type Err = String;
@@ -51,15 +55,15 @@ impl FromStr for CacheOrigin {
 }
 
 impl CacheOrigin {
-    pub(super) fn url(&self) -> &HttpUrl {
+    pub(crate) fn url(&self) -> &HttpUrl {
         &self.0
     }
 
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         self.0.as_str().trim_end_matches('/')
     }
 
-    fn is_network_host(&self) -> bool {
+    pub(super) fn is_network_host(&self) -> bool {
         match self.0.host().parse::<IpAddr>() {
             Ok(address) => is_permitted_probe_destination(address),
             Err(_) => self.0.host() != "localhost" && !self.0.host().ends_with(".localhost"),
@@ -84,6 +88,7 @@ pub(super) struct AdvertisedCache {
     instance: String,
     pub(super) origin: CacheOrigin,
     pub(super) setup: SetupPage,
+    pub(super) addresses: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -132,9 +137,25 @@ impl TryFrom<&ResolvedService> for AdvertisedCache {
                 instance: service.get_fullname().to_owned(),
                 origin,
                 setup,
+                addresses: service
+                    .get_addresses()
+                    .iter()
+                    .filter_map(|address| scoped_socket_address(address, service.get_port()))
+                    .take(16)
+                    .collect(),
             }),
             false => Err("unsupported or inconsistent cache advertisement"),
         }
+    }
+}
+
+fn scoped_socket_address(address: &mdns_sd::ScopedIp, port: u16) -> Option<SocketAddr> {
+    match address {
+        mdns_sd::ScopedIp::V4(address) => Some(SocketAddr::from((*address.addr(), port))),
+        mdns_sd::ScopedIp::V6(address) => Some(
+            std::net::SocketAddrV6::new(*address.addr(), port, 0, address.scope_id().index).into(),
+        ),
+        _ => None,
     }
 }
 

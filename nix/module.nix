@@ -359,6 +359,11 @@
       "--stats-filesystem-sample"
       filesystemSampleFile
     ]
+    ++ lib.optionals (cfg.publicUrl != null) ["--public-url" cfg.publicUrl]
+    ++ lib.optionals cfg.discovery.enable ["--advertise"]
+    ++ lib.optionals (cfg.discovery.name != null) ["--discovery-name" cfg.discovery.name]
+    ++ lib.optionals cfg.onboarding.enable ["--onboarding"]
+    ++ lib.optionals cfg.onboarding.diagnostics ["--onboarding-diagnostics"]
   );
   zfsProperties = [
     "mountpoint"
@@ -986,11 +991,13 @@ in {
           ProtectKernelTunables = true;
           ProtectProc = "invisible";
           RemoveIPC = true;
-          RestrictAddressFamilies = [
-            "AF_UNIX"
-            "AF_INET"
-            "AF_INET6"
-          ];
+          RestrictAddressFamilies =
+            [
+              "AF_UNIX"
+              "AF_INET"
+              "AF_INET6"
+            ]
+            ++ lib.optional cfg.discovery.enable "AF_NETLINK";
           RestrictNamespaces = true;
           RestrictRealtime = true;
           SystemCallArchitectures = "native";

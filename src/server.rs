@@ -144,6 +144,7 @@ impl PublicationQueue {
 
 #[derive(Clone)]
 struct RequestWorkerContext {
+    setup: Arc<Option<crate::discovery::page::SetupDocument>>,
     storage: Arc<Storage>,
     source: Arc<ReadSource>,
     authorizer: Arc<Authorizer>,
@@ -267,6 +268,7 @@ fn process_next_request(
             Method::Get | Method::Head | Method::Other | Method::Put => respond(
                 request,
                 ReadContext {
+                    setup: context.setup.as_ref().as_ref().map(|page| page.bytes()),
                     storage: &context.storage,
                     source: &context.source,
                 },
@@ -578,6 +580,11 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         authorizer,
         trusted_keys,
     } = initialize_server_resources(&config)?;
+    let setup = Arc::new(
+        config
+            .hosting
+            .setup_document(&trusted_keys, authorizer.read_visibility())?,
+    );
     let publication_workers = match source.as_ref() {
         ReadSource::FlatCache => config.workers.get(),
         #[cfg(unix)]
@@ -699,6 +706,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     )
     .map_err(|error| Error::runtime(format!("cannot start idle connection monitor: {error}")))?;
     let request_context = RequestWorkerContext {
+        setup,
         storage: Arc::clone(&storage),
         source: Arc::clone(&source),
         authorizer: Arc::clone(&authorizer),
@@ -711,6 +719,12 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     };
     let handles = spawn_request_workers(config.workers.get(), receiver.clone(), request_context);
     drop(receiver);
+
+    let advertisement = config.hosting.advertise(
+        listener
+            .local_addr()
+            .map_err(|error| Error::runtime(error.to_string()))?,
+    )?;
 
     notify_service_ready(std::env::var_os("NOTIFY_SOCKET").as_deref())
         .map_err(|error| Error::runtime(format!("cannot report service readiness: {error}")))?;
@@ -726,6 +740,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             io_timeout: Duration::from_secs(config.io_timeout_seconds.get()),
         },
     )?;
+    drop(advertisement);
     idle_handle
         .join()
         .map_err(|_| Error::runtime("idle connection monitor panicked"))?
@@ -980,6 +995,7 @@ mod tests {
         )
         .unwrap();
         let context = super::RequestWorkerContext {
+            setup: Arc::new(None),
             storage: Arc::new(storage),
             source: Arc::new(super::ReadSource::FlatCache),
             authorizer: Arc::new(Authorizer::load(&root).unwrap()),
