@@ -91,6 +91,27 @@
     };
     listen = "[::1]:5000";
   };
+  restrictedProxy = evaluate {
+    services.narjar = {
+      enable = true;
+      publicUrl = "http://cache.example";
+      proxy = {
+        enable = true;
+        tls = "off";
+      };
+    };
+    services.nginx.defaultListenAddresses = ["127.0.0.1"];
+  };
+  sharedEdgeOptions = {
+    publicUrl = "https://cache.example";
+    proxy.enable = true;
+    edge = {
+      enable = true;
+      upstream = "https://upstream.example";
+      trustedPublicKeys = [key];
+    };
+  };
+  sharedEdge = server sharedEdgeOptions;
   location = tls.services.nginx.virtualHosts."cache.example".locations."/";
   proxyCheck = pkgs.runCommand "narjar-shared-proxy-check" {} ''
     for config in ${tls.environment.etc."nginx/nginx.conf".source} ${lan.environment.etc."nginx/nginx.conf".source}; do
@@ -101,10 +122,12 @@
         'proxy_buffering off;' \
         'proxy_cache off;' \
         'proxy_intercept_errors off;' \
-        'proxy_read_timeout 3600s;'; do
+        'proxy_read_timeout 3630s;'; do
         grep -F -- "$directive" "$config"
       done
     done
+    grep -F 'listen 0.0.0.0:80 ' ${tls.environment.etc."nginx/nginx.conf".source}
+    grep -F 'location ^~ /.well-known/acme-challenge/' ${tls.environment.etc."nginx/nginx.conf".source}
     touch "$out"
   '';
 in
@@ -113,21 +136,20 @@ in
   assert !disabled.services.narjar.enable;
   assert valid tls;
   assert tls.services.nginx.virtualHosts."cache.example".enableACME;
-  assert tls.services.nginx.virtualHosts."cache.example".onlySSL;
+  assert tls.services.nginx.virtualHosts."cache.example".forceSSL;
+  assert builtins.any (listener: listener.port == 80 && !listener.ssl) tls.services.nginx.virtualHosts."cache.example".listen;
+  assert tls.services.narjar.proxy.idleTimeoutSeconds > tls.services.narjar.edge.fillTimeoutSeconds;
+  assert valid sharedEdge;
+  assert sharedEdge.services.narjar.proxy.idleTimeoutSeconds >= sharedEdge.services.narjar.edge.fillTimeoutSeconds + sharedEdge.services.narjar.ioTimeoutSeconds;
+  assert map (listener: listener.addr) restrictedProxy.services.nginx.virtualHosts."cache.example".listen == ["127.0.0.1"];
   assert location.proxyPass == "http://127.0.0.1:5000";
   assert lib.hasInfix "proxy_request_buffering off;" location.extraConfig;
   assert lib.hasInfix "proxy_cache off;" location.extraConfig;
   assert !lib.hasInfix "proxy_hide_header" location.extraConfig;
   assert tls.networking.firewall.allowedTCPPorts == [];
   assert valid lan;
-  assert map (listener: {inherit (listener) addr port ssl;}) lan.services.nginx.virtualHosts."cache.example".listen
-  == [
-    {
-      addr = "0.0.0.0";
-      port = 8080;
-      ssl = false;
-    }
-  ];
+  assert map (listener: listener.addr) lan.services.nginx.virtualHosts."cache.example".listen == lan.services.nginx.defaultListenAddresses;
+  assert builtins.all (listener: listener.port == 8080 && !listener.ssl) lan.services.nginx.virtualHosts."cache.example".listen;
   assert !lan.services.nginx.virtualHosts."cache.example".enableACME;
   assert valid existingProxy;
   assert existingProxy.services.nginx.virtualHosts ? "other.example";
@@ -153,6 +175,35 @@ in
   assert inheritedUrl.services.narjar.client.url == inheritedUrl.services.narjar.publicUrl;
   assert builtins.all (cfg: !valid cfg) [
     (server {proxy.enable = true;})
+    (server {
+      publicUrl = "http://cache.example:5000";
+      proxy = {
+        enable = true;
+        tls = "off";
+      };
+    })
+    (server {
+      publicUrl = "https://cache.example:8443";
+      proxy.enable = true;
+    })
+    (server (sharedEdgeOptions
+      // {
+        proxy = {
+          enable = true;
+          idleTimeoutSeconds = 3600;
+        };
+      }))
+    (evaluate {
+      services.narjar = {
+        enable = true;
+        publicUrl = "http://cache.example:5000";
+        proxy = {
+          enable = true;
+          tls = "off";
+        };
+      };
+      services.nginx.defaultListenAddresses = ["127.0.0.1"];
+    })
     (server {
       publicUrl = "http://cache.example";
       proxy.enable = true;

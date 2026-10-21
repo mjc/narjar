@@ -35,6 +35,17 @@
     else lib.toInt (builtins.elemAt originParts 4);
   loopbackParts = builtins.match "(127[.]0[.]0[.]1|[[]::1[]]):([1-9][0-9]{0,4})" cfg.listen;
   loopback = loopbackParts != null && lib.toInt (builtins.elemAt loopbackParts 1) <= 65535;
+  acme = cfg.proxy.tls == "acme";
+  overlapsBackend = listener:
+    loopbackParts
+    != null
+    && listener.port == lib.toInt (builtins.elemAt loopbackParts 1)
+    && builtins.elem listener.addr ([(builtins.elemAt loopbackParts 0)]
+      ++ (
+        if builtins.elemAt loopbackParts 0 == "127.0.0.1"
+        then ["0.0.0.0"]
+        else ["[::]" "[::0]"]
+      ));
   localEdge = client.enable && client.mode == "local-edge";
   substituter =
     if localEdge
@@ -62,8 +73,8 @@ in {
       };
       idleTimeoutSeconds = mkOption {
         type = types.ints.positive;
-        default = lib.max cfg.ioTimeoutSeconds cfg.edge.fillTimeoutSeconds;
-        defaultText = lib.literalExpression "lib.max config.services.narjar.ioTimeoutSeconds config.services.narjar.edge.fillTimeoutSeconds";
+        default = cfg.ioTimeoutSeconds + cfg.edge.fillTimeoutSeconds;
+        defaultText = lib.literalExpression "config.services.narjar.ioTimeoutSeconds + config.services.narjar.edge.fillTimeoutSeconds";
         description = "Proxy timeout between successive I/O operations, also allowing a narinfo request to wait for a complete upstream fill. This is not a total request deadline.";
       };
     };
@@ -132,25 +143,44 @@ in {
           assertion = !cfg.edge.enable || cfg.edge.upstream != cfg.publicUrl;
           message = "services.narjar.edge.upstream must not point at this server's publicUrl";
         }
+        {
+          assertion = !acme || port == 443;
+          message = "services.narjar.proxy ACME mode requires the standard HTTPS port; use existing certificates for custom HTTPS ports";
+        }
+        {
+          assertion = !builtins.any overlapsBackend config.services.nginx.virtualHosts.${host}.listen;
+          message = "services.narjar.proxy listener must not overlap the Narjar backend socket";
+        }
+        {
+          assertion = !cfg.edge.enable || cfg.proxy.idleTimeoutSeconds >= cfg.edge.fillTimeoutSeconds + cfg.ioTimeoutSeconds;
+          message = "services.narjar.proxy.idleTimeoutSeconds must cover the edge fill timeout plus ioTimeoutSeconds";
+        }
       ];
       services.nginx = {
         enable = true;
         virtualHosts.${host} = {
-          enableACME = cfg.proxy.tls == "acme";
-          onlySSL = secure;
-          listen = [
-            {
-              addr = "0.0.0.0";
-              inherit port;
-              ssl = secure;
-            }
-          ];
+          enableACME = acme;
+          forceSSL = acme;
+          onlySSL = secure && !acme;
+          listen = mkDefault (lib.concatMap (addr:
+            [
+              {
+                inherit addr port;
+                ssl = secure;
+              }
+            ]
+            ++ lib.optional acme {
+              inherit addr;
+              port = 80;
+              ssl = false;
+            })
+          config.services.nginx.defaultListenAddresses);
           locations."/" = {
             proxyPass = "http://${cfg.listen}";
             recommendedProxySettings = false;
             extraConfig = ''
               proxy_http_version 1.1;
-              proxy_set_header Host $http_host;
+              proxy_set_header Host $host;
               proxy_set_header Connection "";
               proxy_request_buffering off;
               proxy_buffering off;
