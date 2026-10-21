@@ -9,7 +9,7 @@ use crate::cache::{
     storage::StoreHash,
 };
 
-use super::{Deadline, EdgeFailure, EdgeMiss};
+use super::{Deadline, EdgeFailure, EdgeHit, EdgeMiss};
 
 const MAX_TABLE_ENTRIES: usize = 4096;
 const MAX_WAITERS: usize = 64;
@@ -106,7 +106,7 @@ impl State {
 
 enum Progress {
     Running { waiters: usize },
-    Complete(Result<(), EdgeMiss>),
+    Complete(Result<EdgeHit, EdgeMiss>),
 }
 
 impl Default for Progress {
@@ -125,8 +125,8 @@ impl Flight {
     pub(super) fn wait(
         &self,
         deadline: Deadline,
-        completed: impl FnOnce(Result<(), EdgeMiss>) -> Result<(), EdgeMiss>,
-    ) -> Result<(), EdgeMiss> {
+        completed: impl FnOnce(Result<EdgeHit, EdgeMiss>) -> Result<EdgeHit, EdgeMiss>,
+    ) -> Result<EdgeHit, EdgeMiss> {
         let mut progress = self
             .progress
             .lock()
@@ -165,7 +165,7 @@ impl Flight {
         }
     }
 
-    pub(super) fn finish(&self, result: Result<(), EdgeMiss>) {
+    pub(super) fn finish(&self, result: Result<EdgeHit, EdgeMiss>) {
         if let Ok(mut progress) = self.progress.lock() {
             *progress = Progress::Complete(result);
             self.completed.notify_all();
@@ -254,13 +254,13 @@ mod tests {
             *flight.progress.lock().unwrap(),
             Progress::Running { waiters: 0 }
         ));
-        flight.finish(Ok(()));
+        flight.finish(Ok(EdgeHit::Local));
         assert_eq!(
             flight.wait(
                 Deadline::new(Duration::from_secs(1)).unwrap(),
                 std::convert::identity
             ),
-            Ok(())
+            Ok(EdgeHit::Local)
         );
     }
 

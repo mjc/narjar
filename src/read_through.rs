@@ -64,6 +64,13 @@ impl EdgeHit {
             Self::Coalesced => "coalesced",
         }
     }
+
+    const fn reported_for_follower(self) -> Self {
+        match self {
+            Self::Local => Self::Local,
+            Self::Filled | Self::Coalesced => Self::Coalesced,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,11 +511,9 @@ impl ReadThroughSource {
                 increment(&self.counters.followers);
                 flight
                     .wait(Deadline::new(self.timeout)?.earlier(deadline), |result| {
-                        finish_shared_fill_or_retry_representation(key, result, || {
-                            fill().map(|_| ())
-                        })
+                        finish_shared_fill_or_retry_representation(key, result, fill)
                     })
-                    .map(|()| EdgeHit::Coalesced)
+                    .map(EdgeHit::reported_for_follower)
             }
             Join::Leader(flight) => {
                 let completion = Completion::new(&flight);
@@ -519,7 +524,7 @@ impl ReadThroughSource {
                         .map_err(|_| EdgeMiss::Failed(EdgeFailure::Storage))?
                         .remember(key, miss.reason(), Instant::now(), self.negative_ttl);
                 }
-                completion.finish(result.map(|_| ()));
+                completion.finish(result);
                 result
             }
         }
@@ -586,9 +591,9 @@ fn increment(counter: &AtomicU64) {
 
 fn finish_shared_fill_or_retry_representation(
     key: Key,
-    result: Result<(), EdgeMiss>,
-    retry: impl FnOnce() -> Result<(), EdgeMiss>,
-) -> Result<(), EdgeMiss> {
+    result: Result<EdgeHit, EdgeMiss>,
+    retry: impl FnOnce() -> Result<EdgeHit, EdgeMiss>,
+) -> Result<EdgeHit, EdgeMiss> {
     match key {
         Key::Store(_) | Key::Representation(_, _) => result,
         Key::Nar(_) => result.or_else(|miss| match miss {
@@ -624,7 +629,7 @@ impl Drop for ActiveSlot<'_> {
 // Wake waiting requests even if the downloading request panics before recording its result.
 struct Completion<'a> {
     flight: &'a Flight,
-    result: Result<(), EdgeMiss>,
+    result: Result<EdgeHit, EdgeMiss>,
 }
 
 impl<'a> Completion<'a> {
@@ -635,7 +640,7 @@ impl<'a> Completion<'a> {
         }
     }
 
-    fn finish(mut self, result: Result<(), EdgeMiss>) {
+    fn finish(mut self, result: Result<EdgeHit, EdgeMiss>) {
         self.result = result;
     }
 }

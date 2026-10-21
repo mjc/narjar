@@ -923,6 +923,31 @@ fn a_cached_representation_failure_stays_negative_for_another_store_path() {
 }
 
 #[test]
+fn followers_keep_the_local_hit_outcome_from_a_shared_flight() {
+    let upstream = Upstream::new(|_, _| panic!("offline repair must not contact upstream"));
+    let source = source(&upstream);
+    let key = Key::Store(StoreHash::parse(STORE).unwrap());
+    let flight = match source
+        .state
+        .lock()
+        .unwrap()
+        .join(key, Instant::now())
+        .unwrap()
+    {
+        Join::Leader(flight) => flight,
+        Join::Follower(_) | Join::Cached(_) => panic!("new store key must start a flight"),
+    };
+    flight.finish(Ok(EdgeHit::Local));
+
+    assert_eq!(
+        source.coalesce(key, Deadline::new(TEST_TIMEOUT).unwrap(), || {
+            panic!("a follower must not run the leader closure")
+        }),
+        Ok(EdgeHit::Local)
+    );
+}
+
+#[test]
 fn progressing_payload_can_outlive_the_network_idle_timeout() {
     let fixture = Fixture::new();
     let metadata = fixture.metadata(
