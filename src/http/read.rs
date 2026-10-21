@@ -18,7 +18,7 @@ use crate::cache::{
 use super::write::unauthorized;
 #[cfg(unix)]
 use crate::native_store::serving::{NativeReadError, NativeStoreSource};
-use crate::read_through::ReadThroughSource;
+use crate::read_through::{EdgeMiss, ReadThroughSource};
 
 pub(crate) enum ReadSource {
     FlatCache,
@@ -191,7 +191,14 @@ fn respond_narinfo(
         }
     };
     record_narinfo_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
-    send_advertised_narinfo(request, advertisement, guard, visibility, public_control)
+    send_advertised_narinfo(
+        request,
+        advertisement,
+        guard,
+        visibility,
+        public_control,
+        [],
+    )
 }
 
 fn send_advertised_narinfo(
@@ -200,6 +207,7 @@ fn send_advertised_narinfo(
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
     public_control: &'static str,
+    extra_headers: impl IntoIterator<Item = Header>,
 ) -> Option<TcpStream> {
     let crate::cache::storage::AdvertisedNarInfo { bytes, _activity } = advertisement;
     let response = cache_policy(
@@ -207,6 +215,9 @@ fn send_advertised_narinfo(
         visibility,
         public_control,
     );
+    let response = extra_headers
+        .into_iter()
+        .fold(response, Response::with_header);
     send_response(guard, request, response)
 }
 
@@ -220,11 +231,18 @@ fn respond_edge_narinfo(
 ) -> Option<TcpStream> {
     let lookup_started = Instant::now();
     match source.advertise(storage, store) {
-        Ok(advertisement) => {
+        Ok((advertisement, hit)) => {
             record_narinfo_lookup(guard, CacheLookupOutcome::Hit, lookup_started);
-            send_advertised_narinfo(request, advertisement, guard, visibility, "no-store")
+            send_advertised_narinfo(
+                request,
+                advertisement,
+                guard,
+                visibility,
+                "no-store",
+                [header("Narjar-Cache-Status", hit.label())],
+            )
         }
-        Err(_) => {
+        Err(miss) => {
             record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
             send_response(
                 guard,
@@ -233,10 +251,19 @@ fn respond_edge_narinfo(
                     Response::empty(StatusCode::NOT_FOUND),
                     visibility,
                     "no-store",
-                ),
+                )
+                .with_header(edge_miss_status_header(miss)),
             )
         }
     }
+}
+
+fn edge_miss_status_header(miss: EdgeMiss) -> Header {
+    Header::owned(
+        "Narjar-Cache-Status",
+        format!("{}; reason={}", miss.label(), miss.reason().label()),
+    )
+    .expect("edge status contains only fixed tokens")
 }
 
 #[derive(Clone, Copy)]

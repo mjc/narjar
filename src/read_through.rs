@@ -50,9 +50,47 @@ pub(crate) struct EdgeSettings {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EdgeLookup {
-    Ready,
-    Miss(EdgeFailure),
+pub(crate) enum EdgeHit {
+    Local,
+    Filled,
+    Coalesced,
+}
+
+impl EdgeHit {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Local => "hit",
+            Self::Filled => "fill",
+            Self::Coalesced => "coalesced",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EdgeMiss {
+    Failed(EdgeFailure),
+    Cached(EdgeFailure),
+}
+
+impl EdgeMiss {
+    pub(crate) const fn reason(self) -> EdgeFailure {
+        match self {
+            Self::Failed(reason) | Self::Cached(reason) => reason,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Failed(_) => "error",
+            Self::Cached(_) => "negative",
+        }
+    }
+}
+
+impl From<EdgeFailure> for EdgeMiss {
+    fn from(reason: EdgeFailure) -> Self {
+        Self::Failed(reason)
+    }
 }
 
 enum LocalLookup {
@@ -71,7 +109,7 @@ pub(crate) enum EdgeFailure {
 }
 
 impl EdgeFailure {
-    const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Authoritative404 => "not_found",
             Self::Transient => "transient",
@@ -143,13 +181,12 @@ impl ReadThroughSource {
         &self,
         storage: &'storage Storage,
         store: &StoreHash,
-    ) -> Result<AdvertisedNarInfo<'storage>, EdgeFailure> {
-        match self.ensure_local(storage, store) {
-            EdgeLookup::Miss(failure) => Err(failure),
-            EdgeLookup::Ready => self
-                .open_raw_advertisement_after_lease_renewal(storage, store)
-                .inspect_err(|failure| increment(&self.counters.failures[*failure])),
-        }
+    ) -> Result<(AdvertisedNarInfo<'storage>, EdgeHit), EdgeMiss> {
+        let hit = self.ensure_local(storage, store)?;
+        self.open_raw_advertisement_after_lease_renewal(storage, store)
+            .inspect_err(|failure| increment(&self.counters.failures[*failure]))
+            .map(|advertisement| (advertisement, hit))
+            .map_err(EdgeMiss::Failed)
     }
 
     fn open_raw_advertisement_after_lease_renewal<'storage>(
@@ -210,22 +247,16 @@ impl ReadThroughSource {
     }
 
     /// Make the NAR and metadata available locally. HTTP then renews retention and reads the metadata.
-    pub(crate) fn ensure_local(&self, storage: &Storage, store: &StoreHash) -> EdgeLookup {
-        let result = self.lookup(storage, store);
-        match result {
-            Ok(()) => EdgeLookup::Ready,
-            Err(failure) => {
-                increment(&self.counters.failures[failure]);
-                EdgeLookup::Miss(failure)
-            }
-        }
+    fn ensure_local(&self, storage: &Storage, store: &StoreHash) -> Result<EdgeHit, EdgeMiss> {
+        self.lookup(storage, store)
+            .inspect_err(|miss| increment(&self.counters.failures[miss.reason()]))
     }
 
-    fn lookup(&self, storage: &Storage, store: &StoreHash) -> Result<(), EdgeFailure> {
+    fn lookup(&self, storage: &Storage, store: &StoreHash) -> Result<EdgeHit, EdgeMiss> {
         match Self::local_lookup(storage, store)? {
             LocalLookup::Ready => {
                 increment(&self.counters.local_hits);
-                return Ok(());
+                return Ok(EdgeHit::Local);
             }
             LocalLookup::Repair | LocalLookup::Missing => {}
         }
@@ -236,17 +267,18 @@ impl ReadThroughSource {
         self.coalesce(Key::Store(*store), deadline, || {
             // Another request may have stored the object since our first lookup.
             match Self::local_lookup(storage, store)? {
-                LocalLookup::Ready => Ok(()),
+                LocalLookup::Ready => Ok(EdgeHit::Local),
                 LocalLookup::Repair => {
                     let _active = self.admit()?;
-                    self.repair_local(storage, store, deadline)
+                    self.repair_local(storage, store, deadline)?;
+                    Ok(EdgeHit::Local)
                 }
                 LocalLookup::Missing => {
                     let _active = self.admit()?;
                     increment(&self.counters.started);
                     self.fill(storage, store, deadline)?;
                     increment(&self.counters.completed);
-                    Ok(())
+                    Ok(EdgeHit::Filled)
                 }
             }
         })
@@ -312,13 +344,14 @@ impl ReadThroughSource {
             Key::Nar(payload.identity().hash()),
             deadline,
             || match storage.ensure_canonical_nar_available(payload.identity()) {
-                Ok(()) => Ok(()),
-                Err(StorageError::MissingNar) => {
-                    self.receive_missing_canonical_nar(storage, payload, deadline)
-                }
+                Ok(()) => Ok(EdgeHit::Local),
+                Err(StorageError::MissingNar) => self
+                    .receive_missing_canonical_nar(storage, payload, deadline)
+                    .map(|()| EdgeHit::Filled),
                 Err(error) => Err(EdgeFailure::ingestion(error)),
             },
-        )?;
+        )
+        .map_err(EdgeMiss::reason)?;
         deadline.remaining()?;
         // Check the signed NarHash and NarSize against the stored uncompressed NAR,
         // even if another request downloaded it with a different compression format.
@@ -341,8 +374,12 @@ impl ReadThroughSource {
         self.coalesce(
             Key::Representation(payload.file_name(), payload.encoded_size()),
             deadline,
-            || self.receive_encoded_representation(storage, payload, deadline),
-        )?;
+            || {
+                self.receive_encoded_representation(storage, payload, deadline)
+                    .map(|()| EdgeHit::Filled)
+            },
+        )
+        .map_err(EdgeMiss::reason)?;
         // Sharing the download does not mean sharing another request's NarHash or NarSize.
         storage
             .ensure_canonical_nar_available(payload.identity())
@@ -450,8 +487,8 @@ impl ReadThroughSource {
         &self,
         key: Key,
         deadline: Deadline,
-        fill: impl FnOnce() -> Result<(), EdgeFailure>,
-    ) -> Result<(), EdgeFailure> {
+        fill: impl FnOnce() -> Result<EdgeHit, EdgeFailure>,
+    ) -> Result<EdgeHit, EdgeMiss> {
         let joined = self
             .state
             .lock()
@@ -460,13 +497,18 @@ impl ReadThroughSource {
         match joined {
             Join::Cached(failure) => {
                 increment(&self.counters.negative_hits);
-                Err(failure)
+                Err(EdgeMiss::Cached(failure))
             }
             Join::Follower(flight) => {
                 increment(&self.counters.followers);
-                flight.wait(Deadline::new(self.timeout)?.earlier(deadline), |result| {
-                    finish_shared_fill_or_retry_representation(key, result, fill)
-                })
+                flight
+                    .wait(Deadline::new(self.timeout)?.earlier(deadline), |result| {
+                        finish_shared_fill_or_retry_representation(key, result, || {
+                            fill().map(|_| ())
+                        })
+                    })
+                    .map(|()| EdgeHit::Coalesced)
+                    .map_err(EdgeMiss::Failed)
             }
             Join::Leader(flight) => {
                 let completion = Completion::new(&flight);
@@ -477,8 +519,8 @@ impl ReadThroughSource {
                         .map_err(|_| EdgeFailure::Storage)?
                         .remember(key, failure, Instant::now(), self.negative_ttl);
                 }
-                completion.finish(result);
-                result
+                completion.finish(result.map(|_| ()));
+                result.map_err(EdgeMiss::Failed)
             }
         }
     }

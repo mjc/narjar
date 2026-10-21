@@ -160,8 +160,13 @@ impl Upstream {
                                 break;
                             }
                         }
-                        requests.lock().unwrap().push(route.clone());
-                        handler(&route, &mut stream);
+                        match route.strip_prefix(&upstream_fixture_prefix()) {
+                            Some(_) => {
+                                requests.lock().unwrap().push(route.clone());
+                                handler(&route, &mut stream);
+                            }
+                            None => reply(&mut stream, 404, b""),
+                        }
                     }));
                 }
                 workers
@@ -178,7 +183,9 @@ impl Upstream {
     }
 
     fn url(&self) -> HttpUrl {
-        format!("http://{}/cache", self.address).parse().unwrap()
+        format!("http://{}{}", self.address, upstream_fixture_prefix())
+            .parse()
+            .unwrap()
     }
 
     fn count(&self, suffix: &str) -> usize {
@@ -189,6 +196,10 @@ impl Upstream {
             .filter(|route| route.ends_with(suffix))
             .count()
     }
+}
+
+fn upstream_fixture_prefix() -> String {
+    format!("/cache/{}/", std::process::id())
 }
 
 impl Drop for Upstream {
@@ -206,6 +217,42 @@ fn reply(stream: &mut TcpStream, status: u16, body: &[u8]) {
         body.len()
     )
     .and_then(|()| stream.write_all(body));
+}
+
+#[test]
+fn upstream_fixture_rejects_foreign_requests_to_a_reused_port() {
+    let handled = Arc::new(AtomicUsize::new(0));
+    let upstream = {
+        let handled = handled.clone();
+        Upstream::new(move |_, stream| {
+            handled.fetch_add(1, Ordering::Relaxed);
+            reply(stream, 200, b"fixture");
+        })
+    };
+    let mut stream = TcpStream::connect(upstream.address).unwrap();
+    stream.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    write!(
+        stream,
+        "GET /{STORE}.narinfo HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    assert_eq!(upstream.count(".narinfo"), 0);
+    assert_eq!(handled.load(Ordering::Relaxed), 0);
+    let response = idle_agent(TEST_TIMEOUT)
+        .get(
+            upstream
+                .url()
+                .endpoint(&[&format!("{STORE}.narinfo")])
+                .as_str(),
+        )
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(upstream.count(".narinfo"), 1);
+    assert_eq!(handled.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -235,9 +282,9 @@ fn identity_content_encoding_accepts_mixed_case_without_accepting_other_codings(
         let (_directory, storage) = storage();
         let result = source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap());
         let expected = if coding == "gzip" {
-            EdgeLookup::Miss(EdgeFailure::Invalid)
+            Err(EdgeMiss::Failed(EdgeFailure::Invalid))
         } else {
-            EdgeLookup::Ready
+            Ok(EdgeHit::Filled)
         };
         assert_eq!(result, expected, "Content-Encoding: {coding}");
     }
@@ -322,7 +369,7 @@ fn offline_repair_rejects_compressed_publications_in_a_raw_only_edge() {
     .unwrap();
     assert_eq!(
         source.ensure_local(&storage, &store),
-        EdgeLookup::Miss(EdgeFailure::Invalid)
+        Err(EdgeMiss::Failed(EdgeFailure::Invalid))
     );
     assert!(matches!(
         storage.advertisement_evidence(store).unwrap(),
@@ -381,7 +428,7 @@ fn recorded_leases_do_not_make_compressed_metadata_a_raw_edge_advertisement() {
     ));
     assert_eq!(
         source.advertise(&storage, &store).err(),
-        Some(EdgeFailure::Invalid)
+        Some(EdgeMiss::Failed(EdgeFailure::Invalid))
     );
 }
 
@@ -424,9 +471,24 @@ fn overlapping_store_requests_make_one_upstream_generation_and_local_hits_stay_o
         wait_for(|| source.counters.followers.load(Ordering::Relaxed) == 7);
         assert!(storage.open_narinfo(&store).unwrap().is_none());
         gate.release();
-        calls
+        let outcomes = calls
             .into_iter()
-            .for_each(|call| assert_eq!(call.join().unwrap(), EdgeLookup::Ready));
+            .map(|call| call.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| **result == Ok(EdgeHit::Filled))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| **result == Ok(EdgeHit::Coalesced))
+                .count(),
+            7
+        );
     });
     assert_eq!(upstream.count(".narinfo"), 1);
     assert_eq!(upstream.count(".nar"), 1);
@@ -438,7 +500,7 @@ fn overlapping_store_requests_make_one_upstream_generation_and_local_hits_stay_o
         Instant::now(),
         Duration::from_secs(1),
     );
-    assert_eq!(source.ensure_local(&storage, &store), EdgeLookup::Ready);
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Local));
     let mut bytes = Vec::new();
     storage
         .open_nar(crate::cache::object::NarFileName::raw(
@@ -489,7 +551,7 @@ fn cached_raw_nars_satisfy_aliases_whose_encoded_download_would_exceed_the_limit
     let (_directory, storage) = storage();
     for hash in [STORE, ALIAS] {
         let store = StoreHash::parse(hash).unwrap();
-        assert_eq!(source.ensure_local(&storage, &store), EdgeLookup::Ready);
+        assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
         let metadata = storage.read_advertised_narinfo(&store).unwrap().unwrap();
         assert_eq!(
             trusted_keys()
@@ -559,7 +621,7 @@ fn aliases_with_different_encodings_share_one_logical_payload_fill() {
         gate.release();
         calls
             .into_iter()
-            .for_each(|call| assert_eq!(call.join().unwrap(), EdgeLookup::Ready));
+            .for_each(|call| assert_eq!(call.join().unwrap(), Ok(EdgeHit::Filled)));
     });
     let requests = upstream.requests.lock().unwrap();
     assert_eq!(
@@ -626,17 +688,17 @@ fn active_limit_rejects_unrelated_keys_while_same_store_followers_wait() {
         assert_eq!(source.blocked_requests.load(Ordering::Relaxed), 2);
         assert_eq!(
             source.ensure_local(storage, &store),
-            EdgeLookup::Miss(EdgeFailure::Capacity),
+            Err(EdgeMiss::Failed(EdgeFailure::Capacity)),
             "a third blocked request must leave the last HTTP worker available"
         );
         assert_eq!(
             source.ensure_local(storage, &StoreHash::parse(ALIAS).unwrap()),
-            EdgeLookup::Miss(EdgeFailure::Capacity)
+            Err(EdgeMiss::Failed(EdgeFailure::Capacity))
         );
         assert_eq!(upstream.count(".narinfo"), 1);
         gate.release();
-        assert_eq!(leader.join().unwrap(), EdgeLookup::Ready);
-        assert_eq!(follower.join().unwrap(), EdgeLookup::Ready);
+        assert_eq!(leader.join().unwrap(), Ok(EdgeHit::Filled));
+        assert_eq!(follower.join().unwrap(), Ok(EdgeHit::Coalesced));
     });
     assert_eq!(source.blocked_requests.load(Ordering::Relaxed), 0);
 }
@@ -700,9 +762,9 @@ fn a_failed_compressed_alias_does_not_poison_a_valid_raw_alias() {
         gate.release();
         assert_eq!(
             leader.join().unwrap(),
-            EdgeLookup::Miss(EdgeFailure::Invalid)
+            Err(EdgeMiss::Failed(EdgeFailure::Invalid))
         );
-        assert_eq!(follower.join().unwrap(), EdgeLookup::Ready);
+        assert_eq!(follower.join().unwrap(), Ok(EdgeHit::Filled));
     });
     assert_eq!(upstream.count(".zst"), 1);
     assert_eq!(upstream.count(".nar"), 1);
@@ -754,9 +816,9 @@ fn a_wrong_decoded_claim_cannot_poison_a_valid_claim_sharing_the_encoded_payload
         gate.release();
         assert_eq!(
             invalid.join().unwrap(),
-            EdgeLookup::Miss(EdgeFailure::Invalid)
+            Err(EdgeMiss::Failed(EdgeFailure::Invalid))
         );
-        assert_eq!(valid.join().unwrap(), EdgeLookup::Ready);
+        assert_eq!(valid.join().unwrap(), Ok(EdgeHit::Filled));
     });
     assert_eq!(upstream.count(".zst"), 1);
     assert!(
@@ -814,12 +876,12 @@ fn an_incorrect_encoded_size_cannot_poison_a_valid_alias_before_negative_expiry(
     let (_directory, storage) = storage();
     assert_eq!(
         source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap()),
-        EdgeLookup::Miss(EdgeFailure::Invalid)
+        Err(EdgeMiss::Failed(EdgeFailure::Invalid))
     );
     assert!(source.state.lock().unwrap().negative_entries() > 0);
     assert_eq!(
         source.ensure_local(&storage, &StoreHash::parse(ALIAS).unwrap()),
-        EdgeLookup::Ready
+        Ok(EdgeHit::Filled)
     );
     assert_eq!(upstream.count(".zst"), 2);
 }
@@ -863,7 +925,7 @@ fn progressing_payload_can_outlive_the_network_idle_timeout() {
     let started = Instant::now();
     assert_eq!(
         source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap()),
-        EdgeLookup::Ready
+        Ok(EdgeHit::Filled)
     );
     assert!(started.elapsed() > Duration::from_secs(2));
 }
@@ -900,21 +962,26 @@ fn transient_negative_expires_and_allows_a_healthy_fill() {
     let store = StoreHash::parse(STORE).unwrap();
     assert_eq!(
         source.ensure_local(&storage, &store),
-        EdgeLookup::Miss(EdgeFailure::Transient)
+        Err(EdgeMiss::Failed(EdgeFailure::Transient))
     );
     healthy.store(true, Ordering::Release);
     assert_eq!(
         source.ensure_local(&storage, &store),
-        EdgeLookup::Miss(EdgeFailure::Transient)
+        Err(EdgeMiss::Cached(EdgeFailure::Transient))
     );
-    assert_eq!(upstream.count(".narinfo"), 1);
+    assert_eq!(
+        upstream.count(".narinfo"),
+        1,
+        "requests: {:?}",
+        upstream.requests.lock().unwrap()
+    );
     // Advance the cleanup clock instead of sleeping until the cached failure expires.
     source
         .state
         .lock()
         .unwrap()
         .prune(Instant::now() + Duration::from_secs(2));
-    assert_eq!(source.ensure_local(&storage, &store), EdgeLookup::Ready);
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
     assert_eq!(upstream.count(".narinfo"), 2);
     assert_eq!(upstream.count(".nar"), 1);
 }
@@ -1131,10 +1198,15 @@ fn assert_failed_fill(case: FailureCase) {
     let store = StoreHash::parse(STORE).unwrap();
     assert_eq!(
         source.ensure_local(&storage, &store),
-        EdgeLookup::Miss(case.expected()),
+        Err(EdgeMiss::Failed(case.expected())),
         "{case:?}"
     );
     assert!(storage.open_narinfo(&store).unwrap().is_none(), "{case:?}");
+    assert_eq!(
+        source.ensure_local(&storage, &store),
+        Err(EdgeMiss::Cached(case.expected())),
+        "cached failures must retain the original class: {case:?}"
+    );
     assert_eq!(
         upstream
             .requests
@@ -1166,11 +1238,11 @@ fn refused_connection_is_a_transient_negative_and_caches_are_bounded() {
     let store = StoreHash::parse(STORE).unwrap();
     assert_eq!(
         source.ensure_local(&storage, &store),
-        EdgeLookup::Miss(EdgeFailure::Transient)
+        Err(EdgeMiss::Failed(EdgeFailure::Transient))
     );
     assert_eq!(
         source.ensure_local(&storage, &store),
-        EdgeLookup::Miss(EdgeFailure::Transient)
+        Err(EdgeMiss::Cached(EdgeFailure::Transient))
     );
     assert_eq!(source.counters.started.load(Ordering::Relaxed), 1);
     assert_eq!(source.counters.negative_hits.load(Ordering::Relaxed), 1);
@@ -1198,7 +1270,7 @@ fn missing_advertisement_evidence_is_repaired_offline_after_reopen() {
     let source = source(&upstream);
     let (directory, storage) = storage();
     let store = StoreHash::parse(STORE).unwrap();
-    assert_eq!(source.ensure_local(&storage, &store), EdgeLookup::Ready);
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
     drop(upstream);
     drop(storage);
     let lease = directory
@@ -1215,7 +1287,7 @@ fn missing_advertisement_evidence_is_repaired_offline_after_reopen() {
         storage.advertisement_evidence(store).unwrap(),
         AdvertisementEvidence::Missing
     ));
-    assert_eq!(source.ensure_local(&storage, &store), EdgeLookup::Ready);
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Local));
     assert!(matches!(
         storage.advertisement_evidence(store).unwrap(),
         AdvertisementEvidence::Recorded
@@ -1251,7 +1323,7 @@ fn missing_evidence_does_not_bless_untrusted_local_metadata() {
     let source = source(&upstream);
     let (directory, storage) = storage();
     let store = StoreHash::parse(STORE).unwrap();
-    assert_eq!(source.ensure_local(&storage, &store), EdgeLookup::Ready);
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
     drop(upstream);
     let lease = directory
         .path()
@@ -1265,7 +1337,7 @@ fn missing_evidence_does_not_bless_untrusted_local_metadata() {
     .unwrap();
     assert_eq!(
         source.ensure_local(&storage, &store),
-        EdgeLookup::Miss(EdgeFailure::Invalid)
+        Err(EdgeMiss::Failed(EdgeFailure::Invalid))
     );
     assert!(!lease.exists());
     assert_eq!(source.counters.started.load(Ordering::Relaxed), 1);
