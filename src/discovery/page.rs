@@ -2,7 +2,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     advertisement::CacheOrigin,
-    configuration::{self, ClientMode, ConfigurationTarget, ExplicitlyTrustedKeys},
+    configuration::{
+        self, ClientMode, ConfigurationTarget, ExplicitlyTrustedKeys, LocalEdgeUpstream,
+    },
     hosting::Diagnostics,
 };
 use crate::{
@@ -34,10 +36,7 @@ impl SetupDocument {
             })
             .collect::<String>();
         let nix_conf = configuration::render(origin, &keys, ConfigurationTarget::NixConf, 300)?;
-        let nixos = match origin.url().host().contains(':') {
-            true => String::new(),
-            false => render_nixos_choices(origin, &keys, visibility)?,
-        };
+        let nixos = render_nixos_choices(origin, &keys, visibility)?;
         let diagnostics = match diagnostics {
             Diagnostics::Omit => "",
             Diagnostics::Include => {
@@ -89,10 +88,10 @@ fn render_nixos_choices(
         ConfigurationTarget::Nixos(ClientMode::Direct),
         300,
     )?;
-    let edge = match visibility {
-        ReadVisibility::Private => String::new(),
-        ReadVisibility::Public => format!(
-            "<h2>NixOS: local fail-open edge</h2><p>A local verifying cache returns misses when the remote cache is unavailable. Other configured substituters remain independent.</p><pre><code>{}</code></pre>",
+    let edge = match (visibility, LocalEdgeUpstream::from_origin(origin)) {
+        (ReadVisibility::Private, _) | (ReadVisibility::Public, None) => String::new(),
+        (ReadVisibility::Public, Some(_)) => format!(
+            "<h2>NixOS: local fail-open edge</h2><p>Import Narjar's NixOS module for this example. A local verifying cache returns misses when the remote cache is unavailable. Other configured substituters remain independent.</p><pre><code>{}</code></pre>",
             escape_html(&configuration::render(
                 origin,
                 keys,
@@ -102,7 +101,7 @@ fn render_nixos_choices(
         ),
     };
     Ok(format!(
-        "<p>Import Narjar's NixOS module to use these NixOS examples.</p>{edge}<h2>NixOS: direct substitution</h2><pre><code>{}</code></pre>",
+        "{edge}<h2>NixOS: direct substitution</h2><pre><code>{}</code></pre>",
         escape_html(&direct)
     ))
 }
@@ -123,6 +122,26 @@ fn escape_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_on_the_local_edge_port_does_not_offer_a_recursive_edge() {
+        let origin = "http://localhost:5000".parse().unwrap();
+        let keys = TrustedPublicKeys::parse(
+            "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+        )
+        .unwrap();
+        let page = SetupDocument::new(
+            &origin,
+            &keys,
+            ReadVisibility::Public,
+            Diagnostics::Omit,
+            None,
+        )
+        .unwrap();
+        let text = std::str::from_utf8(page.bytes()).unwrap();
+        assert!(text.contains("NixOS: direct substitution"));
+        assert!(!text.contains("local fail-open edge"));
+    }
 
     #[test]
     fn public_key_source_and_html_output_are_bounded_and_escaped() {
@@ -152,6 +171,8 @@ mod tests {
         assert!(text.contains(key));
         assert!(text.contains("http://[2001:db8::1]:8080"));
         assert!(text.contains("nix.conf"));
+        assert!(text.contains("NixOS: direct substitution"));
+        assert!(text.contains("extra-substituters"));
         assert!(!text.contains("services.narjar.client"));
     }
 }

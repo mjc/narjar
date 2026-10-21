@@ -58,6 +58,17 @@ impl ConfigurationTarget {
 
 pub(super) struct ExplicitlyTrustedKeys(Vec<String>);
 
+pub(super) struct LocalEdgeUpstream<'a>(&'a CacheOrigin);
+
+impl<'a> LocalEdgeUpstream<'a> {
+    pub(super) fn from_origin(origin: &'a CacheOrigin) -> Option<Self> {
+        match origin.url().is_https() || origin.url().port() != 5000 || origin.is_network_host() {
+            true => Some(Self(origin)),
+            false => None,
+        }
+    }
+}
+
 impl ExplicitlyTrustedKeys {
     pub(super) fn tokens(&self) -> &[String] {
         &self.0
@@ -92,7 +103,7 @@ pub(super) fn run(options: Configure) -> Result<(), Error> {
         "Configuration uses only the keys you supplied; discovery does not establish trust."
     )
     .map_err(runtime)?;
-    writeln!(notices, "Import Narjar's NixOS module for NixOS output. Confirm the operator retains advertised payloads for at least {} seconds.", 2 * u64::from(options.positive_ttl_seconds) + 300).map_err(runtime)?;
+    writeln!(notices, "The local-edge example requires Narjar's NixOS module. Confirm the operator retains advertised payloads for at least {} seconds.", 2 * u64::from(options.positive_ttl_seconds) + 300).map_err(runtime)?;
     keys.0.iter().try_for_each(|key| {
         writeln!(
             notices,
@@ -129,31 +140,39 @@ fn render_nixos(
     mode: ClientMode,
     positive_ttl_seconds: u32,
 ) -> Result<String, Error> {
-    let edge = match mode {
-        ClientMode::Direct => String::new(),
-        ClientMode::LocalEdge => format!(
-            "  services.narjar.edge.leaseSeconds = {};\n",
-            5_187_600_u64.max(2 * u64::from(positive_ttl_seconds) + 300)
+    let keys = keys
+        .0
+        .iter()
+        .map(|key| nix_string(key))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (substituter, service) = match mode {
+        ClientMode::Direct => (origin.as_str(), String::new()),
+        ClientMode::LocalEdge => (
+            "http://127.0.0.1:5000",
+            render_local_edge_service(
+                LocalEdgeUpstream::from_origin(origin).ok_or_else(|| Error::usage("local-edge upstream would point at its own HTTP listener on port 5000; use direct mode or another upstream port"))?,
+                &keys,
+                positive_ttl_seconds,
+            ),
         ),
     };
-    let mode = match mode {
-        ClientMode::Direct => "direct",
-        ClientMode::LocalEdge => "local-edge",
-    };
-    match origin.url().host().contains(':') {
-        true => Err(Error::usage(
-            "the NixOS module currently requires a DNS or IPv4 cache origin; use --format nix-conf for an IPv6 literal",
-        )),
-        false => Ok(format!(
-            "{{\n  services.narjar.client = {{\n    enable = true;\n    url = {};\n    mode = \"{mode}\";\n    trustedPublicKeys = [ {} ];\n    substituterPolicy = \"append\";\n    priority = 30;\n    fallback = false;\n    positiveTtlSeconds = {positive_ttl_seconds};\n    negativeTtlSeconds = 1;\n  }};\n{edge}}}\n",
-            nix_string(origin.as_str()),
-            keys.0
-                .iter()
-                .map(|key| nix_string(key))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )),
-    }
+    Ok(format!(
+        "{{\n{service}  nix.settings = {{\n    extra-substituters = [ {} ];\n    extra-trusted-public-keys = [ {keys} ];\n    fallback = false;\n    narinfo-cache-positive-ttl = {positive_ttl_seconds};\n    narinfo-cache-negative-ttl = 1;\n  }};\n}}\n",
+        nix_string(&format!("{substituter}?priority=30")),
+    ))
+}
+
+fn render_local_edge_service(
+    upstream: LocalEdgeUpstream<'_>,
+    keys: &str,
+    positive_ttl_seconds: u32,
+) -> String {
+    format!(
+        "  services.narjar = {{\n    enable = true;\n    listen = \"127.0.0.1:5000\";\n    edge = {{\n      enable = true;\n      upstream = {};\n      trustedPublicKeys = [ {keys} ];\n      leaseSeconds = {};\n    }};\n  }};\n",
+        nix_string(upstream.0.as_str()),
+        5_187_600_u64.max(2 * u64::from(positive_ttl_seconds) + 300),
+    )
 }
 
 fn nix_string(value: &str) -> String {
@@ -182,10 +201,11 @@ mod tests {
             300,
         )
         .unwrap();
-        assert!(nixos.contains("substituterPolicy = \"append\""));
-        assert!(nixos.contains("mode = \"local-edge\""));
-        assert!(nixos.contains("positiveTtlSeconds = 300"));
-        assert!(nixos.contains("services.narjar.edge.leaseSeconds = 5187600;"));
+        assert!(nixos.contains("extra-substituters = [ \"http://127.0.0.1:5000?priority=30\" ];"));
+        assert!(nixos.contains("upstream = \"https://cache.example\";"));
+        assert!(nixos.contains("narinfo-cache-positive-ttl = 300;"));
+        assert!(nixos.contains("leaseSeconds = 5187600;"));
+        assert!(!nixos.contains("services.narjar.client"));
         let direct = render(
             &origin,
             &keys,
@@ -193,7 +213,9 @@ mod tests {
             86_400,
         )
         .unwrap();
-        assert!(!direct.contains("edge.leaseSeconds"));
+        assert!(!direct.contains("services.narjar"));
+        assert!(direct.contains("extra-substituters = [ \"https://cache.example?priority=30\" ];"));
+        assert!(direct.contains("narinfo-cache-positive-ttl = 86400;"));
         let conf = render(&origin, &keys, ConfigurationTarget::NixConf, 300).unwrap();
         assert!(conf.starts_with("extra-substituters = https://cache.example?priority=30\n"));
         assert!(conf.contains(KEY));
@@ -209,6 +231,58 @@ mod tests {
             vec![format!("{KEY}\n{KEY}")],
         ] {
             assert!(ExplicitlyTrustedKeys::try_from(keys).is_err());
+        }
+    }
+
+    #[test]
+    fn local_edge_cannot_upstream_itself_but_direct_substitution_can() {
+        let keys = ExplicitlyTrustedKeys::try_from(vec![KEY.into()]).unwrap();
+        for url in [
+            "http://127.0.0.1:5000",
+            "http://localhost:5000",
+            "http://cache.localhost:5000",
+            "http://[::1]:5000",
+            "http://[::ffff:127.0.0.1]:5000",
+            "http://0.0.0.0:5000",
+        ] {
+            let origin = url.parse().unwrap();
+            assert!(
+                render(
+                    &origin,
+                    &keys,
+                    ConfigurationTarget::Nixos(ClientMode::LocalEdge),
+                    300
+                )
+                .is_err(),
+                "{url}"
+            );
+            assert!(
+                render(
+                    &origin,
+                    &keys,
+                    ConfigurationTarget::Nixos(ClientMode::Direct),
+                    300
+                )
+                .is_ok(),
+                "{url}"
+            );
+        }
+        for url in [
+            "http://localhost:8080",
+            "https://localhost:5000",
+            "https://cache.example",
+        ] {
+            let origin = url.parse().unwrap();
+            assert!(
+                render(
+                    &origin,
+                    &keys,
+                    ConfigurationTarget::Nixos(ClientMode::LocalEdge),
+                    300
+                )
+                .is_ok(),
+                "{url}"
+            );
         }
     }
 

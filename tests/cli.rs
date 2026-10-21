@@ -1481,7 +1481,8 @@ fn onboarding_is_served_by_the_binary_without_external_services() {
     assert!(text.contains(test_trusted_public_key().trim()));
     assert!(text.contains("extra-substituters"));
     assert!(!text.contains("href=\"/metrics\""));
-    assert!(!text.contains("127.0.0.1"));
+    assert!(text.contains("http://127.0.0.1:5000?priority=30"));
+    assert!(!text.contains(&format!("http://{}", server.address)));
     assert!(!text.contains("producer.sec"));
     let (head, body) = response_parts(&server.request("HEAD", "/"));
     assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));

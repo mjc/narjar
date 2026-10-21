@@ -6,6 +6,12 @@
   cfg = config.services.narjar;
 in {
   options.services.narjar = {
+    publicUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://cache.example";
+      description = "Public cache origin for native discovery and setup instructions. The daemon validates the URL.";
+    };
     discovery = {
       enable = lib.mkEnableOption "Narjar's native LAN advertisement";
       name = lib.mkOption {
