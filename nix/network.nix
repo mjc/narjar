@@ -45,6 +45,12 @@
   publicHost = config.services.nginx.virtualHosts.${host};
   matchesPublicEndpoint = listener: listener.port == port && listener.ssl == secure;
   isHttpChallengeListener = listener: listener.port == 80 && !listener.ssl;
+  normalizedHost = value: let
+    name = lib.removeSuffix "." (lib.toLower value);
+  in
+    if name == "localhost"
+    then "127.0.0.1"
+    else name;
   normalizedOrigin = url: let
     parts = builtins.match "(http|https)://([a-z0-9.-]+)(:([0-9]+))?([/?#].*)?" (lib.toLower url);
   in
@@ -52,7 +58,7 @@
     then null
     else {
       scheme = builtins.elemAt parts 0;
-      host = lib.removeSuffix "." (builtins.elemAt parts 1);
+      host = normalizedHost (builtins.elemAt parts 1);
       port =
         if builtins.elemAt parts 3 != null
         then lib.toIntBase10 (builtins.elemAt parts 3)
@@ -61,6 +67,24 @@
         else 80;
     };
   upstreamOrigin = normalizedOrigin cfg.edge.upstream;
+  localOrigins =
+    [
+      {
+        scheme = "http";
+        host = "127.0.0.1";
+        port = backendPort;
+      }
+    ]
+    ++ lib.concatMap (listener:
+      map (name: {
+        scheme =
+          if listener.ssl
+          then "https"
+          else "http";
+        host = normalizedHost name;
+        port = listener.port;
+      }) ([host listener.addr] ++ lib.optional (builtins.elem listener.addr ["*" "0.0.0.0"]) "127.0.0.1"))
+    proxyListeners;
   localEdge = client.enable && client.mode == "local-edge";
   substituter =
     if localEdge
@@ -155,8 +179,8 @@ in {
           message = "services.narjar.proxy.tls must agree with publicUrl's HTTP or HTTPS scheme";
         }
         {
-          assertion = !cfg.edge.enable || (upstreamOrigin != null && upstreamOrigin != normalizedOrigin cfg.publicUrl);
-          message = "services.narjar.edge.upstream must have a DNS or IPv4 HTTP(S) origin different from this server's publicUrl";
+          assertion = !cfg.edge.enable || (upstreamOrigin != null && !builtins.elem upstreamOrigin localOrigins);
+          message = "services.narjar.edge.upstream must have a DNS or IPv4 HTTP(S) origin outside this server's backend and proxy listeners";
         }
         {
           assertion = !acme || port == 443;

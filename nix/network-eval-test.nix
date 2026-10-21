@@ -141,6 +141,8 @@ in
   assert builtins.any (listener: listener.port == 80 && !listener.ssl) tls.services.nginx.virtualHosts."cache.example".listen;
   assert tls.services.narjar.proxy.idleTimeoutSeconds > tls.services.narjar.edge.fillTimeoutSeconds;
   assert valid sharedEdge;
+  assert valid restrictedProxy;
+  assert valid ipv6Backend;
   assert sharedEdge.services.narjar.proxy.idleTimeoutSeconds >= sharedEdge.services.narjar.edge.fillTimeoutSeconds + sharedEdge.services.narjar.ioTimeoutSeconds;
   assert map (listener: listener.addr) restrictedProxy.services.nginx.virtualHosts."cache.example".listen == ["127.0.0.1"];
   assert location.proxyPass == "http://127.0.0.1:5000";
@@ -177,6 +179,33 @@ in
   assert ipv6Backend.services.nginx.virtualHosts."cache.example".locations."/".proxyPass == "http://[::1]:5000";
   assert inheritedUrl.services.narjar.client.url == inheritedUrl.services.narjar.publicUrl;
   assert builtins.all (cfg: !valid cfg) [
+    (server (sharedEdgeOptions
+      // {
+        listen = "[::1]:5000";
+        edge = sharedEdgeOptions.edge // {upstream = "http://localhost:5000";};
+      }))
+    (server (sharedEdgeOptions // {edge = sharedEdgeOptions.edge // {upstream = "http://127.0.0.1:5000";};}))
+    (server (sharedEdgeOptions // {edge = sharedEdgeOptions.edge // {upstream = "http://localhost:5000";};}))
+    (evaluate {
+      services.narjar = {enable = true;} // sharedEdgeOptions // {edge = sharedEdgeOptions.edge // {upstream = "https://cache.example:8443";};};
+      services.nginx.virtualHosts."cache.example".listen = [
+        {
+          addr = "0.0.0.0";
+          port = 443;
+          ssl = true;
+        }
+        {
+          addr = "0.0.0.0";
+          port = 8443;
+          ssl = true;
+        }
+        {
+          addr = "0.0.0.0";
+          port = 80;
+          ssl = false;
+        }
+      ];
+    })
     (server (sharedEdgeOptions // {edge = sharedEdgeOptions.edge // {upstream = "https://cache.example/";};}))
     (server (sharedEdgeOptions // {edge = sharedEdgeOptions.edge // {upstream = "https://CACHE.example:443";};}))
     (server (sharedEdgeOptions // {edge = sharedEdgeOptions.edge // {upstream = "https://cache.example.:0443/?x=1";};}))
