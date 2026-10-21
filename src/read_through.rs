@@ -334,7 +334,7 @@ impl ReadThroughSource {
         storage: &Storage,
         store: &StoreHash,
         deadline: Deadline,
-    ) -> Result<(), EdgeFailure> {
+    ) -> Result<(), EdgeMiss> {
         let metadata = self.metadata(store, deadline)?;
         let payload = metadata.payload();
         self.policy
@@ -348,10 +348,9 @@ impl ReadThroughSource {
                 Err(StorageError::MissingNar) => self
                     .receive_missing_canonical_nar(storage, payload, deadline)
                     .map(|()| EdgeHit::Filled),
-                Err(error) => Err(EdgeFailure::ingestion(error)),
+                Err(error) => Err(EdgeMiss::Failed(EdgeFailure::ingestion(error))),
             },
-        )
-        .map_err(EdgeMiss::reason)?;
+        )?;
         deadline.remaining()?;
         // Check the signed NarHash and NarSize against the stored uncompressed NAR,
         // even if another request downloaded it with a different compression format.
@@ -370,22 +369,24 @@ impl ReadThroughSource {
         storage: &Storage,
         payload: NarRepresentation,
         deadline: Deadline,
-    ) -> Result<(), EdgeFailure> {
+    ) -> Result<(), EdgeMiss> {
         self.coalesce(
             Key::Representation(payload.file_name(), payload.encoded_size()),
             deadline,
             || {
                 self.receive_encoded_representation(storage, payload, deadline)
+                    .map_err(EdgeMiss::Failed)
                     .map(|()| EdgeHit::Filled)
             },
-        )
-        .map_err(EdgeMiss::reason)?;
+        )?;
         // Sharing the download does not mean sharing another request's NarHash or NarSize.
         storage
             .ensure_canonical_nar_available(payload.identity())
             .map_err(|error| match error {
-                StorageError::MissingNar | StorageError::NarMismatch => EdgeFailure::Invalid,
-                error => EdgeFailure::ingestion(error),
+                StorageError::MissingNar | StorageError::NarMismatch => {
+                    EdgeMiss::Failed(EdgeFailure::Invalid)
+                }
+                error => EdgeMiss::Failed(EdgeFailure::ingestion(error)),
             })
     }
 
@@ -487,12 +488,12 @@ impl ReadThroughSource {
         &self,
         key: Key,
         deadline: Deadline,
-        fill: impl FnOnce() -> Result<EdgeHit, EdgeFailure>,
+        fill: impl FnOnce() -> Result<EdgeHit, EdgeMiss>,
     ) -> Result<EdgeHit, EdgeMiss> {
         let joined = self
             .state
             .lock()
-            .map_err(|_| EdgeFailure::Storage)?
+            .map_err(|_| EdgeMiss::Failed(EdgeFailure::Storage))?
             .join(key, Instant::now())?;
         match joined {
             Join::Cached(failure) => {
@@ -508,19 +509,18 @@ impl ReadThroughSource {
                         })
                     })
                     .map(|()| EdgeHit::Coalesced)
-                    .map_err(EdgeMiss::Failed)
             }
             Join::Leader(flight) => {
                 let completion = Completion::new(&flight);
                 let result = fill();
-                if let Err(failure) = result {
+                if let Err(miss) = result {
                     self.state
                         .lock()
-                        .map_err(|_| EdgeFailure::Storage)?
-                        .remember(key, failure, Instant::now(), self.negative_ttl);
+                        .map_err(|_| EdgeMiss::Failed(EdgeFailure::Storage))?
+                        .remember(key, miss.reason(), Instant::now(), self.negative_ttl);
                 }
                 completion.finish(result.map(|_| ()));
-                result.map_err(EdgeMiss::Failed)
+                result
             }
         }
     }
@@ -586,16 +586,17 @@ fn increment(counter: &AtomicU64) {
 
 fn finish_shared_fill_or_retry_representation(
     key: Key,
-    result: Result<(), EdgeFailure>,
-    retry: impl FnOnce() -> Result<(), EdgeFailure>,
-) -> Result<(), EdgeFailure> {
+    result: Result<(), EdgeMiss>,
+    retry: impl FnOnce() -> Result<(), EdgeMiss>,
+) -> Result<(), EdgeMiss> {
     match key {
         Key::Store(_) | Key::Representation(_, _) => result,
-        Key::Nar(_) => result.or_else(|failure| match failure {
-            EdgeFailure::Authoritative404 | EdgeFailure::Transient | EdgeFailure::Invalid => {
-                retry()
-            }
-            EdgeFailure::Capacity | EdgeFailure::Storage => Err(failure),
+        Key::Nar(_) => result.or_else(|miss| match miss {
+            EdgeMiss::Failed(
+                EdgeFailure::Authoritative404 | EdgeFailure::Transient | EdgeFailure::Invalid,
+            ) => retry(),
+            EdgeMiss::Failed(EdgeFailure::Capacity | EdgeFailure::Storage)
+            | EdgeMiss::Cached(_) => Err(miss),
         }),
     }
 }
@@ -623,18 +624,18 @@ impl Drop for ActiveSlot<'_> {
 // Wake waiting requests even if the downloading request panics before recording its result.
 struct Completion<'a> {
     flight: &'a Flight,
-    result: Result<(), EdgeFailure>,
+    result: Result<(), EdgeMiss>,
 }
 
 impl<'a> Completion<'a> {
     fn new(flight: &'a Flight) -> Self {
         Self {
             flight,
-            result: Err(EdgeFailure::Storage),
+            result: Err(EdgeMiss::Failed(EdgeFailure::Storage)),
         }
     }
 
-    fn finish(mut self, result: Result<(), EdgeFailure>) {
+    fn finish(mut self, result: Result<(), EdgeMiss>) {
         self.result = result;
     }
 }

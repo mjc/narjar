@@ -887,6 +887,42 @@ fn an_incorrect_encoded_size_cannot_poison_a_valid_alias_before_negative_expiry(
 }
 
 #[test]
+fn a_cached_representation_failure_stays_negative_for_another_store_path() {
+    let fixture = Fixture::new();
+    let representation = NarRepresentation::compressed(fixture.encoded, fixture.identity);
+    let first_metadata = fixture.metadata(STORE, representation, &signing_key());
+    let alias_metadata = fixture.metadata(ALIAS, representation, &signing_key());
+    let upstream = Upstream::new(move |route, stream| {
+        if route.ends_with(".narinfo") {
+            reply(
+                stream,
+                200,
+                if route.contains(STORE) {
+                    &first_metadata
+                } else {
+                    &alias_metadata
+                },
+            );
+        } else {
+            reply(stream, 503, b"");
+        }
+    });
+    let source = source(&upstream);
+    let (_directory, storage) = storage();
+
+    assert_eq!(
+        source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap()),
+        Err(EdgeMiss::Failed(EdgeFailure::Transient))
+    );
+    assert_eq!(
+        source.ensure_local(&storage, &StoreHash::parse(ALIAS).unwrap()),
+        Err(EdgeMiss::Cached(EdgeFailure::Transient))
+    );
+    assert_eq!(upstream.count(".narinfo"), 2);
+    assert_eq!(upstream.count(".zst"), 1);
+}
+
+#[test]
 fn progressing_payload_can_outlive_the_network_idle_timeout() {
     let fixture = Fixture::new();
     let metadata = fixture.metadata(
