@@ -18,6 +18,9 @@ fn native_push_and_raw_read_share_one_chunked_cache_url() {
             NativePushRunOptions {
                 signing: true,
                 insecure_http: true,
+                // Chunk publication waits for a filesystem-wide durability barrier.
+                // This round-trip test is not a check of the default idle deadline.
+                timeout_seconds: Some(300),
                 ..NativePushRunOptions::default()
             },
         );
