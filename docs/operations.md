@@ -605,6 +605,10 @@ Listeners follow NixOS's `services.nginx.defaultListenAddresses`, including
 IPv6 when enabled. Per-host `listen` settings can override them; each must use
 an explicit TCP port different from the Narjar backend. Empty listener lists
 and implicit ports are rejected.
+Overrides must retain the public URL's port/TLS combination and ACME's HTTP
+challenge listener. Existing HTTPS redirect policies are preserved.
+With the managed proxy, read-through upstreams use a DNS or IPv4 HTTP(S)
+origin. Equivalent spellings of this server's own origin are rejected.
 
 The [README](../README.md#shared-cache) has a TLS example. `proxy.tls` selects
 `acme` (the default), `existing`, or `off`. ACME uses HTTPS on port 443 and an

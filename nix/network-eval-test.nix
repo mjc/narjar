@@ -52,6 +52,7 @@
       };
     };
     services.nginx.virtualHosts."cache.example" = {
+      forceSSL = true;
       sslCertificate = "/run/secrets/cache.crt";
       sslCertificateKey = "/run/secrets/cache.key";
       locations."/other".return = "200 ok";
@@ -152,6 +153,8 @@ in
   assert builtins.all (listener: listener.port == 8080 && !listener.ssl) lan.services.nginx.virtualHosts."cache.example".listen;
   assert !lan.services.nginx.virtualHosts."cache.example".enableACME;
   assert valid existingProxy;
+  assert existingProxy.services.nginx.virtualHosts."cache.example".forceSSL;
+  assert !existingProxy.services.nginx.virtualHosts."cache.example".onlySSL;
   assert existingProxy.services.nginx.virtualHosts ? "other.example";
   assert existingProxy.services.nginx.virtualHosts."cache.example".locations ? "/other";
   assert valid direct;
@@ -174,6 +177,51 @@ in
   assert ipv6Backend.services.nginx.virtualHosts."cache.example".locations."/".proxyPass == "http://[::1]:5000";
   assert inheritedUrl.services.narjar.client.url == inheritedUrl.services.narjar.publicUrl;
   assert builtins.all (cfg: !valid cfg) [
+    (server (sharedEdgeOptions // {edge = sharedEdgeOptions.edge // {upstream = "https://cache.example/";};}))
+    (server (sharedEdgeOptions // {edge = sharedEdgeOptions.edge // {upstream = "https://CACHE.example:443";};}))
+    (server (sharedEdgeOptions // {edge = sharedEdgeOptions.edge // {upstream = "https://cache.example.:0443/?x=1";};}))
+    (evaluate {
+      services.narjar = {
+        enable = true;
+        publicUrl = "https://cache.example";
+        proxy.enable = true;
+      };
+      services.nginx.virtualHosts."cache.example".listen = [
+        {
+          addr = "0.0.0.0";
+          port = 443;
+          ssl = false;
+        }
+      ];
+    })
+    (evaluate {
+      services.narjar = {
+        enable = true;
+        publicUrl = "https://cache.example";
+        proxy.enable = true;
+      };
+      services.nginx.virtualHosts."cache.example".listen = [
+        {
+          addr = "0.0.0.0";
+          port = 8443;
+          ssl = true;
+        }
+      ];
+    })
+    (evaluate {
+      services.narjar = {
+        enable = true;
+        publicUrl = "https://cache.example";
+        proxy.enable = true;
+      };
+      services.nginx.virtualHosts."cache.example".listen = [
+        {
+          addr = "0.0.0.0";
+          port = 443;
+          ssl = true;
+        }
+      ];
+    })
     (server {proxy.enable = true;})
     (server {
       publicUrl = "http://cache.example:5000";

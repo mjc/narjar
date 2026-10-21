@@ -42,6 +42,25 @@
     else lib.toInt (builtins.elemAt loopbackParts 1);
   proxyListeners = config.services.nginx.virtualHosts.${host}.listen;
   hasDistinctBackendPort = listener: listener.port != null && listener.port != backendPort;
+  publicHost = config.services.nginx.virtualHosts.${host};
+  matchesPublicEndpoint = listener: listener.port == port && listener.ssl == secure;
+  isHttpChallengeListener = listener: listener.port == 80 && !listener.ssl;
+  normalizedOrigin = url: let
+    parts = builtins.match "(http|https)://([a-z0-9.-]+)(:([0-9]+))?([/?#].*)?" (lib.toLower url);
+  in
+    if parts == null
+    then null
+    else {
+      scheme = builtins.elemAt parts 0;
+      host = lib.removeSuffix "." (builtins.elemAt parts 1);
+      port =
+        if builtins.elemAt parts 3 != null
+        then lib.toIntBase10 (builtins.elemAt parts 3)
+        else if builtins.elemAt parts 0 == "https"
+        then 443
+        else 80;
+    };
+  upstreamOrigin = normalizedOrigin cfg.edge.upstream;
   localEdge = client.enable && client.mode == "local-edge";
   substituter =
     if localEdge
@@ -136,8 +155,8 @@ in {
           message = "services.narjar.proxy.tls must agree with publicUrl's HTTP or HTTPS scheme";
         }
         {
-          assertion = !cfg.edge.enable || cfg.edge.upstream != cfg.publicUrl;
-          message = "services.narjar.edge.upstream must not point at this server's publicUrl";
+          assertion = !cfg.edge.enable || (upstreamOrigin != null && upstreamOrigin != normalizedOrigin cfg.publicUrl);
+          message = "services.narjar.edge.upstream must have a DNS or IPv4 HTTP(S) origin different from this server's publicUrl";
         }
         {
           assertion = !acme || port == 443;
@@ -148,6 +167,18 @@ in {
           message = "services.narjar.proxy requires explicit listener ports different from the Narjar backend; empty or implicit listeners are unsupported";
         }
         {
+          assertion = builtins.any matchesPublicEndpoint proxyListeners;
+          message = "services.narjar.proxy listeners must include publicUrl's port and TLS mode";
+        }
+        {
+          assertion = !acme || (publicHost.forceSSL && builtins.any isHttpChallengeListener proxyListeners);
+          message = "services.narjar.proxy ACME mode requires HTTPS redirection and an HTTP listener on port 80";
+        }
+        {
+          assertion = secure == (publicHost.forceSSL || publicHost.onlySSL || publicHost.addSSL);
+          message = "services.narjar.proxy virtual host TLS policy must agree with publicUrl";
+        }
+        {
           assertion = !cfg.edge.enable || cfg.proxy.idleTimeoutSeconds >= cfg.edge.fillTimeoutSeconds + cfg.ioTimeoutSeconds;
           message = "services.narjar.proxy.idleTimeoutSeconds must cover the edge fill timeout plus ioTimeoutSeconds";
         }
@@ -155,9 +186,9 @@ in {
       services.nginx = {
         enable = true;
         virtualHosts.${host} = {
-          enableACME = acme;
-          forceSSL = acme;
-          onlySSL = secure && !acme;
+          enableACME = mkDefault acme;
+          forceSSL = mkDefault acme;
+          onlySSL = mkDefault (secure && !publicHost.forceSSL);
           listen = mkDefault (lib.concatMap (addr:
             [
               {
@@ -165,7 +196,7 @@ in {
                 ssl = secure;
               }
             ]
-            ++ lib.optional acme {
+            ++ lib.optional publicHost.forceSSL {
               inherit addr;
               port = 80;
               ssl = false;
