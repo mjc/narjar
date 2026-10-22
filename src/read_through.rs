@@ -180,6 +180,15 @@ pub(crate) enum EdgeFailure {
 }
 
 impl EdgeFailure {
+    const fn allows_upstream_source_refresh(self) -> bool {
+        match self {
+            Self::Authoritative404 | Self::Transient | Self::Invalid => true,
+            Self::Capacity | Self::Storage => false,
+        }
+    }
+}
+
+impl EdgeFailure {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Authoritative404 => "not_found",
@@ -433,8 +442,8 @@ impl ReadThroughSource {
                     .map_err(EdgeFailure::ingestion)?;
             }
             Err(StorageError::MissingNar | StorageError::NarMismatch) => {
-                let upstream_source = self.source_for_repair(store, output, source, deadline)?;
-                self.restore_missing_local_payload(storage, output, &upstream_source, deadline)?;
+                let upstream_source =
+                    self.restore_payload_for_recovery(storage, store, output, source, deadline)?;
                 source = Some(upstream_source);
                 let metadata = self
                     .keys
@@ -452,25 +461,55 @@ impl ReadThroughSource {
         Ok(())
     }
 
-    fn source_for_repair(
+    fn restore_payload_for_recovery(
         &self,
+        storage: &Storage,
         store: &StoreHash,
         output: NarRepresentation,
         recorded: Option<UpstreamNarSource>,
         deadline: Deadline,
     ) -> Result<UpstreamNarSource, EdgeFailure> {
         match recorded {
-            Some(source) if source.payload().identity() == output.identity() => Ok(source),
-            Some(_) => Err(EdgeFailure::Invalid),
-            None => {
-                let metadata = self.metadata(store, deadline)?;
-                if metadata.payload().identity() != output.identity() {
-                    return Err(EdgeFailure::Invalid);
-                }
-                UpstreamNarSource::new(metadata.payload(), metadata.download_url().as_str())
-                    .map_err(EdgeFailure::ingestion)
+            Some(source) if source.payload().identity() == output.identity() => self
+                .restore_from_recorded_source_or_refresh(storage, store, output, source, deadline),
+            Some(_) | None => {
+                self.restore_from_current_upstream_metadata(storage, store, output, deadline)
             }
         }
+    }
+
+    fn restore_from_recorded_source_or_refresh(
+        &self,
+        storage: &Storage,
+        store: &StoreHash,
+        output: NarRepresentation,
+        recorded: UpstreamNarSource,
+        deadline: Deadline,
+    ) -> Result<UpstreamNarSource, EdgeFailure> {
+        match self.restore_missing_local_payload(storage, output, &recorded, deadline) {
+            Ok(()) => Ok(recorded),
+            Err(failure) if failure.allows_upstream_source_refresh() => {
+                self.restore_from_current_upstream_metadata(storage, store, output, deadline)
+            }
+            Err(failure) => Err(failure),
+        }
+    }
+
+    fn restore_from_current_upstream_metadata(
+        &self,
+        storage: &Storage,
+        store: &StoreHash,
+        output: NarRepresentation,
+        deadline: Deadline,
+    ) -> Result<UpstreamNarSource, EdgeFailure> {
+        let metadata = self.metadata(store, deadline)?;
+        if metadata.payload().identity() != output.identity() {
+            return Err(EdgeFailure::Invalid);
+        }
+        let source = UpstreamNarSource::new(metadata.payload(), metadata.download_url().as_str())
+            .map_err(EdgeFailure::ingestion)?;
+        self.restore_missing_local_payload(storage, output, &source, deadline)?;
+        Ok(source)
     }
 
     fn restore_missing_local_payload(

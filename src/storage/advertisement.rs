@@ -422,7 +422,9 @@ impl Storage {
                 match existing {
                     Some(record)
                         if record.retention.expires_at() >= required_expiry
-                            && (source.is_none() || record.source.is_some()) =>
+                            && source
+                                .as_ref()
+                                .is_none_or(|source| record.source.as_ref() == Some(source)) =>
                     {
                         synchronize_reused(directory).map_err(Into::into)
                     }

@@ -574,6 +574,79 @@ fn recovery_uses_the_recorded_upstream_url_to_repair_a_corrupt_canonical_nar() {
 }
 
 #[test]
+fn recovery_refreshes_a_stale_recorded_upstream_url() {
+    let fixture = Fixture::new();
+    let compressed = NarRepresentation::compressed(fixture.encoded, fixture.identity);
+    let old_resource = "objects/fixture.zst?token=expired";
+    let new_resource = "objects/fixture.zst?token=current";
+    let old_metadata =
+        fixture.metadata_with_download_url(STORE, compressed, &signing_key(), old_resource);
+    let current_metadata =
+        fixture.metadata_with_download_url(STORE, compressed, &signing_key(), new_resource);
+    let metadata_requests = Arc::new(AtomicUsize::new(0));
+    let expired_downloads = Arc::new(AtomicUsize::new(0));
+    let compressed_bytes = fixture.compressed.clone();
+    let upstream = {
+        let metadata_requests = metadata_requests.clone();
+        let expired_downloads = expired_downloads.clone();
+        Upstream::new(move |route, stream| {
+            if route.ends_with(".narinfo") {
+                let metadata = if metadata_requests.fetch_add(1, Ordering::AcqRel) == 0 {
+                    &old_metadata
+                } else {
+                    &current_metadata
+                };
+                reply(stream, 200, metadata);
+            } else if route.ends_with(old_resource) {
+                if expired_downloads.fetch_add(1, Ordering::AcqRel) == 0 {
+                    reply(stream, 200, &compressed_bytes);
+                } else {
+                    reply(stream, 403, b"");
+                }
+            } else if route.ends_with(new_resource) {
+                reply(stream, 200, &compressed_bytes);
+            } else {
+                reply(stream, 404, b"");
+            }
+        })
+    };
+    let source = source_with_egress(&upstream, WireEncoding::Raw);
+    let (directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
+    fs::write(
+        directory
+            .path()
+            .join("nar")
+            .join(NarFileName::raw(fixture.identity.hash()).to_string()),
+        b"corrupt canonical NAR",
+    )
+    .unwrap();
+
+    source.repair_recovery_blockers(&storage).unwrap();
+
+    let mut repaired = storage
+        .open_nar(NarFileName::raw(fixture.identity.hash()))
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    repaired.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, fixture.raw);
+    assert_eq!(upstream.count(".narinfo"), 2);
+    assert_eq!(upstream.count(old_resource), 2);
+    assert_eq!(upstream.count(new_resource), 1);
+    assert_eq!(
+        storage.read_through_source(store).unwrap().unwrap().url(),
+        upstream
+            .url()
+            .resolve_trusted_cache_resource(new_resource)
+            .unwrap()
+            .as_str()
+    );
+}
+
+#[test]
 fn recorded_leases_serve_compressed_metadata_without_upstream_access() {
     use crate::cache::object::{NarFileName, WireEncoding};
     let fixture = Fixture::new();
