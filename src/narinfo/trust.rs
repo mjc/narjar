@@ -11,7 +11,8 @@ use crate::cache::filesystem::{FilePrivacy, validate_file_privacy};
 use crate::cache::storage::{Directory, StoreHash, open_regular_at};
 
 use super::{
-    NamedSignature, NarInfoClaims, NarInfoDocument, NarInfoError, PublishedNarInfoError,
+    ExternalNarInfoTransport, NamedSignature, NarInfoClaims, NarInfoDocument, NarInfoError,
+    NarInfoMetadata, PublicationNarInfo, PublishedNarInfoError, SignatureVerifiedExternalNarInfo,
     TrustedNarInfoClaims, UnverifiedPublicationNarInfo, ValidatedNarInfo, parse_narinfo_text,
     valid_name,
 };
@@ -110,13 +111,43 @@ impl TrustedPublicKeys {
         bytes: Vec<u8>,
     ) -> Result<TrustedNarInfoClaims, NarInfoError> {
         let text = parse_narinfo_text(bytes)?;
-        let document = NarInfoDocument::parse_external(&text)?;
+        let (_, claims) = self.verify_external_document(route, &text)?;
+        Ok(TrustedNarInfoClaims(claims))
+    }
+
+    pub(crate) fn verify_external_narinfo_for_transfer(
+        &self,
+        route: &StoreHash,
+        bytes: Vec<u8>,
+    ) -> Result<SignatureVerifiedExternalNarInfo, NarInfoError> {
+        let text = parse_narinfo_text(bytes)?;
+        let (document, claims) = self.verify_external_document(route, &text)?;
+        let metadata = NarInfoMetadata::from_document_claims(claims, &document)?;
+        let transport = document.external_transport(metadata.claims().identity())?;
+        let ExternalNarInfoTransport {
+            download_url,
+            payload,
+        } = transport;
+        let publication = ValidatedNarInfo(PublicationNarInfo { metadata, payload });
+        Ok(SignatureVerifiedExternalNarInfo {
+            publication,
+            download_url,
+        })
+    }
+
+    fn verify_external_document<'text>(
+        &self,
+        route: &StoreHash,
+        text: &'text str,
+    ) -> Result<(NarInfoDocument<'text>, NarInfoClaims), NarInfoError> {
+        let document = NarInfoDocument::parse_external(text)?;
         document.validate_external_transport()?;
         let claims = NarInfoClaims::from_external_document(route, &document)?;
         let signatures = document.named_signatures()?;
-        self.verifies(claims.fingerprint().as_bytes(), &signatures)
-            .then_some(TrustedNarInfoClaims(claims))
-            .ok_or(NarInfoError)
+        if !self.verifies(claims.fingerprint().as_bytes(), &signatures) {
+            return Err(NarInfoError);
+        }
+        Ok((document, claims))
     }
 
     pub(super) fn verifies(&self, fingerprint: &[u8], signatures: &[NamedSignature]) -> bool {

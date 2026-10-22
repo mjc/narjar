@@ -119,8 +119,18 @@ A local miss downloads the upstream narinfo, verifies its signature, then
 downloads and verifies the NAR it names. The NAR, rewritten narinfo and retention
 record must be written and synced to disk before the request succeeds. Downloads
 can be uncompressed, XZ or Zstd; the local cache always serves uncompressed NARs.
-Concurrent requests for the same object share the download. Redirects are
-rejected, and NAR downloads must use paths under the configured upstream URL.
+Upstream `NarHash` and `FileHash` values must use SHA-256; other hash algorithms
+are rejected because Narjar's current NAR identity types represent 32-byte
+SHA-256 digests.
+For raw NARs, upstream narinfo may omit `FileHash` and `FileSize`; if present,
+they must agree with the signed `NarHash` and `NarSize`. Compressed NARs require
+both fields, and a partial pair is rejected. The narinfo signature covers the
+logical NAR identity, not its download URL, so Narjar resolves that URL and
+checks it against the configured upstream origin and path before requesting it.
+Concurrent requests for the same object share the download. Narjar follows at
+most five redirects when each remains on that origin and within the configured
+upstream path. Escaped path separators, credentials, fragments and path escapes
+are rejected.
 Use a separate data directory for this mode. It does not serve, overwrite or
 migrate existing compressed publications.
 

@@ -338,8 +338,15 @@ impl NarInfoMetadata {
         route: &StoreHash,
         document: &NarInfoDocument<'_>,
     ) -> Result<Self, NarInfoError> {
+        Self::from_document_claims(NarInfoClaims::from_document(route, document)?, document)
+    }
+
+    fn from_document_claims(
+        claims: NarInfoClaims,
+        document: &NarInfoDocument<'_>,
+    ) -> Result<Self, NarInfoError> {
         Ok(Self {
-            claims: NarInfoClaims::from_document(route, document)?,
+            claims,
             deriver: document
                 .field(NarInfoField::Deriver)
                 .map(Deriver::from_narinfo_value)
@@ -542,6 +549,41 @@ impl<'text> NarInfoDocument<'text> {
         representation_from_narinfo_fields(file_name, file_hash, file_size, identity)
     }
 
+    fn external_transport(
+        &self,
+        identity: NarIdentity,
+    ) -> Result<ExternalNarInfoTransport, NarInfoError> {
+        let download_url = self.required(NarInfoField::Url)?.to_owned();
+        let encoding = self
+            .required(NarInfoField::Compression)?
+            .parse::<WireEncoding>()
+            .map_err(|_| NarInfoError)?;
+        let file_hash = self.external_file_hash()?;
+        let file_size = self.external_file_size()?;
+        let payload = match encoding {
+            WireEncoding::Raw => {
+                let expected_hash = FileHash::from_nar_hash(identity.hash());
+                let expected_size = EncodedSize::new(identity.size().get());
+                if file_hash.is_some_and(|hash| hash != expected_hash)
+                    || file_size.is_some_and(|size| size != expected_size)
+                {
+                    return Err(NarInfoError);
+                }
+                NarRepresentation::Raw(identity)
+            }
+            WireEncoding::Compressed(codec) => match (file_hash, file_size) {
+                (Some(hash), Some(size)) => {
+                    NarRepresentation::compressed(EncodedIdentity::new(codec, hash, size), identity)
+                }
+                _ => return Err(NarInfoError),
+            },
+        };
+        Ok(ExternalNarInfoTransport {
+            download_url,
+            payload,
+        })
+    }
+
     fn validate_external_transport(&self) -> Result<(), NarInfoError> {
         let url = self.required(NarInfoField::Url)?;
         if url.is_empty() {
@@ -562,23 +604,34 @@ impl<'text> NarInfoDocument<'text> {
         self.required(NarInfoField::Compression)?
             .parse::<WireEncoding>()
             .map_err(|_| NarInfoError)?;
-        match (
-            self.field(NarInfoField::FileHash),
-            self.field(NarInfoField::FileSize),
-        ) {
-            (None, None) => Ok(()),
-            (Some(hash), Some(size)) => {
-                hash.strip_prefix("sha256:")
-                    .ok_or(NarInfoError)
-                    .and_then(|value| FileHash::parse(value).map_err(|_| NarInfoError))?;
-                size.parse::<u64>()
-                    .ok()
-                    .filter(|size| *size != 0)
-                    .ok_or(NarInfoError)?;
-                Ok(())
-            }
+        match (self.external_file_hash()?, self.external_file_size()?) {
+            (None, None) | (Some(_), Some(_)) => Ok(()),
             _ => Err(NarInfoError),
         }
+    }
+
+    fn external_file_hash(&self) -> Result<Option<FileHash>, NarInfoError> {
+        self.field(NarInfoField::FileHash)
+            .map(|value| {
+                value
+                    .strip_prefix("sha256:")
+                    .ok_or(NarInfoError)
+                    .and_then(|value| FileHash::parse(value).map_err(|_| NarInfoError))
+            })
+            .transpose()
+    }
+
+    fn external_file_size(&self) -> Result<Option<EncodedSize>, NarInfoError> {
+        self.field(NarInfoField::FileSize)
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|size| *size != 0)
+                    .map(EncodedSize::new)
+                    .ok_or(NarInfoError)
+            })
+            .transpose()
     }
 }
 
@@ -641,6 +694,27 @@ impl NamedSignature {
 struct PublicationNarInfo {
     metadata: NarInfoMetadata,
     payload: NarRepresentation,
+}
+
+struct ExternalNarInfoTransport {
+    download_url: String,
+    payload: NarRepresentation,
+}
+
+/// Signature verification establishes logical claims, not transport identity.
+pub(crate) struct SignatureVerifiedExternalNarInfo {
+    publication: ValidatedNarInfo,
+    download_url: String,
+}
+
+impl SignatureVerifiedExternalNarInfo {
+    pub(crate) fn download_url(&self) -> &str {
+        &self.download_url
+    }
+
+    pub(crate) fn into_publication(self) -> ValidatedNarInfo {
+        self.publication
+    }
 }
 
 struct UnverifiedPublicationNarInfo {

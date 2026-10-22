@@ -30,6 +30,10 @@ pub(crate) enum HttpUrlError {
     Fragment,
     #[error("redirect leaves the trusted cache authority")]
     UntrustedRedirectAuthority,
+    #[error("upstream URL leaves the configured cache origin")]
+    UntrustedResourceOrigin,
+    #[error("upstream URL leaves the configured cache path")]
+    UntrustedResourcePath,
 }
 
 impl HttpUrl {
@@ -95,6 +99,50 @@ impl HttpUrl {
         }
     }
 
+    pub(crate) fn resolve_trusted_cache_resource(
+        &self,
+        reference: &str,
+    ) -> Result<Self, HttpUrlError> {
+        let cache_directory = self.endpoint(&[""]);
+        let reference = parse_cache_reference(reference)?;
+        let resolved = reference
+            .resolve_against(&cache_directory.0)
+            .map_err(|error| HttpUrlError::Parse(format!("invalid upstream URL: {error}")))?;
+        self.validate_cache_resource(resolved)
+    }
+
+    pub(crate) fn resolve_trusted_cache_redirect(
+        &self,
+        current: &Self,
+        location: &str,
+    ) -> Result<Self, HttpUrlError> {
+        let reference = parse_cache_reference(location)?;
+        let resolved = reference
+            .resolve_against(&current.0)
+            .map_err(|error| HttpUrlError::Parse(format!("invalid upstream redirect: {error}")))?;
+        self.validate_cache_resource(resolved)
+    }
+
+    fn validate_cache_resource(&self, uri: Uri<String>) -> Result<Self, HttpUrlError> {
+        let resource = Self::try_from_uri(uri)?;
+        if !self.has_same_origin(&resource) {
+            return Err(HttpUrlError::UntrustedResourceOrigin);
+        }
+
+        let cache_directory = self.endpoint(&[""]);
+        let allowed_path = cache_directory.0.path().as_str();
+        if !resource.0.path().as_str().starts_with(allowed_path) {
+            return Err(HttpUrlError::UntrustedResourcePath);
+        }
+        Ok(resource)
+    }
+
+    fn has_same_origin(&self, other: &Self) -> bool {
+        self.0.scheme() == other.0.scheme()
+            && self.host().eq_ignore_ascii_case(other.host())
+            && self.port() == other.port()
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -156,6 +204,25 @@ impl HttpUrl {
         }
         Ok(Self(uri))
     }
+}
+
+fn parse_cache_reference(value: &str) -> Result<UriRef<String>, HttpUrlError> {
+    let reference = UriRef::parse(value.trim())
+        .map_err(|error| HttpUrlError::Parse(format!("invalid upstream URL reference: {error}")))?;
+    let path = reference.path().as_str();
+    if reference.has_fragment() || has_ambiguous_path_escape(path) {
+        return Err(HttpUrlError::UntrustedResourcePath);
+    }
+    Ok(reference.to_owned())
+}
+
+fn has_ambiguous_path_escape(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        let decoded_dot = segment.replace("%2e", ".").replace("%2E", ".");
+        decoded_dot != segment && (decoded_dot == "." || decoded_dot == "..")
+    }) || ["%2f", "%2F", "%5c", "%5C"]
+        .iter()
+        .any(|escape| path.contains(escape))
 }
 
 impl FromStr for HttpUrl {
@@ -220,6 +287,93 @@ mod tests {
             https
                 .resolve_trusted_redirect("http://cache.example/object")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn upstream_resources_resolve_queries_and_same_origin_absolute_urls() {
+        let cache =
+            HttpUrl::from_str("https://cache.example/base/cache").expect("cache URL should parse");
+
+        assert_eq!(
+            cache
+                .resolve_trusted_cache_resource("objects/not-a-hash.nar?token=1")
+                .expect("relative object URL should stay in the configured cache path")
+                .as_str(),
+            "https://cache.example/base/cache/objects/not-a-hash.nar?token=1"
+        );
+        assert_eq!(
+            cache
+                .resolve_trusted_cache_resource(
+                    "https://cache.example/base/cache/objects/object.nar?token=2"
+                )
+                .expect("same-origin absolute object URL should be permitted")
+                .as_str(),
+            "https://cache.example/base/cache/objects/object.nar?token=2"
+        );
+        assert_eq!(
+            cache
+                .resolve_trusted_cache_resource("./objects/a.nar")
+                .expect("in-scope dot segment should be normalized")
+                .as_str(),
+            "https://cache.example/base/cache/objects/a.nar"
+        );
+        assert_eq!(
+            cache
+                .resolve_trusted_cache_resource("objects/a%20file.nar?token=3")
+                .expect("escaped path characters should remain valid")
+                .as_str(),
+            "https://cache.example/base/cache/objects/a%20file.nar?token=3"
+        );
+    }
+
+    #[test]
+    fn upstream_resources_reject_path_escapes_and_other_origins() {
+        let cache =
+            HttpUrl::from_str("https://cache.example/base/cache/").expect("cache URL should parse");
+
+        for location in [
+            "../outside.nar",
+            "%2e%2e/outside.nar",
+            "https://cache.example/base/other/object.nar",
+            "https://other.example/base/cache/object.nar",
+            "https://user:secret@cache.example/base/cache/object.nar",
+            "http://cache.example/base/cache/object.nar",
+        ] {
+            assert!(
+                cache.resolve_trusted_cache_resource(location).is_err(),
+                "accepted untrusted upstream URL {location}"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_redirects_must_stay_inside_the_configured_path() {
+        let cache =
+            HttpUrl::from_str("https://cache.example/base/cache/").expect("cache URL should parse");
+        let current = cache
+            .resolve_trusted_cache_resource("objects/object.nar")
+            .expect("initial object should resolve");
+
+        assert_eq!(
+            cache
+                .resolve_trusted_cache_redirect(&current, "../other/object.nar?token=3")
+                .expect("normalized redirect remains within the configured cache path")
+                .as_str(),
+            "https://cache.example/base/cache/other/object.nar?token=3"
+        );
+        assert_eq!(
+            cache
+                .resolve_trusted_cache_redirect(&current, "../../outside.nar")
+                .expect_err("redirect escaping the cache path must be rejected"),
+            super::HttpUrlError::UntrustedResourcePath
+        );
+        assert_eq!(
+            cache
+                .resolve_trusted_cache_redirect(&current, "sibling.nar?token=3")
+                .expect("same-scope redirect should resolve")
+                .as_str(),
+            "https://cache.example/base/cache/objects/sibling.nar?token=3"
         );
     }
 
