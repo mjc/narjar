@@ -179,8 +179,19 @@ fn source(upstream: &Upstream) -> ReadThroughSource {
 }
 
 fn source_with_egress(upstream: &Upstream, egress_compression: WireEncoding) -> ReadThroughSource {
+    source_with_egress_timeout(upstream, egress_compression, TEST_TIMEOUT)
+}
+
+fn source_with_egress_timeout(
+    upstream: &Upstream,
+    egress_compression: WireEncoding,
+    timeout: Duration,
+) -> ReadThroughSource {
+    let mut settings = settings_with_egress(upstream.url(), egress_compression);
+    settings.timeout = timeout;
+    settings.fill_timeout = timeout;
     ReadThroughSource::new(
-        settings_with_egress(upstream.url(), egress_compression),
+        settings,
         trusted_keys(),
         NarUploadPolicy::new(1024 * 1024, 0),
     )
@@ -1519,7 +1530,11 @@ fn compressed_aliases_share_one_exact_retained_download() {
             }
         })
     };
-    let source = source_with_egress(&upstream, WireEncoding::Compressed(CompressionCodec::Zstd));
+    let source = source_with_egress_timeout(
+        &upstream,
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+        Duration::from_secs(30),
+    );
     let (_directory, storage) = storage();
     thread::scope(|scope| {
         let calls = [STORE, ALIAS]
@@ -1532,9 +1547,10 @@ fn compressed_aliases_share_one_exact_retained_download() {
         wait_for(|| upstream.count(".narinfo") == 2);
         wait_for(|| source.counters.followers.load(Ordering::Relaxed) == 1);
         gate.release();
-        calls
-            .into_iter()
-            .for_each(|call| assert!(call.join().unwrap().is_ok()));
+        calls.into_iter().for_each(|call| {
+            let result = call.join().unwrap();
+            assert!(result.is_ok(), "read-through request failed: {result:?}");
+        });
     });
 
     assert_eq!(upstream.count(".nar.zst"), 1);
