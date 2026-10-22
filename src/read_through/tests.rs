@@ -23,11 +23,11 @@ use crate::cache::{
         CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash,
         NarIdentity, NarSize,
     },
-    storage::{
-        CHUNK_DIRECTORY, CacheCreation, Directory, EGRESS_RECEIPT_DIRECTORY, StorageBackend,
-        SupportedStorageBackend,
-    },
+    storage::{CacheCreation, Directory, EGRESS_RECEIPT_DIRECTORY, SupportedStorageBackend},
 };
+
+#[cfg(target_os = "linux")]
+use crate::cache::storage::{CHUNK_DIRECTORY, StorageBackend};
 
 const STORE: &str = "00000000000000000000000000000000";
 const ALIAS: &str = "11111111111111111111111111111111";
