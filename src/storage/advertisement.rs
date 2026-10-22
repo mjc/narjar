@@ -422,6 +422,7 @@ impl Storage {
                 match existing {
                     Some(record)
                         if record.retention.expires_at() >= required_expiry
+                            && record.output == output
                             && source
                                 .as_ref()
                                 .is_none_or(|source| record.source.as_ref() == Some(source)) =>
@@ -1250,6 +1251,41 @@ mod tests {
         );
         drop(storage);
         drop(directory);
+    }
+
+    #[test]
+    fn changed_advertised_output_rewrites_an_unexpired_lease() {
+        let (directory, mut storage) = unconfigured_fixture();
+        storage
+            .configure_advertisement_leases(NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let store = StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        let encoded = EncodedIdentity::new(
+            CompressionCodec::Zstd,
+            FileHash::from_digest([7; 32]),
+            EncodedSize::new(29),
+        );
+        let compressed_output = NarRepresentation::compressed(encoded, identity);
+
+        storage.record_publication_lease(store, identity).unwrap();
+        storage
+            .record_publication_lease_for_output(store, identity, compressed_output)
+            .unwrap();
+
+        let lease = read_record::<AdvertisementLease>(
+            &File::open(directory.path().join(DIRECTORY)).unwrap(),
+            &lease_name(store),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            lease.output,
+            AdvertisementOutput::from_representation(compressed_output),
+            "an active lease must protect the newly advertised representation"
+        );
+        let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
+        assert!(protection.protects_nar_name(encoded.file_name().to_string().as_ref()));
     }
 
     #[test]
