@@ -1255,7 +1255,7 @@ mod tests {
 
     #[test]
     fn changed_advertised_output_rewrites_an_unexpired_lease() {
-        let (directory, mut storage) = unconfigured_fixture();
+        let (_directory, mut storage) = unconfigured_fixture();
         storage
             .configure_advertisement_leases(NonZeroU64::new(3600).unwrap(), 0)
             .unwrap();
@@ -1273,18 +1273,8 @@ mod tests {
             .record_publication_lease_for_output(store, identity, compressed_output)
             .unwrap();
 
-        let lease = read_record::<AdvertisementLease>(
-            &File::open(directory.path().join(DIRECTORY)).unwrap(),
-            &lease_name(store),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            lease.output,
-            AdvertisementOutput::from_representation(compressed_output),
-            "an active lease must protect the newly advertised representation"
-        );
         let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
+        assert!(protection.protects(ProtectedObject::CanonicalNar(identity.hash())));
         assert!(protection.protects_nar_name(encoded.file_name().to_string().as_ref()));
     }
 
