@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::cache::{
-    object::{EncodedSize, NarFileName, NarHash},
+    object::{EncodedIdentity, NarIdentity},
     storage::StoreHash,
 };
 
@@ -17,8 +17,8 @@ const MAX_WAITERS: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum Key {
     Store(StoreHash),
-    Nar(NarHash),
-    Representation(NarFileName, EncodedSize),
+    Nar(NarIdentity),
+    Representation(NarIdentity, EncodedIdentity),
 }
 
 pub(super) enum Join {
@@ -176,11 +176,10 @@ impl Flight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::object::NarHash;
 
     fn key(index: u64) -> Key {
-        let mut bytes = [0; 32];
-        bytes[..8].copy_from_slice(&index.to_le_bytes());
-        Key::Representation(NarFileName::raw(NarHash::from_digest(bytes)), 0.into())
+        Key::Store(StoreHash::parse(&format!("{index:032}")).unwrap())
     }
 
     #[test]
@@ -267,7 +266,7 @@ mod tests {
     #[test]
     fn a_representation_failure_never_negative_caches_the_logical_nar() {
         let mut state = State::new(1);
-        let key = Key::Nar(NarHash::from_digest([42; 32]));
+        let key = Key::Nar(NarIdentity::new(NarHash::from_digest([42; 32]), 1.into()));
         state.remember(
             key,
             EdgeFailure::Invalid,

@@ -86,10 +86,7 @@ impl ServeSource {
             egress_compression,
             native,
         )?;
-        match cache.egress_compression() {
-            WireEncoding::Raw => Ok(cache.storage_backend()),
-            WireEncoding::Compressed(_) => Err(SourcePreparationError::EdgeCompressedOutput),
-        }
+        Ok(cache.storage_backend())
     }
 
     pub(crate) fn prepare(
@@ -176,7 +173,7 @@ impl ServeSource {
             } => *egress_compression,
             #[cfg(unix)]
             Self::NativeStore(_) => WireEncoding::Raw,
-            Self::ReadThrough { .. } => WireEncoding::Raw,
+            Self::ReadThrough { settings, .. } => settings.egress_compression,
         }
     }
 }
@@ -192,8 +189,6 @@ pub(crate) enum SourcePreparationError {
     MissingEdgeUpstream,
     #[error("edge upstream options require --serve-source read-through")]
     EdgeOptionsForOtherSource,
-    #[error("read-through source requires uncompressed output (--egress-compression none)")]
-    EdgeCompressedOutput,
     #[error("read-through source requires at least two HTTP workers and connection admissions")]
     EdgeRequestCapacityTooSmall,
     #[error("native-store HTTP serving requires --native-store-dir /nix/store")]
@@ -221,7 +216,6 @@ impl SourcePreparationError {
             Self::NativeUnavailable => "native Nix store serving is unavailable on Windows",
             Self::MissingEdgeUpstream => "required edge upstream is missing",
             Self::EdgeOptionsForOtherSource => "edge options require read-through selection",
-            Self::EdgeCompressedOutput => "read-through source requires raw output",
             Self::EdgeRequestCapacityTooSmall => {
                 "read-through source requires two workers and connection admissions"
             }
@@ -411,6 +405,7 @@ impl ServeArgs {
             storage_backend,
             settings: EdgeSettings {
                 upstream: upstream.clone(),
+                egress_compression: self.egress_compression,
                 lease_seconds: self.edge_lease_seconds,
                 max_fills: self.edge_max_fills,
                 request_workers: self.workers,
@@ -641,22 +636,23 @@ mod tests {
     }
 
     #[test]
-    fn edge_source_rejects_compressed_output_and_options_for_other_sources() {
+    fn edge_source_accepts_compressed_output_and_rejects_options_for_other_sources() {
         assert_eq!(
             parse_serve_config(&["--edge-upstream", "https://cache.example"]).unwrap_err(),
             SourcePreparationError::EdgeOptionsForOtherSource.to_string()
         );
+        let config = parse_serve_config(&[
+            "--serve-source",
+            "read-through",
+            "--edge-upstream",
+            "https://cache.example",
+            "--egress-compression",
+            "zstd",
+        ])
+        .expect("read-through may opt into a compressed served representation");
         assert_eq!(
-            parse_serve_config(&[
-                "--serve-source",
-                "read-through",
-                "--edge-upstream",
-                "https://cache.example",
-                "--egress-compression",
-                "zstd"
-            ])
-            .unwrap_err(),
-            SourcePreparationError::EdgeCompressedOutput.to_string()
+            config.egress_compression(),
+            WireEncoding::Compressed(crate::cache::object::CompressionCodec::Zstd)
         );
         assert_eq!(
             parse_serve_config(&[

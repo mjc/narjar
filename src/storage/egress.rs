@@ -18,7 +18,7 @@ use crate::cache::object::{
 use crate::cache::records::{BoundedRegularFile, read_bounded_regular_file};
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
-use super::collection::ActivityLease;
+use super::collection::{ActivityLease, ProtectedObject};
 use super::compression::{
     CapacityCheckedStagingWriter, encoded_file_matches, nar_file_size_matches,
 };
@@ -136,6 +136,20 @@ impl EgressSlot {
     }
 }
 
+fn retained_upstream_identity(
+    upstream: NarRepresentation,
+    egress_codec: CompressionCodec,
+) -> Option<EncodedIdentity> {
+    match upstream {
+        NarRepresentation::Compressed(compressed)
+            if compressed.encoded().codec() == egress_codec =>
+        {
+            Some(compressed.encoded())
+        }
+        NarRepresentation::Raw(_) | NarRepresentation::Compressed(_) => None,
+    }
+}
+
 enum ExistingDerivative {
     Missing,
     Corrupt,
@@ -145,6 +159,25 @@ enum ExistingDerivative {
 enum DerivativeWork {
     Reuse(Validated<EncodedIdentity>),
     Generate(GenerationContract),
+}
+
+impl DerivativeWork {
+    fn reuse_verified_retained_candidate(
+        self,
+        storage: &Storage,
+        slot: EgressSlot,
+        candidate: Option<EncodedIdentity>,
+    ) -> Result<Self, StorageError> {
+        match candidate {
+            Some(candidate) => match storage.inspect_retained_candidate(slot, candidate)? {
+                ExistingDerivative::Usable(output) => Ok(Self::Reuse(output)),
+                ExistingDerivative::Missing | ExistingDerivative::Corrupt => {
+                    Ok(Self::Generate(GenerationContract::ExactOutput(candidate)))
+                }
+            },
+            None => Ok(self),
+        }
+    }
 }
 
 enum GenerationContract {
@@ -346,6 +379,60 @@ impl Storage {
         })
     }
 
+    pub(crate) fn verify_read_through_payloads(
+        &self,
+        output: NarRepresentation,
+    ) -> Result<(), StorageError> {
+        let identity = output.identity();
+        match &self.payloads {
+            PayloadStorage::Flat => self.verify_flat_payload_identity(
+                NarFileName::raw(identity.hash()),
+                identity,
+                identity.size().get(),
+            )?,
+            PayloadStorage::Chunked(store) => {
+                self.verify_chunked_payload_identity(store, identity)?
+            }
+        }
+        if let NarRepresentation::Compressed(compressed) = output {
+            self.verify_flat_payload_identity(
+                compressed.encoded().file_name(),
+                compressed.decoded(),
+                compressed.encoded().size().get(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn verify_chunked_payload_identity(
+        &self,
+        store: &ChunkStore,
+        expected: NarIdentity,
+    ) -> Result<(), StorageError> {
+        let _activity = self
+            .collection
+            .reader(ProtectedObject::CanonicalNar(expected.hash()))?
+            .ok_or(StorageError::CollectionBusy)?;
+        store
+            .verify_nar_content(expected)
+            .map_err(read_through_chunk_error)
+    }
+
+    fn verify_flat_payload_identity(
+        &self,
+        name: NarFileName,
+        expected_nar: NarIdentity,
+        expected_file_size: u64,
+    ) -> Result<(), StorageError> {
+        let file = self.open_nar(name)?.ok_or(StorageError::MissingNar)?;
+        if file.metadata()?.len() != expected_file_size
+            || self.validated_delivery_identity(name, &file)? != expected_nar
+        {
+            return Err(StorageError::NarMismatch);
+        }
+        Ok(())
+    }
+
     pub(super) fn select_egress(
         &self,
         raw: &VerifiedCanonicalNar<'_>,
@@ -360,11 +447,62 @@ impl Storage {
         }
     }
 
+    pub(crate) fn retained_egress_candidate_is_usable(
+        &self,
+        raw: NarIdentity,
+        candidate: EncodedIdentity,
+    ) -> Result<bool, StorageError> {
+        let slot = EgressSlot::new(raw, candidate.codec());
+        let lock = self.destination_lock(slot.lock_key());
+        let waiting_since = Instant::now();
+        let _guard = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.activity
+                    .record_egress_coalesced_wait(waiting_since.elapsed());
+                guard
+            }
+        };
+        match self.inspect_retained_candidate(slot, candidate)? {
+            ExistingDerivative::Usable(_) => Ok(true),
+            ExistingDerivative::Missing | ExistingDerivative::Corrupt => Ok(false),
+        }
+    }
+
+    pub(super) fn select_read_through_egress(
+        &self,
+        raw: &VerifiedCanonicalNar<'_>,
+        upstream: NarRepresentation,
+        encoding: WireEncoding,
+        policy: NarUploadPolicy,
+    ) -> Result<NarRepresentation, StorageError> {
+        match encoding {
+            WireEncoding::Raw => Ok(NarRepresentation::Raw(raw.identity())),
+            WireEncoding::Compressed(codec) => {
+                let slot = EgressSlot::new(raw.identity(), codec);
+                let retained = retained_upstream_identity(upstream, codec);
+                self.select_compressed_with_retained_candidate(raw, slot, policy, retained)
+            }
+        }
+    }
+
     fn select_compressed(
         &self,
         raw: &VerifiedCanonicalNar<'_>,
         slot: EgressSlot,
         policy: NarUploadPolicy,
+    ) -> Result<NarRepresentation, StorageError> {
+        self.select_compressed_with_retained_candidate(raw, slot, policy, None)
+    }
+
+    fn select_compressed_with_retained_candidate(
+        &self,
+        raw: &VerifiedCanonicalNar<'_>,
+        slot: EgressSlot,
+        policy: NarUploadPolicy,
+        retained_candidate: Option<EncodedIdentity>,
     ) -> Result<NarRepresentation, StorageError> {
         let lock = self.destination_lock(slot.lock_key());
         let waiting_since = Instant::now();
@@ -378,7 +516,9 @@ impl Storage {
                 guard
             }
         };
-        let decision = self.resolve_derivative_work(slot)?;
+        let decision = self
+            .resolve_derivative_work(slot)?
+            .reuse_verified_retained_candidate(self, slot, retained_candidate)?;
         let output = match decision {
             DerivativeWork::Reuse(output) => {
                 self.activity.record_egress_reuse();
@@ -403,7 +543,7 @@ impl Storage {
     }
 
     fn work_for_receipt(&self, receipt: EgressReceipt) -> Result<DerivativeWork, StorageError> {
-        match self.inspect_egress_derivative(receipt.output())? {
+        match self.inspect_egress_derivative_for_slot(receipt.slot(), receipt.output())? {
             ExistingDerivative::Usable(output) => Ok(DerivativeWork::Reuse(output)),
             ExistingDerivative::Missing | ExistingDerivative::Corrupt => Ok(
                 DerivativeWork::Generate(GenerationContract::ExactOutput(receipt.output())),
@@ -437,13 +577,70 @@ impl Storage {
         }
     }
 
-    fn inspect_egress_derivative(
+    fn inspect_egress_derivative_for_slot(
         &self,
+        slot: EgressSlot,
         output: EncodedIdentity,
     ) -> Result<ExistingDerivative, StorageError> {
-        self.inspect_derivative_with_directory_sync(output, File::sync_all)
+        let nar = self.nar_directory()?;
+        open_optional_at(&nar, output.file_name().to_string().as_ref())?.map_or(
+            Ok(ExistingDerivative::Missing),
+            |file| {
+                let cached_identity = self.delivery_validation.get(output.file_name(), &file)?;
+                let identity_matches = match cached_identity {
+                    Some(identity) => identity == slot.raw(),
+                    None => encoded_file_matches(&file, output)?,
+                };
+                if identity_matches {
+                    File::sync_all(&nar)?;
+                    if cached_identity.is_none() {
+                        self.delivery_validation
+                            .insert(output.file_name(), &file, slot.raw())?;
+                    }
+                    Ok(ExistingDerivative::Usable(Validated::new(output)))
+                } else {
+                    Ok(ExistingDerivative::Corrupt)
+                }
+            },
+        )
     }
 
+    fn inspect_retained_candidate(
+        &self,
+        slot: EgressSlot,
+        candidate: EncodedIdentity,
+    ) -> Result<ExistingDerivative, StorageError> {
+        let nar = self.nar_directory()?;
+        open_optional_at(&nar, candidate.file_name().to_string().as_ref())?.map_or(
+            Ok(ExistingDerivative::Missing),
+            |file| match self.delivery_validation.get(candidate.file_name(), &file)? {
+                Some(identity) => match identity == slot.raw() {
+                    true => {
+                        File::sync_all(&nar)?;
+                        Ok(ExistingDerivative::Usable(Validated::new(candidate)))
+                    }
+                    false => Ok(ExistingDerivative::Corrupt),
+                },
+                None => {
+                    let expected = CompressedNarIdentity::new(candidate, slot.raw());
+                    match super::compression::validate_compressed_nar(&file, expected)? {
+                        Some(identity) if identity == slot.raw() => {
+                            File::sync_all(&nar)?;
+                            self.delivery_validation.insert(
+                                candidate.file_name(),
+                                &file,
+                                identity,
+                            )?;
+                            Ok(ExistingDerivative::Usable(Validated::new(candidate)))
+                        }
+                        Some(_) | None => Ok(ExistingDerivative::Corrupt),
+                    }
+                }
+            },
+        )
+    }
+
+    #[cfg(test)]
     fn inspect_derivative_with_directory_sync(
         &self,
         output: EncodedIdentity,
@@ -474,6 +671,32 @@ impl Storage {
             PublishTarget::EgressReceipt(&receipt),
             Cursor::new(receipt.bytes()),
         )
+    }
+
+    pub(super) fn publish_retained_egress_receipt(
+        &self,
+        raw: NarIdentity,
+        output: EncodedIdentity,
+    ) -> Result<(), StorageError> {
+        let slot = EgressSlot::new(raw, output.codec());
+        if output.size().get() == 0 {
+            return Err(StorageError::NarMismatch);
+        }
+        let lock = self.destination_lock(slot.lock_key());
+        let _guard = lock
+            .lock()
+            .map_err(|_| io::Error::other("egress publication lock poisoned"))?;
+        if self.read_egress_receipt(slot)?.is_some() {
+            return Ok(());
+        }
+        let file = self.open_durable_nar(output.file_name())?;
+        if file.metadata()?.len() != output.size().get() {
+            return Err(StorageError::NarMismatch);
+        }
+        self.delivery_validation
+            .insert(output.file_name(), &file, raw)?;
+        self.publish_egress_receipt(EgressReceipt::for_slot(slot, output.hash(), output.size()))?;
+        Ok(())
     }
 
     fn read_egress_receipt(&self, slot: EgressSlot) -> Result<Option<EgressReceipt>, StorageError> {
@@ -614,8 +837,36 @@ impl Storage {
     }
 
     #[cfg(test)]
-    pub(super) fn egress_generations(&self) -> u64 {
+    pub(crate) fn egress_generations(&self) -> u64 {
         self.egress_generations.load(Ordering::Relaxed)
+    }
+}
+
+fn read_through_chunk_error(error: super::chunk_store::ChunkStoreError) -> StorageError {
+    use super::chunk_store::ChunkStoreError;
+
+    match error {
+        ChunkStoreError::MissingNar => StorageError::MissingNar,
+        ChunkStoreError::NarHashMismatch { .. } | ChunkStoreError::NarSizeMismatch { .. } => {
+            StorageError::NarMismatch
+        }
+        ChunkStoreError::Manifest(super::chunked::ManifestError::Io(error))
+            if error.kind() == io::ErrorKind::InvalidData
+                || error.kind() == io::ErrorKind::NotFound =>
+        {
+            StorageError::NarMismatch
+        }
+        ChunkStoreError::Manifest(super::chunked::ManifestError::Io(error)) => {
+            StorageError::Io(error)
+        }
+        ChunkStoreError::Manifest(_) => StorageError::NarMismatch,
+        ChunkStoreError::Io(error)
+            if error.kind() == io::ErrorKind::InvalidData
+                || error.kind() == io::ErrorKind::NotFound =>
+        {
+            StorageError::NarMismatch
+        }
+        error => super::operations::storage_error_for_chunk_store(error),
     }
 }
 

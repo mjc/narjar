@@ -16,20 +16,6 @@ pub use trust::TrustedPublicKeys;
 
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
-/// Require uncompressed narinfo without rereading or hashing the stored NAR.
-pub(crate) fn require_raw_narinfo_transport(bytes: &[u8]) -> Result<(), NarInfoError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| NarInfoError)?;
-    let document = NarInfoDocument::parse(text)?;
-    match document
-        .required(NarInfoField::Compression)?
-        .parse::<WireEncoding>()
-        .map_err(|_| NarInfoError)?
-    {
-        WireEncoding::Raw => Ok(()),
-        WireEncoding::Compressed(_) => Err(NarInfoError),
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NixStorePath {
     value: String,
@@ -190,17 +176,29 @@ impl NarInfoClaims {
     /// Parse and validate the logical claims and transport fields in an
     /// external narinfo before using its existence as a cache result.
     pub fn parse_external_narinfo(route: &StoreHash, bytes: Vec<u8>) -> Result<Self, NarInfoError> {
+        Self::parse_external_publication(route, bytes).map(|(claims, _)| claims)
+    }
+
+    pub(crate) fn parse_external_publication(
+        route: &StoreHash,
+        bytes: Vec<u8>,
+    ) -> Result<(Self, NarRepresentation), NarInfoError> {
         let text = parse_narinfo_text(bytes)?;
         let document = NarInfoDocument::parse_external(&text)?;
         document.validate_external_transport()?;
         let claims = Self::from_external_document(route, &document)?;
-        document.publication_payload(claims.identity())?;
-        Ok(claims)
+        let payload = document.publication_payload(claims.identity())?;
+        Ok((claims, payload))
     }
 
-    pub fn matches_external_narinfo(&self, bytes: Vec<u8>) -> bool {
-        Self::parse_external_narinfo(self.store(), bytes)
-            .is_ok_and(|claims| self.compare_logical_claims(&claims).is_ok())
+    pub(crate) fn matches_external_publication(
+        &self,
+        bytes: Vec<u8>,
+        output: NarRepresentation,
+    ) -> bool {
+        Self::parse_external_publication(self.store(), bytes).is_ok_and(|(claims, payload)| {
+            self.compare_logical_claims(&claims).is_ok() && payload == output
+        })
     }
 
     /// Compare every signed logical field, independently of transport and signatures.
@@ -839,6 +837,10 @@ impl BoundNarInfo<'_> {
 
     pub(crate) fn claims(&self) -> &NarInfoClaims {
         self.narinfo.metadata.claims()
+    }
+
+    pub(crate) const fn output(&self) -> NarRepresentation {
+        self.output
     }
 }
 

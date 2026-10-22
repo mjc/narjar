@@ -850,7 +850,7 @@ impl Doctor {
             )
             .map(|storage_backend| ServeSource::FlatCache {
                 storage_backend,
-                egress_compression: WireEncoding::Raw,
+                egress_compression: self.egress_compression,
             }),
             choice @ (ServeSourceChoice::FlatCache | ServeSourceChoice::NativeStore) => {
                 ServeSource::prepare(
@@ -987,7 +987,6 @@ pub(crate) fn doctor(options: Doctor) -> Result<(), Error> {
             SourcePreparationError::NativeOptionsForCache
             | SourcePreparationError::MissingEdgeUpstream
             | SourcePreparationError::EdgeOptionsForOtherSource
-            | SourcePreparationError::EdgeCompressedOutput
             | SourcePreparationError::EdgeRequestCapacityTooSmall
             | SourcePreparationError::NativeStoreDirectory
             | SourcePreparationError::MissingNativeOptions

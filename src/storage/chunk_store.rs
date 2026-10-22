@@ -1,15 +1,18 @@
 use std::{
+    collections::{HashMap, VecDeque},
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     ops::Range,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::SystemTime,
 };
+
+use crate::cache::filesystem::FileStamp;
 
 use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
 
@@ -28,7 +31,7 @@ use super::{
     fs::{
         DirectoryEntryAction, DirectoryScanOutcome, ImmutableLinkOutcome, ensure_directory_at,
         for_each_dir_name, link_or_compare_immutable, open_at, open_directory_at, open_regular_at,
-        read_dir_names, require_directory_at, unlink_at,
+        read_dir_names, rename_at, require_directory_at, unlink_at,
     },
     publication::StagingReservation,
     state::StorageActivity,
@@ -43,6 +46,9 @@ const GC_MANIFEST_MARK_DIRECTORY: &str = "manifests";
 const CHUNK_PUBLICATION_BATCH_SIZE: usize = 16;
 const CHUNK_PUBLICATION_WORKER_BATCH_SIZE: usize = 16;
 pub(crate) const MAX_CHUNK_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
+const VERIFIED_CHUNK_CACHE_CAPACITY: usize = 4096;
+const VERIFIED_NAR_CACHE_CAPACITY: usize = 256;
+const CHUNK_REPAIR_LOCK_COUNT: usize = 64;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -53,6 +59,67 @@ pub(crate) struct ChunkStore {
     activity: Arc<StorageActivity>,
     durability: ChunkDurability,
     gc_marks: Mutex<()>,
+    chunk_repair_locks: [Mutex<()>; CHUNK_REPAIR_LOCK_COUNT],
+    chunk_repair_activity: [ChunkRepairActivity; CHUNK_REPAIR_LOCK_COUNT],
+    verified_chunks: Mutex<VerifiedChunkProofs>,
+    verified_nars: Mutex<VerifiedNarProofs>,
+    #[cfg(test)]
+    nar_content_hashes: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct ChunkRepairActivity {
+    generation: AtomicU64,
+    active_operations: AtomicUsize,
+    pending_markers: AtomicUsize,
+}
+
+struct ChunkRepairOperation<'store>(&'store ChunkRepairActivity);
+
+impl ChunkRepairActivity {
+    fn begin_operation(&self) -> ChunkRepairOperation<'_> {
+        self.active_operations.fetch_add(1, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        ChunkRepairOperation(self)
+    }
+
+    fn can_open_without_repair_lock(&self) -> Option<u64> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        (self.active_operations.load(Ordering::SeqCst) == 0
+            && self.pending_markers.load(Ordering::SeqCst) == 0)
+            .then_some(generation)
+    }
+
+    fn remained_quiescent(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
+            && self.active_operations.load(Ordering::SeqCst) == 0
+            && self.pending_markers.load(Ordering::SeqCst) == 0
+    }
+}
+
+impl Drop for ChunkRepairOperation<'_> {
+    fn drop(&mut self) {
+        self.0.active_operations.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, Default)]
+struct VerifiedChunkProofs {
+    by_hash: HashMap<ChunkHash, FileStamp>,
+    insertion_order: VecDeque<ChunkHash>,
+}
+
+#[derive(Debug, Default)]
+struct VerifiedNarProofs {
+    by_hash: HashMap<NarHash, VerifiedNarProof>,
+    insertion_order: VecDeque<NarHash>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedNarProof {
+    identity: NarIdentity,
+    manifest_stamp: FileStamp,
+    chunk_stamps: [u8; 32],
 }
 
 struct GcMarks<'store> {
@@ -157,12 +224,19 @@ impl ChunkStore {
         else {
             unreachable!("chunked selection must contain a chunk capability")
         };
+        let pending_repairs = pending_chunk_repair_counts(&chunks)?;
         Ok(Self {
             chunks,
             manifests,
             activity,
             durability,
             gc_marks: Mutex::new(()),
+            chunk_repair_locks: std::array::from_fn(|_| Mutex::new(())),
+            chunk_repair_activity: repair_activity_by_stripe(pending_repairs),
+            verified_chunks: Mutex::new(VerifiedChunkProofs::default()),
+            verified_nars: Mutex::new(VerifiedNarProofs::default()),
+            #[cfg(test)]
+            nar_content_hashes: AtomicU64::new(0),
         })
     }
 
@@ -171,12 +245,20 @@ impl ChunkStore {
         durability: ChunkDurability,
         activity: Arc<StorageActivity>,
     ) -> io::Result<Self> {
+        let chunks = require_directory_at(root, CHUNK_DIRECTORY)?;
+        let pending_repairs = pending_chunk_repair_counts(&chunks)?;
         Ok(Self {
-            chunks: require_directory_at(root, CHUNK_DIRECTORY)?,
+            chunks,
             manifests: require_directory_at(root, MANIFEST_DIRECTORY)?,
             activity,
             durability,
             gc_marks: Mutex::new(()),
+            chunk_repair_locks: std::array::from_fn(|_| Mutex::new(())),
+            chunk_repair_activity: repair_activity_by_stripe(pending_repairs),
+            verified_chunks: Mutex::new(VerifiedChunkProofs::default()),
+            verified_nars: Mutex::new(VerifiedNarProofs::default()),
+            #[cfg(test)]
+            nar_content_hashes: AtomicU64::new(0),
         })
     }
 
@@ -250,11 +332,41 @@ impl ChunkStore {
     }
 
     pub(crate) fn open_chunk(&self, hash: ChunkHash) -> io::Result<Option<File>> {
+        let _repair_lock = self.chunk_repair_lock(hash);
+        self.open_chunk_while_repair_locked(hash)
+    }
+
+    fn open_serving_chunk(&self, hash: ChunkHash) -> io::Result<Option<File>> {
+        let activity = self.chunk_repair_activity(hash);
+        if let Some(generation) = activity.can_open_without_repair_lock() {
+            let opened = self.open_chunk_without_repair_lock(hash);
+            if activity.remained_quiescent(generation) {
+                return opened;
+            }
+        }
+        self.open_chunk(hash)
+    }
+
+    fn open_chunk_without_repair_lock(&self, hash: ChunkHash) -> io::Result<Option<File>> {
         let shard = match self.open_shard(hash) {
             Ok(shard) => shard,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
+        match open_regular_at(&shard, chunk_name(hash)) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_chunk_while_repair_locked(&self, hash: ChunkHash) -> io::Result<Option<File>> {
+        let shard = match self.open_shard(hash) {
+            Ok(shard) => shard,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.finish_pending_chunk_repair(&shard, hash, &mut |directory| directory.sync_all())?;
         match open_regular_at(&shard, chunk_name(hash)) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -329,13 +441,117 @@ impl ChunkStore {
         Ok(())
     }
 
+    pub(crate) fn verify_nar_content(&self, identity: NarIdentity) -> Result<(), ChunkStoreError> {
+        let manifest_file = self
+            .open_manifest(identity.hash())?
+            .ok_or(ChunkStoreError::MissingNar)?;
+        let manifest_stamp = FileStamp::from_file(&manifest_file)?;
+        let manifest_for_stamp = manifest_file.try_clone()?;
+        let mut reader = ManifestReader::new(manifest_file, MAX_CHUNK_MANIFEST_BYTES)?;
+        let manifest = reader.manifest();
+        validate_manifest_identity(manifest.identity(), identity)?;
+        let mut chunk_stamps = Sha256::new();
+        chunk_stamps.update(identity.hash().as_bytes());
+        chunk_stamps.update(identity.size().get().to_le_bytes());
+        manifest_stamp.update_identity_digest(&mut chunk_stamps);
+        (0..manifest.chunk_count()).try_fold(0_u64, |start, _| {
+            let descriptor = reader.next_record()?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest ended before its chunk count",
+                )
+            })?;
+            let file = self
+                .open_chunk(descriptor.hash())?
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            let expected = descriptor.end() - start;
+            let actual = file.metadata()?.len();
+            if actual != expected {
+                return Err(ChunkStoreError::NarSizeMismatch { expected, actual });
+            }
+            FileStamp::from_file(&file)?.update_identity_digest(&mut chunk_stamps);
+            Ok(descriptor.end())
+        })?;
+        reader.finish_remaining()?;
+        if FileStamp::from_file(&manifest_for_stamp)? != manifest_stamp {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk manifest changed during validation",
+            )
+            .into());
+        }
+        let proof = VerifiedNarProof {
+            identity,
+            manifest_stamp,
+            chunk_stamps: chunk_stamps.finalize().into(),
+        };
+        if self.nar_content_is_verified(proof) {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        self.nar_content_hashes.fetch_add(1, Ordering::Relaxed);
+        let mut reader = self.open_verified_reader(
+            identity.hash(),
+            0..identity.size().get(),
+            MAX_CHUNK_MANIFEST_BYTES,
+        )?;
+        let mut actual = NarIdentityHasher::default();
+        io::copy(&mut reader, &mut actual)?;
+        let actual = actual.finish();
+        if actual.size() != identity.size() {
+            return Err(ChunkStoreError::NarSizeMismatch {
+                expected: identity.size().get(),
+                actual: actual.size().get(),
+            });
+        }
+        if actual.hash() != identity.hash() {
+            return Err(ChunkStoreError::NarHashMismatch {
+                expected: identity.hash(),
+                actual: actual.hash(),
+            });
+        }
+        self.cache_verified_nar(proof);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn nar_content_hashes(&self) -> u64 {
+        self.nar_content_hashes.load(Ordering::Relaxed)
+    }
+
+    fn nar_content_is_verified(&self, proof: VerifiedNarProof) -> bool {
+        self.verified_nars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .by_hash
+            .get(&proof.identity.hash())
+            == Some(&proof)
+    }
+
+    fn cache_verified_nar(&self, proof: VerifiedNarProof) {
+        let mut proofs = self
+            .verified_nars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let hash = proof.identity.hash();
+        if proofs.by_hash.insert(hash, proof).is_none() {
+            proofs.insertion_order.push_back(hash);
+        }
+        while proofs.by_hash.len() > VERIFIED_NAR_CACHE_CAPACITY {
+            if let Some(expired) = proofs.insertion_order.pop_front() {
+                proofs.by_hash.remove(&expired);
+            }
+        }
+    }
+
     fn open_manifest_reader(
         &self,
         identity: NarIdentity,
     ) -> Result<ManifestReader<File>, ChunkStoreError> {
         let file = self
             .open_manifest(identity.hash())?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            .ok_or(ChunkStoreError::MissingNar)?;
         ManifestReader::new(file, MAX_CHUNK_MANIFEST_BYTES).map_err(Into::into)
     }
 
@@ -361,6 +577,50 @@ impl ChunkStore {
             }
             Ok(descriptor.end())
         })?;
+        Ok(())
+    }
+
+    fn chunk_stamp_is_verified(&self, hash: ChunkHash, stamp: FileStamp) -> bool {
+        let proofs = self
+            .verified_chunks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        proofs.by_hash.get(&hash) == Some(&stamp)
+    }
+
+    fn cache_verified_chunk(
+        &self,
+        hash: ChunkHash,
+        file: &File,
+        stamp: FileStamp,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        let actual_hash = ChunkHash::from_digest(Sha256::digest(bytes).into());
+        if actual_hash != hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk hash does not match its manifest record",
+            ));
+        }
+
+        if FileStamp::from_file(file)? != stamp {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk changed while its content was being verified",
+            ));
+        }
+        let mut proofs = self
+            .verified_chunks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if proofs.by_hash.insert(hash, stamp).is_none() {
+            proofs.insertion_order.push_back(hash);
+        }
+        while proofs.by_hash.len() > VERIFIED_CHUNK_CACHE_CAPACITY {
+            if let Some(expired) = proofs.insertion_order.pop_front() {
+                proofs.by_hash.remove(&expired);
+            }
+        }
         Ok(())
     }
 
@@ -609,6 +869,12 @@ impl ChunkStore {
                         if marked {
                             return Ok(deleted_from_shard);
                         }
+                        let hash = parse_chunk_hash_name(&name)
+                            .expect("valid chunk names contain a SHA-256 digest");
+                        let _repair_lock = self.chunk_repair_lock(hash);
+                        self.finish_pending_chunk_repair(&shard, hash, &mut |directory| {
+                            directory.sync_all()
+                        })?;
                         unlink_at(&shard, &name)?;
                         Ok(deleted_from_shard + 1)
                     },
@@ -648,14 +914,126 @@ impl ChunkStore {
     }
 
     fn store_chunk(&self, hash: ChunkHash, bytes: &[u8]) -> io::Result<ChunkPublication> {
+        self.store_chunk_with_sync(hash, bytes, |directory| directory.sync_all())
+    }
+
+    fn store_chunk_with_sync(
+        &self,
+        hash: ChunkHash,
+        bytes: &[u8],
+        mut synchronize_shard: impl FnMut(&File) -> io::Result<()>,
+    ) -> io::Result<ChunkPublication> {
+        let _repair_activity = self.chunk_repair_activity(hash).begin_operation();
+        let _repair_lock = self.chunk_repair_lock(hash);
         let shard = self.open_or_create_shard(hash)?;
-        let outcome = publish_immutable_bytes_without_directory_sync(
-            &shard,
-            &chunk_name(hash),
-            CHUNK_TEMP_PREFIX,
-            bytes,
-        )?;
-        Ok(ChunkPublication { outcome })
+        self.finish_pending_chunk_repair(&shard, hash, &mut synchronize_shard)?;
+        let temporary = temporary_name(CHUNK_TEMP_PREFIX);
+        let result = write_temporary_file(&shard, &temporary, bytes).and_then(|()| {
+            match link_or_compare_immutable(&shard, &temporary, &shard, &chunk_name(hash))? {
+                ImmutableLinkOutcome::Created => Ok(super::publication::PublishOutcome::Created),
+                ImmutableLinkOutcome::Identical => {
+                    Ok(super::publication::PublishOutcome::Identical)
+                }
+                ImmutableLinkOutcome::Collision => self.replace_corrupt_chunk(
+                    &shard,
+                    &temporary,
+                    hash,
+                    bytes.len() as u64,
+                    &mut synchronize_shard,
+                ),
+            }
+        });
+        let cleanup = remove_temporary_file(&shard, &temporary);
+        match (result, cleanup) {
+            (Ok(outcome), Ok(())) => Ok(ChunkPublication { outcome }),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn replace_corrupt_chunk(
+        &self,
+        shard: &File,
+        temporary: &OsStr,
+        hash: ChunkHash,
+        expected_size: u64,
+        synchronize_shard: &mut impl FnMut(&File) -> io::Result<()>,
+    ) -> io::Result<super::publication::PublishOutcome> {
+        let destination = chunk_name(hash);
+        match self.open_chunk_while_repair_locked(hash)? {
+            Some(mut file) => match chunk_file_matches_identity(&mut file, hash, expected_size)? {
+                true => {
+                    let temporary_file = open_regular_at(shard, temporary)?;
+                    if files_have_identical_contents(&mut file, temporary_file)? {
+                        Ok(super::publication::PublishOutcome::Identical)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "content-addressed chunk collision",
+                        ))
+                    }
+                }
+                false => {
+                    open_regular_at(shard, temporary)?.sync_all()?;
+                    let marker = create_chunk_repair_marker(&self.chunks, hash)?;
+                    self.chunk_repair_activity(hash)
+                        .pending_markers
+                        .fetch_add(1, Ordering::SeqCst);
+                    marker.sync_all()?;
+                    self.chunks.sync_all()?;
+                    rename_at(shard, temporary, shard, &destination)?;
+                    synchronize_shard(shard)?;
+                    unlink_at(&self.chunks, &chunk_repair_marker_name(hash))?;
+                    self.chunk_repair_activity(hash)
+                        .pending_markers
+                        .fetch_sub(1, Ordering::SeqCst);
+                    self.chunks.sync_all()?;
+                    Ok(super::publication::PublishOutcome::Created)
+                }
+            },
+            None => match link_or_compare_immutable(shard, temporary, shard, &destination)? {
+                ImmutableLinkOutcome::Created => Ok(super::publication::PublishOutcome::Created),
+                ImmutableLinkOutcome::Identical => {
+                    Ok(super::publication::PublishOutcome::Identical)
+                }
+                ImmutableLinkOutcome::Collision => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk destination changed during repair",
+                )),
+            },
+        }
+    }
+
+    fn finish_pending_chunk_repair(
+        &self,
+        shard: &File,
+        hash: ChunkHash,
+        synchronize_shard: &mut impl FnMut(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let marker = chunk_repair_marker_name(hash);
+        match open_regular_at(&self.chunks, &marker) {
+            Ok(_pending) => {
+                synchronize_shard(shard)?;
+                unlink_at(&self.chunks, &marker)?;
+                self.chunk_repair_activity(hash)
+                    .pending_markers
+                    .fetch_sub(1, Ordering::SeqCst);
+                self.chunks.sync_all()
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn chunk_repair_lock(&self, hash: ChunkHash) -> MutexGuard<'_, ()> {
+        let lock = chunk_repair_stripe(hash);
+        self.chunk_repair_locks[lock]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn chunk_repair_activity(&self, hash: ChunkHash) -> &ChunkRepairActivity {
+        &self.chunk_repair_activity[chunk_repair_stripe(hash)]
     }
 
     fn open_or_create_shard(&self, hash: ChunkHash) -> io::Result<File> {
@@ -986,7 +1364,7 @@ fn open_serving_chunk(
         .checked_sub(chunk_start)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end moved backwards"))?;
     let mut file = store
-        .open_chunk(descriptor.hash())?
+        .open_serving_chunk(descriptor.hash())?
         .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
     if file.metadata()?.len() != chunk_length {
         return Err(io::Error::new(
@@ -1020,18 +1398,92 @@ fn read_verified_chunk(
             "chunk length does not match its manifest record",
         ));
     }
+    let stamp = FileStamp::from_file(&file)?;
+    let cached = store.chunk_stamp_is_verified(descriptor.hash(), stamp);
+    let chunk = read_chunk_bytes(&mut file, chunk_length)?;
+    if FileStamp::from_file(&file)? != stamp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk changed while it was being read",
+        ));
+    }
+    if !cached {
+        store.cache_verified_chunk(descriptor.hash(), &file, stamp, &chunk)?;
+    }
+    Ok(chunk)
+}
+
+fn read_chunk_bytes(file: &mut File, chunk_length: u64) -> io::Result<Vec<u8>> {
     let chunk_length = usize::try_from(chunk_length)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk is too large"))?;
     let mut chunk = vec![0; chunk_length];
     file.read_exact(&mut chunk)?;
-    let actual_hash = ChunkHash::from_digest(Sha256::digest(&chunk).into());
-    if actual_hash != descriptor.hash() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "chunk hash does not match its manifest record",
-        ));
-    }
     Ok(chunk)
+}
+
+fn chunk_file_matches_identity(
+    file: &mut File,
+    expected_hash: ChunkHash,
+    expected_size: u64,
+) -> io::Result<bool> {
+    if file.metadata()?.len() != expected_size {
+        return Ok(false);
+    }
+    let bytes = read_chunk_bytes(file, expected_size)?;
+    Ok(ChunkHash::from_digest(Sha256::digest(bytes).into()) == expected_hash)
+}
+
+fn files_have_identical_contents(left: &mut File, mut right: File) -> io::Result<bool> {
+    let length = left.metadata()?.len();
+    if right.metadata()?.len() != length {
+        return Ok(false);
+    }
+    left.seek(SeekFrom::Start(0))?;
+    right.seek(SeekFrom::Start(0))?;
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    let mut remaining = length;
+    while remaining > 0 {
+        let count = usize::try_from(remaining.min(left_buffer.len() as u64))
+            .expect("bounded chunk comparison fits usize");
+        left.read_exact(&mut left_buffer[..count])?;
+        right.read_exact(&mut right_buffer[..count])?;
+        if left_buffer[..count] != right_buffer[..count] {
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(true)
+}
+
+#[derive(Default)]
+struct NarIdentityHasher {
+    hash: Sha256,
+    size: u64,
+}
+
+impl NarIdentityHasher {
+    fn finish(self) -> NarIdentity {
+        NarIdentity::new(
+            NarHash::from_digest(self.hash.finalize().into()),
+            self.size.into(),
+        )
+    }
+}
+
+impl Write for NarIdentityHasher {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.size = self
+            .size
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NAR is too large"))?;
+        self.hash.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn io_for_manifest_error(error: ManifestError) -> io::Error {
@@ -1641,6 +2093,82 @@ fn temporary_name(prefix: &str) -> OsString {
     .into()
 }
 
+fn chunk_repair_marker_name(hash: ChunkHash) -> OsString {
+    format!(".repair-{}", hex_name(*hash.as_bytes())).into()
+}
+
+fn chunk_repair_stripe(hash: ChunkHash) -> usize {
+    usize::from(hash.as_bytes()[0]) % CHUNK_REPAIR_LOCK_COUNT
+}
+
+fn repair_activity_by_stripe(
+    pending_markers: [usize; CHUNK_REPAIR_LOCK_COUNT],
+) -> [ChunkRepairActivity; CHUNK_REPAIR_LOCK_COUNT] {
+    std::array::from_fn(|stripe| ChunkRepairActivity {
+        pending_markers: AtomicUsize::new(pending_markers[stripe]),
+        ..ChunkRepairActivity::default()
+    })
+}
+
+fn pending_chunk_repair_counts(directory: &File) -> io::Result<[usize; CHUNK_REPAIR_LOCK_COUNT]> {
+    read_dir_names(directory)?.into_iter().try_fold(
+        [0_usize; CHUNK_REPAIR_LOCK_COUNT],
+        |mut counts, name| {
+            if let Some(hash) = parse_chunk_repair_marker_name(&name) {
+                let stripe = chunk_repair_stripe(hash);
+                counts[stripe] = counts[stripe].checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "repair marker count overflow")
+                })?;
+            }
+            Ok(counts)
+        },
+    )
+}
+
+fn parse_chunk_repair_marker_name(name: &OsStr) -> Option<ChunkHash> {
+    let name = name.to_str()?;
+    let hex = name.strip_prefix(".repair-")?;
+    parse_chunk_hash(hex)
+}
+
+fn parse_chunk_hash_name(name: &OsStr) -> Option<ChunkHash> {
+    parse_chunk_hash(name.to_str()?)
+}
+
+fn parse_chunk_hash(hex: &str) -> Option<ChunkHash> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    for (byte, pair) in digest.iter_mut().zip(pairs) {
+        *byte = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
+    }
+    Some(ChunkHash::from_digest(digest))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn create_chunk_repair_marker(directory: &File, hash: ChunkHash) -> io::Result<File> {
+    open_at(
+        directory,
+        &chunk_repair_marker_name(hash),
+        FileAccess::Write,
+        FileCreation::CreateNew,
+        FilePrivacy::Private,
+    )
+}
+
 fn mark_gc_file(directory: &File, name: &OsStr) -> io::Result<()> {
     match open_at(
         directory,
@@ -1767,6 +2295,8 @@ fn hex_name(bytes: [u8; 32]) -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ChunkStoreError {
+    #[error("chunked NAR is missing")]
+    MissingNar,
     #[error("range {start}..{end} is outside NAR size {size}")]
     InvalidRange { start: u64, end: u64, size: u64 },
     #[error("{0}")]
@@ -1783,14 +2313,16 @@ pub(crate) enum ChunkStoreError {
 mod tests {
     use std::{
         ffi::OsStr,
-        fs,
-        io::{Cursor, Read, Write},
+        fs::{self, OpenOptions},
+        io::{Cursor, Read, Seek, Write},
+        sync::{Arc, Barrier, atomic::Ordering, mpsc},
+        time::Duration,
     };
 
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use super::{ChunkStore, ChunkStoreError, remove_abandoned_temps};
+    use super::{ChunkStore, ChunkStoreError, FileStamp, remove_abandoned_temps};
     use crate::cache::filesystem::{FileAccess, FileCreation, FilePrivacy};
     use crate::cache::{
         object::{NarHash, NarIdentity, NarSize},
@@ -2596,6 +3128,322 @@ mod tests {
             .unwrap();
         let mut output = Vec::new();
         assert!(reader.read_to_end(&mut output).is_err());
+    }
+
+    #[test]
+    fn reingesting_repairs_a_corrupt_content_addressed_chunk() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        store
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
+            .unwrap();
+
+        let shard = fs::read_dir(directory.path().join(super::super::CHUNK_DIRECTORY))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let chunk = fs::read_dir(shard).unwrap().next().unwrap().unwrap().path();
+        let mut corrupt = fs::read(&chunk).unwrap();
+        corrupt[0] ^= 1;
+        fs::write(chunk, corrupt).unwrap();
+
+        store
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
+            .unwrap();
+        store.verify_nar_content(identity).unwrap();
+    }
+
+    #[test]
+    fn concurrent_reingests_accept_the_same_corrupt_chunk_repair() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        store
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
+            .unwrap();
+        let hash = ChunkHash::from_digest(Sha256::digest(&input).into());
+        let chunk_path = directory
+            .path()
+            .join(super::super::CHUNK_DIRECTORY)
+            .join(super::shard_name(hash))
+            .join(super::chunk_name(hash));
+        let mut corrupted = fs::read(&chunk_path).unwrap();
+        corrupted[0] ^= 1;
+        fs::write(&chunk_path, corrupted).unwrap();
+
+        let start = Arc::new(Barrier::new(3));
+        let outcomes = std::thread::scope(|scope| {
+            let store = &store;
+            let input = &input;
+            let workers = (0..2)
+                .map(|_| {
+                    let start = Arc::clone(&start);
+                    scope.spawn(move || {
+                        start.wait();
+                        store.store_chunk(hash, input)
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap().unwrap().outcome)
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| matches!(
+            outcome,
+            super::super::publication::PublishOutcome::Created
+                | super::super::publication::PublishOutcome::Identical
+        )));
+        let mut verified = store
+            .open_verified_reader(identity.hash(), 0..identity.size().get(), 1_000_000)
+            .unwrap();
+        let mut repaired = Vec::new();
+        verified.read_to_end(&mut repaired).unwrap();
+        assert_eq!(repaired, input);
+    }
+
+    #[test]
+    fn serving_open_skips_repair_lock_when_no_repair_is_active() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = Arc::new(ChunkStore::initialize(root.file()).unwrap());
+        let bytes = b"verified chunk";
+        let hash = ChunkHash::from_digest(Sha256::digest(bytes).into());
+        store.store_chunk(hash, bytes).unwrap();
+
+        let repair_lock = store.chunk_repair_lock(hash);
+        let (sender, receiver) = mpsc::channel();
+        let open_thread = std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || sender.send(store.open_serving_chunk(hash)).unwrap()
+        });
+        let opened = receiver.recv_timeout(Duration::from_secs(2));
+        drop(repair_lock);
+        open_thread.join().unwrap();
+
+        assert!(opened.unwrap().unwrap().is_some());
+    }
+
+    #[test]
+    fn completed_repair_invalidates_an_open_started_before_it() {
+        let activity = super::ChunkRepairActivity::default();
+        let generation = activity.can_open_without_repair_lock().unwrap();
+
+        drop(activity.begin_operation());
+
+        assert!(!activity.remained_quiescent(generation));
+    }
+
+    #[test]
+    fn collecting_a_chunk_also_clears_its_orphaned_repair_marker() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let orphaned_bytes = b"orphaned chunk";
+        let orphaned_hash = ChunkHash::from_digest(Sha256::digest(orphaned_bytes).into());
+        store.store_chunk(orphaned_hash, orphaned_bytes).unwrap();
+        let orphaned_path = directory
+            .path()
+            .join(super::super::CHUNK_DIRECTORY)
+            .join(super::shard_name(orphaned_hash))
+            .join(super::chunk_name(orphaned_hash));
+        let mut corrupt_bytes = fs::read(&orphaned_path).unwrap();
+        corrupt_bytes[0] ^= 1;
+        fs::write(&orphaned_path, corrupt_bytes).unwrap();
+        assert!(
+            store
+                .store_chunk_with_sync(orphaned_hash, orphaned_bytes, |_| {
+                    Err(std::io::Error::from_raw_os_error(
+                        crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
+                    ))
+                })
+                .is_err()
+        );
+
+        let unrelated_bytes = (0..256)
+            .map(|candidate| format!("retained chunk {candidate}").into_bytes())
+            .find(|bytes| {
+                let hash = ChunkHash::from_digest(Sha256::digest(bytes).into());
+                super::chunk_repair_stripe(orphaned_hash) == super::chunk_repair_stripe(hash)
+            })
+            .expect("a matching repair stripe exists");
+        let unrelated_identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&unrelated_bytes).into()),
+            NarSize::new(unrelated_bytes.len() as u64),
+        );
+        let unrelated_hash = ChunkHash::from_digest(Sha256::digest(&unrelated_bytes).into());
+        assert_eq!(
+            super::chunk_repair_stripe(orphaned_hash),
+            super::chunk_repair_stripe(unrelated_hash)
+        );
+        store
+            .store_nar(
+                Cursor::new(&unrelated_bytes),
+                unrelated_identity,
+                super::ChunkProfile::MinCdcHash4V2,
+            )
+            .unwrap();
+
+        let marker = directory
+            .path()
+            .join(super::super::CHUNK_DIRECTORY)
+            .join(super::chunk_repair_marker_name(orphaned_hash));
+        assert!(marker.exists());
+        store
+            .sweep_unreachable([unrelated_identity.hash()])
+            .unwrap();
+
+        assert!(!marker.exists());
+        assert_eq!(
+            store
+                .chunk_repair_activity(unrelated_hash)
+                .pending_markers
+                .load(Ordering::SeqCst),
+            0
+        );
+        let _repair_lock = store.chunk_repair_lock(unrelated_hash);
+        assert!(store.open_serving_chunk(unrelated_hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_chunk_repair_sync_is_retried_before_existing_manifest_is_reused() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'y'; 100_000];
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        store
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
+            .unwrap();
+        let hash = ChunkHash::from_digest(Sha256::digest(&input).into());
+        let chunk_path = directory
+            .path()
+            .join(super::super::CHUNK_DIRECTORY)
+            .join(super::shard_name(hash))
+            .join(super::chunk_name(hash));
+        let mut corrupted = fs::read(&chunk_path).unwrap();
+        corrupted[0] ^= 1;
+        fs::write(&chunk_path, corrupted).unwrap();
+
+        let failed_repair = store.store_chunk_with_sync(hash, &input, |_| {
+            Err(std::io::Error::from_raw_os_error(
+                crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
+            ))
+        });
+        assert!(failed_repair.is_err());
+        let marker = directory
+            .path()
+            .join(super::super::CHUNK_DIRECTORY)
+            .join(super::chunk_repair_marker_name(hash));
+        assert!(
+            marker.exists(),
+            "failed repair retains its durability marker"
+        );
+        assert!(store.validate_manifest(identity.hash()).unwrap().is_some());
+
+        drop(store);
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        assert_eq!(
+            store
+                .chunk_repair_activity(hash)
+                .pending_markers
+                .load(Ordering::SeqCst),
+            1,
+            "reopening counts a durable repair marker before enabling serving fast paths"
+        );
+
+        let synchronized = std::cell::Cell::new(false);
+        let retry = store
+            .store_chunk_with_sync(hash, &input, |shard| {
+                synchronized.set(true);
+                shard.sync_all()
+            })
+            .unwrap();
+        assert_eq!(
+            retry.outcome,
+            super::super::publication::PublishOutcome::Identical
+        );
+        assert!(synchronized.get(), "retry settles the pending repair first");
+        assert!(!marker.exists());
+        assert_eq!(
+            store
+                .chunk_repair_activity(hash)
+                .pending_markers
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn read_through_validation_reuses_the_complete_nar_proof() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let input = vec![b'x'; 100_000];
+        let identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&input).into()),
+            NarSize::new(input.len() as u64),
+        );
+        store
+            .store_nar(Cursor::new(&input), identity, ChunkProfile::MinCdcHash4V2)
+            .unwrap();
+
+        store.verify_nar_content(identity).unwrap();
+        store.verify_nar_content(identity).unwrap();
+
+        assert_eq!(store.nar_content_hashes(), 1);
+    }
+
+    #[test]
+    fn chunk_proof_is_not_cached_if_the_file_changes_after_its_bytes_were_read() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let path = directory.path().join("racing-chunk");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let verified_bytes = b"verified chunk contents";
+        file.write_all(verified_bytes).unwrap();
+        file.sync_all().unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut observed_bytes = vec![0; verified_bytes.len()];
+        file.read_exact(&mut observed_bytes).unwrap();
+        let observed_stamp = FileStamp::from_file(&file).unwrap();
+        let hash = ChunkHash::from_digest(Sha256::digest(&observed_bytes).into());
+
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.write_all(b"bad data chunk contents").unwrap();
+        file.sync_all().unwrap();
+
+        assert!(
+            store
+                .cache_verified_chunk(hash, &file, observed_stamp, &observed_bytes)
+                .is_err()
+        );
+        assert!(!store.chunk_stamp_is_verified(hash, FileStamp::from_file(&file).unwrap()));
     }
 
     #[test]

@@ -210,7 +210,7 @@ pub type NarIdentity = ContentIdentity<LogicalNar>;
 /// A raw filename still begins as a `FileHash` at the HTTP boundary. Its
 /// equality with the logical `NarHash` is established while validating the
 /// upload or narinfo, rather than assumed from its suffix.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NarFileName {
     file_hash: FileHash,
     encoding: WireEncoding,
@@ -271,7 +271,7 @@ impl fmt::Display for NarFileName {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Encoding named by a payload filename or narinfo transport fields.
 pub enum WireEncoding {
     /// Uncompressed NAR bytes.
@@ -298,7 +298,7 @@ impl FromStr for WireEncoding {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 /// A supported NAR compression codec.
 pub enum CompressionCodec {
     /// Zstandard compression.
@@ -359,6 +359,14 @@ impl NarRepresentation {
         match self {
             Self::Raw(identity) => EncodedSize::new(identity.size().get()),
             Self::Compressed(identity) => identity.encoded().size(),
+        }
+    }
+
+    /// Returns the compression declaration for this exact representation.
+    pub const fn wire_encoding(self) -> WireEncoding {
+        match self {
+            Self::Raw(_) => WireEncoding::Raw,
+            Self::Compressed(identity) => WireEncoding::Compressed(identity.encoded().codec()),
         }
     }
 }

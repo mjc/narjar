@@ -1126,18 +1126,98 @@ fn respond_cache_route(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        time::Instant,
+    };
 
     use super::{
         CacheRoute, RequestedRange, RouteMatch, invalid_route_status, parse_range_value,
-        readiness_response, record_nar_open_outcome, request_route,
+        readiness_response, record_nar_open_outcome, request_route, respond_nar,
     };
     use crate::cache::{
+        auth::ReadVisibility,
         http_server::{Method, StatusCode},
         metrics::{Metrics, RequestMethod, RequestRoute as MetricsRoute},
-        object::{CompressionCodec, WireEncoding},
-        storage::StorageReadiness,
+        nar_compression::encode_and_measure_nar,
+        object::{CompressionCodec, NarFileName, WireEncoding},
+        storage::{CacheCreation, Directory, StorageReadiness, SupportedStorageBackend},
     };
+
+    fn compressed_fixture() -> (
+        tempfile::TempDir,
+        crate::cache::storage::Storage,
+        NarFileName,
+        Vec<u8>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CacheCreation::prepare(
+            &Directory::open(directory.path()).unwrap(),
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap()
+        .create_or_complete()
+        .unwrap();
+        let raw = b"an exact compressed NAR response with enough bytes for range tests";
+        let mut compressed = Vec::new();
+        let encoded = encode_and_measure_nar(CompressionCodec::Zstd, &mut compressed, |writer| {
+            writer.write_all(raw)
+        })
+        .unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join("nar")
+                .join(encoded.file_name().to_string()),
+            &compressed,
+        )
+        .unwrap();
+        (directory, storage, encoded.file_name(), compressed)
+    }
+
+    fn request_compressed_nar(
+        storage: &crate::cache::storage::Storage,
+        name: NarFileName,
+        method: &str,
+        range: Option<&str>,
+    ) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut headers = format!("{method} /nar/{name} HTTP/1.1\r\nHost: cache\r\n");
+        if let Some(range) = range {
+            headers.push_str(&format!("Range: {range}\r\n"));
+        }
+        headers.push_str("Connection: close\r\n\r\n");
+        client.write_all(headers.as_bytes()).unwrap();
+        let request = crate::cache::http_server::Request::read(server).unwrap();
+        let metrics = Metrics::default();
+        let guard = metrics.request(RequestMethod::Get, MetricsRoute::Nar);
+        drop(respond_nar(
+            request,
+            storage,
+            name,
+            &guard,
+            ReadVisibility::Public,
+        ));
+        drop(guard);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        response
+    }
+
+    fn response_parts(response: &[u8]) -> (&str, &[u8]) {
+        let boundary = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let headers = std::str::from_utf8(&response[..boundary]).unwrap();
+        (headers, &response[boundary + 4..])
+    }
 
     #[test]
     fn nar_open_failure_after_size_lookup_is_not_counted_as_a_hit() {
@@ -1152,6 +1232,38 @@ mod tests {
         assert_eq!(lookup.hits, 0);
         assert_eq!(lookup.failures, 1);
         assert_eq!(lookup.hit_ratio, None);
+    }
+
+    #[test]
+    fn compressed_nar_get_head_and_range_serve_the_published_bytes() {
+        let (_directory, storage, name, expected) = compressed_fixture();
+
+        let get_response = request_compressed_nar(&storage, name, "GET", None);
+        let (get_headers, get_body) = response_parts(&get_response);
+        assert!(get_headers.starts_with("HTTP/1.1 200"), "{get_headers}");
+        assert!(get_headers.contains(&format!("Content-Length: {}", expected.len())));
+        assert!(!get_headers.contains("Content-Encoding:"), "{get_headers}");
+        assert_eq!(get_body, expected);
+
+        let head_response = request_compressed_nar(&storage, name, "HEAD", None);
+        let (head_headers, head_body) = response_parts(&head_response);
+        assert!(head_headers.starts_with("HTTP/1.1 200"));
+        assert!(head_headers.contains(&format!("Content-Length: {}", expected.len())));
+        assert!(
+            !head_headers.contains("Content-Encoding:"),
+            "{head_headers}"
+        );
+        assert!(head_body.is_empty());
+
+        let range_response = request_compressed_nar(&storage, name, "GET", Some("bytes=3-11"));
+        let (range_headers, range_body) = response_parts(&range_response);
+        assert!(range_headers.starts_with("HTTP/1.1 206"));
+        assert!(range_headers.contains(&format!("Content-Range: bytes 3-11/{}", expected.len())));
+        assert!(
+            !range_headers.contains("Content-Encoding:"),
+            "{range_headers}"
+        );
+        assert_eq!(range_body, &expected[3..12]);
     }
 
     #[test]

@@ -314,11 +314,9 @@ impl CacheLayout {
         let activity = Arc::new(StorageActivity::default());
         let payloads = match self.backend.0 {
             BackendSupport::Flat => PayloadStorage::Flat,
-            BackendSupport::Chunked(durability) => PayloadStorage::Chunked(ChunkStore::open(
-                &self.root,
-                durability,
-                Arc::clone(&activity),
-            )?),
+            BackendSupport::Chunked(durability) => PayloadStorage::Chunked(Box::new(
+                ChunkStore::open(&self.root, durability, Arc::clone(&activity))?,
+            )),
         };
         let recovery = RecoveryState::new(&self.root)?;
         Ok(Storage {

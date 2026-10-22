@@ -20,7 +20,7 @@ use crate::cache::object::{NarFileName, NarIdentity};
 #[derive(Debug)]
 pub(super) enum PayloadStorage {
     Flat,
-    Chunked(ChunkStore),
+    Chunked(Box<ChunkStore>),
 }
 
 impl PayloadStorage {

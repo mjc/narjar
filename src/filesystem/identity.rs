@@ -29,6 +29,14 @@ impl FileStamp {
     pub(crate) fn from_file(file: &File) -> io::Result<Self> {
         platform::stamp(file)
     }
+
+    pub(crate) fn update_identity_digest(self, digest: &mut impl sha2::Digest) {
+        digest.update(self.identity.volume.to_le_bytes());
+        digest.update(self.identity.object);
+        digest.update(self.size.to_le_bytes());
+        digest.update(self.modified.to_le_bytes());
+        digest.update(self.changed.to_le_bytes());
+    }
 }
 
 #[cfg(unix)]

@@ -6,7 +6,7 @@ use super::super::{
     advertisement::lease_name, collection::AdvertisementRenewal, compression::IngestionReceipt,
     egress::EgressReceipt, ids::StoreHash, location::StorePath,
 };
-use crate::cache::object::{EncodedIdentity, NarFileName};
+use crate::cache::object::{EncodedIdentity, NarFileName, NarIdentity};
 
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
@@ -64,6 +64,7 @@ pub(crate) enum PublishTarget<'a> {
     IngestionReceipt(&'a IngestionReceipt),
     EgressReceipt(&'a EgressReceipt),
     RepairEgressNar(EncodedIdentity),
+    RepairCanonicalNar(NarIdentity),
     AdvertisementRecord(&'a std::ffi::OsStr),
     AdvertisementRenewal(&'a AdvertisementRenewal<'a>),
 }
@@ -107,6 +108,7 @@ pub(crate) enum DestinationPublication {
     Link,
     Replace,
     Repair(EncodedIdentity),
+    RepairCanonical(NarIdentity),
     RenewAdvertisement(StoreHash),
 }
 
@@ -159,6 +161,12 @@ impl PublishTarget<'_> {
                 path: StorePath::Nar(output.file_name().to_string().into()),
                 temporary_directory: TemporaryDirectory::Nar,
                 publication: DestinationPublication::Repair(*output),
+                temp_prefix: "nar",
+            },
+            Self::RepairCanonicalNar(identity) => PublicationDestination {
+                path: StorePath::Nar(NarFileName::raw(identity.hash()).to_string().into()),
+                temporary_directory: TemporaryDirectory::Nar,
+                publication: DestinationPublication::RepairCanonical(*identity),
                 temp_prefix: "nar",
             },
         }

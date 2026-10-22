@@ -17,14 +17,63 @@ use super::{
     publication::PublishTarget,
 };
 use crate::cache::{
-    object::NarIdentity,
+    object::{EncodedIdentity, NarFileName, NarIdentity, NarRepresentation},
     records::{BoundedRegularFile, decode_complete, read_bounded_regular_file},
 };
 
 pub(super) const DIRECTORY: &str = ".narjar-advertisements";
 const POLICY: &str = "policy";
-const MAX_RECORD_BYTES: u64 = 256;
+const MAX_SOURCE_URL_BYTES: usize = 16 * 1024;
+const MAX_RECORD_BYTES: u64 = (MAX_SOURCE_URL_BYTES + 512) as u64;
 const LEASE_VERSION: u8 = 2;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct UpstreamNarSource {
+    identity: NarIdentity,
+    encoding: UpstreamNarEncoding,
+    url: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum UpstreamNarEncoding {
+    Raw,
+    Compressed(EncodedIdentity),
+}
+
+impl UpstreamNarSource {
+    pub(crate) fn new(payload: NarRepresentation, url: &str) -> Result<Self, StorageError> {
+        if url.len() > MAX_SOURCE_URL_BYTES {
+            return Err(invalid("upstream NAR URL exceeds the storage limit"));
+        }
+        Ok(Self {
+            identity: payload.identity(),
+            encoding: match payload {
+                NarRepresentation::Raw(_) => UpstreamNarEncoding::Raw,
+                NarRepresentation::Compressed(compressed) => {
+                    UpstreamNarEncoding::Compressed(compressed.encoded())
+                }
+            },
+            url: url.to_owned(),
+        })
+    }
+
+    pub(crate) const fn identity(&self) -> NarIdentity {
+        self.identity
+    }
+
+    pub(crate) const fn payload(&self) -> NarRepresentation {
+        match self.encoding {
+            UpstreamNarEncoding::Raw => NarRepresentation::Raw(self.identity),
+            UpstreamNarEncoding::Compressed(encoded) => {
+                NarRepresentation::compressed(encoded, self.identity)
+            }
+        }
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum AdvertisementRemovalContext<'operation> {
@@ -39,11 +88,45 @@ pub(super) struct LeasePolicy {
     min_free_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct AdvertisementLease {
     version: u8,
     identity: NarIdentity,
     retention: AdvertisementRetention,
+    #[serde(default)]
+    output: AdvertisementOutput,
+    #[serde(default)]
+    source: Option<UpstreamNarSource>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ExistingAdvertisementLease {
+    version: u8,
+    identity: NarIdentity,
+    retention: AdvertisementRetention,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+enum AdvertisementOutput {
+    #[default]
+    Raw,
+    Compressed(EncodedIdentity),
+}
+
+impl AdvertisementOutput {
+    fn from_representation(output: NarRepresentation) -> Self {
+        match output {
+            NarRepresentation::Raw(_) => Self::Raw,
+            NarRepresentation::Compressed(compressed) => Self::Compressed(compressed.encoded()),
+        }
+    }
+
+    fn file_name(self, raw: NarIdentity) -> NarFileName {
+        match self {
+            Self::Raw => NarFileName::raw(raw.hash()),
+            Self::Compressed(encoded) => encoded.file_name(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -77,6 +160,7 @@ pub(super) enum AdvertisementProtection {
     Recorded {
         publications: BTreeMap<StoreHash, u64>,
         nars: BTreeSet<crate::cache::object::NarHash>,
+        outputs: BTreeSet<NarFileName>,
         now: u64,
     },
 }
@@ -85,11 +169,14 @@ impl AdvertisementProtection {
     pub(super) fn protects_nar_name(&self, name: &OsStr) -> bool {
         match self {
             Self::All => true,
-            Self::Absent | Self::Recorded { .. } => name
+            Self::Absent => false,
+            Self::Recorded { nars, outputs, .. } => name
                 .to_str()
-                .and_then(|name| crate::cache::object::NarFileName::parse(name).ok())
-                .and_then(crate::cache::object::NarFileName::raw_hash)
-                .is_some_and(|hash| self.protects(ProtectedObject::CanonicalNar(hash))),
+                .and_then(|name| NarFileName::parse(name).ok())
+                .is_some_and(|name| {
+                    outputs.contains(&name)
+                        || name.raw_hash().is_some_and(|hash| nars.contains(&hash))
+                }),
         }
     }
 
@@ -100,6 +187,7 @@ impl AdvertisementProtection {
             Self::Recorded {
                 publications,
                 nars,
+                outputs: _,
                 now,
             } => match object {
                 ProtectedObject::Publication(store) => {
@@ -128,7 +216,7 @@ impl AdvertisementLeases {
 
 #[derive(Clone, Copy)]
 enum LeasePurpose<'reader> {
-    Publication(NarIdentity),
+    Publication(NarIdentity, AdvertisementOutput),
     Advertisement(&'reader AdvertisementRenewal<'reader>, &'reader [u8]),
 }
 
@@ -148,7 +236,7 @@ impl Storage {
             }
             AdvertisementLeases::Incomplete => Err(invalid("advertisement policy is missing")),
             AdvertisementLeases::Active { directory, .. } => {
-                match read_record::<AdvertisementLease>(directory, &lease_name(store))? {
+                match read_advertisement_lease(directory, &lease_name(store))? {
                     Some(record) if record.version == LEASE_VERSION => match record.retention {
                         AdvertisementRetention::Until(_) => Ok(AdvertisementEvidence::Recorded),
                         AdvertisementRetention::RemovalPending => {
@@ -194,17 +282,63 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn record_publication_lease(
         &self,
         store: StoreHash,
         identity: NarIdentity,
     ) -> Result<(), StorageError> {
+        self.record_publication_lease_for_output(store, identity, NarRepresentation::Raw(identity))
+    }
+
+    pub(super) fn record_publication_lease_for_output(
+        &self,
+        store: StoreHash,
+        identity: NarIdentity,
+        output: NarRepresentation,
+    ) -> Result<(), StorageError> {
         self.update_advertisement_lease(
             store,
-            LeasePurpose::Publication(identity),
+            LeasePurpose::Publication(identity, AdvertisementOutput::from_representation(output)),
+            None,
             unix_seconds()?,
             File::sync_all,
         )
+    }
+
+    pub(super) fn record_read_through_lease(
+        &self,
+        store: StoreHash,
+        identity: NarIdentity,
+        output: NarRepresentation,
+        source: UpstreamNarSource,
+    ) -> Result<(), StorageError> {
+        self.update_advertisement_lease(
+            store,
+            LeasePurpose::Publication(identity, AdvertisementOutput::from_representation(output)),
+            Some(source),
+            unix_seconds()?,
+            File::sync_all,
+        )
+    }
+
+    pub(crate) fn read_through_source(
+        &self,
+        store: StoreHash,
+    ) -> Result<Option<UpstreamNarSource>, StorageError> {
+        let AdvertisementLeases::Active { directory, .. } = &self.advertisements else {
+            return Ok(None);
+        };
+        read_advertisement_lease(directory, &lease_name(store))?.map_or(Ok(None), |record| {
+            if record.version != LEASE_VERSION {
+                return Err(invalid("unsupported advertisement lease"));
+            }
+            match record.source {
+                Some(source) if source.identity() == record.identity => Ok(Some(source)),
+                Some(_) => Err(invalid("upstream NAR source identity does not match lease")),
+                None => Ok(None),
+            }
+        })
     }
 
     pub(super) fn renew_advertisement_lease(
@@ -216,6 +350,7 @@ impl Storage {
         self.update_advertisement_lease(
             renewal.store(),
             LeasePurpose::Advertisement(&renewal, metadata),
+            None,
             unix_seconds()?,
             File::sync_all,
         )
@@ -225,6 +360,7 @@ impl Storage {
         &self,
         store: StoreHash,
         purpose: LeasePurpose<'_>,
+        source: Option<UpstreamNarSource>,
         now: u64,
         synchronize_reused: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<(), StorageError> {
@@ -239,27 +375,43 @@ impl Storage {
                     .lock()
                     .map_err(|_| invalid("advertisement renewal lock poisoned"))?;
                 let name = lease_name(store);
-                let existing = read_record::<AdvertisementLease>(directory, &name)?;
-                let identity = match (purpose, existing) {
+                let existing = read_advertisement_lease(directory, &name)?;
+                let (identity, output, source) = match (&purpose, &existing) {
                     (_, Some(record)) if record.version != LEASE_VERSION => {
                         return Err(invalid("unsupported advertisement lease"));
                     }
-                    (LeasePurpose::Publication(identity), Some(record)) => match record.retention {
-                        AdvertisementRetention::Until(_) if identity != record.identity => {
-                            return Err(StorageError::NarMismatch);
-                        }
-                        AdvertisementRetention::Until(_)
-                        | AdvertisementRetention::RemovalPending => identity,
-                    },
-                    (LeasePurpose::Advertisement(renewal, metadata), Some(record)) => {
+                    (LeasePurpose::Publication(identity, output), Some(record)) => {
                         match record.retention {
-                            AdvertisementRetention::Until(_) => record.identity,
+                            AdvertisementRetention::Until(_) if *identity != record.identity => {
+                                return Err(StorageError::NarMismatch);
+                            }
+                            AdvertisementRetention::Until(_) => (
+                                *identity,
+                                *output,
+                                source.clone().or_else(|| record.source.clone()),
+                            ),
                             AdvertisementRetention::RemovalPending => {
-                                identity_from_pending_metadata(renewal.store(), metadata)?
+                                (*identity, *output, source.clone())
                             }
                         }
                     }
-                    (LeasePurpose::Publication(identity), None) => identity,
+                    (LeasePurpose::Advertisement(renewal, metadata), Some(record)) => {
+                        match record.retention {
+                            AdvertisementRetention::Until(_) => {
+                                (record.identity, record.output, record.source.clone())
+                            }
+                            AdvertisementRetention::RemovalPending => {
+                                let (identity, output) = pending_metadata_identity_and_output(
+                                    renewal.store(),
+                                    metadata,
+                                )?;
+                                (identity, output, record.source.clone())
+                            }
+                        }
+                    }
+                    (LeasePurpose::Publication(identity, output), None) => {
+                        (*identity, *output, source.clone())
+                    }
                     // GC keeps publications with missing retention records. Read-through
                     // requests recreate them from verified metadata and NARs before success.
                     (LeasePurpose::Advertisement(_, _), None) => return Ok(()),
@@ -268,7 +420,13 @@ impl Storage {
                     .checked_add(policy.lifetime_seconds.get())
                     .ok_or_else(|| invalid("advertisement expiry overflow"))?;
                 match existing {
-                    Some(record) if record.retention.expires_at() >= required_expiry => {
+                    Some(record)
+                        if record.retention.expires_at() >= required_expiry
+                            && record.output == output
+                            && source
+                                .as_ref()
+                                .is_none_or(|source| record.source.as_ref() == Some(source)) =>
+                    {
                         synchronize_reused(directory).map_err(Into::into)
                     }
                     Some(_) | None => {
@@ -276,6 +434,8 @@ impl Storage {
                         let lease = AdvertisementLease {
                             version: LEASE_VERSION,
                             identity,
+                            output,
+                            source,
                             retention: AdvertisementRetention::Until(
                                 required_expiry
                                     .checked_add(headroom)
@@ -283,7 +443,7 @@ impl Storage {
                             ),
                         };
                         match purpose {
-                            LeasePurpose::Publication(_) => self.publish_advertisement_record(
+                            LeasePurpose::Publication(_, _) => self.publish_advertisement_record(
                                 name,
                                 &lease,
                                 policy.min_free_bytes,
@@ -378,6 +538,7 @@ impl Storage {
                     .as_secs();
                 let mut publications = BTreeMap::new();
                 let mut nars = BTreeSet::new();
+                let mut outputs = BTreeSet::new();
                 for name in read_dir_names(directory)? {
                     if name == POLICY {
                         continue;
@@ -387,10 +548,9 @@ impl Storage {
                         .and_then(|name| name.strip_suffix(".lease"))
                         .and_then(|name| StoreHash::parse(name).ok())
                         .ok_or_else(|| invalid("invalid advertisement lease filename"))?;
-                    let lease =
-                        read_record::<AdvertisementLease>(directory, &name)?.ok_or_else(|| {
-                            invalid("advertisement lease disappeared during collection")
-                        })?;
+                    let lease = read_advertisement_lease(directory, &name)?.ok_or_else(|| {
+                        invalid("advertisement lease disappeared during collection")
+                    })?;
                     if lease.version != LEASE_VERSION {
                         return Err(invalid("unsupported advertisement lease"));
                     }
@@ -398,11 +558,13 @@ impl Storage {
                     publications.insert(store, expires_at);
                     if expires_at > now {
                         nars.insert(lease.identity.hash());
+                        outputs.insert(lease.output.file_name(lease.identity));
                     }
                 }
                 Ok(AdvertisementProtection::Recorded {
                     publications,
                     nars,
+                    outputs,
                     now,
                 })
             }
@@ -425,7 +587,7 @@ impl Storage {
                     .lock()
                     .map_err(|_| invalid("advertisement renewal lock poisoned"))?;
                 let name = lease_name(store);
-                match read_record::<AdvertisementLease>(directory, &name)? {
+                match read_advertisement_lease(directory, &name)? {
                     None => Ok(()),
                     Some(record) if record.version != LEASE_VERSION => {
                         Err(invalid("unsupported advertisement lease"))
@@ -492,12 +654,43 @@ fn read_record<T: for<'de> Deserialize<'de>>(
     }
 }
 
-fn identity_from_pending_metadata(
+fn read_advertisement_lease(
+    directory: &File,
+    name: &OsStr,
+) -> Result<Option<AdvertisementLease>, StorageError> {
+    match read_bounded_regular_file(directory, name, MAX_RECORD_BYTES)? {
+        BoundedRegularFile::Missing => Ok(None),
+        BoundedRegularFile::Invalid => Err(invalid("invalid advertisement record file")),
+        BoundedRegularFile::Valid(bytes) => decode_advertisement_lease(&bytes).map(Some),
+    }
+}
+
+fn decode_advertisement_lease(bytes: &[u8]) -> Result<AdvertisementLease, StorageError> {
+    match decode_complete::<AdvertisementLease>(bytes) {
+        Ok(lease) => Ok(lease),
+        Err(current_error) => decode_complete::<ExistingAdvertisementLease>(bytes)
+            .map(|existing| AdvertisementLease {
+                version: existing.version,
+                identity: existing.identity,
+                retention: existing.retention,
+                output: AdvertisementOutput::Raw,
+                source: None,
+            })
+            .map_err(|_| invalid(current_error.to_string())),
+    }
+}
+
+fn pending_metadata_identity_and_output(
     store: StoreHash,
     metadata: &[u8],
-) -> Result<NarIdentity, StorageError> {
-    crate::cache::narinfo::NarInfoClaims::parse_external_narinfo(&store, metadata.to_vec())
-        .map(|claims| claims.identity())
+) -> Result<(NarIdentity, AdvertisementOutput), StorageError> {
+    crate::cache::narinfo::NarInfoClaims::parse_external_publication(&store, metadata.to_vec())
+        .map(|(claims, output)| {
+            (
+                claims.identity(),
+                AdvertisementOutput::from_representation(output),
+            )
+        })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
 }
 
@@ -522,7 +715,7 @@ mod tests {
         CacheCreation, Directory, SupportedStorageBackend, publication::PublishBoundary,
     };
     use super::*;
-    use crate::cache::object::NarHash;
+    use crate::cache::object::{CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarHash};
 
     fn unconfigured_fixture() -> (tempfile::TempDir, Storage) {
         let directory = tempfile::tempdir().unwrap();
@@ -938,6 +1131,8 @@ mod tests {
         let record = AdvertisementLease {
             version: LEASE_VERSION,
             identity,
+            output: AdvertisementOutput::Raw,
+            source: None,
             retention: AdvertisementRetention::Until(now + 7200),
         };
         let bytes = postcard::to_allocvec(&record).unwrap();
@@ -964,6 +1159,7 @@ mod tests {
         let failure = storage.update_advertisement_lease(
             store,
             LeasePurpose::Advertisement(&renewal, &[]),
+            None,
             now,
             |_| Err(io::Error::other("directory synchronization still fails")),
         );
@@ -975,6 +1171,7 @@ mod tests {
             .update_advertisement_lease(
                 store,
                 LeasePurpose::Advertisement(&renewal, &[]),
+                None,
                 now,
                 File::sync_all,
             )
@@ -998,16 +1195,101 @@ mod tests {
         let protection = AdvertisementProtection::Recorded {
             publications: BTreeMap::new(),
             nars: BTreeSet::new(),
+            outputs: BTreeSet::new(),
             now: 10,
         };
         assert!(protection.protects(ProtectedObject::Publication(store)));
         let protection = AdvertisementProtection::Recorded {
             publications: BTreeMap::from([(store, 9)]),
             nars: BTreeSet::new(),
+            outputs: BTreeSet::new(),
             now: 10,
         };
         assert!(!protection.protects(ProtectedObject::Publication(store)));
         assert!(!protection.protects(ProtectedObject::CanonicalNar(hash)));
         assert!(AdvertisementProtection::All.protects(ProtectedObject::CanonicalNar(hash)));
+    }
+
+    #[test]
+    fn compressed_advertisement_lease_protects_both_raw_and_served_files() {
+        let (directory, mut storage) = unconfigured_fixture();
+        storage
+            .configure_advertisement_leases(NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let store = StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        let encoded = EncodedIdentity::new(
+            CompressionCodec::Zstd,
+            FileHash::from_digest([7; 32]),
+            EncodedSize::new(29),
+        );
+
+        storage
+            .record_publication_lease_for_output(
+                store,
+                identity,
+                NarRepresentation::compressed(encoded, identity),
+            )
+            .unwrap();
+        let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
+
+        assert!(
+            protection.protects_nar_name(NarFileName::raw(identity.hash()).to_string().as_ref())
+        );
+        assert!(protection.protects_nar_name(encoded.file_name().to_string().as_ref()));
+        assert!(
+            !protection.protects_nar_name(
+                EncodedIdentity::new(
+                    CompressionCodec::Zstd,
+                    FileHash::from_digest([8; 32]),
+                    EncodedSize::new(29),
+                )
+                .file_name()
+                .to_string()
+                .as_ref()
+            )
+        );
+        drop(storage);
+        drop(directory);
+    }
+
+    #[test]
+    fn changed_advertised_output_rewrites_an_unexpired_lease() {
+        let (_directory, mut storage) = unconfigured_fixture();
+        storage
+            .configure_advertisement_leases(NonZeroU64::new(3600).unwrap(), 0)
+            .unwrap();
+        let store = StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        let encoded = EncodedIdentity::new(
+            CompressionCodec::Zstd,
+            FileHash::from_digest([7; 32]),
+            EncodedSize::new(29),
+        );
+        let compressed_output = NarRepresentation::compressed(encoded, identity);
+
+        storage.record_publication_lease(store, identity).unwrap();
+        storage
+            .record_publication_lease_for_output(store, identity, compressed_output)
+            .unwrap();
+
+        let protection = storage.advertisement_protection(SystemTime::now()).unwrap();
+        assert!(protection.protects(ProtectedObject::CanonicalNar(identity.hash())));
+        assert!(protection.protects_nar_name(encoded.file_name().to_string().as_ref()));
+    }
+
+    #[test]
+    fn existing_advertisement_records_default_to_their_canonical_raw_file() {
+        let identity = NarIdentity::new(NarHash::from_digest([42; 32]), 3.into());
+        let bytes = postcard::to_allocvec(&ExistingAdvertisementLease {
+            version: LEASE_VERSION,
+            identity,
+            retention: AdvertisementRetention::Until(123),
+        })
+        .unwrap();
+        let lease = decode_advertisement_lease(&bytes).unwrap();
+
+        assert_eq!(lease.identity, identity);
+        assert_eq!(lease.output, AdvertisementOutput::Raw);
     }
 }
