@@ -46,6 +46,7 @@
     edge ? {},
     workers ? 8,
     maxInFlight ? 64,
+    minFreeBytes ? 0,
   }:
     (import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = pkgs.system;
@@ -92,7 +93,7 @@
             nativeStore.signingKeyFile = nativeSigningKeyFile;
             inherit gc;
             inherit edge;
-            minFreeBytes = 0;
+            inherit minFreeBytes;
             package = package;
           };
           systemd.services.narjar.serviceConfig = lib.optionalAttrs (stopTimeout != null) {
@@ -138,6 +139,28 @@
   edgeConfig = configuration {
     dataDir = "/var/lib/narjar";
     edge = edgeOptions;
+  };
+  sharedCacheProfileConfig = configuration {
+    dataDir = "/var/lib/narjar";
+    minFreeBytes = 1073741824;
+    edge = edgeOptions // {
+      leaseSeconds = 5187600;
+      clientPositiveTtlSeconds = 2592000;
+      clientNegativeTtlSeconds = 1;
+    };
+    gc = {
+      enable = true;
+      schedule = "hourly";
+      randomizedDelaySeconds = 300;
+      evictionOrder = "last-use";
+      maxBytes = 107374182400;
+      targetBytes = 85899345920;
+      minFreeBytes = 21474836480;
+      targetFreeBytes = 32212254720;
+      maxDeletions = 100;
+      retryAttempts = 3;
+      retryDelayMillis = 1000;
+    };
   };
   disabledEdgeKeysConfig = configuration {
     dataDir = "/var/lib/narjar";
@@ -578,6 +601,23 @@ in
   assert lib.hasInfix "--edge-upstream https://cache.example" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
   assert lib.hasInfix "--edge-lease-seconds 3600" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
   assert lib.hasInfix "--edge-fill-timeout-seconds 3600" edgeConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert evaluatesConfig sharedCacheProfileConfig;
+  assert lib.hasInfix "--min-free-bytes 1073741824" sharedCacheProfileConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert lib.hasInfix "--edge-lease-seconds 5187600" sharedCacheProfileConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert sharedCacheProfileConfig.nix.settings.narinfo-cache-positive-ttl == 2592000;
+  assert sharedCacheProfileConfig.nix.settings.narinfo-cache-negative-ttl == 1;
+  assert lib.all (flag: lib.hasInfix flag sharedCacheProfileConfig.systemd.services.narjar-gc.serviceConfig.ExecStart) [
+    "--eviction-order last-use"
+    "--max-bytes 107374182400"
+    "--target-bytes 85899345920"
+    "--min-free-bytes 21474836480"
+    "--target-free-bytes 32212254720"
+    "--max-deletions 100"
+    "--retry-attempts 3"
+    "--retry-delay-millis 1000"
+  ];
+  assert lib.hasInfix "--track-access" sharedCacheProfileConfig.systemd.services.narjar.serviceConfig.ExecStart;
+  assert sharedCacheProfileConfig.systemd.timers.narjar-gc.timerConfig.OnCalendar == "hourly";
   assert !(evaluatesConfig singleWorkerEdgeConfig);
   assert !(evaluatesConfig singleAdmissionEdgeConfig);
   assert edgeConfig.nix.settings.substituters == ["http://127.0.0.1:5000"];

@@ -207,30 +207,47 @@ The module can configure both the loopback service and Nix's substituter:
 ~~~nix
 services.narjar = {
   enable = true;
+  minFreeBytes = 1 * 1024 * 1024 * 1024;
   edge = {
     enable = true;
     upstream = "https://cache.example";
     trustedPublicKeys = [ "cache.example:BASE64_PUBLIC_KEY" ];
     configureClient = true;
-    clientPositiveTtlSeconds = 300;
+    clientPositiveTtlSeconds = 30 * 24 * 60 * 60;
     clientNegativeTtlSeconds = 1;
-    leaseSeconds = 3600;
+    leaseSeconds = 60 * 24 * 60 * 60 + 60 * 60;
   };
   gc = {
     enable = true;
-    maxBytes = 20 * 1024 * 1024 * 1024;
-    targetBytes = 15 * 1024 * 1024 * 1024;
+    schedule = "hourly";
+    randomizedDelaySeconds = 300;
+    evictionOrder = "last-use";
+    maxBytes = 100 * 1024 * 1024 * 1024;
+    targetBytes = 80 * 1024 * 1024 * 1024;
+    minFreeBytes = 20 * 1024 * 1024 * 1024;
+    targetFreeBytes = 30 * 1024 * 1024 * 1024;
+    maxDeletions = 100;
+    retryAttempts = 3;
+    retryDelayMillis = 1000;
   };
 };
 ~~~
 
 `configureClient` replaces Nix's substituter list with this loopback endpoint,
 installs the same public keys for Nix, sets the TTLs, and keeps fallback disabled.
-The module requires a lease of at least twice the positive TTL plus 300 seconds
-to allow for delayed NAR requests. Public keys may be in the Nix store; no secret
-signing key is needed. GC can leave the cache above its size target while leases
-have not expired. `/metrics` reports local hits, upstream results, active
-downloads and cached failures.
+The 60-day lease covers two 30-day positive-cache periods plus an hour for
+delayed NAR requests. The module requires at least twice the positive TTL plus
+300 seconds. Public keys may be in the Nix store; no secret signing key is
+needed.
+
+Top-level `minFreeBytes` is the admission reserve for writes. `gc.minFreeBytes`
+and `gc.targetFreeBytes` trigger and bound physical-space collection; they
+measure filesystem headroom. `gc.maxBytes` and `gc.targetBytes` count logical
+cache lengths. A pass removes at most `maxDeletions` publications and orphans.
+Active advertisement leases and protected roots take priority over these
+targets, so GC can report an unmet target and leave the cache over its logical
+limit rather than delete content a client may still request. `/metrics` reports
+the measured capacity and collection outcome.
 
 Run `nix run .#edge-e2e` on Linux to test builds with fallback disabled, reuse of
 cached narinfo after a restart and offline GC, and recovery after an upstream
@@ -456,6 +473,8 @@ Evicted keys can be recorded more often. Hints are not
 synced per read and may be lost on a crash; reader pins, protected roots, and
 advertisement grace do not depend on them. Missing or malformed hints fall back
 to publication time; hint write or cleanup failures do not fail reads or GC.
+`maxAgeDays` expires by publication age, not inactivity. Narjar has no separate
+inactivity-expiry setting; `last-use` only changes pressure ordering.
 
 For physical pressure, set `gc.minFreeBytes` and `gc.targetFreeBytes` together,
 with a positive `gc.maxDeletions`. A bounded pass starts below the minimum and
@@ -604,18 +623,9 @@ secret contents in Nix expressions.
 `auth.writeTokens` must contain Narjar's hashed token records, not a plaintext
 token. See the [README example](../README.md#nixos-service).
 
-Scheduled online GC is disabled by default:
-
-~~~nix
-services.narjar.gc = {
-  enable = true;
-  schedule = "*-*-* 03:00:00";
-  maxBytes = 8 * 1024 * 1024 * 1024;
-  targetBytes = 6 * 1024 * 1024 * 1024;
-  minAgeSeconds = 7 * 24 * 60 * 60;
-  protectedRoots = "/var/lib/narjar/protected-roots";
-};
-~~~
+Scheduled online GC is disabled by default. The NixOS example above combines
+the timer, deletion limits, logical cache targets, and measured filesystem
+thresholds.
 
 The GC unit requests collection through the running daemon; it does not stop
 or restart the service. Collection starts above `maxBytes`, which is also the
