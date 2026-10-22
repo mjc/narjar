@@ -74,6 +74,7 @@ pub(crate) struct AdvertisedNarInfo<'storage> {
 #[allow(dead_code)]
 pub(super) fn storage_error_for_chunk_store(error: ChunkStoreError) -> StorageError {
     match error {
+        ChunkStoreError::MissingNar => StorageError::MissingNar,
         ChunkStoreError::InvalidRange { .. } => StorageError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "chunked NAR range is outside the object",

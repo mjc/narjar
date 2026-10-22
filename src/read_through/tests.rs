@@ -23,7 +23,10 @@ use crate::cache::{
         CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash,
         NarIdentity, NarSize,
     },
-    storage::{CacheCreation, Directory, EGRESS_RECEIPT_DIRECTORY, SupportedStorageBackend},
+    storage::{
+        CHUNK_DIRECTORY, CacheCreation, Directory, EGRESS_RECEIPT_DIRECTORY, StorageBackend,
+        SupportedStorageBackend,
+    },
 };
 
 const STORE: &str = "00000000000000000000000000000000";
@@ -160,14 +163,15 @@ fn settings_with_egress(upstream: HttpUrl, egress_compression: WireEncoding) -> 
 }
 
 fn storage() -> (TempDir, Storage) {
+    storage_with_backend(SupportedStorageBackend::FLAT)
+}
+
+fn storage_with_backend(backend: SupportedStorageBackend) -> (TempDir, Storage) {
     let directory = tempfile::tempdir().unwrap();
-    let mut storage = CacheCreation::prepare(
-        &Directory::open(directory.path()).unwrap(),
-        SupportedStorageBackend::FLAT,
-    )
-    .unwrap()
-    .create_or_complete()
-    .unwrap();
+    let mut storage = CacheCreation::prepare(&Directory::open(directory.path()).unwrap(), backend)
+        .unwrap()
+        .create_or_complete()
+        .unwrap();
     storage
         .configure_advertisement_leases(NonZeroU64::new(60).unwrap(), 0)
         .unwrap();
@@ -596,6 +600,67 @@ fn recovery_uses_the_recorded_upstream_url_to_repair_a_corrupt_canonical_nar() {
     assert_eq!(bytes, fixture.raw);
     assert_eq!(upstream.count(".narinfo"), 1);
     assert_eq!(upstream.count(expected_resource), 2);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn read_through_repairs_a_same_size_corrupt_chunk_before_serving_local_narinfo() {
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata(
+        STORE,
+        NarRepresentation::Raw(fixture.identity),
+        &signing_key(),
+    );
+    let raw = fixture.raw.clone();
+    let upstream = Upstream::new(move |route, stream| {
+        if route.ends_with(".narinfo") {
+            reply(stream, 200, &metadata);
+        } else {
+            reply(stream, 200, &raw);
+        }
+    });
+    let source = source(&upstream);
+    let backend = SupportedStorageBackend::try_from(StorageBackend::Chunked).unwrap();
+    let (directory, storage) = storage_with_backend(backend);
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
+    storage
+        .verify_read_through_payloads(NarRepresentation::Raw(fixture.identity))
+        .unwrap();
+    let shard = fs::read_dir(directory.path().join(CHUNK_DIRECTORY))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_type().unwrap().is_dir())
+        .unwrap()
+        .path();
+    let chunk = fs::read_dir(shard)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_type().unwrap().is_file())
+        .unwrap()
+        .path();
+    let mut corrupted = fs::read(&chunk).unwrap();
+    corrupted[0] ^= 1;
+    fs::write(chunk, corrupted).unwrap();
+
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Local));
+    storage
+        .verify_read_through_payloads(NarRepresentation::Raw(fixture.identity))
+        .unwrap();
+    let mut payload = storage
+        .open_nar_range(
+            NarFileName::raw(fixture.identity.hash()),
+            0..fixture.identity.size().get(),
+        )
+        .unwrap()
+        .unwrap()
+        .body;
+    let mut served = Vec::new();
+    payload.read_to_end(&mut served).unwrap();
+    assert_eq!(served, fixture.raw);
+    assert_eq!(upstream.count(".narinfo"), 1);
+    assert_eq!(upstream.count(".nar"), 2);
 }
 
 #[test]

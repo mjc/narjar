@@ -196,14 +196,7 @@ impl NarInfoClaims {
         bytes: Vec<u8>,
         output: NarRepresentation,
     ) -> bool {
-        let parsed = parse_narinfo_text(bytes).and_then(|text| {
-            let document = NarInfoDocument::parse_external(&text)?;
-            document.validate_external_transport()?;
-            let claims = Self::from_external_document(self.store(), &document)?;
-            let payload = document.publication_payload(claims.identity())?;
-            Ok((claims, payload))
-        });
-        parsed.is_ok_and(|(claims, payload)| {
+        Self::parse_external_publication(self.store(), bytes).is_ok_and(|(claims, payload)| {
             self.compare_logical_claims(&claims).is_ok() && payload == output
         })
     }

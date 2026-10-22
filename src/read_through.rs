@@ -400,11 +400,12 @@ impl ReadThroughSource {
             .keys
             .validate(store, bytes)
             .map_err(|_| EdgeFailure::Invalid)?;
-        if !storage
-            .read_through_payloads_are_usable(metadata.payload())
-            .map_err(EdgeFailure::ingestion)?
-        {
-            return Ok(LocalLookup::Repair);
+        match storage.verify_read_through_payloads(metadata.payload()) {
+            Ok(()) => {}
+            Err(StorageError::MissingNar | StorageError::NarMismatch) => {
+                return Ok(LocalLookup::Repair);
+            }
+            Err(error) => return Err(EdgeFailure::ingestion(error)),
         }
         match storage
             .advertisement_evidence(*store)
@@ -426,7 +427,7 @@ impl ReadThroughSource {
             .map_err(|_| EdgeFailure::Storage)?
             .ok_or(EdgeFailure::Storage)?;
         let bytes = read_narinfo_file(file).map_err(|_| EdgeFailure::Invalid)?;
-        let metadata = self
+        let mut metadata = self
             .keys
             .validate(store, bytes.clone())
             .map_err(|_| EdgeFailure::Invalid)?;
@@ -435,6 +436,22 @@ impl ReadThroughSource {
         let mut source = storage
             .read_through_source(*store)
             .map_err(EdgeFailure::ingestion)?;
+        // Recovery source is the canonical raw NAR. Validate that object first;
+        // the advertised derivative can be regenerated from it without contacting
+        // the upstream when only the derivative is missing or corrupt.
+        match storage.verify_read_through_payloads(NarRepresentation::Raw(output.identity())) {
+            Ok(()) => {}
+            Err(StorageError::MissingNar | StorageError::NarMismatch) => {
+                source = Some(
+                    self.restore_payload_for_recovery(storage, store, output, source, deadline)?,
+                );
+                metadata = self
+                    .keys
+                    .validate(store, bytes.clone())
+                    .map_err(|_| EdgeFailure::Invalid)?;
+            }
+            Err(error) => return Err(EdgeFailure::ingestion(error)),
+        }
         match storage.bind_read_through_narinfo(metadata, output_encoding, self.policy) {
             Ok(bound) => {
                 bound

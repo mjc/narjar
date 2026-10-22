@@ -18,7 +18,7 @@ use crate::cache::object::{
 use crate::cache::records::{BoundedRegularFile, read_bounded_regular_file};
 
 use super::chunk_store::{ChunkStore, ChunkedNarReader, MAX_CHUNK_MANIFEST_BYTES};
-use super::collection::ActivityLease;
+use super::collection::{ActivityLease, ProtectedObject};
 use super::compression::{
     CapacityCheckedStagingWriter, encoded_file_matches, nar_file_size_matches,
 };
@@ -379,22 +379,58 @@ impl Storage {
         })
     }
 
-    pub(crate) fn read_through_payloads_are_usable(
+    pub(crate) fn verify_read_through_payloads(
         &self,
         output: NarRepresentation,
-    ) -> Result<bool, StorageError> {
-        let raw = NarRepresentation::Raw(output.identity());
-        match self.open_verified_canonical_nar(raw) {
-            Ok(canonical) => drop(canonical),
-            Err(StorageError::MissingNar | StorageError::NarMismatch) => return Ok(false),
-            Err(error) => return Err(error),
-        }
-        match output {
-            NarRepresentation::Raw(_) => Ok(true),
-            NarRepresentation::Compressed(compressed) => {
-                self.retained_egress_candidate_is_usable(compressed.decoded(), compressed.encoded())
+    ) -> Result<(), StorageError> {
+        let identity = output.identity();
+        match &self.payloads {
+            PayloadStorage::Flat => self.verify_flat_payload_identity(
+                NarFileName::raw(identity.hash()),
+                identity,
+                identity.size().get(),
+            )?,
+            PayloadStorage::Chunked(store) => {
+                self.verify_chunked_payload_identity(store, identity)?
             }
         }
+        if let NarRepresentation::Compressed(compressed) = output {
+            self.verify_flat_payload_identity(
+                compressed.encoded().file_name(),
+                compressed.decoded(),
+                compressed.encoded().size().get(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn verify_chunked_payload_identity(
+        &self,
+        store: &ChunkStore,
+        expected: NarIdentity,
+    ) -> Result<(), StorageError> {
+        let _activity = self
+            .collection
+            .reader(ProtectedObject::CanonicalNar(expected.hash()))?
+            .ok_or(StorageError::CollectionBusy)?;
+        store
+            .verify_nar_content(expected)
+            .map_err(read_through_chunk_error)
+    }
+
+    fn verify_flat_payload_identity(
+        &self,
+        name: NarFileName,
+        expected_nar: NarIdentity,
+        expected_file_size: u64,
+    ) -> Result<(), StorageError> {
+        let file = self.open_nar(name)?.ok_or(StorageError::MissingNar)?;
+        if file.metadata()?.len() != expected_file_size
+            || self.validated_delivery_identity(name, &file)? != expected_nar
+        {
+            return Err(StorageError::NarMismatch);
+        }
+        Ok(())
     }
 
     pub(super) fn select_egress(
@@ -803,6 +839,34 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn egress_generations(&self) -> u64 {
         self.egress_generations.load(Ordering::Relaxed)
+    }
+}
+
+fn read_through_chunk_error(error: super::chunk_store::ChunkStoreError) -> StorageError {
+    use super::chunk_store::ChunkStoreError;
+
+    match error {
+        ChunkStoreError::MissingNar => StorageError::MissingNar,
+        ChunkStoreError::NarHashMismatch { .. } | ChunkStoreError::NarSizeMismatch { .. } => {
+            StorageError::NarMismatch
+        }
+        ChunkStoreError::Manifest(super::chunked::ManifestError::Io(error))
+            if error.kind() == io::ErrorKind::InvalidData
+                || error.kind() == io::ErrorKind::NotFound =>
+        {
+            StorageError::NarMismatch
+        }
+        ChunkStoreError::Manifest(super::chunked::ManifestError::Io(error)) => {
+            StorageError::Io(error)
+        }
+        ChunkStoreError::Manifest(_) => StorageError::NarMismatch,
+        ChunkStoreError::Io(error)
+            if error.kind() == io::ErrorKind::InvalidData
+                || error.kind() == io::ErrorKind::NotFound =>
+        {
+            StorageError::NarMismatch
+        }
+        error => super::operations::storage_error_for_chunk_store(error),
     }
 }
 

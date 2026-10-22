@@ -164,6 +164,33 @@ fn a_completed_narinfo_miss_does_not_invalidate_the_collection_snapshot() {
 }
 
 #[test]
+fn validating_local_read_through_payloads_does_not_invalidate_a_collection_scan() {
+    let (_directory, storage) = flat_storage_fixture();
+    let raw = vec![b'r'; 4096];
+    let identity = upload_raw_nar(
+        &storage,
+        &raw,
+        super::NarUploadPolicy::new(raw.len() as u64, 0),
+    );
+    let (name, size) = storage
+        .compressed_representation_for_test(identity, CompressionCodec::Zstd, 0)
+        .expect("compressed NAR should be generated");
+    let encoded = EncodedIdentity::new(CompressionCodec::Zstd, name.file_hash(), size);
+    let snapshot = storage.collection.snapshot().unwrap();
+
+    storage
+        .verify_read_through_payloads(NarRepresentation::Raw(identity))
+        .unwrap();
+    storage
+        .verify_read_through_payloads(NarRepresentation::compressed(encoded, identity))
+        .unwrap();
+    assert!(
+        snapshot.authorize_deletion().is_ok(),
+        "a read-only cache-hit validation must not invalidate the GC snapshot"
+    );
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn a_lazy_chunk_reader_defers_collection_until_its_final_unopened_chunk_is_read() {
     let (_directory, storage) = storage_fixture(StorageBackend::Chunked.try_into().unwrap());
@@ -718,6 +745,9 @@ fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
         super::NarUploadPolicy::new(raw.len() as u64, 0),
     );
     let name = NarFileName::raw(identity.hash());
+    storage
+        .verify_read_through_payloads(NarRepresentation::Raw(identity))
+        .unwrap();
 
     let chunks = directory.path().join(super::CHUNK_DIRECTORY);
     let shard = fs::read_dir(&chunks)
@@ -734,6 +764,12 @@ fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
     bytes[0] ^= 1;
     fs::write(chunk, bytes).unwrap();
 
+    let snapshot = storage.collection.snapshot().unwrap();
+    assert!(matches!(
+        storage.verify_read_through_payloads(NarRepresentation::Raw(identity)),
+        Err(StorageError::NarMismatch)
+    ));
+
     let mut opened = storage
         .open_nar_range(name, 0..raw.len() as u64)
         .unwrap()
@@ -741,6 +777,8 @@ fn chunked_serving_rejects_a_corrupt_chunk_before_emitting_bytes() {
         .body;
     let error = io::copy(&mut opened, &mut io::sink()).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    drop(opened);
+    assert!(snapshot.authorize_deletion().is_ok());
 }
 
 #[test]
@@ -762,6 +800,10 @@ fn flat_canonical_nar_rejects_same_size_corruption() {
 
     assert!(matches!(
         storage.open_verified_canonical_nar(NarRepresentation::Raw(identity)),
+        Err(StorageError::NarMismatch)
+    ));
+    assert!(matches!(
+        storage.verify_read_through_payloads(NarRepresentation::Raw(identity)),
         Err(StorageError::NarMismatch)
     ));
     assert!(matches!(
@@ -849,6 +891,14 @@ fn compressed_delivery_rejects_same_size_corruption() {
     corrupted[0] ^= 1;
     fs::write(payload, corrupted).expect("same-size corruption should be writable");
 
+    let expected = NarRepresentation::compressed(
+        EncodedIdentity::new(CompressionCodec::Zstd, name.file_hash(), encoded_size),
+        identity,
+    );
+    assert!(matches!(
+        storage.verify_read_through_payloads(expected),
+        Err(StorageError::NarMismatch)
+    ));
     assert!(matches!(
         storage.open_nar_range(name, 0..encoded_size.get()),
         Err(StorageError::NarMismatch)
