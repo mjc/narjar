@@ -286,11 +286,26 @@ impl NarUploadPolicy {
         }
         Ok(())
     }
+
+    pub(crate) const fn bounded_by_nar_size(
+        self,
+        identity: crate::cache::object::NarIdentity,
+    ) -> Self {
+        Self {
+            max_decoded_bytes: if self.max_decoded_bytes < identity.size().get() {
+                self.max_decoded_bytes
+            } else {
+                identity.size().get()
+            },
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub(super) struct StagingBudget {
     outstanding_bytes: u64,
+    outstanding_inodes: u64,
 }
 
 impl StagingBudget {
@@ -318,6 +333,93 @@ impl StagingBudget {
 
     pub(super) const fn outstanding_bytes(&self) -> u64 {
         self.outstanding_bytes
+    }
+
+    pub(super) fn reserve_inodes(
+        &mut self,
+        capacity: super::capacity::StorageCapacity,
+        requested: u64,
+    ) -> Result<u64, StorageError> {
+        match capacity.inodes {
+            super::capacity::InodeCapacity::Measured { available, .. } => {
+                let total = self
+                    .outstanding_inodes
+                    .checked_add(requested)
+                    .ok_or(StorageError::InsufficientInodes)?;
+                if total > available {
+                    return Err(StorageError::InsufficientInodes);
+                }
+                self.outstanding_inodes = total;
+                Ok(requested)
+            }
+            super::capacity::InodeCapacity::NotReported => Ok(0),
+        }
+    }
+
+    fn release_inodes(&mut self, slots: u64) {
+        self.outstanding_inodes = self.outstanding_inodes.saturating_sub(slots);
+    }
+}
+
+pub(crate) struct StagingInodeReservation {
+    budget: Arc<Mutex<StagingBudget>>,
+    slots: u64,
+}
+
+impl StagingInodeReservation {
+    pub(super) fn reserve(
+        budget: &Arc<Mutex<StagingBudget>>,
+        directory: &File,
+        slots: u64,
+    ) -> Result<Self, StorageError> {
+        Self::reserve_with_measurement(budget, slots, || {
+            super::capacity::filesystem_space(directory)
+        })
+    }
+
+    fn reserve_with_measurement(
+        budget: &Arc<Mutex<StagingBudget>>,
+        slots: u64,
+        measure: impl FnOnce() -> io::Result<super::capacity::StorageCapacity>,
+    ) -> Result<Self, StorageError> {
+        let mut budget_guard = budget
+            .lock()
+            .map_err(|_| StorageError::Io(io::Error::other("staging budget lock poisoned")))?;
+        let capacity = measure()?;
+        let slots = budget_guard.reserve_inodes(capacity, slots)?;
+        Ok(Self {
+            budget: Arc::clone(budget),
+            slots,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserve_for_test(
+        budget: &Arc<Mutex<StagingBudget>>,
+        slots: u64,
+        measure: impl FnOnce() -> io::Result<super::capacity::StorageCapacity>,
+    ) -> Result<Self, StorageError> {
+        Self::reserve_with_measurement(budget, slots, measure)
+    }
+
+    pub(super) fn record_created_staging_entries(&mut self, count: u64) {
+        let released = count.min(self.slots);
+        let mut budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        budget.release_inodes(released);
+        self.slots -= released;
+    }
+}
+
+impl Drop for StagingInodeReservation {
+    fn drop(&mut self) {
+        let mut budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        budget.release_inodes(self.slots);
     }
 }
 

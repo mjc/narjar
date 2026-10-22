@@ -68,7 +68,7 @@ impl CleanupAction {
     }
 }
 
-pub(crate) use advertisement::AdvertisementEvidence;
+pub(crate) use advertisement::{AdvertisementEvidence, UpstreamNarSource};
 pub(crate) use capacity::{CapacityErrorKind, capacity_error_kind, filesystem_space};
 pub use capacity::{InodeCapacity, StorageCapacity};
 

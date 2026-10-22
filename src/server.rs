@@ -409,7 +409,6 @@ fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, 
         })?
         .into_parts();
     let trusted_keys = Arc::new(trusted_keys);
-    recover_server_storage(&storage, &trusted_keys)?;
     let source = match &config.source {
         ServeSource::FlatCache { .. } => ReadSource::FlatCache,
         #[cfg(unix)]
@@ -444,6 +443,19 @@ fn initialize_server_resources(config: &ServeConfig) -> Result<ServerResources, 
             ReadSource::ReadThrough(Box::new(source))
         }
     };
+    let recovery_required = storage
+        .recovery_required_for()
+        .map_err(|error| Error::runtime(format!("cannot inspect cache recovery state: {error}")))?;
+    if let (true, ReadSource::ReadThrough(source)) = (recovery_required, &source) {
+        source
+            .repair_recovery_blockers(&storage)
+            .map_err(|failure| {
+                Error::runtime(format!(
+                    "cannot repair read-through payloads before recovery: {failure:?}"
+                ))
+            })?;
+    }
+    recover_server_storage(&storage, &trusted_keys)?;
     Ok(ServerResources {
         storage: Arc::new(storage),
         source: Arc::new(source),
@@ -843,6 +855,146 @@ mod tests {
 
     use super::{Admissions, configure_accepted_socket, request_read_failure_outcome};
     use crate::cache::metrics::ConnectionOutcome;
+
+    #[test]
+    fn read_through_startup_repairs_missing_advertised_output_before_recovery() {
+        use clap::{Args, Command, FromArgMatches};
+        use data_encoding::BASE64;
+        use ed25519_dalek::{Signer, SigningKey};
+        use narjar::nar_encode::{Encoder, Event};
+
+        use crate::{
+            cache::{
+                narinfo::{NarInfoMetadata, TrustedPublicKeys},
+                object::{
+                    CompressionCodec, NarFileName, NarIdentity, NarRepresentation, NarSize,
+                    WireEncoding,
+                },
+                storage::{Directory, Storage, SupportedStorageBackend},
+            },
+            config::{ServeArgs, ServeConfig},
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let data_dir = temporary.path().join("cache");
+        crate::operator::initialize_cache(
+            data_dir.clone(),
+            0,
+            false,
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap();
+
+        let signer = SigningKey::from_bytes(&[19; 32]);
+        let encoded_key = format!(
+            "fixture:{}\n",
+            BASE64.encode(signer.verifying_key().as_bytes())
+        );
+        std::fs::write(data_dir.join("trusted-public-keys"), encoded_key).unwrap();
+        let trusted = TrustedPublicKeys::parse(&format!(
+            "fixture:{}",
+            BASE64.encode(signer.verifying_key().as_bytes())
+        ))
+        .unwrap();
+
+        let mut nar = Encoder::new(Vec::new()).unwrap();
+        nar.push(Event::BeginDirectory).unwrap();
+        nar.push(Event::Entry(b"payload")).unwrap();
+        nar.push(Event::BeginFile {
+            executable: false,
+            size: 4,
+        })
+        .unwrap();
+        nar.push(Event::FileChunk(b"data")).unwrap();
+        nar.push(Event::EndFile).unwrap();
+        nar.push(Event::EndDirectory).unwrap();
+        let (nar_bytes, summary) = nar.finish().unwrap();
+        let identity = NarIdentity::new(
+            crate::cache::object::NarHash::from_digest(summary.raw_sha256),
+            NarSize::new(summary.raw_size),
+        );
+        let store =
+            crate::cache::storage::StoreHash::parse("00000000000000000000000000000000").unwrap();
+        let mut metadata = NarInfoMetadata::from_store_metadata(
+            "/nix/store/00000000000000000000000000000000-startup-repair".to_owned(),
+            None,
+            None,
+            identity,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let signature = signer.sign(metadata.claims().fingerprint().as_bytes());
+        metadata.add_signature(format!("fixture:{}", BASE64.encode(&signature.to_bytes())));
+        let source_metadata = metadata
+            .serialize(NarRepresentation::Raw(identity))
+            .unwrap();
+
+        let root = Directory::open(&data_dir).unwrap();
+        let storage = Storage::open(&root, SupportedStorageBackend::FLAT).unwrap();
+        let policy = crate::cache::storage::NarUploadPolicy::new(1024 * 1024, 0);
+        storage
+            .publish_nar(
+                NarFileName::raw(identity.hash()),
+                nar_bytes.as_slice(),
+                nar_bytes.len() as u64,
+                policy,
+            )
+            .unwrap();
+        let validated = trusted.validate(&store, source_metadata).unwrap();
+        let bound = storage
+            .bind_narinfo(
+                validated,
+                WireEncoding::Compressed(CompressionCodec::Zstd),
+                policy,
+            )
+            .unwrap();
+        let output = bound.output();
+        bound.publish().unwrap();
+        let output_name = match output {
+            NarRepresentation::Compressed(compressed) => compressed.encoded().file_name(),
+            NarRepresentation::Raw(_) => panic!("the test publishes compressed output"),
+        };
+        std::fs::remove_file(data_dir.join("nar").join(output_name.to_string())).unwrap();
+        drop(storage);
+
+        let recovery_marker = std::fs::File::create(data_dir.join(".narjar-recovery")).unwrap();
+        crate::cache::filesystem::set_file_privacy(
+            &recovery_marker,
+            crate::cache::filesystem::FilePrivacy::Private,
+        )
+        .unwrap();
+        recovery_marker.sync_all().unwrap();
+        let arguments = [
+            "serve",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--serve-source",
+            "read-through",
+            "--edge-upstream",
+            "http://127.0.0.1:1",
+            "--min-free-bytes",
+            "0",
+        ];
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from(arguments)
+            .unwrap();
+        let config = ServeConfig::try_from(ServeArgs::from_arg_matches(&matches).unwrap()).unwrap();
+
+        let resources = super::initialize_server_resources(&config).unwrap();
+        assert!(!resources.storage.recovery_required_for().unwrap());
+        assert!(resources.storage.open_nar(output_name).unwrap().is_some());
+        let published = resources
+            .storage
+            .read_advertised_narinfo(&store)
+            .unwrap()
+            .unwrap();
+        let published = trusted
+            .verify_external_narinfo_for_transfer(&store, published.bytes)
+            .unwrap()
+            .into_publication();
+        assert_eq!(published.payload(), output);
+    }
 
     #[test]
     fn standalone_serving_needs_no_notification_socket() {

@@ -487,7 +487,7 @@ fn edge_tuning_environment_requires_read_through_configuration() {
 }
 
 #[test]
-fn doctor_rejects_compressed_edge_output_from_the_environment() {
+fn doctor_does_not_reject_compressed_edge_output_from_the_environment() {
     let data_dir = init_data_dir("edge-doctor-output-policy");
     for encoding in ["xz", "zstd"] {
         let output = run_with_env(
@@ -497,13 +497,14 @@ fn doctor_rejects_compressed_edge_output_from_the_environment() {
                 ("NARJAR_EGRESS_COMPRESSION", encoding),
             ],
         );
-        assert!(!output.status.success(), "compressed edge output must fail");
+        // This fixture has no trusted keys, so doctor still exits with an error.
+        // The source detail proves output encoding is no longer the error.
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["source"]["name"], "read-through");
         assert_eq!(report["source"]["severity"], "error");
         assert_eq!(
             report["source"]["detail"],
-            "read-through source requires raw output"
+            "read-through source requires trusted public keys"
         );
     }
 }

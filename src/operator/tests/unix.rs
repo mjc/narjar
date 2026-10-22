@@ -77,22 +77,6 @@ fn doctor_source_policy_errors_keep_the_existing_static_details() {
     };
     for (choice, native, encoding, backend, expected_error, detail) in [
         (
-            ServeSourceChoice::ReadThrough,
-            NativeStoreOptions::default(),
-            WireEncoding::Compressed(CompressionCodec::Zstd),
-            StorageBackend::Flat,
-            SourcePreparationError::EdgeCompressedOutput,
-            "read-through source requires raw output",
-        ),
-        (
-            ServeSourceChoice::ReadThrough,
-            NativeStoreOptions::default(),
-            WireEncoding::Compressed(CompressionCodec::Xz),
-            StorageBackend::Flat,
-            SourcePreparationError::EdgeCompressedOutput,
-            "read-through source requires raw output",
-        ),
-        (
             ServeSourceChoice::FlatCache,
             complete,
             WireEncoding::Raw,

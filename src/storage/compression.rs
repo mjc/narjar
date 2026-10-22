@@ -138,6 +138,53 @@ pub(super) struct CapacityCheckedStagingWriter<'a> {
     bytes_written: u64,
 }
 
+pub(super) struct EncodedStagingWriter<'a> {
+    destination: CapacityCheckedStagingWriter<'a>,
+    codec: CompressionCodec,
+    hasher: Sha256,
+    bytes_written: u64,
+}
+
+impl<'a> EncodedStagingWriter<'a> {
+    pub(super) fn new(
+        destination: CapacityCheckedStagingWriter<'a>,
+        codec: CompressionCodec,
+    ) -> Self {
+        Self {
+            destination,
+            codec,
+            hasher: Sha256::new(),
+            bytes_written: 0,
+        }
+    }
+
+    pub(super) fn finish(self) -> EncodedIdentity {
+        EncodedIdentity::new(
+            self.codec,
+            FileHash::from_digest(self.hasher.finalize().into()),
+            EncodedSize::new(self.bytes_written),
+        )
+    }
+}
+
+impl Write for EncodedStagingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.destination.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(written as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "encoded NAR is too large")
+            })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.destination.flush()
+    }
+}
+
 impl<'a> CapacityCheckedStagingWriter<'a> {
     pub(super) fn new(
         file: &'a mut File,
@@ -284,6 +331,46 @@ pub(super) fn receive_uploaded_nar<W: Write>(
         expectation.compressed_identity(codec),
         decoded,
     )))
+}
+
+pub(super) fn receive_uploaded_nar_while_capturing<WRaw, WEncoded>(
+    source: impl Read,
+    captured: &mut WEncoded,
+    name: NarFileName,
+    length: u64,
+    max_nar_size: u64,
+    decoder_memory_limit: DecoderMemoryLimit,
+    destination: &mut WRaw,
+) -> io::Result<ReceivedNar>
+where
+    WRaw: Write,
+    WEncoded: Write,
+{
+    let mut source = EncodedCaptureReader {
+        inner: source,
+        captured,
+    };
+    receive_uploaded_nar(
+        &mut source,
+        name,
+        length,
+        max_nar_size,
+        decoder_memory_limit,
+        destination,
+    )
+}
+
+struct EncodedCaptureReader<'capture, R, W> {
+    inner: R,
+    captured: &'capture mut W,
+}
+
+impl<R: Read, W: Write> Read for EncodedCaptureReader<'_, R, W> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.captured.write_all(&buffer[..read])?;
+        Ok(read)
+    }
 }
 
 fn copy_raw_upload_to_raw_staging<W: Write>(

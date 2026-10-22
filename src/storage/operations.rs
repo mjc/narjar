@@ -29,10 +29,12 @@ use crate::cache::{
 
 use super::{
     CleanupAction, INGESTION_RECEIPT_DIRECTORY, VALIDATION_DIRECTORY,
-    advertisement::{AdvertisementLeases, AdvertisementRemovalContext, lease_name},
+    advertisement::{
+        AdvertisementLeases, AdvertisementRemovalContext, UpstreamNarSource, lease_name,
+    },
     cache_info::{MAX_CACHE_INFO_BYTES, validate as validate_cache_info},
     capacity::{StorageCapacity, filesystem_space, reserve_staging_bytes},
-    chunk_store::{ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
+    chunk_store::{ChunkStore, ChunkStoreError, MAX_CHUNK_MANIFEST_BYTES},
     chunked::ChunkProfile,
     collection::{ActivityLease, CollectionLease, ProtectedObject},
     compression::{
@@ -46,6 +48,7 @@ use super::{
         rename_at, rollback_link_at, unlink_at,
     },
     ids::StoreHash,
+    ingest::DecodedNarIdentityRequirement,
     location::{StorePath, TemporaryPath},
     publication::{
         DestinationPublication, NEXT_TEMP, NarUploadPolicy, OwnedPublication, PublicationActivity,
@@ -211,6 +214,16 @@ impl NarMatch {
     }
 }
 
+pub(super) struct ChunkedNarUpload<'store, Source> {
+    pub(super) store: &'store ChunkStore,
+    pub(super) name: NarFileName,
+    pub(super) source: Source,
+    pub(super) expected_length: u64,
+    pub(super) policy: NarUploadPolicy,
+    pub(super) reservation: StagingReservation,
+    pub(super) identity_requirement: DecodedNarIdentityRequirement,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageReadiness {
@@ -365,11 +378,26 @@ impl PublicationProgress {
 
 impl BoundNarInfo<'_> {
     pub(crate) fn publish(self) -> Result<PublishOutcome, StorageError> {
+        self.publish_with_source(None)
+    }
+
+    pub(crate) fn publish_read_through(
+        self,
+        source: Option<UpstreamNarSource>,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.publish_with_source(source)
+    }
+
+    fn publish_with_source(
+        self,
+        source: Option<UpstreamNarSource>,
+    ) -> Result<PublishOutcome, StorageError> {
         let claims = self.claims();
+        let output = self.output();
         let bytes = self.output_bytes()?;
         self.stored()
             .storage()
-            .publish_narinfo_with_claims(claims, bytes)
+            .publish_bound_narinfo_with_claims(claims, output, bytes, source)
     }
 }
 
@@ -378,10 +406,26 @@ impl Storage {
         self.access.enable(&self.root)?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn publish_narinfo_with_claims(
         &self,
         claims: &NarInfoClaims,
         bytes: Vec<u8>,
+    ) -> Result<PublishOutcome, StorageError> {
+        self.publish_bound_narinfo_with_claims(
+            claims,
+            NarRepresentation::Raw(claims.identity()),
+            bytes,
+            None,
+        )
+    }
+
+    fn publish_bound_narinfo_with_claims(
+        &self,
+        claims: &NarInfoClaims,
+        output: NarRepresentation,
+        bytes: Vec<u8>,
+        source: Option<UpstreamNarSource>,
     ) -> Result<PublishOutcome, StorageError> {
         let _activity = self.collection.mutation()?;
         // Block reads and other publishers until retention is recorded or rollback finishes.
@@ -391,12 +435,12 @@ impl Storage {
             .map_err(|_| io::Error::other("narinfo publication lock poisoned"))?;
         let outcome = match self.publish(PublishTarget::NarInfo(claims.store()), Cursor::new(bytes))
         {
-            Err(StorageError::Conflict) if self.existing_narinfo_matches(claims)? => {
+            Err(StorageError::Conflict) if self.existing_narinfo_matches(claims, output)? => {
                 Ok(PublishOutcome::Identical)
             }
             result => result,
         }?;
-        self.record_narinfo_lease_or_remove_new_metadata(claims, outcome)
+        self.record_narinfo_lease_or_remove_new_metadata(claims, output, outcome, source)
     }
 
     pub(super) fn narinfo_publication_lock(&self, store: &StoreHash) -> Arc<RwLock<()>> {
@@ -406,9 +450,19 @@ impl Storage {
     fn record_narinfo_lease_or_remove_new_metadata(
         &self,
         claims: &NarInfoClaims,
+        output: NarRepresentation,
         outcome: PublishOutcome,
+        source: Option<UpstreamNarSource>,
     ) -> Result<PublishOutcome, StorageError> {
-        match self.record_publication_lease(*claims.store(), claims.identity()) {
+        let lease = match source {
+            Some(source) => {
+                self.record_read_through_lease(*claims.store(), claims.identity(), output, source)
+            }
+            None => {
+                self.record_publication_lease_for_output(*claims.store(), claims.identity(), output)
+            }
+        };
+        match lease {
             Ok(()) => Ok(outcome),
             Err(error) => {
                 match outcome {
@@ -423,13 +477,17 @@ impl Storage {
         }
     }
 
-    fn existing_narinfo_matches(&self, expected: &NarInfoClaims) -> Result<bool, StorageError> {
+    fn existing_narinfo_matches(
+        &self,
+        expected: &NarInfoClaims,
+        output: NarRepresentation,
+    ) -> Result<bool, StorageError> {
         let destination = PublishTarget::NarInfo(expected.store()).destination();
         let Some(file) = self.open_durable_destination(&destination)? else {
             return Ok(false);
         };
         let bytes = read_narinfo_file(file)?;
-        Ok(expected.matches_external_narinfo(bytes))
+        Ok(expected.matches_external_publication(bytes, output))
     }
 
     #[cfg(test)]
@@ -551,26 +609,33 @@ impl Storage {
                 let complete = receiving.receive(source)?;
                 complete.commit()
             }
-            PayloadStorage::Chunked(store) => self.publish_chunked_nar_with_staging(
-                store,
-                name,
-                source,
-                expected_length,
-                policy,
-                staging,
-            ),
+            PayloadStorage::Chunked(store) => {
+                self.publish_chunked_nar_with_staging(ChunkedNarUpload {
+                    store,
+                    name,
+                    source,
+                    expected_length,
+                    policy,
+                    reservation: staging,
+                    identity_requirement: DecodedNarIdentityRequirement::NotProvidedByTheCaller,
+                })
+            }
         }
     }
 
-    fn publish_chunked_nar_with_staging(
+    pub(super) fn publish_chunked_nar_with_staging<Source: Read>(
         &self,
-        store: &super::chunk_store::ChunkStore,
-        name: NarFileName,
-        source: impl Read,
-        expected_length: u64,
-        policy: NarUploadPolicy,
-        reservation: StagingReservation,
+        upload: ChunkedNarUpload<'_, Source>,
     ) -> Result<PublishOutcome, StorageError> {
+        let ChunkedNarUpload {
+            store,
+            name,
+            source,
+            expected_length,
+            policy,
+            reservation,
+            identity_requirement,
+        } = upload;
         let activity = self.collection.mutation()?;
         let mut destination = store
             .begin_ingest_with_reservation(
@@ -587,6 +652,7 @@ impl Storage {
             policy.decoder_memory_limit,
             &mut destination,
         )?;
+        identity_requirement.verify(received.identity())?;
         let completed = destination
             .finish(received.identity())
             .map_err(storage_error_for_chunk_store)?;
@@ -630,12 +696,16 @@ impl Storage {
     }
 
     /// Match signed NarHash and NarSize to the stored raw NAR, regardless of upload compression.
-    pub(crate) fn bind_canonical_narinfo(
+    pub(crate) fn bind_read_through_narinfo(
         &self,
         narinfo: ValidatedNarInfo,
+        output_encoding: WireEncoding,
+        policy: NarUploadPolicy,
     ) -> Result<BoundNarInfo<'_>, StorageError> {
-        let output = NarRepresentation::Raw(narinfo.claims().identity());
-        let stored = self.open_verified_canonical_nar(output)?;
+        let canonical = NarRepresentation::Raw(narinfo.claims().identity());
+        let upstream = narinfo.payload();
+        let stored = self.open_verified_canonical_nar(canonical)?;
+        let output = self.select_read_through_egress(&stored, upstream, output_encoding, policy)?;
         narinfo
             .bind_to_stored_nar(stored, output)
             .map_err(|_| StorageError::NarMismatch)
@@ -1134,7 +1204,8 @@ impl Storage {
             }
             DestinationPublication::Link
             | DestinationPublication::Replace
-            | DestinationPublication::Repair(_) => self.collection.mutation(),
+            | DestinationPublication::Repair(_)
+            | DestinationPublication::RepairCanonical(_) => self.collection.mutation(),
         }
     }
 
@@ -1148,8 +1219,10 @@ impl Storage {
         progress: &mut PublicationProgress,
     ) -> Result<PublishOutcome, StorageError> {
         match destination.publication {
-            DestinationPublication::Link | DestinationPublication::Repair(_) => self
-                .with_destination_lock(destination, || {
+            DestinationPublication::Link
+            | DestinationPublication::Repair(_)
+            | DestinationPublication::RepairCanonical(_) => {
+                self.with_destination_lock(destination, || {
                     self.publish_temporary_and_finalize_destination(
                         destination,
                         destination_directory,
@@ -1158,7 +1231,8 @@ impl Storage {
                         checkpoint,
                         progress,
                     )
-                }),
+                })
+            }
             DestinationPublication::Replace | DestinationPublication::RenewAdvertisement(_) => self
                 .publish_temporary_and_finalize_destination(
                     destination,
@@ -1258,6 +1332,50 @@ impl Storage {
                     temp,
                     output,
                 ),
+            DestinationPublication::RepairCanonical(identity) => self
+                .repair_canonical_nar_while_destination_is_locked(
+                    destination,
+                    destination_directory,
+                    temp,
+                    identity,
+                ),
+        }
+    }
+
+    fn repair_canonical_nar_while_destination_is_locked(
+        &self,
+        destination: &PublicationDestination,
+        destination_directory: &File,
+        temp: &TemporaryFile,
+        identity: NarIdentity,
+    ) -> Result<DestinationPublicationAttempt, StorageError> {
+        match open_regular_at(destination_directory, destination.path.name()) {
+            Ok(file) if nar_file_matches(&file, NarRepresentation::Raw(identity))? => {
+                Ok(DestinationPublicationAttempt::Existing)
+            }
+            Ok(_) => {
+                rename_at(
+                    &temp.directory,
+                    &temp.name,
+                    destination_directory,
+                    destination.path.name(),
+                )?;
+                Ok(DestinationPublicationAttempt::Repaired(
+                    TemporaryLocation::Destination,
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                rename_at(
+                    &temp.directory,
+                    &temp.name,
+                    destination_directory,
+                    destination.path.name(),
+                )?;
+                Ok(DestinationPublicationAttempt::Created(
+                    TemporaryLocation::Destination,
+                ))
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1489,7 +1607,7 @@ impl Storage {
         )
     }
 
-    fn publish_ingestion_receipt_for_received_nar(
+    pub(super) fn publish_ingestion_receipt_for_received_nar(
         &self,
         received: ReceivedNar,
     ) -> Result<(), StorageError> {

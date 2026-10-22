@@ -10,14 +10,20 @@ use std::{
 
 use data_encoding::BASE64;
 use ed25519_dalek::{Signer, SigningKey};
+use lzma_rust2::{XzOptions, XzWriter};
 use narjar::nar_encode::{Encoder, Event};
+use sha2::{Digest, Sha256};
+use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
 use tempfile::TempDir;
 
 use crate::cache::{
     nar_compression::encode_and_measure_nar,
     narinfo::NarInfoMetadata,
-    object::{CompressionCodec, EncodedIdentity, FileHash, NarHash, NarIdentity, NarSize},
-    storage::{CacheCreation, Directory, SupportedStorageBackend},
+    object::{
+        CompressionCodec, EncodedIdentity, EncodedSize, FileHash, NarFileName, NarHash,
+        NarIdentity, NarSize,
+    },
+    storage::{CacheCreation, Directory, EGRESS_RECEIPT_DIRECTORY, SupportedStorageBackend},
 };
 
 const STORE: &str = "00000000000000000000000000000000";
@@ -33,8 +39,25 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_file_data(&[])
+    }
+
+    fn with_file_data(data: &[u8]) -> Self {
         let mut encoder = Encoder::new(Vec::new()).unwrap();
         encoder.push(Event::BeginDirectory).unwrap();
+        if !data.is_empty() {
+            encoder.push(Event::Entry(b"payload")).unwrap();
+            encoder
+                .push(Event::BeginFile {
+                    executable: false,
+                    size: data.len() as u64,
+                })
+                .unwrap();
+            for chunk in data.chunks(64 * 1024) {
+                encoder.push(Event::FileChunk(chunk)).unwrap();
+            }
+            encoder.push(Event::EndFile).unwrap();
+        }
         encoder.push(Event::EndDirectory).unwrap();
         let (raw, summary) = encoder.finish().unwrap();
         let identity = NarIdentity::new(
@@ -82,6 +105,26 @@ impl Fixture {
             .replace(&old_url, &format!("URL: {url}\n"))
             .into_bytes()
     }
+
+    fn metadata_with_claimed_identity(
+        store: &str,
+        claimed: NarIdentity,
+        payload: NarRepresentation,
+        signer: &SigningKey,
+    ) -> Vec<u8> {
+        let mut metadata = NarInfoMetadata::from_store_metadata(
+            format!("/nix/store/{store}-fixture"),
+            None,
+            None,
+            claimed,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let signature = signer.sign(metadata.claims().fingerprint().as_bytes());
+        metadata.add_signature(format!("fixture:{}", BASE64.encode(&signature.to_bytes())));
+        metadata.serialize(payload).unwrap()
+    }
 }
 
 fn signing_key() -> SigningKey {
@@ -99,8 +142,13 @@ fn trusted_keys() -> Arc<TrustedPublicKeys> {
 }
 
 fn settings(upstream: HttpUrl) -> EdgeSettings {
+    settings_with_egress(upstream, WireEncoding::Raw)
+}
+
+fn settings_with_egress(upstream: HttpUrl, egress_compression: WireEncoding) -> EdgeSettings {
     EdgeSettings {
         upstream,
+        egress_compression,
         lease_seconds: NonZeroU64::new(60).unwrap(),
         max_fills: NonZeroUsize::new(8).unwrap(),
         request_workers: NonZeroUsize::new(16).unwrap(),
@@ -127,12 +175,54 @@ fn storage() -> (TempDir, Storage) {
 }
 
 fn source(upstream: &Upstream) -> ReadThroughSource {
+    source_with_egress(upstream, WireEncoding::Raw)
+}
+
+fn source_with_egress(upstream: &Upstream, egress_compression: WireEncoding) -> ReadThroughSource {
     ReadThroughSource::new(
-        settings(upstream.url()),
+        settings_with_egress(upstream.url(), egress_compression),
         trusted_keys(),
         NarUploadPolicy::new(1024 * 1024, 0),
     )
     .unwrap()
+}
+
+fn nondefault_upstream_encoding(raw: &[u8], codec: CompressionCodec) -> (Vec<u8>, EncodedIdentity) {
+    let mut encoded = Vec::new();
+    match codec {
+        CompressionCodec::Xz => {
+            let mut encoder = XzWriter::new(&mut encoded, XzOptions::with_preset(6)).unwrap();
+            encoder.write_all(raw).unwrap();
+            encoder.finish().unwrap();
+        }
+        CompressionCodec::Zstd => {
+            let mut encoder = StreamingEncoder::new(&mut encoded, CompressionLevel::Best);
+            encoder.write_all(raw).unwrap();
+            encoder.finish().unwrap();
+        }
+    }
+    let identity = EncodedIdentity::new(
+        codec,
+        FileHash::from_digest(Sha256::digest(&encoded).into()),
+        EncodedSize::new(encoded.len() as u64),
+    );
+    (encoded, identity)
+}
+
+fn zstd_upstream_encoding(
+    raw: &[u8],
+    level: structured_zstd::encoding::CompressionLevel,
+) -> (Vec<u8>, EncodedIdentity) {
+    let mut encoded = Vec::new();
+    let mut encoder = StreamingEncoder::new(&mut encoded, level);
+    encoder.write_all(raw).unwrap();
+    encoder.finish().unwrap();
+    let identity = EncodedIdentity::new(
+        CompressionCodec::Zstd,
+        FileHash::from_digest(Sha256::digest(&encoded).into()),
+        EncodedSize::new(encoded.len() as u64),
+    );
+    (encoded, identity)
 }
 
 struct Upstream {
@@ -312,9 +402,13 @@ struct Gate {
 
 impl Gate {
     fn wait(&self) {
+        self.wait_until_released(TEST_TIMEOUT);
+    }
+
+    fn wait_until_released(&self, timeout: Duration) {
         let (open, _) = self
             .changed
-            .wait_timeout_while(self.open.lock().unwrap(), TEST_TIMEOUT, |open| !*open)
+            .wait_timeout_while(self.open.lock().unwrap(), timeout, |open| !*open)
             .unwrap();
         assert!(*open, "test did not release the upstream gate");
     }
@@ -326,7 +420,11 @@ impl Gate {
 }
 
 fn wait_for(condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    wait_for_within(TEST_TIMEOUT, condition);
+}
+
+fn wait_for_within(timeout: Duration, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
     while !condition() {
         assert!(Instant::now() < deadline, "expected overlap did not occur");
         thread::yield_now();
@@ -338,6 +436,7 @@ fn empty_trust_is_rejected_before_any_fill() {
     let result = ReadThroughSource::new(
         EdgeSettings {
             upstream: "http://127.0.0.1:1".parse().unwrap(),
+            egress_compression: WireEncoding::Raw,
             lease_seconds: NonZeroU64::new(60).unwrap(),
             max_fills: NonZeroUsize::new(1).unwrap(),
             request_workers: NonZeroUsize::new(2).unwrap(),
@@ -353,26 +452,44 @@ fn empty_trust_is_rejected_before_any_fill() {
 }
 
 #[test]
-fn offline_repair_rejects_compressed_publications_in_a_raw_only_edge() {
+fn offline_repair_preserves_the_existing_compressed_output() {
     let fixture = Fixture::new();
     let (directory, storage) = storage();
+    let policy = NarUploadPolicy::new(1024 * 1024, 0);
     storage
         .publish_nar(
             crate::cache::object::NarFileName::raw(fixture.identity.hash()),
             fixture.raw.as_slice(),
             fixture.raw.len() as u64,
-            NarUploadPolicy::new(1024 * 1024, 0),
+            policy,
         )
         .unwrap();
-    let compressed = fixture.metadata(
-        STORE,
-        NarRepresentation::compressed(fixture.encoded, fixture.identity),
-        &signing_key(),
-    );
     let store = StoreHash::parse(STORE).unwrap();
-    fs::write(
-        directory.path().join(format!("{STORE}.narinfo")),
-        &compressed,
+    let metadata = trusted_keys()
+        .validate(
+            &store,
+            fixture.metadata(
+                STORE,
+                NarRepresentation::Raw(fixture.identity),
+                &signing_key(),
+            ),
+        )
+        .unwrap();
+    let bound = storage
+        .bind_narinfo(
+            metadata,
+            WireEncoding::Compressed(fixture.encoded.codec()),
+            policy,
+        )
+        .unwrap();
+    let output = bound.output();
+    bound.publish().unwrap();
+    let compressed = fs::read(directory.path().join(format!("{STORE}.narinfo"))).unwrap();
+    fs::remove_file(
+        directory
+            .path()
+            .join(".narjar-advertisements")
+            .join(format!("{STORE}.lease")),
     )
     .unwrap();
     let source = ReadThroughSource::new(
@@ -381,23 +498,83 @@ fn offline_repair_rejects_compressed_publications_in_a_raw_only_edge() {
         NarUploadPolicy::new(1024 * 1024, 0),
     )
     .unwrap();
-    assert_eq!(
-        source.ensure_local(&storage, &store),
-        Err(EdgeMiss::Failed(EdgeFailure::Invalid))
-    );
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Local));
     assert!(matches!(
         storage.advertisement_evidence(store).unwrap(),
-        AdvertisementEvidence::Missing
+        AdvertisementEvidence::Recorded
     ));
     assert_eq!(
         fs::read(directory.path().join(format!("{STORE}.narinfo"))).unwrap(),
         compressed,
-        "raw-only mode must not overwrite immutable metadata"
+        "repair must preserve the representation already published"
     );
+    let output_file = match output {
+        NarRepresentation::Compressed(compressed) => compressed.encoded().file_name(),
+        NarRepresentation::Raw(_) => panic!("test selected compressed egress"),
+    };
+    assert!(storage.open_nar(output_file).unwrap().is_some());
 }
 
 #[test]
-fn recorded_leases_do_not_make_compressed_metadata_a_raw_edge_advertisement() {
+fn recovery_uses_the_recorded_upstream_url_to_repair_a_corrupt_canonical_nar() {
+    let fixture = Fixture::new();
+    let compressed = NarRepresentation::compressed(fixture.encoded, fixture.identity);
+    let expected_resource = "objects/fixture.zst?token=keep-this-query";
+    let metadata = fixture.metadata(STORE, compressed, &signing_key());
+    let metadata = String::from_utf8(metadata)
+        .unwrap()
+        .replace(
+            &format!("URL: nar/{}", fixture.encoded.file_name()),
+            &format!("URL: {expected_resource}"),
+        )
+        .into_bytes();
+    let compressed_bytes = fixture.compressed.clone();
+    let upstream = Upstream::new(move |route, stream| {
+        if route.ends_with(".narinfo") {
+            reply(stream, 200, &metadata);
+        } else if route.ends_with(expected_resource) {
+            reply(stream, 200, &compressed_bytes);
+        } else {
+            reply(stream, 404, b"");
+        }
+    });
+    let source = source_with_egress(&upstream, WireEncoding::Raw);
+    let (directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
+    assert_eq!(
+        storage.read_through_source(store).unwrap().unwrap().url(),
+        upstream
+            .url()
+            .resolve_trusted_cache_resource(expected_resource)
+            .unwrap()
+            .as_str()
+    );
+
+    fs::write(
+        directory
+            .path()
+            .join("nar")
+            .join(NarFileName::raw(fixture.identity.hash()).to_string()),
+        b"corrupt canonical NAR",
+    )
+    .unwrap();
+    source.repair_recovery_blockers(&storage).unwrap();
+
+    let mut repaired = storage
+        .open_nar(NarFileName::raw(fixture.identity.hash()))
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    repaired.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, fixture.raw);
+    assert_eq!(upstream.count(".narinfo"), 1);
+    assert_eq!(upstream.count(expected_resource), 2);
+}
+
+#[test]
+fn recorded_leases_serve_compressed_metadata_without_upstream_access() {
     use crate::cache::object::{NarFileName, WireEncoding};
     let fixture = Fixture::new();
     let (_directory, storage) = storage();
@@ -440,9 +617,12 @@ fn recorded_leases_do_not_make_compressed_metadata_a_raw_edge_advertisement() {
         storage.advertisement_evidence(store).unwrap(),
         AdvertisementEvidence::Recorded
     ));
-    assert_eq!(
-        source.advertise(&storage, &store).err(),
-        Some(EdgeMiss::Failed(EdgeFailure::Invalid))
+    let (advertisement, hit) = source.advertise(&storage, &store).unwrap();
+    assert_eq!(hit, EdgeHit::Local);
+    assert!(
+        std::str::from_utf8(&advertisement.bytes)
+            .unwrap()
+            .contains("Compression: zstd\n")
     );
 }
 
@@ -525,6 +705,289 @@ fn overlapping_store_requests_make_one_upstream_generation_and_local_hits_stay_o
         .read_to_end(&mut bytes)
         .unwrap();
     assert_eq!(bytes, fixture.raw);
+}
+
+#[test]
+fn compressed_egress_preserves_exact_matching_upstream_bytes() {
+    for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
+        let data = (0..512 * 1024)
+            .map(|index| ((index * 31 + index / 251) % 251) as u8)
+            .collect::<Vec<_>>();
+        let fixture = Fixture::with_file_data(&data);
+        let (encoded_bytes, encoded_identity) = nondefault_upstream_encoding(&fixture.raw, codec);
+        let payload = NarRepresentation::compressed(encoded_identity, fixture.identity);
+        let metadata = fixture.metadata_with_download_url(
+            STORE,
+            payload,
+            &signing_key(),
+            "objects/source.nar?token=one",
+        );
+        let upstream = {
+            let encoded_bytes = encoded_bytes.clone();
+            Upstream::new(move |route, stream| {
+                if route.ends_with(".narinfo") {
+                    reply(stream, 200, &metadata);
+                } else if route.ends_with("/objects/source.nar?token=one") {
+                    reply(stream, 200, &encoded_bytes);
+                } else {
+                    reply(stream, 404, b"");
+                }
+            })
+        };
+        let source = source_with_egress(&upstream, WireEncoding::Compressed(codec));
+        let (directory, storage) = storage();
+        let store = StoreHash::parse(STORE).unwrap();
+
+        assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
+        let published = {
+            let advertisement = storage.read_advertised_narinfo(&store).unwrap().unwrap();
+            String::from_utf8(advertisement.bytes).unwrap()
+        };
+        let verified = trusted_keys()
+            .verify_external_narinfo_for_transfer(&store, published.as_bytes().to_vec())
+            .unwrap()
+            .into_publication();
+        assert_eq!(verified.claims().identity(), fixture.identity);
+        assert_eq!(
+            verified.payload(),
+            NarRepresentation::compressed(encoded_identity, fixture.identity)
+        );
+        assert!(published.contains(&format!(
+            "Compression: {}\n",
+            WireEncoding::from(codec).compression()
+        )));
+        assert!(published.contains(&format!("FileHash: sha256:{}\n", encoded_identity.hash())));
+        assert!(published.contains(&format!("FileSize: {}\n", encoded_identity.size().get())));
+
+        let mut stored = storage
+            .open_nar(encoded_identity.file_name())
+            .unwrap()
+            .unwrap();
+        let mut stored_bytes = Vec::new();
+        stored.read_to_end(&mut stored_bytes).unwrap();
+        assert_eq!(stored_bytes, encoded_bytes);
+        assert_eq!(storage.egress_generations(), 0);
+
+        fs::remove_file(
+            directory
+                .path()
+                .join(EGRESS_RECEIPT_DIRECTORY)
+                .join(format!(
+                    "{}{}.receipt",
+                    fixture.identity.hash(),
+                    codec.suffix()
+                )),
+        )
+        .unwrap();
+        fs::remove_file(
+            directory
+                .path()
+                .join(".narjar-advertisements")
+                .join(format!("{STORE}.lease")),
+        )
+        .unwrap();
+        fs::remove_file(
+            directory
+                .path()
+                .join("nar")
+                .join(encoded_identity.file_name().to_string()),
+        )
+        .unwrap();
+
+        drop(storage);
+        let storage = Storage::open(
+            &Directory::open(directory.path()).unwrap(),
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap();
+        assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Local));
+        assert_eq!(
+            storage.egress_generations(),
+            1,
+            "the local encoder is checked before fetching a non-reproducible derivative"
+        );
+        let mut stored = storage
+            .open_nar(encoded_identity.file_name())
+            .unwrap()
+            .unwrap();
+        let mut stored_bytes = Vec::new();
+        stored.read_to_end(&mut stored_bytes).unwrap();
+        assert_eq!(stored_bytes, encoded_bytes);
+
+        stored_bytes[0] ^= 0x01;
+        fs::write(
+            directory
+                .path()
+                .join("nar")
+                .join(encoded_identity.file_name().to_string()),
+            &stored_bytes,
+        )
+        .unwrap();
+        drop(storage);
+        let storage = Storage::open(
+            &Directory::open(directory.path()).unwrap(),
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap();
+        assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Local));
+        assert_eq!(storage.egress_generations(), 1);
+        let mut stored = storage
+            .open_nar(encoded_identity.file_name())
+            .unwrap()
+            .unwrap();
+        stored_bytes.clear();
+        stored.read_to_end(&mut stored_bytes).unwrap();
+        assert_eq!(stored_bytes, encoded_bytes);
+        assert_eq!(upstream.count("objects/source.nar?token=one"), 3);
+    }
+}
+
+#[test]
+fn cached_raw_nar_still_fetches_the_exact_upstream_compressed_output() {
+    for codec in [CompressionCodec::Xz, CompressionCodec::Zstd] {
+        let fixture = Fixture::new();
+        let (encoded_bytes, encoded_identity) = nondefault_upstream_encoding(&fixture.raw, codec);
+        let payload = NarRepresentation::compressed(encoded_identity, fixture.identity);
+        let metadata = fixture.metadata(STORE, payload, &signing_key());
+        let upstream = {
+            let encoded_bytes = encoded_bytes.clone();
+            Upstream::new(move |route, stream| {
+                if route.ends_with(".narinfo") {
+                    reply(stream, 200, &metadata);
+                } else if route.ends_with(codec.suffix()) {
+                    reply(stream, 200, &encoded_bytes);
+                } else {
+                    reply(stream, 404, b"");
+                }
+            })
+        };
+        let source = source_with_egress(&upstream, WireEncoding::Compressed(codec));
+        let (_directory, storage) = storage();
+        storage
+            .publish_nar(
+                crate::cache::object::NarFileName::raw(fixture.identity.hash()),
+                fixture.raw.as_slice(),
+                fixture.raw.len() as u64,
+                NarUploadPolicy::new(1024 * 1024, 0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap()),
+            Ok(EdgeHit::Filled)
+        );
+        assert_eq!(upstream.count(codec.suffix()), 1);
+        let mut stored = storage
+            .open_nar(encoded_identity.file_name())
+            .unwrap()
+            .unwrap();
+        let mut actual = Vec::new();
+        stored.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, encoded_bytes);
+        assert_eq!(storage.egress_generations(), 0);
+    }
+}
+
+#[test]
+fn decoded_identity_mismatch_publishes_neither_raw_nar_nor_retained_encoding() {
+    let fixture = Fixture::new();
+    let (encoded_bytes, encoded_identity) =
+        nondefault_upstream_encoding(&fixture.raw, CompressionCodec::Zstd);
+    let claimed_identity =
+        NarIdentity::new(NarHash::from_digest([0x91; 32]), fixture.identity.size());
+    let payload = NarRepresentation::compressed(encoded_identity, claimed_identity);
+    let metadata =
+        Fixture::metadata_with_claimed_identity(STORE, claimed_identity, payload, &signing_key());
+    let upstream = Upstream::new(move |route, stream| {
+        if route.ends_with(".narinfo") {
+            reply(stream, 200, &metadata);
+        } else if route.ends_with(".nar.zst") {
+            reply(stream, 200, &encoded_bytes);
+        } else {
+            reply(stream, 404, b"");
+        }
+    });
+    let source = source_with_egress(&upstream, WireEncoding::Compressed(CompressionCodec::Zstd));
+    let (_directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(
+        source.ensure_local(&storage, &store),
+        Err(EdgeMiss::Failed(EdgeFailure::Invalid))
+    );
+    assert!(
+        storage
+            .open_nar(NarFileName::raw(fixture.identity.hash()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .open_nar(encoded_identity.file_name())
+            .unwrap()
+            .is_none()
+    );
+    assert!(storage.open_narinfo(&store).unwrap().is_none());
+    assert!(matches!(
+        storage.advertisement_evidence(store).unwrap(),
+        AdvertisementEvidence::Missing
+    ));
+}
+
+#[test]
+fn changing_egress_policy_does_not_strand_an_existing_advertisement() {
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata(
+        STORE,
+        NarRepresentation::Raw(fixture.identity),
+        &signing_key(),
+    );
+    let upstream = Upstream::new(move |route, stream| {
+        if route.ends_with(".narinfo") {
+            reply(stream, 200, &metadata);
+        } else if route.ends_with(".nar") {
+            reply(stream, 200, &fixture.raw);
+        } else {
+            reply(stream, 404, b"");
+        }
+    });
+    let raw_source = source(&upstream);
+    let compressed_source =
+        source_with_egress(&upstream, WireEncoding::Compressed(CompressionCodec::Zstd));
+    let (directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(
+        raw_source.ensure_local(&storage, &store),
+        Ok(EdgeHit::Filled)
+    );
+    let original = storage
+        .read_advertised_narinfo(&store)
+        .unwrap()
+        .unwrap()
+        .bytes;
+    let (advertisement, hit) = compressed_source.advertise(&storage, &store).unwrap();
+    assert_eq!(hit, EdgeHit::Local);
+    assert_eq!(advertisement.bytes, original);
+
+    fs::remove_file(
+        directory
+            .path()
+            .join(".narjar-advertisements")
+            .join(format!("{STORE}.lease")),
+    )
+    .unwrap();
+    assert_eq!(
+        compressed_source.ensure_local(&storage, &store),
+        Ok(EdgeHit::Local)
+    );
+    let repaired = storage
+        .read_advertised_narinfo(&store)
+        .unwrap()
+        .unwrap()
+        .bytes;
+    assert_eq!(repaired, original);
+    assert_eq!(storage.egress_generations(), 0);
 }
 
 #[test]
@@ -883,6 +1346,186 @@ fn aliases_with_different_encodings_share_one_logical_payload_fill() {
 }
 
 #[test]
+fn compressed_aliases_share_one_exact_retained_download() {
+    let data = (0..256 * 1024)
+        .map(|index| ((index * 17 + index / 193) % 251) as u8)
+        .collect::<Vec<_>>();
+    let fixture = Fixture::with_file_data(&data);
+    let encoded = nondefault_upstream_encoding(&fixture.raw, CompressionCodec::Zstd);
+    let payload = NarRepresentation::compressed(encoded.1, fixture.identity);
+    let primary_metadata = fixture.metadata(STORE, payload, &signing_key());
+    let alias_metadata = fixture.metadata(ALIAS, payload, &signing_key());
+    let metadata_overlap = Arc::new(Barrier::new(2));
+    let gate = Arc::new(Gate::default());
+    let upstream = {
+        let (metadata_overlap, gate) = (metadata_overlap.clone(), gate.clone());
+        let (primary, alias, encoded_bytes) = (primary_metadata, alias_metadata, encoded.0.clone());
+        Upstream::new(move |route, stream| {
+            if route.ends_with(".narinfo") {
+                metadata_overlap.wait();
+                reply(
+                    stream,
+                    200,
+                    if route.contains(STORE) {
+                        &primary
+                    } else {
+                        &alias
+                    },
+                );
+            } else {
+                gate.wait();
+                reply(stream, 200, &encoded_bytes);
+            }
+        })
+    };
+    let source = source_with_egress(&upstream, WireEncoding::Compressed(CompressionCodec::Zstd));
+    let (_directory, storage) = storage();
+    thread::scope(|scope| {
+        let calls = [STORE, ALIAS]
+            .into_iter()
+            .map(|hash| {
+                let (source, storage) = (&source, &storage);
+                scope.spawn(move || source.ensure_local(storage, &StoreHash::parse(hash).unwrap()))
+            })
+            .collect::<Vec<_>>();
+        wait_for(|| upstream.count(".narinfo") == 2);
+        wait_for(|| source.counters.followers.load(Ordering::Relaxed) == 1);
+        gate.release();
+        calls
+            .into_iter()
+            .for_each(|call| assert!(call.join().unwrap().is_ok()));
+    });
+
+    assert_eq!(upstream.count(".nar.zst"), 1);
+    assert_eq!(storage.egress_generations(), 0);
+    for hash in [STORE, ALIAS] {
+        let store = StoreHash::parse(hash).unwrap();
+        let advertisement = storage.read_advertised_narinfo(&store).unwrap().unwrap();
+        let verified = trusted_keys()
+            .verify_external_narinfo_for_transfer(&store, advertisement.bytes)
+            .unwrap()
+            .into_publication();
+        assert_eq!(verified.payload(), payload);
+    }
+    let mut stored = storage.open_nar(encoded.1.file_name()).unwrap().unwrap();
+    let mut actual = Vec::new();
+    stored.read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, encoded.0);
+}
+
+#[test]
+fn aliases_with_distinct_compressed_encodings_retain_each_requested_identity() {
+    let data = (0..512 * 1024)
+        .map(|index| ((index * 31 + index / 127) % 251) as u8)
+        .collect::<Vec<_>>();
+    let fixture = Fixture::with_file_data(&data);
+    let (primary_bytes, primary_encoded) =
+        zstd_upstream_encoding(&fixture.raw, CompressionLevel::Best);
+    let (alias_bytes, alias_encoded) =
+        zstd_upstream_encoding(&fixture.raw, CompressionLevel::Fastest);
+    assert_ne!(primary_encoded, alias_encoded);
+    let primary_payload = NarRepresentation::compressed(primary_encoded, fixture.identity);
+    let alias_payload = NarRepresentation::compressed(alias_encoded, fixture.identity);
+    let primary_metadata = fixture.metadata(STORE, primary_payload, &signing_key());
+    let alias_metadata = fixture.metadata(ALIAS, alias_payload, &signing_key());
+    let metadata_overlap = Arc::new(Barrier::new(2));
+    let gate = Arc::new(Gate::default());
+    let upstream = {
+        let (metadata_overlap, gate) = (metadata_overlap.clone(), gate.clone());
+        let (primary_name, alias_name) = (
+            primary_encoded.file_name().to_string(),
+            alias_encoded.file_name().to_string(),
+        );
+        let (primary_bytes, alias_bytes) = (primary_bytes.clone(), alias_bytes.clone());
+        Upstream::new(move |route, stream| {
+            if route.ends_with(".narinfo") {
+                metadata_overlap.wait();
+                reply(
+                    stream,
+                    200,
+                    if route.contains(STORE) {
+                        &primary_metadata
+                    } else {
+                        &alias_metadata
+                    },
+                );
+            } else {
+                gate.wait_until_released(Duration::from_secs(30));
+                let encoded = if route.ends_with(&primary_name) {
+                    &primary_bytes
+                } else if route.ends_with(&alias_name) {
+                    &alias_bytes
+                } else {
+                    reply(stream, 404, b"");
+                    return;
+                };
+                reply(stream, 200, encoded);
+            }
+        })
+    };
+    let mut edge_settings = settings_with_egress(
+        upstream.url(),
+        WireEncoding::Compressed(CompressionCodec::Zstd),
+    );
+    edge_settings.fill_timeout = Duration::from_secs(30);
+    let source = ReadThroughSource::new(
+        edge_settings,
+        trusted_keys(),
+        NarUploadPolicy::new(1024 * 1024, 0),
+    )
+    .unwrap();
+    let (_directory, storage) = storage();
+
+    thread::scope(|scope| {
+        let primary =
+            scope.spawn(|| source.ensure_local(&storage, &StoreHash::parse(STORE).unwrap()));
+        wait_for(|| upstream.count(".narinfo") == 1);
+        let alias =
+            scope.spawn(|| source.ensure_local(&storage, &StoreHash::parse(ALIAS).unwrap()));
+        wait_for(|| upstream.count(".narinfo") == 2);
+        wait_for_within(Duration::from_secs(30), || {
+            source.counters.followers.load(Ordering::Relaxed) == 1
+        });
+        gate.release();
+        let primary_result = primary.join().unwrap();
+        let alias_result = alias.join().unwrap();
+        assert_eq!(
+            primary_result,
+            Ok(EdgeHit::Filled),
+            "primary failed; requests: {:?}",
+            upstream.requests.lock().unwrap()
+        );
+        assert_eq!(
+            alias_result,
+            Ok(EdgeHit::Filled),
+            "alias failed; requests: {:?}",
+            upstream.requests.lock().unwrap()
+        );
+    });
+
+    assert_eq!(upstream.count(".nar.zst"), 2);
+    assert_eq!(storage.egress_generations(), 0);
+    for (hash, expected) in [(STORE, primary_payload), (ALIAS, alias_payload)] {
+        let store = StoreHash::parse(hash).unwrap();
+        let advertisement = storage.read_advertised_narinfo(&store).unwrap().unwrap();
+        let verified = trusted_keys()
+            .verify_external_narinfo_for_transfer(&store, advertisement.bytes)
+            .unwrap()
+            .into_publication();
+        assert_eq!(verified.payload(), expected);
+    }
+    for (encoded, expected) in [
+        (primary_encoded, primary_bytes),
+        (alias_encoded, alias_bytes),
+    ] {
+        let mut stored = storage.open_nar(encoded.file_name()).unwrap().unwrap();
+        let mut actual = Vec::new();
+        stored.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
 fn active_limit_rejects_unrelated_keys_while_same_store_followers_wait() {
     let fixture = Fixture::new();
     let metadata = fixture.metadata(
@@ -1047,7 +1690,7 @@ fn a_wrong_decoded_claim_cannot_poison_a_valid_claim_sharing_the_encoded_payload
         wait_for(|| upstream.count(".zst") == 1);
         let valid =
             scope.spawn(|| source.ensure_local(&storage, &StoreHash::parse(ALIAS).unwrap()));
-        wait_for(|| source.counters.followers.load(Ordering::Relaxed) == 1);
+        wait_for(|| upstream.count(".zst") == 2);
         gate.release();
         assert_eq!(
             invalid.join().unwrap(),
@@ -1055,7 +1698,7 @@ fn a_wrong_decoded_claim_cannot_poison_a_valid_claim_sharing_the_encoded_payload
         );
         assert_eq!(valid.join().unwrap(), Ok(EdgeHit::Filled));
     });
-    assert_eq!(upstream.count(".zst"), 1);
+    assert_eq!(upstream.count(".zst"), 2);
     assert!(
         storage
             .open_narinfo(&StoreHash::parse(STORE).unwrap())
@@ -1188,7 +1831,7 @@ fn a_cached_representation_failure_retries_for_a_coalesced_logical_nar() {
     let retries = AtomicUsize::new(0);
 
     let result = finish_shared_fill_or_retry_representation(
-        Key::Nar(fixture.identity.hash()),
+        Key::Nar(fixture.identity),
         Err(EdgeMiss::Cached(EdgeFailure::Transient)),
         || {
             retries.fetch_add(1, Ordering::Relaxed);

@@ -128,6 +128,7 @@ pub(super) fn reserve_staging_bytes_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::storage::publication::StagingInodeReservation;
 
     #[test]
     fn measured_inode_capacity_keeps_the_flat_doctor_json_fields() {
@@ -163,5 +164,41 @@ mod tests {
             serde_json::json!({"total_bytes": 100, "available_bytes": 40, "read_only": false})
         );
         assert_eq!(capacity.inodes.to_string(), "inode counts unavailable");
+    }
+
+    #[test]
+    fn retained_staging_reserves_its_transient_journal_draft_inode() {
+        let budget = Arc::new(Mutex::new(StagingBudget::default()));
+        let four_inodes = StorageCapacity {
+            total_bytes: 100,
+            available_bytes: 100,
+            inodes: InodeCapacity::Measured {
+                total: 5,
+                available: 4,
+            },
+            read_only: false,
+        };
+        assert!(matches!(
+            StagingInodeReservation::reserve_for_test(&budget, 5, || Ok(four_inodes)),
+            Err(StorageError::InsufficientInodes)
+        ));
+
+        let five_inodes = StorageCapacity {
+            inodes: InodeCapacity::Measured {
+                total: 5,
+                available: 5,
+            },
+            ..four_inodes
+        };
+        let mut first = StagingInodeReservation::reserve_for_test(&budget, 5, || Ok(five_inodes))
+            .expect("staging entries and a journal transition draft fit");
+        first.record_created_staging_entries(4);
+        assert!(matches!(
+            StagingInodeReservation::reserve_for_test(&budget, 5, || Ok(five_inodes)),
+            Err(StorageError::InsufficientInodes)
+        ));
+
+        drop(first);
+        assert!(StagingInodeReservation::reserve_for_test(&budget, 5, || Ok(five_inodes)).is_ok());
     }
 }

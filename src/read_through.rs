@@ -19,14 +19,15 @@ use ureq::{Agent, http::StatusCode};
 
 use crate::{
     cache::{
+        inventory::{Inventory, InventoryClass, VerificationMode},
         narinfo::{
             MAX_NARINFO_BYTES, SignatureVerifiedExternalNarInfo, TrustedPublicKeys,
-            ValidatedNarInfo, read_narinfo_file, require_raw_narinfo_transport,
+            ValidatedNarInfo, read_narinfo_file,
         },
-        object::NarRepresentation,
+        object::{CompressionCodec, EncodedIdentity, NarRepresentation, WireEncoding},
         storage::{
             AdvertisedNarInfo, AdvertisementEvidence, NarUploadPolicy, Storage, StorageError,
-            StoreHash,
+            StoreHash, UpstreamNarSource,
         },
     },
     http_client::idle_agent,
@@ -37,6 +38,41 @@ use state::{Flight, Join, Key, State};
 
 const MAX_NEGATIVE_TTL: Duration = Duration::from_secs(60);
 const MAX_UPSTREAM_REDIRECTS: usize = 5;
+
+#[derive(Clone, Copy)]
+enum EdgeOutputPlan {
+    Raw,
+    RetainUpstream(EncodedIdentity),
+    Generate(CompressionCodec),
+}
+
+impl EdgeOutputPlan {
+    const fn encoding(self) -> WireEncoding {
+        match self {
+            Self::Raw => WireEncoding::Raw,
+            Self::RetainUpstream(encoded) => WireEncoding::Compressed(encoded.codec()),
+            Self::Generate(codec) => WireEncoding::Compressed(codec),
+        }
+    }
+
+    const fn retained_encoding(self) -> Option<EncodedIdentity> {
+        match self {
+            Self::RetainUpstream(encoded) => Some(encoded),
+            Self::Raw | Self::Generate(_) => None,
+        }
+    }
+}
+
+fn compressed_edge_output(codec: CompressionCodec, payload: NarRepresentation) -> EdgeOutputPlan {
+    match payload {
+        NarRepresentation::Compressed(compressed) if compressed.encoded().codec() == codec => {
+            EdgeOutputPlan::RetainUpstream(compressed.encoded())
+        }
+        NarRepresentation::Raw(_) | NarRepresentation::Compressed(_) => {
+            EdgeOutputPlan::Generate(codec)
+        }
+    }
+}
 
 struct ResolvedUpstreamNarInfo {
     publication: ValidatedNarInfo,
@@ -67,6 +103,7 @@ impl ResolvedUpstreamNarInfo {
 #[derive(Clone, Debug)]
 pub(crate) struct EdgeSettings {
     pub(crate) upstream: HttpUrl,
+    pub(crate) egress_compression: WireEncoding,
     pub(crate) lease_seconds: NonZeroU64,
     pub(crate) max_fills: NonZeroUsize,
     pub(crate) request_workers: NonZeroUsize,
@@ -196,6 +233,7 @@ struct Counters {
 
 pub(crate) struct ReadThroughSource {
     upstream: HttpUrl,
+    egress_compression: WireEncoding,
     keys: Arc<TrustedPublicKeys>,
     policy: NarUploadPolicy,
     agent: Agent,
@@ -217,23 +255,21 @@ impl ReadThroughSource {
         store: &StoreHash,
     ) -> Result<(AdvertisedNarInfo<'storage>, EdgeHit), EdgeMiss> {
         let hit = self.ensure_local(storage, store)?;
-        self.open_raw_advertisement_after_lease_renewal(storage, store)
+        self.open_advertisement_after_lease_renewal(storage, store)
             .inspect_err(|failure| increment(&self.counters.failures[*failure]))
             .map(|advertisement| (advertisement, hit))
             .map_err(EdgeMiss::Failed)
     }
 
-    fn open_raw_advertisement_after_lease_renewal<'storage>(
+    fn open_advertisement_after_lease_renewal<'storage>(
         &self,
         storage: &'storage Storage,
         store: &StoreHash,
     ) -> Result<AdvertisedNarInfo<'storage>, EdgeFailure> {
-        let advertisement = storage
+        storage
             .read_advertised_narinfo(store)
             .map_err(EdgeFailure::ingestion)?
-            .ok_or(EdgeFailure::Storage)?;
-        require_raw_narinfo_transport(&advertisement.bytes).map_err(|_| EdgeFailure::Invalid)?;
-        Ok(advertisement)
+            .ok_or(EdgeFailure::Storage)
     }
 
     pub(crate) fn new(
@@ -261,6 +297,7 @@ impl ReadThroughSource {
         }
         Ok(Self {
             upstream: settings.upstream,
+            egress_compression: settings.egress_compression,
             keys,
             policy,
             agent: idle_agent(settings.timeout),
@@ -286,8 +323,28 @@ impl ReadThroughSource {
             .inspect_err(|miss| increment(&self.counters.failures[miss.reason()]))
     }
 
+    pub(crate) fn repair_recovery_blockers(&self, storage: &Storage) -> Result<(), EdgeFailure> {
+        let inventory =
+            Inventory::scan_storage(storage, &self.keys, VerificationMode::Availability)
+                .map_err(|_| EdgeFailure::Storage)?;
+        inventory
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.class(),
+                    InventoryClass::MissingNar | InventoryClass::HashOrSizeMismatch
+                )
+            })
+            .try_for_each(|entry| {
+                let store =
+                    StoreHash::parse(entry.identifier()).map_err(|_| EdgeFailure::Invalid)?;
+                self.repair_local(storage, &store, Deadline::new(self.fill_timeout)?)
+            })
+    }
+
     fn lookup(&self, storage: &Storage, store: &StoreHash) -> Result<EdgeHit, EdgeMiss> {
-        match Self::local_lookup(storage, store)? {
+        match self.local_lookup(storage, store)? {
             LocalLookup::Ready => {
                 increment(&self.counters.local_hits);
                 return Ok(EdgeHit::Local);
@@ -300,7 +357,7 @@ impl ReadThroughSource {
         let deadline = Deadline::new(self.fill_timeout)?;
         self.coalesce(Key::Store(*store), deadline, || {
             // Another request may have stored the object since our first lookup.
-            match Self::local_lookup(storage, store)? {
+            match self.local_lookup(storage, store)? {
                 LocalLookup::Ready => Ok(EdgeHit::Local),
                 LocalLookup::Repair => {
                     let _active = self.admit()?;
@@ -318,13 +375,27 @@ impl ReadThroughSource {
         })
     }
 
-    fn local_lookup(storage: &Storage, store: &StoreHash) -> Result<LocalLookup, EdgeFailure> {
-        if storage
+    fn local_lookup(
+        &self,
+        storage: &Storage,
+        store: &StoreHash,
+    ) -> Result<LocalLookup, EdgeFailure> {
+        let Some(file) = storage
             .open_narinfo(store)
             .map_err(|_| EdgeFailure::Storage)?
-            .is_none()
-        {
+        else {
             return Ok(LocalLookup::Missing);
+        };
+        let bytes = read_narinfo_file(file).map_err(|_| EdgeFailure::Storage)?;
+        let metadata = self
+            .keys
+            .validate(store, bytes)
+            .map_err(|_| EdgeFailure::Invalid)?;
+        if !storage
+            .read_through_payloads_are_usable(metadata.payload())
+            .map_err(EdgeFailure::ingestion)?
+        {
+            return Ok(LocalLookup::Repair);
         }
         match storage
             .advertisement_evidence(*store)
@@ -348,19 +419,89 @@ impl ReadThroughSource {
         let bytes = read_narinfo_file(file).map_err(|_| EdgeFailure::Invalid)?;
         let metadata = self
             .keys
-            .validate(store, bytes)
+            .validate(store, bytes.clone())
             .map_err(|_| EdgeFailure::Invalid)?;
-        match metadata.payload() {
-            NarRepresentation::Raw(_) => {}
-            NarRepresentation::Compressed(_) => return Err(EdgeFailure::Invalid),
-        }
-        let bound = storage
-            .bind_canonical_narinfo(metadata)
+        let output = metadata.payload();
+        let output_encoding = output.wire_encoding();
+        let mut source = storage
+            .read_through_source(*store)
             .map_err(EdgeFailure::ingestion)?;
-        deadline.remaining()?;
-        bound.publish().map_err(EdgeFailure::ingestion)?;
+        match storage.bind_read_through_narinfo(metadata, output_encoding, self.policy) {
+            Ok(bound) => {
+                bound
+                    .publish_read_through(source)
+                    .map_err(EdgeFailure::ingestion)?;
+            }
+            Err(StorageError::MissingNar | StorageError::NarMismatch) => {
+                let upstream_source = self.source_for_repair(store, output, source, deadline)?;
+                self.restore_missing_local_payload(storage, output, &upstream_source, deadline)?;
+                source = Some(upstream_source);
+                let metadata = self
+                    .keys
+                    .validate(store, bytes)
+                    .map_err(|_| EdgeFailure::Invalid)?;
+                storage
+                    .bind_read_through_narinfo(metadata, output_encoding, self.policy)
+                    .map_err(EdgeFailure::ingestion)?
+                    .publish_read_through(source)
+                    .map_err(EdgeFailure::ingestion)?;
+            }
+            Err(error) => return Err(EdgeFailure::ingestion(error)),
+        }
         deadline.remaining()?;
         Ok(())
+    }
+
+    fn source_for_repair(
+        &self,
+        store: &StoreHash,
+        output: NarRepresentation,
+        recorded: Option<UpstreamNarSource>,
+        deadline: Deadline,
+    ) -> Result<UpstreamNarSource, EdgeFailure> {
+        match recorded {
+            Some(source) if source.payload().identity() == output.identity() => Ok(source),
+            Some(_) => Err(EdgeFailure::Invalid),
+            None => {
+                let metadata = self.metadata(store, deadline)?;
+                if metadata.payload().identity() != output.identity() {
+                    return Err(EdgeFailure::Invalid);
+                }
+                UpstreamNarSource::new(metadata.payload(), metadata.download_url().as_str())
+                    .map_err(EdgeFailure::ingestion)
+            }
+        }
+    }
+
+    fn restore_missing_local_payload(
+        &self,
+        storage: &Storage,
+        published_output: NarRepresentation,
+        source: &UpstreamNarSource,
+        deadline: Deadline,
+    ) -> Result<(), EdgeFailure> {
+        let source_payload = source.payload();
+        let output_plan = match (source_payload, published_output) {
+            (NarRepresentation::Compressed(source), NarRepresentation::Compressed(output))
+                if source.encoded() == output.encoded() =>
+            {
+                EdgeOutputPlan::RetainUpstream(output.encoded())
+            }
+            (NarRepresentation::Raw(_) | NarRepresentation::Compressed(_), _) => {
+                EdgeOutputPlan::Raw
+            }
+        };
+        let download_url = self
+            .upstream
+            .resolve_trusted_cache_resource(source.url())
+            .map_err(|_| EdgeFailure::Invalid)?;
+        self.receive_encoded_representation(
+            storage,
+            source_payload,
+            output_plan,
+            &download_url,
+            deadline,
+        )
     }
 
     fn fill(
@@ -371,55 +512,128 @@ impl ReadThroughSource {
     ) -> Result<(), EdgeMiss> {
         let metadata = self.metadata(store, deadline)?;
         let payload = metadata.payload();
+        let source = UpstreamNarSource::new(payload, metadata.download_url().as_str())
+            .map_err(EdgeFailure::ingestion)?;
+        let output_plan = self.output_plan(payload);
         self.policy
             .ensure_decoded_size_within_limit(payload.identity().size())
             .map_err(EdgeFailure::ingestion)?;
-        self.coalesce(
-            Key::Nar(payload.identity().hash()),
-            deadline,
-            || match storage.ensure_canonical_nar_available(payload.identity()) {
+        self.coalesce(Key::Nar(payload.identity()), deadline, || {
+            match storage.ensure_canonical_nar_available(payload.identity()) {
                 Ok(()) => Ok(EdgeHit::Local),
                 Err(StorageError::MissingNar) => self
                     .receive_missing_canonical_nar(
                         storage,
                         payload,
+                        output_plan,
                         metadata.download_url(),
                         deadline,
                     )
                     .map(|()| EdgeHit::Filled),
                 Err(error) => Err(EdgeMiss::Failed(EdgeFailure::ingestion(error))),
-            },
+            }
+        })?;
+        self.ensure_retained_upstream_output(
+            storage,
+            payload,
+            output_plan,
+            metadata.download_url(),
+            deadline,
         )?;
         deadline.remaining()?;
         // Check the signed NarHash and NarSize against the stored uncompressed NAR,
         // even if another request downloaded it with a different compression format.
         let bound = storage
-            .bind_canonical_narinfo(metadata.into_publication())
+            .bind_read_through_narinfo(
+                metadata.into_publication(),
+                output_plan.encoding(),
+                self.policy,
+            )
             .map_err(EdgeFailure::ingestion)?;
         deadline.remaining()?;
         // Store and sync the metadata, then its retention record, before returning success.
-        bound.publish().map_err(EdgeFailure::ingestion)?;
+        bound
+            .publish_read_through(Some(source))
+            .map_err(EdgeFailure::ingestion)?;
         deadline.remaining()?;
         Ok(())
+    }
+
+    fn ensure_retained_upstream_output(
+        &self,
+        storage: &Storage,
+        payload: NarRepresentation,
+        output_plan: EdgeOutputPlan,
+        download_url: &HttpUrl,
+        deadline: Deadline,
+    ) -> Result<(), EdgeMiss> {
+        match output_plan {
+            EdgeOutputPlan::RetainUpstream(encoded) => self
+                .coalesce(
+                    Key::Representation(payload.identity(), encoded),
+                    deadline,
+                    || match storage
+                        .retained_egress_candidate_is_usable(payload.identity(), encoded)
+                    {
+                        Ok(true) => Ok(EdgeHit::Local),
+                        Ok(false) => self.receive_and_confirm_canonical_nar(
+                            storage,
+                            payload,
+                            output_plan,
+                            download_url,
+                            deadline,
+                        ),
+                        Err(error) => Err(EdgeMiss::Failed(EdgeFailure::ingestion(error))),
+                    },
+                )
+                .map(|_| ()),
+            EdgeOutputPlan::Raw | EdgeOutputPlan::Generate(_) => Ok(()),
+        }
     }
 
     fn receive_missing_canonical_nar(
         &self,
         storage: &Storage,
         payload: NarRepresentation,
+        output_plan: EdgeOutputPlan,
         download_url: &HttpUrl,
         deadline: Deadline,
     ) -> Result<(), EdgeMiss> {
-        self.coalesce(
-            Key::Representation(payload.file_name(), payload.encoded_size()),
-            deadline,
-            || {
-                self.receive_encoded_representation(storage, payload, download_url, deadline)
-                    .map_err(EdgeMiss::Failed)
-                    .map(|()| EdgeHit::Filled)
-            },
-        )?;
-        // Sharing the download does not mean sharing another request's NarHash or NarSize.
+        let receive = || {
+            self.receive_and_confirm_canonical_nar(
+                storage,
+                payload,
+                output_plan,
+                download_url,
+                deadline,
+            )
+        };
+        match payload {
+            NarRepresentation::Raw(_) => {
+                receive()?;
+            }
+            NarRepresentation::Compressed(compressed) => {
+                self.coalesce(
+                    Key::Representation(payload.identity(), compressed.encoded()),
+                    deadline,
+                    receive,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn receive_and_confirm_canonical_nar(
+        &self,
+        storage: &Storage,
+        payload: NarRepresentation,
+        output_plan: EdgeOutputPlan,
+        download_url: &HttpUrl,
+        deadline: Deadline,
+    ) -> Result<EdgeHit, EdgeMiss> {
+        self.receive_encoded_representation(storage, payload, output_plan, download_url, deadline)
+            .map_err(EdgeMiss::Failed)?;
+        // Coalescing the stream never removes the signed identity check.
         storage
             .ensure_canonical_nar_available(payload.identity())
             .map_err(|error| match error {
@@ -427,7 +641,8 @@ impl ReadThroughSource {
                     EdgeMiss::Failed(EdgeFailure::Invalid)
                 }
                 error => EdgeMiss::Failed(EdgeFailure::ingestion(error)),
-            })
+            })?;
+        Ok(EdgeHit::Filled)
     }
 
     fn metadata(
@@ -470,15 +685,23 @@ impl ReadThroughSource {
         &self,
         storage: &Storage,
         payload: NarRepresentation,
+        output_plan: EdgeOutputPlan,
         download_url: &HttpUrl,
         deadline: Deadline,
     ) -> Result<(), EdgeFailure> {
         let encoded_size = payload.encoded_size().get();
-        self.policy
+        let policy = self.policy.bounded_by_nar_size(payload.identity());
+        policy
             .ensure_encoded_size_within_limit(encoded_size)
             .map_err(EdgeFailure::ingestion)?;
-        let reservation = storage
-            .reserve_staging(encoded_size, self.policy.min_free_bytes())
+        let retention = output_plan.retained_encoding();
+        let reservations = storage
+            .reserve_read_through_staging(
+                payload.identity(),
+                encoded_size,
+                policy.min_free_bytes(),
+                retention,
+            )
             .map_err(EdgeFailure::ingestion)?;
         let name = payload.file_name();
         let response = self.get(download_url, deadline)?;
@@ -491,10 +714,17 @@ impl ReadThroughSource {
         }
         let reader = DeadlineReader::new(response.into_body().into_reader(), deadline);
         storage
-            .publish_nar_with_staging(name, reader, encoded_size, self.policy, reservation)
+            .publish_read_through_nar(name, reader, encoded_size, policy, reservations)
             .map_err(EdgeFailure::ingestion)?;
         deadline.remaining()?;
         Ok(())
+    }
+
+    fn output_plan(&self, payload: NarRepresentation) -> EdgeOutputPlan {
+        match self.egress_compression {
+            WireEncoding::Raw => EdgeOutputPlan::Raw,
+            WireEncoding::Compressed(codec) => compressed_edge_output(codec, payload),
+        }
     }
 
     fn get(
