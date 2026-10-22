@@ -503,10 +503,19 @@ impl ReadThroughSource {
         deadline: Deadline,
     ) -> Result<UpstreamNarSource, EdgeFailure> {
         let metadata = self.metadata(store, deadline)?;
-        if metadata.payload().identity() != output.identity() {
+        let payload = metadata.payload();
+        if payload.identity() != output.identity() {
             return Err(EdgeFailure::Invalid);
         }
-        let source = UpstreamNarSource::new(metadata.payload(), metadata.download_url().as_str())
+        if let NarRepresentation::Compressed(expected) = output {
+            match payload {
+                NarRepresentation::Compressed(actual) if actual == expected => {}
+                NarRepresentation::Raw(_) | NarRepresentation::Compressed(_) => {
+                    return Err(EdgeFailure::Invalid);
+                }
+            }
+        }
+        let source = UpstreamNarSource::new(payload, metadata.download_url().as_str())
             .map_err(EdgeFailure::ingestion)?;
         self.restore_missing_local_payload(storage, output, &source, deadline)?;
         Ok(source)
