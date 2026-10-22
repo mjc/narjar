@@ -405,15 +405,29 @@ fn identity_content_encoding_accepts_mixed_case_without_accepting_other_codings(
     }
 }
 
-#[derive(Default)]
 struct Gate {
     open: Mutex<bool>,
     changed: Condvar,
+    timeout: Duration,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self::with_timeout(TEST_TIMEOUT)
+    }
 }
 
 impl Gate {
+    fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+            timeout,
+        }
+    }
+
     fn wait(&self) {
-        self.wait_until_released(TEST_TIMEOUT);
+        self.wait_until_released(self.timeout);
     }
 
     fn wait_until_released(&self, timeout: Duration) {
@@ -1507,8 +1521,9 @@ fn compressed_aliases_share_one_exact_retained_download() {
     let payload = NarRepresentation::compressed(encoded.1, fixture.identity);
     let primary_metadata = fixture.metadata(STORE, payload, &signing_key());
     let alias_metadata = fixture.metadata(ALIAS, payload, &signing_key());
+    let concurrency_timeout = Duration::from_secs(30);
     let metadata_overlap = Arc::new(Barrier::new(2));
-    let gate = Arc::new(Gate::default());
+    let gate = Arc::new(Gate::with_timeout(concurrency_timeout));
     let upstream = {
         let (metadata_overlap, gate) = (metadata_overlap.clone(), gate.clone());
         let (primary, alias, encoded_bytes) = (primary_metadata, alias_metadata, encoded.0.clone());
@@ -1533,7 +1548,7 @@ fn compressed_aliases_share_one_exact_retained_download() {
     let source = source_with_egress_timeout(
         &upstream,
         WireEncoding::Compressed(CompressionCodec::Zstd),
-        Duration::from_secs(30),
+        concurrency_timeout,
     );
     let (_directory, storage) = storage();
     thread::scope(|scope| {
@@ -1544,8 +1559,10 @@ fn compressed_aliases_share_one_exact_retained_download() {
                 scope.spawn(move || source.ensure_local(storage, &StoreHash::parse(hash).unwrap()))
             })
             .collect::<Vec<_>>();
-        wait_for(|| upstream.count(".narinfo") == 2);
-        wait_for(|| source.counters.followers.load(Ordering::Relaxed) == 1);
+        wait_for_within(concurrency_timeout, || upstream.count(".narinfo") == 2);
+        wait_for_within(concurrency_timeout, || {
+            source.counters.followers.load(Ordering::Relaxed) == 1
+        });
         gate.release();
         calls.into_iter().for_each(|call| {
             let result = call.join().unwrap();
