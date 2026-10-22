@@ -6,7 +6,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::SystemTime,
@@ -60,10 +60,47 @@ pub(crate) struct ChunkStore {
     durability: ChunkDurability,
     gc_marks: Mutex<()>,
     chunk_repair_locks: [Mutex<()>; CHUNK_REPAIR_LOCK_COUNT],
+    chunk_repair_activity: [ChunkRepairActivity; CHUNK_REPAIR_LOCK_COUNT],
     verified_chunks: Mutex<VerifiedChunkProofs>,
     verified_nars: Mutex<VerifiedNarProofs>,
     #[cfg(test)]
     nar_content_hashes: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct ChunkRepairActivity {
+    generation: AtomicU64,
+    active_operations: AtomicUsize,
+    pending_markers: AtomicUsize,
+}
+
+struct ChunkRepairOperation<'store>(&'store ChunkRepairActivity);
+
+impl ChunkRepairActivity {
+    fn begin_operation(&self) -> ChunkRepairOperation<'_> {
+        self.active_operations.fetch_add(1, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        ChunkRepairOperation(self)
+    }
+
+    fn can_open_without_repair_lock(&self) -> Option<u64> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        (self.active_operations.load(Ordering::SeqCst) == 0
+            && self.pending_markers.load(Ordering::SeqCst) == 0)
+            .then_some(generation)
+    }
+
+    fn remained_quiescent(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
+            && self.active_operations.load(Ordering::SeqCst) == 0
+            && self.pending_markers.load(Ordering::SeqCst) == 0
+    }
+}
+
+impl Drop for ChunkRepairOperation<'_> {
+    fn drop(&mut self) {
+        self.0.active_operations.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +224,7 @@ impl ChunkStore {
         else {
             unreachable!("chunked selection must contain a chunk capability")
         };
+        let pending_repairs = pending_chunk_repair_counts(&chunks)?;
         Ok(Self {
             chunks,
             manifests,
@@ -194,6 +232,7 @@ impl ChunkStore {
             durability,
             gc_marks: Mutex::new(()),
             chunk_repair_locks: std::array::from_fn(|_| Mutex::new(())),
+            chunk_repair_activity: repair_activity_by_stripe(pending_repairs),
             verified_chunks: Mutex::new(VerifiedChunkProofs::default()),
             verified_nars: Mutex::new(VerifiedNarProofs::default()),
             #[cfg(test)]
@@ -206,13 +245,16 @@ impl ChunkStore {
         durability: ChunkDurability,
         activity: Arc<StorageActivity>,
     ) -> io::Result<Self> {
+        let chunks = require_directory_at(root, CHUNK_DIRECTORY)?;
+        let pending_repairs = pending_chunk_repair_counts(&chunks)?;
         Ok(Self {
-            chunks: require_directory_at(root, CHUNK_DIRECTORY)?,
+            chunks,
             manifests: require_directory_at(root, MANIFEST_DIRECTORY)?,
             activity,
             durability,
             gc_marks: Mutex::new(()),
             chunk_repair_locks: std::array::from_fn(|_| Mutex::new(())),
+            chunk_repair_activity: repair_activity_by_stripe(pending_repairs),
             verified_chunks: Mutex::new(VerifiedChunkProofs::default()),
             verified_nars: Mutex::new(VerifiedNarProofs::default()),
             #[cfg(test)]
@@ -292,6 +334,30 @@ impl ChunkStore {
     pub(crate) fn open_chunk(&self, hash: ChunkHash) -> io::Result<Option<File>> {
         let _repair_lock = self.chunk_repair_lock(hash);
         self.open_chunk_while_repair_locked(hash)
+    }
+
+    fn open_serving_chunk(&self, hash: ChunkHash) -> io::Result<Option<File>> {
+        let activity = self.chunk_repair_activity(hash);
+        if let Some(generation) = activity.can_open_without_repair_lock() {
+            let opened = self.open_chunk_without_repair_lock(hash);
+            if activity.remained_quiescent(generation) {
+                return opened;
+            }
+        }
+        self.open_chunk(hash)
+    }
+
+    fn open_chunk_without_repair_lock(&self, hash: ChunkHash) -> io::Result<Option<File>> {
+        let shard = match self.open_shard(hash) {
+            Ok(shard) => shard,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match open_regular_at(&shard, chunk_name(hash)) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn open_chunk_while_repair_locked(&self, hash: ChunkHash) -> io::Result<Option<File>> {
@@ -803,6 +869,12 @@ impl ChunkStore {
                         if marked {
                             return Ok(deleted_from_shard);
                         }
+                        let hash = parse_chunk_hash_name(&name)
+                            .expect("valid chunk names contain a SHA-256 digest");
+                        let _repair_lock = self.chunk_repair_lock(hash);
+                        self.finish_pending_chunk_repair(&shard, hash, &mut |directory| {
+                            directory.sync_all()
+                        })?;
                         unlink_at(&shard, &name)?;
                         Ok(deleted_from_shard + 1)
                     },
@@ -851,6 +923,7 @@ impl ChunkStore {
         bytes: &[u8],
         mut synchronize_shard: impl FnMut(&File) -> io::Result<()>,
     ) -> io::Result<ChunkPublication> {
+        let _repair_activity = self.chunk_repair_activity(hash).begin_operation();
         let _repair_lock = self.chunk_repair_lock(hash);
         let shard = self.open_or_create_shard(hash)?;
         self.finish_pending_chunk_repair(&shard, hash, &mut synchronize_shard)?;
@@ -903,11 +976,17 @@ impl ChunkStore {
                 false => {
                     open_regular_at(shard, temporary)?.sync_all()?;
                     let marker = create_chunk_repair_marker(&self.chunks, hash)?;
+                    self.chunk_repair_activity(hash)
+                        .pending_markers
+                        .fetch_add(1, Ordering::SeqCst);
                     marker.sync_all()?;
                     self.chunks.sync_all()?;
                     rename_at(shard, temporary, shard, &destination)?;
                     synchronize_shard(shard)?;
                     unlink_at(&self.chunks, &chunk_repair_marker_name(hash))?;
+                    self.chunk_repair_activity(hash)
+                        .pending_markers
+                        .fetch_sub(1, Ordering::SeqCst);
                     self.chunks.sync_all()?;
                     Ok(super::publication::PublishOutcome::Created)
                 }
@@ -936,6 +1015,9 @@ impl ChunkStore {
             Ok(_pending) => {
                 synchronize_shard(shard)?;
                 unlink_at(&self.chunks, &marker)?;
+                self.chunk_repair_activity(hash)
+                    .pending_markers
+                    .fetch_sub(1, Ordering::SeqCst);
                 self.chunks.sync_all()
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -944,10 +1026,14 @@ impl ChunkStore {
     }
 
     fn chunk_repair_lock(&self, hash: ChunkHash) -> MutexGuard<'_, ()> {
-        let lock = usize::from(hash.as_bytes()[0]) % CHUNK_REPAIR_LOCK_COUNT;
+        let lock = chunk_repair_stripe(hash);
         self.chunk_repair_locks[lock]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn chunk_repair_activity(&self, hash: ChunkHash) -> &ChunkRepairActivity {
+        &self.chunk_repair_activity[chunk_repair_stripe(hash)]
     }
 
     fn open_or_create_shard(&self, hash: ChunkHash) -> io::Result<File> {
@@ -1278,7 +1364,7 @@ fn open_serving_chunk(
         .checked_sub(chunk_start)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk end moved backwards"))?;
     let mut file = store
-        .open_chunk(descriptor.hash())?
+        .open_serving_chunk(descriptor.hash())?
         .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
     if file.metadata()?.len() != chunk_length {
         return Err(io::Error::new(
@@ -2011,6 +2097,68 @@ fn chunk_repair_marker_name(hash: ChunkHash) -> OsString {
     format!(".repair-{}", hex_name(*hash.as_bytes())).into()
 }
 
+fn chunk_repair_stripe(hash: ChunkHash) -> usize {
+    usize::from(hash.as_bytes()[0]) % CHUNK_REPAIR_LOCK_COUNT
+}
+
+fn repair_activity_by_stripe(
+    pending_markers: [usize; CHUNK_REPAIR_LOCK_COUNT],
+) -> [ChunkRepairActivity; CHUNK_REPAIR_LOCK_COUNT] {
+    std::array::from_fn(|stripe| ChunkRepairActivity {
+        pending_markers: AtomicUsize::new(pending_markers[stripe]),
+        ..ChunkRepairActivity::default()
+    })
+}
+
+fn pending_chunk_repair_counts(directory: &File) -> io::Result<[usize; CHUNK_REPAIR_LOCK_COUNT]> {
+    read_dir_names(directory)?.into_iter().try_fold(
+        [0_usize; CHUNK_REPAIR_LOCK_COUNT],
+        |mut counts, name| {
+            if let Some(hash) = parse_chunk_repair_marker_name(&name) {
+                let stripe = chunk_repair_stripe(hash);
+                counts[stripe] = counts[stripe].checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "repair marker count overflow")
+                })?;
+            }
+            Ok(counts)
+        },
+    )
+}
+
+fn parse_chunk_repair_marker_name(name: &OsStr) -> Option<ChunkHash> {
+    let name = name.to_str()?;
+    let hex = name.strip_prefix(".repair-")?;
+    parse_chunk_hash(hex)
+}
+
+fn parse_chunk_hash_name(name: &OsStr) -> Option<ChunkHash> {
+    parse_chunk_hash(name.to_str()?)
+}
+
+fn parse_chunk_hash(hex: &str) -> Option<ChunkHash> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    for (byte, pair) in digest.iter_mut().zip(pairs) {
+        *byte = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
+    }
+    Some(ChunkHash::from_digest(digest))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn create_chunk_repair_marker(directory: &File, hash: ChunkHash) -> io::Result<File> {
     open_at(
         directory,
@@ -2167,7 +2315,8 @@ mod tests {
         ffi::OsStr,
         fs::{self, OpenOptions},
         io::{Cursor, Read, Seek, Write},
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, atomic::Ordering, mpsc},
+        time::Duration,
     };
 
     use sha2::{Digest, Sha256};
@@ -3070,6 +3219,109 @@ mod tests {
     }
 
     #[test]
+    fn serving_open_skips_repair_lock_when_no_repair_is_active() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = Arc::new(ChunkStore::initialize(root.file()).unwrap());
+        let bytes = b"verified chunk";
+        let hash = ChunkHash::from_digest(Sha256::digest(bytes).into());
+        store.store_chunk(hash, bytes).unwrap();
+
+        let repair_lock = store.chunk_repair_lock(hash);
+        let (sender, receiver) = mpsc::channel();
+        let open_thread = std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || sender.send(store.open_serving_chunk(hash)).unwrap()
+        });
+        let opened = receiver.recv_timeout(Duration::from_secs(2));
+        drop(repair_lock);
+        open_thread.join().unwrap();
+
+        assert!(opened.unwrap().unwrap().is_some());
+    }
+
+    #[test]
+    fn completed_repair_invalidates_an_open_started_before_it() {
+        let activity = super::ChunkRepairActivity::default();
+        let generation = activity.can_open_without_repair_lock().unwrap();
+
+        drop(activity.begin_operation());
+
+        assert!(!activity.remained_quiescent(generation));
+    }
+
+    #[test]
+    fn collecting_a_chunk_also_clears_its_orphaned_repair_marker() {
+        let directory = tempdir().unwrap();
+        let root = Directory::open(directory.path()).unwrap();
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        let orphaned_bytes = b"orphaned chunk";
+        let orphaned_hash = ChunkHash::from_digest(Sha256::digest(orphaned_bytes).into());
+        store.store_chunk(orphaned_hash, orphaned_bytes).unwrap();
+        let orphaned_path = directory
+            .path()
+            .join(super::super::CHUNK_DIRECTORY)
+            .join(super::shard_name(orphaned_hash))
+            .join(super::chunk_name(orphaned_hash));
+        let mut corrupt_bytes = fs::read(&orphaned_path).unwrap();
+        corrupt_bytes[0] ^= 1;
+        fs::write(&orphaned_path, corrupt_bytes).unwrap();
+        assert!(
+            store
+                .store_chunk_with_sync(orphaned_hash, orphaned_bytes, |_| {
+                    Err(std::io::Error::from_raw_os_error(
+                        crate::cache::test_support::InjectedIoFailure::ReadFailure.code(),
+                    ))
+                })
+                .is_err()
+        );
+
+        let unrelated_bytes = (0..256)
+            .map(|candidate| format!("retained chunk {candidate}").into_bytes())
+            .find(|bytes| {
+                let hash = ChunkHash::from_digest(Sha256::digest(bytes).into());
+                super::chunk_repair_stripe(orphaned_hash) == super::chunk_repair_stripe(hash)
+            })
+            .expect("a matching repair stripe exists");
+        let unrelated_identity = NarIdentity::new(
+            NarHash::from_digest(Sha256::digest(&unrelated_bytes).into()),
+            NarSize::new(unrelated_bytes.len() as u64),
+        );
+        let unrelated_hash = ChunkHash::from_digest(Sha256::digest(&unrelated_bytes).into());
+        assert_eq!(
+            super::chunk_repair_stripe(orphaned_hash),
+            super::chunk_repair_stripe(unrelated_hash)
+        );
+        store
+            .store_nar(
+                Cursor::new(&unrelated_bytes),
+                unrelated_identity,
+                super::ChunkProfile::MinCdcHash4V2,
+            )
+            .unwrap();
+
+        let marker = directory
+            .path()
+            .join(super::super::CHUNK_DIRECTORY)
+            .join(super::chunk_repair_marker_name(orphaned_hash));
+        assert!(marker.exists());
+        store
+            .sweep_unreachable([unrelated_identity.hash()])
+            .unwrap();
+
+        assert!(!marker.exists());
+        assert_eq!(
+            store
+                .chunk_repair_activity(unrelated_hash)
+                .pending_markers
+                .load(Ordering::SeqCst),
+            0
+        );
+        let _repair_lock = store.chunk_repair_lock(unrelated_hash);
+        assert!(store.open_serving_chunk(unrelated_hash).unwrap().is_some());
+    }
+
+    #[test]
     fn failed_chunk_repair_sync_is_retried_before_existing_manifest_is_reused() {
         let directory = tempdir().unwrap();
         let root = Directory::open(directory.path()).unwrap();
@@ -3108,6 +3360,17 @@ mod tests {
         );
         assert!(store.validate_manifest(identity.hash()).unwrap().is_some());
 
+        drop(store);
+        let store = ChunkStore::initialize(root.file()).unwrap();
+        assert_eq!(
+            store
+                .chunk_repair_activity(hash)
+                .pending_markers
+                .load(Ordering::SeqCst),
+            1,
+            "reopening counts a durable repair marker before enabling serving fast paths"
+        );
+
         let synchronized = std::cell::Cell::new(false);
         let retry = store
             .store_chunk_with_sync(hash, &input, |shard| {
@@ -3121,6 +3384,13 @@ mod tests {
         );
         assert!(synchronized.get(), "retry settles the pending repair first");
         assert!(!marker.exists());
+        assert_eq!(
+            store
+                .chunk_repair_activity(hash)
+                .pending_markers
+                .load(Ordering::SeqCst),
+            0
+        );
     }
 
     #[test]
