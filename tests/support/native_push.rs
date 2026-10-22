@@ -129,11 +129,15 @@ fn native_push_skips_payload_generation_for_a_matching_trusted_upstream() {
     let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream listener");
     let upstream_address = upstream.local_addr().expect("inspect upstream listener");
     let nar_bytes = native_nar_bytes();
-    let narinfo = signed_narinfo_for(
-        STORE_HASH,
-        &nix32_sha256(&nar_bytes),
-        nar_bytes.len() as u64,
-    );
+    let nar_hash = nix32_sha256(&nar_bytes);
+    let narinfo = signed_narinfo_for(STORE_HASH, &nar_hash, nar_bytes.len() as u64)
+        .replace(
+            &format!("URL: nar/{nar_hash}.nar"),
+            "URL: objects/cache-entry?type=zstd",
+        )
+        .replace("Compression: none", "Compression: zstd")
+        .replace(&format!("FileHash: sha256:{nar_hash}\n"), "")
+        .replace(&format!("FileSize: {}\n", nar_bytes.len()), "");
     let upstream_server = thread::spawn(move || {
         let (mut stream, _) = upstream.accept().expect("accept upstream lookup");
         let request = read_http_request(&mut stream);

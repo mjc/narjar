@@ -68,6 +68,20 @@ impl Fixture {
         metadata.add_signature(format!("fixture:{}", BASE64.encode(&signature.to_bytes())));
         metadata.serialize(payload).unwrap()
     }
+
+    fn metadata_with_download_url(
+        &self,
+        store: &str,
+        payload: NarRepresentation,
+        signer: &SigningKey,
+        url: &str,
+    ) -> Vec<u8> {
+        let metadata = String::from_utf8(self.metadata(store, payload, signer)).unwrap();
+        let old_url = format!("URL: nar/{}\n", payload.file_name());
+        metadata
+            .replace(&old_url, &format!("URL: {url}\n"))
+            .into_bytes()
+    }
 }
 
 fn signing_key() -> SigningKey {
@@ -511,6 +525,227 @@ fn overlapping_store_requests_make_one_upstream_generation_and_local_hits_stay_o
         .read_to_end(&mut bytes)
         .unwrap();
     assert_eq!(bytes, fixture.raw);
+}
+
+#[test]
+fn external_transport_url_with_a_query_selects_the_download_without_changing_local_output() {
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata_with_download_url(
+        STORE,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+        "objects/not-a-hash.nar?token=one",
+    );
+    let upstream = {
+        let compressed = fixture.compressed.clone();
+        Upstream::new(move |route, stream| {
+            if route.ends_with(".narinfo") {
+                reply(stream, 200, &metadata);
+            } else if route.ends_with("/objects/not-a-hash.nar?token=one") {
+                reply(stream, 200, &compressed);
+            } else {
+                reply(stream, 404, b"");
+            }
+        })
+    };
+    let source = source(&upstream);
+    let (_directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
+    assert!(
+        upstream
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|route| route.ends_with("/objects/not-a-hash.nar?token=one"))
+    );
+
+    let published = storage.read_advertised_narinfo(&store).unwrap().unwrap();
+    let published = String::from_utf8(published.bytes).unwrap();
+    assert!(published.contains(&format!("URL: nar/{}.nar\n", fixture.identity.hash())));
+    assert!(published.contains("Compression: none\n"));
+}
+
+#[test]
+fn same_scope_redirects_are_followed_and_the_final_bytes_are_still_verified() {
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata_with_download_url(
+        STORE,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+        "objects/start.nar?token=one",
+    );
+    let upstream = {
+        let compressed = fixture.compressed.clone();
+        Upstream::new(move |route, stream| {
+            if route.ends_with(".narinfo") {
+                reply(stream, 200, &metadata);
+            } else if route.ends_with("/objects/start.nar?token=one") {
+                write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: final.nar?token=two\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            } else if route.ends_with("/objects/final.nar?token=two") {
+                reply(stream, 200, &compressed);
+            } else {
+                reply(stream, 404, b"");
+            }
+        })
+    };
+    let source = source(&upstream);
+    let (_directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
+    assert!(
+        upstream
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|route| route.ends_with("/objects/final.nar?token=two"))
+    );
+}
+
+#[test]
+fn a_redirect_outside_the_configured_path_is_not_requested() {
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata_with_download_url(
+        STORE,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+        "objects/start.nar",
+    );
+    let upstream = Upstream::new(move |route, stream| {
+        if route.ends_with(".narinfo") {
+            reply(stream, 200, &metadata);
+        } else {
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: ../../../outside.nar\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        }
+    });
+    let source = source(&upstream);
+    let (_directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(
+        source.ensure_local(&storage, &store),
+        Err(EdgeMiss::Failed(EdgeFailure::Invalid))
+    );
+    assert_eq!(upstream.count(".narinfo"), 1);
+    assert_eq!(upstream.count(".nar"), 1);
+}
+
+#[test]
+fn a_valid_logical_signature_does_not_authorize_an_upstream_path_escape() {
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata_with_download_url(
+        STORE,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+        "../outside.nar?token=one",
+    );
+    let upstream = Upstream::new(move |route, stream| {
+        if route.ends_with(".narinfo") {
+            reply(stream, 200, &metadata);
+        } else {
+            panic!("untrusted metadata URL was requested: {route}");
+        }
+    });
+    let source = source(&upstream);
+    let (_directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(
+        source.ensure_local(&storage, &store),
+        Err(EdgeMiss::Failed(EdgeFailure::Invalid))
+    );
+    assert_eq!(upstream.count(".narinfo"), 1);
+}
+
+#[test]
+fn raw_upstream_metadata_can_omit_encoded_identity_and_include_system() {
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata_with_download_url(
+        STORE,
+        NarRepresentation::Raw(fixture.identity),
+        &signing_key(),
+        "objects/raw-without-hash?token=one",
+    );
+    let metadata = without_encoded_file_identity(metadata)
+        .replace(
+            "Compression: none\n",
+            "Compression: none\nSystem: x86_64-linux\n",
+        )
+        .into_bytes();
+    let upstream = {
+        let raw = fixture.raw.clone();
+        Upstream::new(move |route, stream| {
+            if route.ends_with(".narinfo") {
+                reply(stream, 200, &metadata);
+            } else if route.ends_with("/objects/raw-without-hash?token=one") {
+                reply(stream, 200, &raw);
+            } else {
+                reply(stream, 404, b"");
+            }
+        })
+    };
+    let source = source(&upstream);
+    let (_directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
+    let published = storage.read_advertised_narinfo(&store).unwrap().unwrap();
+    let published = String::from_utf8(published.bytes).unwrap();
+    assert!(published.contains("Compression: none\n"));
+    assert!(published.contains("FileHash: sha256:"));
+    assert!(!published.contains("System:"));
+}
+
+#[test]
+fn compressed_upstream_metadata_without_encoded_identity_is_rejected() {
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata_with_download_url(
+        STORE,
+        NarRepresentation::compressed(fixture.encoded, fixture.identity),
+        &signing_key(),
+        "objects/compressed-without-hash?token=one",
+    );
+    let metadata = without_encoded_file_identity(metadata).into_bytes();
+    let upstream = Upstream::new(move |route, stream| {
+        if route.ends_with(".narinfo") {
+            reply(stream, 200, &metadata);
+        } else {
+            panic!("download started without encoded identity: {route}");
+        }
+    });
+    let source = source(&upstream);
+    let (_directory, storage) = storage();
+    let store = StoreHash::parse(STORE).unwrap();
+
+    assert_eq!(
+        source.ensure_local(&storage, &store),
+        Err(EdgeMiss::Failed(EdgeFailure::Invalid))
+    );
+    assert_eq!(upstream.count(".narinfo"), 1);
+}
+
+fn without_encoded_file_identity(metadata: Vec<u8>) -> String {
+    let metadata = String::from_utf8(metadata).unwrap();
+    format!(
+        "{}\n",
+        metadata
+            .lines()
+            .filter(|line| !line.starts_with("FileHash: ") && !line.starts_with("FileSize: "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 #[test]

@@ -20,8 +20,8 @@ use ureq::{Agent, http::StatusCode};
 use crate::{
     cache::{
         narinfo::{
-            MAX_NARINFO_BYTES, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file,
-            require_raw_narinfo_transport,
+            MAX_NARINFO_BYTES, SignatureVerifiedExternalNarInfo, TrustedPublicKeys,
+            ValidatedNarInfo, read_narinfo_file, require_raw_narinfo_transport,
         },
         object::NarRepresentation,
         storage::{
@@ -36,6 +36,33 @@ use crate::{
 use state::{Flight, Join, Key, State};
 
 const MAX_NEGATIVE_TTL: Duration = Duration::from_secs(60);
+const MAX_UPSTREAM_REDIRECTS: usize = 5;
+
+struct ResolvedUpstreamNarInfo {
+    publication: ValidatedNarInfo,
+    download_url: HttpUrl,
+}
+
+impl ResolvedUpstreamNarInfo {
+    fn new(verified: SignatureVerifiedExternalNarInfo, download_url: HttpUrl) -> Self {
+        Self {
+            publication: verified.into_publication(),
+            download_url,
+        }
+    }
+
+    const fn payload(&self) -> NarRepresentation {
+        self.publication.payload()
+    }
+
+    fn download_url(&self) -> &HttpUrl {
+        &self.download_url
+    }
+
+    fn into_publication(self) -> ValidatedNarInfo {
+        self.publication
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct EdgeSettings {
@@ -353,7 +380,12 @@ impl ReadThroughSource {
             || match storage.ensure_canonical_nar_available(payload.identity()) {
                 Ok(()) => Ok(EdgeHit::Local),
                 Err(StorageError::MissingNar) => self
-                    .receive_missing_canonical_nar(storage, payload, deadline)
+                    .receive_missing_canonical_nar(
+                        storage,
+                        payload,
+                        metadata.download_url(),
+                        deadline,
+                    )
                     .map(|()| EdgeHit::Filled),
                 Err(error) => Err(EdgeMiss::Failed(EdgeFailure::ingestion(error))),
             },
@@ -362,7 +394,7 @@ impl ReadThroughSource {
         // Check the signed NarHash and NarSize against the stored uncompressed NAR,
         // even if another request downloaded it with a different compression format.
         let bound = storage
-            .bind_canonical_narinfo(metadata)
+            .bind_canonical_narinfo(metadata.into_publication())
             .map_err(EdgeFailure::ingestion)?;
         deadline.remaining()?;
         // Store and sync the metadata, then its retention record, before returning success.
@@ -375,13 +407,14 @@ impl ReadThroughSource {
         &self,
         storage: &Storage,
         payload: NarRepresentation,
+        download_url: &HttpUrl,
         deadline: Deadline,
     ) -> Result<(), EdgeMiss> {
         self.coalesce(
             Key::Representation(payload.file_name(), payload.encoded_size()),
             deadline,
             || {
-                self.receive_encoded_representation(storage, payload, deadline)
+                self.receive_encoded_representation(storage, payload, download_url, deadline)
                     .map_err(EdgeMiss::Failed)
                     .map(|()| EdgeHit::Filled)
             },
@@ -401,7 +434,7 @@ impl ReadThroughSource {
         &self,
         store: &StoreHash,
         deadline: Deadline,
-    ) -> Result<ValidatedNarInfo, EdgeFailure> {
+    ) -> Result<ResolvedUpstreamNarInfo, EdgeFailure> {
         let url = self
             .upstream
             .endpoint(&[&format!("{}.narinfo", store.as_str())]);
@@ -422,15 +455,22 @@ impl ReadThroughSource {
         if bytes.len() as u64 > MAX_NARINFO_BYTES {
             return Err(EdgeFailure::Invalid);
         }
-        self.keys
-            .validate(store, bytes)
-            .map_err(|_| EdgeFailure::Invalid)
+        let verified = self
+            .keys
+            .verify_external_narinfo_for_transfer(store, bytes)
+            .map_err(|_| EdgeFailure::Invalid)?;
+        let download_url = self
+            .upstream
+            .resolve_trusted_cache_resource(verified.download_url())
+            .map_err(|_| EdgeFailure::Invalid)?;
+        Ok(ResolvedUpstreamNarInfo::new(verified, download_url))
     }
 
     fn receive_encoded_representation(
         &self,
         storage: &Storage,
         payload: NarRepresentation,
+        download_url: &HttpUrl,
         deadline: Deadline,
     ) -> Result<(), EdgeFailure> {
         let encoded_size = payload.encoded_size().get();
@@ -441,8 +481,7 @@ impl ReadThroughSource {
             .reserve_staging(encoded_size, self.policy.min_free_bytes())
             .map_err(EdgeFailure::ingestion)?;
         let name = payload.file_name();
-        let url = self.upstream.endpoint(&["nar", &name.to_string()]);
-        let response = self.get(&url, deadline)?;
+        let response = self.get(download_url, deadline)?;
         if response
             .body()
             .content_length()
@@ -463,32 +502,49 @@ impl ReadThroughSource {
         url: &HttpUrl,
         deadline: Deadline,
     ) -> Result<ureq::http::Response<ureq::Body>, EdgeFailure> {
-        let response = self
-            .agent
-            .get(url.as_str())
-            .header("Accept-Encoding", "identity")
-            .config()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(deadline.remaining()?))
-            .build()
-            .call()
-            .map_err(|_| EdgeFailure::Transient)?;
-        deadline.remaining()?;
-        match response.status() {
-            StatusCode::OK => {}
-            StatusCode::NOT_FOUND => return Err(EdgeFailure::Authoritative404),
-            status if status.is_redirection() => return Err(EdgeFailure::Invalid),
-            _ => return Err(EdgeFailure::Transient),
+        let mut current_url = self
+            .upstream
+            .resolve_trusted_cache_resource(url.as_str())
+            .map_err(|_| EdgeFailure::Invalid)?;
+        for redirect_count in 0..=MAX_UPSTREAM_REDIRECTS {
+            let response = self
+                .agent
+                .get(current_url.as_str())
+                .header("Accept-Encoding", "identity")
+                .config()
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(deadline.remaining()?))
+                .build()
+                .call()
+                .map_err(|_| EdgeFailure::Transient)?;
+            deadline.remaining()?;
+            match response.status() {
+                StatusCode::OK => return validate_upstream_response(response),
+                StatusCode::NOT_FOUND => return Err(EdgeFailure::Authoritative404),
+                StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT => {
+                    if redirect_count == MAX_UPSTREAM_REDIRECTS {
+                        return Err(EdgeFailure::Invalid);
+                    }
+                    let location = response
+                        .headers()
+                        .get("Location")
+                        .and_then(|value| value.to_str().ok())
+                        .ok_or(EdgeFailure::Invalid)?;
+                    current_url = self
+                        .upstream
+                        .resolve_trusted_cache_redirect(&current_url, location)
+                        .map_err(|_| EdgeFailure::Invalid)?;
+                }
+                status if status.is_redirection() => return Err(EdgeFailure::Invalid),
+                _ => return Err(EdgeFailure::Transient),
+            }
         }
-        if response
-            .headers()
-            .get("Content-Encoding")
-            .is_some_and(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
-        {
-            return Err(EdgeFailure::Invalid);
-        }
-        Ok(response)
+        unreachable!("the bounded redirect attempts always return a response or error")
     }
 
     fn coalesce(
@@ -581,6 +637,19 @@ impl ReadThroughSource {
             );
         }
     }
+}
+
+fn validate_upstream_response(
+    response: ureq::http::Response<ureq::Body>,
+) -> Result<ureq::http::Response<ureq::Body>, EdgeFailure> {
+    if response
+        .headers()
+        .get("Content-Encoding")
+        .is_some_and(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(EdgeFailure::Invalid);
+    }
+    Ok(response)
 }
 
 fn increment(counter: &AtomicU64) {
