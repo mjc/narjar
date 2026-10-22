@@ -558,6 +558,36 @@ report the last pass's duration and logically reclaimed objects and bytes.
 Each series has HELP text describing it. Labels do not contain
 paths, hashes, token names, or request IDs.
 
+Read-through origin traffic is reported as upstream response-body bytes:
+`narjar_edge_upstream_metadata_bytes_total` counts narinfo bodies, and
+`narjar_edge_upstream_payload_bytes_total` counts NAR bodies with the bounded
+`encoding` label set to `none`, `xz`, or `zstd`. These counters increase as
+bytes are read, including partial bodies from failed transfers and bytes from
+retries.
+They exclude HTTP headers and reset when the process restarts. They measure
+encoded bytes read from the origin, not decoded NAR size or filesystem
+allocation.
+
+`narjar_edge_fill_duration_seconds` is a histogram for each store-path leader
+fill, from the start of its upstream lookup through verification and publication
+or failure. Requests coalesced on the same store path do not add observations;
+their wait time is not included. For total origin body throughput over five
+minutes, use:
+
+~~~promql
+sum(rate(narjar_edge_upstream_metadata_bytes_total[5m]))
++ sum(rate(narjar_edge_upstream_payload_bytes_total[5m]))
+~~~
+
+For the 95th percentile leader-fill duration over five minutes, use:
+
+~~~promql
+histogram_quantile(
+  0.95,
+  sum by (le) (rate(narjar_edge_fill_duration_seconds_bucket[5m]))
+)
+~~~
+
 Hit ratio is hits divided by hits plus misses; failures are separate. A narinfo
 hit means committed metadata was read successfully. Reads trust immutable disk
 contents: they do not recheck signatures or backing payloads. Payload lookups

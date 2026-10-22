@@ -2,7 +2,7 @@ use super::*;
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Cursor, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{Barrier, Condvar, atomic::AtomicBool},
     thread::{self, JoinHandle},
@@ -27,8 +27,10 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 struct Fixture {
     raw: Vec<u8>,
     compressed: Vec<u8>,
+    xz_compressed: Vec<u8>,
     identity: NarIdentity,
     encoded: EncodedIdentity,
+    xz_encoded: EncodedIdentity,
 }
 
 impl Fixture {
@@ -46,11 +48,19 @@ impl Fixture {
             writer.write_all(&raw)
         })
         .unwrap();
+        let mut xz_compressed = Vec::new();
+        let xz_encoded =
+            encode_and_measure_nar(CompressionCodec::Xz, &mut xz_compressed, |writer| {
+                writer.write_all(&raw)
+            })
+            .unwrap();
         Self {
             raw,
             compressed,
+            xz_compressed,
             identity,
             encoded,
+            xz_encoded,
         }
     }
 
@@ -440,6 +450,7 @@ fn overlapping_store_requests_make_one_upstream_generation_and_local_hits_stay_o
         NarRepresentation::Raw(fixture.identity),
         &signing_key(),
     );
+    let metadata_length = metadata.len() as u64;
     let gate = Arc::new(Gate::default());
     let upstream = {
         let gate = gate.clone();
@@ -492,6 +503,22 @@ fn overlapping_store_requests_make_one_upstream_generation_and_local_hits_stay_o
     });
     assert_eq!(upstream.count(".narinfo"), 1);
     assert_eq!(upstream.count(".nar"), 1);
+    assert_eq!(
+        source
+            .counters
+            .upstream_metadata_bytes
+            .load(Ordering::Relaxed),
+        metadata_length
+    );
+    assert_eq!(
+        source
+            .counters
+            .upstream_payload_bytes
+            .raw
+            .load(Ordering::Relaxed),
+        fixture.raw.len() as u64
+    );
+    assert_eq!(source.counters.fill_duration.snapshot().count, 1);
     drop(upstream);
     // Return a locally stored object even if an earlier upstream failure is cached.
     source.state.lock().unwrap().remember(
@@ -564,6 +591,65 @@ fn cached_raw_nars_satisfy_aliases_whose_encoded_download_would_exceed_the_limit
     assert_eq!(upstream.count(".narinfo"), 2);
     assert_eq!(upstream.count(".zst"), 1);
     assert_eq!(upstream.count(".nar"), 0);
+}
+
+#[test]
+fn upstream_payload_bytes_are_counted_by_the_representation_that_was_read() {
+    let fixture = Fixture::new();
+    let representations = [
+        (
+            WireEncoding::Raw,
+            NarRepresentation::Raw(fixture.identity),
+            fixture.raw.as_slice(),
+        ),
+        (
+            WireEncoding::Compressed(CompressionCodec::Xz),
+            NarRepresentation::compressed(fixture.xz_encoded, fixture.identity),
+            fixture.xz_compressed.as_slice(),
+        ),
+        (
+            WireEncoding::Compressed(CompressionCodec::Zstd),
+            NarRepresentation::compressed(fixture.encoded, fixture.identity),
+            fixture.compressed.as_slice(),
+        ),
+    ];
+
+    representations
+        .into_iter()
+        .for_each(|(encoding, representation, payload)| {
+            let metadata = fixture.metadata(STORE, representation, &signing_key());
+            let metadata_length = metadata.len() as u64;
+            let payload = payload.to_vec();
+            let payload_length = payload.len() as u64;
+            let upstream = Upstream::new(move |route, stream| {
+                if route.ends_with(".narinfo") {
+                    reply(stream, 200, &metadata);
+                } else {
+                    reply(stream, 200, &payload);
+                }
+            });
+            let source = source(&upstream);
+            let (_directory, storage) = storage();
+            let store = StoreHash::parse(STORE).unwrap();
+
+            assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
+            assert_eq!(
+                source
+                    .counters
+                    .upstream_metadata_bytes
+                    .load(Ordering::Relaxed),
+                metadata_length
+            );
+            assert_eq!(
+                source
+                    .counters
+                    .upstream_payload_bytes
+                    .for_encoding(encoding)
+                    .load(Ordering::Relaxed),
+                payload_length
+            );
+            assert_eq!(source.counters.fill_duration.snapshot().count, 1);
+        });
 }
 
 #[test]
@@ -726,6 +812,9 @@ fn a_failed_compressed_alias_does_not_poison_a_valid_raw_alias() {
         NarRepresentation::Raw(fixture.identity),
         &signing_key(),
     );
+    let expected_metadata_bytes = (compressed_metadata.len() + raw_metadata.len()) as u64;
+    let expected_compressed_bytes = fixture.compressed.len() as u64;
+    let expected_raw_bytes = fixture.raw.len() as u64;
     let gate = Arc::new(Gate::default());
     let upstream = {
         let gate = gate.clone();
@@ -768,6 +857,29 @@ fn a_failed_compressed_alias_does_not_poison_a_valid_raw_alias() {
     });
     assert_eq!(upstream.count(".zst"), 1);
     assert_eq!(upstream.count(".nar"), 1);
+    assert_eq!(
+        source
+            .counters
+            .upstream_metadata_bytes
+            .load(Ordering::Relaxed),
+        expected_metadata_bytes
+    );
+    let compressed_bytes = source
+        .counters
+        .upstream_payload_bytes
+        .zstd
+        .load(Ordering::Relaxed);
+    assert!(compressed_bytes > 0);
+    assert!(compressed_bytes <= expected_compressed_bytes);
+    assert_eq!(
+        source
+            .counters
+            .upstream_payload_bytes
+            .raw
+            .load(Ordering::Relaxed),
+        expected_raw_bytes
+    );
+    assert_eq!(source.counters.fill_duration.snapshot().count, 2);
 }
 
 #[test]
@@ -1017,6 +1129,8 @@ fn transient_negative_expires_and_allows_a_healthy_fill() {
         NarRepresentation::Raw(fixture.identity),
         &signing_key(),
     );
+    let metadata_length = metadata.len() as u64;
+    let raw_length = fixture.raw.len() as u64;
     let healthy = Arc::new(AtomicBool::new(false));
     let upstream = {
         let healthy = healthy.clone();
@@ -1063,6 +1177,24 @@ fn transient_negative_expires_and_allows_a_healthy_fill() {
     assert_eq!(source.ensure_local(&storage, &store), Ok(EdgeHit::Filled));
     assert_eq!(upstream.count(".narinfo"), 2);
     assert_eq!(upstream.count(".nar"), 1);
+    assert_eq!(
+        source
+            .counters
+            .upstream_metadata_bytes
+            .load(Ordering::Relaxed),
+        metadata_length
+    );
+    assert_eq!(
+        source
+            .counters
+            .upstream_payload_bytes
+            .raw
+            .load(Ordering::Relaxed),
+        raw_length
+    );
+    assert_eq!(source.counters.started.load(Ordering::Relaxed), 2);
+    assert_eq!(source.counters.completed.load(Ordering::Relaxed), 1);
+    assert_eq!(source.counters.fill_duration.snapshot().count, 2);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1159,6 +1291,7 @@ fn upstream_failure_matrix_never_publishes_metadata() {
 fn assert_failed_fill(case: FailureCase) {
     let fixture = Fixture::new();
     let mut compressed = fixture.compressed.clone();
+    let partial_compressed_length = (compressed.len() / 2) as u64;
     let (encoded, identity) = match case {
         FailureCase::WrongEncodedHash => (
             EncodedIdentity::new(
@@ -1202,6 +1335,7 @@ fn assert_failed_fill(case: FailureCase) {
         NarRepresentation::compressed(encoded, identity),
         &signer,
     );
+    let metadata_length = metadata.len() as u64;
     if let FailureCase::ArbitraryPayloadUrl = case {
         let original = format!("URL: nar/{}", encoded.file_name());
         metadata = String::from_utf8(metadata)
@@ -1298,6 +1432,24 @@ fn assert_failed_fill(case: FailureCase) {
         "{case:?}"
     );
     assert_eq!(source.active.load(Ordering::Relaxed), 0);
+    if matches!(case, FailureCase::MidstreamDrop) {
+        assert_eq!(
+            source
+                .counters
+                .upstream_metadata_bytes
+                .load(Ordering::Relaxed),
+            metadata_length
+        );
+        assert_eq!(
+            source
+                .counters
+                .upstream_payload_bytes
+                .zstd
+                .load(Ordering::Relaxed),
+            partial_compressed_length
+        );
+        assert_eq!(source.counters.fill_duration.snapshot().count, 1);
+    }
 }
 
 #[test]
@@ -1448,8 +1600,137 @@ fn metrics_use_fixed_labels_and_do_not_expose_upstream_or_store_paths() {
     let mut metrics = String::new();
     source.append_metrics(&mut metrics);
     assert!(metrics.contains("narjar_edge_failures_total{reason=\"transient\"} 0"));
+    assert!(metrics.contains("narjar_edge_upstream_metadata_bytes_total 0"));
+    assert!(metrics.contains("narjar_edge_upstream_payload_bytes_total{encoding=\"none\"} 0"));
+    assert!(metrics.contains("narjar_edge_upstream_payload_bytes_total{encoding=\"xz\"} 0"));
+    assert!(metrics.contains("narjar_edge_upstream_payload_bytes_total{encoding=\"zstd\"} 0"));
+    assert!(metrics.contains("narjar_edge_fill_duration_seconds_count 0"));
     assert!(!metrics.contains("127.0.0.1"));
     assert!(!metrics.contains("private-upstream"));
     assert!(!metrics.contains("/nix/store"));
     assert_eq!(source.negative_ttl, Duration::from_secs(1));
+}
+
+#[test]
+fn upstream_body_reader_counts_returned_bytes_once_and_ignores_eof() {
+    let counter = AtomicU64::new(0);
+    let mut reader = UpstreamBodyReader::new(Cursor::new(b"payload"), &counter);
+    let mut body = Vec::new();
+
+    reader.read_to_end(&mut body).unwrap();
+
+    assert_eq!(body, b"payload");
+    assert_eq!(counter.load(Ordering::Relaxed), 7);
+    assert_eq!(reader.read(&mut [0; 4]).unwrap(), 0);
+    assert_eq!(counter.load(Ordering::Relaxed), 7);
+
+    let empty_counter = AtomicU64::new(0);
+    let mut empty_reader = UpstreamBodyReader::new(Cursor::new(b""), &empty_counter);
+    assert_eq!(empty_reader.read(&mut [0; 1]).unwrap(), 0);
+    assert_eq!(empty_counter.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn upstream_body_reader_keeps_partial_bytes_when_a_transfer_fails_and_retries() {
+    let counter = AtomicU64::new(0);
+    let mut interrupted = UpstreamBodyReader::new(PartialThenFailure::new(b"first"), &counter);
+    let mut body = Vec::new();
+
+    assert!(interrupted.read_to_end(&mut body).is_err());
+    assert_eq!(body, b"first");
+    assert_eq!(counter.load(Ordering::Relaxed), 5);
+
+    let mut retry = UpstreamBodyReader::new(Cursor::new(b"retry"), &counter);
+    retry.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"firstretry");
+    assert_eq!(counter.load(Ordering::Relaxed), 10);
+}
+
+#[test]
+fn fill_duration_histogram_records_failed_and_completed_leader_fills() {
+    let histogram = FillDurationHistogram::default();
+    histogram.observe(Duration::from_millis(75));
+    histogram.observe(Duration::from_secs(2));
+    histogram.observe(Duration::from_secs(300));
+
+    let mut metrics = String::new();
+    histogram.append_metrics(&mut metrics);
+
+    assert!(metrics.contains("narjar_edge_fill_duration_seconds_count 3"));
+    assert!(metrics.contains("narjar_edge_fill_duration_seconds_sum 302.075"));
+    assert!(metrics.contains("narjar_edge_fill_duration_seconds_bucket{le=\"0.1\"} 1"));
+    assert!(metrics.contains("narjar_edge_fill_duration_seconds_bucket{le=\"300\"} 3"));
+    assert!(metrics.contains("narjar_edge_fill_duration_seconds_bucket{le=\"+Inf\"} 3"));
+}
+
+#[test]
+fn fill_duration_histogram_scrapes_keep_buckets_cumulative_during_concurrent_fills() {
+    let histogram = Arc::new(FillDurationHistogram::default());
+    let start = Arc::new(Barrier::new(9));
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+
+    thread::scope(|scope| {
+        for worker in 0..8 {
+            let histogram = Arc::clone(&histogram);
+            let start = Arc::clone(&start);
+            scope.spawn(move || {
+                start.wait();
+                (0..500).for_each(|sample| {
+                    histogram.observe(Duration::from_millis((worker * 10 + sample % 10) as u64));
+                });
+            });
+        }
+
+        let histogram = Arc::clone(&histogram);
+        let start = Arc::clone(&start);
+        let snapshots = Arc::clone(&snapshots);
+        scope.spawn(move || {
+            start.wait();
+            (0..500).for_each(|_| {
+                let mut metrics = String::new();
+                histogram.append_metrics(&mut metrics);
+                snapshots.lock().unwrap().push(metrics);
+            });
+        });
+    });
+
+    let snapshots = snapshots.lock().unwrap();
+    assert_eq!(histogram.snapshot().count, 4_000);
+    assert!(!snapshots.is_empty());
+    snapshots.iter().for_each(|metrics| {
+        let bucket_counts = metrics
+            .lines()
+            .filter(|line| line.starts_with("narjar_edge_fill_duration_seconds_bucket"))
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap())
+            .collect::<Vec<_>>();
+        assert!(bucket_counts.windows(2).all(|pair| pair[0] <= pair[1]));
+    });
+}
+
+struct PartialThenFailure {
+    bytes: Cursor<&'static [u8]>,
+    returned_error: bool,
+}
+
+impl PartialThenFailure {
+    fn new(bytes: &'static [u8]) -> Self {
+        Self {
+            bytes: Cursor::new(bytes),
+            returned_error: false,
+        }
+    }
+}
+
+impl Read for PartialThenFailure {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let amount = self.bytes.read(buffer)?;
+        if amount != 0 {
+            return Ok(amount);
+        }
+        if self.returned_error {
+            return Ok(0);
+        }
+        self.returned_error = true;
+        Err(io::Error::from(io::ErrorKind::ConnectionReset))
+    }
 }

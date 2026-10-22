@@ -23,7 +23,7 @@ use crate::{
             MAX_NARINFO_BYTES, TrustedPublicKeys, ValidatedNarInfo, read_narinfo_file,
             require_raw_narinfo_transport,
         },
-        object::NarRepresentation,
+        object::{CompressionCodec, NarRepresentation, WireEncoding},
         storage::{
             AdvertisedNarInfo, AdvertisementEvidence, NarUploadPolicy, Storage, StorageError,
             StoreHash,
@@ -36,6 +36,23 @@ use crate::{
 use state::{Flight, Join, Key, State};
 
 const MAX_NEGATIVE_TTL: Duration = Duration::from_secs(60);
+const FILL_DURATION_BUCKETS: [(u64, &str); 15] = [
+    (10, "0.01"),
+    (50, "0.05"),
+    (100, "0.1"),
+    (250, "0.25"),
+    (500, "0.5"),
+    (1_000, "1"),
+    (2_500, "2.5"),
+    (5_000, "5"),
+    (10_000, "10"),
+    (30_000, "30"),
+    (60_000, "60"),
+    (300_000, "300"),
+    (1_800_000, "1800"),
+    (3_600_000, "3600"),
+    (86_400_000, "86400"),
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct EdgeSettings {
@@ -165,6 +182,130 @@ struct Counters {
     followers: AtomicU64,
     negative_hits: AtomicU64,
     failures: EnumMap<EdgeFailure, AtomicU64>,
+    upstream_metadata_bytes: AtomicU64,
+    upstream_payload_bytes: UpstreamPayloadBytes,
+    fill_duration: FillDurationHistogram,
+}
+
+#[derive(Default)]
+struct UpstreamPayloadBytes {
+    raw: AtomicU64,
+    xz: AtomicU64,
+    zstd: AtomicU64,
+}
+
+impl UpstreamPayloadBytes {
+    fn for_encoding(&self, encoding: WireEncoding) -> &AtomicU64 {
+        match encoding {
+            WireEncoding::Raw => &self.raw,
+            WireEncoding::Compressed(CompressionCodec::Xz) => &self.xz,
+            WireEncoding::Compressed(CompressionCodec::Zstd) => &self.zstd,
+        }
+    }
+
+    fn append_metrics(&self, output: &mut String) {
+        output.push_str(
+            "# HELP narjar_edge_upstream_payload_bytes_total Upstream NAR response-body bytes read, including failed and retried transfers. Resets when the process restarts.\n# TYPE narjar_edge_upstream_payload_bytes_total counter\n",
+        );
+        for (encoding, counter) in [("none", &self.raw), ("xz", &self.xz), ("zstd", &self.zstd)] {
+            let _ = writeln!(
+                output,
+                "narjar_edge_upstream_payload_bytes_total{{encoding=\"{encoding}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+struct FillDurationHistogram {
+    snapshot: Mutex<FillDurationSnapshot>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FillDurationSnapshot {
+    buckets: [u64; FILL_DURATION_BUCKETS.len()],
+    count: u64,
+    sum_nanoseconds: u64,
+}
+
+impl Default for FillDurationHistogram {
+    fn default() -> Self {
+        Self {
+            snapshot: Mutex::new(FillDurationSnapshot::default()),
+        }
+    }
+}
+
+impl FillDurationHistogram {
+    fn observe(&self, elapsed: Duration) {
+        let elapsed_nanos = elapsed.as_nanos();
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        FILL_DURATION_BUCKETS
+            .iter()
+            .zip(&mut snapshot.buckets)
+            .filter(|((bound_millis, _), _)| elapsed_nanos <= u128::from(*bound_millis) * 1_000_000)
+            .for_each(|(_, bucket)| *bucket = bucket.saturating_add(1));
+        snapshot.count = snapshot.count.saturating_add(1);
+        snapshot.sum_nanoseconds = snapshot
+            .sum_nanoseconds
+            .saturating_add(u64::try_from(elapsed_nanos).unwrap_or(u64::MAX));
+    }
+
+    fn append_metrics(&self, output: &mut String) {
+        output.push_str(
+            "# HELP narjar_edge_fill_duration_seconds Time from start of a leader cache fill through validation, publication or failure; excludes requests coalesced on the same store path. Resets when the process restarts.\n# TYPE narjar_edge_fill_duration_seconds histogram\n",
+        );
+        let snapshot = self.snapshot();
+        FILL_DURATION_BUCKETS
+            .iter()
+            .zip(snapshot.buckets)
+            .for_each(|((_, bound), count)| {
+                let _ = writeln!(
+                    output,
+                    "narjar_edge_fill_duration_seconds_bucket{{le=\"{bound}\"}} {}",
+                    count
+                );
+            });
+        let _ = writeln!(
+            output,
+            "narjar_edge_fill_duration_seconds_bucket{{le=\"+Inf\"}} {}\nnarjar_edge_fill_duration_seconds_sum {}\nnarjar_edge_fill_duration_seconds_count {}",
+            snapshot.count,
+            snapshot.sum_nanoseconds as f64 / 1_000_000_000.0,
+            snapshot.count
+        );
+    }
+
+    fn snapshot(&self) -> FillDurationSnapshot {
+        *self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct UpstreamBodyReader<'counter, R> {
+    inner: R,
+    byte_counter: &'counter AtomicU64,
+}
+
+impl<'counter, R> UpstreamBodyReader<'counter, R> {
+    fn new(inner: R, byte_counter: &'counter AtomicU64) -> Self {
+        Self {
+            inner,
+            byte_counter,
+        }
+    }
+}
+
+impl<R: Read> Read for UpstreamBodyReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = self.inner.read(buffer)?;
+        add_saturating(self.byte_counter, bytes_read as u64);
+        Ok(bytes_read)
+    }
 }
 
 pub(crate) struct ReadThroughSource {
@@ -283,7 +424,10 @@ impl ReadThroughSource {
                 LocalLookup::Missing => {
                     let _active = self.admit()?;
                     increment(&self.counters.started);
-                    self.fill(storage, store, deadline)?;
+                    let started_at = Instant::now();
+                    let result = self.fill(storage, store, deadline);
+                    self.counters.fill_duration.observe(started_at.elapsed());
+                    result?;
                     increment(&self.counters.completed);
                     Ok(EdgeHit::Filled)
                 }
@@ -413,7 +557,11 @@ impl ReadThroughSource {
         {
             return Err(EdgeFailure::Invalid);
         }
-        let mut reader = DeadlineReader::new(response.into_body().into_reader(), deadline);
+        let reader = UpstreamBodyReader::new(
+            response.into_body().into_reader(),
+            &self.counters.upstream_metadata_bytes,
+        );
+        let mut reader = DeadlineReader::new(reader, deadline);
         let mut bytes = Vec::new();
         (&mut reader)
             .take(MAX_NARINFO_BYTES + 1)
@@ -450,7 +598,13 @@ impl ReadThroughSource {
         {
             return Err(EdgeFailure::Invalid);
         }
-        let reader = DeadlineReader::new(response.into_body().into_reader(), deadline);
+        let reader = UpstreamBodyReader::new(
+            response.into_body().into_reader(),
+            self.counters
+                .upstream_payload_bytes
+                .for_encoding(name.encoding()),
+        );
+        let reader = DeadlineReader::new(reader, deadline);
         storage
             .publish_nar_with_staging(name, reader, encoded_size, self.policy, reservation)
             .map_err(EdgeFailure::ingestion)?;
@@ -554,6 +708,15 @@ impl ReadThroughSource {
                 counter.load(Ordering::Relaxed)
             );
         }
+        let _ = writeln!(
+            output,
+            "# HELP narjar_edge_upstream_metadata_bytes_total Upstream narinfo response-body bytes read, including failed and retried transfers. Resets when the process restarts.\n# TYPE narjar_edge_upstream_metadata_bytes_total counter\nnarjar_edge_upstream_metadata_bytes_total {}",
+            self.counters
+                .upstream_metadata_bytes
+                .load(Ordering::Relaxed)
+        );
+        self.counters.upstream_payload_bytes.append_metrics(output);
+        self.counters.fill_duration.append_metrics(output);
         output.push_str("# TYPE narjar_edge_failures_total counter\n");
         for (failure, counter) in &self.counters.failures {
             let _ = writeln!(
@@ -584,8 +747,12 @@ impl ReadThroughSource {
 }
 
 fn increment(counter: &AtomicU64) {
+    add_saturating(counter, 1);
+}
+
+fn add_saturating(counter: &AtomicU64, amount: u64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        Some(value.saturating_add(1))
+        Some(value.saturating_add(amount))
     });
 }
 
