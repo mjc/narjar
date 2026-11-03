@@ -1569,14 +1569,15 @@ fn upstream_payload_bytes_are_counted_by_the_representation_that_was_read() {
                     .load(Ordering::Relaxed),
                 metadata_length
             );
-            assert_eq!(
-                source
-                    .counters
-                    .upstream_payload_bytes
-                    .for_encoding(encoding)
-                    .load(Ordering::Relaxed),
-                payload_length
-            );
+            let (expected_raw, expected_xz, expected_zstd) = match encoding {
+                WireEncoding::Raw => (payload_length, 0, 0),
+                WireEncoding::Compressed(CompressionCodec::Xz) => (0, payload_length, 0),
+                WireEncoding::Compressed(CompressionCodec::Zstd) => (0, 0, payload_length),
+            };
+            let payload_bytes = &source.counters.upstream_payload_bytes;
+            assert_eq!(payload_bytes.raw.load(Ordering::Relaxed), expected_raw);
+            assert_eq!(payload_bytes.xz.load(Ordering::Relaxed), expected_xz);
+            assert_eq!(payload_bytes.zstd.load(Ordering::Relaxed), expected_zstd);
             assert_eq!(source.counters.fill_duration.snapshot().count, 1);
         });
 }
@@ -2821,6 +2822,12 @@ fn fill_duration_histogram_scrapes_keep_buckets_cumulative_during_concurrent_fil
             .map(|line| line.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap())
             .collect::<Vec<_>>();
         assert!(bucket_counts.windows(2).all(|pair| pair[0] <= pair[1]));
+        let count = metrics
+            .lines()
+            .find(|line| line.starts_with("narjar_edge_fill_duration_seconds_count "))
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap())
+            .unwrap();
+        assert_eq!(bucket_counts.last(), Some(&count));
     });
 }
 
