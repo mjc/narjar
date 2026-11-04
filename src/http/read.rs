@@ -1454,6 +1454,18 @@ mod tests {
     }
 
     #[test]
+    fn peerix_paths_are_ordinary_cache_misses() {
+        assert!(matches!(
+            CacheRoute::classify("/peerix/peers"),
+            RouteMatch::Missing
+        ));
+        assert!(matches!(
+            CacheRoute::classify("/peerix/find/0123456789abcdfghijklmnpqrsvwxyz"),
+            RouteMatch::Missing
+        ));
+    }
+
+    #[test]
     fn malformed_nar_reads_are_cache_misses() {
         assert_eq!(
             invalid_route_status(Method::Get, &RouteMatch::InvalidNarPath),

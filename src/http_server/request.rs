@@ -188,6 +188,7 @@ struct BufferedHead {
 }
 
 struct ParsedHead {
+    http_method: String,
     method: Method,
     url: RequestTargetRange,
     headers: HeaderRanges,
@@ -200,6 +201,7 @@ pub struct Request {
     stream: TcpStream,
     buffer: [u8; MAX_HEADER_BYTES],
     body_prefix: Range<usize>,
+    http_method: String,
     method: Method,
     url: RequestTargetRange,
     headers: HeaderRanges,
@@ -277,6 +279,7 @@ impl BufferedHead {
             stream: self.stream,
             buffer: self.buffer,
             body_prefix: self.boundary.body_prefix(),
+            http_method: parsed.http_method,
             method: parsed.method,
             url: parsed.url,
             headers: parsed.headers,
@@ -316,6 +319,7 @@ impl ParsedHead {
         let expectation = request_expectation(version, buffered.bytes(), &headers);
 
         Ok(Self {
+            http_method: method.to_owned(),
             method: Method::from_http(method),
             url,
             headers,
@@ -413,6 +417,17 @@ impl Request {
 
     pub fn method(&self) -> Method {
         self.method
+    }
+
+    pub fn http_method(&self) -> &str {
+        &self.http_method
+    }
+
+    pub fn peer_ip(&self) -> Option<String> {
+        self.stream
+            .peer_addr()
+            .ok()
+            .map(|addr| addr.ip().to_string())
     }
 
     pub fn url(&self) -> &str {

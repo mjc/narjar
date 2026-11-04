@@ -32,7 +32,14 @@
       };
     };
   };
+  tracker = evaluate {
+    services.narjar = {
+      enable = true;
+      peerixTracker.enable = true;
+    };
+  };
   defaultCommand = defaults.systemd.services.narjar.serviceConfig.ExecStart;
+  trackerCommand = tracker.systemd.services.narjar.serviceConfig.ExecStart;
   enabledCommand = enabled.systemd.services.narjar.serviceConfig.ExecStart;
   publishCommand = publishAll.systemd.services.narjar.serviceConfig.ExecStart;
   signedCommand = signed.systemd.services.narjar.serviceConfig.ExecStart;
@@ -47,6 +54,22 @@ in
   assert defaults.services.narjar.p2p.upstream == "https://cache.nixos.org";
   assert defaults.services.narjar.p2p.signingKeyFile == null;
   assert !(lib.hasInfix "--peer-share" defaultCommand);
+  assert !defaults.services.narjar.peerixTracker.enable;
+  assert defaults.services.narjar.peerixTracker.upstream == "https://sophronesis.dev/peerix";
+  assert !(lib.hasInfix "--peerix-tracker" defaultCommand);
+  assert valid tracker;
+  assert lib.hasInfix "--peerix-tracker" trackerCommand;
+  assert lib.hasInfix "--peerix-tracker-upstream https://sophronesis.dev/peerix" trackerCommand;
+  assert !(lib.hasInfix "--peer-share" trackerCommand);
+  assert !valid (evaluate {
+    services.narjar = {
+      enable = true;
+      peerixTracker = {
+        enable = true;
+        upstream = "sophronesis.dev/peerix";
+      };
+    };
+  });
   assert lib.hasInfix "--peer-share-store /nix/store" enabledCommand;
   assert lib.hasInfix "--peer-share-upstream https://cache.nixos.org" enabledCommand;
   assert !(lib.hasInfix "--peer-share-publish-all" enabledCommand);

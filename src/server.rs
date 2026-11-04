@@ -155,6 +155,7 @@ struct RequestWorkerContext {
     min_free_bytes: u64,
     max_encoded_nar_bytes: u64,
     idle: Arc<idle::IdleConnections>,
+    tracker: Option<Arc<crate::peerix_tracker::Tracker>>,
 }
 
 #[derive(Clone)]
@@ -261,23 +262,30 @@ fn process_next_request(
     }
     match Request::read(stream) {
         Ok(_) if context.stopping.load(Ordering::Acquire) => None,
-        Ok(request) => match request.method() {
-            Method::Put if let ReadSource::FlatCache = &*context.source => {
-                queue_publication(request, admission, context);
-                None
+        Ok(request) => {
+            if let Some(tracker) = &context.tracker
+                && crate::peerix_tracker::is_mount(request.url())
+            {
+                return tracker.respond(request);
             }
-            Method::Get | Method::Head | Method::Other | Method::Put => respond(
-                request,
-                ReadContext {
-                    setup: context.setup.as_deref().map(SetupDocument::bytes),
-                    storage: &context.storage,
-                    source: &context.source,
-                },
-                &context.authorizer,
-                &context.metrics,
-                context.min_free_bytes,
-            ),
-        },
+            match request.method() {
+                Method::Put if let ReadSource::FlatCache = &*context.source => {
+                    queue_publication(request, admission, context);
+                    None
+                }
+                Method::Get | Method::Head | Method::Other | Method::Put => respond(
+                    request,
+                    ReadContext {
+                        setup: context.setup.as_deref().map(SetupDocument::bytes),
+                        storage: &context.storage,
+                        source: &context.source,
+                    },
+                    &context.authorizer,
+                    &context.metrics,
+                    context.min_free_bytes,
+                ),
+            }
+        }
         Err((mut stream, error)) => {
             report_request_read_failure(&mut stream, error, &context.metrics);
             None
@@ -643,6 +651,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     let peer_share = start_peer_share(&config, Arc::clone(&stopping))?;
     #[cfg(not(unix))]
     let peer_share = None::<thread::JoinHandle<()>>;
+    let peerix_refresh = start_peerix_refresh(&config, Arc::clone(&stopping))?;
     let control = match crate::control::ControlService::start(
         &config.data_dir,
         Arc::clone(&storage),
@@ -736,6 +745,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         min_free_bytes,
         max_encoded_nar_bytes,
         idle,
+        tracker: peerix_refresh
+            .as_ref()
+            .map(|refresh| Arc::clone(&refresh.tracker)),
     };
     let handles = spawn_request_workers(config.workers.get(), receiver.clone(), request_context);
     drop(receiver);
@@ -771,6 +783,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
     if let Some(refresh) = &peer_share {
         refresh.thread().unpark();
+    }
+    if let Some(refresh) = &peerix_refresh {
+        refresh.handle.thread().unpark();
     }
 
     let deadline = Instant::now() + Duration::from_secs(config.shutdown_grace_seconds.get());
@@ -824,6 +839,20 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .join()
             .map_err(|_| Error::runtime("peer share refresh panicked"))?;
     }
+    if let Some(refresh) = &peerix_refresh {
+        while !refresh.handle.is_finished() {
+            if Instant::now() >= deadline {
+                return Err(Error::runtime("shutdown grace period expired"));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    if let Some(refresh) = peerix_refresh {
+        refresh
+            .handle
+            .join()
+            .map_err(|_| Error::runtime("peerix tracker refresh panicked"))?;
+    }
 
     drop(source);
     drop(storage);
@@ -856,6 +885,37 @@ fn start_peer_share(
         })
         .map(Some)
         .map_err(|error| Error::runtime(format!("cannot start peer share refresh: {error}")))
+}
+
+struct PeerixRefresh {
+    tracker: Arc<crate::peerix_tracker::Tracker>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn start_peerix_refresh(
+    config: &ServeConfig,
+    stopping: Arc<AtomicBool>,
+) -> Result<Option<PeerixRefresh>, Error> {
+    let Some(settings) = config.peerix_tracker.clone() else {
+        return Ok(None);
+    };
+    let tracker = Arc::new(crate::peerix_tracker::Tracker::new(settings));
+    let refresh = Arc::clone(&tracker);
+    let handle = thread::Builder::new()
+        .name("narjar-peerix-tracker".to_owned())
+        .spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                if let Err(error) = refresh.refresh() {
+                    eprintln!("narjar: peerix tracker refresh failed: {error}");
+                }
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::park_timeout(crate::peerix_tracker::REFRESH_INTERVAL);
+            }
+        })
+        .map_err(|error| Error::runtime(format!("cannot start peerix tracker refresh: {error}")))?;
+    Ok(Some(PeerixRefresh { tracker, handle }))
 }
 
 fn spawn_population_sampler(
@@ -926,6 +986,55 @@ mod tests {
         let started = super::start_peer_share(&config, Arc::new(AtomicBool::new(true)))
             .expect("absent peer share starts nothing");
         assert!(started.is_none());
+    }
+
+    #[test]
+    fn peerix_tracker_stays_off_without_the_flag_and_does_not_dial_when_stopping() {
+        use std::sync::atomic::AtomicBool;
+
+        use clap::{Args as _, Command, FromArgMatches};
+
+        use crate::config::{ServeArgs, ServeConfig};
+
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from(["serve", "--data-dir", "/cache"])
+            .expect("serve arguments should parse");
+        let config = ServeConfig::try_from(
+            ServeArgs::from_arg_matches(&matches).expect("serve arguments should deserialize"),
+        )
+        .expect("flat-cache config should validate");
+        let started = super::start_peerix_refresh(&config, Arc::new(AtomicBool::new(true)))
+            .expect("absent tracker starts nothing");
+        assert!(started.is_none());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = format!("http://{address}/peerix");
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from([
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--io-timeout-seconds",
+                "1",
+                "--peerix-tracker",
+                "--peerix-tracker-upstream",
+                upstream.as_str(),
+            ])
+            .expect("tracker arguments should parse");
+        let config = ServeConfig::try_from(
+            ServeArgs::from_arg_matches(&matches).expect("tracker arguments should deserialize"),
+        )
+        .expect("tracker config should validate");
+        let started = super::start_peerix_refresh(&config, Arc::new(AtomicBool::new(true)))
+            .expect("stopping tracker can start");
+        started
+            .expect("refresh thread")
+            .handle
+            .join()
+            .expect("refresh thread");
+        assert!(listener.accept().is_err());
     }
 
     #[test]
@@ -1232,6 +1341,7 @@ mod tests {
             min_free_bytes: 0,
             max_encoded_nar_bytes: 1024,
             idle,
+            tracker: None,
         };
         let mut receiver = Some(receiver);
         enum Rejection {

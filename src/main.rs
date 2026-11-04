@@ -19,6 +19,7 @@ mod native_store;
 mod operator;
 #[cfg(unix)]
 mod peer_share;
+mod peerix_tracker;
 #[cfg(unix)]
 mod push;
 #[cfg(windows)]
