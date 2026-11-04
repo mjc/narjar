@@ -23,7 +23,7 @@ use std::{
 use sqlite::{Connection, ConnectionThreadSafe, OpenFlags, State};
 
 use crate::{
-    cache::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, NarInfoMetadata},
+    cache::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, NarInfoMetadata, NixStorePath},
     cache::storage::StoreHash,
     http_client::idle_agent_allowing_status,
     http_url::HttpUrl,
@@ -74,12 +74,12 @@ struct Offered(BTreeMap<StoreHash, Vec<u8>>);
 
 pub(crate) struct ShareIndex {
     offered: RwLock<Offered>,
-    settings: Option<PeerShareSettings>,
+    settings: PeerShareSettings,
 }
 
 #[derive(Clone)]
 struct LocalPath {
-    store_path: String,
+    store_path: NixStorePath,
     nar_hash: NarHash,
     nar_size: u64,
     references: Option<Vec<String>>,
@@ -95,16 +95,7 @@ trait UpstreamNarinfo {
 }
 
 impl ShareIndex {
-    #[cfg(test)]
-    pub(crate) fn off() -> Self {
-        Self::new(None)
-    }
-
-    pub(crate) fn enabled(settings: PeerShareSettings) -> Self {
-        Self::new(Some(settings))
-    }
-
-    fn new(settings: Option<PeerShareSettings>) -> Self {
+    pub(crate) fn new(settings: PeerShareSettings) -> Self {
         Self {
             offered: RwLock::new(Offered(BTreeMap::new())),
             settings,
@@ -112,10 +103,7 @@ impl ShareIndex {
     }
 
     pub(crate) fn refresh_interval(&self) -> Duration {
-        self.settings
-            .as_ref()
-            .map(|settings| settings.refresh_interval)
-            .unwrap_or(DEFAULT_REFRESH_INTERVAL)
+        self.settings.refresh_interval
     }
 
     // Nothing in the daemon asks for a peer narinfo yet. The index still has to answer.
@@ -130,9 +118,7 @@ impl ShareIndex {
     }
 
     pub(crate) fn refresh(&self, stopping: &AtomicBool) -> Result<(), String> {
-        let Some(settings) = &self.settings else {
-            return Ok(());
-        };
+        let settings = &self.settings;
         let source = FilesystemSource {
             store_root: &settings.store_root,
             state_dir: settings.state_dir.as_deref(),
@@ -159,9 +145,7 @@ impl ShareIndex {
         stopping: &AtomicBool,
         offered_byte_limit: usize,
     ) -> Result<RefreshOutcome, String> {
-        let Some(settings) = &self.settings else {
-            return Ok(RefreshOutcome::Complete(None));
-        };
+        let settings = &self.settings;
         let Some(locals) = source.list(stopping)? else {
             return Ok(RefreshOutcome::Stopped);
         };
@@ -178,7 +162,7 @@ impl ShareIndex {
                 limit_reached = true;
                 break;
             }
-            let hash = store_hash(&local.store_path)?;
+            let hash = *local.store_path.store();
             let fetched = match upstream.fetch(&hash) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -273,12 +257,12 @@ fn offer_narinfo(
 }
 
 fn upstream_matches(local: &LocalPath, bytes: &[u8]) -> bool {
-    let Ok(hash) = store_hash(&local.store_path) else {
-        return false;
-    };
-    NarInfoClaims::parse_external_logical_claims(&hash, bytes).is_ok_and(|claims| {
-        claims.store_path() == local.store_path && claims.identity().hash() == local.nar_hash
-    })
+    NarInfoClaims::parse_external_logical_claims(local.store_path.store(), bytes).is_ok_and(
+        |claims| {
+            claims.store_path() == local.store_path.as_str()
+                && claims.identity().hash() == local.nar_hash
+        },
+    )
 }
 
 fn signed_narinfo(
@@ -288,7 +272,7 @@ fn signed_narinfo(
 ) -> Result<Vec<u8>, String> {
     let identity = NarIdentity::new(local.nar_hash, NarSize::new(local.nar_size));
     let mut metadata = NarInfoMetadata::from_store_metadata(
-        local.store_path.clone(),
+        local.store_path.as_str().to_owned(),
         None,
         None,
         identity,
@@ -300,16 +284,6 @@ fn signed_narinfo(
     metadata
         .serialize(NarRepresentation::Raw(identity))
         .map_err(|_| "peer share narinfo is too large".to_owned())
-}
-
-fn store_hash(store_path: &str) -> Result<StoreHash, String> {
-    let basename = store_path
-        .strip_prefix("/nix/store/")
-        .ok_or_else(|| format!("invalid store path {store_path}"))?;
-    let (hash, _) = basename
-        .split_once('-')
-        .ok_or_else(|| format!("invalid store path {store_path}"))?;
-    StoreHash::parse(hash).map_err(|_| format!("invalid store path {store_path}"))
 }
 
 struct FilesystemSource<'a> {
@@ -396,17 +370,16 @@ fn local_path(
     let Some(basename) = name.to_str() else {
         return Ok(None);
     };
-    if crate::cache::storage::validate_store_basename(basename).is_err() {
+    let Ok(store_path) = NixStorePath::from_basename(basename) else {
         return Ok(None);
-    }
+    };
     let path = store_root.join(name);
     let (digest, nar_size) = match hash_store_nar(&path) {
         Ok(hashed) => hashed,
         Err(_) => return Ok(None),
     };
-    let store_path = format!("/nix/store/{basename}");
     Ok(Some(LocalPath {
-        references: references.and_then(|database| database.references(&store_path)),
+        references: references.and_then(|database| database.references(store_path.as_str())),
         store_path,
         nar_hash: NarHash::from_digest(digest),
         nar_size,
@@ -524,14 +497,6 @@ mod tests {
         }
     }
 
-    struct PanicSource;
-
-    impl PathSource for PanicSource {
-        fn list(&self, _: &AtomicBool) -> Result<Option<Vec<LocalPath>>, String> {
-            panic!("disabled peer share read the store");
-        }
-    }
-
     struct MapUpstream(BTreeMap<String, Vec<u8>>);
 
     impl UpstreamNarinfo for MapUpstream {
@@ -559,7 +524,7 @@ mod tests {
         references: Option<Vec<String>>,
     ) -> LocalPath {
         LocalPath {
-            store_path: format!("/nix/store/{hash}-package"),
+            store_path: NixStorePath::parse(format!("/nix/store/{hash}-package")).unwrap(),
             nar_hash,
             nar_size,
             references,
@@ -580,7 +545,7 @@ mod tests {
     fn upstream_narinfo(path: &LocalPath) -> Vec<u8> {
         let identity = NarIdentity::new(path.nar_hash, NarSize::new(path.nar_size));
         NarInfoMetadata::from_store_metadata(
-            path.store_path.clone(),
+            path.store_path.as_str().to_owned(),
             None,
             None,
             identity,
@@ -593,18 +558,10 @@ mod tests {
     }
 
     #[test]
-    fn disabled_share_does_not_read_the_store_or_answer() {
-        let index = ShareIndex::off();
-        refresh(&index, &PanicSource, &MapUpstream(BTreeMap::new()));
-        let hash = StoreHash::parse(HASH).unwrap();
-        assert!(index.narinfo(&hash).is_none());
-    }
-
-    #[test]
     fn a_matching_upstream_narinfo_is_offered_unchanged() {
         let path = local(HASH, NarHash::from_digest([1; 32]), 32, None);
         let narinfo = upstream_narinfo(&path);
-        let index = ShareIndex::enabled(settings(false, None));
+        let index = ShareIndex::new(settings(false, None));
         let mut upstream = BTreeMap::new();
         upstream.insert(HASH.to_owned(), narinfo.clone());
         refresh(&index, &Listed(vec![path]), &MapUpstream(upstream));
@@ -617,7 +574,7 @@ mod tests {
     #[test]
     fn a_path_missing_upstream_is_not_offered() {
         let path = local(OTHER, NarHash::from_digest([2; 32]), 8, Some(Vec::new()));
-        let index = ShareIndex::enabled(settings(false, Some(signing_key())));
+        let index = ShareIndex::new(settings(false, Some(signing_key())));
         refresh(&index, &Listed(vec![path]), &MapUpstream(BTreeMap::new()));
         assert!(index.narinfo(&StoreHash::parse(OTHER).unwrap()).is_none());
     }
@@ -625,7 +582,7 @@ mod tests {
     #[test]
     fn publish_all_signs_a_path_the_upstream_does_not_have() {
         let path = local(OTHER, NarHash::from_digest([3; 32]), 8, Some(Vec::new()));
-        let index = ShareIndex::enabled(settings(true, Some(signing_key())));
+        let index = ShareIndex::new(settings(true, Some(signing_key())));
         refresh(&index, &Listed(vec![path]), &MapUpstream(BTreeMap::new()));
         let narinfo = index.narinfo(&StoreHash::parse(OTHER).unwrap()).unwrap();
         let text = String::from_utf8(narinfo).unwrap();
@@ -636,7 +593,7 @@ mod tests {
     #[test]
     fn publish_all_without_a_signing_key_omits_the_path() {
         let path = local(OTHER, NarHash::from_digest([4; 32]), 8, Some(Vec::new()));
-        let index = ShareIndex::enabled(settings(true, None));
+        let index = ShareIndex::new(settings(true, None));
         refresh(&index, &Listed(vec![path]), &MapUpstream(BTreeMap::new()));
         assert!(index.narinfo(&StoreHash::parse(OTHER).unwrap()).is_none());
     }
@@ -644,7 +601,7 @@ mod tests {
     #[test]
     fn publish_all_without_known_references_omits_the_path() {
         let path = local(OTHER, NarHash::from_digest([5; 32]), 8, None);
-        let index = ShareIndex::enabled(settings(true, Some(signing_key())));
+        let index = ShareIndex::new(settings(true, Some(signing_key())));
         refresh(&index, &Listed(vec![path]), &MapUpstream(BTreeMap::new()));
         assert!(index.narinfo(&StoreHash::parse(OTHER).unwrap()).is_none());
     }
@@ -652,7 +609,7 @@ mod tests {
     #[test]
     fn an_upstream_lookup_error_omits_the_path() {
         let path = local(OTHER, NarHash::from_digest([6; 32]), 8, Some(Vec::new()));
-        let index = ShareIndex::enabled(settings(true, Some(signing_key())));
+        let index = ShareIndex::new(settings(true, Some(signing_key())));
         let outcome = refresh(&index, &Listed(vec![path]), &FailingUpstream);
         assert!(index.narinfo(&StoreHash::parse(OTHER).unwrap()).is_none());
         match outcome {
@@ -691,7 +648,7 @@ mod tests {
         let mut configured = settings(true, Some(signing_key()));
         configured.store_root = root.path().to_path_buf();
         configured.state_dir = Some(state.path().to_path_buf());
-        let index = ShareIndex::enabled(configured);
+        let index = ShareIndex::new(configured);
         let source = FilesystemSource {
             store_root: root.path(),
             state_dir: Some(state.path()),
@@ -715,7 +672,7 @@ mod tests {
         let mut settings = settings(false, None);
         settings.store_root = root.path().to_path_buf();
         let reads = AtomicUsize::new(0);
-        let index = ShareIndex::enabled(settings);
+        let index = ShareIndex::new(settings);
         let source = CountingSource {
             inner: FilesystemSource {
                 store_root: root.path(),
@@ -768,10 +725,10 @@ mod tests {
              NarHash: sha256:0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl\n\
              NarSize: 32\n\
              Sig: cache.example:AAAA\n",
-            path.store_path,
+            path.store_path.as_str(),
         )
         .into_bytes();
-        let index = ShareIndex::enabled(settings(true, Some(signing_key())));
+        let index = ShareIndex::new(settings(true, Some(signing_key())));
         let mut upstream = BTreeMap::new();
         upstream.insert(HASH.to_owned(), narinfo.clone());
         refresh(&index, &Listed(vec![path]), &MapUpstream(upstream));
@@ -805,7 +762,7 @@ mod tests {
         let mut configured = settings(true, Some(signing_key()));
         configured.upstream = upstream_url.clone();
         configured.request_timeout = Duration::from_secs(5);
-        let index = ShareIndex::enabled(configured);
+        let index = ShareIndex::new(configured);
         let path = local(OTHER, NarHash::from_digest([8; 32]), 8, Some(Vec::new()));
         let outcome = refresh(
             &index,
@@ -877,7 +834,10 @@ mod tests {
             .list_limited(&AtomicBool::new(false), 2)
             .unwrap()
             .unwrap();
-        let mut offered: Vec<_> = paths.into_iter().map(|path| path.store_path).collect();
+        let mut offered: Vec<_> = paths
+            .into_iter()
+            .map(|path| path.store_path.as_str().to_owned())
+            .collect();
         offered.sort();
         assert_eq!(
             offered,
@@ -894,7 +854,7 @@ mod tests {
         let second = local(OTHER, NarHash::from_digest([2; 32]), 32, None);
         let first_narinfo = upstream_narinfo(&first);
         let second_narinfo = upstream_narinfo(&second);
-        let index = ShareIndex::enabled(settings(false, None));
+        let index = ShareIndex::new(settings(false, None));
         let mut upstream = BTreeMap::new();
         upstream.insert(HASH.to_owned(), first_narinfo.clone());
         upstream.insert(OTHER.to_owned(), second_narinfo);
@@ -928,7 +888,7 @@ mod tests {
             Some(vec!["not-a-store-path".to_owned()]),
         );
         let valid = local(HASH, NarHash::from_digest([4; 32]), 8, Some(Vec::new()));
-        let index = ShareIndex::enabled(settings(true, Some(signing_key())));
+        let index = ShareIndex::new(settings(true, Some(signing_key())));
         let outcome = refresh(
             &index,
             &Listed(vec![invalid, valid]),

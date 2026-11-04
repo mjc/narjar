@@ -839,7 +839,7 @@ fn start_peer_share(
     let Some(settings) = config.peer_share.clone() else {
         return Ok(None);
     };
-    let index = Arc::new(crate::peer_share::ShareIndex::enabled(settings));
+    let index = Arc::new(crate::peer_share::ShareIndex::new(settings));
     thread::Builder::new()
         .name("narjar-peer-share".to_owned())
         .spawn(move || {
@@ -906,6 +906,27 @@ mod tests {
 
     use super::{Admissions, configure_accepted_socket, request_read_failure_outcome};
     use crate::cache::metrics::ConnectionOutcome;
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_share_does_not_start_without_a_store_root() {
+        use std::sync::atomic::AtomicBool;
+
+        use clap::{Args as _, Command, FromArgMatches};
+
+        use crate::config::{ServeArgs, ServeConfig};
+
+        let matches = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from(["serve", "--data-dir", "/cache"])
+            .expect("serve arguments should parse");
+        let config = ServeConfig::try_from(
+            ServeArgs::from_arg_matches(&matches).expect("serve arguments should deserialize"),
+        )
+        .expect("flat-cache config should validate");
+        let started = super::start_peer_share(&config, Arc::new(AtomicBool::new(true)))
+            .expect("absent peer share starts nothing");
+        assert!(started.is_none());
+    }
 
     #[test]
     fn read_through_startup_repairs_missing_advertised_output_before_recovery() {

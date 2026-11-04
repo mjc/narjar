@@ -17,23 +17,23 @@ pub use trust::TrustedPublicKeys;
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct NixStorePath {
+pub(crate) struct NixStorePath {
     value: String,
     store: StoreHash,
 }
 
 impl NixStorePath {
-    fn parse(value: String) -> Result<Self, NarInfoError> {
+    pub(crate) fn parse(value: String) -> Result<Self, NarInfoError> {
         let basename = value.strip_prefix("/nix/store/").ok_or(NarInfoError)?;
         let (store, _) = validate_store_basename(basename)?;
         Ok(Self { value, store })
     }
 
-    fn from_basename(value: &str) -> Result<Self, NarInfoError> {
+    pub(crate) fn from_basename(value: &str) -> Result<Self, NarInfoError> {
         Self::parse(format!("/nix/store/{value}"))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.value
     }
 
@@ -43,7 +43,7 @@ impl NixStorePath {
             .expect("validated store paths retain their prefix")
     }
 
-    fn store(&self) -> &StoreHash {
+    pub(crate) fn store(&self) -> &StoreHash {
         &self.store
     }
 }
