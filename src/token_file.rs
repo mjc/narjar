@@ -9,6 +9,7 @@ use crate::cache::filesystem::{
     FilePrivacy, PreparedFile, create_private_directory_tree, open_regular, validate_private_file,
 };
 use data_encoding::HEXLOWER;
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 pub const TOKEN_BYTES: usize = 32;
 
@@ -66,8 +67,16 @@ impl TokenFile {
         Ok(Self(records))
     }
 
-    pub fn hashes(&self) -> impl Iterator<Item = &[u8; TOKEN_BYTES]> {
-        self.0.iter().map(|record| &record.digest)
+    pub(crate) fn matching_label(&self, actual: &[u8; TOKEN_BYTES]) -> Option<String> {
+        let mut found = Choice::from(0);
+        let mut index = 0u32;
+        for (position, record) in self.0.iter().enumerate() {
+            let equal = record.digest.ct_eq(actual);
+            let take = equal & !found;
+            index = u32::conditional_select(&index, &(position as u32), take);
+            found |= equal;
+        }
+        bool::from(found).then(|| self.0[index as usize].label.clone())
     }
 
     pub fn insert(&mut self, label: &str, digest: [u8; TOKEN_BYTES]) -> Result<bool, Error> {
@@ -139,7 +148,7 @@ mod tests {
             tokens.insert("not a label", [0; super::TOKEN_BYTES]),
             Err(Error::InvalidLabel)
         ));
-        assert_eq!(tokens.hashes().count(), 0);
+        assert!(tokens.0.is_empty());
     }
 
     #[test]

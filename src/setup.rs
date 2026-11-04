@@ -72,15 +72,17 @@ pub(crate) fn run(mut options: Setup) -> Result<(), Error> {
     generate_key_pair(&options.key_name, &secret_key, &public_key)?;
     install_trusted_public_key(&options.data_dir, &public_key)?;
 
-    let write_token =
-        token::create_secret_token(&options.data_dir.join("auth/write.tokens"), "setup-write")?;
+    let write_token = token::create_secret_token(
+        &options.data_dir.join("auth/write.tokens"),
+        SETUP_WRITE_LABEL,
+    )?;
     operator::create_file(
         &options.credentials_dir.join("write.token"),
         write_token.as_bytes(),
         FilePrivacy::Private,
         false,
     )?;
-    let netrc = netrc_entry(options.cache_url.host(), &write_token);
+    let netrc = netrc_entry(options.cache_url.host(), SETUP_WRITE_LABEL, &write_token);
     operator::create_file(
         &options.credentials_dir.join("narjar.netrc"),
         netrc.as_bytes(),
@@ -216,8 +218,10 @@ fn create_private_read_token(options: &Setup) -> Result<(), Error> {
     )
 }
 
-fn netrc_entry(host: &str, token: &str) -> String {
-    format!("machine {host} login narjar password {token}\n")
+const SETUP_WRITE_LABEL: &str = "setup-write";
+
+fn netrc_entry(host: &str, login: &str, secret: &str) -> String {
+    format!("machine {host} login {login} password {secret}\n")
 }
 
 fn print_setup_summary(options: &Setup, secret_key: &Path, public_key: &Path) {

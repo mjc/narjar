@@ -7,11 +7,10 @@ use crate::cache::{
 };
 use data_encoding::BASE64;
 use sha2::{Digest, Sha256};
-use subtle::{Choice, ConstantTimeEq};
 
 const TOKEN_BYTES: usize = 32;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Permission {
     Read,
     Write,
@@ -35,12 +34,8 @@ impl TokenHashes {
         }
     }
 
-    fn matches(&self, actual: &[u8; TOKEN_BYTES]) -> Choice {
-        self.0
-            .hashes()
-            .fold(Choice::from(0), |accepted, candidate| {
-                accepted | candidate.ct_eq(actual)
-            })
+    fn matching_label(&self, actual: &[u8; TOKEN_BYTES]) -> Option<String> {
+        self.0.matching_label(actual)
     }
 }
 
@@ -59,15 +54,24 @@ impl ReadPolicy {
     }
 
     fn is_public(&self) -> bool {
-        matches!(self, Self::Public)
-    }
-
-    fn matches(&self, actual: &[u8; TOKEN_BYTES]) -> Choice {
         match self {
-            Self::Public => Choice::from(0),
-            Self::Private(tokens) => tokens.matches(actual),
+            Self::Public => true,
+            Self::Private(_) => false,
         }
     }
+
+    fn matching_label(&self, actual: &[u8; TOKEN_BYTES]) -> Option<String> {
+        match self {
+            Self::Public => None,
+            Self::Private(tokens) => tokens.matching_label(actual),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcceptedAccess {
+    Unlabeled,
+    Token(String),
 }
 
 #[derive(Debug)]
@@ -85,19 +89,26 @@ impl Authorizer {
         })
     }
 
-    pub fn allows(&self, request: &Request, permission: Permission) -> bool {
-        if matches!(permission, Permission::Read) && self.read.is_public() {
-            return true;
+    pub fn authenticate(
+        &self,
+        request: &Request,
+        permission: Permission,
+    ) -> Option<AcceptedAccess> {
+        if permission == Permission::Read && self.read.is_public() {
+            return Some(AcceptedAccess::Unlabeled);
         }
-        let Some(actual) = authorization_token_hash(request) else {
-            return false;
+        let actual = authorization_token_hash(request)?;
+        let write_label = self.write.matching_label(&actual);
+        let read_label = self.read.matching_label(&actual);
+        let label = match permission {
+            Permission::Read => write_label.or(read_label),
+            Permission::Write => write_label,
         };
+        label.map(AcceptedAccess::Token)
+    }
 
-        let accepted = match permission {
-            Permission::Read => self.read.matches(&actual) | self.write.matches(&actual),
-            Permission::Write => self.write.matches(&actual),
-        };
-        bool::from(accepted)
+    pub fn allows(&self, request: &Request, permission: Permission) -> bool {
+        self.authenticate(request, permission).is_some()
     }
 
     pub(crate) fn read_visibility(&self) -> ReadVisibility {
@@ -139,6 +150,7 @@ fn authorization_token_hash(request: &Request) -> Option<[u8; TOKEN_BYTES]> {
 mod tests {
     use std::{
         fs,
+        io::Write,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -153,6 +165,128 @@ mod tests {
             .expect("clock should be after the Unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("narjar-auth-{test}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn accepted_request_resolves_to_the_matching_token_label() {
+        let root = test_root("labels");
+        let auth = root.join("auth");
+        fs::create_dir_all(&auth).expect("create test auth directory");
+        write_private_token_file(
+            &auth.join("write.tokens"),
+            &format!(
+                "{}{}",
+                token_record("other-writer", "unused-write-secret"),
+                token_record("publisher", "write-secret")
+            ),
+        );
+        write_private_token_file(
+            &auth.join("read.tokens"),
+            &token_record("reader", "read-secret"),
+        );
+        let authorizer = Authorizer::load(&Directory::open(&root).expect("open test root"))
+            .expect("load token files");
+
+        let write = authenticate(&authorizer, "narjar", "write-secret");
+        let read = authenticate(&authorizer, "someone-else", "read-secret");
+        let write_used_to_read = authenticate(&authorizer, "narjar", "write-secret");
+        let rejected = authenticate(&authorizer, "publisher", "wrong-secret");
+        fs::remove_dir_all(root).expect("remove test data directory");
+
+        assert_eq!(
+            write,
+            (
+                Some(AcceptedAccess::Token("publisher".to_owned())),
+                Some(AcceptedAccess::Token("publisher".to_owned()))
+            )
+        );
+        assert_eq!(
+            read,
+            (Some(AcceptedAccess::Token("reader".to_owned())), None)
+        );
+        assert_eq!(
+            write_used_to_read.0,
+            Some(AcceptedAccess::Token("publisher".to_owned()))
+        );
+        assert_eq!(rejected, (None, None));
+    }
+
+    #[test]
+    fn public_read_has_no_token_label() {
+        let root = test_root("public");
+        let auth = root.join("auth");
+        fs::create_dir_all(&auth).expect("create test auth directory");
+        write_private_token_file(
+            &auth.join("write.tokens"),
+            &token_record("publisher", "write-secret"),
+        );
+        let authorizer = Authorizer::load(&Directory::open(&root).expect("open test root"))
+            .expect("load token files");
+
+        let unlabeled = authenticate(&authorizer, "publisher", "not-the-secret");
+        let named_write = authenticate(&authorizer, "other-login", "write-secret");
+        fs::remove_dir_all(root).expect("remove test data directory");
+
+        assert_eq!(unlabeled.0, Some(AcceptedAccess::Unlabeled));
+        assert_eq!(unlabeled.1, None);
+        assert_eq!(
+            named_write,
+            (
+                Some(AcceptedAccess::Unlabeled),
+                Some(AcceptedAccess::Token("publisher".to_owned()))
+            )
+        );
+    }
+
+    fn token_record(label: &str, secret: &str) -> String {
+        format!(
+            "{label} {}\n",
+            data_encoding::HEXLOWER.encode(Sha256::digest(secret.as_bytes()).as_slice())
+        )
+    }
+
+    fn write_private_token_file(path: &std::path::Path, contents: &str) {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .expect("create private token file")
+            .write_all(contents.as_bytes())
+            .expect("write private token file");
+    }
+
+    fn authenticate(
+        authorizer: &Authorizer,
+        login: &str,
+        secret: &str,
+    ) -> (Option<AcceptedAccess>, Option<AcceptedAccess>) {
+        let encoded = BASE64.encode(format!("{login}:{secret}").as_bytes());
+        let request = format!("GET / HTTP/1.1\r\nAuthorization: Basic {encoded}\r\n\r\n");
+        let mut access = None;
+        with_request(request.as_bytes(), |request| {
+            access = Some((
+                authorizer.authenticate(&request, Permission::Read),
+                authorizer.authenticate(&request, Permission::Write),
+            ));
+        });
+        access.expect("request should be parsed")
+    }
+
+    fn with_request(input: &[u8], inspect: impl FnOnce(Request)) {
+        use std::{io::Write, net::TcpListener, thread};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let input = input.to_vec();
+        let writer = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect test listener");
+            stream.write_all(&input).expect("write test request");
+        });
+        let (stream, _) = listener.accept().expect("accept test request");
+        let request = Request::read(stream).expect("parse test request");
+        inspect(request);
+        writer.join().expect("test writer");
     }
 
     #[test]
