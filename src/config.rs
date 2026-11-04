@@ -41,6 +41,7 @@ pub(crate) struct ServeConfig {
     pub(crate) stats_filesystem_sample: Option<PathBuf>,
     #[cfg(unix)]
     pub(crate) peer_share: Option<crate::peer_share::PeerShareSettings>,
+    pub(crate) peerix_tracker: Option<crate::peerix_tracker::TrackerSettings>,
 }
 
 /// Prepared source selection; native-store output is inherently flat/raw.
@@ -369,6 +370,16 @@ pub(crate) struct ServeArgs {
     /// Seconds between peer share index refreshes.
     #[arg(long, env = "NARJAR_PEER_SHARE_REFRESH_SECONDS")]
     peer_share_refresh_seconds: Option<NonZeroU64>,
+    /// Serve peerix announce, peer list, package, and find routes on this listener.
+    #[arg(long, env = "NARJAR_PEERIX_TRACKER")]
+    peerix_tracker: bool,
+    /// Upstream tracker to read for peer lists and find results.
+    #[arg(
+        long,
+        env = "NARJAR_PEERIX_TRACKER_UPSTREAM",
+        requires = "peerix_tracker"
+    )]
+    peerix_tracker_upstream: Option<HttpUrl>,
     #[arg(
         long,
         env = "NARJAR_STATS_INVENTORY_INTERVAL_SECONDS",
@@ -458,6 +469,7 @@ impl TryFrom<ServeArgs> for ServeConfig {
         }
         #[cfg(unix)]
         let peer_share = peer_share_settings(&args)?;
+        let peerix_tracker = peerix_tracker_settings(&args);
         Ok(Self {
             hosting: args.hosting.prepare(source.minimum_advertisement_lease())?,
             track_access: args.track_access,
@@ -476,8 +488,25 @@ impl TryFrom<ServeArgs> for ServeConfig {
             stats_filesystem_sample: args.stats_filesystem_sample,
             #[cfg(unix)]
             peer_share,
+            peerix_tracker,
         })
     }
+}
+
+fn peerix_tracker_settings(args: &ServeArgs) -> Option<crate::peerix_tracker::TrackerSettings> {
+    if !args.peerix_tracker {
+        return None;
+    }
+    let upstream = match args.peerix_tracker_upstream.clone() {
+        Some(upstream) => upstream,
+        None => crate::peerix_tracker::DEFAULT_UPSTREAM
+            .parse()
+            .expect("default peerix tracker URL"),
+    };
+    Some(crate::peerix_tracker::TrackerSettings {
+        upstream,
+        timeout: std::time::Duration::from_secs(args.io_timeout_seconds.get()),
+    })
 }
 
 #[cfg(unix)]
@@ -646,6 +675,41 @@ mod tests {
         assert!(matches!(config.source, ServeSource::FlatCache { .. }));
         assert_eq!(config.storage_backend(), SupportedStorageBackend::FLAT);
         assert_eq!(config.egress_compression(), WireEncoding::Raw);
+        assert!(config.peerix_tracker.is_none());
+    }
+
+    #[test]
+    fn peerix_tracker_defaults_to_sophronesis_until_an_upstream_is_set() {
+        let config = parse_serve_config(&["--peerix-tracker"]).unwrap();
+        let settings = config.peerix_tracker.expect("tracker");
+        assert_eq!(settings.upstream.as_str(), "https://sophronesis.dev/peerix");
+        let config = parse_serve_config(&[
+            "--peerix-tracker",
+            "--peerix-tracker-upstream",
+            "http://127.0.0.1:9/peerix",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.peerix_tracker.unwrap().upstream.as_str(),
+            "http://127.0.0.1:9/peerix"
+        );
+    }
+
+    #[test]
+    fn peerix_tracker_upstream_requires_the_tracker_flag() {
+        let error = ServeArgs::augment_args(Command::new("serve"))
+            .try_get_matches_from([
+                "serve",
+                "--data-dir",
+                "/cache",
+                "--peerix-tracker-upstream",
+                "https://sophronesis.dev/peerix",
+            ])
+            .expect_err("upstream without the tracker flag");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     fn parse_serve_config(extra: &[&str]) -> Result<ServeConfig, String> {

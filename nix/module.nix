@@ -379,6 +379,11 @@
       "--peer-share-signing-key-file"
       "%d/peer-share-signing-key"
     ]
+    ++ lib.optionals cfg.peerixTracker.enable [
+      "--peerix-tracker"
+      "--peerix-tracker-upstream"
+      cfg.peerixTracker.upstream
+    ]
   );
   zfsProperties = [
     "mountpoint"
@@ -640,6 +645,15 @@ in {
       };
     };
 
+    peerixTracker = {
+      enable = lib.mkEnableOption "the peerix tracker on this server";
+      upstream = lib.mkOption {
+        type = lib.types.str;
+        default = "https://sophronesis.dev/peerix";
+        description = "Tracker whose peer lists and find results this server learns. Narjar does not register its peers there.";
+      };
+    };
+
     listen = lib.mkOption {
       type = lib.types.str;
       default = "127.0.0.1:5000";
@@ -844,6 +858,10 @@ in {
       narinfo-cache-negative-ttl = cfg.edge.clientNegativeTtlSeconds;
     };
     assertions = [
+      {
+        assertion = !cfg.peerixTracker.enable || builtins.match "https?://[^/?#@]+([/?#].*)?" cfg.peerixTracker.upstream != null;
+        message = "services.narjar.peerixTracker.upstream must be an HTTP(S) URL with a host";
+      }
       {
         assertion = !cfg.edge.enable || (!cfg.nativeStore.enable && cfg.egressCompression == "none" && cfg.workers >= 2 && cfg.maxInFlight >= 2);
         message = "services.narjar.edge requires raw output, two workers and connection admissions, and cannot be combined with nativeStore";

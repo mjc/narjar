@@ -549,6 +549,14 @@ before serving, then check `/readyz`. Keep the restored copy private:
 `auth/` and `trusted-public-keys` define its authorization and trust policy.
 Filesystem snapshots and replication are managed outside Narjar.
 
+## Peerix tracker
+
+`narjar serve --peerix-tracker` answers peerix tracker routes on the same listener as the binary cache: announce, the peer lists, package batch and delta, and find. Without that flag the routes are absent and the server does not call another tracker.
+
+With the flag, Narjar reads peer lists from an upstream tracker, by default `https://sophronesis.dev/peerix`, about once a minute. Each find asks that tracker for providers. Learned rows are served with the local announcements. A local announce for a peer id is the row later reads return. When the upstream cannot be reached, learned rows remain until 120 seconds after the upstream `last_seen`, and local announcements keep working. Narjar does not send its own peers upstream.
+
+IPFS lookups, transfer reports, and reputation are outside this tracker. Discovery's default tracker URL is `https://narjar.mjc.lol/peerix`. The NixOS option `services.narjar.peerixTracker.enable` turns the routes on; it defaults to off. `services.narjar.peerixTracker.upstream` selects the tracker Narjar reads. The routes are on the serve listener, so a reverse proxy in front of Narjar has to forward `/peerix` before clients can use a public URL.
+
 ## Observability
 
 `GET /healthz` is a public liveness check. `GET /readyz` checks the staging
