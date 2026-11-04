@@ -25,7 +25,7 @@ use crate::cache::{
             self, EvictionOrder, FreeSpaceThresholds, GcMode, GcOptions, GcReport, ProtectedRoots,
             RetentionOptions,
         },
-        storage_directories,
+        read_recent_fetch_failures, storage_directories,
     },
 };
 use clap::{Args, builder::TypedValueParser};
@@ -1221,6 +1221,19 @@ fn print_doctor(report: &DoctorReport) {
             path.detail
         );
     }
+}
+
+#[derive(Args)]
+pub(crate) struct FetchFailures {
+    #[arg(long)]
+    data_dir: PathBuf,
+}
+
+pub(crate) fn fetch_failures(options: FetchFailures) -> Result<(), Error> {
+    for line in read_recent_fetch_failures(&options.data_dir, SystemTime::now()).map_err(runtime)? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 #[derive(Args)]

@@ -568,6 +568,16 @@ report the last pass's duration and logically reclaimed objects and bytes.
 Each series has HELP text describing it. Labels do not contain
 paths, hashes, token names, or request IDs.
 
+When a narinfo or NAR fetch misses or fails for a store path this cache
+published within the last seven days, Narjar appends a line to
+`.narjar-fetch-failures` in the data directory. The line records the request
+time, the reader token label when the read was authenticated, the store hash,
+the store path, the failure kind, the publication time, and the writer label.
+An anonymous read leaves the reader empty. The file is private to the cache
+owner and capped at 1 MiB; lines older than seven days are dropped.
+`narjar fetch-failures --data-dir PATH` prints the lines still inside that
+window, newest first. A hit is not recorded.
+
 Read-through origin traffic is reported as upstream response-body bytes:
 `narjar_edge_upstream_metadata_bytes_total` counts narinfo bodies, and
 `narjar_edge_upstream_payload_bytes_total` counts NAR bodies with the bounded

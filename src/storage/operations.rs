@@ -487,6 +487,7 @@ impl Storage {
                     claims.store(),
                     claims.store_path(),
                     writer,
+                    Some(output.file_name()),
                     SystemTime::now(),
                 )?;
                 Ok(outcome)

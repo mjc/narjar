@@ -22,6 +22,8 @@ mod compression;
 mod directory;
 #[path = "storage/egress.rs"]
 mod egress;
+#[path = "storage/fetch_failure.rs"]
+mod fetch_failure;
 #[path = "storage/fs.rs"]
 mod fs;
 #[path = "storage/gc.rs"]
@@ -93,6 +95,7 @@ pub use recovery::RecoveryStatus;
 pub use state::Storage;
 pub(crate) use state::StorageActivitySnapshot;
 
+pub(crate) use fetch_failure::{FetchFailureKind, FetchTarget, read_recent_fetch_failures};
 pub(crate) use operations::AdvertisedNarInfo;
 pub use operations::{RecoveredStorage, StorageReadiness};
 pub use population::PopulationCounts;

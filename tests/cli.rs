@@ -491,6 +491,7 @@ fn cli_help_and_version_work_for_the_packaged_binary() {
         "list-orphans",
         "delete",
         "stats",
+        "fetch-failures",
         "doctor",
         "token",
         "push",
@@ -4974,6 +4975,76 @@ fn nix_2_31_5_trace_drives_redacted_socket_conformance() {
     );
     assert!(!transcript.contains(TEST_AUTHORIZATION), "{transcript}");
     assert_clean_shutdown(signal, status);
+}
+
+#[test]
+fn fetch_failures_prints_retained_lines_newest_first() {
+    let data_dir = init_data_dir("fetch-failures");
+    let path = data_dir.to_str().expect("temporary path should be UTF-8");
+    let missing = run(&["fetch-failures", "--data-dir", path]);
+    assert!(
+        missing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(missing.stdout.is_empty());
+
+    let root = crate::cache::storage::Directory::open(data_dir.path()).expect("open cache");
+    let _storage = crate::cache::storage::Storage::open(
+        &root,
+        crate::cache::storage::SupportedStorageBackend::FLAT,
+    )
+    .expect("hold the cache lock");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after the Unix epoch")
+        .as_secs();
+    let store = "00000000000000000000000000000000";
+    let published = now.saturating_sub(86_400);
+    let same = now.saturating_sub(100);
+    let fresh = now.saturating_sub(10);
+    let expired = now.saturating_sub(8 * 24 * 60 * 60);
+    let line = |requested: u64, reader: &str| {
+        format!(
+            "v1\t{requested}\t{reader}\t{store}\t/nix/store/{store}-sample\tnarinfo-miss\t{published}\twriter-token"
+        )
+    };
+    let body = format!(
+        "{}\n{}\n{}\n{}\n",
+        line(expired, "expired-reader"),
+        line(same, "first-reader"),
+        line(same, "second-reader"),
+        line(fresh, "fresh-reader"),
+    );
+    crate::cache::test_support::private_file(
+        data_dir.join(".narjar-fetch-failures"),
+        body.as_bytes(),
+    )
+    .expect("write failure log");
+
+    let output = run(&["fetch-failures", "--data-dir", path]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            line(fresh, "fresh-reader"),
+            line(same, "second-reader"),
+            line(same, "first-reader"),
+        ]
+    );
+
+    crate::cache::test_support::private_file(
+        data_dir.join(".narjar-fetch-failures"),
+        b"not a failure log\n",
+    )
+    .expect("replace failure log");
+    let invalid = run(&["fetch-failures", "--data-dir", path]);
+    assert_eq!(invalid.status.code(), Some(1));
 }
 
 fn init_data_dir(test: &str) -> TestDir {

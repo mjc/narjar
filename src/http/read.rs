@@ -1,18 +1,18 @@
 use std::{
     io::{self, Read},
     net::TcpStream,
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
 use crate::cache::{
-    auth::{Authorizer, Permission, ReadVisibility},
+    auth::{AcceptedAccess, Authorizer, Permission, ReadVisibility},
     http_server::{Method, Request, Response, ResponseHeader as Header, StatusCode, static_header},
     metrics::{
         CacheLookupOutcome, CacheObject, Metrics, NarRangeOutcome, RequestGuard, RequestMethod,
         RequestRoute, render_prometheus,
     },
     object::NarFileName,
-    storage::{NarReadBody, Storage, StorageReadiness, StoreHash},
+    storage::{FetchFailureKind, FetchTarget, NarReadBody, Storage, StorageReadiness, StoreHash},
 };
 
 use super::write::unauthorized;
@@ -174,6 +174,7 @@ fn respond_narinfo(
     request: Request,
     storage: &Storage,
     store: &StoreHash,
+    authorizer: &Authorizer,
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
     public_control: &'static str,
@@ -183,10 +184,24 @@ fn respond_narinfo(
         Ok(advertisement) => advertisement,
         Err(NarInfoReadFailure::Missing) => {
             record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
+            note_recent_fetch_failure(
+                storage,
+                authorizer,
+                &request,
+                FetchFailureKind::MissingNarinfo,
+                FetchTarget::NarInfo(store),
+            );
             return not_found(guard, request);
         }
         Err(NarInfoReadFailure::InvalidOrUnreadable) => {
             record_narinfo_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+            note_recent_fetch_failure(
+                storage,
+                authorizer,
+                &request,
+                FetchFailureKind::FailedNarinfo,
+                FetchTarget::NarInfo(store),
+            );
             return internal_error(guard, request);
         }
     };
@@ -226,6 +241,7 @@ fn respond_edge_narinfo(
     storage: &Storage,
     source: &ReadThroughSource,
     store: &StoreHash,
+    authorizer: &Authorizer,
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
@@ -244,6 +260,13 @@ fn respond_edge_narinfo(
         }
         Err(miss) => {
             record_narinfo_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
+            note_recent_fetch_failure(
+                storage,
+                authorizer,
+                &request,
+                FetchFailureKind::MissingNarinfo,
+                FetchTarget::NarInfo(store),
+            );
             send_response(
                 guard,
                 request,
@@ -292,6 +315,42 @@ fn record_narinfo_lookup(
 }
 
 #[cfg(unix)]
+fn note_native_fetch_failure(
+    storage: &Storage,
+    authorizer: &Authorizer,
+    request: &Request,
+    outcome: CacheLookupOutcome,
+    target: FetchTarget<'_>,
+) {
+    let kind = match (outcome, &target) {
+        (CacheLookupOutcome::Hit, _) => return,
+        (CacheLookupOutcome::Miss, FetchTarget::NarInfo(_)) => FetchFailureKind::MissingNarinfo,
+        (CacheLookupOutcome::Failure, FetchTarget::NarInfo(_)) => FetchFailureKind::FailedNarinfo,
+        (CacheLookupOutcome::Miss, FetchTarget::Nar(_)) => FetchFailureKind::MissingNar,
+        (CacheLookupOutcome::Failure, FetchTarget::Nar(_)) => FetchFailureKind::FailedNar,
+    };
+    note_recent_fetch_failure(storage, authorizer, request, kind, target);
+}
+
+fn note_recent_fetch_failure(
+    storage: &Storage,
+    authorizer: &Authorizer,
+    request: &Request,
+    kind: FetchFailureKind,
+    target: FetchTarget<'_>,
+) {
+    let reader = match authorizer.authenticate(request, Permission::Read) {
+        Some(AcceptedAccess::Token(label)) => Some(label),
+        Some(AcceptedAccess::Unlabeled) | None => None,
+    };
+    if let Err(error) =
+        storage.record_recent_fetch_failure(kind, target, reader.as_deref(), SystemTime::now())
+    {
+        eprintln!("narjar: {error}");
+    }
+}
+
+#[cfg(unix)]
 fn native_read_failure(
     request: Request,
     guard: &RequestGuard<'_>,
@@ -323,8 +382,10 @@ fn native_lookup_outcome(error: &NativeReadError) -> CacheLookupOutcome {
 #[cfg(unix)]
 fn respond_native_narinfo(
     request: Request,
+    storage: &Storage,
     source: &NativeStoreSource,
     store: StoreHash,
+    authorizer: &Authorizer,
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
@@ -341,7 +402,15 @@ fn respond_native_narinfo(
             send_response(guard, request, response)
         }
         Err(error) => {
-            record_narinfo_lookup(guard, native_lookup_outcome(&error), started);
+            let outcome = native_lookup_outcome(&error);
+            record_narinfo_lookup(guard, outcome, started);
+            note_native_fetch_failure(
+                storage,
+                authorizer,
+                &request,
+                outcome,
+                FetchTarget::NarInfo(&store),
+            );
             native_read_failure(request, guard, error)
         }
     }
@@ -350,8 +419,10 @@ fn respond_native_narinfo(
 #[cfg(unix)]
 fn respond_native_nar(
     request: Request,
+    storage: &Storage,
     source: &NativeStoreSource,
     name: NarFileName,
+    authorizer: &Authorizer,
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
@@ -363,7 +434,15 @@ fn respond_native_nar(
     let object = match opened {
         Ok(object) => object,
         Err(error) => {
-            record_nar_lookup(guard, native_lookup_outcome(&error), started);
+            let outcome = native_lookup_outcome(&error);
+            record_nar_lookup(guard, outcome, started);
+            note_native_fetch_failure(
+                storage,
+                authorizer,
+                &request,
+                outcome,
+                FetchTarget::Nar(name),
+            );
             return native_read_failure(request, guard, error);
         }
     };
@@ -417,6 +496,13 @@ fn respond_native_nar(
                 }
                 Err(error) => {
                     record_nar_lookup(guard, CacheLookupOutcome::Failure, started);
+                    note_recent_fetch_failure(
+                        storage,
+                        authorizer,
+                        &request,
+                        FetchFailureKind::FailedNar,
+                        FetchTarget::Nar(name),
+                    );
                     native_read_failure(request, guard, error)
                 }
             }
@@ -522,6 +608,7 @@ fn respond_nar(
     request: Request,
     storage: &Storage,
     name: NarFileName,
+    authorizer: &Authorizer,
     guard: &RequestGuard<'_>,
     visibility: ReadVisibility,
 ) -> Option<TcpStream> {
@@ -530,10 +617,24 @@ fn respond_nar(
         Ok(Some(length)) => length,
         Ok(None) => {
             record_nar_lookup(guard, CacheLookupOutcome::Miss, lookup_started);
+            note_recent_fetch_failure(
+                storage,
+                authorizer,
+                &request,
+                FetchFailureKind::MissingNar,
+                FetchTarget::Nar(name),
+            );
             return not_found(guard, request);
         }
         Err(_) => {
             record_nar_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+            note_recent_fetch_failure(
+                storage,
+                authorizer,
+                &request,
+                FetchFailureKind::FailedNar,
+                FetchTarget::Nar(name),
+            );
             return internal_error(guard, request);
         }
     };
@@ -545,6 +646,7 @@ fn respond_nar(
             request,
             storage,
             name,
+            authorizer,
             NarResponseRange::Full { length },
             NarResponseContext {
                 guard,
@@ -556,6 +658,7 @@ fn respond_nar(
             request,
             storage,
             name,
+            authorizer,
             NarResponseRange::Partial {
                 start,
                 end,
@@ -613,6 +716,7 @@ fn respond_nar_bytes(
     request: Request,
     storage: &Storage,
     name: NarFileName,
+    authorizer: &Authorizer,
     response_range: NarResponseRange,
     context: NarResponseContext<'_, '_>,
 ) -> Option<TcpStream> {
@@ -625,14 +729,39 @@ fn respond_nar_bytes(
     let range_length = response_range.content_length();
     let Ok(content_length) = usize::try_from(range_length) else {
         record_nar_lookup(guard, CacheLookupOutcome::Failure, lookup_started);
+        note_recent_fetch_failure(
+            storage,
+            authorizer,
+            &request,
+            FetchFailureKind::FailedNar,
+            FetchTarget::Nar(name),
+        );
         return internal_error(guard, request);
     };
     let opened = storage.open_nar_range(name, range.clone());
     record_nar_open_outcome(guard, &opened, lookup_started);
     let opened = match opened {
         Ok(Some(opened)) => opened,
-        Ok(None) => return not_found(guard, request),
-        Err(_) => return internal_error(guard, request),
+        Ok(None) => {
+            note_recent_fetch_failure(
+                storage,
+                authorizer,
+                &request,
+                FetchFailureKind::FailedNar,
+                FetchTarget::Nar(name),
+            );
+            return not_found(guard, request);
+        }
+        Err(_) => {
+            note_recent_fetch_failure(
+                storage,
+                authorizer,
+                &request,
+                FetchFailureKind::FailedNar,
+                FetchTarget::Nar(name),
+            );
+            return internal_error(guard, request);
+        }
     };
     opened.record_served_access(storage, name);
     match opened.body {
@@ -1089,32 +1218,51 @@ fn respond_cache_route(
                     send_response(guard, request, response)
                 }
                 CacheRoute::Nar(name) => match context.source {
-                    ReadSource::FlatCache | ReadSource::ReadThrough(_) => {
-                        respond_nar(request, context.storage, name, guard, visibility)
-                    }
+                    ReadSource::FlatCache | ReadSource::ReadThrough(_) => respond_nar(
+                        request,
+                        context.storage,
+                        name,
+                        authorizer,
+                        guard,
+                        visibility,
+                    ),
                     #[cfg(unix)]
-                    ReadSource::NativeStore(source) => {
-                        respond_native_nar(request, source, name, guard, visibility)
-                    }
+                    ReadSource::NativeStore(source) => respond_native_nar(
+                        request,
+                        context.storage,
+                        source,
+                        name,
+                        authorizer,
+                        guard,
+                        visibility,
+                    ),
                 },
                 CacheRoute::NarInfo(store) => match context.source {
                     ReadSource::FlatCache => respond_narinfo(
                         request,
                         context.storage,
                         &store,
+                        authorizer,
                         guard,
                         visibility,
                         IMMUTABLE_CACHE_CONTROL,
                     ),
                     #[cfg(unix)]
-                    ReadSource::NativeStore(source) => {
-                        respond_native_narinfo(request, source, store, guard, visibility)
-                    }
+                    ReadSource::NativeStore(source) => respond_native_narinfo(
+                        request,
+                        context.storage,
+                        source,
+                        store,
+                        authorizer,
+                        guard,
+                        visibility,
+                    ),
                     ReadSource::ReadThrough(source) => respond_edge_narinfo(
                         request,
                         context.storage,
                         source,
                         &store,
+                        authorizer,
                         guard,
                         visibility,
                     ),
@@ -1137,7 +1285,7 @@ mod tests {
         readiness_response, record_nar_open_outcome, request_route, respond_nar,
     };
     use crate::cache::{
-        auth::ReadVisibility,
+        auth::{Authorizer, ReadVisibility},
         http_server::{Method, StatusCode},
         metrics::{Metrics, RequestMethod, RequestRoute as MetricsRoute},
         nar_compression::encode_and_measure_nar,
@@ -1176,8 +1324,17 @@ mod tests {
         (directory, storage, encoded.file_name(), compressed)
     }
 
+    fn public_authorizer(path: &std::path::Path) -> Authorizer {
+        let auth = path.join("auth");
+        if !auth.exists() {
+            crate::cache::test_support::private_directory(&auth).unwrap();
+        }
+        Authorizer::load(&Directory::open(path).unwrap()).unwrap()
+    }
+
     fn request_compressed_nar(
         storage: &crate::cache::storage::Storage,
+        authorizer: &Authorizer,
         name: NarFileName,
         method: &str,
         range: Option<&str>,
@@ -1201,6 +1358,7 @@ mod tests {
             request,
             storage,
             name,
+            authorizer,
             &guard,
             ReadVisibility::Public,
         ));
@@ -1236,16 +1394,17 @@ mod tests {
 
     #[test]
     fn compressed_nar_get_head_and_range_serve_the_published_bytes() {
-        let (_directory, storage, name, expected) = compressed_fixture();
+        let (directory, storage, name, expected) = compressed_fixture();
+        let authorizer = public_authorizer(directory.path());
 
-        let get_response = request_compressed_nar(&storage, name, "GET", None);
+        let get_response = request_compressed_nar(&storage, &authorizer, name, "GET", None);
         let (get_headers, get_body) = response_parts(&get_response);
         assert!(get_headers.starts_with("HTTP/1.1 200"), "{get_headers}");
         assert!(get_headers.contains(&format!("Content-Length: {}", expected.len())));
         assert!(!get_headers.contains("Content-Encoding:"), "{get_headers}");
         assert_eq!(get_body, expected);
 
-        let head_response = request_compressed_nar(&storage, name, "HEAD", None);
+        let head_response = request_compressed_nar(&storage, &authorizer, name, "HEAD", None);
         let (head_headers, head_body) = response_parts(&head_response);
         assert!(head_headers.starts_with("HTTP/1.1 200"));
         assert!(head_headers.contains(&format!("Content-Length: {}", expected.len())));
@@ -1255,7 +1414,8 @@ mod tests {
         );
         assert!(head_body.is_empty());
 
-        let range_response = request_compressed_nar(&storage, name, "GET", Some("bytes=3-11"));
+        let range_response =
+            request_compressed_nar(&storage, &authorizer, name, "GET", Some("bytes=3-11"));
         let (range_headers, range_body) = response_parts(&range_response);
         assert!(range_headers.starts_with("HTTP/1.1 206"));
         assert!(range_headers.contains(&format!("Content-Range: bytes 3-11/{}", expected.len())));
@@ -1398,5 +1558,253 @@ mod tests {
                 "{readiness:?}"
             );
         }
+    }
+
+    fn cache_response(
+        storage: &crate::cache::storage::Storage,
+        authorizer: &Authorizer,
+        request_target: &str,
+        authorization: Option<&str>,
+    ) -> (u16, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut headers = format!("{request_target} HTTP/1.1\r\nHost: cache\r\n");
+        if let Some(authorization) = authorization {
+            headers.push_str(&format!("Authorization: {authorization}\r\n"));
+        }
+        headers.push_str("Connection: close\r\n\r\n");
+        client.write_all(headers.as_bytes()).unwrap();
+        let request = crate::cache::http_server::Request::read(server).unwrap();
+        let metrics = Metrics::default();
+        drop(super::respond(
+            request,
+            super::ReadContext {
+                setup: None,
+                storage,
+                source: &super::ReadSource::FlatCache,
+            },
+            authorizer,
+            &metrics,
+            0,
+        ));
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let status = std::str::from_utf8(&response)
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        (status, response)
+    }
+
+    #[test]
+    fn recent_publication_failures_are_logged_without_metric_labels() {
+        use std::time::{Duration, SystemTime};
+
+        use data_encoding::BASE64;
+        use sha2::{Digest, Sha256};
+
+        use crate::cache::narinfo::NarInfoClaims;
+        use crate::cache::object::{NarHash, NarIdentity, NarSize};
+        use crate::cache::storage::{StoreHash, read_recent_fetch_failures};
+        use crate::cache::token_file::TokenFile;
+
+        const STORE_HASH: &str = "00000000000000000000000000000000";
+        const NAR_ID: &str = "0000000000000000000000000000000000000000000000000000";
+        const OTHER_HASH: &str = "11111111111111111111111111111111";
+
+        let directory = tempfile::tempdir().unwrap();
+        crate::cache::test_support::private_directory(directory.path()).unwrap();
+        let storage = CacheCreation::prepare(
+            &Directory::open(directory.path()).unwrap(),
+            SupportedStorageBackend::FLAT,
+        )
+        .unwrap()
+        .create_or_complete()
+        .unwrap();
+        let mut tokens = TokenFile::default();
+        tokens
+            .insert("reader-token", Sha256::digest(b"reader-secret").into())
+            .unwrap();
+        tokens
+            .store(&directory.path().join("auth/read.tokens"))
+            .unwrap();
+        let path = format!("/nix/store/{STORE_HASH}-sample");
+        let claims = NarInfoClaims::new(
+            path.clone(),
+            Vec::new(),
+            NarIdentity::new(NarHash::parse(NAR_ID).unwrap(), NarSize::new(11)),
+        )
+        .unwrap();
+        let narinfo = format!(
+            "StorePath: {path}\nURL: nar/{NAR_ID}.nar\nCompression: none\nFileHash: sha256:{NAR_ID}\nFileSize: 11\nNarHash: sha256:{NAR_ID}\nNarSize: 11\nReferences: \n"
+        );
+        storage
+            .publish_narinfo_for(&claims, narinfo.clone().into_bytes(), Some("writer-token"))
+            .unwrap();
+        let store = StoreHash::parse(STORE_HASH).unwrap();
+        let published_at = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+        storage
+            .remember_publication(&store, &path, None, None, published_at)
+            .unwrap();
+        let authorizer = Authorizer::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let authorization = format!("Basic {}", BASE64.encode(b"reader-token:reader-secret"));
+        let lines = || read_recent_fetch_failures(directory.path(), SystemTime::now()).unwrap();
+        let labeled = |line: &str, kind: &str| {
+            assert!(line.contains(&format!("\t{kind}\t")), "{line}");
+            assert!(line.contains("reader-token"), "{line}");
+            assert!(line.contains("writer-token"), "{line}");
+            assert!(line.contains(&path), "{line}");
+        };
+
+        let (status, _) = cache_response(
+            &storage,
+            &authorizer,
+            &format!("GET /{STORE_HASH}.narinfo"),
+            Some(&authorization),
+        );
+        assert_eq!(status, 200);
+        assert!(lines().is_empty());
+
+        let (status, _) = cache_response(
+            &storage,
+            &authorizer,
+            &format!("GET /{OTHER_HASH}.narinfo"),
+            Some(&authorization),
+        );
+        assert_eq!(status, 404);
+        assert!(lines().is_empty());
+
+        let (status, _) = cache_response(
+            &storage,
+            &authorizer,
+            &format!("GET /nar/{NAR_ID}.nar"),
+            Some(&authorization),
+        );
+        assert_eq!(status, 404);
+        let logged = lines();
+        assert_eq!(logged.len(), 1);
+        labeled(&logged[0], "nar-miss");
+
+        std::fs::create_dir(directory.path().join("nar").join(format!("{NAR_ID}.nar"))).unwrap();
+        let (status, _) = cache_response(
+            &storage,
+            &authorizer,
+            &format!("GET /nar/{NAR_ID}.nar"),
+            Some(&authorization),
+        );
+        assert_eq!(status, 500);
+        let logged = lines();
+        assert_eq!(logged.len(), 2);
+        labeled(
+            logged
+                .iter()
+                .find(|line| line.contains("\tnar-failure\t"))
+                .expect("nar failure"),
+            "nar-failure",
+        );
+
+        storage.delete_narinfo(&store).unwrap();
+        let (status, _) = cache_response(
+            &storage,
+            &authorizer,
+            &format!("GET /{STORE_HASH}.narinfo"),
+            Some(&authorization),
+        );
+        assert_eq!(status, 404);
+        let logged = lines();
+        assert_eq!(logged.len(), 3);
+        labeled(
+            logged
+                .iter()
+                .find(|line| line.contains("\tnarinfo-miss\t"))
+                .expect("narinfo miss"),
+            "narinfo-miss",
+        );
+
+        let narinfo_path = directory.path().join(format!("{STORE_HASH}.narinfo"));
+        std::fs::create_dir(&narinfo_path).unwrap();
+        let (status, _) = cache_response(
+            &storage,
+            &authorizer,
+            &format!("GET /{STORE_HASH}.narinfo"),
+            Some(&authorization),
+        );
+        assert_eq!(status, 500);
+        let logged = lines();
+        assert_eq!(logged.len(), 4);
+        labeled(
+            logged
+                .iter()
+                .find(|line| line.contains("\tnarinfo-failure\t"))
+                .expect("narinfo failure"),
+            "narinfo-failure",
+        );
+
+        let (status, metrics) =
+            cache_response(&storage, &authorizer, "GET /metrics", Some(&authorization));
+        assert_eq!(status, 200);
+        let metrics = String::from_utf8(metrics).unwrap();
+        assert!(!metrics.contains(STORE_HASH), "{metrics}");
+        assert!(!metrics.contains("reader-token"), "{metrics}");
+        assert!(!metrics.contains("writer-token"), "{metrics}");
+
+        storage
+            .remember_publication(
+                &store,
+                &path,
+                None,
+                None,
+                SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60),
+            )
+            .unwrap();
+        let (status, _) = cache_response(
+            &storage,
+            &authorizer,
+            &format!("GET /{STORE_HASH}.narinfo"),
+            Some(&authorization),
+        );
+        assert_eq!(status, 500);
+        assert_eq!(lines().len(), 4);
+
+        std::fs::remove_dir(&narinfo_path).unwrap();
+        std::fs::remove_file(directory.path().join("auth/read.tokens")).unwrap();
+        storage
+            .publish_narinfo_for(&claims, narinfo.into_bytes(), Some("writer-token"))
+            .unwrap();
+        storage
+            .remember_publication(
+                &store,
+                &path,
+                None,
+                None,
+                SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60),
+            )
+            .unwrap();
+        storage.delete_narinfo(&store).unwrap();
+        let authorizer = Authorizer::load(&Directory::open(directory.path()).unwrap()).unwrap();
+        let (status, _) = cache_response(
+            &storage,
+            &authorizer,
+            &format!("GET /{STORE_HASH}.narinfo"),
+            None,
+        );
+        assert_eq!(status, 404);
+        let logged = lines();
+        assert_eq!(logged.len(), 5);
+        let anonymous = &logged[0];
+        assert!(anonymous.contains("\tnarinfo-miss\t"), "{anonymous}");
+        assert!(
+            anonymous.contains(&format!("\t\t{STORE_HASH}\t")),
+            "{anonymous}"
+        );
+        assert!(anonymous.contains("writer-token"), "{anonymous}");
+        assert!(!anonymous.contains("reader-token"), "{anonymous}");
     }
 }

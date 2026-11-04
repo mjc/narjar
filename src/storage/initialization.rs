@@ -67,6 +67,7 @@ pub(super) fn storage_root_files() -> impl Iterator<Item = &'static str> {
         DESCRIPTOR_DRAFT,
         "lock",
         super::gc::PRESSURE_HINT,
+        super::fetch_failure::LOG_FILE,
     ]
     .into_iter()
     .chain(CACHE_RECOVERY_MARKERS)
@@ -82,6 +83,7 @@ pub(super) fn storage_root_directories() -> impl Iterator<Item = &'static str> {
             super::access::ACCESS_DIRECTORY,
             super::advertisement::DIRECTORY,
             super::publication_record::DIRECTORY,
+            super::publication_record::NAR_NAMES,
         ])
         .filter(|name| !name.contains('/'))
 }
@@ -331,6 +333,7 @@ impl CacheLayout {
             collection: Default::default(),
             delivery_validation: DeliveryValidationCache::default(),
             publication_locks: Mutex::new(HashMap::new()),
+            fetch_failure_log: Mutex::new(()),
             narinfo_publication_locks: Mutex::new(HashMap::new()),
             staging_budget: Arc::new(Mutex::new(Default::default())),
             temporary_objects: AtomicU64::new(0),

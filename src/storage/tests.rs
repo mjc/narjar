@@ -4443,6 +4443,10 @@ fn a_committed_narinfo_keeps_a_private_publication_record_for_seven_days() {
         .expect("live publication");
     assert_eq!(live.store_path, path);
     assert_eq!(live.writer.as_deref(), Some("first-writer"));
+    assert_eq!(
+        live.nar_file.as_deref(),
+        Some(format!("{NAR_ID}.nar").as_str())
+    );
     assert!(live.removed_at.is_none());
 
     let root = storage.root_directory().expect("storage root");
@@ -4453,6 +4457,14 @@ fn a_committed_narinfo_keeps_a_private_publication_record_for_seven_days() {
     validate_private_file(&record_file).expect("record file is private");
     drop(record_file);
     drop(records);
+    let names = open_directory_at(&root, OsStr::new(super::publication_record::NAR_NAMES))
+        .expect("nar name index");
+    validate_private_directory(&names).expect("nar name index is private");
+    let nar_name = format!("{NAR_ID}.nar");
+    let name_file = open_regular_at(&names, OsStr::new(&nar_name)).expect("nar name");
+    validate_private_file(&name_file).expect("nar name file is private");
+    drop(name_file);
+    drop(names);
 
     let mut served = String::new();
     storage
@@ -4466,7 +4478,7 @@ fn a_committed_narinfo_keeps_a_private_publication_record_for_seven_days() {
 
     let later = live.published_at + Duration::from_secs(30);
     storage
-        .remember_publication(&store, &path, Some("clock-writer"), later)
+        .remember_publication(&store, &path, Some("clock-writer"), None, later)
         .expect("replace publication time");
     let replaced = storage
         .publication_record(&store, later)
@@ -4474,6 +4486,10 @@ fn a_committed_narinfo_keeps_a_private_publication_record_for_seven_days() {
         .expect("replaced publication");
     assert_eq!(replaced.published_at, later);
     assert_eq!(replaced.writer.as_deref(), Some("clock-writer"));
+    assert_eq!(
+        replaced.nar_file.as_deref(),
+        Some(format!("{NAR_ID}.nar").as_str())
+    );
     assert!(replaced.removed_at.is_none());
 
     assert_eq!(
@@ -4538,6 +4554,179 @@ fn a_committed_narinfo_keeps_a_private_publication_record_for_seven_days() {
             .expect("read after expiry")
             .is_none()
     );
+    let root = storage.root_directory().expect("storage root");
+    let names = open_directory_at(&root, OsStr::new(super::publication_record::NAR_NAMES))
+        .expect("nar name index remains");
+    assert!(
+        matches!(
+            open_regular_at(&names, OsStr::new(&format!("{NAR_ID}.nar"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ),
+        "expired publication removes its nar name"
+    );
+}
+
+#[test]
+fn recent_fetch_failures_keep_seven_days_and_a_bounded_private_log() {
+    use std::time::UNIX_EPOCH;
+
+    use super::fetch_failure::{
+        FetchFailureKind, FetchTarget, LOG_FILE, MAX_LOG_BYTES, read_recent_fetch_failures,
+    };
+
+    assert_eq!(MAX_LOG_BYTES, 1024 * 1024);
+    let (directory, storage) = flat_storage_fixture();
+    let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
+    let path = format!("/nix/store/{STORE_HASH}-sample");
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let week = Duration::from_secs(7 * 24 * 60 * 60);
+    let claims = NarInfoClaims::new(
+        path.clone(),
+        Vec::new(),
+        NarIdentity::new(
+            NarHash::parse(NAR_ID).expect("valid NAR hash"),
+            NarSize::new(11),
+        ),
+    )
+    .expect("valid narinfo claims");
+    let narinfo = format!(
+        "StorePath: {path}\nURL: nar/{NAR_ID}.nar\nCompression: none\nFileHash: sha256:{NAR_ID}\nFileSize: 11\nNarHash: sha256:{NAR_ID}\nNarSize: 11\nReferences: \n"
+    );
+    storage
+        .publish_narinfo_for(&claims, narinfo.into_bytes(), Some("writer-token"))
+        .expect("commit narinfo");
+    let log = directory.path().join(LOG_FILE);
+    let published_nar = NarFileName::raw(NarHash::parse(NAR_ID).expect("valid NAR hash"));
+
+    let other = StoreHash::parse("11111111111111111111111111111111").expect("second store hash");
+    storage
+        .record_recent_fetch_failure(
+            FetchFailureKind::MissingNarinfo,
+            FetchTarget::NarInfo(&other),
+            Some("reader-token"),
+            now,
+        )
+        .expect("different hash");
+    storage
+        .record_recent_fetch_failure(
+            FetchFailureKind::MissingNar,
+            FetchTarget::Nar(NarFileName::raw(NarHash::from_digest([1; 32]))),
+            Some("reader-token"),
+            now,
+        )
+        .expect("unpublished nar");
+    storage
+        .remember_publication(
+            &store,
+            &path,
+            None,
+            None,
+            now - week - Duration::from_secs(1),
+        )
+        .expect("backdate past seven days");
+    storage
+        .record_recent_fetch_failure(
+            FetchFailureKind::MissingNarinfo,
+            FetchTarget::NarInfo(&store),
+            Some("reader-token"),
+            now,
+        )
+        .expect("eight day publication");
+    assert!(
+        !log.exists(),
+        "old and unpublished fetches are not recorded"
+    );
+
+    storage
+        .remember_publication(&store, &path, None, None, now - week)
+        .expect("backdate to exactly seven days");
+    storage
+        .record_recent_fetch_failure(
+            FetchFailureKind::MissingNarinfo,
+            FetchTarget::NarInfo(&store),
+            Some("reader-aaaa"),
+            now,
+        )
+        .expect("seven day publication");
+    validate_private_file(&crate::cache::filesystem::open_regular(&log).expect("log file"))
+        .expect("failure log is private");
+    let kept = read_recent_fetch_failures(directory.path(), now + week).expect("read log");
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].contains("reader-aaaa"), "{}", kept[0]);
+    assert!(kept[0].contains("\tnarinfo-miss\t"), "{}", kept[0]);
+    assert!(kept[0].contains("writer-token"), "{}", kept[0]);
+    assert!(
+        read_recent_fetch_failures(directory.path(), now + week + Duration::from_secs(1))
+            .expect("read expired log")
+            .is_empty()
+    );
+
+    storage
+        .remember_publication(&store, &path, Some("writer-token"), None, now)
+        .expect("refresh publication");
+    let one_line = fs::metadata(&log).expect("log length").len();
+    storage
+        .record_recent_fetch_failure_within(
+            FetchFailureKind::MissingNarinfo,
+            FetchTarget::NarInfo(&store),
+            Some("reader-bbbb"),
+            now,
+            one_line,
+        )
+        .expect("bounded append");
+    let bounded = fs::read_to_string(&log).expect("read bounded log");
+    assert!(bounded.contains("reader-bbbb"), "{bounded}");
+    assert!(!bounded.contains("reader-aaaa"), "{bounded}");
+    assert_eq!(bounded.len() as u64, one_line);
+    storage
+        .record_recent_fetch_failure_within(
+            FetchFailureKind::MissingNar,
+            FetchTarget::Nar(published_nar),
+            Some("reader-cccc"),
+            now,
+            1,
+        )
+        .expect("drop an oversized line");
+    assert_eq!(fs::read(&log).expect("read emptied log"), b"");
+
+    private_file(
+        directory
+            .path()
+            .join(super::publication_record::DIRECTORY)
+            .join(STORE_HASH),
+        format!("v1\npath {path}\npublished 1700000000\nwriter writer-token\nremoved\n").as_bytes(),
+    )
+    .expect("write legacy publication record");
+    let legacy = storage
+        .publication_record(&store, now)
+        .expect("read legacy record")
+        .expect("legacy record");
+    assert!(legacy.nar_file.is_none());
+    storage
+        .record_recent_fetch_failure(
+            FetchFailureKind::MissingNar,
+            FetchTarget::Nar(published_nar),
+            Some("reader-dddd"),
+            now,
+        )
+        .expect("legacy nar miss");
+    assert_eq!(fs::read(&log).expect("legacy nar miss writes nothing"), b"");
+    storage
+        .record_recent_fetch_failure(
+            FetchFailureKind::FailedNarinfo,
+            FetchTarget::NarInfo(&store),
+            None,
+            now,
+        )
+        .expect("legacy narinfo failure");
+    let anonymous = fs::read_to_string(&log).expect("read anonymous failure");
+    assert!(anonymous.contains("narinfo-failure"), "{anonymous}");
+    assert!(
+        anonymous.contains(&format!("\t\t{STORE_HASH}\t")),
+        "{anonymous}"
+    );
+    assert!(anonymous.contains("writer-token"), "{anonymous}");
+    assert!(!anonymous.contains("reader-dddd"), "{anonymous}");
 }
 
 struct TestDir(tempfile::TempDir);
