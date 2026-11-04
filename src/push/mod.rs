@@ -37,10 +37,16 @@ mod transfer;
 mod upstream;
 use nar_stream::open_upload_reader;
 
-pub(crate) fn hash_store_nar(path: &std::path::Path) -> Result<([u8; 32], u64), String> {
-    let summary =
-        nar_stream::write_nar(path, std::io::sink()).map_err(|error| error.to_string())?;
+pub(crate) fn write_store_nar<W: std::io::Write>(
+    path: &std::path::Path,
+    output: W,
+) -> Result<([u8; 32], u64), String> {
+    let summary = nar_stream::write_nar(path, output).map_err(|error| error.to_string())?;
     Ok((summary.raw_sha256, summary.raw_size))
+}
+
+pub(crate) fn hash_store_nar(path: &std::path::Path) -> Result<([u8; 32], u64), String> {
+    write_store_nar(path, std::io::sink())
 }
 use payload::measure_encoded_nar;
 use plan::dependency_waves;
