@@ -156,6 +156,7 @@ impl NativeStoreSource {
                     "native narinfo exceeds the protocol limit or has invalid fields".into(),
                 ))
             })?;
+            super::delivery::confirm_store_nar(&object.lease, object.identity())?;
             self.store
                 .leases()
                 .record_advertisement(&object.lease, &signed)?;

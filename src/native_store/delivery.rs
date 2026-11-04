@@ -16,7 +16,10 @@ use narjar::{
 };
 use rustix::fs::{self, AtFlags, FileType};
 
-use super::{directory_entry::NativeDirectoryEntry, lease::NativeStoreLease};
+use super::{
+    directory_entry::NativeDirectoryEntry,
+    lease::{NativeStoreLease, NativeStorePath},
+};
 
 const FILE_BUFFER_SIZE: usize = 64 * 1024;
 const DISCARD_BUFFER_SIZE: usize = 64 * 1024;
@@ -167,8 +170,27 @@ fn validate_delivery_range(range: Range<u64>, length: u64) -> io::Result<()> {
     }
 }
 
+pub(crate) fn confirm_store_nar(lease: &NativeStoreLease, identity: NarIdentity) -> io::Result<()> {
+    let active_delivery = lease
+        .begin_active_delivery()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let store_path = lease.store_path().clone();
+    let mut reader = VerifiedStream::spawn(identity, "narjar-native-nar", move |writer| {
+        let _active_delivery = active_delivery;
+        write_store_path_nar(&store_path, writer).map(|_| ())
+    })?;
+    io::copy(&mut reader, &mut io::sink()).map(|_| ())
+}
+
 fn write_leased_nar<W: Write>(lease: &NativeStoreLease, output: W) -> io::Result<EncodeSummary> {
-    let path = lease.store_path().as_path();
+    write_store_path_nar(lease.store_path(), output)
+}
+
+fn write_store_path_nar<W: Write>(
+    store_path: &NativeStorePath,
+    output: W,
+) -> io::Result<EncodeSummary> {
+    let path = store_path.as_path();
     let parent = path
         .parent()
         .ok_or_else(|| invalid_path("native store path has no parent"))?;
@@ -297,7 +319,7 @@ mod tests {
     use std::{
         ffi::{OsStr, OsString},
         fs::{self, File},
-        io::{self, Read},
+        io::{self, Read, Write},
         num::{NonZeroU64, NonZeroUsize},
         os::unix::{
             ffi::{OsStrExt, OsStringExt},
@@ -367,6 +389,12 @@ mod tests {
                 fs::create_dir(&target).expect("create symlink target");
                 std::os::unix::fs::symlink("native-symlink-target", path)
                     .expect("create native store symlink object");
+            })
+        }
+
+        fn file(contents: &[u8]) -> Self {
+            Self::with_store_object(|path| {
+                fs::write(path, contents).expect("write native file object");
             })
         }
 
@@ -787,6 +815,43 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn narinfo_confirmation_rejects_an_appended_or_truncated_store_file() {
+        let appended = NativeDeliveryFixture::file(b"mutate-me-content");
+        let appended_identity = identity_of(&appended);
+        let appended_lease = appended.lease();
+        let held = appended_lease
+            .begin_active_delivery()
+            .expect("hold the narinfo delivery pin");
+        super::confirm_store_nar(&appended_lease, appended_identity)
+            .expect("intact file should confirm while its narinfo pin is held");
+        drop(held);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&appended.physical_path)
+            .expect("open store file for append");
+        file.write_all(b"X").expect("append one byte");
+        drop(file);
+        let appended_error = super::confirm_store_nar(&appended_lease, appended_identity)
+            .expect_err("appended store file should not confirm");
+        assert_eq!(appended_error.kind(), io::ErrorKind::InvalidData);
+
+        let truncated = NativeDeliveryFixture::file(b"short-read-content");
+        let truncated_identity = identity_of(&truncated);
+        fs::write(&truncated.physical_path, b"x").expect("truncate store file");
+        let truncated_error = super::confirm_store_nar(&truncated.lease(), truncated_identity)
+            .expect_err("truncated store file should not confirm");
+        assert_eq!(truncated_error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    fn identity_of(fixture: &NativeDeliveryFixture) -> NarIdentity {
+        let bytes = raw_nar_bytes(fixture.lease());
+        NarIdentity::new(
+            NarHash::from_digest(sha2::Sha256::digest(&bytes).into()),
+            NarSize::new(bytes.len() as u64),
+        )
     }
 
     #[test]
