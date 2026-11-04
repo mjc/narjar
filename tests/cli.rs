@@ -5168,7 +5168,7 @@ fn assert_setup_creates_ready_cache_and_private_credentials(backend: &str) {
         fs::read(cache_path.join("trusted-public-keys"))
             .expect("public key should be trusted by this cache")
     );
-    assert!(netrc_text.contains("machine cache.example login narjar password "));
+    assert!(netrc_text.contains("machine cache.example login setup-write password "));
     assert!(netrc_text.contains(write_token_text.trim()));
     assert_eq!(
         fs::read_to_string(cache_path.join("nix-cache-info")).expect("cache info should exist"),
