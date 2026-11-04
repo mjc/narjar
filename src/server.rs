@@ -583,6 +583,10 @@ fn continue_after_accept_error(error: io::Error) -> Result<(), Error> {
 }
 
 pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
+    #[cfg(unix)]
+    if let Some(settings) = &config.peer_share {
+        crate::peer_share::ensure_store_readable(&settings.store_root).map_err(Error::runtime)?;
+    }
     let stopping = Arc::new(AtomicBool::new(false));
     // Register first so this guard outlives every server resource during shutdown.
     let shutdown = host::install_shutdown(Arc::clone(&stopping))
@@ -635,6 +639,10 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         })
         .transpose()
         .map_err(|error| Error::runtime(format!("cannot start population sampler: {error}")))?;
+    #[cfg(unix)]
+    let peer_share = start_peer_share(&config, Arc::clone(&stopping))?;
+    #[cfg(not(unix))]
+    let peer_share = None::<thread::JoinHandle<()>>;
     let control = match crate::control::ControlService::start(
         &config.data_dir,
         Arc::clone(&storage),
@@ -761,6 +769,9 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     if let Some(sampler) = &population_sampler {
         sampler.thread().unpark();
     }
+    if let Some(refresh) = &peer_share {
+        refresh.thread().unpark();
+    }
 
     let deadline = Instant::now() + Duration::from_secs(config.shutdown_grace_seconds.get());
     control
@@ -800,11 +811,43 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .join()
             .map_err(|_| Error::runtime("population sampler panicked"))?;
     }
+    if let Some(refresh) = peer_share {
+        refresh
+            .join()
+            .map_err(|_| Error::runtime("peer share refresh panicked"))?;
+    }
 
     drop(source);
     drop(storage);
     shutdown.complete();
     Ok(())
+}
+
+#[cfg(unix)]
+fn start_peer_share(
+    config: &ServeConfig,
+    stopping: Arc<AtomicBool>,
+) -> Result<Option<thread::JoinHandle<()>>, Error> {
+    let Some(settings) = config.peer_share.clone() else {
+        return Ok(None);
+    };
+    let index = Arc::new(crate::peer_share::ShareIndex::enabled(settings));
+    thread::Builder::new()
+        .name("narjar-peer-share".to_owned())
+        .spawn(move || {
+            let interval = index.refresh_interval();
+            while !stopping.load(Ordering::Acquire) {
+                if let Err(error) = index.refresh(&stopping) {
+                    eprintln!("narjar: peer share refresh failed: {error}");
+                }
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::park_timeout(interval);
+            }
+        })
+        .map(Some)
+        .map_err(|error| Error::runtime(format!("cannot start peer share refresh: {error}")))
 }
 
 fn spawn_population_sampler(

@@ -364,6 +364,21 @@
     ++ lib.optionals (cfg.discovery.name != null) ["--discovery-name" cfg.discovery.name]
     ++ lib.optionals cfg.onboarding.enable ["--onboarding"]
     ++ lib.optionals cfg.onboarding.diagnostics ["--onboarding-diagnostics"]
+    ++ lib.optionals cfg.p2p.enable [
+      "--peer-share-store"
+      cfg.p2p.storeDir
+      "--peer-share-upstream"
+      cfg.p2p.upstream
+    ]
+    ++ lib.optionals cfg.p2p.publishAll [
+      "--peer-share-publish-all"
+      "--peer-share-state-dir"
+      cfg.nativeStore.stateDir
+    ]
+    ++ lib.optionals (cfg.p2p.signingKeyFile != null) [
+      "--peer-share-signing-key-file"
+      "%d/peer-share-signing-key"
+    ]
   );
   zfsProperties = [
     "mountpoint"
@@ -506,7 +521,7 @@
     ]
   );
 in {
-  imports = [./lan.nix];
+  imports = [./lan.nix ./p2p.nix];
   options.services.narjar = {
     enable = lib.mkEnableOption "the Narjar binary cache";
 
@@ -939,9 +954,12 @@ in {
       description = "Narjar binary cache";
       wantedBy = ["multi-user.target"];
       after = ["network.target"];
-      unitConfig.RequiresMountsFor =
+      unitConfig.RequiresMountsFor = lib.unique (
         [cfg.dataDir]
-        ++ lib.optionals cfg.nativeStore.enable [cfg.nativeStore.storeDir cfg.nativeStore.stateDir nativeRootsParent];
+        ++ lib.optionals cfg.nativeStore.enable [cfg.nativeStore.storeDir cfg.nativeStore.stateDir nativeRootsParent]
+        ++ lib.optionals cfg.p2p.enable [cfg.p2p.storeDir]
+        ++ lib.optionals cfg.p2p.publishAll [cfg.nativeStore.stateDir]
+      );
 
       preStart = lib.mkIf cfg.dynamicUser preStartScript;
 
@@ -954,7 +972,8 @@ in {
           ExecStartPre = lib.mkIf (!cfg.dynamicUser) "+${privilegedPreStart}";
           LoadCredential =
             map (credential: "${credential.name}:${credential.source}") credentials
-            ++ lib.optional (cfg.nativeStore.signingKeyFile != null) "native-signing-key:${cfg.nativeStore.signingKeyFile}";
+            ++ lib.optional (cfg.nativeStore.signingKeyFile != null) "native-signing-key:${cfg.nativeStore.signingKeyFile}"
+            ++ lib.optional (cfg.p2p.signingKeyFile != null) "peer-share-signing-key:${cfg.p2p.signingKeyFile}";
           ExecStart = "${executable} ${serveArgs}";
           Type = "notify";
           NotifyAccess = "main";
