@@ -42,6 +42,8 @@ mod operations;
 mod population;
 #[path = "storage/publication/mod.rs"]
 mod publication;
+#[path = "storage/publication_record.rs"]
+mod publication_record;
 #[path = "storage/receipt.rs"]
 mod receipt;
 #[path = "storage/reconcile.rs"]

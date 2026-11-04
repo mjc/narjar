@@ -4411,6 +4411,135 @@ fn safe_delete_removes_only_narinfo_and_syncs_visibility() {
     );
 }
 
+#[test]
+fn a_committed_narinfo_keeps_a_private_publication_record_for_seven_days() {
+    use std::ffi::OsStr;
+
+    use super::{open_directory_at, open_regular_at};
+    use crate::cache::filesystem::validate_private_directory;
+
+    let (_directory, storage) = flat_storage_fixture();
+    let store = StoreHash::parse(STORE_HASH).expect("valid store hash");
+    let path = format!("/nix/store/{STORE_HASH}-sample");
+    let claims = NarInfoClaims::new(
+        path.clone(),
+        Vec::new(),
+        NarIdentity::new(
+            NarHash::parse(NAR_ID).expect("valid NAR hash"),
+            NarSize::new(11),
+        ),
+    )
+    .expect("valid narinfo claims");
+    let narinfo = format!(
+        "StorePath: {path}\nURL: nar/{NAR_ID}.nar\nCompression: none\nFileHash: sha256:{NAR_ID}\nFileSize: 11\nNarHash: sha256:{NAR_ID}\nNarSize: 11\nReferences: \n"
+    );
+    storage
+        .publish_narinfo_for(&claims, narinfo.clone().into_bytes(), Some("first-writer"))
+        .expect("commit narinfo");
+
+    let live = storage
+        .publication_record(&store, SystemTime::now())
+        .expect("read publication record")
+        .expect("live publication");
+    assert_eq!(live.store_path, path);
+    assert_eq!(live.writer.as_deref(), Some("first-writer"));
+    assert!(live.removed_at.is_none());
+
+    let root = storage.root_directory().expect("storage root");
+    let records = open_directory_at(&root, OsStr::new(super::publication_record::DIRECTORY))
+        .expect("publication record directory");
+    validate_private_directory(&records).expect("record directory is private");
+    let record_file = open_regular_at(&records, OsStr::new(store.as_str())).expect("record file");
+    validate_private_file(&record_file).expect("record file is private");
+    drop(record_file);
+    drop(records);
+
+    let mut served = String::new();
+    storage
+        .open_narinfo(&store)
+        .expect("open narinfo")
+        .expect("narinfo is served")
+        .read_to_string(&mut served)
+        .expect("read served narinfo");
+    assert_eq!(served, narinfo);
+    assert!(!served.contains("first-writer"));
+
+    let later = live.published_at + Duration::from_secs(30);
+    storage
+        .remember_publication(&store, &path, Some("clock-writer"), later)
+        .expect("replace publication time");
+    let replaced = storage
+        .publication_record(&store, later)
+        .expect("read replaced publication")
+        .expect("replaced publication");
+    assert_eq!(replaced.published_at, later);
+    assert_eq!(replaced.writer.as_deref(), Some("clock-writer"));
+    assert!(replaced.removed_at.is_none());
+
+    assert_eq!(
+        storage.delete_narinfo(&store).expect("delete narinfo"),
+        super::operations::NarInfoDeletion::Deleted
+    );
+    assert!(
+        storage
+            .open_narinfo(&store)
+            .expect("open narinfo")
+            .is_none()
+    );
+    let removed = storage
+        .publication_record(&store, SystemTime::now())
+        .expect("read removed publication")
+        .expect("removed publication is retained");
+    let removed_at = removed.removed_at.expect("removal time");
+    assert_eq!(removed.writer.as_deref(), Some("clock-writer"));
+    assert_eq!(removed.store_path, path);
+    let one_day = storage
+        .publication_record(&store, removed_at + Duration::from_secs(24 * 60 * 60))
+        .expect("read one-day-old publication")
+        .expect("one-day-old publication is retained");
+    assert_eq!(one_day.store_path, path);
+
+    storage
+        .publish_narinfo_for(&claims, narinfo.into_bytes(), Some("second-writer"))
+        .expect("republish narinfo");
+    let republished = storage
+        .publication_record(&store, SystemTime::now())
+        .expect("read republished record")
+        .expect("republished record");
+    assert_eq!(republished.writer.as_deref(), Some("second-writer"));
+    assert!(republished.removed_at.is_none());
+    assert!(
+        storage
+            .open_narinfo(&store)
+            .expect("open narinfo")
+            .is_some()
+    );
+
+    storage
+        .delete_narinfo(&store)
+        .expect("delete republished narinfo");
+    let removed_again = storage
+        .publication_record(&store, SystemTime::now())
+        .expect("read second removal")
+        .expect("second removal is retained");
+    let removed_again_at = removed_again.removed_at.expect("second removal time");
+    assert!(
+        storage
+            .publication_record(
+                &store,
+                removed_again_at + Duration::from_secs(8 * 24 * 60 * 60),
+            )
+            .expect("read expired publication")
+            .is_none()
+    );
+    assert!(
+        storage
+            .publication_record(&store, SystemTime::now())
+            .expect("read after expiry")
+            .is_none()
+    );
+}
+
 struct TestDir(tempfile::TempDir);
 
 impl TestDir {

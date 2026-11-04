@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::cache::{
-    auth::{Authorizer, Permission},
+    auth::{AcceptedAccess, Authorizer, Permission},
     http_server::{BodyReader, BodyReaderError, Request, RequestExpectation, Response, StatusCode},
     metrics::{ConnectionOutcome, Metrics, RequestGuard, RequestMethod, ValidationClass},
     narinfo::{MAX_NARINFO_BYTES, TrustedPublicKeys},
@@ -82,6 +82,7 @@ pub struct PublicationRequest {
     upload: UploadRequest,
     route: CacheRoute,
     staging_bytes: u64,
+    writer: String,
 }
 
 impl PublicationRequest {
@@ -112,6 +113,7 @@ impl PublicationRequest {
             upload,
             route,
             staging_bytes: _,
+            writer,
         } = self;
         let _ = match route {
             CacheRoute::Nar(name) => respond_nar_put(
@@ -136,6 +138,7 @@ impl PublicationRequest {
                         policy,
                         metrics,
                         guard: &guard,
+                        writer: &writer,
                     },
                 );
                 drop(staging);
@@ -157,12 +160,15 @@ pub fn prepare_publication(
     max_encoded_nar_bytes: u64,
 ) -> Option<PublicationRequest> {
     request.close_after_response();
-    if !authorizer.allows(&request, Permission::Write) {
-        metrics.auth_failure(true);
-        let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
-        let _ = unauthorized(&guard, request);
-        return None;
-    }
+    let writer = match authorizer.authenticate(&request, Permission::Write) {
+        Some(AcceptedAccess::Token(label)) => label,
+        Some(AcceptedAccess::Unlabeled) | None => {
+            metrics.auth_failure(true);
+            let guard = metrics.request(RequestMethod::Put, request_route(request.url()));
+            let _ = unauthorized(&guard, request);
+            return None;
+        }
+    };
 
     let route = match CacheRoute::classify(request.url()) {
         RouteMatch::Found(route) => route,
@@ -197,6 +203,7 @@ pub fn prepare_publication(
         upload,
         route,
         staging_bytes,
+        writer,
     })
 }
 
@@ -470,6 +477,7 @@ struct NarInfoPutContext<'storage, 'request> {
     policy: NarUploadPolicy,
     metrics: &'storage Metrics,
     guard: &'request RequestGuard<'storage>,
+    writer: &'request str,
 }
 
 fn respond_narinfo_put(
@@ -484,6 +492,7 @@ fn respond_narinfo_put(
         policy,
         metrics,
         guard,
+        writer,
     } = context;
     let _upload = metrics.upload(upload.length() as u64);
     let bytes = match upload.read_body(MAX_NARINFO_BYTES as usize, metrics) {
@@ -503,6 +512,7 @@ fn respond_narinfo_put(
     let started = Instant::now();
     let result = storage
         .bind_narinfo(validated, egress_compression, policy)
+        .map(|bound| bound.attributed_to(writer))
         .and_then(|bound| bound.publish());
     metrics.publication(started.elapsed());
     metrics.record_publication_result(&result);
