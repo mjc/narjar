@@ -811,6 +811,14 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .join()
             .map_err(|_| Error::runtime("population sampler panicked"))?;
     }
+    if let Some(refresh) = &peer_share {
+        while !refresh.is_finished() {
+            if Instant::now() >= deadline {
+                return Err(Error::runtime("shutdown grace period expired"));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     if let Some(refresh) = peer_share {
         refresh
             .join()

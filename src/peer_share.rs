@@ -2,9 +2,11 @@
 //!
 //! The index is off until a store root is configured. A refresh examines at
 //! most [`MAX_SCANNED_PATHS`] paths, one at a time ([`SCAN_CONCURRENCY`]), and
-//! keeps at most [`MAX_OFFERED_PATHS`] narinfo documents. It does not retain
-//! NAR bytes. The default refresh interval is one hour. An upstream lookup
-//! failure omits that path and leaves the rest of the refresh intact.
+//! keeps at most [`MAX_OFFERED_PATHS`] narinfo documents or
+//! [`MAX_OFFERED_BYTES`] of those documents. It does not retain NAR bytes. The
+//! default refresh interval is one hour. An upstream lookup failure, or a path
+//! whose narinfo cannot be built, omits that path and leaves the rest of the
+//! refresh intact.
 
 use std::{
     collections::{BTreeMap, BinaryHeap},
@@ -35,6 +37,8 @@ use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
 pub(crate) const MAX_SCANNED_PATHS: usize = 100_000;
 /// Narinfo documents retained. Each document is at most [`MAX_NARINFO_BYTES`].
 pub(crate) const MAX_OFFERED_PATHS: usize = 100_000;
+/// Narinfo bytes retained by one refresh.
+pub(crate) const MAX_OFFERED_BYTES: usize = 256 * 1024 * 1024;
 /// Store paths hashed at once. Refresh is synchronous, so this stays one.
 pub(crate) const SCAN_CONCURRENCY: usize = 1;
 /// Time between refreshes when the caller does not ask for one.
@@ -136,9 +140,9 @@ impl ShareIndex {
         };
         let upstream = HttpUpstream {
             upstream: &settings.upstream,
-            timeout: settings.request_timeout,
+            agent: idle_agent_allowing_status(settings.request_timeout),
         };
-        match self.refresh_from(&source, &upstream, stopping)? {
+        match self.refresh_from(&source, &upstream, stopping, MAX_OFFERED_BYTES)? {
             RefreshOutcome::Stopped => Ok(()),
             RefreshOutcome::Complete(Some(warning)) => {
                 eprintln!("narjar: {warning}");
@@ -153,6 +157,7 @@ impl ShareIndex {
         source: &impl PathSource,
         upstream: &impl UpstreamNarinfo,
         stopping: &AtomicBool,
+        offered_byte_limit: usize,
     ) -> Result<RefreshOutcome, String> {
         let Some(settings) = &self.settings else {
             return Ok(RefreshOutcome::Complete(None));
@@ -161,12 +166,16 @@ impl ShareIndex {
             return Ok(RefreshOutcome::Stopped);
         };
         let mut offered = BTreeMap::new();
+        let mut offered_bytes = 0usize;
         let mut upstream_failure = None;
+        let mut signing_failure = None;
+        let mut limit_reached = false;
         for local in locals {
             if stopping.load(Ordering::Acquire) {
                 return Ok(RefreshOutcome::Stopped);
             }
             if offered.len() >= MAX_OFFERED_PATHS {
+                limit_reached = true;
                 break;
             }
             let hash = store_hash(&local.store_path)?;
@@ -177,18 +186,53 @@ impl ShareIndex {
                     continue;
                 }
             };
-            if let Some(narinfo) = offer_narinfo(&local, fetched.as_deref(), settings)? {
-                offered.insert(hash, narinfo);
+            let narinfo = match offer_narinfo(&local, fetched.as_deref(), settings) {
+                Ok(Some(narinfo)) => narinfo,
+                Ok(None) => continue,
+                Err(error) => {
+                    signing_failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            if offered_bytes.saturating_add(narinfo.len()) > offered_byte_limit {
+                limit_reached = true;
+                break;
             }
+            offered_bytes += narinfo.len();
+            offered.insert(hash, narinfo);
         }
         *self
             .offered
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Offered(offered);
-        Ok(RefreshOutcome::Complete(upstream_failure.map(|error| {
-            format!("peer share upstream lookup failed; unmatched paths stay unoffered: {error}")
-        })))
+        Ok(RefreshOutcome::Complete(refresh_warning(
+            upstream_failure,
+            signing_failure,
+            limit_reached,
+        )))
     }
+}
+
+fn refresh_warning(
+    upstream_failure: Option<String>,
+    signing_failure: Option<String>,
+    limit_reached: bool,
+) -> Option<String> {
+    let mut warnings = Vec::new();
+    if let Some(error) = upstream_failure {
+        warnings.push(format!(
+            "peer share upstream lookup failed; unmatched paths stay unoffered: {error}"
+        ));
+    }
+    if let Some(error) = signing_failure {
+        warnings.push(format!(
+            "peer share left a path unoffered because its narinfo could not be built: {error}"
+        ));
+    }
+    if limit_reached {
+        warnings.push("peer share offer limit reached; later paths stay unoffered".to_owned());
+    }
+    (!warnings.is_empty()).then(|| warnings.join(" "))
 }
 
 #[derive(Debug)]
@@ -412,7 +456,7 @@ impl ReferenceDatabase {
 
 struct HttpUpstream<'a> {
     upstream: &'a HttpUrl,
-    timeout: Duration,
+    agent: ureq::Agent,
 }
 
 impl UpstreamNarinfo for HttpUpstream<'_> {
@@ -422,7 +466,8 @@ impl UpstreamNarinfo for HttpUpstream<'_> {
             self.upstream.as_str().trim_end_matches('/'),
             hash.as_str()
         );
-        let response = idle_agent_allowing_status(self.timeout)
+        let response = self
+            .agent
             .get(&url)
             .call()
             .map_err(|error| format!("GET {url} failed: {error}"))?;
@@ -464,7 +509,7 @@ mod tests {
         upstream: &impl UpstreamNarinfo,
     ) -> RefreshOutcome {
         index
-            .refresh_from(source, upstream, &AtomicBool::new(false))
+            .refresh_from(source, upstream, &AtomicBool::new(false), MAX_OFFERED_BYTES)
             .expect("peer share refresh")
     }
 
@@ -767,7 +812,7 @@ mod tests {
             &Listed(vec![path]),
             &HttpUpstream {
                 upstream: &upstream_url,
-                timeout: Duration::from_secs(5),
+                agent: idle_agent_allowing_status(Duration::from_secs(5)),
             },
         );
         server.join().unwrap();
@@ -841,6 +886,65 @@ mod tests {
                 format!("/nix/store/{OTHER}-b"),
             ]
         );
+    }
+
+    #[test]
+    fn an_offer_stops_before_the_byte_limit_and_keeps_earlier_paths() {
+        let first = local(HASH, NarHash::from_digest([1; 32]), 32, None);
+        let second = local(OTHER, NarHash::from_digest([2; 32]), 32, None);
+        let first_narinfo = upstream_narinfo(&first);
+        let second_narinfo = upstream_narinfo(&second);
+        let index = ShareIndex::enabled(settings(false, None));
+        let mut upstream = BTreeMap::new();
+        upstream.insert(HASH.to_owned(), first_narinfo.clone());
+        upstream.insert(OTHER.to_owned(), second_narinfo);
+        let outcome = index
+            .refresh_from(
+                &Listed(vec![first, second]),
+                &MapUpstream(upstream),
+                &AtomicBool::new(false),
+                first_narinfo.len(),
+            )
+            .expect("peer share refresh");
+        assert_eq!(
+            index.narinfo(&StoreHash::parse(HASH).unwrap()).as_deref(),
+            Some(first_narinfo.as_slice())
+        );
+        assert!(index.narinfo(&StoreHash::parse(OTHER).unwrap()).is_none());
+        match outcome {
+            RefreshOutcome::Complete(Some(warning)) => {
+                assert!(warning.contains("offer limit reached"));
+            }
+            other => panic!("expected the offer limit warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_path_whose_narinfo_cannot_be_built_does_not_abort_the_refresh() {
+        let invalid = local(
+            OTHER,
+            NarHash::from_digest([3; 32]),
+            8,
+            Some(vec!["not-a-store-path".to_owned()]),
+        );
+        let valid = local(HASH, NarHash::from_digest([4; 32]), 8, Some(Vec::new()));
+        let index = ShareIndex::enabled(settings(true, Some(signing_key())));
+        let outcome = refresh(
+            &index,
+            &Listed(vec![invalid, valid]),
+            &MapUpstream(BTreeMap::new()),
+        );
+        assert!(index.narinfo(&StoreHash::parse(OTHER).unwrap()).is_none());
+        let text =
+            String::from_utf8(index.narinfo(&StoreHash::parse(HASH).unwrap()).unwrap()).unwrap();
+        assert!(text.contains("Sig: test:"));
+        match outcome {
+            RefreshOutcome::Complete(Some(warning)) => {
+                assert!(warning.contains("could not be built"));
+                assert!(warning.contains("claims are invalid"));
+            }
+            other => panic!("expected a signing warning, got {other:?}"),
+        }
     }
 
     #[test]

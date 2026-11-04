@@ -11,7 +11,7 @@ in {
     storeDir = lib.mkOption {
       type = lib.types.str;
       default = "/nix/store";
-      description = "Nix store directory to index. This is the machine's Nix store.";
+      description = "Nix store directory to index. The scan examines the lexicographically first 100,000 names. This is the machine's Nix store.";
     };
 
     upstream = lib.mkOption {
@@ -23,7 +23,7 @@ in {
     publishAll = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Offer every path in storeDir. Paths without a matching upstream narinfo are signed with signingKeyFile. Without that key, those paths stay unoffered.";
+      description = "Offer paths in storeDir. The index examines only the lexicographically first 100,000 names. Paths without a matching upstream narinfo are signed with signingKeyFile. Without that key, those paths stay unoffered.";
     };
 
     signingKeyFile = lib.mkOption {
@@ -47,8 +47,10 @@ in {
       message = "services.narjar.p2p.signingKeyFile requires services.narjar.p2p.enable";
     }
     {
-      assertion = !cfg.p2p.enable || lib.hasPrefix "https://" cfg.p2p.upstream || lib.hasPrefix "http://" cfg.p2p.upstream;
-      message = "services.narjar.p2p.upstream must be an HTTP(S) cache URL";
+      assertion =
+        !cfg.p2p.enable
+        || builtins.match "https?://[^/?#@]+([/?#].*)?" cfg.p2p.upstream != null;
+      message = "services.narjar.p2p.upstream must be an HTTP(S) URL with a host";
     }
   ];
 }

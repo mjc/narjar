@@ -60,6 +60,24 @@ in
   assert lib.hasInfix "--peer-share-signing-key-file %d/peer-share-signing-key" signedCommand;
   assert builtins.elem "peer-share-signing-key:/run/secrets/narjar-peer-signing-key" signed.systemd.services.narjar.serviceConfig.LoadCredential;
   assert !(lib.any (credential: lib.hasInfix "peer-share-signing-key:" credential) publishAll.systemd.services.narjar.serviceConfig.LoadCredential);
+  assert valid (evaluate {
+    services.narjar = {
+      enable = true;
+      p2p = {
+        enable = true;
+        upstream = "http://127.0.0.1:8080";
+      };
+    };
+  });
+  assert valid (evaluate {
+    services.narjar = {
+      enable = true;
+      p2p = {
+        enable = true;
+        upstream = "https://[::1]/";
+      };
+    };
+  });
   assert builtins.all (cfg: !valid cfg) [
     (evaluate {services.narjar.p2p.enable = true;})
     (evaluate {services.narjar.p2p.publishAll = true;})
@@ -70,6 +88,24 @@ in
         p2p = {
           enable = true;
           upstream = "cache.nixos.org";
+        };
+      };
+    })
+    (evaluate {
+      services.narjar = {
+        enable = true;
+        p2p = {
+          enable = true;
+          upstream = "https://";
+        };
+      };
+    })
+    (evaluate {
+      services.narjar = {
+        enable = true;
+        p2p = {
+          enable = true;
+          upstream = "http://";
         };
       };
     })
