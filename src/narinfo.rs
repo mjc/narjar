@@ -17,23 +17,23 @@ pub use trust::TrustedPublicKeys;
 pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct NixStorePath {
+pub(crate) struct NixStorePath {
     value: String,
     store: StoreHash,
 }
 
 impl NixStorePath {
-    fn parse(value: String) -> Result<Self, NarInfoError> {
+    pub(crate) fn parse(value: String) -> Result<Self, NarInfoError> {
         let basename = value.strip_prefix("/nix/store/").ok_or(NarInfoError)?;
         let (store, _) = validate_store_basename(basename)?;
         Ok(Self { value, store })
     }
 
-    fn from_basename(value: &str) -> Result<Self, NarInfoError> {
+    pub(crate) fn from_basename(value: &str) -> Result<Self, NarInfoError> {
         Self::parse(format!("/nix/store/{value}"))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.value
     }
 
@@ -43,7 +43,7 @@ impl NixStorePath {
             .expect("validated store paths retain their prefix")
     }
 
-    fn store(&self) -> &StoreHash {
+    pub(crate) fn store(&self) -> &StoreHash {
         &self.store
     }
 }
@@ -177,6 +177,19 @@ impl NarInfoClaims {
     /// external narinfo before using its existence as a cache result.
     pub fn parse_external_narinfo(route: &StoreHash, bytes: Vec<u8>) -> Result<Self, NarInfoError> {
         Self::parse_external_publication(route, bytes).map(|(claims, _)| claims)
+    }
+
+    /// Store path and NAR identity from an external narinfo.
+    ///
+    /// Peer sharing compares these claims and keeps the original bytes. The
+    /// document's URL does not have to be this cache's `nar/<hash>.nar` name.
+    pub(crate) fn parse_external_logical_claims(
+        route: &StoreHash,
+        bytes: &[u8],
+    ) -> Result<Self, NarInfoError> {
+        let text = parse_narinfo_text(bytes.to_vec())?;
+        let document = NarInfoDocument::parse_external(&text)?;
+        Self::from_external_document(route, &document)
     }
 
     pub(crate) fn parse_external_publication(

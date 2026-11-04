@@ -18,6 +18,8 @@ mod narinfo_signing;
 mod native_store;
 mod operator;
 #[cfg(unix)]
+mod peer_share;
+#[cfg(unix)]
 mod push;
 #[cfg(windows)]
 #[path = "push/windows.rs"]

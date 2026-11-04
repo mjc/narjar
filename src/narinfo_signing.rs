@@ -3,6 +3,7 @@ use std::{fs, path::Path};
 use data_encoding::BASE64;
 use ed25519_dalek::{Signer, SigningKey};
 
+#[derive(Clone)]
 pub(crate) struct NixSigningKey {
     name: String,
     signing_key: SigningKey,

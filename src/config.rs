@@ -39,6 +39,8 @@ pub(crate) struct ServeConfig {
     pub(crate) source: ServeSource,
     pub(crate) stats_inventory_interval_seconds: Option<NonZeroU64>,
     pub(crate) stats_filesystem_sample: Option<PathBuf>,
+    #[cfg(unix)]
+    pub(crate) peer_share: Option<crate::peer_share::PeerShareSettings>,
 }
 
 /// Prepared source selection; native-store output is inherently flat/raw.
@@ -349,6 +351,24 @@ pub(crate) struct ServeArgs {
     /// Nix secret key used to sign native paths without a reusable trusted signature.
     #[arg(long, env = "NARJAR_NATIVE_SIGNING_KEY_FILE", value_parser = non_empty_path)]
     native_signing_key_file: Option<PathBuf>,
+    /// Nix store whose paths may be offered to peers. Unset leaves peer sharing off.
+    #[arg(long, env = "NARJAR_PEER_SHARE_STORE", value_parser = non_empty_path)]
+    peer_share_store: Option<PathBuf>,
+    /// Upstream cache whose narinfo must match a path before it is offered.
+    #[arg(long, env = "NARJAR_PEER_SHARE_UPSTREAM")]
+    peer_share_upstream: Option<HttpUrl>,
+    /// Offer every path in the peer share store. Paths the upstream does not have are signed.
+    #[arg(long, env = "NARJAR_PEER_SHARE_PUBLISH_ALL")]
+    peer_share_publish_all: bool,
+    /// Nix secret key for paths offered with --peer-share-publish-all.
+    #[arg(long, env = "NARJAR_PEER_SHARE_SIGNING_KEY_FILE", value_parser = non_empty_path)]
+    peer_share_signing_key_file: Option<PathBuf>,
+    /// Nix state directory containing db/db.sqlite. Used for references when publish-all is set.
+    #[arg(long, env = "NARJAR_PEER_SHARE_STATE_DIR", value_parser = non_empty_path)]
+    peer_share_state_dir: Option<PathBuf>,
+    /// Seconds between peer share index refreshes.
+    #[arg(long, env = "NARJAR_PEER_SHARE_REFRESH_SECONDS")]
+    peer_share_refresh_seconds: Option<NonZeroU64>,
     #[arg(
         long,
         env = "NARJAR_STATS_INVENTORY_INTERVAL_SECONDS",
@@ -423,6 +443,21 @@ impl TryFrom<ServeArgs> for ServeConfig {
 
     fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
         let source = args.prepare_source().map_err(|error| error.to_string())?;
+        if args.peer_share_store.is_none()
+            && (args.peer_share_publish_all
+                || args.peer_share_upstream.is_some()
+                || args.peer_share_signing_key_file.is_some()
+                || args.peer_share_state_dir.is_some()
+                || args.peer_share_refresh_seconds.is_some())
+        {
+            return Err("peer share options require --peer-share-store".to_owned());
+        }
+        #[cfg(not(unix))]
+        if args.peer_share_store.is_some() {
+            return Err("peer sharing requires a unix host".to_owned());
+        }
+        #[cfg(unix)]
+        let peer_share = peer_share_settings(&args)?;
         Ok(Self {
             hosting: args.hosting.prepare(source.minimum_advertisement_lease())?,
             track_access: args.track_access,
@@ -439,8 +474,42 @@ impl TryFrom<ServeArgs> for ServeConfig {
             source,
             stats_inventory_interval_seconds: args.stats_inventory_interval_seconds,
             stats_filesystem_sample: args.stats_filesystem_sample,
+            #[cfg(unix)]
+            peer_share,
         })
     }
+}
+
+#[cfg(unix)]
+fn peer_share_settings(
+    args: &ServeArgs,
+) -> Result<Option<crate::peer_share::PeerShareSettings>, String> {
+    let Some(store_root) = args.peer_share_store.clone() else {
+        return Ok(None);
+    };
+    let signing_key = args
+        .peer_share_signing_key_file
+        .as_deref()
+        .map(crate::narinfo_signing::NixSigningKey::read)
+        .transpose()?;
+    let upstream = args.peer_share_upstream.clone().unwrap_or_else(|| {
+        "https://cache.nixos.org"
+            .parse()
+            .expect("default upstream URL")
+    });
+    Ok(Some(crate::peer_share::PeerShareSettings {
+        store_root,
+        upstream,
+        publish_all: args.peer_share_publish_all,
+        signing_key,
+        state_dir: args.peer_share_state_dir.clone(),
+        refresh_interval: std::time::Duration::from_secs(
+            args.peer_share_refresh_seconds
+                .map(NonZeroU64::get)
+                .unwrap_or(crate::peer_share::DEFAULT_REFRESH_INTERVAL.as_secs()),
+        ),
+        request_timeout: std::time::Duration::from_secs(args.io_timeout_seconds.get()),
+    }))
 }
 
 fn non_empty_path(value: &str) -> Result<PathBuf, String> {
