@@ -1,17 +1,20 @@
-//! Decide which local Nix store paths this daemon may offer to a peer.
+//! Decide which local Nix store paths this daemon may offer to a peer, and
+//! serve the narinfo and raw NAR for a path that decision kept.
 //!
 //! The index is off until a store root is configured. A refresh examines at
 //! most [`MAX_SCANNED_PATHS`] paths, one at a time ([`SCAN_CONCURRENCY`]), and
 //! keeps at most [`MAX_OFFERED_PATHS`] narinfo documents or
-//! [`MAX_OFFERED_BYTES`] of those documents. It does not retain NAR bytes. The
-//! default refresh interval is one hour. An upstream lookup failure, or a path
-//! whose narinfo cannot be built, omits that path and leaves the rest of the
-//! refresh intact.
+//! [`MAX_OFFERED_BYTES`] of those documents. It does not retain NAR bytes.
+//! [`ShareIndex::write_nar`] streams a raw NAR to the caller and keeps nothing
+//! after it returns. The default refresh interval is one hour. An upstream
+//! lookup failure, or a path whose narinfo cannot be built, omits that path
+//! and leaves the rest of the refresh intact.
 
 use std::{
     collections::{BTreeMap, BinaryHeap},
     ffi::OsString,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         RwLock,
@@ -72,6 +75,20 @@ impl std::fmt::Debug for PeerShareSettings {
 
 struct Offered(BTreeMap<StoreHash, Vec<u8>>);
 
+/// Why a peer read did not succeed.
+///
+/// The daemon does not call this until a peer socket exists. Tests cover it.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum ShareServeError {
+    /// The share decision does not offer this store-path hash.
+    Miss,
+    /// The store path could not be read, or the caller stopped reading.
+    Failed(String),
+    /// The streamed NAR hash or size does not match the offered narinfo.
+    Mismatch,
+}
+
 pub(crate) struct ShareIndex {
     offered: RwLock<Offered>,
     settings: PeerShareSettings,
@@ -106,8 +123,7 @@ impl ShareIndex {
         self.settings.refresh_interval
     }
 
-    // Nothing in the daemon asks for a peer narinfo yet. The index still has to answer.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // peer sockets are a later change; tests call this
     pub(crate) fn narinfo(&self, hash: &StoreHash) -> Option<Vec<u8>> {
         self.offered
             .read()
@@ -115,6 +131,32 @@ impl ShareIndex {
             .0
             .get(hash)
             .cloned()
+    }
+
+    /// Stream the raw NAR for an offered store-path hash.
+    ///
+    /// Bytes start leaving before the store file has been read in full, and
+    /// this call keeps none of them. `Ok` means the streamed NarHash and
+    /// NarSize match the offered narinfo.
+    #[allow(dead_code)] // peer sockets are a later change; tests call this
+    pub(crate) fn write_nar<W: Write>(
+        &self,
+        hash: &StoreHash,
+        output: W,
+    ) -> Result<(), ShareServeError> {
+        let Some(narinfo) = self.narinfo(hash) else {
+            return Err(ShareServeError::Miss);
+        };
+        let claims = NarInfoClaims::parse_external_logical_claims(hash, &narinfo)
+            .map_err(|_| ShareServeError::Failed("peer share narinfo is invalid".to_owned()))?;
+        let path = offered_store_file(&self.settings.store_root, &claims)?;
+        let (digest, size) =
+            crate::push::write_store_nar(&path, output).map_err(ShareServeError::Failed)?;
+        let actual = NarHash::from_digest(digest);
+        if claims.identity().hash() != actual || claims.identity().size().get() != size {
+            return Err(ShareServeError::Mismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn refresh(&self, stopping: &AtomicBool) -> Result<(), String> {
@@ -254,6 +296,24 @@ fn offer_narinfo(
         return Ok(None);
     };
     signed_narinfo(local, references, signing_key).map(Some)
+}
+
+#[allow(dead_code)] // called by write_nar, which waits for a peer socket
+fn offered_store_file(
+    store_root: &Path,
+    claims: &NarInfoClaims,
+) -> Result<PathBuf, ShareServeError> {
+    let path = NixStorePath::parse(claims.store_path().to_owned()).map_err(|_| {
+        ShareServeError::Failed("peer share narinfo store path is invalid".to_owned())
+    })?;
+    let basename = path
+        .as_str()
+        .strip_prefix("/nix/store/")
+        .filter(|basename| !basename.is_empty() && !basename.contains('/'))
+        .ok_or_else(|| {
+            ShareServeError::Failed("peer share narinfo store path is invalid".to_owned())
+        })?;
+    Ok(store_root.join(basename))
 }
 
 fn upstream_matches(local: &LocalPath, bytes: &[u8]) -> bool {
@@ -905,6 +965,133 @@ mod tests {
             }
             other => panic!("expected a signing warning, got {other:?}"),
         }
+    }
+
+    fn offer_store_file(bytes: &[u8]) -> (tempfile::TempDir, ShareIndex, Vec<u8>) {
+        let root = tempfile::tempdir().unwrap();
+        let basename = format!("{HASH}-package");
+        std::fs::write(root.path().join(&basename), bytes).unwrap();
+        let (digest, nar_size) = hash_store_nar(&root.path().join(&basename)).unwrap();
+        let path = local(HASH, NarHash::from_digest(digest), nar_size, None);
+        let narinfo = upstream_narinfo(&path);
+        let mut configured = settings(false, None);
+        configured.store_root = root.path().to_path_buf();
+        let index = ShareIndex::new(configured);
+        let source = FilesystemSource {
+            store_root: root.path(),
+            state_dir: None,
+            publish_all: false,
+        };
+        let mut upstream = BTreeMap::new();
+        upstream.insert(HASH.to_owned(), narinfo.clone());
+        refresh(&index, &source, &MapUpstream(upstream));
+        (root, index, narinfo)
+    }
+
+    #[test]
+    fn an_offered_path_returns_the_upstream_narinfo_and_streams_its_nar() {
+        let (root, index, narinfo) = offer_store_file(b"hello");
+        let hash = StoreHash::parse(HASH).unwrap();
+        assert_eq!(index.narinfo(&hash).as_deref(), Some(narinfo.as_slice()));
+        let mut served = Vec::new();
+        index.write_nar(&hash, &mut served).unwrap();
+        let mut direct = Vec::new();
+        crate::push::write_store_nar(&root.path().join(format!("{HASH}-package")), &mut direct)
+            .unwrap();
+        assert_eq!(served, direct);
+        assert!(served.len() > 8);
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "the NAR is not retained beside the store path"
+        );
+    }
+
+    #[test]
+    fn a_path_the_share_decision_rejected_is_a_miss_while_the_file_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let basename = format!("{HASH}-package");
+        std::fs::write(root.path().join(&basename), b"hello").unwrap();
+        let mut configured = settings(false, None);
+        configured.store_root = root.path().to_path_buf();
+        let index = ShareIndex::new(configured);
+        refresh(
+            &index,
+            &FilesystemSource {
+                store_root: root.path(),
+                state_dir: None,
+                publish_all: false,
+            },
+            &MapUpstream(BTreeMap::new()),
+        );
+        let error = index
+            .write_nar(&StoreHash::parse(HASH).unwrap(), std::io::sink())
+            .unwrap_err();
+        assert!(matches!(error, ShareServeError::Miss));
+        assert!(root.path().join(basename).is_file());
+    }
+
+    #[test]
+    fn a_changed_store_file_is_a_mismatch_rather_than_a_successful_nar() {
+        let (root, index, _) = offer_store_file(b"hello");
+        std::fs::write(root.path().join(format!("{HASH}-package")), b"hellp").unwrap();
+        let mut served = Vec::new();
+        let error = index
+            .write_nar(&StoreHash::parse(HASH).unwrap(), &mut served)
+            .unwrap_err();
+        assert!(matches!(error, ShareServeError::Mismatch));
+        assert!(!served.is_empty());
+    }
+
+    #[test]
+    fn a_deleted_offered_path_is_a_failure_not_a_miss() {
+        let (root, index, narinfo) = offer_store_file(b"hello");
+        let hash = StoreHash::parse(HASH).unwrap();
+        std::fs::remove_file(root.path().join(format!("{HASH}-package"))).unwrap();
+        let error = index.write_nar(&hash, &mut Vec::new()).unwrap_err();
+        assert!(matches!(error, ShareServeError::Failed(_)));
+        assert_eq!(index.narinfo(&hash).as_deref(), Some(narinfo.as_slice()));
+    }
+
+    struct StopAfter {
+        accepted: usize,
+        limit: usize,
+    }
+
+    impl std::io::Write for StopAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.accepted >= self.limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client stopped",
+                ));
+            }
+            let take = buf.len().min(self.limit - self.accepted);
+            self.accepted += take;
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_client_that_stops_reading_does_not_finish_the_nar() {
+        let (root, index, _) = offer_store_file(b"hello");
+        let mut writer = StopAfter {
+            accepted: 0,
+            limit: 8,
+        };
+        let error = index
+            .write_nar(&StoreHash::parse(HASH).unwrap(), &mut writer)
+            .unwrap_err();
+        match error {
+            ShareServeError::Failed(message) => assert!(message.contains("client stopped")),
+            other => panic!("expected the client stop, got {other:?}"),
+        }
+        assert_eq!(writer.accepted, 8);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]
