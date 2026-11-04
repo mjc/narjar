@@ -170,16 +170,22 @@ fn validate_delivery_range(range: Range<u64>, length: u64) -> io::Result<()> {
     }
 }
 
-pub(crate) fn confirm_store_nar(lease: &NativeStoreLease, identity: NarIdentity) -> io::Result<()> {
-    let active_delivery = lease
-        .begin_active_delivery()
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let store_path = lease.store_path().clone();
-    let mut reader = VerifiedStream::spawn(identity, "narjar-native-nar", move |writer| {
-        let _active_delivery = active_delivery;
-        write_store_path_nar(&store_path, writer).map(|_| ())
-    })?;
-    io::copy(&mut reader, &mut io::sink()).map(|_| ())
+pub(crate) fn confirm_store_object(store_path: &NativeStorePath) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(store_path.as_path())?;
+    if was_modified_after_access(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native store object was modified after it was last accessed",
+        ));
+    }
+    Ok(())
+}
+
+fn was_modified_after_access(metadata: &std::fs::Metadata) -> bool {
+    // A write updates the modification time and leaves the access time behind.
+    let modified = (metadata.mtime(), metadata.mtime_nsec());
+    let accessed = (metadata.atime(), metadata.atime_nsec());
+    modified > accessed
 }
 
 fn write_leased_nar<W: Write>(lease: &NativeStoreLease, output: W) -> io::Result<EncodeSummary> {
@@ -327,6 +333,7 @@ mod tests {
         },
         path::{Path, PathBuf},
         sync::Arc,
+        time::{Duration, SystemTime},
     };
 
     use narjar::{
@@ -818,32 +825,65 @@ mod tests {
     }
 
     #[test]
-    fn narinfo_confirmation_rejects_an_appended_or_truncated_store_file() {
-        let appended = NativeDeliveryFixture::file(b"mutate-me-content");
-        let appended_identity = identity_of(&appended);
-        let appended_lease = appended.lease();
-        let held = appended_lease
-            .begin_active_delivery()
-            .expect("hold the narinfo delivery pin");
-        super::confirm_store_nar(&appended_lease, appended_identity)
-            .expect("intact file should confirm while its narinfo pin is held");
-        drop(held);
+    fn narinfo_stat_rejects_a_store_object_modified_after_it_was_last_accessed() {
+        let fixture = NativeDeliveryFixture::file(b"mutate-me-content");
+        let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let later = earlier + Duration::from_secs(10);
+        set_store_times(&fixture.physical_path, earlier, later);
+
+        let error = super::confirm_store_object(fixture.lease().store_path())
+            .expect_err("a store object modified after it was last accessed should not confirm");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn narinfo_stat_accepts_an_appended_file_whose_access_time_is_current() {
+        let fixture = NativeDeliveryFixture::file(b"mutate-me-content");
+        let identity = identity_of(&fixture);
         let mut file = fs::OpenOptions::new()
             .append(true)
-            .open(&appended.physical_path)
+            .open(&fixture.physical_path)
             .expect("open store file for append");
         file.write_all(b"X").expect("append one byte");
         drop(file);
-        let appended_error = super::confirm_store_nar(&appended_lease, appended_identity)
-            .expect_err("appended store file should not confirm");
-        assert_eq!(appended_error.kind(), io::ErrorKind::InvalidData);
+        let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let later = earlier + Duration::from_secs(10);
+        set_store_times(&fixture.physical_path, later, earlier);
 
-        let truncated = NativeDeliveryFixture::file(b"short-read-content");
-        let truncated_identity = identity_of(&truncated);
-        fs::write(&truncated.physical_path, b"x").expect("truncate store file");
-        let truncated_error = super::confirm_store_nar(&truncated.lease(), truncated_identity)
-            .expect_err("truncated store file should not confirm");
-        assert_eq!(truncated_error.kind(), io::ErrorKind::UnexpectedEof);
+        super::confirm_store_object(fixture.lease().store_path())
+            .expect("narinfo does not read an appended file whose access time is current");
+
+        let delivery = NativeNarDelivery::new(fixture.lease(), identity)
+            .expect("open native delivery of an appended file");
+        let error = io::copy(&mut delivery.into_reader(), &mut io::sink())
+            .expect_err("serving should reject an appended file");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn narinfo_stat_rejects_a_missing_store_object() {
+        let fixture = NativeDeliveryFixture::file(b"gone");
+        let lease = fixture.lease();
+        fs::remove_file(&fixture.physical_path).expect("remove store file");
+
+        let error = super::confirm_store_object(lease.store_path())
+            .expect_err("a missing store object should not confirm");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    fn set_store_times(path: &Path, accessed: SystemTime, modified: SystemTime) {
+        let file = File::options()
+            .write(true)
+            .open(path)
+            .expect("open store file to set times");
+        file.set_times(
+            fs::FileTimes::new()
+                .set_accessed(accessed)
+                .set_modified(modified),
+        )
+        .expect("set store file times");
     }
 
     fn identity_of(fixture: &NativeDeliveryFixture) -> NarIdentity {
