@@ -51,6 +51,7 @@ pub struct Storage {
     pub(super) collection: CollectionCoordinator,
     pub(super) delivery_validation: DeliveryValidationCache,
     pub(super) publication_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    pub(super) fetch_failure_log: Mutex<()>,
     pub(super) narinfo_publication_locks: Mutex<HashMap<StoreHash, Weak<RwLock<()>>>>,
     pub(super) staging_budget: Arc<Mutex<StagingBudget>>,
     pub(super) temporary_objects: AtomicU64,
