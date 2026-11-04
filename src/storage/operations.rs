@@ -393,12 +393,17 @@ impl BoundNarInfo<'_> {
         self,
         source: Option<UpstreamNarSource>,
     ) -> Result<PublishOutcome, StorageError> {
+        let writer = self.writer().map(str::to_owned);
         let claims = self.claims();
         let output = self.output();
         let bytes = self.output_bytes()?;
-        self.stored()
-            .storage()
-            .publish_bound_narinfo_with_claims(claims, output, bytes, source)
+        self.stored().storage().publish_bound_narinfo_with_claims(
+            claims,
+            output,
+            bytes,
+            source,
+            writer.as_deref(),
+        )
     }
 }
 
@@ -413,11 +418,22 @@ impl Storage {
         claims: &NarInfoClaims,
         bytes: Vec<u8>,
     ) -> Result<PublishOutcome, StorageError> {
+        self.publish_narinfo_for(claims, bytes, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_narinfo_for(
+        &self,
+        claims: &NarInfoClaims,
+        bytes: Vec<u8>,
+        writer: Option<&str>,
+    ) -> Result<PublishOutcome, StorageError> {
         self.publish_bound_narinfo_with_claims(
             claims,
             NarRepresentation::Raw(claims.identity()),
             bytes,
             None,
+            writer,
         )
     }
 
@@ -427,6 +443,7 @@ impl Storage {
         output: NarRepresentation,
         bytes: Vec<u8>,
         source: Option<UpstreamNarSource>,
+        writer: Option<&str>,
     ) -> Result<PublishOutcome, StorageError> {
         let _activity = self.collection.mutation()?;
         // Block reads and other publishers until retention is recorded or rollback finishes.
@@ -441,7 +458,7 @@ impl Storage {
             }
             result => result,
         }?;
-        self.record_narinfo_lease_or_remove_new_metadata(claims, output, outcome, source)
+        self.record_narinfo_lease_or_remove_new_metadata(claims, output, outcome, source, writer)
     }
 
     pub(super) fn narinfo_publication_lock(&self, store: &StoreHash) -> Arc<RwLock<()>> {
@@ -454,6 +471,7 @@ impl Storage {
         output: NarRepresentation,
         outcome: PublishOutcome,
         source: Option<UpstreamNarSource>,
+        writer: Option<&str>,
     ) -> Result<PublishOutcome, StorageError> {
         let lease = match source {
             Some(source) => {
@@ -464,7 +482,15 @@ impl Storage {
             }
         };
         match lease {
-            Ok(()) => Ok(outcome),
+            Ok(()) => {
+                self.remember_publication(
+                    claims.store(),
+                    claims.store_path(),
+                    writer,
+                    SystemTime::now(),
+                )?;
+                Ok(outcome)
+            }
             Err(error) => {
                 match outcome {
                     PublishOutcome::Created => {
@@ -1042,6 +1068,7 @@ impl Storage {
         unlink_metadata: impl FnOnce(&File, &OsStr) -> io::Result<()>,
     ) -> Result<(), StorageError> {
         self.mark_advertisement_removal_pending(*store, context)?;
+        self.note_publication_removed(store, SystemTime::now())?;
         unlink_metadata(
             &self.root,
             &OsString::from(format!("{}.narinfo", store.as_str())),

@@ -824,6 +824,7 @@ impl ValidatedNarInfo {
             narinfo: self.0,
             stored,
             output,
+            writer: None,
         })
     }
 }
@@ -835,6 +836,7 @@ pub(crate) struct BoundNarInfo<'storage> {
     narinfo: PublicationNarInfo,
     stored: VerifiedCanonicalNar<'storage>,
     output: NarRepresentation,
+    writer: Option<String>,
 }
 
 impl BoundNarInfo<'_> {
@@ -854,6 +856,15 @@ impl BoundNarInfo<'_> {
 
     pub(crate) const fn output(&self) -> NarRepresentation {
         self.output
+    }
+
+    pub(crate) fn attributed_to(mut self, writer: &str) -> Self {
+        self.writer = Some(writer.to_owned());
+        self
+    }
+
+    pub(crate) fn writer(&self) -> Option<&str> {
+        self.writer.as_deref()
     }
 }
 

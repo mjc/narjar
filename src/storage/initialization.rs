@@ -81,6 +81,7 @@ pub(super) fn storage_root_directories() -> impl Iterator<Item = &'static str> {
             ".narjar-control",
             super::access::ACCESS_DIRECTORY,
             super::advertisement::DIRECTORY,
+            super::publication_record::DIRECTORY,
         ])
         .filter(|name| !name.contains('/'))
 }
