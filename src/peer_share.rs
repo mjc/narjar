@@ -7,7 +7,8 @@
 //! failure omits that path and leaves the rest of the refresh intact.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BinaryHeap},
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -22,14 +23,15 @@ use sqlite::{Connection, ConnectionThreadSafe, OpenFlags, State};
 use crate::{
     cache::narinfo::{MAX_NARINFO_BYTES, NarInfoClaims, NarInfoMetadata},
     cache::storage::StoreHash,
-    http_client::idle_agent,
+    http_client::idle_agent_allowing_status,
     http_url::HttpUrl,
     narinfo_signing::NixSigningKey,
     push::hash_store_nar,
 };
 use narjar::object::{NarHash, NarIdentity, NarRepresentation, NarSize};
 
-/// Paths examined in one refresh. Later directory entries are left unoffered.
+/// Paths examined in one refresh. The scan keeps the lexicographically first
+/// names and leaves the rest unoffered.
 pub(crate) const MAX_SCANNED_PATHS: usize = 100_000;
 /// Narinfo documents retained. Each document is at most [`MAX_NARINFO_BYTES`].
 pub(crate) const MAX_OFFERED_PATHS: usize = 100_000;
@@ -230,7 +232,7 @@ fn upstream_matches(local: &LocalPath, bytes: &[u8]) -> bool {
     let Ok(hash) = store_hash(&local.store_path) else {
         return false;
     };
-    NarInfoClaims::parse_external_narinfo(&hash, bytes.to_vec()).is_ok_and(|claims| {
+    NarInfoClaims::parse_external_logical_claims(&hash, bytes).is_ok_and(|claims| {
         claims.store_path() == local.store_path && claims.identity().hash() == local.nar_hash
     })
 }
@@ -274,6 +276,16 @@ struct FilesystemSource<'a> {
 
 impl PathSource for FilesystemSource<'_> {
     fn list(&self, stopping: &AtomicBool) -> Result<Option<Vec<LocalPath>>, String> {
+        self.list_limited(stopping, MAX_SCANNED_PATHS)
+    }
+}
+
+impl FilesystemSource<'_> {
+    fn list_limited(
+        &self,
+        stopping: &AtomicBool,
+        limit: usize,
+    ) -> Result<Option<Vec<LocalPath>>, String> {
         if stopping.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -281,16 +293,16 @@ impl PathSource for FilesystemSource<'_> {
             .publish_all
             .then(|| self.state_dir.and_then(ReferenceDatabase::open))
             .flatten();
-        let mut names = fs::read_dir(self.store_root)
+        let entries = fs::read_dir(self.store_root)
             .map_err(|error| format!("reading {}: {error}", self.store_root.display()))?
             .map(|entry| {
                 entry
                     .map_err(|error| format!("reading {}: {error}", self.store_root.display()))
                     .map(|entry| entry.file_name())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        names.sort();
-        names.truncate(MAX_SCANNED_PATHS);
+            });
+        let Some(names) = bounded_directory_names(entries, limit, stopping)? else {
+            return Ok(None);
+        };
         let mut paths = Vec::new();
         for name in names {
             if stopping.load(Ordering::Acquire) {
@@ -302,6 +314,34 @@ impl PathSource for FilesystemSource<'_> {
         }
         Ok(Some(paths))
     }
+}
+
+/// Keeps at most `limit` names while the iterator is consumed. `None` means
+/// shutdown was requested and the caller should keep the previous index.
+fn bounded_directory_names(
+    mut entries: impl Iterator<Item = Result<OsString, String>>,
+    limit: usize,
+    stopping: &AtomicBool,
+) -> Result<Option<Vec<OsString>>, String> {
+    let mut selected = BinaryHeap::new();
+    loop {
+        if stopping.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        let name = entry?;
+        if selected.len() < limit {
+            selected.push(name);
+        } else if selected.peek().is_some_and(|largest| &name < largest) {
+            selected.pop();
+            selected.push(name);
+        }
+    }
+    let mut names = Vec::from(selected);
+    names.sort();
+    Ok(Some(names))
 }
 
 fn local_path(
@@ -382,7 +422,7 @@ impl UpstreamNarinfo for HttpUpstream<'_> {
             self.upstream.as_str().trim_end_matches('/'),
             hash.as_str()
         );
-        let response = idle_agent(self.timeout)
+        let response = idle_agent_allowing_status(self.timeout)
             .get(&url)
             .call()
             .map_err(|error| format!("GET {url} failed: {error}"))?;
@@ -667,6 +707,140 @@ mod tests {
         fn fetch(&self, hash: &StoreHash) -> Result<Option<Vec<u8>>, String> {
             Err(format!("GET {} failed", hash.as_str()))
         }
+    }
+
+    #[test]
+    fn a_matching_upstream_narinfo_with_another_url_layout_is_offered_unchanged() {
+        let nar_hash =
+            NarHash::parse("0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl").unwrap();
+        let path = local(HASH, nar_hash, 32, Some(Vec::new()));
+        let narinfo = format!(
+            "StorePath: {}\n\
+             URL: https://cache.example/objects/package.nar.xz\n\
+             Compression: xz\n\
+             FileHash: sha256:1111111111111111111111111111111111111111111111111111\n\
+             FileSize: 12\n\
+             NarHash: sha256:0li9rfm1hh9f00632vd0m0ihhnmwn4yvqvwcvkrfbi47da5a80nl\n\
+             NarSize: 32\n\
+             Sig: cache.example:AAAA\n",
+            path.store_path,
+        )
+        .into_bytes();
+        let index = ShareIndex::enabled(settings(true, Some(signing_key())));
+        let mut upstream = BTreeMap::new();
+        upstream.insert(HASH.to_owned(), narinfo.clone());
+        refresh(&index, &Listed(vec![path]), &MapUpstream(upstream));
+        assert_eq!(
+            index.narinfo(&StoreHash::parse(HASH).unwrap()).as_deref(),
+            Some(narinfo.as_slice())
+        );
+    }
+
+    #[test]
+    fn publish_all_signs_when_the_upstream_returns_not_found() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let upstream_url: HttpUrl = format!("http://{address}").parse().unwrap();
+        let mut configured = settings(true, Some(signing_key()));
+        configured.upstream = upstream_url.clone();
+        configured.request_timeout = Duration::from_secs(5);
+        let index = ShareIndex::enabled(configured);
+        let path = local(OTHER, NarHash::from_digest([8; 32]), 8, Some(Vec::new()));
+        let outcome = refresh(
+            &index,
+            &Listed(vec![path]),
+            &HttpUpstream {
+                upstream: &upstream_url,
+                timeout: Duration::from_secs(5),
+            },
+        );
+        server.join().unwrap();
+        assert!(
+            matches!(outcome, RefreshOutcome::Complete(None)),
+            "{outcome:?}"
+        );
+        let text =
+            String::from_utf8(index.narinfo(&StoreHash::parse(OTHER).unwrap()).unwrap()).unwrap();
+        assert!(text.contains("Sig: test:"));
+        assert!(text.contains(&format!("/nix/store/{OTHER}-package")));
+    }
+
+    #[test]
+    fn a_directory_scan_keeps_the_lexicographically_first_names() {
+        let names = ["m", "a", "z", "b", "c"]
+            .into_iter()
+            .map(|name| Ok(OsString::from(name)));
+        let selected = bounded_directory_names(names, 2, &AtomicBool::new(false))
+            .unwrap()
+            .unwrap();
+        let selected: Vec<_> = selected
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(selected, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_directory_scan_stops_before_reading_every_name() {
+        let stopping = AtomicBool::new(false);
+        let mut reads = 0usize;
+        let names = ["m", "a", "z", "b", "c"].into_iter().map(|name| {
+            reads += 1;
+            if reads == 3 {
+                stopping.store(true, Ordering::Release);
+            }
+            Ok(OsString::from(name))
+        });
+        let selected = bounded_directory_names(names, 2, &stopping).unwrap();
+        assert!(selected.is_none());
+        assert_eq!(reads, 3);
+    }
+
+    #[test]
+    fn a_store_scan_hashes_only_the_first_paths_within_the_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let kept = [format!("{HASH}-a"), format!("{OTHER}-b")];
+        let skipped = [
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-c".to_owned(),
+            "cccccccccccccccccccccccccccccccc-d".to_owned(),
+        ];
+        for name in kept.iter().chain(skipped.iter()) {
+            std::fs::write(root.path().join(name), b"x").unwrap();
+        }
+        let source = FilesystemSource {
+            store_root: root.path(),
+            state_dir: None,
+            publish_all: false,
+        };
+        let paths = source
+            .list_limited(&AtomicBool::new(false), 2)
+            .unwrap()
+            .unwrap();
+        let mut offered: Vec<_> = paths.into_iter().map(|path| path.store_path).collect();
+        offered.sort();
+        assert_eq!(
+            offered,
+            vec![
+                format!("/nix/store/{HASH}-a"),
+                format!("/nix/store/{OTHER}-b"),
+            ]
+        );
     }
 
     #[test]

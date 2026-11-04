@@ -13,17 +13,32 @@ use ureq::{
 };
 
 pub(crate) fn idle_agent(timeout: Duration) -> Agent {
+    idle_agent_with(timeout, true)
+}
+
+/// Like [`idle_agent`], but a 404 or other HTTP status stays on the response.
+pub(crate) fn idle_agent_allowing_status(timeout: Duration) -> Agent {
+    idle_agent_with(timeout, false)
+}
+
+fn idle_agent_with(timeout: Duration, http_status_as_error: bool) -> Agent {
     Agent::with_parts(
-        connection_config(timeout),
+        agent_config(timeout, http_status_as_error),
         DefaultConnector::default().chain(IdleConnector { timeout }),
         DefaultResolver::default(),
     )
 }
 
+#[cfg(test)]
 fn connection_config(timeout: Duration) -> Config {
+    agent_config(timeout, true)
+}
+
+fn agent_config(timeout: Duration, http_status_as_error: bool) -> Config {
     Agent::config_builder()
         .timeout_resolve(Some(timeout))
         .timeout_connect(Some(timeout))
+        .http_status_as_error(http_status_as_error)
         .build()
 }
 

@@ -179,6 +179,19 @@ impl NarInfoClaims {
         Self::parse_external_publication(route, bytes).map(|(claims, _)| claims)
     }
 
+    /// Store path and NAR identity from an external narinfo.
+    ///
+    /// Peer sharing compares these claims and keeps the original bytes. The
+    /// document's URL does not have to be this cache's `nar/<hash>.nar` name.
+    pub(crate) fn parse_external_logical_claims(
+        route: &StoreHash,
+        bytes: &[u8],
+    ) -> Result<Self, NarInfoError> {
+        let text = parse_narinfo_text(bytes.to_vec())?;
+        let document = NarInfoDocument::parse_external(&text)?;
+        Self::from_external_document(route, &document)
+    }
+
     pub(crate) fn parse_external_publication(
         route: &StoreHash,
         bytes: Vec<u8>,
