@@ -150,7 +150,6 @@ fn authorization_token_hash(request: &Request) -> Option<[u8; TOKEN_BYTES]> {
 mod tests {
     use std::{
         fs,
-        io::Write,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -246,15 +245,8 @@ mod tests {
     }
 
     fn write_private_token_file(path: &std::path::Path, contents: &str) {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .expect("create private token file")
-            .write_all(contents.as_bytes())
-            .expect("write private token file");
+        crate::cache::test_support::private_file(path, contents.as_bytes())
+            .expect("create private token file");
     }
 
     fn authenticate(
