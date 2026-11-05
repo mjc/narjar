@@ -802,27 +802,43 @@ async fn send_bytes(
 
 async fn write_data(
     stream: &mut h2::SendStream<Bytes>,
-    data: Bytes,
+    mut data: Bytes,
     end: bool,
     stall: Duration,
 ) -> Result<(), String> {
-    let needed = data.len();
-    if needed > 0 {
-        stream.reserve_capacity(needed);
-        while stream.capacity() < needed {
-            let available = tokio::time::timeout(stall, poll_fn(|cx| stream.poll_capacity(cx)))
+    // A peer may grant a stream window smaller than this buffer. Send the
+    // granted prefix now; waiting for the rest leaves the peer nothing to read,
+    // so the window never grows.
+    if data.is_empty() {
+        return stream
+            .send_data(data, end)
+            .map_err(|error| error.to_string());
+    }
+    while !data.is_empty() {
+        stream.reserve_capacity(data.len());
+        let available = if stream.capacity() > 0 {
+            stream.capacity()
+        } else {
+            let granted = tokio::time::timeout(stall, poll_fn(|cx| stream.poll_capacity(cx)))
                 .await
                 .map_err(|_| "mesh send stalled".to_owned())?
                 .ok_or_else(|| "mesh send closed".to_owned())?
                 .map_err(|error| error.to_string())?;
-            if available == 0 {
+            if granted == 0 {
                 return Err("mesh send closed".to_owned());
             }
+            granted
+        };
+        let take = available.min(data.len());
+        if take == 0 {
+            return Err("mesh send closed".to_owned());
         }
+        let piece = data.split_to(take);
+        stream
+            .send_data(piece, end && data.is_empty())
+            .map_err(|error| error.to_string())?;
     }
-    stream
-        .send_data(data, end)
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 async fn serve_substituter(
@@ -1628,6 +1644,47 @@ Sig: cache.example:AAAA\n";
         drop(root);
     }
 
+    #[test]
+    fn a_small_receive_window_still_returns_the_narinfo() {
+        let (root, index, _hash, _narinfo) = offered_hello();
+        let wide_hash = StoreHash::parse("cccccccccccccccccccccccccccccccc").unwrap();
+        let mut wide = b"URL: nar/wide.nar\nCompression: none\n".to_vec();
+        wide.resize(wide.len() + 70_000, b'x');
+        wide.push(b'\n');
+        assert!(wide.len() > 65_535);
+        index.insert_offered_for_test(wide_hash, wide.clone());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_io()
+            .enable_time()
+            .thread_name("narjar-mesh-test")
+            .build()
+            .unwrap();
+        let stall = Duration::from_secs(3);
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let shared = Arc::clone(&index);
+            let (_shutdown, rx) = watch::channel(false);
+            tokio::spawn(async move {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                serve_connection(stream, Some(shared), stall, rx).await;
+            });
+            let (status, body) = read_exchange_window(
+                TcpStream::connect(addr).await.unwrap(),
+                &format!("/{}.narinfo", wide_hash.as_str()),
+                stall,
+                1024,
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(body, wide);
+        });
+        drop(root);
+    }
+
     async fn exchange_share(
         index: &Arc<ShareIndex>,
         hash: &StoreHash,
@@ -1707,6 +1764,43 @@ Sig: cache.example:AAAA\n";
 
     async fn read_exchange(stream: TcpStream, path: &str, stall: Duration) -> (u16, Vec<u8>) {
         let mut opened = http2_exchange(stream, path, stall).await.expect("exchange");
+        let body = read_limited(&mut opened, 1024 * 1024, stall)
+            .await
+            .expect("body");
+        (opened.status, body)
+    }
+
+    async fn read_exchange_window(
+        stream: TcpStream,
+        path: &str,
+        stall: Duration,
+        window: u32,
+    ) -> (u16, Vec<u8>) {
+        let (client, connection) = h2::client::Builder::new()
+            .initial_window_size(window)
+            .initial_connection_window_size(window)
+            .handshake::<_, bytes::Bytes>(stream)
+            .await
+            .expect("handshake");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut client = client.ready().await.expect("ready");
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .version(http::Version::HTTP_2)
+            .uri(mesh_uri(path).expect("uri"))
+            .body(())
+            .expect("request");
+        let (response, _send) = client.send_request(request, true).expect("send");
+        let response = response.await.expect("response");
+        let (parts, mut body) = response.into_parts();
+        let flow = body.flow_control().clone();
+        let mut opened = H2Response {
+            status: parts.status.as_u16(),
+            body,
+            flow,
+        };
         let body = read_limited(&mut opened, 1024 * 1024, stall)
             .await
             .expect("body");
