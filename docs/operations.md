@@ -563,7 +563,7 @@ IPFS lookups, transfer reports, and reputation are outside this tracker. Discove
 
 The first start writes `iroh_secret.key`, 32 bytes, mode 0600, under `--peerix-endpoint-state-dir`. When that option is unset the file is `peerix/iroh_secret.key` in the data directory. Later starts reuse the file, so the endpoint id stays the same. Serve prints that id on startup.
 
-A narinfo request is the store-path hash. A shareable path is answered with the offered narinfo. Any other hash is the bytes `NOTFOUND`. A NAR request is the narinfo `URL` value, or the store-path hash when that path is offered. The response is an 8-byte big-endian length and then that many NAR bytes. A miss, a read error, or a hash mismatch closes the stream without that successful ending. `--peerix-endpoint-stall-seconds` aborts a stream that sits longer than the limit. Unset, the limit is the serve I/O timeout.
+A narinfo request is the store-path hash. A shareable path is answered with the offered narinfo. Any other hash is the bytes `NOTFOUND`. A NAR request is the narinfo `URL` value, or the store-path hash when that path is offered. The response is an 8-byte big-endian length and then that many NAR bytes, both taken from the serialization whose hash and size matched. A miss, a read error, or a hash mismatch sends no length. `--peerix-endpoint-stall-seconds` aborts a stream that sits longer than the limit. Unset, the limit is the serve I/O timeout.
 
 The endpoint uses a direct path when the peer has one. Otherwise it falls back to the public Iroh relay. A failed peer is skipped for one second, then two, then four, up to one minute, and the next peer is tried. A peer that answers `NOTFOUND` is not skipped. There is no reputation score.
 

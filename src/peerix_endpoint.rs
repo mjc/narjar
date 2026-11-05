@@ -9,7 +9,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -446,11 +446,16 @@ async fn serve_nar(
     let Some(hash) = share.hash_for_nar_request(&query) else {
         return Err("peerix NAR request is not offered".to_owned());
     };
-    let share_for_size = Arc::clone(&share);
-    let size = tokio::task::spawn_blocking(move || share_for_size.measured_nar(&hash))
+    let share_for_body = Arc::clone(&share);
+    let prepared = tokio::task::spawn_blocking(move || checked_nar(&share_for_body, &hash))
         .await
-        .map_err(|error| format!("peerix NAR measurement task failed: {error}"))?
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("peerix NAR measurement task failed: {error}"))?;
+    let mut spool = prepared?;
+    let size = spool
+        .as_file()
+        .metadata()
+        .map_err(|error| format!("cannot read the peerix NAR: {error}"))?
+        .len();
     wait_for(
         stall_timeout,
         "NAR length",
@@ -459,10 +464,9 @@ async fn serve_nar(
     .await?;
 
     let (chunks, mut incoming) = tokio::sync::mpsc::channel(4);
-    let share_for_body = Arc::clone(&share);
     let body = tokio::task::spawn_blocking(move || {
         let mut writer = ChunkWriter { chunks };
-        share_for_body.write_nar(&hash, &mut writer)
+        io::copy(&mut spool, &mut writer).map_err(|error| error.to_string())
     });
     let forwarded: Result<(), String> = async {
         loop {
@@ -485,8 +489,24 @@ async fn serve_nar(
     let streamed = body
         .await
         .map_err(|error| format!("peerix NAR stream task failed: {error}"))?;
-    streamed.map_err(|error| error.to_string())?;
+    streamed?;
     finish_response(&mut send, &connection, stall_timeout).await
+}
+
+/// Serialize the NAR once, check it, and keep those bytes for the frame.
+///
+/// The length prefix cannot be taken back. A second read of the store path
+/// could send different bytes after the hash had already passed.
+fn checked_nar(share: &ShareIndex, hash: &StoreHash) -> Result<tempfile::NamedTempFile, String> {
+    let mut spool = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("cannot store the peerix NAR: {error}"))?;
+    share
+        .write_nar(hash, &mut spool)
+        .map_err(|error| error.to_string())?;
+    spool
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("cannot rewind the peerix NAR: {error}"))?;
+    Ok(spool)
 }
 
 /// Finish the response and keep the connection until the peer has read it.
@@ -606,6 +626,7 @@ async fn fetch_nar<W: Write + Send>(
 mod tests {
     use std::{
         fs,
+        io::Read,
         os::unix::fs::PermissionsExt,
         sync::{
             Arc,
@@ -692,6 +713,55 @@ mod tests {
                 .expect("second endpoint");
         assert_eq!(second.id(), id);
         assert_eq!(fs::read(path).expect("reused secret"), secret);
+    }
+
+    #[test]
+    fn an_invalid_secret_file_is_kept_and_refused() {
+        let state = tempfile::tempdir().expect("state");
+        let path = state.path().join(SECRET_FILE_NAME);
+        fs::write(&path, b"short").expect("invalid secret");
+        let started =
+            PeerEndpoint::start_local(&settings(state.path(), Duration::from_secs(2)), None);
+        let Err(error) = started else {
+            panic!("invalid secret was accepted");
+        };
+        assert!(error.contains("invalid"), "{error}");
+        assert_eq!(fs::read(&path).expect("kept"), b"short");
+    }
+
+    #[test]
+    fn the_checked_nar_remains_the_serialization_that_matched() {
+        let (root, share, _) = offered_share(b"hello peer");
+        let hash = StoreHash::parse(HASH).expect("hash");
+        let mut expected = Vec::new();
+        share.write_nar(&hash, &mut expected).expect("original nar");
+        let mut spool = checked_nar(&share, &hash).expect("checked nar");
+        fs::write(root.path().join(format!("{HASH}-package")), b"mutated").expect("replace");
+        let mut got = Vec::new();
+        spool.read_to_end(&mut got).expect("read spool");
+        assert_eq!(got, expected);
+        assert!(checked_nar(&share, &hash).is_err());
+    }
+
+    #[test]
+    fn a_replaced_store_file_is_not_a_successful_nar() {
+        let (root, share, _) = offered_share(b"hello peer");
+        let state = tempfile::tempdir().expect("state");
+        let server = PeerEndpoint::start_local(
+            &settings(state.path(), Duration::from_secs(2)),
+            Some(Arc::clone(&share)),
+        )
+        .expect("server");
+        fs::write(root.path().join(format!("{HASH}-package")), b"mutated").expect("replace");
+        let client_state = tempfile::tempdir().expect("client state");
+        let client =
+            PeerEndpoint::start_local(&settings(client_state.path(), Duration::from_secs(2)), None)
+                .expect("client");
+        let mut nar = Vec::new();
+        let error = client
+            .fetch_nar(&server.addr(), HASH, &mut nar)
+            .expect_err("replaced store file");
+        assert!(nar.is_empty(), "{error}");
     }
 
     #[test]

@@ -179,26 +179,6 @@ impl ShareIndex {
         })
     }
 
-    /// Read the offered store file once to learn its NAR size.
-    ///
-    /// The peerix NAR stream has to send that length before any body bytes.
-    /// This keeps none of the NAR. A hash or size that disagrees with the
-    /// offered narinfo is a mismatch, before a caller writes a length.
-    pub(crate) fn measured_nar(&self, hash: &StoreHash) -> Result<u64, ShareServeError> {
-        let Some(narinfo) = self.narinfo(hash) else {
-            return Err(ShareServeError::Miss);
-        };
-        let claims = NarInfoClaims::parse_external_logical_claims(hash, &narinfo)
-            .map_err(|_| ShareServeError::Failed("peer share narinfo is invalid".to_owned()))?;
-        let path = offered_store_file(&self.settings.store_root, &claims)?;
-        let (digest, size) = hash_store_nar(&path).map_err(ShareServeError::Failed)?;
-        let actual = NarHash::from_digest(digest);
-        if claims.identity().hash() != actual || claims.identity().size().get() != size {
-            return Err(ShareServeError::Mismatch);
-        }
-        Ok(size)
-    }
-
     #[cfg(test)]
     pub(crate) fn insert_offered_for_test(&self, hash: StoreHash, narinfo: Vec<u8>) {
         self.offered
@@ -1065,7 +1045,6 @@ mod tests {
         crate::push::write_store_nar(&root.path().join(format!("{HASH}-package")), &mut direct)
             .unwrap();
         assert_eq!(served, direct);
-        assert_eq!(index.measured_nar(&hash).unwrap(), served.len() as u64);
         assert_eq!(index.hash_for_nar_request(HASH), Some(hash));
         let text = String::from_utf8(narinfo.clone()).unwrap();
         let url = text
