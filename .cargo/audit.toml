@@ -1,0 +1,4 @@
+[advisories]
+# paste 1.0.15 is unmaintained and has no patched release. It arrives only
+# through iroh's netlink stack. Narjar does not call it.
+ignore = ["RUSTSEC-2024-0436"]

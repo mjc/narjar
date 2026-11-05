@@ -19,6 +19,8 @@ mod native_store;
 mod operator;
 #[cfg(unix)]
 mod peer_share;
+#[cfg(unix)]
+mod peerix_endpoint;
 mod peerix_tracker;
 #[cfg(unix)]
 mod push;

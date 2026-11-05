@@ -384,6 +384,15 @@
       "--peerix-tracker-upstream"
       cfg.peerixTracker.upstream
     ]
+    ++ lib.optionals cfg.peerixEndpoint.enable [
+      "--peerix-endpoint"
+      "--peerix-endpoint-stall-seconds"
+      (toString cfg.peerixEndpoint.stallSeconds)
+    ]
+    ++ lib.optionals (cfg.peerixEndpoint.stateDir != null) [
+      "--peerix-endpoint-state-dir"
+      cfg.peerixEndpoint.stateDir
+    ]
   );
   zfsProperties = [
     "mountpoint"
@@ -465,7 +474,8 @@
     ProtectSystem = "strict";
     ReadWritePaths =
       [runtimeDataDir]
-      ++ lib.optionals cfg.nativeStore.enable [nativeRootsParent nativeGcLock];
+      ++ lib.optionals cfg.nativeStore.enable [nativeRootsParent nativeGcLock]
+      ++ lib.optionals (cfg.peerixEndpoint.stateDir != null) [cfg.peerixEndpoint.stateDir];
     UMask = "0077";
   };
   serviceIdentityConfig =
@@ -651,6 +661,20 @@ in {
         type = lib.types.str;
         default = "https://sophronesis.dev/peerix";
         description = "Tracker whose peer lists and find results this server learns. Narjar does not register its peers there.";
+      };
+    };
+
+    peerixEndpoint = {
+      enable = lib.mkEnableOption "an Iroh endpoint for the peerix narinfo and NAR protocols";
+      stateDir = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Directory for the endpoint secret. The module creates it, mode 0700, for the static narjar user. Unset keeps iroh_secret.key under peerix/ in the data directory.";
+      };
+      stallSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 60;
+        description = "Seconds a stalled peerix stream may sit before it is aborted.";
       };
     };
 
@@ -863,6 +887,14 @@ in {
         message = "services.narjar.peerixTracker.upstream must be an HTTP(S) URL with a host";
       }
       {
+        assertion = cfg.peerixEndpoint.stateDir == null || cfg.peerixEndpoint.enable;
+        message = "services.narjar.peerixEndpoint.stateDir requires services.narjar.peerixEndpoint.enable";
+      }
+      {
+        assertion = cfg.peerixEndpoint.stateDir == null || !cfg.dynamicUser;
+        message = "services.narjar.peerixEndpoint.stateDir requires dynamicUser = false so the directory is created for the narjar user";
+      }
+      {
         assertion = !cfg.edge.enable || (!cfg.nativeStore.enable && cfg.egressCompression == "none" && cfg.workers >= 2 && cfg.maxInFlight >= 2);
         message = "services.narjar.edge requires raw output, two workers and connection admissions, and cannot be combined with nativeStore";
       }
@@ -966,7 +998,8 @@ in {
       group = "narjar";
     };
     systemd.tmpfiles.rules =
-      lib.optional (!cfg.dynamicUser) "d ${cfg.dataDir} 0700 narjar narjar -";
+      lib.optional (!cfg.dynamicUser) "d ${cfg.dataDir} 0700 narjar narjar -"
+      ++ lib.optional (!cfg.dynamicUser && cfg.peerixEndpoint.stateDir != null) "d ${cfg.peerixEndpoint.stateDir} 0700 narjar narjar -";
 
     systemd.services.narjar = {
       description = "Narjar binary cache";
@@ -977,6 +1010,7 @@ in {
         ++ lib.optionals cfg.nativeStore.enable [cfg.nativeStore.storeDir cfg.nativeStore.stateDir nativeRootsParent]
         ++ lib.optionals cfg.p2p.enable [cfg.p2p.storeDir]
         ++ lib.optionals cfg.p2p.publishAll [cfg.nativeStore.stateDir]
+        ++ lib.optionals (cfg.peerixEndpoint.stateDir != null) [cfg.peerixEndpoint.stateDir]
       );
 
       preStart = lib.mkIf cfg.dynamicUser preStartScript;

@@ -650,7 +650,14 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     #[cfg(unix)]
     let peer_share = start_peer_share(&config, Arc::clone(&stopping))?;
     #[cfg(not(unix))]
-    let peer_share = None::<thread::JoinHandle<()>>;
+    let peer_share = None::<PeerShareRefresh>;
+    #[cfg(unix)]
+    let peerix_endpoint = start_peerix_endpoint(
+        &config,
+        peer_share
+            .as_ref()
+            .map(|refresh| Arc::clone(&refresh.index)),
+    )?;
     let peerix_refresh = start_peerix_refresh(&config, Arc::clone(&stopping))?;
     let control = match crate::control::ControlService::start(
         &config.data_dir,
@@ -782,7 +789,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
         sampler.thread().unpark();
     }
     if let Some(refresh) = &peer_share {
-        refresh.thread().unpark();
+        refresh.handle.thread().unpark();
     }
     if let Some(refresh) = &peerix_refresh {
         refresh.handle.thread().unpark();
@@ -827,7 +834,7 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .map_err(|_| Error::runtime("population sampler panicked"))?;
     }
     if let Some(refresh) = &peer_share {
-        while !refresh.is_finished() {
+        while !refresh.handle.is_finished() {
             if Instant::now() >= deadline {
                 return Err(Error::runtime("shutdown grace period expired"));
             }
@@ -836,9 +843,12 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
     if let Some(refresh) = peer_share {
         refresh
+            .handle
             .join()
             .map_err(|_| Error::runtime("peer share refresh panicked"))?;
     }
+    #[cfg(unix)]
+    drop(peerix_endpoint);
     if let Some(refresh) = &peerix_refresh {
         while !refresh.handle.is_finished() {
             if Instant::now() >= deadline {
@@ -860,21 +870,28 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     Ok(())
 }
 
+struct PeerShareRefresh {
+    #[cfg(unix)]
+    index: Arc<crate::peer_share::ShareIndex>,
+    handle: thread::JoinHandle<()>,
+}
+
 #[cfg(unix)]
 fn start_peer_share(
     config: &ServeConfig,
     stopping: Arc<AtomicBool>,
-) -> Result<Option<thread::JoinHandle<()>>, Error> {
+) -> Result<Option<PeerShareRefresh>, Error> {
     let Some(settings) = config.peer_share.clone() else {
         return Ok(None);
     };
     let index = Arc::new(crate::peer_share::ShareIndex::new(settings));
-    thread::Builder::new()
+    let refresh = Arc::clone(&index);
+    let handle = thread::Builder::new()
         .name("narjar-peer-share".to_owned())
         .spawn(move || {
-            let interval = index.refresh_interval();
+            let interval = refresh.refresh_interval();
             while !stopping.load(Ordering::Acquire) {
-                if let Err(error) = index.refresh(&stopping) {
+                if let Err(error) = refresh.refresh(&stopping) {
                     eprintln!("narjar: peer share refresh failed: {error}");
                 }
                 if stopping.load(Ordering::Acquire) {
@@ -883,8 +900,21 @@ fn start_peer_share(
                 thread::park_timeout(interval);
             }
         })
+        .map_err(|error| Error::runtime(format!("cannot start peer share refresh: {error}")))?;
+    Ok(Some(PeerShareRefresh { index, handle }))
+}
+
+#[cfg(unix)]
+fn start_peerix_endpoint(
+    config: &ServeConfig,
+    share: Option<Arc<crate::peer_share::ShareIndex>>,
+) -> Result<Option<crate::peerix_endpoint::PeerEndpoint>, Error> {
+    let Some(settings) = config.peerix_endpoint.clone() else {
+        return Ok(None);
+    };
+    crate::peerix_endpoint::PeerEndpoint::start(&settings, share)
         .map(Some)
-        .map_err(|error| Error::runtime(format!("cannot start peer share refresh: {error}")))
+        .map_err(Error::runtime)
 }
 
 struct PeerixRefresh {
@@ -986,6 +1016,51 @@ mod tests {
         let started = super::start_peer_share(&config, Arc::new(AtomicBool::new(true)))
             .expect("absent peer share starts nothing");
         assert!(started.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peerix_endpoint_stays_off_without_the_flag_and_leaves_mdns_advertise_unset() {
+        use clap::{Args as _, Command, FromArgMatches};
+
+        use crate::config::{ServeArgs, ServeConfig};
+
+        let state = tempfile::tempdir().expect("state");
+        let data_dir = state.path().to_str().expect("utf-8 path");
+        let off = serve_config(&[
+            "serve",
+            "--data-dir",
+            data_dir,
+            "--public-url",
+            "http://10.0.0.8:5000",
+        ]);
+        assert!(off.peerix_endpoint.is_none());
+        assert!(format!("{:?}", off.hosting).contains("advertisement: None"));
+        let started = super::start_peerix_endpoint(&off, None).expect("endpoint stays off");
+        assert!(started.is_none());
+        assert!(!state.path().join("peerix").exists());
+
+        let on = serve_config(&[
+            "serve",
+            "--data-dir",
+            data_dir,
+            "--public-url",
+            "http://10.0.0.8:5000",
+            "--advertise",
+            "--peerix-endpoint",
+        ]);
+        assert!(on.peerix_endpoint.is_some());
+        assert!(format!("{:?}", on.hosting).contains("advertisement: Some"));
+
+        fn serve_config(args: &[&str]) -> ServeConfig {
+            let matches = ServeArgs::augment_args(Command::new("serve"))
+                .try_get_matches_from(args)
+                .expect("serve arguments should parse");
+            ServeConfig::try_from(
+                ServeArgs::from_arg_matches(&matches).expect("serve arguments should deserialize"),
+            )
+            .expect("flat-cache config should validate")
+        }
     }
 
     #[test]

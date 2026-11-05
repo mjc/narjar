@@ -42,6 +42,8 @@ pub(crate) struct ServeConfig {
     #[cfg(unix)]
     pub(crate) peer_share: Option<crate::peer_share::PeerShareSettings>,
     pub(crate) peerix_tracker: Option<crate::peerix_tracker::TrackerSettings>,
+    #[cfg(unix)]
+    pub(crate) peerix_endpoint: Option<crate::peerix_endpoint::EndpointSettings>,
 }
 
 /// Prepared source selection; native-store output is inherently flat/raw.
@@ -380,6 +382,24 @@ pub(crate) struct ServeArgs {
         requires = "peerix_tracker"
     )]
     peerix_tracker_upstream: Option<HttpUrl>,
+    /// Speak the peerix narinfo and NAR protocols on an Iroh endpoint.
+    #[arg(long, env = "NARJAR_PEERIX_ENDPOINT")]
+    peerix_endpoint: bool,
+    /// Directory for the endpoint secret. Unset uses peerix/ inside the data directory.
+    #[arg(
+        long,
+        env = "NARJAR_PEERIX_ENDPOINT_STATE_DIR",
+        value_parser = non_empty_path,
+        requires = "peerix_endpoint"
+    )]
+    peerix_endpoint_state_dir: Option<PathBuf>,
+    /// Seconds a stalled peerix stream may sit before it is aborted.
+    #[arg(
+        long,
+        env = "NARJAR_PEERIX_ENDPOINT_STALL_SECONDS",
+        requires = "peerix_endpoint"
+    )]
+    peerix_endpoint_stall_seconds: Option<NonZeroU64>,
     #[arg(
         long,
         env = "NARJAR_STATS_INVENTORY_INTERVAL_SECONDS",
@@ -467,9 +487,15 @@ impl TryFrom<ServeArgs> for ServeConfig {
         if args.peer_share_store.is_some() {
             return Err("peer sharing requires a unix host".to_owned());
         }
+        #[cfg(not(unix))]
+        if args.peerix_endpoint {
+            return Err("peerix endpoint requires a unix host".to_owned());
+        }
         #[cfg(unix)]
         let peer_share = peer_share_settings(&args)?;
         let peerix_tracker = peerix_tracker_settings(&args);
+        #[cfg(unix)]
+        let peerix_endpoint = peerix_endpoint_settings(&args);
         Ok(Self {
             hosting: args.hosting.prepare(source.minimum_advertisement_lease())?,
             track_access: args.track_access,
@@ -489,8 +515,30 @@ impl TryFrom<ServeArgs> for ServeConfig {
             #[cfg(unix)]
             peer_share,
             peerix_tracker,
+            #[cfg(unix)]
+            peerix_endpoint,
         })
     }
+}
+
+#[cfg(unix)]
+fn peerix_endpoint_settings(args: &ServeArgs) -> Option<crate::peerix_endpoint::EndpointSettings> {
+    if !args.peerix_endpoint {
+        return None;
+    }
+    let state_dir = args
+        .peerix_endpoint_state_dir
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join("peerix"));
+    let stall_timeout = std::time::Duration::from_secs(
+        args.peerix_endpoint_stall_seconds
+            .map(NonZeroU64::get)
+            .unwrap_or(args.io_timeout_seconds.get()),
+    );
+    Some(crate::peerix_endpoint::EndpointSettings {
+        state_dir,
+        stall_timeout,
+    })
 }
 
 fn peerix_tracker_settings(args: &ServeArgs) -> Option<crate::peerix_tracker::TrackerSettings> {
