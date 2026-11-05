@@ -55,6 +55,19 @@
   publishCommand = publishAll.systemd.services.narjar.serviceConfig.ExecStart;
   signedCommand = signed.systemd.services.narjar.serviceConfig.ExecStart;
   endpointCommand = endpoint.systemd.services.narjar.serviceConfig.ExecStart;
+  mesh = evaluate {
+    services.narjar = {
+      enable = true;
+      storeMesh = {
+        hosts = {
+          other = "100.64.0.2";
+          "peer.tail" = "[fd7a:115c:a1e0::8]:9730";
+        };
+        listen = "100.64.0.1:9722";
+      };
+    };
+  };
+  meshCommand = mesh.systemd.services.narjar.serviceConfig.ExecStart;
 in
   assert valid defaults;
   assert valid enabled;
@@ -73,6 +86,9 @@ in
   assert defaults.services.narjar.peerixEndpoint.stateDir == null;
   assert defaults.services.narjar.peerixEndpoint.stallSeconds == 60;
   assert !(lib.hasInfix "--peerix-endpoint" defaultCommand);
+  assert defaults.services.narjar.storeMesh.hosts == {};
+  assert defaults.services.narjar.storeMesh.listen == null;
+  assert !(lib.hasInfix "--store-mesh" defaultCommand);
   assert valid tracker;
   assert lib.hasInfix "--peerix-tracker" trackerCommand;
   assert lib.hasInfix "--peerix-tracker-upstream https://sophronesis.dev/peerix" trackerCommand;
@@ -97,6 +113,18 @@ in
     services.narjar = {
       enable = true;
       peerixEndpoint.stateDir = "/var/lib/narjar-peerix";
+    };
+  });
+  assert valid mesh;
+  assert lib.hasInfix "--store-mesh-host 'other=100.64.0.2'" meshCommand;
+  assert lib.hasInfix "--store-mesh-host 'peer.tail=[fd7a:115c:a1e0::8]:9730'" meshCommand;
+  assert lib.hasInfix "--store-mesh-listen 100.64.0.1:9722" meshCommand;
+  assert !(lib.hasInfix "trusted=true" meshCommand);
+  assert mesh.nix.settings.substituters == defaults.nix.settings.substituters;
+  assert !valid (evaluate {
+    services.narjar = {
+      enable = true;
+      storeMesh.hosts."bad name" = "100.64.0.2";
     };
   });
   assert !(lib.hasInfix "--peer-share" trackerCommand);

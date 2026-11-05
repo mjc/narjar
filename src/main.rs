@@ -30,6 +30,8 @@ mod push;
 mod read_through;
 mod server;
 mod setup;
+#[cfg(unix)]
+mod store_mesh;
 mod token;
 #[cfg(unix)]
 mod verified_stream;

@@ -1815,6 +1815,7 @@ dependencies = [
 name = "narjar"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "clap",
  "crossbeam-channel",
  "data-encoding",
@@ -1824,7 +1825,9 @@ dependencies = [
  "fluent-uri",
  "fs_at",
  "getrandom 0.2.17",
+ "h2",
  "hostname-validator",
+ "http",
  "httparse",
  "iroh",
  "libc",

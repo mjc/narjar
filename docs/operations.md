@@ -569,6 +569,20 @@ The endpoint uses a direct path when the peer has one. Otherwise it falls back t
 
 `services.narjar.peerixEndpoint.enable` turns the endpoint on and defaults to off. `stateDir` selects the secret directory and requires a static user; the module creates that directory, mode 0700, before the service starts. `stallSeconds` sets the stall limit and defaults to 60.
 
+## Store mesh
+
+`narjar serve` can fetch store paths from nix-store-mesh hosts and publish shareable paths to them. Both stay off until the operator sets a host map or a listen address. Off means serve opens no mesh socket and dials no mesh host. mDNS advertisement and browse stay as they are.
+
+`--store-mesh-host NAME=TARGET` may be repeated. `NAME` is the other machine's hostname: ASCII letters, digits, `-`, `_`, and `.`. `TARGET` is that machine's Tailscale address or MagicDNS name. A missing port means 9722. An IPv6 address is `[address]` or `[address]:port`. Serve leaves its own hostname out of the fetch list.
+
+Outbound requests use HTTP/2. Serve dials only addresses in `100.64.0.0/10` and `fd7a:115c:a1e0::/48`. A host is used after `GET /nix-cache-info` succeeds.
+
+With a host map, serve listens on `127.0.0.1:9740` and prints `narjar: store mesh substituter http://127.0.0.1:9740`. Point Nix at that URL. The URL has no `trusted=true`. Narinfo signature lines are returned unchanged, so an unsigned narinfo stays rejected until the operator trusts that key. The cache priority is 50, which Nix tries after cache.nixos.org. A `.narinfo` request asks the hosts in map order. The NAR request goes to the host that returned the narinfo.
+
+`--store-mesh-listen ADDR` serves this machine over HTTP/2. Leave it unset and the node only fetches. `GET /nix-cache-info` succeeds. `GET /{hash}.narinfo` returns the offered narinfo when that document has one `URL: nar/...` line and no query string. `GET /nar/...` streams the store NAR for that URL. A path the share decision left out is a miss. A client is accepted only when its source address is a Tailscale address of a host in the map. `/log/` is not served.
+
+`services.narjar.storeMesh.hosts` and `services.narjar.storeMesh.listen` pass those values through to serve. An empty host map and an unset listen address leave the integration off.
+
 ## Observability
 
 `GET /healthz` is a public liveness check. `GET /readyz` checks the staging
