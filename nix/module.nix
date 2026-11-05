@@ -384,6 +384,15 @@
       "--peerix-tracker-upstream"
       cfg.peerixTracker.upstream
     ]
+    ++ lib.optionals cfg.peerixEndpoint.enable [
+      "--peerix-endpoint"
+      "--peerix-endpoint-stall-seconds"
+      (toString cfg.peerixEndpoint.stallSeconds)
+    ]
+    ++ lib.optionals (cfg.peerixEndpoint.stateDir != null) [
+      "--peerix-endpoint-state-dir"
+      cfg.peerixEndpoint.stateDir
+    ]
   );
   zfsProperties = [
     "mountpoint"
@@ -465,7 +474,8 @@
     ProtectSystem = "strict";
     ReadWritePaths =
       [runtimeDataDir]
-      ++ lib.optionals cfg.nativeStore.enable [nativeRootsParent nativeGcLock];
+      ++ lib.optionals cfg.nativeStore.enable [nativeRootsParent nativeGcLock]
+      ++ lib.optionals (cfg.peerixEndpoint.stateDir != null) [cfg.peerixEndpoint.stateDir];
     UMask = "0077";
   };
   serviceIdentityConfig =
@@ -651,6 +661,20 @@ in {
         type = lib.types.str;
         default = "https://sophronesis.dev/peerix";
         description = "Tracker whose peer lists and find results this server learns. Narjar does not register its peers there.";
+      };
+    };
+
+    peerixEndpoint = {
+      enable = lib.mkEnableOption "an Iroh endpoint for the peerix narinfo and NAR protocols";
+      stateDir = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Directory for the endpoint secret. Unset keeps iroh_secret.key under peerix/ in the data directory.";
+      };
+      stallSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 60;
+        description = "Seconds a stalled peerix stream may sit before it is aborted.";
       };
     };
 
@@ -861,6 +885,10 @@ in {
       {
         assertion = !cfg.peerixTracker.enable || builtins.match "https?://[^/?#@]+([/?#].*)?" cfg.peerixTracker.upstream != null;
         message = "services.narjar.peerixTracker.upstream must be an HTTP(S) URL with a host";
+      }
+      {
+        assertion = cfg.peerixEndpoint.stateDir == null || cfg.peerixEndpoint.enable;
+        message = "services.narjar.peerixEndpoint.stateDir requires services.narjar.peerixEndpoint.enable";
       }
       {
         assertion = !cfg.edge.enable || (!cfg.nativeStore.enable && cfg.egressCompression == "none" && cfg.workers >= 2 && cfg.maxInFlight >= 2);

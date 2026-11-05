@@ -38,11 +38,22 @@
       peerixTracker.enable = true;
     };
   };
+  endpoint = evaluate {
+    services.narjar = {
+      enable = true;
+      peerixEndpoint = {
+        enable = true;
+        stateDir = "/var/lib/narjar-peerix";
+        stallSeconds = 15;
+      };
+    };
+  };
   defaultCommand = defaults.systemd.services.narjar.serviceConfig.ExecStart;
   trackerCommand = tracker.systemd.services.narjar.serviceConfig.ExecStart;
   enabledCommand = enabled.systemd.services.narjar.serviceConfig.ExecStart;
   publishCommand = publishAll.systemd.services.narjar.serviceConfig.ExecStart;
   signedCommand = signed.systemd.services.narjar.serviceConfig.ExecStart;
+  endpointCommand = endpoint.systemd.services.narjar.serviceConfig.ExecStart;
 in
   assert valid defaults;
   assert valid enabled;
@@ -57,9 +68,25 @@ in
   assert !defaults.services.narjar.peerixTracker.enable;
   assert defaults.services.narjar.peerixTracker.upstream == "https://sophronesis.dev/peerix";
   assert !(lib.hasInfix "--peerix-tracker" defaultCommand);
+  assert !defaults.services.narjar.peerixEndpoint.enable;
+  assert defaults.services.narjar.peerixEndpoint.stateDir == null;
+  assert defaults.services.narjar.peerixEndpoint.stallSeconds == 60;
+  assert !(lib.hasInfix "--peerix-endpoint" defaultCommand);
   assert valid tracker;
   assert lib.hasInfix "--peerix-tracker" trackerCommand;
   assert lib.hasInfix "--peerix-tracker-upstream https://sophronesis.dev/peerix" trackerCommand;
+  assert valid endpoint;
+  assert lib.hasInfix "--peerix-endpoint" endpointCommand;
+  assert lib.hasInfix "--peerix-endpoint-stall-seconds 15" endpointCommand;
+  assert lib.hasInfix "--peerix-endpoint-state-dir /var/lib/narjar-peerix" endpointCommand;
+  assert !(lib.hasInfix "--advertise" endpointCommand);
+  assert builtins.elem "/var/lib/narjar-peerix" endpoint.systemd.services.narjar.serviceConfig.ReadWritePaths;
+  assert !valid (evaluate {
+    services.narjar = {
+      enable = true;
+      peerixEndpoint.stateDir = "/var/lib/narjar-peerix";
+    };
+  });
   assert !(lib.hasInfix "--peer-share" trackerCommand);
   assert !valid (evaluate {
     services.narjar = {

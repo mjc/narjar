@@ -76,9 +76,6 @@ impl std::fmt::Debug for PeerShareSettings {
 struct Offered(BTreeMap<StoreHash, Vec<u8>>);
 
 /// Why a peer read did not succeed.
-///
-/// The daemon does not call this until a peer socket exists. Tests cover it.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum ShareServeError {
     /// The share decision does not offer this store-path hash.
@@ -123,7 +120,6 @@ impl ShareIndex {
         self.settings.refresh_interval
     }
 
-    #[allow(dead_code)] // peer sockets are a later change; tests call this
     pub(crate) fn narinfo(&self, hash: &StoreHash) -> Option<Vec<u8>> {
         self.offered
             .read()
@@ -138,7 +134,6 @@ impl ShareIndex {
     /// Bytes start leaving before the store file has been read in full, and
     /// this call keeps none of them. `Ok` means the streamed NarHash and
     /// NarSize match the offered narinfo.
-    #[allow(dead_code)] // peer sockets are a later change; tests call this
     pub(crate) fn write_nar<W: Write>(
         &self,
         hash: &StoreHash,
@@ -157,6 +152,60 @@ impl ShareIndex {
             return Err(ShareServeError::Mismatch);
         }
         Ok(())
+    }
+
+    /// Resolve a peerix NAR query to an offered store-path hash.
+    ///
+    /// The query is the narinfo `URL` value. A bare store-path hash is also
+    /// accepted when that path is offered.
+    pub(crate) fn hash_for_nar_request(&self, query: &str) -> Option<StoreHash> {
+        let query = query.trim();
+        if query.is_empty() || query.len() > 1024 {
+            return None;
+        }
+        if let Ok(hash) = StoreHash::parse(query)
+            && self.narinfo(&hash).is_some()
+        {
+            return Some(hash);
+        }
+        let offered = self
+            .offered
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        offered.0.iter().find_map(|(hash, narinfo)| {
+            narinfo_url(narinfo)
+                .is_some_and(|url| url == query)
+                .then_some(*hash)
+        })
+    }
+
+    /// Read the offered store file once to learn its NAR size.
+    ///
+    /// The peerix NAR stream has to send that length before any body bytes.
+    /// This keeps none of the NAR. A hash or size that disagrees with the
+    /// offered narinfo is a mismatch, before a caller writes a length.
+    pub(crate) fn measured_nar(&self, hash: &StoreHash) -> Result<u64, ShareServeError> {
+        let Some(narinfo) = self.narinfo(hash) else {
+            return Err(ShareServeError::Miss);
+        };
+        let claims = NarInfoClaims::parse_external_logical_claims(hash, &narinfo)
+            .map_err(|_| ShareServeError::Failed("peer share narinfo is invalid".to_owned()))?;
+        let path = offered_store_file(&self.settings.store_root, &claims)?;
+        let (digest, size) = hash_store_nar(&path).map_err(ShareServeError::Failed)?;
+        let actual = NarHash::from_digest(digest);
+        if claims.identity().hash() != actual || claims.identity().size().get() != size {
+            return Err(ShareServeError::Mismatch);
+        }
+        Ok(size)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_offered_for_test(&self, hash: StoreHash, narinfo: Vec<u8>) {
+        self.offered
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            .insert(hash, narinfo);
     }
 
     pub(crate) fn refresh(&self, stopping: &AtomicBool) -> Result<(), String> {
@@ -298,7 +347,6 @@ fn offer_narinfo(
     signed_narinfo(local, references, signing_key).map(Some)
 }
 
-#[allow(dead_code)] // called by write_nar, which waits for a peer socket
 fn offered_store_file(
     store_root: &Path,
     claims: &NarInfoClaims,
@@ -314,6 +362,24 @@ fn offered_store_file(
             ShareServeError::Failed("peer share narinfo store path is invalid".to_owned())
         })?;
     Ok(store_root.join(basename))
+}
+
+fn narinfo_url(narinfo: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(narinfo).ok()?;
+    text.lines().find_map(|line| {
+        let value = line.strip_prefix("URL:")?.trim();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+impl std::fmt::Display for ShareServeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Miss => formatter.write_str("share miss"),
+            Self::Failed(error) => formatter.write_str(error),
+            Self::Mismatch => formatter.write_str("nar mismatch"),
+        }
+    }
 }
 
 fn upstream_matches(local: &LocalPath, bytes: &[u8]) -> bool {
@@ -999,6 +1065,16 @@ mod tests {
         crate::push::write_store_nar(&root.path().join(format!("{HASH}-package")), &mut direct)
             .unwrap();
         assert_eq!(served, direct);
+        assert_eq!(index.measured_nar(&hash).unwrap(), served.len() as u64);
+        assert_eq!(index.hash_for_nar_request(HASH), Some(hash));
+        let text = String::from_utf8(narinfo.clone()).unwrap();
+        let url = text
+            .lines()
+            .find_map(|line| line.strip_prefix("URL:"))
+            .unwrap()
+            .trim();
+        assert_eq!(index.hash_for_nar_request(url), Some(hash));
+        assert!(index.hash_for_nar_request("nar/missing.nar").is_none());
         assert!(served.len() > 8);
         assert_eq!(
             std::fs::read_dir(root.path()).unwrap().count(),

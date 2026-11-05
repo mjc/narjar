@@ -557,6 +557,18 @@ With the flag, Narjar reads peer lists from an upstream tracker, by default `htt
 
 IPFS lookups, transfer reports, and reputation are outside this tracker. Discovery's default tracker URL is `https://narjar.mjc.lol/peerix`. The NixOS option `services.narjar.peerixTracker.enable` turns the routes on; it defaults to off. `services.narjar.peerixTracker.upstream` selects the tracker Narjar reads. The routes are on the serve listener, so a reverse proxy in front of Narjar has to forward `/peerix` before clients can use a public URL.
 
+## Peerix endpoint
+
+`narjar serve --peerix-endpoint` answers the peerix narinfo and NAR protocols on an Iroh endpoint. The protocol names are `peerix/narinfo/1` and `peerix/nar/1`. Without the flag, serve does not open that socket, write an endpoint secret, or contact a relay. mDNS advertisement and browse stay as they are, and an advertisement does not include the endpoint id.
+
+The first start writes `iroh_secret.key`, 32 bytes, mode 0600, under `--peerix-endpoint-state-dir`. When that option is unset the file is `peerix/iroh_secret.key` in the data directory. Later starts reuse the file, so the endpoint id stays the same. Serve prints that id on startup.
+
+A narinfo request is the store-path hash. A shareable path is answered with the offered narinfo. Any other hash is the bytes `NOTFOUND`. A NAR request is the narinfo `URL` value, or the store-path hash when that path is offered. The response is an 8-byte big-endian length and then that many NAR bytes. A miss, a read error, or a hash mismatch closes the stream without that successful ending. `--peerix-endpoint-stall-seconds` aborts a stream that sits longer than the limit. Unset, the limit is the serve I/O timeout.
+
+The endpoint uses a direct path when the peer has one. Otherwise it falls back to the public Iroh relay. A failed peer is skipped for one second, then two, then four, up to one minute, and the next peer is tried. A peer that answers `NOTFOUND` is not skipped. There is no reputation score.
+
+`services.narjar.peerixEndpoint.enable` turns the endpoint on and defaults to off. `stateDir` selects the secret directory. `stallSeconds` sets the stall limit and defaults to 60.
+
 ## Observability
 
 `GET /healthz` is a public liveness check. `GET /readyz` checks the staging

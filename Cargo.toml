@@ -45,6 +45,7 @@ application = [
     "dep:memchr", "dep:mincdc", "dep:mio", "dep:mdns-sd", "dep:httparse", "dep:postcard", "dep:rustix",
     "dep:sqlite", "dep:signal-hook", "dep:serde_json", "dep:subtle",
     "dep:tempfile", "dep:structured-zstd", "dep:ureq", "dep:fs_at", "dep:windows-sys", "dep:getrandom", "dep:scopeguard",
+    "dep:iroh", "dep:tokio",
 ]
 
 [[bin]]
@@ -94,6 +95,8 @@ thiserror = "=2.0.21"
 tempfile = { optional = true, version = "=3.27.0", default-features = false }
 structured-zstd = { optional = true, version = "=0.0.57", default-features = false, features = ["hash", "std", "kernel-sse", "kernel-bmi2", "kernel-avx2", "kernel-neon", "kernel-sve"] }
 ureq = { optional = true, version = "=3.4.2", default-features = false, features = ["rustls"] }
+iroh = { optional = true, version = "=1.4.1" }
+tokio = { optional = true, version = "=1.48.0", default-features = false, features = ["rt-multi-thread", "macros", "time", "io-util", "sync", "net"] }
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
 # rustix has no Apple mkfifo API; keep FIFO-rejection tests on Darwin.
