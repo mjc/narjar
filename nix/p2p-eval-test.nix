@@ -41,6 +41,7 @@
   endpoint = evaluate {
     services.narjar = {
       enable = true;
+      dynamicUser = false;
       peerixEndpoint = {
         enable = true;
         stateDir = "/var/lib/narjar-peerix";
@@ -81,6 +82,17 @@ in
   assert lib.hasInfix "--peerix-endpoint-state-dir /var/lib/narjar-peerix" endpointCommand;
   assert !(lib.hasInfix "--advertise" endpointCommand);
   assert builtins.elem "/var/lib/narjar-peerix" endpoint.systemd.services.narjar.serviceConfig.ReadWritePaths;
+  assert builtins.elem "/var/lib/narjar-peerix" endpoint.systemd.services.narjar.unitConfig.RequiresMountsFor;
+  assert builtins.elem "d /var/lib/narjar-peerix 0700 narjar narjar -" endpoint.systemd.tmpfiles.rules;
+  assert !valid (evaluate {
+    services.narjar = {
+      enable = true;
+      peerixEndpoint = {
+        enable = true;
+        stateDir = "/var/lib/narjar-peerix";
+      };
+    };
+  });
   assert !valid (evaluate {
     services.narjar = {
       enable = true;

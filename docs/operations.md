@@ -567,7 +567,7 @@ A narinfo request is the store-path hash. A shareable path is answered with the 
 
 The endpoint uses a direct path when the peer has one. Otherwise it falls back to the public Iroh relay. A failed peer is skipped for one second, then two, then four, up to one minute, and the next peer is tried. A peer that answers `NOTFOUND` is not skipped. There is no reputation score.
 
-`services.narjar.peerixEndpoint.enable` turns the endpoint on and defaults to off. `stateDir` selects the secret directory. `stallSeconds` sets the stall limit and defaults to 60.
+`services.narjar.peerixEndpoint.enable` turns the endpoint on and defaults to off. `stateDir` selects the secret directory and requires a static user; the module creates that directory, mode 0700, before the service starts. `stallSeconds` sets the stall limit and defaults to 60.
 
 ## Observability
 
