@@ -14,7 +14,7 @@ use std::{
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -31,6 +31,8 @@ pub(crate) const SUBSTITUTER_PORT: u16 = 9740;
 const NAR_CHUNK: usize = 16 * 1024;
 const CACHE_INFO: &[u8] = b"StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 50\n";
 const OUTSIDE_TAILSCALE: &str = "mesh address is outside the tailscale ranges";
+const ALLOW_REFRESH: Duration = Duration::from_secs(60);
+const ALLOW_RETRY: Duration = Duration::from_secs(5);
 
 pub(crate) fn substituter_socket() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SUBSTITUTER_PORT)
@@ -260,10 +262,16 @@ pub(crate) enum ScriptReply {
 #[cfg(test)]
 type HostScript = Arc<dyn Fn(&MeshHost, &str) -> Result<ScriptReply, String> + Send + Sync>;
 
+struct NameAllow {
+    by_host: BTreeMap<String, Vec<IpAddr>>,
+    refreshed: Instant,
+    retry_soon: bool,
+}
+
 struct MeshState {
     hosts: Vec<MeshHost>,
     own: Vec<u8>,
-    allow: Vec<IpAddr>,
+    allow: Mutex<NameAllow>,
     usable: Mutex<BTreeSet<String>>,
     routes: Mutex<BTreeMap<String, MeshHost>>,
     fetch: FetchMode,
@@ -327,7 +335,7 @@ impl StoreMesh {
         let state = Arc::new(MeshState {
             hosts: settings.hosts.clone(),
             own: own_hostname(),
-            allow,
+            allow: Mutex::new(allow),
             usable: Mutex::new(BTreeSet::new()),
             routes: Mutex::new(BTreeMap::new()),
             fetch,
@@ -369,7 +377,7 @@ impl Drop for StoreMesh {
 
 async fn bind_listeners(
     settings: &MeshSettings,
-) -> Result<(TcpListener, Option<TcpListener>, Vec<IpAddr>), String> {
+) -> Result<(TcpListener, Option<TcpListener>, NameAllow), String> {
     let substituter = TcpListener::bind(settings.substituter)
         .await
         .map_err(|error| format!("cannot listen for the store mesh substituter: {error}"))?;
@@ -381,27 +389,76 @@ async fn bind_listeners(
         ),
         None => None,
     };
-    let allow = allow_list(&settings.hosts, settings.stall_timeout).await;
+    let allow = resolve_names(&settings.hosts, &BTreeMap::new(), settings.stall_timeout).await;
     Ok((substituter, listen, allow))
 }
 
-async fn allow_list(hosts: &[MeshHost], stall: Duration) -> Vec<IpAddr> {
-    let mut ips = Vec::new();
+fn allow_due(allow: &NameAllow) -> bool {
+    let age = allow.refreshed.elapsed();
+    if allow.retry_soon {
+        age >= ALLOW_RETRY
+    } else {
+        age >= ALLOW_REFRESH
+    }
+}
+
+/// Keep the last addresses when a lookup fails. A new answer replaces them.
+fn apply_resolution(
+    previous: Option<&Vec<IpAddr>>,
+    result: Result<Vec<IpAddr>, String>,
+) -> Option<Vec<IpAddr>> {
+    match result {
+        Ok(ips) => Some(ips),
+        Err(_) => previous.cloned(),
+    }
+}
+
+async fn resolve_names(
+    hosts: &[MeshHost],
+    previous: &BTreeMap<String, Vec<IpAddr>>,
+    stall: Duration,
+) -> NameAllow {
+    let mut by_host = BTreeMap::new();
+    let mut retry_soon = false;
     for host in hosts {
         let HostTarget::Name { host: name, port } = &host.target else {
             continue;
         };
-        match resolve_name(name, *port, stall).await {
-            Ok(addrs) => ips.extend(addrs.into_iter().map(|addr| addr.ip())),
-            Err(error) => {
-                eprintln!(
-                    "narjar: store mesh host {} is not on the allow list: {error}",
-                    host.name()
-                );
+        let result = resolve_name(name, *port, stall)
+            .await
+            .map(|addrs| addrs.into_iter().map(|addr| addr.ip()).collect::<Vec<_>>());
+        if let Err(error) = &result {
+            eprintln!(
+                "narjar: store mesh host {} is not on the allow list: {error}",
+                host.name()
+            );
+            if !previous.contains_key(host.name()) {
+                retry_soon = true;
             }
         }
+        if let Some(ips) = apply_resolution(previous.get(host.name()), result) {
+            by_host.insert(host.name().to_owned(), ips);
+        }
     }
-    ips
+    NameAllow {
+        by_host,
+        refreshed: Instant::now(),
+        retry_soon,
+    }
+}
+
+async fn current_allow(state: &MeshState) -> Vec<IpAddr> {
+    if allow_due(&locked(&state.allow)) {
+        let previous = locked(&state.allow).by_host.clone();
+        let next = resolve_names(&state.hosts, &previous, state.stall).await;
+        *locked(&state.allow) = next;
+    }
+    locked(&state.allow)
+        .by_host
+        .values()
+        .flatten()
+        .copied()
+        .collect()
 }
 
 async fn resolve_name(host: &str, port: u16, stall: Duration) -> Result<Vec<SocketAddr>, String> {
@@ -466,7 +523,8 @@ async fn serve_listener(
             }
             accepted = listener.accept() => {
                 let Ok((stream, peer)) = accepted else { break };
-                if !client_allowed(peer.ip(), &state.hosts, &state.allow) {
+                let allow = current_allow(&state).await;
+                if !client_allowed(peer.ip(), &state.hosts, &allow) {
                     drop(stream);
                     continue;
                 }
@@ -591,7 +649,44 @@ fn mesh_shaped(body: &[u8]) -> bool {
     let Some(url) = urls.next() else {
         return false;
     };
-    urls.next().is_none() && url.starts_with("nar/") && !url.contains('?') && !url.contains(' ')
+    urls.next().is_none()
+        && url.starts_with("nar/")
+        && !url.contains('?')
+        && !url.contains(' ')
+        && raw_nar_claim(text)
+}
+
+/// The listener streams a raw NAR, so the narinfo has to describe those bytes.
+fn raw_nar_claim(text: &str) -> bool {
+    if single_field(text, "Compression") != Some("none") {
+        return false;
+    }
+    match (
+        single_field(text, "FileHash"),
+        single_field(text, "FileSize"),
+    ) {
+        (None, None) => true,
+        (Some(file_hash), Some(file_size)) => {
+            single_field(text, "NarHash") == Some(file_hash)
+                && single_field(text, "NarSize") == Some(file_size)
+        }
+        _ => false,
+    }
+}
+
+fn single_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let mut found = None;
+    let header = format!("{name}:");
+    for line in text.lines() {
+        let Some(value) = line.strip_prefix(&header) else {
+            continue;
+        };
+        if found.is_some() {
+            return None;
+        }
+        found = Some(value.trim());
+    }
+    found
 }
 
 async fn serve_nar(
@@ -687,7 +782,22 @@ async fn send_bytes(
     let mut stream = respond
         .send_response(response, false)
         .map_err(|error| error.to_string())?;
-    write_data(&mut stream, Bytes::copy_from_slice(body), true, stall).await
+    if body.is_empty() {
+        return write_data(&mut stream, Bytes::new(), true, stall).await;
+    }
+    let mut offset = 0;
+    while offset < body.len() {
+        let end = offset.saturating_add(NAR_CHUNK).min(body.len());
+        write_data(
+            &mut stream,
+            Bytes::copy_from_slice(&body[offset..end]),
+            end == body.len(),
+            stall,
+        )
+        .await?;
+        offset = end;
+    }
+    Ok(())
 }
 
 async fn write_data(
@@ -1132,10 +1242,11 @@ async fn write_chunk_end(stream: &mut TcpStream) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         io::Read,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         sync::{Arc, Mutex},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use tokio::{
@@ -1256,11 +1367,86 @@ mod tests {
 
     #[test]
     fn mesh_shaped_narinfo_has_one_relative_nar_url() {
-        assert!(mesh_shaped(b"URL: nar/abc.nar\nSig: cache.example:AAAA\n"));
-        assert!(!mesh_shaped(b"URL: nar/abc.nar?peer=a\n"));
-        assert!(!mesh_shaped(b"URL: https://cache.example/nar/abc.nar\n"));
-        assert!(!mesh_shaped(b"URL: nar/one.nar\nURL: nar/two.nar\n"));
+        assert!(mesh_shaped(
+            b"URL: nar/abc.nar\nCompression: none\nSig: cache.example:AAAA\n"
+        ));
+        assert!(mesh_shaped(
+            b"URL: nar/abc.nar\nCompression: none\nFileHash: sha256:abc\nFileSize: 4\nNarHash: sha256:abc\nNarSize: 4\n"
+        ));
+        assert!(!mesh_shaped(b"URL: nar/abc.nar\nSig: cache.example:AAAA\n"));
+        assert!(!mesh_shaped(b"URL: nar/abc.nar.xz\nCompression: xz\n"));
+        assert!(!mesh_shaped(
+            b"URL: nar/abc.nar\nCompression: none\nCompression: none\n"
+        ));
+        assert!(!mesh_shaped(
+            b"URL: nar/abc.nar\nCompression: none\nFileHash: sha256:abc\nFileSize: 4\nNarHash: sha256:other\nNarSize: 4\n"
+        ));
+        assert!(!mesh_shaped(
+            b"URL: nar/abc.nar\nCompression: none\nFileHash: sha256:abc\n"
+        ));
+        assert!(!mesh_shaped(
+            b"URL: nar/abc.nar?peer=a\nCompression: none\n"
+        ));
+        assert!(!mesh_shaped(
+            b"URL: https://cache.example/nar/abc.nar\nCompression: none\n"
+        ));
+        assert!(!mesh_shaped(
+            b"URL: nar/one.nar\nURL: nar/two.nar\nCompression: none\n"
+        ));
         assert!(!mesh_shaped(b"Sig: cache.example:AAAA\n"));
+    }
+
+    #[test]
+    fn a_name_keeps_its_last_addresses_until_a_new_answer() {
+        let hosts = vec![host("named=machine.tail.ts.net")];
+        let previous = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2));
+        let moved = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3));
+        let public = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        assert!(apply_resolution(None, Err("dns".into())).is_none());
+        assert!(!client_allowed(previous, &hosts, &[]));
+
+        let first = apply_resolution(None, Ok(vec![previous])).expect("first");
+        assert!(client_allowed(previous, &hosts, &first));
+        assert!(!client_allowed(moved, &hosts, &first));
+        assert!(!client_allowed(public, &hosts, &[public]));
+
+        let next = apply_resolution(Some(&first), Ok(vec![moved])).expect("moved");
+        assert!(!client_allowed(previous, &hosts, &next));
+        assert!(client_allowed(moved, &hosts, &next));
+
+        let kept = apply_resolution(Some(&next), Err("dns".into())).expect("kept");
+        assert_eq!(kept, vec![moved]);
+        assert!(client_allowed(moved, &hosts, &kept));
+        assert!(!client_allowed(previous, &hosts, &kept));
+    }
+
+    #[test]
+    fn an_unresolved_name_is_retried_before_a_resolved_one() {
+        let now = Instant::now();
+        let unresolved = NameAllow {
+            by_host: BTreeMap::new(),
+            refreshed: now,
+            retry_soon: true,
+        };
+        assert!(!allow_due(&unresolved));
+        let retry = NameAllow {
+            by_host: BTreeMap::new(),
+            refreshed: now.checked_sub(ALLOW_RETRY).expect("clock"),
+            retry_soon: true,
+        };
+        assert!(allow_due(&retry));
+        let fresh = NameAllow {
+            by_host: BTreeMap::new(),
+            refreshed: now.checked_sub(ALLOW_RETRY).expect("clock"),
+            retry_soon: false,
+        };
+        assert!(!allow_due(&fresh));
+        let stale = NameAllow {
+            by_host: BTreeMap::new(),
+            refreshed: now.checked_sub(ALLOW_REFRESH).expect("clock"),
+            retry_soon: false,
+        };
+        assert!(allow_due(&stale));
     }
 
     #[test]
@@ -1380,6 +1566,65 @@ Sig: cache.example:AAAA\n";
             &narinfo,
             Duration::from_secs(3),
         ));
+        drop(root);
+    }
+
+    #[test]
+    fn a_wide_narinfo_arrives_and_a_compressed_one_is_a_miss() {
+        let (root, index, _hash, _narinfo) = offered_hello();
+        let wide_hash = StoreHash::parse("cccccccccccccccccccccccccccccccc").unwrap();
+        let mut wide = b"URL: nar/wide.nar\nCompression: none\n".to_vec();
+        wide.resize(wide.len() + 70_000, b'x');
+        wide.push(b'\n');
+        assert!(wide.len() > 65_535);
+        index.insert_offered_for_test(wide_hash, wide.clone());
+        let compressed = StoreHash::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        index.insert_offered_for_test(
+            compressed,
+            b"URL: nar/abc.nar.xz\nCompression: xz\n".to_vec(),
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_io()
+            .enable_time()
+            .thread_name("narjar-mesh-test")
+            .build()
+            .unwrap();
+        let stall = Duration::from_secs(3);
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let shared = Arc::clone(&index);
+            let (_shutdown, rx) = watch::channel(false);
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let shared = Arc::clone(&shared);
+                    let rx = rx.clone();
+                    tokio::spawn(async move {
+                        serve_connection(stream, Some(shared), stall, rx).await;
+                    });
+                }
+            });
+            let (status, body) = read_exchange(
+                TcpStream::connect(addr).await.unwrap(),
+                &format!("/{}.narinfo", wide_hash.as_str()),
+                stall,
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(body, wide);
+            let (status, body) = read_exchange(
+                TcpStream::connect(addr).await.unwrap(),
+                &format!("/{}.narinfo", compressed.as_str()),
+                stall,
+            )
+            .await;
+            assert_eq!(status, 404);
+            assert!(body.is_empty());
+        });
         drop(root);
     }
 
