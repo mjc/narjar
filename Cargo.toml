@@ -96,7 +96,7 @@ tempfile = { optional = true, version = "=3.27.0", default-features = false }
 structured-zstd = { optional = true, version = "=0.0.57", default-features = false, features = ["hash", "std", "kernel-sse", "kernel-bmi2", "kernel-avx2", "kernel-neon", "kernel-sve"] }
 ureq = { optional = true, version = "=3.4.2", default-features = false, features = ["rustls"] }
 iroh = { optional = true, version = "=1.4.1" }
-tokio = { optional = true, version = "=1.48.0", default-features = false, features = ["rt-multi-thread", "macros", "time", "io-util", "sync", "net"] }
+tokio = { optional = true, version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "time", "io-util", "sync", "net"] }
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
 # rustix has no Apple mkfifo API; keep FIFO-rejection tests on Darwin.
