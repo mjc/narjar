@@ -44,6 +44,8 @@ pub(crate) struct ServeConfig {
     pub(crate) peerix_tracker: Option<crate::peerix_tracker::TrackerSettings>,
     #[cfg(unix)]
     pub(crate) peerix_endpoint: Option<crate::peerix_endpoint::EndpointSettings>,
+    #[cfg(unix)]
+    pub(crate) store_mesh: Option<crate::store_mesh::MeshSettings>,
 }
 
 /// Prepared source selection; native-store output is inherently flat/raw.
@@ -400,6 +402,16 @@ pub(crate) struct ServeArgs {
         requires = "peerix_endpoint"
     )]
     peerix_endpoint_stall_seconds: Option<NonZeroU64>,
+    /// Fetch store paths from this nix-store-mesh host. NAME is the other machine's hostname.
+    #[arg(long = "store-mesh-host", value_name = "NAME=TARGET")]
+    store_mesh_host: Vec<String>,
+    /// Publish shareable paths to nix-store-mesh peers on this address.
+    #[arg(
+        long = "store-mesh-listen",
+        value_name = "ADDR",
+        env = "NARJAR_STORE_MESH_LISTEN"
+    )]
+    store_mesh_listen: Option<String>,
     #[arg(
         long,
         env = "NARJAR_STATS_INVENTORY_INTERVAL_SECONDS",
@@ -491,11 +503,17 @@ impl TryFrom<ServeArgs> for ServeConfig {
         if args.peerix_endpoint {
             return Err("peerix endpoint requires a unix host".to_owned());
         }
+        #[cfg(not(unix))]
+        if !args.store_mesh_host.is_empty() || args.store_mesh_listen.is_some() {
+            return Err("store mesh requires a unix host".to_owned());
+        }
         #[cfg(unix)]
         let peer_share = peer_share_settings(&args)?;
         let peerix_tracker = peerix_tracker_settings(&args);
         #[cfg(unix)]
         let peerix_endpoint = peerix_endpoint_settings(&args);
+        #[cfg(unix)]
+        let store_mesh = store_mesh_settings(&args)?;
         Ok(Self {
             hosting: args.hosting.prepare(source.minimum_advertisement_lease())?,
             track_access: args.track_access,
@@ -517,8 +535,21 @@ impl TryFrom<ServeArgs> for ServeConfig {
             peerix_tracker,
             #[cfg(unix)]
             peerix_endpoint,
+            #[cfg(unix)]
+            store_mesh,
         })
     }
+}
+
+#[cfg(unix)]
+fn store_mesh_settings(
+    args: &ServeArgs,
+) -> Result<Option<crate::store_mesh::MeshSettings>, String> {
+    crate::store_mesh::settings_from_cli(
+        &args.store_mesh_host,
+        args.store_mesh_listen.as_deref(),
+        std::time::Duration::from_secs(args.io_timeout_seconds.get()),
+    )
 }
 
 #[cfg(unix)]

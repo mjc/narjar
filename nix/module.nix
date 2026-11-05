@@ -393,6 +393,16 @@
       "--peerix-endpoint-state-dir"
       cfg.peerixEndpoint.stateDir
     ]
+    ++ lib.concatLists (
+      lib.mapAttrsToList (name: target: [
+        "--store-mesh-host"
+        "${name}=${target}"
+      ]) cfg.storeMesh.hosts
+    )
+    ++ lib.optionals (cfg.storeMesh.listen != null) [
+      "--store-mesh-listen"
+      cfg.storeMesh.listen
+    ]
   );
   zfsProperties = [
     "mountpoint"
@@ -678,6 +688,19 @@ in {
       };
     };
 
+    storeMesh = {
+      hosts = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = {};
+        description = "OS hostname to a Tailscale address or MagicDNS name. A missing port means 9722. This machine's hostname is not fetched.";
+      };
+      listen = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "HTTP/2 address for shareable paths. Unset publishes nothing.";
+      };
+    };
+
     listen = lib.mkOption {
       type = lib.types.str;
       default = "127.0.0.1:5000";
@@ -893,6 +916,18 @@ in {
       {
         assertion = cfg.peerixEndpoint.stateDir == null || !cfg.dynamicUser;
         message = "services.narjar.peerixEndpoint.stateDir requires dynamicUser = false so the directory is created for the narjar user";
+      }
+      {
+        assertion = builtins.all (name: builtins.match "[0-9A-Za-z._-]+" name != null) (builtins.attrNames cfg.storeMesh.hosts);
+        message = "services.narjar.storeMesh.hosts names are letters, digits, '-', '_', and '.'";
+      }
+      {
+        assertion = builtins.all (target: target != "") (builtins.attrValues cfg.storeMesh.hosts);
+        message = "services.narjar.storeMesh.hosts values are Tailscale addresses or names";
+      }
+      {
+        assertion = cfg.storeMesh.listen == null || cfg.storeMesh.listen != "";
+        message = "services.narjar.storeMesh.listen is an address";
       }
       {
         assertion = !cfg.edge.enable || (!cfg.nativeStore.enable && cfg.egressCompression == "none" && cfg.workers >= 2 && cfg.maxInFlight >= 2);

@@ -45,7 +45,7 @@ application = [
     "dep:memchr", "dep:mincdc", "dep:mio", "dep:mdns-sd", "dep:httparse", "dep:postcard", "dep:rustix",
     "dep:sqlite", "dep:signal-hook", "dep:serde_json", "dep:subtle",
     "dep:tempfile", "dep:structured-zstd", "dep:ureq", "dep:fs_at", "dep:windows-sys", "dep:getrandom", "dep:scopeguard",
-    "dep:iroh", "dep:tokio",
+    "dep:iroh", "dep:tokio", "dep:h2", "dep:http", "dep:bytes",
 ]
 
 [[bin]]
@@ -97,13 +97,16 @@ structured-zstd = { optional = true, version = "=0.0.57", default-features = fal
 ureq = { optional = true, version = "=3.4.2", default-features = false, features = ["rustls"] }
 iroh = { optional = true, version = "=1.4.1" }
 tokio = { optional = true, version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "time", "io-util", "sync", "net"] }
+h2 = { optional = true, version = "=0.4.20" }
+http = { optional = true, version = "=1.5.0", default-features = false, features = ["std"] }
+bytes = { optional = true, version = "=1.12.1", default-features = false, features = ["std"] }
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
 # rustix has no Apple mkfifo API; keep FIFO-rejection tests on Darwin.
 libc = { version = "=0.2.189", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { optional = true, version = "=1.1.5", default-features = false, features = ["event", "fs", "net", "param", "process", "std"] }
+rustix = { optional = true, version = "=1.1.5", default-features = false, features = ["event", "fs", "net", "param", "process", "std", "system"] }
 sqlite = { optional = true, version = "=0.37.3", default-features = false, features = ["linkage"] }
 signal-hook = { optional = true, version = "=0.4.4", default-features = false }
 

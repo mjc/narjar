@@ -658,6 +658,13 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
             .as_ref()
             .map(|refresh| Arc::clone(&refresh.index)),
     )?;
+    #[cfg(unix)]
+    let store_mesh = start_store_mesh(
+        &config,
+        peer_share
+            .as_ref()
+            .map(|refresh| Arc::clone(&refresh.index)),
+    )?;
     let peerix_refresh = start_peerix_refresh(&config, Arc::clone(&stopping))?;
     let control = match crate::control::ControlService::start(
         &config.data_dir,
@@ -849,6 +856,8 @@ pub(crate) fn serve(config: ServeConfig) -> Result<(), Error> {
     }
     #[cfg(unix)]
     drop(peerix_endpoint);
+    #[cfg(unix)]
+    drop(store_mesh);
     if let Some(refresh) = &peerix_refresh {
         while !refresh.handle.is_finished() {
             if Instant::now() >= deadline {
@@ -913,6 +922,19 @@ fn start_peerix_endpoint(
         return Ok(None);
     };
     crate::peerix_endpoint::PeerEndpoint::start(&settings, share)
+        .map(Some)
+        .map_err(Error::runtime)
+}
+
+#[cfg(unix)]
+fn start_store_mesh(
+    config: &ServeConfig,
+    share: Option<Arc<crate::peer_share::ShareIndex>>,
+) -> Result<Option<crate::store_mesh::StoreMesh>, Error> {
+    let Some(settings) = config.store_mesh.clone() else {
+        return Ok(None);
+    };
+    crate::store_mesh::StoreMesh::start(&settings, share)
         .map(Some)
         .map_err(Error::runtime)
 }
@@ -1051,6 +1073,23 @@ mod tests {
         ]);
         assert!(on.peerix_endpoint.is_some());
         assert!(format!("{:?}", on.hosting).contains("advertisement: Some"));
+
+        let mesh_off = serve_config(&["serve", "--data-dir", data_dir]);
+        assert!(mesh_off.store_mesh.is_none());
+        let started = super::start_store_mesh(&mesh_off, None).expect("mesh stays off");
+        assert!(started.is_none());
+
+        let mesh_on = serve_config(&[
+            "serve",
+            "--data-dir",
+            data_dir,
+            "--public-url",
+            "http://10.0.0.8:5000",
+            "--store-mesh-host",
+            "other=100.64.0.2",
+        ]);
+        assert!(mesh_on.store_mesh.is_some());
+        assert!(format!("{:?}", mesh_on.hosting).contains("advertisement: None"));
 
         fn serve_config(args: &[&str]) -> ServeConfig {
             let matches = ServeArgs::augment_args(Command::new("serve"))
