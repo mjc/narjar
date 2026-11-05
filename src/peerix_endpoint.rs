@@ -260,16 +260,32 @@ fn load_or_create_secret(state_dir: &Path) -> Result<[u8; 32], String> {
         return Ok(secret);
     }
     if path.exists() {
-        fs::remove_file(&path).map_err(|error| {
-            format!(
-                "cannot replace invalid peerix endpoint secret {}: {error}",
-                path.display()
-            )
-        })?;
+        return Err(format!(
+            "peerix endpoint secret {} is invalid",
+            path.display()
+        ));
     }
     let secret = SecretKey::generate().to_bytes();
-    write_secret(&path, &secret)?;
-    Ok(secret)
+    match publish_secret(state_dir, &path, &secret) {
+        Ok(()) => Ok(secret),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => read_secret(&path)?
+            .ok_or_else(|| format!("peerix endpoint secret {} is invalid", path.display())),
+        Err(error) => Err(format!(
+            "cannot create peerix endpoint secret {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn publish_secret(state_dir: &Path, path: &Path, secret: &[u8; 32]) -> io::Result<()> {
+    let temporary = state_dir.join(format!(".{}.{}.tmp", SECRET_FILE_NAME, std::process::id()));
+    if let Err(error) = write_secret(&temporary, secret) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let published = fs::hard_link(&temporary, path);
+    let _ = fs::remove_file(&temporary);
+    published
 }
 
 fn read_secret(path: &Path) -> Result<Option<[u8; 32]>, String> {
@@ -288,25 +304,14 @@ fn read_secret(path: &Path) -> Result<Option<[u8; 32]>, String> {
     }
 }
 
-fn write_secret(path: &Path, secret: &[u8; 32]) -> Result<(), String> {
+fn write_secret(path: &Path, secret: &[u8; 32]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .map_err(|error| {
-            format!(
-                "cannot create peerix endpoint secret {}: {error}",
-                path.display()
-            )
-        })?;
-    file.write_all(secret).map_err(|error| {
-        format!(
-            "cannot write peerix endpoint secret {}: {error}",
-            path.display()
-        )
-    })?;
-    restrict_secret(path)
+        .open(path)?;
+    file.write_all(secret)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
 fn restrict_secret(path: &Path) -> Result<(), String> {
@@ -460,16 +465,26 @@ async fn serve_nar(
         share_for_body.write_nar(&hash, &mut writer)
     });
     let forwarded: Result<(), String> = async {
-        while let Some(chunk) = incoming.recv().await {
+        loop {
+            let chunk = match tokio::time::timeout(stall_timeout, incoming.recv()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => return Ok(()),
+                Err(_elapsed) => return Err("peerix NAR chunk stalled".to_owned()),
+            };
             wait_for(stall_timeout, "NAR write", send.write_all(&chunk)).await?;
         }
-        Ok(())
     }
     .await;
+    // Drop the receiver before joining. A failed send otherwise leaves the
+    // producer blocked on a full channel, and the join never finishes.
+    drop(incoming);
+    if let Err(error) = forwarded {
+        drop(body);
+        return Err(error);
+    }
     let streamed = body
         .await
         .map_err(|error| format!("peerix NAR stream task failed: {error}"))?;
-    forwarded?;
     streamed.map_err(|error| error.to_string())?;
     finish_response(&mut send, &connection, stall_timeout).await
 }
